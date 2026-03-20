@@ -1,10 +1,21 @@
 import { createServer } from "http";
 import { Readable } from "stream";
 import fs from "fs";
-import { createRequire } from "module";
 import path from "path";
-import { fileURLToPath, pathToFileURL } from "url";
 import { webcrypto } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { Pool } from "../../DrakonSite/node_modules/pg/esm/index.mjs";
+
+import {
+  resolveActiveBrandRuntime,
+  resolveDatabaseBackend,
+  resolveDefaultSqlitePath,
+} from "../../DrakonSite/server/brand.ts";
+import { loadEnv } from "../../DrakonSite/server/env.ts";
+import { LocalR2Bucket } from "../../DrakonSite/server/local-r2.ts";
+import { PgD1Database } from "../../DrakonSite/server/pg-d1.ts";
+import { SqliteD1Database } from "../../DrakonSite/server/sqlite-d1.ts";
+import worker from "../../DrakonSite/src/worker/index.ts";
 
 if (!globalThis.crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -13,34 +24,18 @@ if (!globalThis.crypto) {
   });
 }
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const workspaceRoot = resolveWorkspaceRoot();
-const drakonSiteRoot = resolveDrakonSiteRoot(workspaceRoot);
-const requireFromDrakonSite = createRequire(path.join(drakonSiteRoot, "package.json"));
-
-function moduleUrl(...segments) {
-  return pathToFileURL(path.join(drakonSiteRoot, ...segments)).href;
-}
-
-const {
-  resolveActiveBrandRuntime,
-  resolveDatabaseBackend,
-  resolveDefaultSqlitePath,
-} = await import(moduleUrl("server", "brand.ts"));
-const { loadEnv } = await import(moduleUrl("server", "env.ts"));
-const { PgD1Database } = await import(moduleUrl("server", "pg-d1.ts"));
-const { LocalR2Bucket } = await import(moduleUrl("server", "local-r2.ts"));
-
 loadEnv();
 
 const port = Number(process.env.PORT || 4000);
 const bindHost = process.env.APP_BIND_HOST || "127.0.0.1";
 const runtimeProfile = (process.env.APP_RUNTIME_ENV || "local").toLowerCase();
 const isServerRuntime = runtimeProfile === "server";
+const runtimeRoot = process.env.APP_RUNTIME_ROOT
+  ? path.resolve(process.env.APP_RUNTIME_ROOT)
+  : path.dirname(fileURLToPath(import.meta.url));
 const storageRoot = process.env.STORAGE_ROOT
   ? path.resolve(process.env.STORAGE_ROOT)
-  : path.resolve(drakonSiteRoot, "storage");
+  : path.resolve(process.cwd(), "storage");
 const staticRoot = process.env.APP_STATIC_ROOT
   ? path.resolve(process.env.APP_STATIC_ROOT)
   : "";
@@ -49,27 +44,355 @@ const appBaseUrl = process.env.APP_BASE_URL || `http://${bindHost}:${port}`;
 const serviceSessionDir = process.env.APP_SERVICE_SESSION_DIR
   ? path.resolve(process.env.APP_SERVICE_SESSION_DIR)
   : path.resolve(storageRoot, "desktop-session");
+const defaultLocalGoogleRedirectUri = isServerRuntime
+  ? ""
+  : `http://localhost:${port}/auth/callback`;
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
+const runtimeHealthRoute = "/api/runtime/health";
+const sqliteCriticalTables = [
+  "app_users",
+  "cameras",
+  "commands",
+  "events",
+  "local_sessions",
+  "local_users",
+];
 
-const { default: worker } = await import(moduleUrl("src", "worker", "index.ts"));
+let cachedExeId = String(process.env.APP_PROVISIONED_EXE_ID || "").trim();
 
 fs.mkdirSync(serviceSessionDir, { recursive: true });
 
 let pool = null;
 let sqliteDb = null;
 const R2_BUCKET = new LocalR2Bucket(r2Root);
+let runtimeState = createRuntimeState({
+  summary: "Local runtime is initializing.",
+  details: {
+    backend: databaseBackend,
+    brand: activeBrand.id,
+  },
+});
 
-async function createDatabase() {
+function createRuntimeState(overrides = {}) {
+  const baseState = {
+    ready: false,
+    fatal: false,
+    summary: "Local runtime is not ready.",
+    details: {
+      backend: databaseBackend,
+      brand: activeBrand.id,
+      port,
+      staticRoot: staticRoot || null,
+    },
+    env: null,
+  };
+
+  return {
+    ...baseState,
+    ...overrides,
+    details: {
+      ...baseState.details,
+      ...(overrides.details || {}),
+    },
+  };
+}
+
+function summarizeError(error) {
+  if (error instanceof Error) {
+    return error.stack || error.message;
+  }
+  return String(error || "Unknown error");
+}
+
+function createWorkerEnv(DB) {
+  const configuredGoogleRedirectUri = String(
+    process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
+  ).trim();
+
+  return {
+    DB,
+    R2_BUCKET,
+    GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
+    GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
+    GOOGLE_OAUTH_REDIRECT_URI:
+      configuredGoogleRedirectUri || defaultLocalGoogleRedirectUri,
+    CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
+    STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
+    STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
+    STRIPE_CHAT_PAYG_PRICE_ID: process.env.STRIPE_CHAT_PAYG_PRICE_ID || "",
+    R2_PUBLIC_BASE_URL:
+      process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
+    APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
+    USD_TO_BRL: process.env.USD_TO_BRL || "",
+    SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+  };
+}
+
+function resolveBundledSqliteSeedPath(brand) {
+  return path.join(runtimeRoot, "bootstrap", `${brand.id}_site.seed.sqlite`);
+}
+
+async function closeDatabaseHandles() {
+  sqliteDb?.close();
+  sqliteDb = null;
+
+  if (pool) {
+    const activePool = pool;
+    pool = null;
+    await activePool.end().catch(() => {});
+  }
+}
+
+function sqliteArtifactPaths(sqlitePath) {
+  return [
+    sqlitePath,
+    `${sqlitePath}-wal`,
+    `${sqlitePath}-shm`,
+    `${sqlitePath}-journal`,
+  ];
+}
+
+function backupSqliteArtifacts(sqlitePath, reason) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
+    if (!fs.existsSync(artifactPath)) {
+      continue;
+    }
+
+    const backupPath = `${artifactPath}.${reason}.${stamp}.bak`;
+    fs.renameSync(artifactPath, backupPath);
+  }
+}
+
+function removeSqliteSidecars(sqlitePath) {
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath).slice(1)) {
+    if (fs.existsSync(artifactPath)) {
+      fs.rmSync(artifactPath, { force: true });
+    }
+  }
+}
+
+function copyBundledSqliteSeed(seedPath, sqlitePath) {
+  fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
+  removeSqliteSidecars(sqlitePath);
+  fs.copyFileSync(seedPath, sqlitePath);
+}
+
+async function inspectSqliteSchema(sqlitePath) {
+  if (!fs.existsSync(sqlitePath)) {
+    return {
+      ok: false,
+      missingCriticalTables: [...sqliteCriticalTables],
+      tableNames: [],
+      error: `SQLite database file was not found at ${sqlitePath}`,
+    };
+  }
+
+  let db = null;
+  try {
+    db = new SqliteD1Database(sqlitePath);
+    const { results = [] } = await db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      )
+      .all();
+    const tableNames = results
+      .map((row) => String(row?.name || "").trim())
+      .filter(Boolean);
+    const existingTables = new Set(tableNames.map((name) => name.toLowerCase()));
+    const missingCriticalTables = sqliteCriticalTables.filter(
+      (name) => !existingTables.has(name)
+    );
+
+    return {
+      ok: missingCriticalTables.length === 0,
+      missingCriticalTables,
+      tableNames,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      missingCriticalTables: [...sqliteCriticalTables],
+      tableNames: [],
+      error: summarizeError(error),
+    };
+  } finally {
+    db?.close();
+  }
+}
+
+async function provisionSqliteDatabase(sqlitePath, seedPath) {
+  const actions = [];
+  const seedExists = fs.existsSync(seedPath);
+
+  if (!fs.existsSync(sqlitePath)) {
+    if (!seedExists) {
+      return {
+        ready: false,
+        summary: `Bundled SQLite seed was not found at ${seedPath}.`,
+        details: {
+          sqlitePath,
+          seedPath,
+          actions,
+          missingCriticalTables: [...sqliteCriticalTables],
+        },
+      };
+    }
+
+    copyBundledSqliteSeed(seedPath, sqlitePath);
+    actions.push("copied bundled SQLite seed because the local database was missing");
+  }
+
+  let inspection = await inspectSqliteSchema(sqlitePath);
+  if (!inspection.ok) {
+    if (!seedExists) {
+      return {
+        ready: false,
+        summary:
+          inspection.error ||
+          `SQLite database is missing required tables: ${inspection.missingCriticalTables.join(", ")}`,
+        details: {
+          sqlitePath,
+          seedPath,
+          actions,
+          missingCriticalTables: inspection.missingCriticalTables,
+          inspectionError: inspection.error,
+        },
+      };
+    }
+
+    backupSqliteArtifacts(sqlitePath, "invalid-schema");
+    copyBundledSqliteSeed(seedPath, sqlitePath);
+    actions.push(
+      "replaced the local SQLite database with the bundled seed after schema validation failed"
+    );
+    inspection = await inspectSqliteSchema(sqlitePath);
+  }
+
+  if (!inspection.ok) {
+    return {
+      ready: false,
+      summary:
+        inspection.error ||
+        `SQLite database is still missing required tables: ${inspection.missingCriticalTables.join(", ")}`,
+      details: {
+        sqlitePath,
+        seedPath,
+        actions,
+        missingCriticalTables: inspection.missingCriticalTables,
+        inspectionError: inspection.error,
+      },
+    };
+  }
+
+  return {
+    ready: true,
+    summary:
+      actions.length > 0
+        ? "SQLite database provisioned from the bundled seed."
+        : "SQLite database schema already available.",
+    details: {
+      sqlitePath,
+      seedPath: seedExists ? seedPath : null,
+      actions,
+      tableCount: inspection.tableNames.length,
+    },
+  };
+}
+
+async function warmWorkerBootstrap(env) {
+  const response = await invokeWorkerFetch(
+    `${appBaseUrl}/api/auth/me`,
+    "GET",
+    new Headers({
+      accept: "application/json",
+    }),
+    undefined,
+    env
+  );
+
+  if (response.ok) {
+    return;
+  }
+
+  const body = await response.text().catch(() => "");
+  throw new Error(
+    `Worker warm-up failed with HTTP ${response.status}${
+      body ? `: ${body.trim()}` : ""
+    }`
+  );
+}
+
+async function initializeRuntimeState() {
   if (databaseBackend === "sqlite") {
     const sqlitePath = resolveDefaultSqlitePath(activeBrand, storageRoot);
-    const { SqliteD1Database } = await import(moduleUrl("server", "sqlite-d1.ts"));
+    const seedPath = resolveBundledSqliteSeedPath(activeBrand);
+    const provision = await provisionSqliteDatabase(sqlitePath, seedPath);
+
+    if (!provision.ready) {
+      return createRuntimeState({
+        fatal: true,
+        summary: provision.summary,
+        details: provision.details,
+      });
+    }
+
+    try {
+      const DB = await createDatabase(sqlitePath);
+      const env = createWorkerEnv(DB);
+      await warmWorkerBootstrap(env);
+
+      return createRuntimeState({
+        ready: true,
+        summary: provision.summary,
+        details: provision.details,
+        env,
+      });
+    } catch (error) {
+      await closeDatabaseHandles();
+      return createRuntimeState({
+        fatal: true,
+        summary: "SQLite database is present, but backend warm-up failed.",
+        details: {
+          ...provision.details,
+          warmupError: summarizeError(error),
+        },
+      });
+    }
+  }
+
+  try {
+    const DB = await createDatabase();
+    const env = createWorkerEnv(DB);
+    await warmWorkerBootstrap(env);
+    return createRuntimeState({
+      ready: true,
+      summary: "Backend warm-up completed successfully.",
+      env,
+    });
+  } catch (error) {
+    await closeDatabaseHandles();
+    return createRuntimeState({
+      fatal: true,
+      summary: "Backend warm-up failed.",
+      details: {
+        warmupError: summarizeError(error),
+      },
+    });
+  }
+}
+
+async function createDatabase(sqlitePathOverride = null) {
+  if (databaseBackend === "sqlite") {
+    const sqlitePath =
+      sqlitePathOverride || resolveDefaultSqlitePath(activeBrand, storageRoot);
     sqliteDb = new SqliteD1Database(sqlitePath);
     console.log(`[desktop-server] SQLite database: ${sqlitePath}`);
     return sqliteDb;
   }
 
-  const { Pool } = requireFromDrakonSite("pg");
   pool = new Pool({
     host: process.env.PGHOST || "localhost",
     port: Number(process.env.PGPORT || 5433),
@@ -81,23 +404,15 @@ async function createDatabase() {
 }
 
 async function startServer() {
-  const DB = await createDatabase();
-  const env = {
-    DB,
-    R2_BUCKET,
-    GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
-    GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
-    GOOGLE_OAUTH_REDIRECT_URI: process.env.GOOGLE_OAUTH_REDIRECT_URI || "",
-    CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
-    STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
-    STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
-    STRIPE_CHAT_PAYG_PRICE_ID: process.env.STRIPE_CHAT_PAYG_PRICE_ID || "",
-    R2_PUBLIC_BASE_URL:
-      process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
-    APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
-    USD_TO_BRL: process.env.USD_TO_BRL || "",
-    SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
-  };
+  runtimeState = await initializeRuntimeState();
+  if (runtimeState.ready) {
+    console.log(`[desktop-server] preflight ready: ${runtimeState.summary}`);
+  } else {
+    console.error(`[desktop-server] preflight failed: ${runtimeState.summary}`);
+    if (runtimeState.details?.warmupError) {
+      console.error(runtimeState.details.warmupError);
+    }
+  }
 
   const server = createServer(async (req, res) => {
     if (!req.url) {
@@ -108,8 +423,30 @@ async function startServer() {
 
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (url.pathname === runtimeHealthRoute) {
+      writeJson(res, runtimeState.ready ? 200 : runtimeState.fatal ? 503 : 202, {
+        ready: runtimeState.ready,
+        fatal: runtimeState.fatal,
+        summary: runtimeState.summary,
+        details: runtimeState.details,
+      });
+      return;
+    }
+
+    if (url.pathname === "/api/auth/country" && req.method === "GET") {
+      writeJson(res, 200, {
+        detectedCountryCode: detectCountryFromHeaders(req),
+      });
+      return;
+    }
+
     if (url.pathname === "/api/runtime/local-session" && req.method === "POST") {
-      await handleRuntimeLocalSession(req, res, env);
+      if (!runtimeState.ready || !runtimeState.env) {
+        writeRuntimeUnavailable(res, url.pathname);
+        return;
+      }
+
+      await handleRuntimeLocalSession(req, res, runtimeState.env);
       return;
     }
 
@@ -128,7 +465,12 @@ async function startServer() {
       return;
     }
 
-    const response = await proxyWorkerRequest(req, url, env);
+    if (!runtimeState.ready || !runtimeState.env) {
+      writeRuntimeUnavailable(res, url.pathname);
+      return;
+    }
+
+    const response = await proxyWorkerRequest(req, url, runtimeState.env);
     await writeWorkerResponse(res, response);
   });
 
@@ -139,7 +481,7 @@ async function startServer() {
 
   server.listen(port, bindHost, () => {
     console.log(
-      `[desktop-server] brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://${bindHost}:${port} static=${staticRoot || "<none>"} sessionDir=${serviceSessionDir}`
+      `[desktop-server] brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://${bindHost}:${port} static=${staticRoot || "<none>"} sessionDir=${serviceSessionDir} health=${runtimeState.ready ? "ready" : "error"}`
     );
   });
 }
@@ -187,13 +529,6 @@ async function handleRuntimeLocalSession(req, res, env) {
       env
     );
 
-    if (!pairResponse.ok) {
-      await writeWorkerResponse(res, pairResponse);
-      return;
-    }
-
-    const pairPayload = await pairResponse.clone().json();
-    persistServiceSession(pairPayload);
     await writeWorkerResponse(res, pairResponse);
   } catch (error) {
     console.error("[desktop-server] local-session failed", error);
@@ -208,87 +543,19 @@ async function handleRuntimeLocalSession(req, res, env) {
   }
 }
 
-function resolveWorkspaceRoot() {
-  const fromEnv = process.env.DRAKON_WORKSPACE_ROOT
-    ? path.resolve(process.env.DRAKON_WORKSPACE_ROOT)
-    : "";
-  const candidates = [
-    fromEnv,
-    path.resolve(__dirname, "..", ".."),
-    path.resolve(__dirname, "..", "..", ".."),
-    path.resolve(__dirname, "..", "..", "..", ".."),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, "brand.config.json"))) {
-      return candidate;
-    }
-  }
-
-  return path.resolve(__dirname, "..", "..");
-}
-
-function resolveDrakonSiteRoot(rootDir) {
-  const candidates = [
-    path.join(rootDir, "DrakonSite"),
-    path.join(__dirname, "drakonsite"),
-    path.resolve(__dirname, "..", "runtime", "drakonsite"),
-  ];
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, "src", "worker", "index.ts"))) {
-      return candidate;
-    }
-  }
-
-  throw new Error(
-    `[desktop-server] Unable to resolve DrakonSite root. Candidates: ${candidates.join(", ")}`
-  );
-}
-
 function resolveOrCreateExeId(candidate) {
   const direct = typeof candidate === "string" ? candidate.trim() : "";
   if (direct) {
-    fs.writeFileSync(path.join(serviceSessionDir, "exe_id.txt"), `${direct}\n`, "utf8");
+    cachedExeId = direct;
     return direct;
   }
 
-  const filePath = path.join(serviceSessionDir, "exe_id.txt");
-  if (fs.existsSync(filePath)) {
-    const saved = String(fs.readFileSync(filePath, "utf8")).trim();
-    if (saved) {
-      return saved;
-    }
+  if (cachedExeId) {
+    return cachedExeId;
   }
 
-  const generated = `desktop-${Date.now()}`;
-  fs.writeFileSync(filePath, `${generated}\n`, "utf8");
-  return generated;
-}
-
-function persistServiceSession(payload) {
-  const exeToken = String(payload?.exe_token || "").trim();
-  const clientId = String(payload?.client_id || "").trim();
-  const exeId = String(payload?.exe_id || "").trim();
-  const timezoneIana = String(payload?.timezone_iana || "").trim();
-
-  if (!exeToken || !clientId || !exeId) {
-    throw new Error("Provisioned session is missing exe_token, client_id, or exe_id.");
-  }
-
-  writeSessionFile("exe_token.txt", exeToken);
-  writeSessionFile("client_id.txt", clientId);
-  writeSessionFile("exe_id.txt", exeId);
-  if (timezoneIana) {
-    writeSessionFile("paired_timezone.txt", timezoneIana);
-  }
-
-  writeSessionFile("drakon_base_url.txt", appBaseUrl);
-  writeSessionFile("perceptrum_base_url.txt", appBaseUrl);
-}
-
-function writeSessionFile(fileName, value) {
-  fs.writeFileSync(path.join(serviceSessionDir, fileName), `${value}\n`, "utf8");
+  cachedExeId = `desktop-${Date.now()}`;
+  return cachedExeId;
 }
 
 function buildForwardHeaders(req, overrides = {}) {
@@ -412,6 +679,39 @@ async function readJsonBody(req) {
   }
 
   return JSON.parse(raw);
+}
+
+function writeJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
+}
+
+function detectCountryFromHeaders(req) {
+  const value = String(
+    req.headers["cf-ipcountry"] ||
+      req.headers["x-country-code"] ||
+      req.headers["x-app-country-code"] ||
+      ""
+  )
+    .trim()
+    .toUpperCase();
+
+  if (!value || value === "XX") {
+    return null;
+  }
+
+  return value;
+}
+
+function writeRuntimeUnavailable(res, pathname) {
+  writeJson(res, 503, {
+    error: runtimeState.summary,
+    ready: runtimeState.ready,
+    fatal: runtimeState.fatal,
+    path: pathname,
+    details: runtimeState.details,
+  });
 }
 
 async function tryServeStatic(res, pathname) {
@@ -576,24 +876,19 @@ function rewriteSetCookie(value) {
 
 void startServer().catch(async (error) => {
   console.error("[desktop-server] failed to start", error);
-  sqliteDb?.close();
-  if (pool) {
-    await pool.end().catch(() => {});
-  }
+  await closeDatabaseHandles();
   process.exit(1);
 });
 
 process.on("exit", () => {
   sqliteDb?.close();
+  sqliteDb = null;
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, async () => {
     try {
-      sqliteDb?.close();
-      if (pool) {
-        await pool.end();
-      }
+      await closeDatabaseHandles();
     } finally {
       process.exit(0);
     }

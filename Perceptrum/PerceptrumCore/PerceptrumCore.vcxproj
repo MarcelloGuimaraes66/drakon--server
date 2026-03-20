@@ -94,6 +94,7 @@
     <ClInclude Include="..\Perceptrum\camera\RtspCapture.h" />
     <ClInclude Include="..\Perceptrum\comm\BackendConfig.h" />
     <ClInclude Include="..\Perceptrum\comm\PairingClient.h" />
+    <ClInclude Include="..\Perceptrum\comm\SecureLocalStore.h" />
     <ClInclude Include="..\Perceptrum\comm\PgClient.h" />
     <ClInclude Include="..\Perceptrum\comm\TelegramNotifier.h" />
     <ClInclude Include="..\Perceptrum\comm\TelegramSettings.h" />
@@ -129,6 +130,7 @@
     <ClCompile Include="..\Perceptrum\camera\MotionDetector.cpp" />
     <ClCompile Include="..\Perceptrum\camera\RtspCapture.cpp" />
     <ClCompile Include="..\Perceptrum\comm\PairingClient.cpp" />
+    <ClCompile Include="..\Perceptrum\comm\SecureLocalStore.cpp" />
     <ClCompile Include="..\Perceptrum\comm\TelegramNotifier.cpp" />
     <ClCompile Include="..\Perceptrum\comm\TelegramNotifierSendVideo.cpp" />
     <ClCompile Include="..\Perceptrum\core\AgentCore.cpp" />

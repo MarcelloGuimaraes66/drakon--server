@@ -1505,6 +1505,15 @@ static bool loadMochaAuth(std::string& baseUrl,
     return ok;
 }
 
+struct AuthorizedHttpResponse {
+    long httpStatus = 0;
+    std::string body;
+};
+
+static AuthorizedHttpResponse httpPostJsonAuthorizedDetailed(const std::string& url,
+    const std::string& exeToken,
+    const json& bodyJson);
+
 
 
 
@@ -1555,6 +1564,52 @@ static std::string httpPostJsonAuthorized(const std::string& url,
     }
 
     return response;
+}
+
+static AuthorizedHttpResponse httpPostJsonAuthorizedDetailed(const std::string& url,
+    const std::string& exeToken,
+    const json& bodyJson)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl)
+        throw std::runtime_error("curl_easy_init failed in httpPostJsonAuthorizedDetailed");
+
+    std::string response;
+    long httpStatus = 0;
+    struct curl_slist* headers = nullptr;
+
+    std::string authHeader = "Authorization: Bearer " + exeToken;
+    headers = curl_slist_append(headers, authHeader.c_str());
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    std::string body = bodyJson.dump();
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpStatus);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        throw std::runtime_error(
+            std::string("curl_easy_perform failed in httpPostJsonAuthorizedDetailed: ") +
+            curl_easy_strerror(res)
+        );
+    }
+
+    return AuthorizedHttpResponse{ httpStatus, response };
 }
 
 
@@ -3728,6 +3783,159 @@ static std::condition_variable g_openMonitorWorkerCv;
 static std::atomic<bool> g_openMonitorWorkerRunning{ false };
 static std::thread g_openMonitorWorkerThread;
 static AgentCore* g_openMonitorWorkerOwner = nullptr;
+static std::mutex g_systemActivityLogMutex;
+static constexpr std::uintmax_t kSystemActivityLogRotateBytes = 64ull * 1024ull * 1024ull;
+static constexpr int kSystemActivityLogRotateFiles = 5;
+
+static std::wstring readEnvironmentVariableWide_(const wchar_t* name) {
+    DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0) {
+        return std::wstring();
+    }
+
+    std::wstring value(static_cast<size_t>(required), L'\0');
+    DWORD written = GetEnvironmentVariableW(name, value.data(), required);
+    if (written == 0 || written >= required) {
+        return std::wstring();
+    }
+
+    value.resize(static_cast<size_t>(written));
+    return value;
+}
+
+static fs::path systemActivityLogPath_() {
+    const std::wstring fromEnv = readEnvironmentVariableWide_(L"SYSTEM_ACTIVITY_LOG_PATH");
+    if (!fromEnv.empty()) {
+        return fs::path(fromEnv);
+    }
+    return fs::current_path() / "logs" / "system-activity.jsonl";
+}
+
+static fs::path systemActivityRotatedPath_(const fs::path& basePath, int index) {
+    return fs::path(basePath.wstring() + L"." + std::to_wstring(index));
+}
+
+static void rotateSystemActivityLogIfNeeded_(const fs::path& logPath) {
+    std::error_code ec;
+    if (!fs::exists(logPath, ec) || ec) {
+        return;
+    }
+
+    const std::uintmax_t currentSize = fs::file_size(logPath, ec);
+    if (ec || currentSize < kSystemActivityLogRotateBytes) {
+        return;
+    }
+
+    const fs::path oldestPath = systemActivityRotatedPath_(logPath, kSystemActivityLogRotateFiles);
+    fs::remove(oldestPath, ec);
+    ec.clear();
+
+    for (int index = kSystemActivityLogRotateFiles; index >= 2; --index) {
+        const fs::path fromPath = systemActivityRotatedPath_(logPath, index - 1);
+        if (!fs::exists(fromPath, ec) || ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::path toPath = systemActivityRotatedPath_(logPath, index);
+        fs::remove(toPath, ec);
+        ec.clear();
+        fs::rename(fromPath, toPath, ec);
+        if (ec) {
+            std::error_code copyEc;
+            fs::copy_file(fromPath, toPath, fs::copy_options::overwrite_existing, copyEc);
+            if (!copyEc) {
+                fs::remove(fromPath, copyEc);
+            }
+            ec.clear();
+        }
+    }
+
+    const fs::path firstRotatedPath = systemActivityRotatedPath_(logPath, 1);
+    fs::remove(firstRotatedPath, ec);
+    ec.clear();
+    fs::rename(logPath, firstRotatedPath, ec);
+    if (ec) {
+        std::error_code copyEc;
+        fs::copy_file(logPath, firstRotatedPath, fs::copy_options::overwrite_existing, copyEc);
+        if (!copyEc) {
+            fs::remove(logPath, copyEc);
+        }
+    }
+}
+
+static std::string openMonitorSnapshotId_(const std::string& sampledAt) {
+    std::string snapshotId;
+    snapshotId.reserve(sampledAt.size() + 3);
+    snapshotId += "om-";
+    for (unsigned char ch : sampledAt) {
+        if (std::isalnum(ch) != 0) {
+            snapshotId.push_back(static_cast<char>(ch));
+        }
+        else {
+            snapshotId.push_back('-');
+        }
+    }
+    return snapshotId;
+}
+
+static std::string asciiPreview_(const std::string& value, std::size_t maxLength = 2048) {
+    std::string preview;
+    preview.reserve((std::min)(value.size(), maxLength) + 3);
+    for (unsigned char ch : value) {
+        if (preview.size() >= maxLength) {
+            preview += "...";
+            break;
+        }
+
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            preview.push_back(' ');
+        }
+        else if (ch >= 32 && ch <= 126) {
+            preview.push_back(static_cast<char>(ch));
+        }
+        else {
+            preview.push_back('?');
+        }
+    }
+    return preview;
+}
+
+static void appendSystemActivityLogEntry_(const json& entry) {
+    std::lock_guard<std::mutex> lock(g_systemActivityLogMutex);
+
+    try {
+        const fs::path logPath = systemActivityLogPath_();
+        if (logPath.empty()) {
+            return;
+        }
+
+        std::error_code ec;
+        if (!logPath.parent_path().empty()) {
+            fs::create_directories(logPath.parent_path(), ec);
+        }
+
+        rotateSystemActivityLogIfNeeded_(logPath);
+
+        std::ofstream out(logPath, std::ios::app | std::ios::binary);
+        if (!out.is_open()) {
+            Logger::instance().logDebug("OpenMonitorWorker", "system activity log open failed");
+            return;
+        }
+
+        out << entry.dump() << '\n';
+        out.flush();
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            "OpenMonitorWorker",
+            std::string("system activity log write failed: ") + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug("OpenMonitorWorker", "system activity log write failed: unknown exception");
+    }
+}
 
 static std::uint64_t fileTimeToU64_(const FILETIME& value) {
     ULARGE_INTEGER li{};
@@ -4272,7 +4480,9 @@ static void flushOpenMonitorSnapshot_(
         };
     }
 
+    const std::string snapshotId = openMonitorSnapshotId_(sampledAt);
     const nlohmann::json body = {
+        { "snapshot_id", snapshotId },
         { "sampled_at", sampledAt },
         { "host", {
             { "sampled_at", sampledAt },
@@ -4307,22 +4517,57 @@ static void flushOpenMonitorSnapshot_(
         { "threads", threadsJson }
     };
 
+    bool transportOk = false;
+    bool backendOk = false;
+    long httpStatus = 0;
+    std::string responsePreview;
+    std::string errorMessage;
+
     try {
         const std::string url = backendBaseUrl + "/api/agent/open-monitor-snapshot?client_id=" + clientId;
-        const std::string response = httpPostJsonAuthorized(url, exeToken, body);
-        Logger::instance().logDebug(
-            "OpenMonitorWorker",
-            "flush ok, cameras=" + std::to_string(camerasJson.size()) +
-            ", threads=" + std::to_string(threadsJson.size()) +
-            ", response=" + response
-        );
+        const AuthorizedHttpResponse response = httpPostJsonAuthorizedDetailed(url, exeToken, body);
+        transportOk = true;
+        httpStatus = response.httpStatus;
+        responsePreview = asciiPreview_(response.body);
+        backendOk = httpStatus >= 200 && httpStatus < 300;
+        if (backendOk) {
+            Logger::instance().logDebug(
+                "OpenMonitorWorker",
+                "flush ok, cameras=" + std::to_string(camerasJson.size()) +
+                ", threads=" + std::to_string(threadsJson.size()) +
+                ", response=" + response.body
+            );
+        }
+        else {
+            errorMessage = "unexpected HTTP status " + std::to_string(httpStatus);
+            Logger::instance().logDebug(
+                "OpenMonitorWorker",
+                "flush failed: " + errorMessage +
+                ", response=" + responsePreview
+            );
+        }
     }
     catch (const std::exception& ex) {
+        errorMessage = asciiPreview_(ex.what());
         Logger::instance().logDebug("OpenMonitorWorker", std::string("flush failed: ") + ex.what());
     }
     catch (...) {
+        errorMessage = "unknown exception";
         Logger::instance().logDebug("OpenMonitorWorker", "flush failed: unknown exception");
     }
+
+    appendSystemActivityLogEntry_(nlohmann::json{
+        { "logged_at", nowUtcIso8601Ms_() },
+        { "snapshot_id", snapshotId },
+        { "sampled_at", sampledAt },
+        { "client_id", clientId },
+        { "transport_ok", transportOk },
+        { "backend_ok", backendOk },
+        { "http_status", httpStatus > 0 ? nlohmann::json(httpStatus) : nlohmann::json(nullptr) },
+        { "error", errorMessage.empty() ? nlohmann::json(nullptr) : nlohmann::json(errorMessage) },
+        { "response_preview", responsePreview.empty() ? nlohmann::json(nullptr) : nlohmann::json(responsePreview) },
+        { "snapshot", body }
+    });
 }
 
 static void openMonitorWorker_() {

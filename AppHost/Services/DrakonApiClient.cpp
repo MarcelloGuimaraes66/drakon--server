@@ -1,6 +1,9 @@
 #include "pch.h"
 #include "DrakonApiClient.h"
 
+#include "../Platform/AppRuntimeConfig.h"
+#include "../Platform/SecureLocalStore.h"
+
 #include <Windows.h>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -1061,6 +1064,11 @@ namespace winrt::DrakonDesktop::services
 
             std::vector<std::filesystem::path> candidates;
             auto const exeDir = ExecutableDirectory();
+            auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+            if (!runtimeConfig.serviceSessionDirectory.empty())
+            {
+                candidates.push_back(runtimeConfig.serviceSessionDirectory);
+            }
             candidates.push_back(exeDir);
             candidates.push_back(std::filesystem::current_path());
             if (exeDir.has_parent_path()) candidates.push_back(exeDir.parent_path());
@@ -1102,12 +1110,28 @@ namespace winrt::DrakonDesktop::services
 
             return std::string("http://localhost:4000");
           }()),
-          m_sessionCookiePath(ExecutableDirectory() / "drakon_desktop_session.cookie")
+          m_sessionCookiePath([]() {
+              auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+              return runtimeConfig.serviceSessionDirectory / "drakon_desktop_session.cookie";
+          }())
     {
-        auto cookie = ReadFirstLine(m_sessionCookiePath);
+        std::error_code errorCode;
+        std::filesystem::create_directories(m_sessionCookiePath.parent_path(), errorCode);
+
+        auto const legacyCookiePath = ExecutableDirectory() / "drakon_desktop_session.cookie";
+        auto cookie = ::DrakonDesktop::platform::ReadProtectedLocalText(m_sessionCookiePath);
+        if (!cookie.has_value() && legacyCookiePath != m_sessionCookiePath)
+        {
+            cookie = ::DrakonDesktop::platform::ReadProtectedLocalText(legacyCookiePath);
+        }
         if (cookie.has_value())
         {
             m_sessionCookie = *cookie;
+            ::DrakonDesktop::platform::WriteProtectedLocalText(m_sessionCookiePath, m_sessionCookie);
+            if (legacyCookiePath != m_sessionCookiePath)
+            {
+                std::filesystem::remove(legacyCookiePath, errorCode);
+            }
         }
     }
 
@@ -1259,8 +1283,7 @@ namespace winrt::DrakonDesktop::services
         {
             std::lock_guard<std::mutex> guard(m_mutex);
             m_sessionCookie = cookie;
-            std::ofstream stream(m_sessionCookiePath, std::ios::trunc);
-            stream << m_sessionCookie;
+            ::DrakonDesktop::platform::WriteProtectedLocalText(m_sessionCookiePath, m_sessionCookie);
         }
 
         result.success = true;
@@ -1304,8 +1327,7 @@ namespace winrt::DrakonDesktop::services
         {
             std::lock_guard<std::mutex> guard(m_mutex);
             m_sessionCookie = cookie;
-            std::ofstream stream(m_sessionCookiePath, std::ios::trunc);
-            stream << m_sessionCookie;
+            ::DrakonDesktop::platform::WriteProtectedLocalText(m_sessionCookiePath, m_sessionCookie);
         }
 
         result.success = true;
@@ -1327,8 +1349,9 @@ namespace winrt::DrakonDesktop::services
         {
             std::lock_guard<std::mutex> guard(m_mutex);
             m_sessionCookie.clear();
+            ::DrakonDesktop::platform::RemoveProtectedLocalText(m_sessionCookiePath);
             std::error_code errorCode;
-            std::filesystem::remove(m_sessionCookiePath, errorCode);
+            std::filesystem::remove(ExecutableDirectory() / "drakon_desktop_session.cookie", errorCode);
         }
 
         result.success = response.statusCode >= 200 && response.statusCode < 300;

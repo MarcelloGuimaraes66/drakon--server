@@ -27,8 +27,8 @@ Accepted values:
 
 ## Local database backend by brand
 
-- `brand.txt=drakon` keeps the local backend on PostgreSQL.
-- `brand.txt=perceptrum` now defaults the local backend to SQLite.
+- `brand.txt=drakon` keeps the local backend on PostgreSQL during source/dev runs, but the bundled desktop runtime now provisions SQLite for installer builds.
+- `brand.txt=perceptrum` defaults the local backend to SQLite.
 - You can override the backend with `APP_DB_BACKEND=postgres|sqlite|auto`.
 - You can override the SQLite file location with `SQLITE_DB_PATH=...`.
 
@@ -39,6 +39,8 @@ npm run db:sqlite:import-perceptrum
 ```
 
 By default this command reads [C:\dev\Workspace\Postgres\perceptrum_site.sql](C:\dev\Workspace\Postgres\perceptrum_site.sql) and writes the SQLite database under `C:\PerceptrumData\local-site\perceptrum_site.sqlite`.
+
+The SQLite converter also accepts `--brand drakon` and writes `drakon_site.sqlite` under the configured Drakon data root.
 
 Template files:
 - `.env.init.example`

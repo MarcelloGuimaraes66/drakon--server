@@ -44,6 +44,14 @@ namespace DrakonDesktop::platform
         PerceptrumRuntimeStatus Status() const;
 
     private:
+        struct ProvisionedSessionSnapshot
+        {
+            std::string exeToken;
+            std::string clientId;
+            std::string exeId;
+            std::optional<std::string> timezoneIana;
+        };
+
         bool StartInternal(std::string& error);
         void StopInternal();
         void PersistProvisionedSession(
@@ -61,5 +69,6 @@ namespace DrakonDesktop::platform
         HANDLE m_job{ nullptr };
         HANDLE m_shutdownEvent{ nullptr };
         DWORD m_processId{ 0 };
+        std::optional<ProvisionedSessionSnapshot> m_pendingProvisionedSession;
     };
 }

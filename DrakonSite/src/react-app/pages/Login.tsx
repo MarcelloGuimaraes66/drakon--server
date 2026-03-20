@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@getmocha/users-service/react";
 import { useNavigate } from "react-router";
 import { Loader2, Eye, EyeOff, Search, Globe } from "lucide-react";
@@ -8,6 +8,11 @@ import { brand } from "@/shared/brand";
 import { COUNTRIES } from "../data/countries";
 
 type Tab = "login" | "signup";
+type LoginLayoutMetrics = {
+  scale: number;
+  width: number;
+  height: number;
+};
 
 function GoogleIcon({ className = "w-5 h-5" }: { className?: string }) {
   return (
@@ -41,6 +46,7 @@ export default function Login() {
   const { user, isPending, redirectToLogin } = useAuth();
   const navigate = useNavigate();
   const { t, i18n } = useTranslation();
+  const layoutContentRef = useRef<HTMLDivElement | null>(null);
   const hasDedicatedLoginWordmark = Boolean(
     brand.assets.loginWordmarkDarkPath || brand.assets.loginWordmarkLightPath
   );
@@ -82,7 +88,7 @@ export default function Login() {
     "absolute right-0 mt-3 w-48 overflow-hidden rounded-2xl border border-white/10 bg-[#171717]/95 shadow-2xl backdrop-blur-xl";
   const countryDropdownClass =
     "absolute z-10 mt-3 max-h-80 w-full overflow-hidden rounded-2xl border border-white/10 bg-[#171717]/95 shadow-2xl backdrop-blur-xl";
-  
+
   const [activeTab, setActiveTab] = useState<Tab>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -96,6 +102,11 @@ export default function Login() {
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
+  const [layoutMetrics, setLayoutMetrics] = useState<LoginLayoutMetrics>({
+    scale: 1,
+    width: 0,
+    height: 0,
+  });
 
   const languages = [
     { code: "en", name: "English" },
@@ -118,6 +129,25 @@ export default function Login() {
   }, [countrySearch]);
 
   const selectedCountry = COUNTRIES.find((c) => c.code === countryCode);
+  const hasMeasuredLayout = layoutMetrics.width > 0 && layoutMetrics.height > 0;
+  const scaledShellStyle =
+    hasMeasuredLayout
+      ? {
+          width: `${Math.ceil(layoutMetrics.width * layoutMetrics.scale)}px`,
+          height: `${Math.ceil(layoutMetrics.height * layoutMetrics.scale)}px`,
+        }
+      : undefined;
+  const scaledContentStyle = {
+    transform: `translateX(-50%) scale(${layoutMetrics.scale})`,
+    transformOrigin: "top center",
+    willChange: layoutMetrics.scale < 0.999 ? "transform" : undefined,
+  } as const;
+  const measuredContentStyle = hasMeasuredLayout
+    ? {
+        ...scaledContentStyle,
+        width: `${layoutMetrics.width}px`,
+      }
+    : undefined;
 
   // Redirect authenticated users away from the login page.
   useEffect(() => {
@@ -144,6 +174,68 @@ export default function Login() {
     };
 
     detectCountry();
+  }, []);
+
+  useLayoutEffect(() => {
+    const node = layoutContentRef.current;
+    if (!node) {
+      return;
+    }
+
+    let frameId = 0;
+    const measure = () => {
+      const naturalWidth = node.offsetWidth;
+      const naturalHeight = node.offsetHeight;
+      if (!naturalWidth || !naturalHeight) {
+        return;
+      }
+
+      const availableWidth = Math.max(window.innerWidth - 32, 280);
+      const availableHeight = Math.max(window.innerHeight - 24, 320);
+      const nextScale = Math.min(
+        1,
+        availableWidth / naturalWidth,
+        availableHeight / naturalHeight
+      );
+
+      setLayoutMetrics((current) => {
+        if (
+          current.width === naturalWidth &&
+          current.height === naturalHeight &&
+          Math.abs(current.scale - nextScale) < 0.01
+        ) {
+          return current;
+        }
+
+        return {
+          scale: nextScale,
+          width: naturalWidth,
+          height: naturalHeight,
+        };
+      });
+    };
+
+    const scheduleMeasure = () => {
+      cancelAnimationFrame(frameId);
+      frameId = requestAnimationFrame(measure);
+    };
+
+    measure();
+
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(() => {
+            scheduleMeasure();
+          });
+    resizeObserver?.observe(node);
+    window.addEventListener("resize", scheduleMeasure);
+
+    return () => {
+      cancelAnimationFrame(frameId);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", scheduleMeasure);
+    };
   }, []);
 
   const validateEmail = (email: string): boolean => {
@@ -279,7 +371,7 @@ export default function Login() {
 
   if (isPending) {
     return (
-      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+      <div className="flex min-h-[100dvh] items-center justify-center bg-gray-950">
         <Loader2
           className={`h-10 w-10 animate-spin ${
             isPerceptrumBrand ? "text-cyan-300" : "text-blue-400"
@@ -290,23 +382,23 @@ export default function Login() {
   }
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#171717] px-4 py-12 text-white">
+    <div className="relative h-[100dvh] min-h-[100dvh] overflow-hidden bg-[#171717] px-4 py-[clamp(0.875rem,2.6vh,1.5rem)] text-white">
       <div className="absolute inset-0 bg-[#171717]" />
-      <div className="absolute inset-0 pointer-events-none">
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
         <div
-          className={`absolute -left-32 top-[38%] h-[28rem] w-[36rem] rounded-full blur-3xl ${
+          className={`absolute -left-32 top-[38%] h-[24rem] w-[32rem] rounded-full blur-3xl ${
             isPerceptrumBrand ? "bg-cyan-400/[0.06]" : "bg-blue-500/[0.07]"
           }`}
         />
         <div
-          className={`absolute -right-28 top-[18%] h-[24rem] w-[30rem] rounded-full blur-3xl ${
+          className={`absolute -right-28 top-[18%] h-[21rem] w-[27rem] rounded-full blur-3xl ${
             isPerceptrumBrand ? "bg-fuchsia-500/[0.05]" : "bg-sky-400/[0.05]"
           }`}
         />
       </div>
 
       {/* Language Selector */}
-      <div className="absolute top-6 right-6 z-20">
+      <div className="absolute right-[clamp(0.75rem,2vw,1.5rem)] top-[clamp(0.75rem,2.2vh,1.5rem)] z-20">
         <div className="relative">
           <button
             onClick={() => setShowLanguageDropdown(!showLanguageDropdown)}
@@ -338,15 +430,22 @@ export default function Login() {
         </div>
       </div>
 
-      <div
-        className={`relative z-10 mx-auto w-full ${
-          useCompactLoginLayout ? "max-w-[26rem]" : "max-w-[27rem]"
-        }`}
-      >
-        <div className={useCompactLoginLayout ? "px-3 py-10" : "px-3 py-12"}>
+      <div className="relative z-10 flex h-full w-full items-center justify-center">
+        <div
+          className="relative flex max-w-full items-start justify-center overflow-hidden"
+          style={scaledShellStyle}
+        >
+          <div
+            ref={layoutContentRef}
+            className={`${hasMeasuredLayout ? "absolute left-1/2 top-0" : "w-full"} ${
+              useCompactLoginLayout ? "max-w-[26rem]" : "max-w-[27rem]"
+            }`}
+            style={measuredContentStyle}
+          >
+            <div className="px-[clamp(0.75rem,2.4vw,1rem)] py-[clamp(0.75rem,2.2vh,1.5rem)]">
           {/* Logo and title */}
-          <div className={useCompactLoginLayout ? "mb-8 text-center" : "mb-10 text-center"}>
-            <div className={useCompactLoginLayout ? "mb-3 flex justify-center" : "mb-4 flex justify-center"}>
+          <div className="mb-[clamp(1.5rem,3vh,2.5rem)] text-center">
+            <div className="mb-[clamp(0.625rem,1.8vh,0.875rem)] flex justify-center">
               <BrandLogo
                 variant="full"
                 theme="dark"
@@ -354,23 +453,26 @@ export default function Login() {
                 className="flex items-center justify-center gap-4"
                 imageClassName={
                   hasDedicatedLoginWordmark
-                    ? "mx-auto h-auto w-full max-w-[13rem] object-contain"
-                    : "h-20 w-auto object-contain mx-auto"
+                    ? "mx-auto h-auto max-h-[clamp(6.25rem,18vh,8.75rem)] w-auto max-w-full object-contain"
+                    : "mx-auto h-[clamp(4rem,9vh,5rem)] w-auto object-contain"
                 }
-                iconClassName="h-16 w-16 object-contain rounded-xl"
-                textClassName="text-3xl font-semibold tracking-tight text-white"
+                iconClassName="h-[clamp(3.25rem,8vh,4rem)] w-[clamp(3.25rem,8vh,4rem)] rounded-xl object-contain"
+                textClassName="text-[clamp(2rem,4vw,2.5rem)] font-semibold tracking-tight text-white"
               />
             </div>
-            <p className={useCompactLoginLayout ? "text-xs text-gray-500" : "text-sm text-gray-500"}>
+            <p className="text-[clamp(0.75rem,1.5vh,0.875rem)] text-gray-500">
               {t("login.tagline")}
             </p>
           </div>
 
           {/* Login Form */}
           {activeTab === "login" && (
-            <form onSubmit={handleLocalLogin} className={useCompactLoginLayout ? "space-y-3.5" : "space-y-4"}>
-              <div className={useCompactLoginLayout ? "mb-6 text-center" : "mb-7 text-center"}>
-                <h2 className="text-[2rem] font-semibold tracking-tight text-white">
+            <form
+              onSubmit={handleLocalLogin}
+              className={useCompactLoginLayout ? "space-y-3" : "space-y-3.5"}
+            >
+              <div className="mb-[clamp(1rem,2.2vh,1.5rem)] text-center">
+                <h2 className="text-[clamp(2rem,4.4vw,3rem)] font-semibold tracking-tight leading-[0.95] text-white">
                   {t("login.welcomeBack")}
                 </h2>
               </div>
@@ -453,15 +555,6 @@ export default function Login() {
                 )}
               </button>
 
-              <div className="text-center">
-                <button
-                  type="button"
-                  className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
-                >
-                  {t("login.forgotPassword")}
-                </button>
-              </div>
-
               {googleLoginEnabled && (
                 <>
                   <div className="flex items-center gap-4 pt-1">
@@ -488,9 +581,12 @@ export default function Login() {
 
           {/* Signup Form */}
           {activeTab === "signup" && (
-            <form onSubmit={handleLocalSignup} className={useCompactLoginLayout ? "space-y-3.5" : "space-y-4"}>
-              <div className={useCompactLoginLayout ? "mb-6 text-center" : "mb-7 text-center"}>
-                <h2 className="text-[2rem] font-semibold tracking-tight text-white">
+            <form
+              onSubmit={handleLocalSignup}
+              className={useCompactLoginLayout ? "space-y-3" : "space-y-3.5"}
+            >
+              <div className="mb-[clamp(1rem,2.2vh,1.5rem)] text-center">
+                <h2 className="text-[clamp(2rem,4.4vw,3rem)] font-semibold tracking-tight leading-[0.95] text-white">
                   {t("login.createAccount")}
                 </h2>
               </div>
@@ -674,9 +770,11 @@ export default function Login() {
           )}
 
           {/* Footer */}
-          <p className={useCompactLoginLayout ? "mt-8 text-center text-xs text-gray-600" : "mt-9 text-center text-xs text-gray-600"}>
+          <p className="mt-[clamp(1rem,2.4vh,2rem)] text-center text-xs text-gray-600">
             {t("login.footer")}
           </p>
+            </div>
+          </div>
         </div>
       </div>
     </div>

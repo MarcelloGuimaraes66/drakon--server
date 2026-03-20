@@ -12,6 +12,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include "../comm/BackendConfig.h"
+#include "../comm/SecureLocalStore.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -68,16 +69,14 @@ static std::string trimAscii(std::string value) {
     return value;
 }
 
-static bool readFirstLineFile(const std::string& path, std::string& out) {
-    std::ifstream in(path);
-    if (!in.is_open()) return false;
+static bool readProtectedLocalFile(const std::string& path, std::string& out) {
+    auto value = securelocal::ReadProtectedLocalText(path);
+    if (!value.has_value()) return false;
 
-    std::string line;
-    std::getline(in, line);
-    line = trimAscii(line);
+    std::string line = trimAscii(*value);
     if (line.empty()) return false;
 
-    out = line;
+    out = std::move(line);
     return true;
 }
 
@@ -256,19 +255,19 @@ bool Logger::flushErrorBatch_(const std::vector<ErrorExportItem>& batch) noexcep
     }
 
     std::string clientId;
-    if (!readFirstLineFile("client_id.txt", clientId)) {
+    if (!readProtectedLocalFile("client_id.txt", clientId)) {
         safeCerr("[Logger] flushErrorBatch_: client_id.txt missing/empty");
         return false;
     }
 
     std::string exeToken;
-    if (!readFirstLineFile("exe_token.txt", exeToken)) {
+    if (!readProtectedLocalFile("exe_token.txt", exeToken)) {
         safeCerr("[Logger] flushErrorBatch_: exe_token.txt missing/empty");
         return false;
     }
 
     std::string exeId;
-    if (!readFirstLineFile("exe_id.txt", exeId)) {
+    if (!readProtectedLocalFile("exe_id.txt", exeId)) {
         exeId = "unknown_exe";
     }
 

@@ -31,6 +31,7 @@ Perceptrum/.git/
 # Root workspace artifacts
 _temporal_regression_check.obj
 temporal_engine_smoke.obj
+tmp-dbs/
 
 # AppHost generated and packaged outputs
 AppHost/dist/
@@ -38,6 +39,7 @@ AppHost/stage/
 AppHost/generated/
 AppHost/_icon_debug/
 AppHost/*_h.h
+AppHost/tmp-*/
 
 # DrakonSite local build/runtime artifacts
 DrakonSite/.codex-logs/

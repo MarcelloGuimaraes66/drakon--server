@@ -194,6 +194,14 @@ namespace winrt::DrakonDesktop::implementation
         m_backendHost = std::make_unique<::DrakonDesktop::platform::LocalBackendHost>();
         auto const backendStatus = m_backendHost->EnsureReady();
         AppendBootstrapTrace("app: backend " + winrt::to_string(backendStatus.summary));
+        if (backendStatus.ready)
+        {
+            SetEnvironmentVariableW(L"DRAKON_BACKEND_BOOTSTRAP_ERROR", nullptr);
+        }
+        else
+        {
+            SetEnvironmentVariableW(L"DRAKON_BACKEND_BOOTSTRAP_ERROR", backendStatus.summary.c_str());
+        }
 
         m_runtimeHost = std::make_unique<::DrakonDesktop::platform::PerceptrumRuntimeHost>();
         g_runtimeHost = m_runtimeHost.get();

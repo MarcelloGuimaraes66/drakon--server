@@ -234,10 +234,22 @@ namespace
             SearchExecutablePath(L"node.exe"),
         });
 
-        config.desktopServerScriptPath = FirstExistingPath({
+        auto const bundledBackendScriptPath = FirstExistingPath({
+            config.runtimeRoot / "desktop-local-server.cjs",
             config.runtimeRoot / "desktop-local-server.mjs",
-            config.workspaceRoot / "AppHost" / "Runtime" / "desktop-local-server.mjs",
         });
+        if (!bundledBackendScriptPath.empty())
+        {
+            config.desktopServerScriptPath = bundledBackendScriptPath;
+            config.backendUsesTsx = false;
+        }
+        else
+        {
+            config.desktopServerScriptPath = FirstExistingPath({
+                config.workspaceRoot / "AppHost" / "Runtime" / "desktop-local-server.mjs",
+            });
+            config.backendUsesTsx = true;
+        }
 
         config.tsxCliPath = FirstExistingPath({
             config.runtimeRoot / "drakonsite" / "node_modules" / "tsx" / "dist" / "cli.mjs",
@@ -253,6 +265,15 @@ namespace
             config.runtimeRoot / "web",
             config.drakonSiteRoot / "dist",
         });
+
+        config.backendWorkingDirectory = config.backendUsesTsx
+            ? FirstExistingPath({
+                config.drakonSiteRoot,
+            })
+            : FirstExistingPath({
+                config.runtimeRoot / "drakonsite",
+                config.runtimeRoot,
+            });
 
         config.serviceSessionDirectory =
             ResolveLocalAppDataRoot() / "DrakonPerceptrumDesktop" / Utf8ToWide(config.brandId);
@@ -272,6 +293,8 @@ namespace
 
         config.backendLogPath = config.serviceSessionDirectory / "backend-host.log";
         config.serviceLogPath = config.serviceSessionDirectory / "service-cpp.log";
+        config.systemActivityLogPath = config.serviceSessionDirectory / "logs" / "system-activity.jsonl";
+        std::filesystem::create_directories(config.systemActivityLogPath.parent_path());
         config.uiBaseUrl = L"http://127.0.0.1:" + std::to_wstring(config.port);
     }
 }

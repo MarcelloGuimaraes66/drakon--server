@@ -2,10 +2,12 @@
 #include "PerceptrumRuntimeHost.h"
 
 #include "AppRuntimeConfig.h"
+#include "SecureLocalStore.h"
 #include "../BootstrapTrace.h"
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <map>
@@ -42,32 +44,19 @@ namespace
         return utf8;
     }
 
-    std::string TrimCopy(std::string value)
+    bool LooksLikeProtectedBlob(std::string const& value)
     {
-        auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
-        while (!value.empty() && isSpace(static_cast<unsigned char>(value.front())))
+        if (value.size() < 32 || value.rfind("AQAAANCM", 0) != 0)
         {
-            value.erase(value.begin());
-        }
-        while (!value.empty() && isSpace(static_cast<unsigned char>(value.back())))
-        {
-            value.pop_back();
-        }
-        return value;
-    }
-
-    std::string ReadFirstLine(std::filesystem::path const& path)
-    {
-        std::ifstream in(path);
-        if (!in.is_open())
-        {
-            return {};
+            return false;
         }
 
-        std::string line;
-        std::getline(in, line);
-        return TrimCopy(std::move(line));
+        return std::all_of(value.begin(), value.end(), [](unsigned char ch)
+        {
+            return std::isalnum(ch) != 0 || ch == '+' || ch == '/' || ch == '=';
+        });
     }
+
 }
 
 namespace DrakonDesktop::platform
@@ -111,7 +100,14 @@ namespace DrakonDesktop::platform
         std::string const& exeId,
         std::optional<std::string> const& timezoneIana)
     {
+        m_pendingProvisionedSession = ProvisionedSessionSnapshot{
+            exeToken,
+            clientId,
+            exeId,
+            timezoneIana,
+        };
         PersistProvisionedSession(exeToken, clientId, exeId, timezoneIana);
+        StopInternal();
 
         std::string error;
         StartInternal(error);
@@ -203,6 +199,23 @@ namespace DrakonDesktop::platform
             { L"APP_BASE_URL", config.uiBaseUrl },
             { L"DRAKON_WORKSPACE_ROOT", config.workspaceRoot.wstring() },
             { L"PORT", std::to_wstring(config.port) },
+            { L"SYSTEM_ACTIVITY_LOG_PATH", config.systemActivityLogPath.wstring() },
+            { L"APP_PROVISIONED_EXE_TOKEN",
+                m_pendingProvisionedSession.has_value()
+                    ? AsciiToWide(m_pendingProvisionedSession->exeToken)
+                    : std::wstring{} },
+            { L"APP_PROVISIONED_CLIENT_ID",
+                m_pendingProvisionedSession.has_value()
+                    ? AsciiToWide(m_pendingProvisionedSession->clientId)
+                    : std::wstring{} },
+            { L"APP_PROVISIONED_EXE_ID",
+                m_pendingProvisionedSession.has_value()
+                    ? AsciiToWide(m_pendingProvisionedSession->exeId)
+                    : std::wstring{} },
+            { L"APP_PROVISIONED_TIMEZONE",
+                (m_pendingProvisionedSession.has_value() && m_pendingProvisionedSession->timezoneIana.has_value())
+                    ? AsciiToWide(*m_pendingProvisionedSession->timezoneIana)
+                    : std::wstring{} },
         });
 
         if (!CreateProcessW(
@@ -284,12 +297,16 @@ namespace DrakonDesktop::platform
         auto const& config = RuntimeConfig();
         std::filesystem::create_directories(config.serviceSessionDirectory);
 
-        std::ofstream(config.serviceSessionDirectory / "exe_token.txt", std::ios::trunc) << exeToken;
-        std::ofstream(config.serviceSessionDirectory / "client_id.txt", std::ios::trunc) << clientId;
-        std::ofstream(config.serviceSessionDirectory / "exe_id.txt", std::ios::trunc) << exeId;
+        WriteProtectedLocalText(config.serviceSessionDirectory / "exe_token.txt", exeToken);
+        WriteProtectedLocalText(config.serviceSessionDirectory / "client_id.txt", clientId);
+        WriteProtectedLocalText(config.serviceSessionDirectory / "exe_id.txt", exeId);
         if (timezoneIana.has_value() && !timezoneIana->empty())
         {
-            std::ofstream(config.serviceSessionDirectory / "paired_timezone.txt", std::ios::trunc) << *timezoneIana;
+            WriteProtectedLocalText(config.serviceSessionDirectory / "paired_timezone.txt", *timezoneIana);
+        }
+        else
+        {
+            RemoveProtectedLocalText(config.serviceSessionDirectory / "paired_timezone.txt");
         }
 
         PersistBaseUrlFiles();
@@ -305,9 +322,22 @@ namespace DrakonDesktop::platform
     void PerceptrumRuntimeHost::RefreshStatus()
     {
         auto const& config = RuntimeConfig();
-        auto const exeToken = ReadFirstLine(config.serviceSessionDirectory / "exe_token.txt");
-        auto const clientId = ReadFirstLine(config.serviceSessionDirectory / "client_id.txt");
-        auto const exeId = ReadFirstLine(config.serviceSessionDirectory / "exe_id.txt");
+        auto const exeTokenPath = config.serviceSessionDirectory / "exe_token.txt";
+        auto const clientIdPath = config.serviceSessionDirectory / "client_id.txt";
+        auto const exeIdPath = config.serviceSessionDirectory / "exe_id.txt";
+        auto const exeToken = ReadProtectedLocalText(exeTokenPath).value_or(std::string{});
+        auto const clientId = ReadProtectedLocalText(clientIdPath).value_or(std::string{});
+        auto const exeId = ReadProtectedLocalText(exeIdPath).value_or(std::string{});
+        if (!exeToken.empty()) WriteProtectedLocalText(exeTokenPath, exeToken);
+        if (!clientId.empty()) WriteProtectedLocalText(clientIdPath, clientId);
+        if (!exeId.empty()) WriteProtectedLocalText(exeIdPath, exeId);
+        auto const hasUsableProvisionedSession =
+            !exeToken.empty() &&
+            !clientId.empty() &&
+            !exeId.empty() &&
+            !LooksLikeProtectedBlob(exeToken) &&
+            !LooksLikeProtectedBlob(clientId) &&
+            !LooksLikeProtectedBlob(exeId);
 
         DWORD exitCode = 0;
         const bool running =
@@ -317,12 +347,17 @@ namespace DrakonDesktop::platform
 
         std::lock_guard lock(m_statusMutex);
         m_status.running = running;
-        m_status.paired = !exeToken.empty() && !clientId.empty() && !exeId.empty();
+        m_status.paired = hasUsableProvisionedSession;
         m_status.clientId = clientId;
         m_status.exeId = exeId;
         m_status.baseUrl = WideToUtf8(config.uiBaseUrl);
         m_status.logPath = config.serviceLogPath;
-        if (m_status.summary.empty())
+        if (!hasUsableProvisionedSession &&
+            (!exeToken.empty() || !clientId.empty() || !exeId.empty()))
+        {
+            m_status.summary = "servico cpp local session requires reprovisioning.";
+        }
+        else if (m_status.summary.empty())
         {
             m_status.summary = running
                 ? "servico cpp running in headless mode."

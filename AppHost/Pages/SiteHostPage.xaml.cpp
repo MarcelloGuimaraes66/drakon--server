@@ -182,6 +182,44 @@ namespace winrt::DrakonDesktop::implementation
             return base + L"dashboard";
         }
 
+        std::wstring ResolveLoginUrl()
+        {
+            auto uiUrl = ResolveUiUrl();
+            if (uiUrl.ends_with(L"/login"))
+            {
+                return uiUrl;
+            }
+
+            if (uiUrl.ends_with(L"/dashboard"))
+            {
+                return uiUrl.substr(0, uiUrl.size() - std::wstring(L"/dashboard").size()) + L"/login";
+            }
+
+            if (!uiUrl.ends_with(L"/"))
+            {
+                uiUrl += L'/';
+            }
+
+            return uiUrl + L"login";
+        }
+
+        std::wstring ReadEnvValue(wchar_t const* name)
+        {
+            wchar_t buffer[4096]{};
+            auto const written = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
+            if (written == 0 || written >= std::size(buffer))
+            {
+                return {};
+            }
+
+            return std::wstring(buffer, written);
+        }
+
+        std::wstring ReadBackendBootstrapError()
+        {
+            return ReadEnvValue(L"DRAKON_BACKEND_BOOTSTRAP_ERROR");
+        }
+
         std::wstring ToLowerCopy(std::wstring value)
         {
             std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch)
@@ -189,15 +227,6 @@ namespace winrt::DrakonDesktop::implementation
                 return static_cast<wchar_t>(std::towlower(ch));
             });
             return value;
-        }
-
-        bool IsLoopbackHost(std::wstring const& host)
-        {
-            auto const normalized = ToLowerCopy(host);
-            return normalized == L"localhost" ||
-                normalized == L"127.0.0.1" ||
-                normalized == L"::1" ||
-                (normalized.size() > 10 && normalized.ends_with(L".localhost"));
         }
 
         std::wstring BuildOrigin(Windows::Foundation::Uri const& uri)
@@ -225,7 +254,8 @@ namespace winrt::DrakonDesktop::implementation
             try
             {
                 Windows::Foundation::Uri const targetUri{ navigationUri };
-                if (!IsLoopbackHost(targetUri.Host().c_str()))
+                auto const callbackPath = ToLowerCopy(std::wstring(targetUri.Path().c_str()));
+                if (callbackPath != L"/auth/callback")
                 {
                     return {};
                 }
@@ -261,6 +291,7 @@ namespace winrt::DrakonDesktop::implementation
         auto webView = FindName(L"SiteWebView").as<WebView2>();
         webView.NavigationCompleted({ this, &SiteHostPage::OnNavigationCompleted });
 
+        FindName(L"BackButton").as<Button>().Click({ this, &SiteHostPage::OnBackClick });
         FindName(L"ReloadButton").as<Button>().Click({ this, &SiteHostPage::OnReloadClick });
         FindName(L"OpenInBrowserButton").as<Button>().Click({ this, &SiteHostPage::OnOpenInBrowserClick });
         Loaded({ this, &SiteHostPage::OnPageLoaded });
@@ -313,6 +344,34 @@ namespace winrt::DrakonDesktop::implementation
         }
     }
 
+    void SiteHostPage::UpdateNavigationButtons(WebView2 const& webView)
+    {
+        bool showBackButton = false;
+
+        try
+        {
+            Windows::Foundation::Uri const uiUri{ ResolveUiUrl() };
+            auto const uiOrigin = BuildOrigin(uiUri);
+
+            if (auto const source = webView.Source())
+            {
+                auto const sourceOrigin = BuildOrigin(source);
+                auto const sourcePath = ToLowerCopy(std::wstring(source.Path().c_str()));
+                auto const isExternalSurface = _wcsicmp(sourceOrigin.c_str(), uiOrigin.c_str()) != 0;
+                auto const isAuthCallback = sourcePath == L"/auth/callback";
+                showBackButton = isExternalSurface || isAuthCallback;
+            }
+        }
+        catch (...)
+        {
+        }
+
+        if (auto host = FindName(L"BackButtonHost").try_as<FrameworkElement>())
+        {
+            host.Visibility(showBackButton ? Visibility::Visible : Visibility::Collapsed);
+        }
+    }
+
     fire_and_forget SiteHostPage::NavigateToLiveSite(bool forceReload)
     {
         auto lifetime = get_strong();
@@ -351,6 +410,7 @@ namespace winrt::DrakonDesktop::implementation
 
             m_navigationStarted = true;
             webView.Source(Windows::Foundation::Uri{ ResolveUiUrl() });
+            UpdateNavigationButtons(webView);
         }
         catch (winrt::hresult_error const& ex)
         {
@@ -368,9 +428,47 @@ namespace winrt::DrakonDesktop::implementation
         Windows::Foundation::IInspectable const&,
         RoutedEventArgs const&)
     {
+        auto const startupError = ReadBackendBootstrapError();
+        if (!startupError.empty())
+        {
+            SetStatus(
+                L"Falha ao inicializar o backend local",
+                winrt::hstring(startupError),
+                false,
+                true);
+            return;
+        }
+
         if (!m_navigationStarted)
         {
             NavigateToLiveSite(false);
+        }
+    }
+
+    void SiteHostPage::OnBackClick(
+        Windows::Foundation::IInspectable const&,
+        RoutedEventArgs const&)
+    {
+        auto webView = FindName(L"SiteWebView").as<WebView2>();
+
+        try
+        {
+            if (webView.CanGoBack())
+            {
+                webView.GoBack();
+                return;
+            }
+        }
+        catch (...)
+        {
+        }
+
+        try
+        {
+            webView.Source(Windows::Foundation::Uri{ ResolveLoginUrl() });
+        }
+        catch (...)
+        {
         }
     }
 
@@ -393,32 +491,56 @@ namespace winrt::DrakonDesktop::implementation
         WebView2 const& sender,
         CoreWebView2NavigationCompletedEventArgs const& args)
     {
+        UpdateNavigationButtons(sender);
+
         if (args.IsSuccess())
         {
             AppendBootstrapTrace("site-host: navigation completed");
             InstallNativePairingBridge(sender);
             if (auto core = sender.CoreWebView2())
             {
-                if (::DrakonDesktop::platform::IsRuntimeAlreadyProvisioned())
+                bool isLoginSurface = false;
+                try
                 {
-                    m_pairingCompleted = true;
-                    core.ExecuteScriptAsync(L"window.__drakonDesktopPairRuntimeCompleted = true;");
+                    if (auto const source = sender.Source())
+                    {
+                        auto const absoluteUri = ToLowerCopy(std::wstring(source.AbsoluteUri()));
+                        isLoginSurface = absoluteUri.find(L"/login") != std::wstring::npos;
+                    }
                 }
-            else
-            {
-                core.ExecuteScriptAsync(L"window.__drakonDesktopPairRuntimeCompleted = false;");
+                catch (...)
+                {
+                }
+
+                // Existing local files are not enough to prove the resident runtime is
+                // still paired to the currently authenticated account. If the user is on
+                // the login surface, allow a fresh local-session provision after sign-in.
+                if (isLoginSurface)
+                {
+                    m_pairingCompleted = false;
+                }
+
+                core.ExecuteScriptAsync(
+                    m_pairingCompleted
+                        ? L"window.__drakonDesktopPairRuntimeCompleted = true;"
+                        : L"window.__drakonDesktopPairRuntimeCompleted = false;");
+
+                core.ExecuteScriptAsync(L"window.__drakonDesktopReportTheme && window.__drakonDesktopReportTheme();");
+                core.ExecuteScriptAsync(winrt::to_hstring("window.__drakonDesktopTryResidentRuntime && window.__drakonDesktopTryResidentRuntime();"));
             }
-            core.ExecuteScriptAsync(L"window.__drakonDesktopReportTheme && window.__drakonDesktopReportTheme();");
-            core.ExecuteScriptAsync(winrt::to_hstring("window.__drakonDesktopTryResidentRuntime && window.__drakonDesktopTryResidentRuntime();"));
-        }
-        SetStatus(L"", L"", false, false);
-        return;
+
+            SetStatus(L"", L"", false, false);
+            return;
         }
 
-        auto errorMessage = L"A interface web local nao respondeu corretamente. Verifique os logs do backend e do host.";
+        auto errorMessage = ReadBackendBootstrapError();
+        if (errorMessage.empty())
+        {
+            errorMessage = L"A interface web local nao respondeu corretamente. Verifique os logs do backend e do host.";
+        }
         SetStatus(
             L"Falha ao carregar a interface web local",
-            errorMessage,
+            winrt::hstring(errorMessage),
             false,
             true);
     }

@@ -22,6 +22,7 @@ namespace DrakonDesktop::platform
         std::filesystem::path tsxCliPath;
         std::filesystem::path tsconfigPath;
         std::filesystem::path desktopServerScriptPath;
+        std::filesystem::path backendWorkingDirectory;
         std::filesystem::path staticRoot;
         std::filesystem::path storageRoot;
         std::filesystem::path runtimeRoot;
@@ -30,6 +31,8 @@ namespace DrakonDesktop::platform
         std::filesystem::path brandIconPath;
         std::filesystem::path backendLogPath;
         std::filesystem::path serviceLogPath;
+        std::filesystem::path systemActivityLogPath;
+        bool backendUsesTsx{ true };
 
         std::wstring displayName{ L"Perceptrum" };
         std::wstring appUserModelId{ L"Perceptrum" };

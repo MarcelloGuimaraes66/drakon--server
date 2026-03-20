@@ -24,6 +24,13 @@ function parseArgs(argv) {
   return args;
 }
 
+function parseBooleanFlag(value) {
+  if (value === undefined || value === null) return false;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized !== "false" && normalized !== "0" && normalized !== "no";
+}
+
 function quoteIdent(value) {
   return `"${String(value).replace(/"/g, "\"\"")}"`;
 }
@@ -730,17 +737,33 @@ function loadBrandConfig() {
   return JSON.parse(fs.readFileSync(configPath, "utf8"));
 }
 
+function firstExistingPath(candidates) {
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates.find(Boolean) || "";
+}
+
 function resolveDefaultPaths(targetBrand) {
   const config = loadBrandConfig();
   const dataRoot =
     config?.brands?.[targetBrand]?.dataRootWindows ||
     path.resolve(workspaceRoot, "DrakonSite", "storage", targetBrand);
   const localDir = path.join(dataRoot, "local-site");
+  const siteStem = `${targetBrand}_site`;
+  const defaultDumpPath = firstExistingPath([
+    path.join(workspaceRoot, "Postgres", `${siteStem}.sql`),
+    path.join(workspaceRoot, "Postgres", "perceptrum_site.sql"),
+    path.join(workspaceRoot, "DrakonSite", "db", "patches", `${targetBrand}_sql.sql`),
+    path.join(workspaceRoot, "DrakonSite", "db", "patches", "perceptrum_sql.sql"),
+  ]);
   return {
-    dump: path.join(workspaceRoot, "Postgres", "perceptrum_site.sql"),
-    out: path.join(localDir, "perceptrum_site.sqlite"),
-    report: path.join(localDir, "perceptrum_site.import-report.json"),
-    schema: path.join(localDir, "perceptrum_site.sqlite.schema.sql"),
+    dump: defaultDumpPath,
+    out: path.join(localDir, `${siteStem}.sqlite`),
+    report: path.join(localDir, `${siteStem}.import-report.json`),
+    schema: path.join(localDir, `${siteStem}.sqlite.schema.sql`),
   };
 }
 
@@ -752,16 +775,21 @@ function main() {
   const outPath = path.resolve(args.out || defaults.out);
   const reportPath = path.resolve(args.report || defaults.report);
   const schemaOutPath = path.resolve(args["schema-out"] || defaults.schema);
-  const userIds = String(args.users || "local:1,local:3,local:5,local:6")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const schemaOnly = parseBooleanFlag(args["schema-only"]);
+  const userIds = schemaOnly
+    ? []
+    : String(args.users || "local:1,local:3,local:5,local:6")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
 
   const dumpSql = fs.readFileSync(dumpPath, "utf8");
   const tables = parseDumpSchema(dumpSql);
   parseDumpData(dumpSql, tables);
 
-  const includedByTable = seedIncludedRows(tables, new Set(userIds));
+  const includedByTable = schemaOnly
+    ? new Map()
+    : seedIncludedRows(tables, new Set(userIds));
   const report = createSqliteDatabase(outPath, tables, includedByTable, schemaOutPath);
 
   fs.mkdirSync(path.dirname(reportPath), { recursive: true });
@@ -770,6 +798,7 @@ function main() {
     JSON.stringify(
       {
         brand: targetBrand,
+        mode: schemaOnly ? "schema-only" : "subset-import",
         dump: dumpPath,
         users: userIds,
         ...report,
@@ -787,7 +816,11 @@ function main() {
   console.log(`SQLite database created at: ${outPath}`);
   console.log(`Schema SQL written to: ${schemaOutPath}`);
   console.log(`Import report written to: ${reportPath}`);
-  console.log(`Imported users: ${userIds.join(", ")}`);
+  console.log(
+    schemaOnly
+      ? "Schema-only seed generated with no imported rows."
+      : `Imported users: ${userIds.join(", ")}`
+  );
   for (const [tableName, count] of importedTables) {
     console.log(`${tableName}\t${count}`);
   }

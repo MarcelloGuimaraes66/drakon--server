@@ -14,8 +14,13 @@ namespace winrt::DrakonDesktop::implementation
             winrt::hstring const& detail,
             bool isBusy,
             bool showOverlay);
+        void UpdateNavigationButtons(
+            winrt::Microsoft::UI::Xaml::Controls::WebView2 const& webView);
         winrt::fire_and_forget NavigateToLiveSite(bool forceReload);
         void OnPageLoaded(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnBackClick(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnReloadClick(

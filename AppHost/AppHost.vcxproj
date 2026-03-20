@@ -122,7 +122,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -159,6 +159,7 @@
     <ClInclude Include="Platform\AppRuntimeConfig.h" />
     <ClInclude Include="Platform\LocalBackendHost.h" />
     <ClInclude Include="Platform\PerceptrumRuntimeHost.h" />
+    <ClInclude Include="Platform\SecureLocalStore.h" />
     <ClInclude Include="Platform\TrayIconHost.h" />
     <ClInclude Include="MainWindow.xaml.h">
       <DependentUpon>MainWindow.xaml</DependentUpon>
@@ -190,6 +191,7 @@
     <ClCompile Include="Platform\AppRuntimeConfig.cpp" />
     <ClCompile Include="Platform\LocalBackendHost.cpp" />
     <ClCompile Include="Platform\PerceptrumRuntimeHost.cpp" />
+    <ClCompile Include="Platform\SecureLocalStore.cpp" />
     <ClCompile Include="Platform\TrayIconHost.cpp" />
     <ClCompile Include="MainWindow.xaml.cpp">
       <DependentUpon>MainWindow.xaml</DependentUpon>

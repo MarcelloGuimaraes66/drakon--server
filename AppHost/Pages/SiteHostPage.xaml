@@ -10,6 +10,24 @@
     <Grid Background="{StaticResource DrakonShellBackgroundBrush}">
         <WebView2 x:Name="SiteWebView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
 
+        <Border
+            x:Name="BackButtonHost"
+            Margin="18,18,0,0"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            Background="{StaticResource DrakonShellChipBrush}"
+            BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="999"
+            Visibility="Collapsed">
+            <Button
+                x:Name="BackButton"
+                Padding="16,10"
+                Background="Transparent"
+                Foreground="{StaticResource DrakonStrongTextBrush}"
+                Content="Voltar" />
+        </Border>
+
         <Grid
             x:Name="LoadingOverlay"
             Background="{StaticResource DrakonOverlayBrush}">

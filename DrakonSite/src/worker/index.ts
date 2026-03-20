@@ -4319,6 +4319,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           exe_id TEXT NOT NULL,
           sampled_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL DEFAULT '',
           cpu_total_percent REAL,
           cpu_hottest_core_percent REAL,
           logical_cores INTEGER,
@@ -4331,27 +4332,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
           net_tx_bytes_per_sec REAL,
           payload_json TEXT NOT NULL DEFAULT '{}',
           PRIMARY KEY (user_id, client_id)
-        )
-      `).run();
-
-      await db.prepare(`
-        CREATE TABLE IF NOT EXISTS open_monitor_host_history (
-          user_id TEXT NOT NULL,
-          client_id TEXT NOT NULL,
-          exe_id TEXT NOT NULL,
-          sampled_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          cpu_total_percent REAL,
-          cpu_hottest_core_percent REAL,
-          logical_cores INTEGER,
-          ram_total_bytes BIGINT,
-          ram_used_bytes BIGINT,
-          ram_available_bytes BIGINT,
-          disk_total_bytes BIGINT,
-          disk_free_bytes BIGINT,
-          net_rx_bytes_per_sec REAL,
-          net_tx_bytes_per_sec REAL,
-          payload_json TEXT NOT NULL DEFAULT '{}'
         )
       `).run();
 
@@ -4362,6 +4342,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           exe_id TEXT NOT NULL,
           sampled_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL DEFAULT '',
           process_cpu_percent REAL,
           working_set_bytes BIGINT,
           private_bytes BIGINT,
@@ -4373,26 +4354,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
           total_consumers INTEGER,
           payload_json TEXT NOT NULL DEFAULT '{}',
           PRIMARY KEY (user_id, client_id)
-        )
-      `).run();
-
-      await db.prepare(`
-        CREATE TABLE IF NOT EXISTS open_monitor_process_history (
-          user_id TEXT NOT NULL,
-          client_id TEXT NOT NULL,
-          exe_id TEXT NOT NULL,
-          sampled_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          process_cpu_percent REAL,
-          working_set_bytes BIGINT,
-          private_bytes BIGINT,
-          handle_count INTEGER,
-          thread_count INTEGER,
-          uptime_seconds BIGINT,
-          active_cameras INTEGER,
-          unique_streams INTEGER,
-          total_consumers INTEGER,
-          payload_json TEXT NOT NULL DEFAULT '{}'
         )
       `).run();
 
@@ -4405,6 +4366,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           step_id INTEGER NOT NULL,
           sampled_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL DEFAULT '',
           status TEXT,
           camera_count INTEGER,
           total_consumers INTEGER,
@@ -4418,26 +4380,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       await db.prepare(`
-        CREATE TABLE IF NOT EXISTS open_monitor_job_step_history (
-          user_id TEXT NOT NULL,
-          client_id TEXT NOT NULL,
-          exe_id TEXT NOT NULL,
-          job_id INTEGER NOT NULL,
-          step_id INTEGER NOT NULL,
-          sampled_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          status TEXT,
-          camera_count INTEGER,
-          total_consumers INTEGER,
-          queue_depth INTEGER,
-          retry_count BIGINT,
-          timeout_count BIGINT,
-          error_count BIGINT,
-          payload_json TEXT NOT NULL DEFAULT '{}'
-        )
-      `).run();
-
-      await db.prepare(`
         CREATE TABLE IF NOT EXISTS open_monitor_camera_latest (
           user_id TEXT NOT NULL,
           client_id TEXT NOT NULL,
@@ -4445,6 +4387,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           camera_id INTEGER NOT NULL,
           sampled_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL DEFAULT '',
           actual_fps REAL,
           expected_fps REAL,
           last_frame_age_ms BIGINT,
@@ -4458,25 +4401,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       await db.prepare(`
-        CREATE TABLE IF NOT EXISTS open_monitor_camera_history (
-          user_id TEXT NOT NULL,
-          client_id TEXT NOT NULL,
-          exe_id TEXT NOT NULL,
-          camera_id INTEGER NOT NULL,
-          sampled_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          actual_fps REAL,
-          expected_fps REAL,
-          last_frame_age_ms BIGINT,
-          queue_depth INTEGER,
-          overwritten_frames BIGINT,
-          reconnect_count BIGINT,
-          consumer_count INTEGER,
-          payload_json TEXT NOT NULL DEFAULT '{}'
-        )
-      `).run();
-
-      await db.prepare(`
         CREATE TABLE IF NOT EXISTS open_monitor_thread_latest (
           user_id TEXT NOT NULL,
           client_id TEXT NOT NULL,
@@ -4485,6 +4409,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           thread_name TEXT NOT NULL,
           sampled_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL DEFAULT '',
           thread_cpu_percent REAL,
           queue_depth INTEGER,
           dropped_items BIGINT,
@@ -4493,21 +4418,34 @@ async function ensureSchema(db: D1Database): Promise<void> {
         )
       `).run();
 
-      await db.prepare(`
-        CREATE TABLE IF NOT EXISTS open_monitor_thread_history (
-          user_id TEXT NOT NULL,
-          client_id TEXT NOT NULL,
-          exe_id TEXT NOT NULL,
-          camera_id INTEGER NOT NULL,
-          thread_name TEXT NOT NULL,
-          sampled_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          thread_cpu_percent REAL,
-          queue_depth INTEGER,
-          dropped_items BIGINT,
-          payload_json TEXT NOT NULL DEFAULT '{}'
-        )
-      `).run();
+      await addColumnIfMissing(`ALTER TABLE open_monitor_host_latest ADD COLUMN snapshot_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE open_monitor_process_latest ADD COLUMN snapshot_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE open_monitor_job_step_latest ADD COLUMN snapshot_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE open_monitor_camera_latest ADD COLUMN snapshot_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE open_monitor_thread_latest ADD COLUMN snapshot_id TEXT`);
+
+      let droppedOpenMonitorHistoryTables = false;
+      const openMonitorHistoryTables = [
+        "open_monitor_host_history",
+        "open_monitor_process_history",
+        "open_monitor_job_step_history",
+        "open_monitor_camera_history",
+        "open_monitor_thread_history",
+      ] as const;
+
+      for (const tableName of openMonitorHistoryTables) {
+        if (!(await tableExists(tableName))) continue;
+        await db.prepare(`DROP TABLE IF EXISTS ${tableName}`).run();
+        droppedOpenMonitorHistoryTables = true;
+      }
+
+      if (droppedOpenMonitorHistoryTables && !isPgLike) {
+        try {
+          await db.prepare(`VACUUM`).run();
+        } catch (error) {
+          console.error("[OPEN MONITOR] SQLite vacuum after dropping history tables failed:", error);
+        }
+      }
 
       if (isPgLike) {
         await db.prepare(`
@@ -4610,36 +4548,16 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON capture_thread_metrics_latest(user_id, updated_at)
       `).run();
       await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_open_monitor_host_history_user_sampled
-        ON open_monitor_host_history(user_id, sampled_at)
-      `).run();
-      await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_open_monitor_process_history_user_sampled
-        ON open_monitor_process_history(user_id, sampled_at)
-      `).run();
-      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_open_monitor_job_step_latest_user_job
         ON open_monitor_job_step_latest(user_id, job_id)
-      `).run();
-      await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_open_monitor_job_step_history_user_sampled
-        ON open_monitor_job_step_history(user_id, sampled_at)
       `).run();
       await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_open_monitor_camera_latest_user_camera
         ON open_monitor_camera_latest(user_id, camera_id)
       `).run();
       await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_open_monitor_camera_history_user_sampled
-        ON open_monitor_camera_history(user_id, sampled_at)
-      `).run();
-      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_open_monitor_thread_latest_user_camera
         ON open_monitor_thread_latest(user_id, camera_id)
-      `).run();
-      await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_open_monitor_thread_history_user_sampled
-        ON open_monitor_thread_history(user_id, sampled_at)
       `).run();
       await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_agent_error_logs_user_occurred
@@ -5458,11 +5376,40 @@ function resolveBrowserOrigin(c: any): string {
   return new URL(c.req.url).origin.replace(/\/$/, "");
 }
 
-function resolveGoogleRedirectUri(c: any): string {
+function resolveAuthoritativeGoogleRedirectUri(): string {
+  const siteUrl = String(brand.siteUrl || "").trim();
+  if (!siteUrl) {
+    return "";
+  }
+
+  try {
+    return new URL("/auth/callback", siteUrl).toString();
+  } catch {
+    return "";
+  }
+}
+
+function isDesktopHostedGoogleLoginRequest(c: any): boolean {
+  try {
+    return new URL(c.req.url).searchParams.get("desktop_host") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function resolveGoogleRedirectUri(c: any, options?: { preferAuthoritative?: boolean }): string {
   const configured = String(c.env.GOOGLE_OAUTH_REDIRECT_URI || "").trim();
   if (configured) {
     return configured;
   }
+
+  if (options?.preferAuthoritative) {
+    const authoritative = resolveAuthoritativeGoogleRedirectUri();
+    if (authoritative) {
+      return authoritative;
+    }
+  }
+
   return `${resolveBrowserOrigin(c)}/auth/callback`;
 }
 
@@ -5641,7 +5588,9 @@ async function markAppUserAsGoogleLinked(
 async function createGoogleOAuthRedirectUrl(c: any): Promise<string> {
   const { clientId } = getGoogleOAuthConfig(c.env);
   const discovery = await getGoogleOidcDiscovery();
-  const redirectUri = resolveGoogleRedirectUri(c);
+  const redirectUri = resolveGoogleRedirectUri(c, {
+    preferAuthoritative: isDesktopHostedGoogleLoginRequest(c),
+  });
   const state = generateRandomBase64Url(24);
   const nonce = generateRandomBase64Url(24);
   const codeVerifier = generateRandomBase64Url(48);
@@ -6654,42 +6603,49 @@ const anyAuthMiddleware = async (c: any, next: any) => {
 };
 
 const OPEN_MONITOR_STALE_AFTER_MS = 90_000;
-const OPEN_MONITOR_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-const OPEN_MONITOR_HISTORY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
-let openMonitorHistoryCleanupStartedAt = 0;
+const OPEN_MONITOR_SNAPSHOT_ID_MAX_LENGTH = 96;
 
 function openMonitorNowIso(): string {
   return new Date().toISOString();
 }
 
-async function openMonitorCleanupHistoryIfDue(
-  db: D1Database,
-  nowIso: string = openMonitorNowIso()
-): Promise<void> {
+function openMonitorBuildSnapshotId(nowIso: string = openMonitorNowIso()): string {
   const nowMs = Date.parse(nowIso);
-  const normalizedNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
-  if (normalizedNowMs - openMonitorHistoryCleanupStartedAt < OPEN_MONITOR_HISTORY_CLEANUP_INTERVAL_MS) {
-    return;
-  }
-  openMonitorHistoryCleanupStartedAt = normalizedNowMs;
+  const timestamp = Number.isFinite(nowMs) ? Math.max(0, Math.floor(nowMs)) : Date.now();
+  const randomPart = Math.random().toString(36).slice(2, 10);
+  return `om-${timestamp}-${randomPart}`;
+}
 
-  const cutoffIso = new Date(normalizedNowMs - OPEN_MONITOR_HISTORY_RETENTION_MS).toISOString();
-  const historyTables = [
-    "open_monitor_host_history",
-    "open_monitor_process_history",
-    "open_monitor_job_step_history",
-    "open_monitor_camera_history",
-    "open_monitor_thread_history",
-  ] as const;
+function openMonitorNormalizeSnapshotId(
+  value: unknown,
+  fallback: string = openMonitorBuildSnapshotId()
+): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim().slice(0, OPEN_MONITOR_SNAPSHOT_ID_MAX_LENGTH);
+  return trimmed || fallback;
+}
 
-  for (const tableName of historyTables) {
-    try {
-      await db.prepare(`DELETE FROM ${tableName} WHERE created_at < ? OR sampled_at < ?`)
-        .bind(cutoffIso, cutoffIso)
-        .run();
-    } catch (error) {
-      console.error(`[OPEN MONITOR] History retention cleanup failed for ${tableName}:`, error);
-    }
+async function openMonitorPruneLatestRowsBySnapshot(
+  db: D1Database,
+  tableName:
+    | "open_monitor_camera_latest"
+    | "open_monitor_thread_latest"
+    | "open_monitor_job_step_latest",
+  userId: string,
+  clientId: string,
+  snapshotId: string
+): Promise<void> {
+  try {
+    await db.prepare(
+      `DELETE FROM ${tableName}
+       WHERE user_id = ?
+         AND client_id = ?
+         AND COALESCE(snapshot_id, '') <> ?`
+    )
+      .bind(userId, clientId, snapshotId)
+      .run();
+  } catch (error) {
+    console.error(`[OPEN MONITOR] Latest prune failed for ${tableName}:`, error);
   }
 }
 
@@ -19502,6 +19458,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
   await ensureSchema(c.env.DB);
 
   type OpenMonitorSnapshotRequestBody = {
+    snapshot_id?: string | null;
     sampled_at?: string | null;
     host?: Record<string, unknown> | null;
     process?: Record<string, unknown> | null;
@@ -19513,7 +19470,14 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
   const now = openMonitorNowIso();
   const body: OpenMonitorSnapshotRequestBody =
     await c.req.json<OpenMonitorSnapshotRequestBody>().catch(() => ({}));
+  const hasCamerasField = Array.isArray(body.cameras);
+  const hasThreadsField = Array.isArray(body.threads);
+  const hasJobStepsField = Array.isArray(body.job_steps);
   const sampledAtDefault = openMonitorNormalizeIso(body.sampled_at, now);
+  const snapshotId = openMonitorNormalizeSnapshotId(
+    body.snapshot_id,
+    openMonitorBuildSnapshotId(now)
+  );
   const hostPayload = openMonitorParseObject(body.host);
   const processPayload = openMonitorParseObject(body.process);
   const cameraPayloads = openMonitorParseArray(body.cameras);
@@ -19526,6 +19490,9 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
 
   let upserted = 0;
   let dropped = 0;
+  let cameraLatestWriteFailed = false;
+  let threadLatestWriteFailed = false;
+  let jobStepLatestWriteFailed = false;
 
   if (Object.keys(hostPayload).length > 0) {
     const sampledAt = openMonitorNormalizeIso(hostPayload.sampled_at, sampledAtDefault);
@@ -19537,6 +19504,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            exe_id,
            sampled_at,
            updated_at,
+           snapshot_id,
            cpu_total_percent,
            cpu_hottest_core_percent,
            logical_cores,
@@ -19549,11 +19517,12 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            net_tx_bytes_per_sec,
            payload_json
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, client_id) DO UPDATE SET
            exe_id = excluded.exe_id,
            sampled_at = excluded.sampled_at,
            updated_at = excluded.updated_at,
+           snapshot_id = excluded.snapshot_id,
            cpu_total_percent = excluded.cpu_total_percent,
            cpu_hottest_core_percent = excluded.cpu_hottest_core_percent,
            logical_cores = excluded.logical_cores,
@@ -19572,47 +19541,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
           pairing.exeId,
           sampledAt,
           now,
-          openMonitorToFiniteNumber(hostPayload.cpu_total_percent),
-          openMonitorToFiniteNumber(hostPayload.cpu_hottest_core_percent),
-          openMonitorToNonNegativeInt(hostPayload.logical_cores),
-          openMonitorToNonNegativeInt(hostPayload.ram_total_bytes),
-          openMonitorToNonNegativeInt(hostPayload.ram_used_bytes),
-          openMonitorToNonNegativeInt(hostPayload.ram_available_bytes),
-          openMonitorToNonNegativeInt(hostPayload.disk_total_bytes),
-          openMonitorToNonNegativeInt(hostPayload.disk_free_bytes),
-          openMonitorToFiniteNumber(hostPayload.net_rx_bytes_per_sec),
-          openMonitorToFiniteNumber(hostPayload.net_tx_bytes_per_sec),
-          openMonitorSafeJson(hostPayload)
-        )
-        .run();
-
-      await c.env.DB.prepare(
-        `INSERT INTO open_monitor_host_history (
-           user_id,
-           client_id,
-           exe_id,
-           sampled_at,
-           created_at,
-           cpu_total_percent,
-           cpu_hottest_core_percent,
-           logical_cores,
-           ram_total_bytes,
-           ram_used_bytes,
-           ram_available_bytes,
-           disk_total_bytes,
-           disk_free_bytes,
-           net_rx_bytes_per_sec,
-           net_tx_bytes_per_sec,
-           payload_json
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          pairing.userId,
-          pairing.clientId,
-          pairing.exeId,
-          sampledAt,
-          now,
+          snapshotId,
           openMonitorToFiniteNumber(hostPayload.cpu_total_percent),
           openMonitorToFiniteNumber(hostPayload.cpu_hottest_core_percent),
           openMonitorToNonNegativeInt(hostPayload.logical_cores),
@@ -19644,6 +19573,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            exe_id,
            sampled_at,
            updated_at,
+           snapshot_id,
            process_cpu_percent,
            working_set_bytes,
            private_bytes,
@@ -19655,11 +19585,12 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            total_consumers,
            payload_json
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, client_id) DO UPDATE SET
            exe_id = excluded.exe_id,
            sampled_at = excluded.sampled_at,
            updated_at = excluded.updated_at,
+           snapshot_id = excluded.snapshot_id,
            process_cpu_percent = excluded.process_cpu_percent,
            working_set_bytes = excluded.working_set_bytes,
            private_bytes = excluded.private_bytes,
@@ -19677,45 +19608,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
           pairing.exeId,
           sampledAt,
           now,
-          openMonitorToFiniteNumber(processPayload.process_cpu_percent),
-          openMonitorToNonNegativeInt(processPayload.working_set_bytes),
-          openMonitorToNonNegativeInt(processPayload.private_bytes),
-          openMonitorToNonNegativeInt(processPayload.handle_count),
-          openMonitorToNonNegativeInt(processPayload.thread_count),
-          openMonitorToNonNegativeInt(processPayload.uptime_seconds),
-          openMonitorToNonNegativeInt(processPayload.active_cameras),
-          openMonitorToNonNegativeInt(processPayload.unique_streams),
-          openMonitorToNonNegativeInt(processPayload.total_consumers),
-          openMonitorSafeJson(processPayload)
-        )
-        .run();
-
-      await c.env.DB.prepare(
-        `INSERT INTO open_monitor_process_history (
-           user_id,
-           client_id,
-           exe_id,
-           sampled_at,
-           created_at,
-           process_cpu_percent,
-           working_set_bytes,
-           private_bytes,
-           handle_count,
-           thread_count,
-           uptime_seconds,
-           active_cameras,
-           unique_streams,
-           total_consumers,
-           payload_json
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          pairing.userId,
-          pairing.clientId,
-          pairing.exeId,
-          sampledAt,
-          now,
+          snapshotId,
           openMonitorToFiniteNumber(processPayload.process_cpu_percent),
           openMonitorToNonNegativeInt(processPayload.working_set_bytes),
           openMonitorToNonNegativeInt(processPayload.private_bytes),
@@ -19753,6 +19646,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            camera_id,
            sampled_at,
            updated_at,
+           snapshot_id,
            actual_fps,
            expected_fps,
            last_frame_age_ms,
@@ -19762,11 +19656,12 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            consumer_count,
            payload_json
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, client_id, camera_id) DO UPDATE SET
            exe_id = excluded.exe_id,
            sampled_at = excluded.sampled_at,
            updated_at = excluded.updated_at,
+           snapshot_id = excluded.snapshot_id,
            actual_fps = excluded.actual_fps,
            expected_fps = excluded.expected_fps,
            last_frame_age_ms = excluded.last_frame_age_ms,
@@ -19783,43 +19678,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
           cameraId,
           sampledAt,
           now,
-          openMonitorToFiniteNumber(cameraPayload.actual_fps),
-          openMonitorToFiniteNumber(cameraPayload.expected_fps),
-          openMonitorToNonNegativeInt(cameraPayload.last_frame_age_ms),
-          openMonitorToNonNegativeInt(cameraPayload.queue_depth),
-          openMonitorToNonNegativeInt(cameraPayload.overwritten_frames),
-          openMonitorToNonNegativeInt(cameraPayload.reconnect_count),
-          openMonitorToNonNegativeInt(cameraPayload.consumer_count),
-          openMonitorSafeJson(cameraPayload)
-        )
-        .run();
-
-      await c.env.DB.prepare(
-        `INSERT INTO open_monitor_camera_history (
-           user_id,
-           client_id,
-           exe_id,
-           camera_id,
-           sampled_at,
-           created_at,
-           actual_fps,
-           expected_fps,
-           last_frame_age_ms,
-           queue_depth,
-           overwritten_frames,
-           reconnect_count,
-           consumer_count,
-           payload_json
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          pairing.userId,
-          pairing.clientId,
-          pairing.exeId,
-          cameraId,
-          sampledAt,
-          now,
+          snapshotId,
           openMonitorToFiniteNumber(cameraPayload.actual_fps),
           openMonitorToFiniteNumber(cameraPayload.expected_fps),
           openMonitorToNonNegativeInt(cameraPayload.last_frame_age_ms),
@@ -19834,6 +19693,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
       upserted += 1;
     } catch (error) {
       console.error("[OPEN MONITOR] Failed to persist camera snapshot:", error);
+      cameraLatestWriteFailed = true;
       dropped += 1;
     }
   }
@@ -19857,16 +19717,18 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            thread_name,
            sampled_at,
            updated_at,
+           snapshot_id,
            thread_cpu_percent,
            queue_depth,
            dropped_items,
            payload_json
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, client_id, camera_id, thread_name) DO UPDATE SET
            exe_id = excluded.exe_id,
            sampled_at = excluded.sampled_at,
            updated_at = excluded.updated_at,
+           snapshot_id = excluded.snapshot_id,
            thread_cpu_percent = excluded.thread_cpu_percent,
            queue_depth = excluded.queue_depth,
            dropped_items = excluded.dropped_items,
@@ -19880,37 +19742,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
           threadName,
           sampledAt,
           now,
-          openMonitorToFiniteNumber(threadPayload.thread_cpu_percent),
-          openMonitorToNonNegativeInt(threadPayload.queue_depth),
-          openMonitorToNonNegativeInt(threadPayload.dropped_items),
-          openMonitorSafeJson(threadPayload)
-        )
-        .run();
-
-      await c.env.DB.prepare(
-        `INSERT INTO open_monitor_thread_history (
-           user_id,
-           client_id,
-           exe_id,
-           camera_id,
-           thread_name,
-           sampled_at,
-           created_at,
-           thread_cpu_percent,
-           queue_depth,
-           dropped_items,
-           payload_json
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          pairing.userId,
-          pairing.clientId,
-          pairing.exeId,
-          cameraId,
-          threadName,
-          sampledAt,
-          now,
+          snapshotId,
           openMonitorToFiniteNumber(threadPayload.thread_cpu_percent),
           openMonitorToNonNegativeInt(threadPayload.queue_depth),
           openMonitorToNonNegativeInt(threadPayload.dropped_items),
@@ -19921,6 +19753,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
       upserted += 1;
     } catch (error) {
       console.error("[OPEN MONITOR] Failed to persist thread snapshot:", error);
+      threadLatestWriteFailed = true;
       dropped += 1;
     }
   }
@@ -19948,6 +19781,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            step_id,
            sampled_at,
            updated_at,
+           snapshot_id,
            status,
            camera_count,
            total_consumers,
@@ -19957,11 +19791,12 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
            error_count,
            payload_json
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, client_id, job_id, step_id) DO UPDATE SET
            exe_id = excluded.exe_id,
            sampled_at = excluded.sampled_at,
            updated_at = excluded.updated_at,
+           snapshot_id = excluded.snapshot_id,
            status = excluded.status,
            camera_count = excluded.camera_count,
            total_consumers = excluded.total_consumers,
@@ -19979,45 +19814,7 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
           stepId,
           sampledAt,
           now,
-          status,
-          openMonitorToNonNegativeInt(jobStepPayload.camera_count),
-          openMonitorToNonNegativeInt(jobStepPayload.total_consumers),
-          openMonitorToNonNegativeInt(jobStepPayload.queue_depth),
-          openMonitorToNonNegativeInt(jobStepPayload.retry_count),
-          openMonitorToNonNegativeInt(jobStepPayload.timeout_count),
-          openMonitorToNonNegativeInt(jobStepPayload.error_count),
-          openMonitorSafeJson(jobStepPayload)
-        )
-        .run();
-
-      await c.env.DB.prepare(
-        `INSERT INTO open_monitor_job_step_history (
-           user_id,
-           client_id,
-           exe_id,
-           job_id,
-           step_id,
-           sampled_at,
-           created_at,
-           status,
-           camera_count,
-           total_consumers,
-           queue_depth,
-           retry_count,
-           timeout_count,
-           error_count,
-           payload_json
-         )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          pairing.userId,
-          pairing.clientId,
-          pairing.exeId,
-          jobId,
-          stepId,
-          sampledAt,
-          now,
+          snapshotId,
           status,
           openMonitorToNonNegativeInt(jobStepPayload.camera_count),
           openMonitorToNonNegativeInt(jobStepPayload.total_consumers),
@@ -20032,14 +19829,44 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
       upserted += 1;
     } catch (error) {
       console.error("[OPEN MONITOR] Failed to persist job-step snapshot:", error);
+      jobStepLatestWriteFailed = true;
       dropped += 1;
     }
   }
 
-  await openMonitorCleanupHistoryIfDue(c.env.DB, now);
+  if (hasCamerasField && !cameraLatestWriteFailed) {
+    await openMonitorPruneLatestRowsBySnapshot(
+      c.env.DB,
+      "open_monitor_camera_latest",
+      pairing.userId,
+      pairing.clientId,
+      snapshotId
+    );
+  }
+
+  if (hasThreadsField && !threadLatestWriteFailed) {
+    await openMonitorPruneLatestRowsBySnapshot(
+      c.env.DB,
+      "open_monitor_thread_latest",
+      pairing.userId,
+      pairing.clientId,
+      snapshotId
+    );
+  }
+
+  if (hasJobStepsField && !jobStepLatestWriteFailed) {
+    await openMonitorPruneLatestRowsBySnapshot(
+      c.env.DB,
+      "open_monitor_job_step_latest",
+      pairing.userId,
+      pairing.clientId,
+      snapshotId
+    );
+  }
 
   return c.json({
     ok: true,
+    snapshot_id: snapshotId,
     received: {
       host: Object.keys(hostPayload).length > 0 ? 1 : 0,
       process: Object.keys(processPayload).length > 0 ? 1 : 0,

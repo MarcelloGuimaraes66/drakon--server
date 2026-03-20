@@ -33,7 +33,7 @@ namespace DrakonDesktop::platform
         LocalBackendStatus const& Status() const noexcept;
 
     private:
-        bool ProbeReady() const;
+        bool ProbeReady(std::wstring* summary = nullptr, bool* fatal = nullptr) const;
         bool WaitForReady(DWORD timeoutMs, std::wstring& error) const;
         bool StartProcess(std::wstring& error);
         static std::wstring BuildEnvironmentBlock(std::initializer_list<std::pair<std::wstring, std::wstring>> overrides);

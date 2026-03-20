@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include "../logging/Logging.h"
+#include "SecureLocalStore.h"
 
 #include <ctime>
 #include <cstdlib>
@@ -32,6 +33,29 @@ static std::string TrimAscii(const std::string& input) {
         --end;
     }
     return input.substr(start, end - start);
+}
+
+static std::string ReadEnvVarLocal(const char* name) {
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
+        return "";
+    }
+
+    std::string out(buf);
+    free(buf);
+    return out;
+}
+
+static bool LooksLikeProtectedBlob(const std::string& input) {
+    const std::string value = TrimAscii(input);
+    if (value.size() < 32 || value.rfind("AQAAANCM", 0) != 0) {
+        return false;
+    }
+
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '+' || ch == '/' || ch == '=';
+    });
 }
 
 static std::string DetectWindowsTimezoneKeyViaTzutil() {
@@ -103,6 +127,13 @@ static std::string DetectMachineTimezoneForPairing() {
 }
 
 static constexpr const char* kPairedTimezoneFilename = "paired_timezone.txt";
+static constexpr const char* kExeTokenFilename = "exe_token.txt";
+static constexpr const char* kClientIdFilename = "client_id.txt";
+static constexpr const char* kExeIdFilename = "exe_id.txt";
+static constexpr const char* kProvisionedExeTokenEnv = "APP_PROVISIONED_EXE_TOKEN";
+static constexpr const char* kProvisionedClientIdEnv = "APP_PROVISIONED_CLIENT_ID";
+static constexpr const char* kProvisionedExeIdEnv = "APP_PROVISIONED_EXE_ID";
+static constexpr const char* kProvisionedTimezoneEnv = "APP_PROVISIONED_TIMEZONE";
 
 // ctor
 PairingClient::PairingClient(const std::string& baseUrl)
@@ -111,12 +142,50 @@ PairingClient::PairingClient(const std::string& baseUrl)
 
 // simple loadSavedToken implementation (use what you already have if it's different)
 bool PairingClient::loadSavedToken(std::string& exeTokenOut, std::string& clientIdOut) {
-    std::ifstream in1("exe_token.txt");
-    std::ifstream in2("client_id.txt");
-    if (!in1 || !in2) return false;
+    const std::string provisionedExeToken = TrimAscii(ReadEnvVarLocal(kProvisionedExeTokenEnv));
+    const std::string provisionedClientId = TrimAscii(ReadEnvVarLocal(kProvisionedClientIdEnv));
+    const std::string provisionedExeId = TrimAscii(ReadEnvVarLocal(kProvisionedExeIdEnv));
+    const std::string provisionedTimezone = TrimAscii(ReadEnvVarLocal(kProvisionedTimezoneEnv));
+    if (!provisionedExeToken.empty() && !provisionedClientId.empty()) {
+        if (LooksLikeProtectedBlob(provisionedExeToken) || LooksLikeProtectedBlob(provisionedClientId)) {
+            Logger::instance().logDebug(
+                "agent",
+                "PairingClient::loadSavedToken: provisioned env session looks encrypted; ignoring"
+            );
+        } else {
+            securelocal::WriteProtectedLocalText(kExeTokenFilename, provisionedExeToken);
+            securelocal::WriteProtectedLocalText(kClientIdFilename, provisionedClientId);
+            if (!provisionedExeId.empty()) {
+                securelocal::WriteProtectedLocalText(kExeIdFilename, provisionedExeId);
+            }
+            if (!provisionedTimezone.empty()) {
+                std::ofstream timezoneFile(kPairedTimezoneFilename, std::ios::trunc);
+                if (timezoneFile.is_open()) {
+                    timezoneFile << provisionedTimezone;
+                }
+            }
 
-    std::getline(in1, exeTokenOut);
-    std::getline(in2, clientIdOut);
+            exeTokenOut = provisionedExeToken;
+            clientIdOut = provisionedClientId;
+            return true;
+        }
+    }
+
+    auto exeToken = securelocal::ReadProtectedLocalText(kExeTokenFilename);
+    auto clientId = securelocal::ReadProtectedLocalText(kClientIdFilename);
+    if (!exeToken.has_value() || !clientId.has_value()) return false;
+
+    exeTokenOut = TrimAscii(*exeToken);
+    clientIdOut = TrimAscii(*clientId);
+    if (LooksLikeProtectedBlob(exeTokenOut) || LooksLikeProtectedBlob(clientIdOut)) {
+        Logger::instance().logDebug(
+            "agent",
+            "PairingClient::loadSavedToken: protected local session looks encrypted/stale; waiting for reprovision"
+        );
+        exeTokenOut.clear();
+        clientIdOut.clear();
+        return false;
+    }
     return !exeTokenOut.empty() && !clientIdOut.empty();
 }
 
@@ -196,13 +265,15 @@ std::optional<PairingResult> PairingClient::pairWithCode(const std::string& pair
         std::string exeToken = j.at("exe_token").get<std::string>();
         std::string clientId = j.at("client_id").get<std::string>();
 
+        if (!securelocal::WriteProtectedLocalText(kExeTokenFilename, exeToken) ||
+            !securelocal::WriteProtectedLocalText(kClientIdFilename, clientId))
         {
-            std::ofstream f("exe_token.txt");
-            f << exeToken;
-        }
-        {
-            std::ofstream f("client_id.txt");
-            f << clientId;
+            errorOut = "Failed to store local pairing secrets";
+            Logger::instance().logDebug(
+                "agent",
+                "PairingClient::pairWithCode failed: could not persist protected local secrets"
+            );
+            return std::nullopt;
         }
         if (!pairedTimezone.empty()) {
             std::ofstream f(kPairedTimezoneFilename);
@@ -227,19 +298,20 @@ std::optional<PairingResult> PairingClient::pairWithCode(const std::string& pair
 
 std::string PairingClient::loadOrCreateExeId()
 {
-    const char* filename = "exe_id.txt";
-    std::ifstream in(filename);
-    if (in.good()) {
-        std::string id;
-        std::getline(in, id);
-        if (!id.empty())
+    if (auto storedId = securelocal::ReadProtectedLocalText(kExeIdFilename); storedId.has_value()) {
+        std::string id = TrimAscii(*storedId);
+        if (!id.empty()) {
             return id;
+        }
     }
-    in.close();
 
     std::string id = "exe-" + std::to_string(std::time(nullptr));
-    std::ofstream out(filename);
-    out << id;
+    if (!securelocal::WriteProtectedLocalText(kExeIdFilename, id)) {
+        Logger::instance().logDebug(
+            "agent",
+            "PairingClient::loadOrCreateExeId: failed to persist protected exe_id"
+        );
+    }
     return id;
 }
 

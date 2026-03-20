@@ -58,7 +58,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [loadUser]);
 
   const redirectToLogin = useCallback(async () => {
-    const response = await fetch("/api/oauth/google/redirect_url", {
+    const desktopWindow =
+      typeof window !== "undefined"
+        ? (window as Window & { chrome?: { webview?: unknown } })
+        : null;
+    const isDesktopHosted =
+      Boolean(desktopWindow?.chrome) &&
+      typeof desktopWindow?.chrome?.webview !== "undefined";
+    const endpoint = isDesktopHosted
+      ? "/api/oauth/google/redirect_url?desktop_host=1"
+      : "/api/oauth/google/redirect_url";
+
+    const response = await fetch(endpoint, {
       credentials: "include",
     });
 

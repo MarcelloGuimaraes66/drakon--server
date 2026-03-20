@@ -3,13 +3,71 @@ param(
     [string]$FileId,
 
     [Parameter(Mandatory = $true)]
-    [string]$DestinationRoot
+    [string]$DestinationRoot,
+
+    [Parameter(Mandatory = $false)]
+    [string]$StatusFile = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 Set-StrictMode -Version Latest
+
+function Format-StatusValue {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return ([string]$Value).Replace("`r", " ").Replace("`n", " ").Trim()
+}
+
+function Write-InstallerStatus {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$State,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Detail,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Percent,
+
+        [string]$ErrorMessage = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StatusFile)) {
+        return
+    }
+
+    $statusPath = [System.IO.Path]::GetFullPath($StatusFile)
+    $statusDir = Split-Path -Parent $statusPath
+    if (-not [string]::IsNullOrWhiteSpace($statusDir)) {
+        New-Item -ItemType Directory -Path $statusDir -Force | Out-Null
+    }
+
+    $tmpPath = "$statusPath.tmp"
+    $content = @(
+        "[progress]"
+        "state=$(Format-StatusValue $State)"
+        "message=$(Format-StatusValue $Message)"
+        "detail=$(Format-StatusValue $Detail)"
+        "percent=$Percent"
+        "error=$(Format-StatusValue $ErrorMessage)"
+    ) -join [System.Environment]::NewLine
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmpPath, $content, $utf8NoBom)
+    Move-Item -Path $tmpPath -Destination $statusPath -Force
+}
 
 function Get-DownloadConfirmation {
     param(
@@ -158,10 +216,21 @@ $existingServerPath = Join-Path $installRoot "llm\\bin\\llama-server.exe"
 $existingModel = Get-ChildItem -Path (Join-Path $installRoot "llm\\models\\chatv2") -Filter *.gguf -File -Recurse -ErrorAction SilentlyContinue |
     Select-Object -First 1
 
+Write-InstallerStatus `
+    -State "running" `
+    -Message "Preparing local AI runtime." `
+    -Detail "Checking whether the required local AI files are already installed." `
+    -Percent 5
+
 if ((Test-Path $existingServerPath) -and $existingModel) {
     Set-Content -Path (Join-Path $installRoot "chatv2_llm_server_path.txt") -Value $existingServerPath -NoNewline
     Set-Content -Path (Join-Path $installRoot "chatv2_llm_model_path.txt") -Value $existingModel.FullName -NoNewline
-    Write-Host "LLM runtime already installed. Skipping download."
+    Write-InstallerStatus `
+        -State "completed" `
+        -Message "Local AI runtime is ready." `
+        -Detail "The required local AI files were already installed on this device." `
+        -Percent 100
+    Write-Host "Local AI runtime already installed. Skipping download."
     exit 0
 }
 
@@ -173,21 +242,56 @@ try {
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
 
+    Write-InstallerStatus `
+        -State "running" `
+        -Message "Preparing local AI runtime." `
+        -Detail "Locating the required local AI package." `
+        -Percent 15
     $confirmation = Get-DownloadConfirmation -DriveFileId $FileId
-    Write-Host "Downloading local LLM package from Google Drive..."
+    Write-InstallerStatus `
+        -State "running" `
+        -Message "Downloading local AI runtime." `
+        -Detail "Downloading the required local AI package. This may take several minutes." `
+        -Percent 45
+    Write-Host "Downloading local AI runtime package from Google Drive..."
     Invoke-WebRequest -Uri $confirmation.DownloadUrl -WebSession $confirmation.Session -UseBasicParsing -MaximumRedirection 5 -OutFile $archivePath
 
     if (-not (Test-ZipSignature -Path $archivePath)) {
         throw "Downloaded file is not a valid ZIP archive."
     }
 
-    Write-Host "Extracting local LLM package..."
+    Write-InstallerStatus `
+        -State "running" `
+        -Message "Extracting local AI runtime." `
+        -Detail "Expanding the downloaded package." `
+        -Percent 70
+    Write-Host "Extracting local AI runtime package..."
     Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot -Force
 
-    Write-Host "Installing local LLM package..."
+    Write-InstallerStatus `
+        -State "running" `
+        -Message "Installing local AI runtime." `
+        -Detail "Finalizing the required local AI files." `
+        -Percent 90
+    Write-Host "Installing local AI runtime package..."
     Install-LlmPayload -ExtractRoot $extractRoot -InstallRoot $installRoot
 
-    Write-Host "Local LLM package installed successfully."
+    Write-InstallerStatus `
+        -State "completed" `
+        -Message "Local AI runtime is ready." `
+        -Detail "The required local AI files were installed successfully." `
+        -Percent 100
+    Write-Host "Local AI runtime package installed successfully."
+}
+catch {
+    $errorMessage = $_.Exception.Message
+    Write-InstallerStatus `
+        -State "failed" `
+        -Message "Failed to install local AI runtime." `
+        -Detail "The required local AI package could not be installed." `
+        -Percent 100 `
+        -ErrorMessage $errorMessage
+    throw
 }
 finally {
     if (Test-Path $tempRoot) {
