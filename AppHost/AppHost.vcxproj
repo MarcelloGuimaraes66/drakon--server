@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{820E9B55-F0A1-4C13-A0B8-B8F177BF0E43}</ProjectGuid>
+    <ProjectName>AppHost</ProjectName>
+    <RootNamespace>DrakonDesktop</RootNamespace>
+    <TargetName>App</TargetName>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>18.0</MinimumVisualStudioVersion>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.17763.0</WindowsTargetPlatformMinVersion>
+    <ConfigurationType>Application</ConfigurationType>
+    <OutputType>Winexe</OutputType>
+    <AppContainerApplication>false</AppContainerApplication>
+    <WindowsPackageType>None</WindowsPackageType>
+    <AppxPackage>false</AppxPackage>
+    <AppxGeneratePriEnabled>false</AppxGeneratePriEnabled>
+    <AppxGeneratePrisForPortableLibrariesEnabled>false</AppxGeneratePrisForPortableLibrariesEnabled>
+    <AppxGetPackagePropertiesEnabled>false</AppxGetPackagePropertiesEnabled>
+    <IncludeProjectPriFile>false</IncludeProjectPriFile>
+    <UseWinUI>true</UseWinUI>
+    <WinUISDKReferences>false</WinUISDKReferences>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <CppWinRTOptimized>true</CppWinRTOptimized>
+    <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
+    <MinimalCoreWin>true</MinimalCoreWin>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <WindowsAppSdkBootstrapInitialize>true</WindowsAppSdkBootstrapInitialize>
+    <ExcludeRestorePackageImports>true</ExcludeRestorePackageImports>
+    <ResolveNuGetPackages>false</ResolveNuGetPackages>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <LinkIncremental>false</LinkIncremental>
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+  <Import Project="generated\Branding.props" Condition="Exists('generated\Branding.props')" />
+
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgManifestRoot>..\Perceptrum</VcpkgManifestRoot>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)'==''">$(USERPROFILE)\.nuget\packages\</NuGetPackageRoot>
+    <WindowsSdkBuildToolsPackageVersion>10.0.22621.756</WindowsSdkBuildToolsPackageVersion>
+    <WindowsAppSDKPackageVersion>1.7.250513003</WindowsAppSDKPackageVersion>
+    <CppWinRTPackageVersion>2.0.250303.1</CppWinRTPackageVersion>
+    <WebView2PackageVersion>1.0.2903.40</WebView2PackageVersion>
+    <PostgreSqlRoot Condition="'$(PostgreSqlRoot)'==''">C:\Program Files\PostgreSQL\17\</PostgreSqlRoot>
+    <OpenCvBinRoot Condition="'$(OpenCvBinRoot)'==''">C:\libs\opencv-4.11.0\build\x64\vc16\bin\</OpenCvBinRoot>
+    <PerceptrumLegacyReleaseRoot Condition="'$(PerceptrumLegacyReleaseRoot)'==''">$(MSBuildThisFileDirectory)..\Perceptrum\x64\$(Configuration)\</PerceptrumLegacyReleaseRoot>
+    <PerceptrumLegacyReleaseServerRoot Condition="'$(PerceptrumLegacyReleaseServerRoot)'==''">$(MSBuildThisFileDirectory)..\Perceptrum\x64\ReleaseServer\</PerceptrumLegacyReleaseServerRoot>
+    <VcpkgRuntimeBinRoot Condition="'$(Configuration)' == 'Debug'">$(VcpkgInstalledDir)\installed\x64-windows\debug\bin\</VcpkgRuntimeBinRoot>
+    <VcpkgRuntimeBinRoot Condition="'$(VcpkgRuntimeBinRoot)' == ''">$(VcpkgInstalledDir)\installed\x64-windows\bin\</VcpkgRuntimeBinRoot>
+    <DisableXbfGeneration>true</DisableXbfGeneration>
+    <WebView2ProjectKind>native</WebView2ProjectKind>
+    <WindowsSdkBuildToolsPackageDir>$(NuGetPackageRoot)microsoft.windows.sdk.buildtools\$(WindowsSdkBuildToolsPackageVersion)\</WindowsSdkBuildToolsPackageDir>
+    <WindowsAppSDKPackageDir>$(NuGetPackageRoot)microsoft.windowsappsdk\$(WindowsAppSDKPackageVersion)\</WindowsAppSDKPackageDir>
+    <CppWinRTPackageDir>$(NuGetPackageRoot)microsoft.windows.cppwinrt\$(CppWinRTPackageVersion)\</CppWinRTPackageDir>
+    <WebView2PackageDir>$(NuGetPackageRoot)microsoft.web.webview2\$(WebView2PackageVersion)\</WebView2PackageDir>
+    <MicrosoftWindowsAppSDKPackageDir>$(WindowsAppSDKPackageDir)</MicrosoftWindowsAppSDKPackageDir>
+  </PropertyGroup>
+
+  <Import Project="$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.props" Condition="Exists('$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.props')" />
+  <Import Project="$(CppWinRTPackageDir)build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('$(CppWinRTPackageDir)build\native\Microsoft.Windows.CppWinRT.props')" />
+  <Import Project="$(WindowsAppSDKPackageDir)build\native\Microsoft.WindowsAppSDK.props" Condition="Exists('$(WindowsAppSDKPackageDir)build\native\Microsoft.WindowsAppSDK.props')" />
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(PostgreSqlRoot)include;..\Perceptrum\Perceptrum;C:\libs\opencv-4.11.0\build\include;C:\dev\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /bigobj</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>opencv_world4110d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>opencv_world4110.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h">
+      <DependentUpon>App.xaml</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="BootstrapTrace.h" />
+    <ClInclude Include="Platform\AppRuntimeConfig.h" />
+    <ClInclude Include="Platform\LocalBackendHost.h" />
+    <ClInclude Include="Platform\PerceptrumRuntimeHost.h" />
+    <ClInclude Include="Platform\TrayIconHost.h" />
+    <ClInclude Include="MainWindow.xaml.h">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="Pages\SiteHostPage.xaml.h">
+      <DependentUpon>Pages\SiteHostPage.xaml</DependentUpon>
+    </ClInclude>
+    <ClInclude Include="XamlMetaDataProvider.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+    <Page Include="MainWindow.xaml" />
+    <Page Include="Pages\SiteHostPage.xaml" />
+    <Page Include="Styles\Colors.xaml" />
+    <Page Include="Styles\Typography.xaml" />
+    <Page Include="Styles\Surfaces.xaml" />
+    <Page Include="Styles\Controls.xaml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="App.xaml.cpp">
+      <DependentUpon>App.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="Platform\AppRuntimeConfig.cpp" />
+    <ClCompile Include="Platform\LocalBackendHost.cpp" />
+    <ClCompile Include="Platform\PerceptrumRuntimeHost.cpp" />
+    <ClCompile Include="Platform\TrayIconHost.cpp" />
+    <ClCompile Include="MainWindow.xaml.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="Pages\SiteHostPage.xaml.cpp">
+      <DependentUpon>Pages\SiteHostPage.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="XamlMetaDataProviderImpl.cpp" />
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Midl Include="MainWindow.idl">
+      <SubType>Code</SubType>
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </Midl>
+    <Midl Include="XamlMetaDataProvider.idl">
+      <SubType>Code</SubType>
+    </Midl>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ResourceCompile Include="Resources\Drakon.Desktop.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="generated\current_app_icon.ico" Condition="Exists('generated\current_app_icon.ico')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Perceptrum\PerceptrumCore\PerceptrumCore.vcxproj">
+      <Project>{7D8C6B4E-8E27-4C93-8CF0-5F1A910CC3B2}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Target Name="StageLooseXamlForOutput" BeforeTargets="CopyGeneratedXaml" Condition="'$(DisableXbfGeneration)' == 'true'">
+    <ItemGroup>
+      <LooseXaml Include="@(ApplicationDefinition);@(Page)" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(LooseXaml)"
+      DestinationFiles="@(LooseXaml->'$(XamlGeneratedOutputPath)$([MSBuild]::MakeRelative('$(ProjectDir)','%(Identity)'))')"
+      SkipUnchangedFiles="true" />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.targets')" />
+    <Import Project="$(WebView2PackageDir)build\Microsoft.Web.WebView2.targets" Condition="Exists('$(WebView2PackageDir)build\Microsoft.Web.WebView2.targets')" />
+    <Import Project="$(WindowsAppSDKPackageDir)build\native\Microsoft.WindowsAppSDK.targets" Condition="Exists('$(WindowsAppSDKPackageDir)build\native\Microsoft.WindowsAppSDK.targets')" />
+    <Import Project="$(CppWinRTPackageDir)build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('$(CppWinRTPackageDir)build\native\Microsoft.Windows.CppWinRT.targets')" />
+  </ImportGroup>
+
+  <Target Name="CopyLocalFilesOutputGroup"
+          DependsOnTargets="$(CopyLocalFilesOutputGroupDependsOn)"
+          Returns="@(CopyLocalFilesOutputGroupOutput)">
+    <ItemGroup>
+      <CopyLocalFilesOutputGroupOutput Include="@(ReferenceCopyLocalPaths)"
+                                       Condition="'%(ReferenceCopyLocalPaths.Extension)' != '.xml' or '$(AppxCopyLocalFilesOutputGroupIncludeXmlFiles)' == 'true'">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+      </CopyLocalFilesOutputGroupOutput>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="GetMrtPackagingOutputs"
+          Returns="@(PackagingOutputs)">
+    <ItemGroup>
+      <PackagingOutputs Include="$(TargetPath)" Condition="Exists('$(TargetPath)')">
+        <TargetPath>$(TargetFileName)</TargetPath>
+        <OutputGroup>BuiltProjectOutputGroup</OutputGroup>
+        <ProjectName>$(ProjectName)</ProjectName>
+      </PackagingOutputs>
+      <PackagingOutputs Include="@(ReferenceCopyLocalPaths)" Condition="Exists('%(Identity)')">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+        <OutputGroup>CopyLocalFilesOutputGroup</OutputGroup>
+        <ProjectName>$(ProjectName)</ProjectName>
+      </PackagingOutputs>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_GetPackageArchitecture">
+    <PropertyGroup>
+      <PackageArchitecture Condition="'$(PackageArchitecture)' == '' and '$(Platform)' == 'Win32'">x86</PackageArchitecture>
+      <PackageArchitecture Condition="'$(PackageArchitecture)' == ''">$(Platform)</PackageArchitecture>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="_GetDefaultResourceLanguage">
+    <PropertyGroup>
+      <DefaultResourceLanguage Condition="'$(DefaultResourceLanguage)' == ''">$(DefaultLanguage)</DefaultResourceLanguage>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="CopyOpenCvRuntime" AfterTargets="CopyMicrosoftWindowsAppRuntimeBootstrapdllToOutDir">
+    <PropertyGroup>
+      <_OpenCvRuntimeName Condition="'$(Configuration)' == 'Debug'">opencv_world4110d.dll</_OpenCvRuntimeName>
+      <_OpenCvRuntimeName Condition="'$(_OpenCvRuntimeName)' == ''">opencv_world4110.dll</_OpenCvRuntimeName>
+      <_OpenCvRuntimeSource>$(OpenCvBinRoot)$(_OpenCvRuntimeName)</_OpenCvRuntimeSource>
+      <_OpenCvRuntimeDestination>$(OutDir)$(_OpenCvRuntimeName)</_OpenCvRuntimeDestination>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_OpenCvRuntimeSource)"
+          DestinationFiles="$(_OpenCvRuntimeDestination)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(_OpenCvRuntimeSource)')" />
+  </Target>
+
+  <Target Name="CopyPerceptrumRuntimeDlls" AfterTargets="CopyMicrosoftWindowsAppRuntimeBootstrapdllToOutDir">
+    <ItemGroup>
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avcodec-61.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avformat-61.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avutil-59.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)libcurl.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)swresample-5.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)swscale-8.dll" />
+      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)zlib1.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PerceptrumRuntimeDll)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('%(PerceptrumRuntimeDll.Identity)')" />
+  </Target>
+
+  <Target Name="CopyPerceptrumRuntimeTools" AfterTargets="CopyPerceptrumRuntimeDlls">
+    <ItemGroup>
+      <PerceptrumRuntimeTool Include="$(PerceptrumLegacyReleaseRoot)ffmpeg.exe"
+                             Condition="Exists('$(PerceptrumLegacyReleaseRoot)ffmpeg.exe')" />
+      <PerceptrumRuntimeTool Include="$(PerceptrumLegacyReleaseServerRoot)ffmpeg.exe"
+                             Condition="!Exists('$(PerceptrumLegacyReleaseRoot)ffmpeg.exe') and Exists('$(PerceptrumLegacyReleaseServerRoot)ffmpeg.exe')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PerceptrumRuntimeTool)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="'@(PerceptrumRuntimeTool)' != ''" />
+  </Target>
+</Project>

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="{StaticResource DrakonShellBackgroundBrush}">
+
+    <Grid Background="{StaticResource DrakonShellBackgroundBrush}">
+        <WebView2 x:Name="SiteWebView" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+
+        <Grid
+            x:Name="LoadingOverlay"
+            Background="{StaticResource DrakonOverlayBrush}">
+            <Border
+                MaxWidth="640"
+                Padding="28"
+                Background="{StaticResource DrakonPanelBrush}"
+                BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="24"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center">
+                <StackPanel Spacing="18">
+                    <ProgressRing
+                        x:Name="LoadingProgressRing"
+                        Width="44"
+                        Height="44"
+                        HorizontalAlignment="Left"
+                        IsActive="True" />
+
+                    <StackPanel Spacing="8">
+                        <TextBlock
+                            x:Name="StatusTitleText"
+                            FontSize="26"
+                            FontWeight="SemiBold"
+                            Foreground="{StaticResource DrakonStrongTextBrush}"
+                            Text="Carregando a interface real do DrakonSite" />
+                        <TextBlock
+                            x:Name="StatusDetailText"
+                            TextWrapping="Wrap"
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="O executável está inicializando o backend local e a interface React original para manter o comportamento do sistema fonte." />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Button
+                            x:Name="ReloadButton"
+                            Padding="16,10"
+                            Background="{StaticResource DrakonAccentBrush}"
+                            Foreground="White"
+                            Content="Recarregar" />
+                        <Button
+                            x:Name="OpenInBrowserButton"
+                            Padding="16,10"
+                            Background="{StaticResource DrakonShellChipBrush}"
+                            BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                            BorderThickness="1"
+                            Foreground="{StaticResource DrakonStrongTextBrush}"
+                            Content="Abrir no navegador" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Page>

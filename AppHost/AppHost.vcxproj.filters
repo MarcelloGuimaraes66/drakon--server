@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Page Include="MainWindow.xaml" />
+    <Page Include="Pages\AIAgentsPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\BillingPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\CameraEditorDialog.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\CamerasPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\ChatPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\DashboardPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\DrakonFindPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\JobsPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\LoginPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\ModulePlaceholderPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\SettingsPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\ShellPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Pages\SiteHostPage.xaml">
+      <Filter>Pages</Filter>
+    </Page>
+    <Page Include="Styles\Colors.xaml">
+      <Filter>Styles</Filter>
+    </Page>
+    <Page Include="Styles\Typography.xaml">
+      <Filter>Styles</Filter>
+    </Page>
+    <Page Include="Styles\Surfaces.xaml">
+      <Filter>Styles</Filter>
+    </Page>
+    <Page Include="Styles\Controls.xaml">
+      <Filter>Styles</Filter>
+    </Page>
+  </ItemGroup>
+  <ItemGroup>
+    <Midl Include="MainWindow.idl" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp" />
+    <ClCompile Include="App.xaml.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="MainWindow.xaml.cpp" />
+    <ClCompile Include="Persistence\Database.cpp">
+      <Filter>Persistence</Filter>
+    </ClCompile>
+    <ClCompile Include="Persistence\TelegramSettingsRepository.cpp">
+      <Filter>Persistence</Filter>
+    </ClCompile>
+    <ClCompile Include="Platform\LocalBackendHost.cpp">
+      <Filter>Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="Platform\PerceptrumRuntimeHost.cpp">
+      <Filter>Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="Platform\TrayIconHost.cpp">
+      <Filter>Platform</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\AIAgentsPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\BillingPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\CameraEditorDialog.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\CamerasPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\ChatPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\DashboardPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\DrakonFindPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\JobsPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\LoginPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\ModulePlaceholderPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\SettingsPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\ShellPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Pages\SiteHostPage.xaml.cpp">
+      <Filter>Pages</Filter>
+    </ClCompile>
+    <ClCompile Include="Services\DrakonApiClient.cpp">
+      <Filter>Services</Filter>
+    </ClCompile>
+    <ClCompile Include="XamlMetaDataProviderImpl.cpp" />
+    <ClCompile Include="Generated Files\module.g.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h" />
+    <ClInclude Include="BootstrapTrace.h" />
+    <ClInclude Include="Persistence\Database.h">
+      <Filter>Persistence</Filter>
+    </ClInclude>
+    <ClInclude Include="Persistence\TelegramSettingsRepository.h">
+      <Filter>Persistence</Filter>
+    </ClInclude>
+    <ClInclude Include="Resources\Resource.h">
+      <Filter>Resources</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\LocalBackendHost.h">
+      <Filter>Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\PerceptrumRuntimeHost.h">
+      <Filter>Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\TrayIconHost.h">
+      <Filter>Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="Services\DrakonApiClient.h">
+      <Filter>Services</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\AIAgentsPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\BillingPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\CameraEditorDialog.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\CameraRecord.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\CamerasPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\ChatPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\DashboardPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\DrakonFindPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\JobsPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\LoginPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="MainWindow.xaml.h" />
+    <ClInclude Include="Pages\ModulePlaceholderPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\SettingsPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\ShellPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="Pages\SiteHostPage.xaml.h">
+      <Filter>Pages</Filter>
+    </ClInclude>
+    <ClInclude Include="XamlMetaDataProvider.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="Assets\Branding\icon-dark.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Branding\icon-light.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\LockScreenLogo.scale-200.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\SplashScreen.scale-200.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Square150x150Logo.scale-200.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Square44x44Logo.scale-200.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\StoreLogo.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Wide310x150Logo.scale-200.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Branding\wordmark-dark.png">
+      <Filter>Assets</Filter>
+    </Image>
+    <Image Include="Assets\Branding\wordmark-light.png">
+      <Filter>Assets</Filter>
+    </Image>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Resources\drakon.ico">
+      <Filter>Resources</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Resources\Drakon.Desktop.rc">
+      <Filter>Resources</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Assets">
+      <UniqueIdentifier>{96A74C22-D1DA-4608-8868-541D5B0E9336}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Styles">
+      <UniqueIdentifier>{7B1D2F97-5E15-4EF9-A6F9-4AF9A49A4C61}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Pages">
+      <UniqueIdentifier>{9E5C22B5-E5F6-4E40-9C5F-9C6B5E2AC2F4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Generated Files">
+      <UniqueIdentifier>{AB31B77C-3122-4E1C-9D08-A29D9A8099B4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Services">
+      <UniqueIdentifier>{3B791AAA-0E55-4E4F-B5F2-B7A228AC2F18}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Platform">
+      <UniqueIdentifier>{F189A50F-713B-4FC7-931A-09E834121E4A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resources">
+      <UniqueIdentifier>{5A784A2F-5B0C-44C5-84FA-D1F9F2A1A71B}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Persistence">
+      <UniqueIdentifier>{B0D2350C-7DD2-4232-8D5A-53B2FE5391FA}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="readme.txt" />
+  </ItemGroup>
+</Project>

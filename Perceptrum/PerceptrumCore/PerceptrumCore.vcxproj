@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{7D8C6B4E-8E27-4C93-8CF0-5F1A910CC3B2}</ProjectGuid>
+    <RootNamespace>PerceptrumCore</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgManifestRoot>$(MSBuildThisFileDirectory)..</VcpkgManifestRoot>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>..\Perceptrum;C:\libs\opencv-4.11.0\build\include;C:\dev\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Lib>
+      <OutputFile>$(OutDir)PerceptrumCore.lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>..\Perceptrum;C:\libs\opencv-4.11.0\build\include;C:\dev\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Lib>
+      <OutputFile>$(OutDir)PerceptrumCore.lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="..\Perceptrum\camera\CameraConfig.h" />
+    <ClInclude Include="..\Perceptrum\camera\CameraSession.h" />
+    <ClInclude Include="..\Perceptrum\camera\Frame.h" />
+    <ClInclude Include="..\Perceptrum\camera\FrameBuffer.h" />
+    <ClInclude Include="..\Perceptrum\camera\FrameDiskWriter.h" />
+    <ClInclude Include="..\Perceptrum\camera\MotionDetector.h" />
+    <ClInclude Include="..\Perceptrum\camera\PerfMetrics.h" />
+    <ClInclude Include="..\Perceptrum\camera\RtspCapture.h" />
+    <ClInclude Include="..\Perceptrum\comm\BackendConfig.h" />
+    <ClInclude Include="..\Perceptrum\comm\PairingClient.h" />
+    <ClInclude Include="..\Perceptrum\comm\PgClient.h" />
+    <ClInclude Include="..\Perceptrum\comm\TelegramNotifier.h" />
+    <ClInclude Include="..\Perceptrum\comm\TelegramSettings.h" />
+    <ClInclude Include="..\Perceptrum\core\AgentCore.h" />
+    <ClInclude Include="..\Perceptrum\core\Localization.h" />
+    <ClInclude Include="..\Perceptrum\core\TemporalEngine.h" />
+    <ClInclude Include="..\Perceptrum\jobs\JobPayloadParser.h" />
+    <ClInclude Include="..\Perceptrum\jobs\JobRuntime.h" />
+    <ClInclude Include="..\Perceptrum\jobs\JobTypes.h" />
+    <ClInclude Include="..\Perceptrum\logging\Logging.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\ChatV2Orchestrator.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\ConfigUtils.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\HttpUtils.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\KnowledgeBase.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\LocalLlmClient.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\PromptBuilder.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\SkillRegistry.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\SkillTypes.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCameraSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateJobSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\VideoSearchSkill.h" />
+    <ClInclude Include="..\Perceptrum\runtime\BrandingRuntime.h" />
+    <ClInclude Include="..\Perceptrum\runtime\HeadlessService.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\Perceptrum\camera\CameraSession.cpp" />
+    <ClCompile Include="..\Perceptrum\camera\FrameBuffer.cpp" />
+    <ClCompile Include="..\Perceptrum\camera\FrameDiskWriter.cpp" />
+    <ClCompile Include="..\Perceptrum\camera\MotionDetector.cpp" />
+    <ClCompile Include="..\Perceptrum\camera\RtspCapture.cpp" />
+    <ClCompile Include="..\Perceptrum\comm\PairingClient.cpp" />
+    <ClCompile Include="..\Perceptrum\comm\TelegramNotifier.cpp" />
+    <ClCompile Include="..\Perceptrum\comm\TelegramNotifierSendVideo.cpp" />
+    <ClCompile Include="..\Perceptrum\core\AgentCore.cpp" />
+    <ClCompile Include="..\Perceptrum\jobs\JobPayloadParser.cpp" />
+    <ClCompile Include="..\Perceptrum\jobs\JobRuntime.cpp" />
+    <ClCompile Include="..\Perceptrum\logging\Logging.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\ChatV2Orchestrator.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\ConfigUtils.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\HttpUtils.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\KnowledgeBase.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\LocalLlmClient.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\PromptBuilder.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\SkillRegistry.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateJobSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\VideoSearchSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\runtime\BrandingRuntime.cpp" />
+    <ClCompile Include="..\Perceptrum\runtime\HeadlessService.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

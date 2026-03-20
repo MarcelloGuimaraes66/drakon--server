@@ -1,0 +1,127 @@
+{
+  "activeBrand": "drakon",
+  "brands": {
+    "drakon": {
+      "displayName": "Drakon",
+      "assistantName": "Drakon AI",
+      "chatName": "Drakon Chat",
+      "quickChatName": "Drakon Quick Chat",
+      "siteTitle": "Drakon",
+      "siteUrl": "https://drakon-solution.com/",
+      "siteDescription": "AI-powered CCTV assistant that understands your cameras.",
+      "marketingTitle": "Drakon - Intelligent CCTV Assistant",
+      "trayTooltip": "Drakon agent running",
+      "backgroundNotificationTitle": "",
+      "backgroundNotificationMessage": "Drakon is now running in the background.",
+      "windowClassName": "DrakonMainWindowClass",
+      "windowTitle": "Drakon",
+      "pairDialogTitle": "Drakon - Pair",
+      "pairingSuccessTitle": "Drakon",
+      "aboutDialogTitle": "About Drakon",
+      "aboutVersionText": "Drakon, Version 1.0",
+      "resourceKey": "DRAKON",
+      "emailSubjectPrefix": "[Drakon]",
+      "appUserModelId": "Drakon",
+      "trayIconGuid": "{A0BEB4AE-3A79-4E65-B8D8-3A7C5F99D601}",
+      "storageNamespace": "drakon",
+      "eventNamespace": "drakon",
+      "cookiePrefix": "drakon",
+      "dataRootWindows": "C:\\DrakonData",
+      "inferenceLoopTempDirName": "inferenceLoopDrakon",
+      "jobsInferenceTempDirName": "jobsInferenceDrakon",
+      "videoSegmentsTempDirName": "drakon_video_segments",
+      "debugConcatTempDirName": "drakon_debug_concat",
+      "uploadedVideosTempDirName": "drakon_uploaded_videos",
+      "baseUrlEnvVarName": "DRAKON_BASE_URL",
+      "legacyBaseUrlEnvVarName": "PERCEPTRUM_BASE_URL",
+      "baseUrlFileName": "drakon_base_url.txt",
+      "legacyBaseUrlFileName": "perceptrum_base_url.txt",
+      "allowedOrigins": [
+        "https://drakon-solution.com",
+        "https://www.drakon-solution.com"
+      ],
+      "features": {
+        "billingEnabled": false,
+        "drakonFindEnabled": true,
+        "googleLoginEnabled": false
+      },
+      "frontend": {
+        "logoMode": "image",
+        "wordmarkDarkSource": "DrakonSite/public/drakon-logo-sidebar.png",
+        "wordmarkLightSource": "DrakonSite/public/drakon-logo-sidebar_preta.png",
+        "loginWordmarkDarkSource": null,
+        "loginWordmarkLightSource": null,
+        "iconDarkSource": "DrakonSite/public/apple-touch-icon.png",
+        "iconLightSource": "DrakonSite/public/LOGO-WITHOUT-TEX-BLACK-128.png",
+        "faviconSource": "DrakonSite/public/favicon.ico",
+        "faviconPngSource": "DrakonSite/public/favicon-32x32.png",
+        "appleTouchSource": "DrakonSite/public/apple-touch-icon.png"
+      },
+      "cpp": {
+        "iconSource": "AppHost/Resources/drakon.ico",
+        "targetName": "Drakon"
+      }
+    },
+    "perceptrum": {
+      "displayName": "Perceptrum",
+      "assistantName": "Perceptrum AI",
+      "chatName": "Perceptrum Chat",
+      "quickChatName": "Perceptrum Quick Chat",
+      "siteTitle": "Perceptrum",
+      "siteUrl": "https://perceptrum.ai/",
+      "siteDescription": "AI-powered CCTV assistant that understands your cameras.",
+      "marketingTitle": "Perceptrum.ai - Intelligent CCTV Assistant",
+      "trayTooltip": "Perceptrum agent running",
+      "backgroundNotificationTitle": "",
+      "backgroundNotificationMessage": "Perceptrum is now running in the background.",
+      "windowClassName": "PerceptrumMainWindowClass",
+      "windowTitle": "Perceptrum",
+      "pairDialogTitle": "Perceptrum - Pair",
+      "pairingSuccessTitle": "Perceptrum",
+      "aboutDialogTitle": "About Perceptrum",
+      "aboutVersionText": "Perceptrum, Version 1.0",
+      "resourceKey": "PERCEPTRUM",
+      "emailSubjectPrefix": "[Perceptrum]",
+      "appUserModelId": "Perceptrum",
+      "trayIconGuid": "{0F84A457-60F0-4E95-A60C-0C28E0BC61C7}",
+      "storageNamespace": "perceptrum",
+      "eventNamespace": "perceptrum",
+      "cookiePrefix": "perceptrum",
+      "dataRootWindows": "C:\\PerceptrumData",
+      "inferenceLoopTempDirName": "inferenceLoopPerceptrum",
+      "jobsInferenceTempDirName": "jobsInferencePerceptrum",
+      "videoSegmentsTempDirName": "perceptrum_video_segments",
+      "debugConcatTempDirName": "perceptrum_debug_concat",
+      "uploadedVideosTempDirName": "perceptrum_uploaded_videos",
+      "baseUrlEnvVarName": "PERCEPTRUM_BASE_URL",
+      "legacyBaseUrlEnvVarName": "PERCEPTRUM_BASE_URL",
+      "baseUrlFileName": "perceptrum_base_url.txt",
+      "legacyBaseUrlFileName": "perceptrum_base_url.txt",
+      "allowedOrigins": [
+        "https://perceptrum.ai",
+        "https://www.perceptrum.ai"
+      ],
+      "features": {
+        "billingEnabled": true,
+        "drakonFindEnabled": false,
+        "googleLoginEnabled": true
+      },
+      "frontend": {
+        "logoMode": "image",
+        "wordmarkDarkSource": "DrakonSite/public/perceptrum_logo_sidebar_2.png",
+        "wordmarkLightSource": "DrakonSite/public/perceptrum_logo_sidebar_2.png",
+        "loginWordmarkDarkSource": "DrakonSite/public/new_perpceptrum_logo.png",
+        "loginWordmarkLightSource": "DrakonSite/public/new_perpceptrum_logo.png",
+        "iconDarkSource": "DrakonSite/public/perceptrum_icon.png",
+        "iconLightSource": "DrakonSite/public/perceptrum_icon.png",
+        "faviconSource": "DrakonSite/public/perceptrum_icon_multi.ico",
+        "faviconPngSource": "DrakonSite/public/perceptrum_icon.png",
+        "appleTouchSource": "DrakonSite/public/perceptrum_icon.png"
+      },
+      "cpp": {
+        "iconSource": "DrakonSite/public/perceptrum_icon_multi.ico",
+        "targetName": "Perceptrum"
+      }
+    }
+  }
+}

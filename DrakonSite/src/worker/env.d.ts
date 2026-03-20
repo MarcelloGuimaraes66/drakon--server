@@ -1,0 +1,36 @@
+import "hono";
+
+declare global {
+  interface Env {
+    DB: D1Database;
+    R2_BUCKET: R2Bucket;
+    GOOGLE_OAUTH_CLIENT_ID: string;
+    GOOGLE_OAUTH_CLIENT_SECRET: string;
+    GOOGLE_OAUTH_REDIRECT_URI?: string;
+    STRIPE_SECRET_KEY: string;
+    STRIPE_WEBHOOK_SECRET: string;
+    STRIPE_CHAT_PAYG_PRICE_ID: string;
+    R2_PUBLIC_BASE_URL?: string;
+    LOCAL_MEDIA_BASE_DIR?: string;
+    APP_ALLOWED_ORIGINS?: string;
+    USD_TO_BRL?: string;
+    SCHEDULER_TICK_SECRET?: string;
+    CHAT_V2_ENABLED?: string;
+  }
+
+  type WorkerAuthenticatedUser = {
+    id: string;
+    email: string;
+    auth_provider: string;
+    country_code?: string | null;
+    google_user_data?: unknown;
+  };
+}
+
+declare module "hono" {
+  interface ContextVariableMap {
+    user?: WorkerAuthenticatedUser;
+  }
+}
+
+export {};

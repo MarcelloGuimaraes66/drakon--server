@@ -1,0 +1,345 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="Transparent"
+    RequestedTheme="Dark">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Padding="24">
+            <StackPanel
+                MaxWidth="1480"
+                HorizontalAlignment="Center"
+                Spacing="20">
+                <InfoBar
+                    x:Name="LoginPageInfoBar"
+                    IsOpen="False"
+                    IsClosable="True"
+                    Severity="Informational" />
+
+                <Grid
+                    x:Name="TopActionsDesktop"
+                    ColumnSpacing="16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock
+                            Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                            Text="Login" />
+                        <TextBlock
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Conversão fiel da entrada do DrakonSite para XAML nativo, mantendo branding, idioma, pairing e os fluxos principais de autenticação."
+                            TextWrapping="WrapWholeWords" />
+                    </StackPanel>
+
+                    <StackPanel
+                        Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="12">
+                        <Button Content="Português" />
+                        <Button Content="Parear estação" />
+                    </StackPanel>
+                </Grid>
+
+                <StackPanel
+                    x:Name="TopActionsCompact"
+                    Visibility="Collapsed"
+                    Spacing="12">
+                    <StackPanel Spacing="6">
+                        <TextBlock
+                            Style="{StaticResource DrakonDisplayTitleTextStyle}"
+                            Text="Login" />
+                        <TextBlock
+                            Style="{StaticResource DrakonBodyTextStyle}"
+                            Text="Conversão fiel da entrada do DrakonSite para XAML nativo, com layout fluido para janelas menores."
+                            TextWrapping="WrapWholeWords" />
+                    </StackPanel>
+
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <Button Content="Português" />
+                        <Button
+                            Grid.Column="1"
+                            Content="Parear estação" />
+                    </Grid>
+                </StackPanel>
+
+                <Grid
+                    x:Name="DesktopLayout"
+                    ColumnSpacing="24">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="1.15*" />
+                        <ColumnDefinition Width="0.95*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Border
+                        Grid.Column="0"
+                        Style="{StaticResource DrakonHeroPanelStyle}">
+                        <StackPanel Spacing="20">
+                            <StackPanel Spacing="14">
+                                <Image
+                                    Height="54"
+                                    HorizontalAlignment="Left"
+                                    Source="ms-appx:///Assets/Branding/wordmark-dark.png"
+                                    Stretch="Uniform" />
+                                <TextBlock
+                                    Style="{StaticResource DrakonBodyTextStyle}"
+                                    Foreground="{StaticResource DrakonStrongTextBrush}"
+                                    Text="A mesma entrada visual do DrakonSite será portada para WinUI 3, mantendo identidade, fluidez e os mesmos grupos de informação."
+                                    TextWrapping="WrapWholeWords" />
+                            </StackPanel>
+
+                            <Grid ColumnSpacing="16">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+
+                                <Border Style="{StaticResource DrakonInsetPanelStyle}">
+                                    <StackPanel Spacing="8">
+                                        <TextBlock
+                                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                            Text="Fluxos confirmados" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="/api/auth/local/login"
+                                            TextWrapping="WrapWholeWords" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="/api/auth/local/signup"
+                                            TextWrapping="WrapWholeWords" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="/api/auth/country"
+                                            TextWrapping="WrapWholeWords" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="redirect /ai-agents"
+                                            TextWrapping="WrapWholeWords" />
+                                    </StackPanel>
+                                </Border>
+
+                                <Border
+                                    Grid.Column="1"
+                                    Style="{StaticResource DrakonInsetPanelStyle}">
+                                    <StackPanel Spacing="8">
+                                        <TextBlock
+                                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                            Text="Elementos visuais preservados" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="Wordmark central, seletor de idioma, login local, signup local e reserva para login social."
+                                            TextWrapping="WrapWholeWords" />
+                                        <TextBlock
+                                            Style="{StaticResource DrakonBodyTextStyle}"
+                                            Text="A janela pode ser redimensionada e a composição troca para modo compacto sem perder hierarquia."
+                                            TextWrapping="WrapWholeWords" />
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+
+                            <InfoBar
+                                IsOpen="True"
+                                IsClosable="False"
+                                Message="Próximo acoplamento: autenticação real, country detection, callback OAuth e pairing nativo."
+                                Severity="Informational" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border
+                        Grid.Column="1"
+                        Style="{StaticResource DrakonPanelStyle}">
+                        <StackPanel Spacing="16">
+                            <StackPanel Spacing="6">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="Authentication" />
+                                <TextBlock
+                                    Style="{StaticResource DrakonCaptionTextStyle}"
+                                    Text="Mesma separação estrutural do site: login e criação de conta em tabs."
+                                    TextWrapping="WrapWholeWords" />
+                            </StackPanel>
+
+                            <TabView
+                                IsAddTabButtonVisible="False"
+                                TabWidthMode="Equal">
+                                <TabViewItem Header="Entrar" IsClosable="False">
+                                    <StackPanel
+                                        Margin="12"
+                                        Spacing="16">
+                                        <TextBlock
+                                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                            Text="Welcome back" />
+                                        <TextBox
+                                            x:Name="DesktopLoginEmailTextBox"
+                                            Header="E-mail"
+                                            PlaceholderText="voce@empresa.com" />
+                                        <PasswordBox
+                                            x:Name="DesktopLoginPasswordBox"
+                                            Header="Senha"
+                                            PasswordRevealMode="Visible" />
+                                        <Grid ColumnSpacing="12">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <CheckBox
+                                                x:Name="DesktopRememberCheckBox"
+                                                Content="Lembrar dispositivo" />
+                                            <Button
+                                                x:Name="DesktopForgotPasswordButton"
+                                                Grid.Column="1"
+                                                Content="Esqueci a senha" />
+                                        </Grid>
+                                        <Button
+                                            x:Name="DesktopLoginSubmitButton"
+                                            Content="Continuar"
+                                            Style="{StaticResource AccentButtonStyle}" />
+                                        <Button
+                                            x:Name="DesktopGoogleLoginButton"
+                                            Content="Continuar com Google" />
+                                    </StackPanel>
+                                </TabViewItem>
+
+                                <TabViewItem Header="Criar conta" IsClosable="False">
+                                    <StackPanel
+                                        Margin="12"
+                                        Spacing="16">
+                                        <TextBlock
+                                            Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                            Text="Create account" />
+                                        <TextBox
+                                            x:Name="DesktopSignupEmailTextBox"
+                                            Header="E-mail"
+                                            PlaceholderText="voce@empresa.com" />
+                                        <PasswordBox
+                                            x:Name="DesktopSignupPasswordBox"
+                                            Header="Senha"
+                                            PasswordRevealMode="Visible" />
+                                        <ComboBox
+                                            x:Name="DesktopSignupCountryComboBox"
+                                            Header="País"
+                                            PlaceholderText="Selecione seu país">
+                                            <ComboBoxItem Content="Brasil" Tag="BR" />
+                                            <ComboBoxItem Content="United States" Tag="US" />
+                                            <ComboBoxItem Content="España" Tag="ES" />
+                                            <ComboBoxItem Content="France" Tag="FR" />
+                                        </ComboBox>
+                                        <CheckBox
+                                            x:Name="DesktopSignupTermsCheckBox"
+                                            Content="Concordo com os termos e política de privacidade" />
+                                        <Button
+                                            x:Name="DesktopSignupSubmitButton"
+                                            Content="Criar conta"
+                                            Style="{StaticResource AccentButtonStyle}" />
+                                    </StackPanel>
+                                </TabViewItem>
+                            </TabView>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <StackPanel
+                    x:Name="CompactLayout"
+                    Visibility="Collapsed"
+                    Spacing="16">
+                    <Border Style="{StaticResource DrakonHeroPanelStyle}">
+                        <StackPanel Spacing="16">
+                            <Image
+                                Height="46"
+                                HorizontalAlignment="Left"
+                                Source="ms-appx:///Assets/Branding/wordmark-dark.png"
+                                Stretch="Uniform" />
+                            <TextBlock
+                                Style="{StaticResource DrakonBodyTextStyle}"
+                                Foreground="{StaticResource DrakonStrongTextBrush}"
+                                Text="A mesma identidade do login web, agora em uma composição vertical para resize e alturas menores."
+                                TextWrapping="WrapWholeWords" />
+                            <InfoBar
+                                IsOpen="True"
+                                IsClosable="False"
+                                Message="Fluxos preservados: login local, signup local, idioma e pairing."
+                                Severity="Informational" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource DrakonPanelStyle}">
+                        <TabView
+                            IsAddTabButtonVisible="False"
+                            TabWidthMode="Equal">
+                            <TabViewItem Header="Entrar" IsClosable="False">
+                                <StackPanel
+                                    Margin="12"
+                                    Spacing="16">
+                                    <TextBox
+                                        x:Name="CompactLoginEmailTextBox"
+                                        Header="E-mail"
+                                        PlaceholderText="voce@empresa.com" />
+                                    <PasswordBox
+                                        x:Name="CompactLoginPasswordBox"
+                                        Header="Senha"
+                                        PasswordRevealMode="Visible" />
+                                    <CheckBox
+                                        x:Name="CompactRememberCheckBox"
+                                        Content="Lembrar dispositivo" />
+                                    <Button
+                                        x:Name="CompactForgotPasswordButton"
+                                        Content="Esqueci a senha" />
+                                    <Button
+                                        x:Name="CompactLoginSubmitButton"
+                                        Content="Continuar"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                    <Button
+                                        x:Name="CompactGoogleLoginButton"
+                                        Content="Continuar com Google" />
+                                </StackPanel>
+                            </TabViewItem>
+
+                            <TabViewItem Header="Criar conta" IsClosable="False">
+                                <StackPanel
+                                    Margin="12"
+                                    Spacing="16">
+                                    <TextBox
+                                        x:Name="CompactSignupEmailTextBox"
+                                        Header="E-mail"
+                                        PlaceholderText="voce@empresa.com" />
+                                    <PasswordBox
+                                        x:Name="CompactSignupPasswordBox"
+                                        Header="Senha"
+                                        PasswordRevealMode="Visible" />
+                                    <ComboBox
+                                        x:Name="CompactSignupCountryComboBox"
+                                        Header="País"
+                                        PlaceholderText="Selecione seu país">
+                                        <ComboBoxItem Content="Brasil" Tag="BR" />
+                                        <ComboBoxItem Content="United States" Tag="US" />
+                                        <ComboBoxItem Content="España" Tag="ES" />
+                                        <ComboBoxItem Content="France" Tag="FR" />
+                                    </ComboBox>
+                                    <CheckBox
+                                        x:Name="CompactSignupTermsCheckBox"
+                                        Content="Concordo com os termos e política de privacidade" />
+                                    <Button
+                                        x:Name="CompactSignupSubmitButton"
+                                        Content="Criar conta"
+                                        Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                            </TabViewItem>
+                        </TabView>
+                    </Border>
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Page>

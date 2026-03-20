@@ -1,0 +1,19459 @@
+#include "AgentCore.h"
+#include "Localization.h"
+#include "TemporalEngine.h"
+#include "../orchestrator/ChatV2Orchestrator.h"
+#include "../orchestrator/ConfigUtils.h"
+#include "../orchestrator/ProgressUtils.h"
+
+#include "../camera/CameraConfig.h"
+#include "../camera/CameraSession.h"
+#include "../camera/RtspCapture.h"
+#include "../logging/Logging.h"
+#include "../jobs/JobRuntime.h"
+#include "../generated/Branding.h"
+
+
+#include <nlohmann/json.hpp>
+#include <curl/curl.h>
+#include <thread>
+#include <atomic>
+#include <string>
+#include <sstream>
+#include <vector>
+
+#include <chrono>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+
+#include <filesystem>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <functional>
+#include <set>
+#include <unordered_map>
+#include <unordered_set>
+
+#define NOMINMAX
+#include <Windows.h>
+#include <wincrypt.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
+
+#include <fstream>
+#include <mutex>      
+
+#include <opencv2/opencv.hpp>
+
+
+
+using json = nlohmann::json;
+
+
+using FrameHit = AgentCore::FrameHit;
+
+
+namespace fs = std::filesystem;
+
+static ErrorLogContext makeAgentErrorContext_(
+    const std::string& flow,
+    const std::string& functionName,
+    const std::string& operation,
+    const json& context = json::object())
+{
+    ErrorLogContext ctx;
+    ctx.flow = flow;
+    ctx.functionName = functionName;
+    ctx.operation = operation;
+    if (!context.is_null() && !context.empty()) {
+        ctx.contextJson = context.dump();
+    }
+    return ctx;
+}
+
+static void logAgentException_(
+    const std::string& sourceId,
+    const std::string& flow,
+    const std::string& functionName,
+    const std::string& operation,
+    const json& context,
+    const std::exception& ex)
+{
+    Logger::instance().logException(
+        sourceId,
+        makeAgentErrorContext_(flow, functionName, operation, context),
+        ex
+    );
+}
+
+static void logAgentUnknownException_(
+    const std::string& sourceId,
+    const std::string& flow,
+    const std::string& functionName,
+    const std::string& operation,
+    const json& context)
+{
+    Logger::instance().logUnknownException(
+        sourceId,
+        makeAgentErrorContext_(flow, functionName, operation, context)
+    );
+}
+
+static std::string sourceIdForCamera_(int cameraId, const std::string& fallback = "agent")
+{
+    return cameraId > 0 ? std::to_string(cameraId) : fallback;
+}
+
+static std::string lowerAsciiCopy_(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+struct TemporalRuntimeGuardConfig_ {
+    bool failClosedEnabled = true;
+    bool shadowOnly = false;
+    bool allowSafeFallback = false;
+    int rolloutPercent = 100;
+};
+
+static const TemporalRuntimeGuardConfig_& temporalRuntimeGuardConfig_()
+{
+    static const TemporalRuntimeGuardConfig_ config = [] {
+        TemporalRuntimeGuardConfig_ loaded;
+        loaded.failClosedEnabled = chatv2::parseBoolValue(
+            chatv2::loadConfigValue(
+                "TEMPORAL_FAIL_CLOSED_ENABLED",
+                { "temporal_fail_closed_enabled.txt" }),
+            true);
+        loaded.shadowOnly = chatv2::parseBoolValue(
+            chatv2::loadConfigValue(
+                "TEMPORAL_FAIL_CLOSED_SHADOW_ONLY",
+                { "temporal_fail_closed_shadow_only.txt" }),
+            false);
+        loaded.allowSafeFallback = chatv2::parseBoolValue(
+            chatv2::loadConfigValue(
+                "TEMPORAL_ALLOW_SAFE_FALLBACK",
+                { "temporal_allow_safe_fallback.txt" }),
+            false);
+        loaded.rolloutPercent = chatv2::parseIntValue(
+            chatv2::loadConfigValue(
+                "TEMPORAL_FAIL_CLOSED_ROLLOUT_PERCENT",
+                { "temporal_fail_closed_rollout_percent.txt" }),
+            100,
+            0,
+            100);
+        return loaded;
+    }();
+    return config;
+}
+
+static bool temporalRuntimeGuardApplies_(
+    const TemporalRuntimeGuardConfig_& config,
+    const std::string& sourceType,
+    int sourceId)
+{
+    if (!config.failClosedEnabled) return false;
+    if (config.rolloutPercent >= 100) return true;
+    if (config.rolloutPercent <= 0) return false;
+    const std::string rolloutKey =
+        sourceType + "#" + std::to_string(std::max(0, sourceId));
+    return static_cast<int>(temporal::fnv1a64(rolloutKey) % 100ULL) < config.rolloutPercent;
+}
+
+static json makeTemporalRuntimeGuardEnvelope_(
+    const std::string& compileStatus,
+    const std::string& guardMode,
+    const std::string& stageTag,
+    const std::string& reason,
+    const std::string& promptHash,
+    const std::string& promptCore,
+    const std::string& alertCondition,
+    const std::string& negativeCondition,
+    const std::string& inputType,
+    const std::string& language)
+{
+    return json{
+        { "compile_status", compileStatus },
+        { "compile_confidence", 0.0 },
+        { "guard_mode", guardMode },
+        { "guard_stage", stageTag },
+        { "guard_reason", reason },
+        { "blockers", json::array({ reason }) },
+        { "plan_json", {
+            { "schema_version", "temporal-plan/1.0" },
+            { "plan_hash", promptHash },
+            { "prompt_fingerprint", {
+                { "prompt_core", promptCore },
+                { "alert_condition", alertCondition },
+                { "negative_condition", negativeCondition },
+                { "input_type", inputType },
+                { "language", language }
+            } }
+        } }
+    };
+}
+
+static int clampRequestedModelFps_(int fps)
+{
+    if (fps < 1) return 1;
+    if (fps > 10) return 10;
+    return fps;
+}
+
+static int normalizeCaptureClipSeconds_(int clipSeconds)
+{
+    return clipSeconds > 10 ? 60 : 10;
+}
+
+static int normalizeAlgorithmModelFps_(
+    int requestedFps,
+    const std::string& inferenceModel,
+    const std::string& inputType)
+{
+    const std::string normalizedInputType = lowerAsciiCopy_(inputType.empty() ? std::string("video") : inputType);
+    (void)inferenceModel;
+    if (normalizedInputType != "video") {
+        return 1;
+    }
+    return clampRequestedModelFps_(requestedFps);
+}
+
+
+static bool extractTimestampFromFrameStem(const std::string& stem,
+    std::string& outTs)
+{
+    std::vector<std::string> parts;
+    std::stringstream ss(stem);
+    std::string token;
+
+    while (std::getline(ss, token, '_')) {
+        parts.push_back(token);
+    }
+
+    // Expect at least: [cameraId, YYYYMMDD, HHMMSS, frameId]
+    if (parts.size() < 3) {
+        return false;
+    }
+
+    // Build "YYYYMMDD_HHMMSS"
+    outTs = parts[1] + "_" + parts[2];
+    return true;
+}
+
+
+/*
+// Forward declaration for your existing Gemini HTTP helper
+std::string httpPostJsonGemini(
+    const std::string& api_key,
+    const std::string& modelName,
+    const nlohmann::json& bodyJson);
+*/
+
+
+std::string httpPostJsonGemini(
+    const std::string& api_key,
+    const std::string& modelName,
+    const nlohmann::json& bodyJson,
+    const std::function<void()>& onFirstRetry);
+
+
+
+static bool parseTimestampToTimePoint(
+    const std::string& ts, // "YYYYMMDD_HHMMSS"
+    std::chrono::system_clock::time_point& outTp)
+{
+    if (ts.size() != 15 || ts[8] != '_') {
+        return false;
+    }
+
+    std::tm tm{};
+    try {
+        tm.tm_year = std::stoi(ts.substr(0, 4)) - 1900;
+        tm.tm_mon = std::stoi(ts.substr(4, 2)) - 1;
+        tm.tm_mday = std::stoi(ts.substr(6, 2));
+        tm.tm_hour = std::stoi(ts.substr(9, 2));
+        tm.tm_min = std::stoi(ts.substr(11, 2));
+        tm.tm_sec = std::stoi(ts.substr(13, 2));
+    }
+    catch (...) {
+        return false;
+    }
+
+#if defined(_WIN32)
+    std::time_t t = _mkgmtime(&tm);
+#else
+    std::time_t t = timegm(&tm);
+#endif
+    if (t == -1) return false;
+
+    outTp = std::chrono::system_clock::from_time_t(t);
+    return true;
+}
+
+static std::string formatTimePointToTimestampUtc(
+    const std::chrono::system_clock::time_point& tp)
+{
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm) == 0) {
+        return "";
+    }
+    return std::string(buf);
+}
+
+static std::string formatTimePointToIsoUtcZ_(
+    const std::chrono::system_clock::time_point& tp)
+{
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0) {
+        return "";
+    }
+    return std::string(buf);
+}
+
+static bool parseCompactLocalTimestampToTimePoint_(
+    const std::string& ts,
+    std::chrono::system_clock::time_point& outTp);
+
+static std::string trimAscii(const std::string& input);
+
+static std::string formatTimePointToLocalIso_(
+    const std::chrono::system_clock::time_point& tp)
+{
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tmLocal{};
+#if defined(_WIN32)
+    localtime_s(&tmLocal, &t);
+#else
+    localtime_r(&t, &tmLocal);
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmLocal) == 0) {
+        return "";
+    }
+    return std::string(buf);
+}
+
+static std::string formatTimePointToCompactLocalTimestampWithMillis_(
+    const std::chrono::system_clock::time_point& tp)
+{
+    const auto wholeSeconds = std::chrono::time_point_cast<std::chrono::seconds>(tp);
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(tp - wholeSeconds);
+    const std::time_t t = std::chrono::system_clock::to_time_t(wholeSeconds);
+    std::tm tmLocal{};
+#if defined(_WIN32)
+    localtime_s(&tmLocal, &t);
+#else
+    localtime_r(&t, &tmLocal);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmLocal, "%Y%m%d_%H%M%S")
+        << '_' << std::setw(3) << std::setfill('0') << millis.count();
+    return oss.str();
+}
+
+static bool parseCompactLocalTimestampWithMillisToTimePoint_(
+    const std::string& raw,
+    std::chrono::system_clock::time_point& outTp)
+{
+    outTp = {};
+    const std::string ts = trimAscii(raw);
+    if (ts.empty()) return false;
+    if (ts.size() == 15 && ts[8] == '_') {
+        return parseCompactLocalTimestampToTimePoint_(ts, outTp);
+    }
+    if (ts.size() != 19 || ts[8] != '_' || ts[15] != '_') {
+        return false;
+    }
+    if (!std::isdigit(static_cast<unsigned char>(ts[16])) ||
+        !std::isdigit(static_cast<unsigned char>(ts[17])) ||
+        !std::isdigit(static_cast<unsigned char>(ts[18])))
+    {
+        return false;
+    }
+
+    if (!parseCompactLocalTimestampToTimePoint_(ts.substr(0, 15), outTp)) {
+        return false;
+    }
+
+    try {
+        outTp += std::chrono::milliseconds(std::stoi(ts.substr(16, 3)));
+    }
+    catch (...) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool parseVideoOffsetToDurationMs_(
+    const std::string& value,
+    std::chrono::milliseconds& outDuration)
+{
+    outDuration = std::chrono::milliseconds(0);
+
+    std::string s = trimAscii(value);
+    if (s.empty()) return false;
+
+    std::vector<std::string> parts;
+    {
+        std::stringstream ss(s);
+        std::string token;
+        while (std::getline(ss, token, ':')) {
+            parts.push_back(token);
+        }
+    }
+
+    if (parts.size() != 2 && parts.size() != 3) {
+        return false;
+    }
+
+    auto parseInt = [](const std::string& x, int& out) -> bool {
+        if (x.empty()) return false;
+        try {
+            size_t idx = 0;
+            int v = std::stoi(x, &idx);
+            if (idx != x.size()) return false;
+            out = v;
+            return true;
+        }
+        catch (...) {
+            return false;
+        }
+    };
+
+    auto parseSeconds = [](const std::string& x, double& out) -> bool {
+        if (x.empty()) return false;
+        try {
+            size_t idx = 0;
+            double v = std::stod(x, &idx);
+            if (idx != x.size()) return false;
+            out = v;
+            return true;
+        }
+        catch (...) {
+            return false;
+        }
+    };
+
+    int hh = 0;
+    int mm = 0;
+    double ss = 0.0;
+    if (parts.size() == 2) {
+        if (!parseInt(parts[0], mm) || !parseSeconds(parts[1], ss)) return false;
+    }
+    else {
+        if (!parseInt(parts[0], hh) || !parseInt(parts[1], mm) || !parseSeconds(parts[2], ss)) {
+            return false;
+        }
+        if (mm < 0 || mm > 59) return false;
+    }
+
+    if (hh < 0 || mm < 0 || ss < 0.0 || ss >= 60.0) return false;
+
+    const double totalMs =
+        (static_cast<double>(hh) * 3600.0 +
+         static_cast<double>(mm) * 60.0 +
+         ss) * 1000.0;
+    outDuration = std::chrono::milliseconds(
+        static_cast<long long>(std::llround(totalMs))
+    );
+    return true;
+}
+
+static bool parseCompactLocalTimestampToTimePoint_(
+    const std::string& ts,
+    std::chrono::system_clock::time_point& outTp)
+{
+    if (ts.size() != 15 || ts[8] != '_') {
+        return false;
+    }
+
+    std::tm tm{};
+    try {
+        tm.tm_year = std::stoi(ts.substr(0, 4)) - 1900;
+        tm.tm_mon = std::stoi(ts.substr(4, 2)) - 1;
+        tm.tm_mday = std::stoi(ts.substr(6, 2));
+        tm.tm_hour = std::stoi(ts.substr(9, 2));
+        tm.tm_min = std::stoi(ts.substr(11, 2));
+        tm.tm_sec = std::stoi(ts.substr(13, 2));
+        tm.tm_isdst = -1;
+    }
+    catch (...) {
+        return false;
+    }
+
+    const std::time_t t = std::mktime(&tm);
+    if (t == static_cast<std::time_t>(-1)) return false;
+
+    outTp = std::chrono::system_clock::from_time_t(t);
+    return true;
+}
+
+static bool parseSegmentTimestampToTimePointPreferLocal_(
+    const std::string& raw,
+    std::chrono::system_clock::time_point& outTp);
+
+static bool deriveUtcIsoFromSegmentTimestamp_(
+    const std::string& raw,
+    std::string& outUtcIso);
+
+
+
+
+// ---------------------------------------------
+// New helpers for selecting MP4 clips per window
+// ---------------------------------------------
+
+
+
+
+
+
+struct ClipInfo {
+    std::string path;      // full filesystem path to the .mp4
+    std::string startTs;   // "YYYYMMDD_HHMMSS"
+    std::string endTs;     // "YYYYMMDD_HHMMSS"
+    int nominalSeconds;    // 10, 60, 300 (parsed from filename if possible)
+
+    int cameraId = -1;          
+    std::string cameraName;     
+};
+
+
+
+
+// Reads an entire file into a vector<uint8_t>
+static bool readFileToBytes(const std::string& path, std::vector<uint8_t>& out)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        Logger::instance().logDebug(
+            "agent",
+            "readFileToBytes: failed to open " + path
+        );
+        return false;
+    }
+
+    out.assign(
+        (std::istreambuf_iterator<char>(ifs)),
+        std::istreambuf_iterator<char>()
+    );
+
+    return true;
+}
+
+
+
+
+
+
+static std::string getExecutableDir()
+{
+    char buffer[MAX_PATH];
+    DWORD len = GetModuleFileNameA(NULL, buffer, MAX_PATH);
+    if (len == 0) {
+        return "";
+    }
+
+    // Convert full EXE path ÃƒÂ¢Ã‚â€ Ã‚â€™ parent folder
+    fs::path exePath(buffer);
+    return exePath.parent_path().string();
+}
+
+static std::string trimAscii(const std::string& input)
+{
+    size_t start = 0;
+    while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+        ++start;
+    }
+
+    size_t end = input.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        --end;
+    }
+
+    return input.substr(start, end - start);
+}
+
+static std::string lowerAsciiCopy(std::string input)
+{
+    std::transform(input.begin(), input.end(), input.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return input;
+}
+
+static size_t findPromptSectionMarker_(const std::string& lowerText, const std::string& marker)
+{
+    if (lowerText.rfind(marker, 0) == 0) return 0;
+    const std::string withNewline = "\n" + marker;
+    const size_t pos = lowerText.find(withNewline);
+    if (pos == std::string::npos) return std::string::npos;
+    return pos + 1;
+}
+
+static void normalizeEmbeddedPromptConditions_(
+    std::string& promptCore,
+    std::string& alertCondition,
+    std::string& negativeCondition)
+{
+    promptCore = trimAscii(promptCore);
+    alertCondition = trimAscii(alertCondition);
+    negativeCondition = trimAscii(negativeCondition);
+    if (promptCore.empty()) return;
+
+    const std::string lowerPrompt = lowerAsciiCopy(promptCore);
+    const std::string alertMarker = "alert_condition:";
+    const std::string negativeMarker = "negative_condition:";
+    const size_t alertPos = findPromptSectionMarker_(lowerPrompt, alertMarker);
+    const size_t negativePos = findPromptSectionMarker_(lowerPrompt, negativeMarker);
+    const size_t firstPos = (std::min)(alertPos, negativePos);
+    if (firstPos == std::string::npos) return;
+
+    struct Marker {
+        size_t pos = std::string::npos;
+        std::string name;
+    };
+    std::vector<Marker> markers;
+    if (alertPos != std::string::npos) markers.push_back({ alertPos, alertMarker });
+    if (negativePos != std::string::npos) markers.push_back({ negativePos, negativeMarker });
+    std::sort(markers.begin(), markers.end(), [](const Marker& a, const Marker& b) {
+        return a.pos < b.pos;
+    });
+
+    const std::string rawPrompt = promptCore;
+    promptCore = trimAscii(rawPrompt.substr(0, firstPos));
+
+    auto assignSectionValue = [&](const Marker& marker, const std::string& value) {
+        if (marker.name == alertMarker) {
+            if (alertCondition.empty()) alertCondition = value;
+        }
+        else if (marker.name == negativeMarker) {
+            if (negativeCondition.empty()) negativeCondition = value;
+        }
+    };
+
+    for (size_t i = 0; i < markers.size(); ++i) {
+        const size_t valueStart = markers[i].pos + markers[i].name.size();
+        const size_t valueEnd = (i + 1 < markers.size()) ? markers[i + 1].pos : rawPrompt.size();
+        const std::string value = trimAscii(rawPrompt.substr(valueStart, valueEnd - valueStart));
+        if (!value.empty()) assignSectionValue(markers[i], value);
+    }
+}
+
+static std::string detectWindowsTimezoneKeyViaTzutil()
+{
+    std::string output;
+#if defined(_WIN32)
+    FILE* pipe = _popen("tzutil /g", "r");
+    if (!pipe) {
+        return "";
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+    _pclose(pipe);
+#endif
+    return trimAscii(output);
+}
+
+static std::string mapWindowsTimezoneToIana(const std::string& windowsKey)
+{
+    if (windowsKey.empty()) return "";
+
+    static const std::unordered_map<std::string, std::string> kMap = {
+        { "E. South America Standard Time", "America/Sao_Paulo" },
+        { "Bahia Standard Time", "America/Bahia" },
+        { "SA Eastern Standard Time", "America/Manaus" },
+        { "SA Western Standard Time", "America/Manaus" },
+        { "Central Brazilian Standard Time", "America/Cuiaba" },
+    };
+
+    const auto it = kMap.find(windowsKey);
+    if (it != kMap.end()) {
+        return it->second;
+    }
+
+    return "";
+}
+
+static std::string detectUtcOffsetTimezoneFallback()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm localTm{};
+    std::tm utcTm{};
+#if defined(_WIN32)
+    localtime_s(&localTm, &now);
+    gmtime_s(&utcTm, &now);
+#else
+    localtime_r(&now, &localTm);
+    gmtime_r(&now, &utcTm);
+#endif
+
+    std::time_t localEpoch = std::mktime(&localTm);
+    std::time_t utcAsLocalEpoch = std::mktime(&utcTm);
+    long offsetSeconds = static_cast<long>(std::difftime(localEpoch, utcAsLocalEpoch));
+
+    const char sign = offsetSeconds >= 0 ? '+' : '-';
+    const long absSeconds = std::labs(offsetSeconds);
+    const int hours = static_cast<int>(absSeconds / 3600);
+    const int minutes = static_cast<int>((absSeconds % 3600) / 60);
+
+    std::ostringstream out;
+    out << "UTC" << sign << hours;
+    if (minutes > 0) {
+        out << ":" << (minutes < 10 ? "0" : "") << minutes;
+    }
+    return out.str();
+}
+
+static std::string readSavedPairedTimezone_()
+{
+    std::ifstream in("paired_timezone.txt");
+    if (!in.is_open()) return "";
+
+    std::string tz;
+    std::getline(in, tz);
+    return trimAscii(tz);
+}
+
+static std::string detectMachineTimezoneForBackendHeaders()
+{
+    const std::string savedTimezone = readSavedPairedTimezone_();
+    if (!savedTimezone.empty()) {
+        return savedTimezone;
+    }
+
+    const std::string windowsKey = detectWindowsTimezoneKeyViaTzutil();
+    const std::string iana = mapWindowsTimezoneToIana(windowsKey);
+    if (!iana.empty()) {
+        return iana;
+    }
+
+    return detectUtcOffsetTimezoneFallback();
+}
+
+
+
+
+// MAX seconds per Gemini video segment
+static constexpr int kMaxSegmentSeconds = 300;
+
+
+
+static fs::path sanitizeFilename(const fs::path& p)
+{
+    fs::path parent = p.parent_path();
+    std::string name = p.filename().string();
+
+    for (char& c : name)
+        if (c == ':') c = '-';
+
+    return parent / name;
+}
+
+
+static std::wstring utf8ToWide(const std::string& str)
+{
+    if (str.empty()) return L"";
+
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
+    std::wstring result(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], size_needed);
+    return result;
+}
+
+
+
+
+
+
+
+// Helper: build one EncodedVideoSegment from a group of clips.
+// Single stored clips are read directly; multi-clip windows are copied to a temp
+// folder and concatenated there.
+static bool buildEncodedSegmentFromGroup(
+    const std::vector<const ClipInfo*>& group,
+    EncodedVideoSegment& out)
+{
+    if (group.empty()) return false;
+
+#ifdef _WIN32
+
+    if (group.size() == 1)
+    {
+        const ClipInfo* ci = group[0];
+        if (!readFileToBytes(ci->path, out.bytes)) {
+            Logger::instance().logDebug(
+                "agent",
+                "buildEncodedSegmentFromGroup: failed to read single clip " +
+                ci->path
+            );
+            return false;
+        }
+
+        out.startTs = ci->startTs;
+        out.endTs = ci->endTs;
+        (void)deriveUtcIsoFromSegmentTimestamp_(ci->startTs, out.startTs);
+        (void)deriveUtcIsoFromSegmentTimestamp_(ci->endTs, out.endTs);
+
+
+        out.sourceFilePath = ci->path;
+        out.isTempFile = false;
+
+        out.cameraId = ci->cameraId;
+        out.cameraName = ci->cameraName;
+
+
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: direct-read clip=" + ci->path +
+            " start=" + ci->startTs + " end=" + ci->endTs +
+            " bytes=" + std::to_string(out.bytes.size())
+        );
+
+        return true;
+    }
+    // --- Multi-clip path (10s and/or 60s) ---
+
+    // 1) Choose a root temp dir
+    fs::path tmpDir;
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetTempPathW(MAX_PATH, buf);
+    if (len == 0 || len > MAX_PATH) {
+        tmpDir = fs::temp_directory_path() / AppBrand::kVideoSegmentsTempDirName;
+    }
+    else {
+        tmpDir = fs::path(buf) / AppBrand::kVideoSegmentsTempDirName;
+    }
+#else
+    tmpDir = fs::temp_directory_path() / AppBrand::kVideoSegmentsTempDirName;
+#endif
+
+    std::error_code ec;
+    fs::create_directories(tmpDir, ec);
+    if (ec) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: failed to create tmpDir: " +
+            tmpDir.string() + " error=" + ec.message()
+        );
+        return false;
+    }
+
+    // NEW: per-group subfolder under tmpDir
+    const ClipInfo* first = group.front();
+    const ClipInfo* last = group.back();
+
+    fs::path groupDir = tmpDir / (
+        std::string("group_") +
+        first->startTs + "_to_" + last->endTs
+        );
+
+
+    fs::create_directories(groupDir, ec);
+    if (ec) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: failed to create groupDir: " +
+            groupDir.string() + " error=" + ec.message()
+        );
+        return false;
+    }
+
+    // 2) Build the concat list and log paths inside tmpDir (not groupDir)
+    const std::string nowStamp = first->startTs + "_to_" + last->endTs;
+
+    fs::path concatListPath = tmpDir / ("ffconcat_" + nowStamp + ".txt");
+    fs::path outMp4Path = tmpDir / ("segment_" + nowStamp + ".mp4");
+    fs::path logPath = tmpDir / ("ffmpeg_log_" + nowStamp + ".txt");
+
+    
+    
+
+
+    concatListPath = sanitizeFilename(concatListPath);
+    outMp4Path = sanitizeFilename(outMp4Path);
+    logPath = sanitizeFilename(logPath);
+    
+
+    // 3) Write concat list using copied 10s/60s paths inside groupDir.
+    {
+        std::ofstream ofs(concatListPath);
+        if (!ofs.is_open()) {
+            Logger::instance().logDebug(
+                "agent",
+                "buildEncodedSegmentFromGroup: failed to open concat list " +
+                concatListPath.string()
+            );
+            // cleanup groupDir
+            std::error_code delEc;
+            fs::remove_all(groupDir, delEc);
+            return false;
+        }
+
+
+
+
+        for (const ClipInfo* ciInner : group) {
+            fs::path src(ciInner->path);
+            fs::path dst = groupDir / src.filename();
+            std::error_code cpEc;
+            fs::copy_file(
+                src,
+                dst,
+                fs::copy_options::overwrite_existing,
+                cpEc
+            );
+            if (cpEc) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "buildEncodedSegmentFromGroup: copy_file failed " +
+                    src.string() + " -> " + dst.string() +
+                    " error=" + cpEc.message()
+                );
+                std::error_code delEc;
+                fs::remove_all(groupDir, delEc);
+                return false;
+            }
+
+            fs::path absPath = fs::absolute(dst);
+            std::string normalized = absPath.string();
+            for (char& c : normalized) {
+                if (c == '\\') c = '/';
+            }
+
+            ofs << "file '" << normalized << "'\n";
+        }
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "concatListPath: " + concatListPath.string()
+    );
+
+
+    {
+        std::ifstream dbg(concatListPath);
+        std::string line;
+        while (std::getline(dbg, line)) {
+            Logger::instance().logDebug("agent", "CONCAT: " + line);
+        }
+    } // <-- dbg destruÃƒÆ’Ã‚Â­do aqui
+
+
+    auto probeClipFps = [](const std::string& path) -> int {
+        try {
+            cv::VideoCapture cap(path);
+            if (!cap.isOpened()) return 0;
+            const double fps = cap.get(cv::CAP_PROP_FPS);
+            if (!std::isfinite(fps) || fps <= 0.0) return 0;
+            int rounded = static_cast<int>(std::llround(fps));
+            if (rounded < 1) rounded = 1;
+            if (rounded > 10) rounded = 10;
+            return rounded;
+        }
+        catch (...) {
+            return 0;
+        }
+    };
+
+    bool needsReencode = false;
+    int concatTargetFps = 0;
+    int referenceFps = 0;
+    for (const ClipInfo* ciInner : group) {
+        const int clipFps = probeClipFps(ciInner->path);
+        if (clipFps <= 0) continue;
+        concatTargetFps = (std::max)(concatTargetFps, clipFps);
+        if (referenceFps == 0) {
+            referenceFps = clipFps;
+        }
+        else if (clipFps != referenceFps) {
+            needsReencode = true;
+        }
+    }
+    if (concatTargetFps <= 0) concatTargetFps = 1;
+    if (needsReencode) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: mixed clip fps detected, re-encoding concat at fps=" +
+            std::to_string(concatTargetFps)
+        );
+    }
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+
+    std::wstring listW = utf8ToWide(concatListPath.string());
+    std::wstring outW = utf8ToWide(outMp4Path.string());
+
+    std::wstring cmdLine;
+    if (needsReencode) {
+        cmdLine =
+            L"\"" + ffmpegW + L"\""
+            L" -y -safe 0 -f concat -i \"" + listW +
+            L"\" -map 0:v:0 -vf fps=" + std::to_wstring(concatTargetFps) +
+            L" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -an \"" + outW + L"\"";
+    }
+    else {
+        cmdLine =
+            L"\"" + ffmpegW + L"\""
+            L" -y -safe 0 -f concat -i \"" + listW +
+            L"\" -map 0:v:0 -c:v copy -an \"" + outW + L"\"";
+    }
+
+        //L"\" -c copy \"" + outW + L"\"";
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+
+    if (!ok) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: CreateProcessW failed"
+        );
+
+        std::error_code delEc;
+        
+        fs::remove_all(groupDir, delEc);
+        fs::remove(concatListPath, delEc);
+        fs::remove(logPath, delEc);
+        
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (exitCode != 0) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: ffmpeg exited with code " +
+            std::to_string(exitCode)
+        );
+
+        std::error_code delEc;
+        
+        fs::remove_all(groupDir, delEc);
+        fs::remove(concatListPath, delEc);
+        fs::remove(logPath, delEc);
+        fs::remove(outMp4Path, delEc); // in case a partial file was created
+        
+        return false;
+    }
+
+    // 5) Read merged file into memory
+    if (!readFileToBytes(outMp4Path.string(), out.bytes)) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedSegmentFromGroup: failed to read merged segment: " +
+            outMp4Path.string()
+        );
+
+        std::error_code delEc;
+        
+        fs::remove_all(groupDir, delEc);
+        fs::remove(concatListPath, delEc);
+        fs::remove(logPath, delEc);
+        fs::remove(outMp4Path, delEc);
+        
+        return false;
+    }
+
+    // 6) Fill metadata
+
+    out.startTs = first->startTs;
+    out.endTs = last->endTs;
+    (void)deriveUtcIsoFromSegmentTimestamp_(first->startTs, out.startTs);
+    (void)deriveUtcIsoFromSegmentTimestamp_(last->endTs, out.endTs);
+
+
+    out.sourceFilePath = outMp4Path.string();
+    out.isTempFile = true;
+
+
+    out.cameraId = first->cameraId;
+    out.cameraName = first->cameraName;
+
+    
+    // 7) Cleanup temp artifacts (what you asked for)
+    {
+        std::error_code delEc;
+        fs::remove_all(groupDir, delEc);
+        fs::remove(concatListPath, delEc);
+        fs::remove(logPath, delEc);
+        //fs::remove(outMp4Path, delEc);
+    }
+    
+    return true;
+#else
+    (void)group;
+    (void)out;
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedSegmentFromGroup: not implemented on this platform"
+    );
+    return false;
+#endif
+}
+
+
+
+
+
+
+static bool parseClipNamePartsForAgent(
+    const std::string& stem,        // e.g. "3_20251130_175128_20251130_175417_300s"
+    std::string& outCameraId,
+    std::string& outStartTs,
+    std::string& outEndTs,
+    int& outNominalSeconds)
+{
+    outCameraId.clear();
+    outStartTs.clear();
+    outEndTs.clear();
+    outNominalSeconds = 0;
+
+    std::vector<std::string> tokens;
+    std::stringstream ss(stem);
+    std::string token;
+
+    while (std::getline(ss, token, '_')) {
+        tokens.push_back(token);
+    }
+
+    // We expect something like:
+    // <cameraId>_YYYYMMDD_HHMMSS_YYYYMMDD_HHMMSS_10s
+    if (tokens.size() < 5) {
+        return false;
+    }
+
+    outCameraId = tokens[0];
+    outStartTs = tokens[1] + "_" + tokens[2];
+    outEndTs = tokens[3] + "_" + tokens[4];
+
+    // Last token should be like "10s", "60s", "300s"
+    std::string last = tokens.back();   // e.g. "300s"
+    if (!last.empty() && last.back() == 's') {
+        last.pop_back(); // drop trailing 's'
+        try {
+            outNominalSeconds = std::stoi(last);
+        }
+        catch (...) {
+            outNominalSeconds = 0;
+        }
+    }
+
+    return true;
+}
+
+static double deriveNominalDurationSecondsFromClipPath_(
+    const std::string& clipPath,
+    int* outNominalSeconds = nullptr,
+    double* outRangeSeconds = nullptr)
+{
+    if (outNominalSeconds) *outNominalSeconds = 0;
+    if (outRangeSeconds) *outRangeSeconds = 0.0;
+    if (clipPath.empty()) return 0.0;
+
+    std::string filename = fs::path(clipPath).filename().string();
+    const std::string processingSuffix = ".processing";
+    if (filename.size() > processingSuffix.size() &&
+        filename.rfind(processingSuffix) == (filename.size() - processingSuffix.size()))
+    {
+        filename = filename.substr(0, filename.size() - processingSuffix.size());
+    }
+
+    std::string cameraId;
+    std::string startTs;
+    std::string endTs;
+    int nominalSeconds = 0;
+    if (!parseClipNamePartsForAgent(
+        fs::path(filename).stem().string(),
+        cameraId,
+        startTs,
+        endTs,
+        nominalSeconds))
+    {
+        return 0.0;
+    }
+
+    if (outNominalSeconds) *outNominalSeconds = nominalSeconds;
+
+    double rangeSeconds = 0.0;
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    if (parseTimestampToTimePoint(startTs, startTp) &&
+        parseTimestampToTimePoint(endTs, endTp) &&
+        endTp > startTp)
+    {
+        const auto diff =
+            std::chrono::duration_cast<std::chrono::seconds>(endTp - startTp).count();
+        if (diff > 0) {
+            rangeSeconds = static_cast<double>(diff);
+        }
+    }
+    if (outRangeSeconds) *outRangeSeconds = rangeSeconds;
+
+    double durationFromName = 0.0;
+    if (nominalSeconds > 0) durationFromName = static_cast<double>(nominalSeconds);
+    if (rangeSeconds > 0.0) durationFromName = (std::max)(durationFromName, rangeSeconds);
+    return durationFromName;
+}
+
+static bool parsePrettyLocalTimestampToTimePoint_(
+    const std::string& text,
+    std::chrono::system_clock::time_point& outTp)
+{
+    outTp = {};
+    if (text.size() != 19) return false; // dd/mm/yyyy HH:MM:SS
+
+    auto isDigitAt = [&](std::size_t i) -> bool {
+        return i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])) != 0;
+    };
+
+    const bool shapeOk =
+        isDigitAt(0) && isDigitAt(1) && text[2] == '/' &&
+        isDigitAt(3) && isDigitAt(4) && text[5] == '/' &&
+        isDigitAt(6) && isDigitAt(7) && isDigitAt(8) && isDigitAt(9) && text[10] == ' ' &&
+        isDigitAt(11) && isDigitAt(12) && text[13] == ':' &&
+        isDigitAt(14) && isDigitAt(15) && text[16] == ':' &&
+        isDigitAt(17) && isDigitAt(18);
+    if (!shapeOk) return false;
+
+    std::tm tm{};
+    try {
+        tm.tm_mday = std::stoi(text.substr(0, 2));
+        tm.tm_mon = std::stoi(text.substr(3, 2)) - 1;
+        tm.tm_year = std::stoi(text.substr(6, 4)) - 1900;
+        tm.tm_hour = std::stoi(text.substr(11, 2));
+        tm.tm_min = std::stoi(text.substr(14, 2));
+        tm.tm_sec = std::stoi(text.substr(17, 2));
+        tm.tm_isdst = -1;
+    }
+    catch (...) {
+        return false;
+    }
+
+    const std::time_t tt = std::mktime(&tm);
+    if (tt == static_cast<std::time_t>(-1)) return false;
+    outTp = std::chrono::system_clock::from_time_t(tt);
+    return true;
+}
+
+static bool parseIsoWallClockAsLocalTimePoint_(
+    const std::string& text,
+    std::chrono::system_clock::time_point& outTp)
+{
+    outTp = {};
+    std::string s = trimAscii(text);
+    if (s.empty()) return false;
+
+    if (!s.empty() && (s.back() == 'Z' || s.back() == 'z')) {
+        s.pop_back();
+    }
+
+    const std::size_t dot = s.find('.');
+    if (dot != std::string::npos) {
+        s = s.substr(0, dot);
+    }
+
+    if (s.size() != 19 ||
+        !std::isdigit(static_cast<unsigned char>(s[0])) ||
+        !std::isdigit(static_cast<unsigned char>(s[1])) ||
+        !std::isdigit(static_cast<unsigned char>(s[2])) ||
+        !std::isdigit(static_cast<unsigned char>(s[3])) ||
+        s[4] != '-' ||
+        !std::isdigit(static_cast<unsigned char>(s[5])) ||
+        !std::isdigit(static_cast<unsigned char>(s[6])) ||
+        s[7] != '-' ||
+        !std::isdigit(static_cast<unsigned char>(s[8])) ||
+        !std::isdigit(static_cast<unsigned char>(s[9])) ||
+        (s[10] != 'T' && s[10] != ' ') ||
+        !std::isdigit(static_cast<unsigned char>(s[11])) ||
+        !std::isdigit(static_cast<unsigned char>(s[12])) ||
+        s[13] != ':' ||
+        !std::isdigit(static_cast<unsigned char>(s[14])) ||
+        !std::isdigit(static_cast<unsigned char>(s[15])) ||
+        s[16] != ':' ||
+        !std::isdigit(static_cast<unsigned char>(s[17])) ||
+        !std::isdigit(static_cast<unsigned char>(s[18])))
+    {
+        return false;
+    }
+
+    std::tm tm{};
+    try {
+        tm.tm_year = std::stoi(s.substr(0, 4)) - 1900;
+        tm.tm_mon = std::stoi(s.substr(5, 2)) - 1;
+        tm.tm_mday = std::stoi(s.substr(8, 2));
+        tm.tm_hour = std::stoi(s.substr(11, 2));
+        tm.tm_min = std::stoi(s.substr(14, 2));
+        tm.tm_sec = std::stoi(s.substr(17, 2));
+        tm.tm_isdst = -1;
+    }
+    catch (...) {
+        return false;
+    }
+
+    const std::time_t tt = std::mktime(&tm);
+    if (tt == static_cast<std::time_t>(-1)) return false;
+    outTp = std::chrono::system_clock::from_time_t(tt);
+    return true;
+}
+
+static bool parseSegmentTimestampToTimePointPreferLocal_(
+    const std::string& raw,
+    std::chrono::system_clock::time_point& outTp)
+{
+    const std::string s = trimAscii(raw);
+    if (s.empty()) return false;
+
+    if (s.size() == 15 && s[8] == '_') {
+        return parseCompactLocalTimestampToTimePoint_(s, outTp);
+    }
+    if (s.size() == 19 && s[2] == '/' && s[5] == '/') {
+        return parsePrettyLocalTimestampToTimePoint_(s, outTp);
+    }
+    return temporal::parseFlexibleTs(s, outTp);
+}
+
+static bool deriveUtcIsoFromSegmentTimestamp_(
+    const std::string& raw,
+    std::string& outUtcIso)
+{
+    outUtcIso.clear();
+    std::chrono::system_clock::time_point tp;
+    if (!parseSegmentTimestampToTimePointPreferLocal_(raw, tp)) return false;
+    outUtcIso = formatTimePointToIsoUtcZ_(tp);
+    return !outUtcIso.empty();
+}
+
+static bool extractJobStartWindowEndUtc_(
+    const json& payload,
+    std::string& outWindowEndUtc)
+{
+    outWindowEndUtc.clear();
+    if (!payload.is_object()) return false;
+    if (!payload.contains("trigger") || !payload["trigger"].is_object()) return false;
+
+    const json& trigger = payload["trigger"];
+    if (!trigger.contains("window") || !trigger["window"].is_object()) return false;
+
+    const json& window = trigger["window"];
+    if (!window.contains("end_utc") || !window["end_utc"].is_string()) return false;
+
+    outWindowEndUtc = trimAscii(window["end_utc"].get<std::string>());
+    return !outWindowEndUtc.empty();
+}
+
+static bool shouldIgnoreExpiredScheduledJobStart_(
+    const json& payload,
+    std::string& outWindowEndUtc,
+    std::string& outNowUtc)
+{
+    outWindowEndUtc.clear();
+    outNowUtc.clear();
+
+    if (!extractJobStartWindowEndUtc_(payload, outWindowEndUtc)) {
+        return false;
+    }
+
+    std::chrono::system_clock::time_point windowEndTp;
+    if (!temporal::parseFlexibleTs(outWindowEndUtc, windowEndTp)) {
+        return false;
+    }
+
+    const auto nowTp = std::chrono::system_clock::now();
+    outNowUtc = formatTimePointToIsoUtcZ_(nowTp);
+
+    static constexpr auto kJobStartWindowGrace = std::chrono::seconds(30);
+    return nowTp > (windowEndTp + kJobStartWindowGrace);
+}
+
+static double deriveDurationSecondsFromSegmentBounds_(
+    const std::string& segmentStartTs,
+    const std::string& segmentEndTs)
+{
+    const std::string startTrimmed = trimAscii(segmentStartTs);
+    const std::string endTrimmed = trimAscii(segmentEndTs);
+    if (startTrimmed.empty() || endTrimmed.empty()) return 0.0;
+
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    const bool parsedAny =
+        parseSegmentTimestampToTimePointPreferLocal_(startTrimmed, startTp) &&
+        parseSegmentTimestampToTimePointPreferLocal_(endTrimmed, endTp);
+
+    if (!parsedAny || endTp <= startTp) {
+        return 0.0;
+    }
+
+    const auto diffSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(endTp - startTp).count();
+    return diffSeconds > 0 ? static_cast<double>(diffSeconds) : 0.0;
+}
+
+static void clampSegmentRangeToAnalyzedWindow_(
+    std::string& segmentStartTs,
+    std::string& segmentEndTs,
+    double analyzedDurationSeconds,
+    const std::string& logStreamId = "",
+    const std::string& scopeTag = "")
+{
+    if (analyzedDurationSeconds <= 0.0) return;
+
+    const std::string startTrimmed = trimAscii(segmentStartTs);
+    const std::string endTrimmed = trimAscii(segmentEndTs);
+    if (startTrimmed.empty() || endTrimmed.empty()) return;
+
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    if (!parseSegmentTimestampToTimePointPreferLocal_(startTrimmed, startTp) ||
+        !parseSegmentTimestampToTimePointPreferLocal_(endTrimmed, endTp) ||
+        endTp <= startTp)
+    {
+        return;
+    }
+
+    const auto analyzedMs = std::chrono::milliseconds(
+        static_cast<long long>(analyzedDurationSeconds * 1000.0 + 0.5));
+    if (analyzedMs <= std::chrono::milliseconds(0)) return;
+
+    const auto analyzedEndTp = startTp + analyzedMs;
+    if (analyzedEndTp >= endTp - std::chrono::milliseconds(500)) return;
+
+    const std::string originalEndTs = endTrimmed;
+    segmentStartTs = formatTimePointToIsoUtcZ_(startTp);
+    segmentEndTs = formatTimePointToIsoUtcZ_(analyzedEndTp);
+
+    if (!logStreamId.empty()) {
+        const std::string prefix = scopeTag.empty() ? "clampSegmentRangeToAnalyzedWindow_" : scopeTag;
+        Logger::instance().logDebug(
+            logStreamId,
+            prefix + ": clamped segment_end_utc to analyzed window start=" +
+            segmentStartTs +
+            " original_end=" + originalEndTs +
+            " adjusted_end=" + segmentEndTs +
+            " analyzed_duration_s=" + std::to_string(analyzedDurationSeconds)
+        );
+    }
+}
+
+static bool isCompactTsToken_(const std::string& value, std::size_t len) {
+    if (value.size() != len) return false;
+    return std::all_of(
+        value.begin(),
+        value.end(),
+        [](unsigned char c) { return std::isdigit(c) != 0; }
+    );
+}
+
+static bool deriveSegmentRangeFromPathForPrompt_(
+    const std::string& sourceFilePath,
+    std::string& outStartTs,
+    std::string& outEndTs)
+{
+    outStartTs.clear();
+    outEndTs.clear();
+    if (sourceFilePath.empty()) return false;
+
+    std::string filename = fs::path(sourceFilePath).filename().string();
+    const std::string processingSuffix = ".processing";
+    if (filename.size() > processingSuffix.size() &&
+        filename.rfind(processingSuffix) == (filename.size() - processingSuffix.size()))
+    {
+        filename = filename.substr(0, filename.size() - processingSuffix.size());
+    }
+
+    std::string cameraId;
+    std::string startLocal;
+    std::string endLocal;
+    int nominalSeconds = 0;
+    if (!parseClipNamePartsForAgent(fs::path(filename).stem().string(), cameraId, startLocal, endLocal, nominalSeconds)) {
+        return false;
+    }
+
+    if (startLocal.size() != 15 || startLocal[8] != '_' ||
+        endLocal.size() != 15 || endLocal[8] != '_')
+    {
+        outStartTs.clear();
+        outEndTs.clear();
+        return false;
+    }
+
+    const std::string startDate = startLocal.substr(0, 8);
+    const std::string startTime = startLocal.substr(9, 6);
+    const std::string endDate = endLocal.substr(0, 8);
+    const std::string endTime = endLocal.substr(9, 6);
+    if (!isCompactTsToken_(startDate, 8) || !isCompactTsToken_(startTime, 6) ||
+        !isCompactTsToken_(endDate, 8) || !isCompactTsToken_(endTime, 6))
+    {
+        outStartTs.clear();
+        outEndTs.clear();
+        return false;
+    }
+    return deriveUtcIsoFromSegmentTimestamp_(startLocal, outStartTs) &&
+        deriveUtcIsoFromSegmentTimestamp_(endLocal, outEndTs);
+}
+
+
+
+
+
+
+
+
+// Main: from routerResult (start/end + search_paths) ÃƒÂ¢Ã‚â€ Ã‚â€™ EncodedVideoSegment list
+static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
+    const std::string& clipsRoot,
+    const json& routerResult,
+    bool preferTenSecondClips = false)
+{
+    std::vector<EncodedVideoSegment> encoded;
+
+    const std::string startTs =
+        routerResult.value("start_timestamp", "");
+    const std::string endTs =
+        routerResult.value("end_timestamp", "");
+
+    if (startTs.empty() || endTs.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: empty start or end timestamp"
+        );
+        return encoded;
+    }
+
+    if (!routerResult.contains("search_paths") ||
+        !routerResult["search_paths"].is_array())
+    {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: search_paths missing or not array"
+        );
+        return encoded;
+    }
+
+    // Convert window to time_points for intersection checks
+    std::chrono::system_clock::time_point windowStartTp, windowEndTp;
+    if (!parseTimestampToTimePoint(startTs, windowStartTp) ||
+        !parseTimestampToTimePoint(endTs, windowEndTp))
+    {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: failed to parse start/end timestamps"
+        );
+        return encoded;
+    }
+
+    if (windowEndTp < windowStartTp) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: end before start, aborting"
+        );
+        return encoded;
+    }
+
+    const auto windowSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            windowEndTp - windowStartTp).count();
+
+    const json& searchPaths = routerResult["search_paths"];
+
+    //std::vector<ClipInfo> candidates;
+
+    // 0) map cameraId -> cameraName (from router)
+    std::unordered_map<int, std::string> camNameById;
+    if (routerResult.contains("camera_ids") && routerResult.contains("camera_names") &&
+        routerResult["camera_ids"].is_array() && routerResult["camera_names"].is_array())
+    {
+        const auto& ids = routerResult["camera_ids"];
+        const auto& names = routerResult["camera_names"];
+        const size_t n = std::min(ids.size(), names.size());
+
+        for (size_t i = 0; i < n; ++i) {
+            if (ids[i].is_number_integer() && names[i].is_string()) {
+                camNameById[ids[i].get<int>()] = names[i].get<std::string>();
+            }
+        }
+    }
+
+
+    std::unordered_map<int, std::vector<ClipInfo>> candidatesByCam;
+
+    const std::string shortRoot = clipsRoot; // e.g. "frames"
+
+    // 1) Scan all candidate directories and collect clips intersecting the window
+    for (const auto& sp : searchPaths) {
+
+        if (!sp.is_string()) continue;
+        std::string relDir = sp.get<std::string>();  // e.g. "cam_12/2025/12/05"
+
+        // 1) Normalize slashes coming from JSON (use OS-preferred separator)
+#ifdef _WIN32
+        std::replace(relDir.begin(), relDir.end(), '/', '\\');
+#else
+        // On POSIX, '/' is already the preferred separator
+#endif
+
+        fs::path dirPath = fs::path(shortRoot) / relDir;
+        dirPath = dirPath.lexically_normal();
+
+        if (!fs::exists(dirPath) || !fs::is_directory(dirPath)) {
+            continue;
+        }
+
+        for (const auto& entry : fs::directory_iterator(dirPath)) {
+            if (!entry.is_regular_file()) continue;
+
+            fs::path filePath = entry.path();
+            std::string ext = filePath.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+            if (ext != ".mp4") {
+                continue;
+            }
+
+            std::string stem = filePath.stem().string();
+            std::string cameraId, clipStartTs, clipEndTs;
+            int nominalSeconds = 0;
+
+            if (!parseClipNamePartsForAgent(
+                stem, cameraId, clipStartTs, clipEndTs, nominalSeconds))
+            {
+                continue;
+            }
+
+            std::chrono::system_clock::time_point clipStartTp, clipEndTp;
+            if (!parseTimestampToTimePoint(clipStartTs, clipStartTp) ||
+                !parseTimestampToTimePoint(clipEndTs, clipEndTp))
+            {
+                continue;
+            }
+
+            if (clipEndTp < windowStartTp || clipStartTp > windowEndTp) {
+                continue;
+            }
+
+            int camId = -1;
+            try { camId = std::stoi(cameraId); }
+            catch (...) { camId = -1; }
+            ClipInfo ci;
+            ci.path = filePath.string();
+            ci.startTs = clipStartTs;
+            ci.endTs = clipEndTs;
+            ci.nominalSeconds = nominalSeconds;
+            ci.cameraId = camId;
+
+            auto itName = camNameById.find(camId);
+            if (itName != camNameById.end()) {
+                ci.cameraName = itName->second;
+            }
+
+            candidatesByCam[camId].push_back(std::move(ci));
+        }
+    }
+
+    /*
+    if (candidates.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: no intersecting clips found"
+        );
+        return encoded;
+    }
+    */
+
+    bool any = false;
+    for (const auto& kv : candidatesByCam) {
+        if (!kv.second.empty()) { any = true; break; }
+    }
+    if (!any) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: no intersecting clips found"
+        );
+        return encoded;
+    }
+
+
+    for (auto& kv : candidatesByCam) {
+        const int camId = kv.first;
+        auto& candidates = kv.second;
+
+        if (candidates.empty()) continue;
+
+        // 2) Sort clips by start time (same logic as before)
+        std::sort(candidates.begin(), candidates.end(),
+            [](const ClipInfo& a, const ClipInfo& b) {
+                return a.startTs < b.startTs;
+            });
+
+        // 3) Bucket by duration type (same logic as before)
+        std::vector<const ClipInfo*> clips10;
+        std::vector<const ClipInfo*> clips60;
+
+        for (const auto& c : candidates) {
+            if (c.nominalSeconds >= 50)  clips60.push_back(&c);
+            else                         clips10.push_back(&c);
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: camId=" + std::to_string(camId) +
+            " windowSeconds=" + std::to_string(windowSeconds) +
+            " candidates=" + std::to_string(candidates.size()) +
+            " (10s=" + std::to_string(clips10.size()) +
+            ", 60s=" + std::to_string(clips60.size()) + ")"
+        );
+
+        // 4) Decide which types to use (same logic as before)
+        std::vector<const ClipInfo*> chosen;
+
+        if (preferTenSecondClips) {
+            if (!clips10.empty())      chosen = clips10;
+            else if (!clips60.empty()) chosen = clips60;
+        }
+        else if (windowSeconds <= 60) {
+            if (!clips10.empty())      chosen = clips10;
+            else if (!clips60.empty()) chosen = clips60;
+        }
+        else {
+            chosen.insert(chosen.end(), clips60.begin(), clips60.end());
+            chosen.insert(chosen.end(), clips10.begin(), clips10.end());
+            std::sort(chosen.begin(), chosen.end(),
+                [](const ClipInfo* a, const ClipInfo* b) {
+                    return a->startTs < b->startTs;
+                });
+        }
+
+        if (chosen.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "buildEncodedVideosFromMp4Clips: camId=" + std::to_string(camId) +
+                " no clips chosen after filtering"
+            );
+            continue;
+        }
+
+        // 5) Group chosen clips (same logic as before)
+        std::vector<std::vector<const ClipInfo*>> groups;
+        std::vector<const ClipInfo*> currentGroup;
+        int currentGroupSeconds = 0;
+
+        for (const ClipInfo* ci : chosen) {
+            int clipSeconds = ci->nominalSeconds > 0 ? ci->nominalSeconds : 10;
+
+            if (!currentGroup.empty() &&
+                currentGroupSeconds + clipSeconds > kMaxSegmentSeconds)
+            {
+                groups.push_back(currentGroup);
+                currentGroup.clear();
+                currentGroupSeconds = 0;
+            }
+
+            currentGroup.push_back(ci);
+            currentGroupSeconds += clipSeconds;
+        }
+        if (!currentGroup.empty()) groups.push_back(currentGroup);
+
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: camId=" + std::to_string(camId) +
+            " grouping -> " + std::to_string(groups.size()) + " merged segments"
+        );
+
+        // 6) Build EncodedVideoSegment for each group (same logic as before)
+        for (const auto& group : groups) {
+            EncodedVideoSegment ev;
+            if (!buildEncodedSegmentFromGroup(group, ev)) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "buildEncodedVideosFromMp4Clips: camId=" + std::to_string(camId) +
+                    " failed to build segment group, skipping"
+                );
+                continue;
+            }
+
+            // If you didnÃƒÂ¢Ã‚â‚¬Ã‚â„¢t set cameraId/cameraName inside buildEncodedSegmentFromGroup,
+            // you can also enforce here:
+            // ev.cameraId = camId;
+            // if (!group.empty()) ev.cameraName = group[0]->cameraName;
+
+            encoded.push_back(std::move(ev));
+        }
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedVideosFromMp4Clips: returning " +
+        std::to_string(encoded.size()) + " encoded merged segments"
+    );
+
+    return encoded;
+}
+
+    /*
+    // 2) Sort clips by start time
+    std::sort(candidates.begin(), candidates.end(),
+        [](const ClipInfo& a, const ClipInfo& b) {
+            return a.startTs < b.startTs;
+        });
+
+    // 3) Bucket by duration type
+    std::vector<const ClipInfo*> clips10;
+    std::vector<const ClipInfo*> clips60;
+    std::vector<const ClipInfo*> clips300;
+
+    for (const auto& c : candidates) {
+        if (c.nominalSeconds >= 290) {
+            clips300.push_back(&c);
+        }
+        else if (c.nominalSeconds >= 50) {
+            clips60.push_back(&c);
+        }
+        else if (c.nominalSeconds >= 5) {
+            clips10.push_back(&c);
+        }
+        else {
+            // Unknown / weird; treat as 10s-ish
+            clips10.push_back(&c);
+        }
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedVideosFromMp4Clips: windowSeconds=" +
+        std::to_string(windowSeconds) +
+        " candidates=" + std::to_string(candidates.size()) +
+        " (10s=" + std::to_string(clips10.size()) +
+        ", 60s=" + std::to_string(clips60.size()) +
+        ", 300s=" + std::to_string(clips300.size()) + ")"
+    );
+
+    // 4) Decide which types to use based on window length.
+    //
+    // Heuristic (unchanged):
+    //  - <= 60s            ÃƒÂ¢Ã‚â€ Ã‚â€™ use only 10s clips (if any)
+    //  - <= 20 minutes     ÃƒÂ¢Ã‚â€ Ã‚â€™ use 10s + 60s + 300s (all we have)
+    //  - > 20 minutes      ÃƒÂ¢Ã‚â€ Ã‚â€™ prefer 300s clips; fallback to 60s/10s if needed
+    //
+    std::vector<const ClipInfo*> chosen;
+
+    if (windowSeconds <= 60) {
+        if (!clips10.empty()) {
+            chosen = clips10;
+        }
+        else if (!clips60.empty()) {
+            chosen = clips60;
+        }
+        else {
+            chosen = clips300;
+        }
+    }
+    else if (windowSeconds <= 20 * 60) {
+        // short/medium window: use all available resolutions
+        chosen.insert(chosen.end(), clips300.begin(), clips300.end());
+        chosen.insert(chosen.end(), clips60.begin(), clips60.end());
+        chosen.insert(chosen.end(), clips10.begin(), clips10.end());
+
+        // keep chronological order (they were already ordered inside each bucket,
+        // but we concatenated buckets)
+        std::sort(chosen.begin(), chosen.end(),
+            [](const ClipInfo* a, const ClipInfo* b) {
+                return a->startTs < b->startTs;
+            });
+    }
+    else {
+        // long window: prefer 300s to control tokens/calls
+        if (!clips300.empty()) {
+            chosen = clips300;
+        }
+        else if (!clips60.empty()) {
+            chosen = clips60;
+        }
+        else {
+            chosen = clips10;
+        }
+    }
+
+    if (chosen.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "buildEncodedVideosFromMp4Clips: no clips chosen after filtering"
+        );
+        return encoded;
+    }
+
+    // 5) Group chosen clips into segments of up to 300 seconds total.
+
+    std::vector<std::vector<const ClipInfo*>> groups;
+    std::vector<const ClipInfo*> currentGroup;
+    int currentGroupSeconds = 0;
+
+    for (const ClipInfo* ci : chosen) {
+        int clipSeconds = ci->nominalSeconds;
+        if (clipSeconds <= 0) {
+            // Fallback: treat unknown durations as 10s-ish
+            clipSeconds = 10;
+        }
+
+        // If adding this clip would exceed 300s, start a new group
+        if (!currentGroup.empty() &&
+            currentGroupSeconds + clipSeconds > kMaxSegmentSeconds)
+        {
+            groups.push_back(currentGroup);
+            currentGroup.clear();
+            currentGroupSeconds = 0;
+        }
+
+        currentGroup.push_back(ci);
+        currentGroupSeconds += clipSeconds;
+    }
+
+    if (!currentGroup.empty()) {
+        groups.push_back(currentGroup);
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedVideosFromMp4Clips: grouping -> " +
+        std::to_string(groups.size()) + " merged segments"
+    );
+
+    // 6) For each group, actually build the EncodedVideoSegment (reading or ffmpeg-concat)
+    for (const auto& group : groups) {
+        EncodedVideoSegment ev;
+
+        if (!buildEncodedSegmentFromGroup(group, ev)) {
+            Logger::instance().logDebug(
+                "agent",
+                "buildEncodedVideosFromMp4Clips: failed to build segment group, skipping"
+            );
+            continue;
+        }
+
+        encoded.push_back(std::move(ev));
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedVideosFromMp4Clips: returning " +
+        std::to_string(encoded.size()) + " encoded merged segments"
+    );
+
+    return encoded;
+}
+    */
+
+
+
+
+
+
+
+
+/*
+
+    // 5) Read each chosen clip into EncodedVideoSegment
+    for (const ClipInfo* ci : chosen) {
+        EncodedVideoSegment ev;
+
+        if (!readFileToBytes(ci->path, ev.bytes)) {
+            continue;
+        }
+
+        ev.startTs = ci->startTs;
+        ev.endTs = ci->endTs;
+
+        encoded.push_back(std::move(ev));
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildEncodedVideosFromMp4Clips: returning " +
+        std::to_string(encoded.size()) + " encoded segments"
+    );
+
+    return encoded;
+}
+
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct FrameWithTs {
+    std::string path;
+    std::string ts;   // "YYYYMMDD_HHMMSS"
+    std::chrono::system_clock::time_point tp;
+};
+
+struct VideoSegment {
+    std::vector<FrameWithTs> frames;
+    std::string segmentStartTs;
+    std::string segmentEndTs;
+};
+
+
+
+
+static std::string extractTimestampFromPath(const std::string& path)
+{
+    fs::path p(path);
+    std::string stem = p.stem().string();  // e.g. "12_20251205_170856_548"
+
+    std::string ts;
+    if (!extractTimestampFromFrameStem(stem, ts)) {
+        return "";  // or some fallback / log error
+    }
+    return ts;      // "20251205_170856"
+}
+
+
+static std::vector<VideoSegment> buildVideoSegmentsForWindowByFrames(
+    const std::vector<std::string>& framePaths,
+    int maxSegmentSeconds,
+    int fps)
+{
+    std::vector<VideoSegment> segments;
+    if (framePaths.empty()) return segments;
+
+    const int maxFramesPerSegment = maxSegmentSeconds * fps; // e.g., 300 * 1 = 300
+
+    VideoSegment current;
+    current.segmentStartTs = extractTimestampFromPath(framePaths.front());
+
+    for (size_t i = 0; i < framePaths.size(); ++i) {
+        FrameWithTs f;
+        f.path = framePaths[i];
+        f.ts = extractTimestampFromPath(framePaths[i]);  // <<< changed
+
+        if (!current.frames.empty() &&
+            static_cast<int>(current.frames.size()) >= maxFramesPerSegment) {
+            // close current segment
+            current.segmentEndTs = current.frames.back().ts;  // <<< changed
+            segments.push_back(std::move(current));
+
+            current = VideoSegment{};
+            current.segmentStartTs = f.ts;                    // <<< changed
+        }
+
+        current.frames.push_back(std::move(f));
+    }
+
+    if (!current.frames.empty()) {
+        current.segmentEndTs = current.frames.back().ts;      // <<< changed
+        segments.push_back(std::move(current));
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "buildVideoSegmentsForWindowByFrames: built " +
+        std::to_string(segments.size()) + " segments"
+    );
+
+    return segments;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+namespace {
+
+    // Simple Base64 encoder for arbitrary binary data
+    std::string base64Encode(const std::string& input)
+    {
+        static const char table[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "0123456789+/";
+
+        const unsigned char* bytes =
+            reinterpret_cast<const unsigned char*>(input.data());
+        const size_t len = input.size();
+
+        std::string out;
+        out.reserve(((len + 2) / 3) * 4);
+
+        size_t i = 0;
+        // Process full 3-byte chunks
+        while (i + 3 <= len) {
+            uint32_t triple =
+                (static_cast<uint32_t>(bytes[i]) << 16) |
+                (static_cast<uint32_t>(bytes[i + 1]) << 8) |
+                static_cast<uint32_t>(bytes[i + 2]);
+
+            i += 3;
+
+            out.push_back(table[(triple >> 18) & 0x3F]);
+            out.push_back(table[(triple >> 12) & 0x3F]);
+            out.push_back(table[(triple >> 6) & 0x3F]);
+            out.push_back(table[triple & 0x3F]);
+        }
+
+        // Handle remaining 1 or 2 bytes (padding)
+        const size_t rem = len - i;
+        if (rem == 1) {
+            uint32_t triple = static_cast<uint32_t>(bytes[i]) << 16;
+
+            out.push_back(table[(triple >> 18) & 0x3F]);
+            out.push_back(table[(triple >> 12) & 0x3F]);
+            out.push_back('=');
+            out.push_back('=');
+        }
+        else if (rem == 2) {
+            uint32_t triple =
+                (static_cast<uint32_t>(bytes[i]) << 16) |
+                (static_cast<uint32_t>(bytes[i + 1]) << 8);
+
+            out.push_back(table[(triple >> 18) & 0x3F]);
+            out.push_back(table[(triple >> 12) & 0x3F]);
+            out.push_back(table[(triple >> 6) & 0x3F]);
+            out.push_back('=');
+        }
+
+        return out;
+    }
+
+
+    std::string stripDataUrlPrefix(const std::string& dataUrl)
+    {
+        // Expect formats like: "data:image/jpeg;base64,XXXXX"
+        const std::string marker = "base64,";
+        std::size_t pos = dataUrl.find(marker);
+        if (pos == std::string::npos) {
+            return dataUrl;  // already plain base64
+        }
+        return dataUrl.substr(pos + marker.size());
+    }
+
+
+
+} // namespace
+
+
+
+
+
+
+
+std::vector<uchar> resizeImageTo1280x720(const std::string& imagePath) {
+    cv::Mat img = cv::imread(imagePath, cv::IMREAD_COLOR);
+    std::vector<uchar> output;
+
+    if (img.empty()) {
+        return output; // empty -> caller can skip
+    }
+
+    const int targetW = 1280;
+    const int targetH = 720;
+
+    // Compute scale factor (fit into 1280x720)
+    double scale = (std::min)(
+        static_cast<double>(targetW) / static_cast<double>(img.cols),
+        static_cast<double>(targetH) / static_cast<double>(img.rows)
+        );
+
+    int newW = (std::max)(
+        1,
+        static_cast<int>(img.cols * scale)
+        );
+    int newH = (std::max)(
+        1,
+        static_cast<int>(img.rows * scale)
+        );
+
+    // Resize
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(newW, newH));
+
+    // Encode as JPEG (quality 80 is good; change if needed)
+    std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 80 };
+    cv::imencode(".jpg", resized, output, params);
+
+    return output;
+}
+
+
+
+
+
+namespace {
+
+    // replace every occurrence of `from` in `s` by `to`
+    std::string replaceAll(std::string s,
+        const std::string& from,
+        const std::string& to)
+    {
+        if (from.empty()) return s;
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+        return s;
+    }
+
+
+    std::vector<std::string> buildRtspCandidatesFromPayload(const json& p)
+    {
+        auto getStringSafe = [&](const char* key) -> std::string {
+            if (!p.contains(key) || p[key].is_null()) {
+                return std::string{};
+            }
+
+            if (p[key].is_string()) {
+                return p[key].get<std::string>();
+            }
+
+            if (p[key].is_number_integer()) {
+                return std::to_string(p[key].get<int>());
+            }
+
+            return std::string{};
+            };
+
+        auto toLower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+                });
+            return s;
+            };
+
+        auto trimCopy = [](std::string s) {
+            auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+            while (!s.empty() && isSpace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+            while (!s.empty() && isSpace(static_cast<unsigned char>(s.back()))) s.pop_back();
+            return s;
+            };
+
+        auto normalizeNumericToken = [&](std::string s) {
+            s = trimCopy(std::move(s));
+            if (s.empty()) return std::string{};
+            for (char ch : s) {
+                if (ch < '0' || ch > '9') {
+                    return std::string{};
+                }
+            }
+            return s;
+            };
+
+        auto replaceQueryParamValue = [](std::string& url, const std::string& key, const std::string& newValue) {
+            const std::string needle = key + "=";
+            size_t pos = 0;
+            while ((pos = url.find(needle, pos)) != std::string::npos) {
+                const size_t valueStart = pos + needle.size();
+                size_t valueEnd = url.find_first_of("&#? \\t\\r\\n|\"'", valueStart);
+                if (valueEnd == std::string::npos) valueEnd = url.size();
+                if (valueEnd > valueStart) {
+                    url.replace(valueStart, valueEnd - valueStart, newValue);
+                    pos = valueStart + newValue.size();
+                }
+                else {
+                    pos = valueStart;
+                }
+            }
+            };
+
+        auto replaceHikvisionChannelInPath = [](std::string& url, const std::string& channelValue) {
+            const std::string marker = "/Streaming/Channels/";
+            size_t pos = url.find(marker);
+            if (pos == std::string::npos) return;
+
+            size_t digitsStart = pos + marker.size();
+            size_t digitsEnd = digitsStart;
+            while (digitsEnd < url.size() && std::isdigit(static_cast<unsigned char>(url[digitsEnd])) != 0) {
+                ++digitsEnd;
+            }
+            if (digitsEnd > digitsStart) {
+                url.replace(digitsStart, digitsEnd - digitsStart, channelValue);
+            }
+            };
+
+        std::string manufacturer = getStringSafe("manufacturer");
+        std::string ip = getStringSafe("ip");
+        std::string username = getStringSafe("username");
+        std::string password = getStringSafe("password");
+        std::string channelOverride = normalizeNumericToken(getStringSafe("channel"));
+        std::string subtypeOverride = normalizeNumericToken(getStringSafe("subtype"));
+
+        std::string portStr = "554";
+        if (p.contains("port") && !p["port"].is_null()) {
+            if (p["port"].is_string()) {
+                portStr = p["port"].get<std::string>();
+            }
+            else if (p["port"].is_number_integer()) {
+                portStr = std::to_string(p["port"].get<int>());
+            }
+        }
+
+        auto make = [&](std::string tmpl) -> std::string {
+            tmpl = replaceAll(tmpl, "USUARIO", username);
+            tmpl = replaceAll(tmpl, "SENHA", password);
+            tmpl = replaceAll(tmpl, "IP", ip);
+            return tmpl;
+            };
+
+        std::vector<std::string> urls;
+        const std::string manufacturerNorm = toLower(trimCopy(manufacturer));
+        const bool isHikvision = (manufacturerNorm == "hikvision");
+        const bool isDahua = (manufacturerNorm == "dahua");
+        const bool isIntelbras = (manufacturerNorm == "intelbras");
+        const bool isAxis = (manufacturerNorm == "axis");
+
+        if (isHikvision) {
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/Streaming/Channels/101"));
+        }
+        else if (isDahua) {
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:5544/cam/realmonitor?channel=1&subtype=0"));
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=1"));
+        }
+        else if (isIntelbras) {
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=0"));
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"));
+            urls.push_back(make("rtsp://IP/user=USUARIO&password=SENHA&channel=1&stream=0.sdp?"));
+        }
+        else if (isAxis) {
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/axis-media/media.amp"));
+            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/axis-media/media.amp?camera=1"));
+        }
+
+        if (urls.empty() && !ip.empty()) {
+            if (!username.empty() || !password.empty()) {
+                urls.push_back(
+                    "rtsp://" + username + ":" + password + "@" +
+                    ip + ":" + portStr + "/Streaming/Channels/101"
+                );
+            }
+            else {
+                urls.push_back(
+                    "rtsp://" + ip + ":" + portStr + "/Streaming/Channels/101"
+                );
+            }
+        }
+
+        if (urls.empty()) {
+            urls.push_back("rtsp://qw:554/Streaming/Channels/101");
+        }
+
+        for (auto& url : urls) {
+            if (isHikvision && !channelOverride.empty()) {
+                replaceHikvisionChannelInPath(url, channelOverride);
+            }
+
+            if ((isDahua || isIntelbras) && !channelOverride.empty()) {
+                replaceQueryParamValue(url, "channel", channelOverride);
+            }
+
+            if (isAxis && !channelOverride.empty()) {
+                replaceQueryParamValue(url, "camera", channelOverride);
+            }
+
+            if ((isDahua || isIntelbras) && !subtypeOverride.empty()) {
+                replaceQueryParamValue(url, "subtype", subtypeOverride);
+            }
+        }
+
+        return urls;
+    }
+
+    static std::string trimCopyPromptEnhance(std::string s)
+    {
+        auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+        while (!s.empty() && isSpace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && isSpace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        return s;
+    }
+
+    static std::string toLowerCopyPromptEnhance(std::string s)
+    {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return s;
+    }
+
+    static int jsonIntOrPromptEnhance(const json& node, const char* key, int fallback)
+    {
+        if (!node.contains(key) || node[key].is_null()) return fallback;
+        const auto& v = node[key];
+        if (v.is_number_integer()) return v.get<int>();
+        if (v.is_string()) {
+            try {
+                return std::stoi(v.get<std::string>());
+            }
+            catch (...) {}
+        }
+        return fallback;
+    }
+
+    static std::string nowUtcIso8601PromptEnhance()
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm tmUtc{};
+#if defined(_WIN32)
+        gmtime_s(&tmUtc, &t);
+#else
+        gmtime_r(&t, &tmUtc);
+#endif
+        char buf[32];
+        if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc) == 0) {
+            return "";
+        }
+        return std::string(buf);
+    }
+
+    static cv::Mat downscaleFrameForPromptEnhance(const cv::Mat& src)
+    {
+        if (src.empty()) return src;
+        const int targetW = 1920;
+        const int targetH = 1080;
+        if (src.cols <= targetW && src.rows <= targetH) return src;
+
+        cv::Mat resized;
+        cv::resize(src, resized, cv::Size(targetW, targetH), 0, 0, cv::INTER_AREA);
+        return resized;
+    }
+
+    static bool encodeJpegDataUrlForPromptEnhance(const cv::Mat& frame, std::string& outDataUrl)
+    {
+        outDataUrl.clear();
+        if (frame.empty()) return false;
+
+        cv::Mat normalized = downscaleFrameForPromptEnhance(frame);
+        std::vector<uchar> jpg;
+        const std::vector<int> params = {
+            cv::IMWRITE_JPEG_QUALITY, 85
+        };
+        if (!cv::imencode(".jpg", normalized, jpg, params) || jpg.empty()) {
+            return false;
+        }
+
+        const std::string bytes(
+            reinterpret_cast<const char*>(jpg.data()),
+            reinterpret_cast<const char*>(jpg.data()) + jpg.size()
+        );
+        outDataUrl = "data:image/jpeg;base64," + base64Encode(bytes);
+        return true;
+    }
+
+    struct PromptEnhanceRegionPoint_ {
+        double x = 0.0;
+        double y = 0.0;
+    };
+
+    struct PromptEnhanceRegion_ {
+        std::string regionId;
+        std::string label;
+        std::vector<PromptEnhanceRegionPoint_> polygonNorm;
+    };
+
+    static double clamp01PromptEnhance_(double value)
+    {
+        if (!std::isfinite(value)) return 0.0;
+        if (value < 0.0) return 0.0;
+        if (value > 1.0) return 1.0;
+        return value;
+    }
+
+    static bool parseBoolPromptEnhance_(const json& node, const char* key, bool fallback)
+    {
+        if (!node.contains(key) || node[key].is_null()) return fallback;
+        const auto& value = node[key];
+        if (value.is_boolean()) return value.get<bool>();
+        if (value.is_number_integer()) return value.get<int>() != 0;
+        if (value.is_number_float()) return std::fabs(value.get<double>()) > 0.000001;
+        if (value.is_string()) {
+            std::string raw = toLowerCopyPromptEnhance(trimCopyPromptEnhance(value.get<std::string>()));
+            if (raw == "1" || raw == "true" || raw == "yes" || raw == "on") return true;
+            if (raw == "0" || raw == "false" || raw == "no" || raw == "off") return false;
+        }
+        return fallback;
+    }
+
+    static std::vector<PromptEnhanceRegion_> parsePromptEnhanceOverlayRegions_(const json& payload)
+    {
+        std::vector<PromptEnhanceRegion_> out;
+        if (!payload.contains("analysis_regions") || !payload["analysis_regions"].is_array()) {
+            return out;
+        }
+
+        std::unordered_set<std::string> usedIds;
+        const auto& regions = payload["analysis_regions"];
+        const size_t maxRegions = (std::min)(regions.size(), static_cast<size_t>(6));
+        out.reserve(maxRegions);
+
+        for (size_t i = 0; i < maxRegions; ++i) {
+            const auto& row = regions[i];
+            if (!row.is_object()) continue;
+
+            bool enabled = parseBoolPromptEnhance_(row, "enabled", true);
+            const bool enabledAlt = parseBoolPromptEnhance_(row, "is_enabled", enabled);
+            enabled = enabledAlt;
+            if (!enabled) continue;
+
+            bool fullFrame = parseBoolPromptEnhance_(row, "full_frame", false);
+            const bool fullFrameAlt = parseBoolPromptEnhance_(row, "fullFrame", fullFrame);
+            fullFrame = fullFrameAlt;
+            if (fullFrame) continue;
+
+            std::string regionId;
+            if (row.contains("region_id") && row["region_id"].is_string()) {
+                regionId = trimCopyPromptEnhance(row["region_id"].get<std::string>());
+            }
+            if (regionId.empty() && row.contains("regionId") && row["regionId"].is_string()) {
+                regionId = trimCopyPromptEnhance(row["regionId"].get<std::string>());
+            }
+            if (regionId.empty()) {
+                regionId = "region-" + std::to_string(i + 1);
+            }
+            if (usedIds.count(regionId)) continue;
+
+            std::string label;
+            if (row.contains("label") && row["label"].is_string()) {
+                label = trimCopyPromptEnhance(row["label"].get<std::string>());
+            }
+            if (label.empty()) label = regionId;
+
+            const json* polygonNode = nullptr;
+            if (row.contains("polygon_norm") && row["polygon_norm"].is_array()) {
+                polygonNode = &row["polygon_norm"];
+            }
+            else if (row.contains("polygonNorm") && row["polygonNorm"].is_array()) {
+                polygonNode = &row["polygonNorm"];
+            }
+            if (!polygonNode) continue;
+
+            PromptEnhanceRegion_ region;
+            region.regionId = regionId;
+            region.label = label;
+            region.polygonNorm.reserve((std::min)(polygonNode->size(), static_cast<size_t>(20)));
+
+            for (size_t p = 0; p < polygonNode->size() && region.polygonNorm.size() < 20; ++p) {
+                const auto& point = (*polygonNode)[p];
+                if (!point.is_object()) continue;
+
+                double x = 0.0;
+                double y = 0.0;
+                bool hasX = false;
+                bool hasY = false;
+
+                if (point.contains("x") && (point["x"].is_number_float() || point["x"].is_number_integer())) {
+                    x = point["x"].get<double>();
+                    hasX = true;
+                }
+                if (point.contains("y") && (point["y"].is_number_float() || point["y"].is_number_integer())) {
+                    y = point["y"].get<double>();
+                    hasY = true;
+                }
+                if (!hasX || !hasY) continue;
+
+                PromptEnhanceRegionPoint_ normPoint;
+                normPoint.x = clamp01PromptEnhance_(x);
+                normPoint.y = clamp01PromptEnhance_(y);
+                region.polygonNorm.push_back(normPoint);
+            }
+
+            if (region.polygonNorm.size() < 3) continue;
+            usedIds.insert(regionId);
+            out.push_back(std::move(region));
+        }
+
+        return out;
+    }
+
+    static std::string sanitizeBase64ForPromptEnhance_(std::string b64)
+    {
+        const auto markerPos = b64.find("base64,");
+        if (markerPos != std::string::npos) {
+            b64 = b64.substr(markerPos + 7);
+        }
+
+        b64.erase(
+            std::remove_if(
+                b64.begin(),
+                b64.end(),
+                [](unsigned char c) { return c == '\r' || c == '\n' || c == '\t' || c == ' '; }
+            ),
+            b64.end()
+        );
+
+        for (char& c : b64) {
+            if (c == '-') c = '+';
+            else if (c == '_') c = '/';
+        }
+
+        const size_t mod = b64.size() % 4;
+        if (mod != 0) b64.append(4 - mod, '=');
+
+        return b64;
+    }
+
+    static bool decodeBase64ToBytesForPromptEnhance_(
+        const std::string& rawBase64OrDataUrl,
+        std::vector<unsigned char>& outBytes,
+        std::string* outErr = nullptr)
+    {
+        outBytes.clear();
+#ifdef _WIN32
+        const std::string b64 = sanitizeBase64ForPromptEnhance_(rawBase64OrDataUrl);
+        if (b64.empty()) {
+            if (outErr) *outErr = "base64 empty after sanitize";
+            return false;
+        }
+
+        DWORD needed = 0;
+        const DWORD flags = CRYPT_STRING_BASE64 | CRYPT_STRING_BASE64_ANY;
+        if (!CryptStringToBinaryA(
+                b64.c_str(),
+                static_cast<DWORD>(b64.size()),
+                flags,
+                nullptr,
+                &needed,
+                nullptr,
+                nullptr)) {
+            if (outErr) {
+                *outErr = "CryptStringToBinaryA(sizeOnly) failed err=" + std::to_string(GetLastError());
+            }
+            return false;
+        }
+
+        if (needed == 0) {
+            if (outErr) *outErr = "decoded size is zero";
+            return false;
+        }
+
+        outBytes.resize(static_cast<size_t>(needed));
+        DWORD written = needed;
+        if (!CryptStringToBinaryA(
+                b64.c_str(),
+                static_cast<DWORD>(b64.size()),
+                flags,
+                outBytes.data(),
+                &written,
+                nullptr,
+                nullptr)) {
+            if (outErr) {
+                *outErr = "CryptStringToBinaryA(decode) failed err=" + std::to_string(GetLastError());
+            }
+            outBytes.clear();
+            return false;
+        }
+
+        outBytes.resize(static_cast<size_t>(written));
+        if (outBytes.empty()) {
+            if (outErr) *outErr = "decoded bytes empty";
+            return false;
+        }
+        return true;
+#else
+        (void)rawBase64OrDataUrl;
+        if (outErr) *outErr = "base64 decode unsupported on this platform";
+        return false;
+#endif
+    }
+
+    static bool decodePromptEnhanceSnapshotToMat_(
+        const std::string& rawBase64OrDataUrl,
+        cv::Mat& outFrame,
+        std::string* outErr = nullptr)
+    {
+        outFrame.release();
+        std::vector<unsigned char> bytes;
+        if (!decodeBase64ToBytesForPromptEnhance_(rawBase64OrDataUrl, bytes, outErr)) {
+            return false;
+        }
+
+        cv::Mat decoded = cv::imdecode(bytes, cv::IMREAD_COLOR);
+        if (decoded.empty()) {
+            if (outErr) *outErr = "imdecode returned empty frame";
+            return false;
+        }
+
+        outFrame = decoded;
+        return true;
+    }
+
+    static cv::Scalar colorForPromptEnhanceRegion_(const std::string& seed)
+    {
+        const std::size_t h = std::hash<std::string>{}(seed);
+        const int b = 70 + static_cast<int>(h % 120);
+        const int g = 120 + static_cast<int>((h >> 8) % 110);
+        const int r = 140 + static_cast<int>((h >> 16) % 100);
+        return cv::Scalar(b, g, r);
+    }
+
+    static std::vector<cv::Point> toCvPointsPromptEnhance_(
+        const std::vector<PromptEnhanceRegionPoint_>& polygonNorm,
+        int width,
+        int height)
+    {
+        std::vector<cv::Point> points;
+        if (width <= 0 || height <= 0) return points;
+        points.reserve(polygonNorm.size());
+
+        const int maxX = (std::max)(0, width - 1);
+        const int maxY = (std::max)(0, height - 1);
+        for (const auto& p : polygonNorm) {
+            const int px = std::clamp(
+                static_cast<int>(std::lround(clamp01PromptEnhance_(p.x) * static_cast<double>(maxX))),
+                0,
+                maxX
+            );
+            const int py = std::clamp(
+                static_cast<int>(std::lround(clamp01PromptEnhance_(p.y) * static_cast<double>(maxY))),
+                0,
+                maxY
+            );
+            points.emplace_back(px, py);
+        }
+        return points;
+    }
+
+    static bool drawPromptEnhanceRegionsOnFrame_(
+        cv::Mat& frame,
+        const std::vector<PromptEnhanceRegion_>& regions,
+        int& outDrawnCount)
+    {
+        outDrawnCount = 0;
+        if (frame.empty()) return false;
+        if (regions.empty()) return true;
+
+        struct PreparedRegion_ {
+            std::string label;
+            cv::Scalar color;
+            std::vector<cv::Point> points;
+            cv::Point centroid;
+        };
+
+        std::vector<PreparedRegion_> prepared;
+        prepared.reserve(regions.size());
+
+        const int width = frame.cols;
+        const int height = frame.rows;
+        const int minSide = (std::min)(width, height);
+        const int lineThickness = (std::max)(2, minSide / 430);
+        const int circleRadius = (std::max)(2, lineThickness + 1);
+        const double fontScale = (std::max)(0.45, static_cast<double>(minSide) / 1500.0);
+        const int fontFace = cv::FONT_HERSHEY_SIMPLEX;
+
+        for (const auto& region : regions) {
+            std::vector<cv::Point> points = toCvPointsPromptEnhance_(region.polygonNorm, width, height);
+            if (points.size() < 3) continue;
+
+            PreparedRegion_ entry;
+            entry.label = trimCopyPromptEnhance(region.label);
+            if (entry.label.empty()) {
+                entry.label = trimCopyPromptEnhance(region.regionId);
+            }
+            if (entry.label.empty()) {
+                entry.label = "Region";
+            }
+            entry.color = colorForPromptEnhanceRegion_(entry.label);
+            entry.points = std::move(points);
+
+            cv::Moments moments = cv::moments(entry.points);
+            if (std::fabs(moments.m00) > 1e-6) {
+                entry.centroid = cv::Point(
+                    static_cast<int>(std::lround(moments.m10 / moments.m00)),
+                    static_cast<int>(std::lround(moments.m01 / moments.m00))
+                );
+            }
+            else {
+                cv::Point sum(0, 0);
+                for (const auto& pt : entry.points) {
+                    sum.x += pt.x;
+                    sum.y += pt.y;
+                }
+                entry.centroid = cv::Point(
+                    sum.x / static_cast<int>(entry.points.size()),
+                    sum.y / static_cast<int>(entry.points.size())
+                );
+            }
+
+            prepared.push_back(std::move(entry));
+        }
+
+        if (prepared.empty()) return true;
+
+        cv::Mat overlay = frame.clone();
+        for (const auto& region : prepared) {
+            const std::vector<std::vector<cv::Point>> polyBatch = { region.points };
+            cv::fillPoly(overlay, polyBatch, region.color, cv::LINE_AA);
+        }
+        cv::addWeighted(overlay, 0.16, frame, 0.84, 0.0, frame);
+
+        const int maxX = (std::max)(0, width - 1);
+        const int maxY = (std::max)(0, height - 1);
+        for (const auto& region : prepared) {
+            const std::vector<std::vector<cv::Point>> polyBatch = { region.points };
+            cv::polylines(frame, polyBatch, true, region.color, lineThickness, cv::LINE_AA);
+
+            for (const auto& pt : region.points) {
+                cv::circle(frame, pt, circleRadius, region.color, cv::FILLED, cv::LINE_AA);
+                cv::circle(frame, pt, (std::max)(1, circleRadius - 1), cv::Scalar(22, 27, 40), 1, cv::LINE_AA);
+            }
+
+            int baseline = 0;
+            const cv::Size textSize = cv::getTextSize(
+                region.label,
+                fontFace,
+                fontScale,
+                (std::max)(1, lineThickness - 1),
+                &baseline
+            );
+
+            const int paddedW = textSize.width + 12;
+            const int paddedH = textSize.height + 8;
+            int boxLeft = region.centroid.x - (paddedW / 2);
+            int boxTop = region.centroid.y - (paddedH / 2);
+            boxLeft = std::clamp(boxLeft, 2, (std::max)(2, maxX - paddedW - 2));
+            boxTop = std::clamp(boxTop, 2, (std::max)(2, maxY - paddedH - 2));
+            const cv::Rect labelRect(boxLeft, boxTop, paddedW, paddedH);
+
+            cv::rectangle(frame, labelRect, cv::Scalar(10, 12, 18), cv::FILLED, cv::LINE_AA);
+            cv::rectangle(frame, labelRect, region.color, 1, cv::LINE_AA);
+            const cv::Point textOrg(
+                labelRect.x + 6,
+                labelRect.y + labelRect.height - baseline - 4
+            );
+            cv::putText(
+                frame,
+                region.label,
+                textOrg,
+                fontFace,
+                fontScale,
+                cv::Scalar(235, 239, 245),
+                (std::max)(1, lineThickness - 1),
+                cv::LINE_AA
+            );
+        }
+
+        outDrawnCount = static_cast<int>(prepared.size());
+        return true;
+    }
+
+    static bool captureStableWebcamSnapshotPromptEnhance(
+        int webcamIndex,
+        int targetSecond,
+        int maxCaptureSeconds,
+        cv::Mat& outFrame,
+        std::string& outError)
+    {
+        outFrame.release();
+        outError.clear();
+
+        cv::VideoCapture cap(webcamIndex, cv::CAP_DSHOW);
+        if (!cap.isOpened()) {
+            cap.open(webcamIndex, cv::CAP_ANY);
+        }
+        if (!cap.isOpened()) {
+            outError = "failed to open webcam index " + std::to_string(webcamIndex);
+            return false;
+        }
+
+        if (targetSecond < 0) targetSecond = 0;
+        if (maxCaptureSeconds < 2) maxCaptureSeconds = 2;
+        if (targetSecond >= maxCaptureSeconds) {
+            targetSecond = (std::max)(0, maxCaptureSeconds - 1);
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        cv::Mat latest;
+        cv::Mat candidate;
+
+        while (true) {
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started
+            ).count();
+            const double elapsedSec = static_cast<double>(elapsedMs) / 1000.0;
+            if (elapsedSec >= static_cast<double>(maxCaptureSeconds)) {
+                break;
+            }
+
+            cv::Mat frame;
+            if (!cap.read(frame) || frame.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                continue;
+            }
+
+            frame = downscaleFrameForPromptEnhance(frame);
+            latest = frame.clone();
+
+            if (elapsedSec >= static_cast<double>(targetSecond)) {
+                candidate = frame.clone();
+                if (elapsedSec >= static_cast<double>(targetSecond) + 1.0) {
+                    break;
+                }
+            }
+        }
+
+        cap.release();
+
+        if (!candidate.empty()) {
+            outFrame = candidate;
+            return true;
+        }
+        if (!latest.empty()) {
+            outFrame = latest;
+            return true;
+        }
+
+        outError = "webcam capture produced no valid frames";
+        return false;
+    }
+
+    static bool captureStableRtspSnapshotPromptEnhance(
+        const json& cameraPayload,
+        int targetSecond,
+        int maxCaptureSeconds,
+        cv::Mat& outFrame,
+        std::string& outError)
+    {
+        outFrame.release();
+        outError.clear();
+
+        if (targetSecond < 0) targetSecond = 0;
+        if (maxCaptureSeconds < 2) maxCaptureSeconds = 2;
+        if (targetSecond >= maxCaptureSeconds) {
+            targetSecond = (std::max)(0, maxCaptureSeconds - 1);
+        }
+
+        std::vector<std::string> urls = buildRtspCandidatesFromPayload(cameraPayload);
+        if (urls.empty()) {
+            outError = "no RTSP candidates available";
+            return false;
+        }
+
+        RtspOpenParams p;
+        p.open_timeout_ms = 20000;
+        p.read_timeout_ms = 5000;
+        p.force_tcp = true;
+        p.buffer_size_bytes = 4 * 1024 * 1024;
+        p.max_delay_us = 2'000'000;
+        p.enable_reconnect = true;
+        p.reconnect_max_delay_s = 5;
+        p.low_cpu_skip_nonref = false;
+
+        std::string lastError;
+
+        for (const auto& url : urls) {
+            p.url = url;
+            RtspCapture cap;
+            if (!cap.open(p)) {
+                lastError = cap.lastError();
+                continue;
+            }
+
+            const auto started = std::chrono::steady_clock::now();
+            cv::Mat latest;
+            cv::Mat candidate;
+
+            while (true) {
+                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started
+                ).count();
+                const double elapsedSec = static_cast<double>(elapsedMs) / 1000.0;
+                if (elapsedSec >= static_cast<double>(maxCaptureSeconds)) {
+                    break;
+                }
+
+                cv::Mat frame;
+                if (!cap.read(frame) || frame.empty()) {
+                    continue;
+                }
+
+                frame = downscaleFrameForPromptEnhance(frame);
+                latest = frame.clone();
+
+                if (elapsedSec >= static_cast<double>(targetSecond)) {
+                    candidate = frame.clone();
+                    if (elapsedSec >= static_cast<double>(targetSecond) + 1.0) {
+                        break;
+                    }
+                }
+            }
+
+            cap.close();
+
+            if (!candidate.empty()) {
+                outFrame = candidate;
+                return true;
+            }
+            if (!latest.empty()) {
+                outFrame = latest;
+                return true;
+            }
+        }
+
+        outError = lastError.empty() ? "RTSP capture produced no valid frames" : lastError;
+        return false;
+    }
+
+    static std::string formatSystemClockAsUtcIsoDrakonFind_(
+        const std::chrono::system_clock::time_point& tp)
+    {
+        const std::time_t raw = std::chrono::system_clock::to_time_t(tp);
+        std::tm tmUtc{};
+#ifdef _WIN32
+        gmtime_s(&tmUtc, &raw);
+#else
+        gmtime_r(&raw, &tmUtc);
+#endif
+        char buf[32];
+        if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc) == 0) {
+            return std::string();
+        }
+        return std::string(buf);
+    }
+
+    static std::string formatSystemClockAsCompactLocalTsDrakonFind_(
+        const std::chrono::system_clock::time_point& tp)
+    {
+        const std::time_t raw = std::chrono::system_clock::to_time_t(tp);
+        std::tm tmLocal{};
+#ifdef _WIN32
+        localtime_s(&tmLocal, &raw);
+#else
+        localtime_r(&raw, &tmLocal);
+#endif
+        char buf[20];
+        if (std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tmLocal) == 0) {
+            return std::string();
+        }
+        return std::string(buf);
+    }
+
+    static fs::path ensureDrakonFindTempDir_()
+    {
+        std::error_code ec;
+        fs::path tmpDir;
+#ifdef _WIN32
+        wchar_t buf[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, buf) > 0) {
+            tmpDir = fs::path(buf) / "drakon_find";
+        }
+        else {
+            tmpDir = fs::temp_directory_path(ec) / "drakon_find";
+        }
+#else
+        tmpDir = fs::temp_directory_path(ec) / "drakon_find";
+#endif
+        fs::create_directories(tmpDir, ec);
+        return tmpDir;
+    }
+
+    static bool buildDataUrlFromJpegBytesDrakonFind_(
+        const std::vector<unsigned char>& jpegBytes,
+        std::string& outDataUrl)
+    {
+        outDataUrl.clear();
+        if (jpegBytes.empty()) return false;
+        const std::string raw(
+            reinterpret_cast<const char*>(jpegBytes.data()),
+            jpegBytes.size()
+        );
+        outDataUrl =
+            std::string("data:image/jpeg;base64,") +
+            base64Encode(raw);
+        return !outDataUrl.empty();
+    }
+    static bool buildDataUrlFromMp4BytesDrakonFind_(
+        const std::vector<uint8_t>& mp4Bytes,
+        std::string& outDataUrl)
+    {
+        outDataUrl.clear();
+        if (mp4Bytes.empty()) return false;
+        const std::string raw(
+            reinterpret_cast<const char*>(mp4Bytes.data()),
+            mp4Bytes.size()
+        );
+        outDataUrl =
+            std::string("data:video/mp4;base64,") +
+            base64Encode(raw);
+        return !outDataUrl.empty();
+    }
+
+    static bool buildVideoDataUrlForDrakonFind_(
+        const std::string& videoPath,
+        std::string& outDataUrl)
+    {
+        outDataUrl.clear();
+        if (videoPath.empty()) return false;
+
+        std::vector<uint8_t> mp4Bytes;
+        if (!readFileToBytes(videoPath, mp4Bytes) || mp4Bytes.empty()) {
+            return false;
+        }
+
+        return buildDataUrlFromMp4BytesDrakonFind_(mp4Bytes, outDataUrl);
+    }
+
+    static bool buildRepresentativeFrameDataUrlForDrakonFind_(
+        const std::string& videoPath,
+        const std::string& detectionTimeHint,
+        std::string& outDataUrl)
+    {
+        outDataUrl.clear();
+        if (videoPath.empty()) return false;
+
+        auto parseTimestampToSeconds = [](const std::string& raw) -> double {
+            const std::string value = trimAscii(raw);
+            if (value.empty()) return 30.0;
+
+            std::vector<std::string> parts;
+            std::stringstream ss(value);
+            std::string token;
+            while (std::getline(ss, token, ':')) {
+                parts.push_back(token);
+            }
+            if (parts.empty()) return 30.0;
+
+            try {
+                if (parts.size() == 2) {
+                    return std::stod(parts[0]) * 60.0 + std::stod(parts[1]);
+                }
+                if (parts.size() >= 3) {
+                    return std::stod(parts[0]) * 3600.0 +
+                        std::stod(parts[1]) * 60.0 +
+                        std::stod(parts[2]);
+                }
+                return std::stod(parts[0]);
+            }
+            catch (...) {
+                return 30.0;
+            }
+        };
+
+        auto extractFrameAsJpeg = [&](double secondOffset, std::vector<unsigned char>& outJpeg) -> bool {
+            outJpeg.clear();
+            cv::VideoCapture cap(videoPath);
+            if (!cap.isOpened()) return false;
+
+            const double safeSeconds = (std::max)(0.0, secondOffset);
+            cap.set(cv::CAP_PROP_POS_MSEC, safeSeconds * 1000.0);
+
+            cv::Mat frame;
+            if (!cap.read(frame) || frame.empty()) {
+                return false;
+            }
+
+            frame = downscaleFrameForPromptEnhance(frame);
+            std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 85 };
+            return cv::imencode(".jpg", frame, outJpeg, params);
+        };
+
+        std::vector<unsigned char> jpegBytes;
+        const double requestedSecond = parseTimestampToSeconds(detectionTimeHint);
+        if (!extractFrameAsJpeg(requestedSecond, jpegBytes) &&
+            std::abs(requestedSecond - 30.0) > 0.001)
+        {
+            extractFrameAsJpeg(30.0, jpegBytes);
+        }
+        if (jpegBytes.empty()) return false;
+        return buildDataUrlFromJpegBytesDrakonFind_(jpegBytes, outDataUrl);
+    }
+
+    static bool hasSuffixDrakonFind_(const std::string& value, const std::string& suffix)
+    {
+        if (suffix.size() > value.size()) return false;
+        return std::equal(suffix.rbegin(), suffix.rend(), value.rbegin());
+    }
+
+    static bool parseStoredClipLocalRangeDrakonFind_(
+        const fs::path& clipPath,
+        std::string& outStartTs,
+        std::string& outEndTs)
+    {
+        outStartTs.clear();
+        outEndTs.clear();
+
+        std::string name = clipPath.filename().string();
+        const std::string processingSuffix = ".processing";
+        if (name.size() > processingSuffix.size() &&
+            name.rfind(processingSuffix) == (name.size() - processingSuffix.size()))
+        {
+            name = name.substr(0, name.size() - processingSuffix.size());
+        }
+
+        const auto dot = name.rfind('.');
+        if (dot != std::string::npos) {
+            name = name.substr(0, dot);
+        }
+
+        std::vector<std::string> parts;
+        {
+            std::stringstream ss(name);
+            std::string tok;
+            while (std::getline(ss, tok, '_')) parts.push_back(tok);
+        }
+
+        if (parts.size() < 6) return false;
+
+        auto isDigitsLen = [](const std::string& s, size_t n) -> bool {
+            if (s.size() != n) return false;
+            return std::all_of(s.begin(), s.end(), [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            });
+        };
+
+        if (!isDigitsLen(parts[1], 8) || !isDigitsLen(parts[2], 6) ||
+            !isDigitsLen(parts[3], 8) || !isDigitsLen(parts[4], 6))
+        {
+            return false;
+        }
+
+        outStartTs = parts[1] + "_" + parts[2];
+        outEndTs = parts[3] + "_" + parts[4];
+        return true;
+    }
+
+    static bool convertCompactLocalTimestampToUtcIsoDrakonFind_(
+        const std::string& compactLocalTs,
+        std::string& outUtcIso)
+    {
+        outUtcIso.clear();
+        if (compactLocalTs.size() != 15 || compactLocalTs[8] != '_') {
+            return false;
+        }
+
+        std::tm tmLocal{};
+        try {
+            tmLocal.tm_year = std::stoi(compactLocalTs.substr(0, 4)) - 1900;
+            tmLocal.tm_mon = std::stoi(compactLocalTs.substr(4, 2)) - 1;
+            tmLocal.tm_mday = std::stoi(compactLocalTs.substr(6, 2));
+            tmLocal.tm_hour = std::stoi(compactLocalTs.substr(9, 2));
+            tmLocal.tm_min = std::stoi(compactLocalTs.substr(11, 2));
+            tmLocal.tm_sec = std::stoi(compactLocalTs.substr(13, 2));
+            tmLocal.tm_isdst = -1;
+        }
+        catch (...) {
+            return false;
+        }
+
+        const std::time_t tt = std::mktime(&tmLocal);
+        if (tt == static_cast<std::time_t>(-1)) {
+            return false;
+        }
+
+        std::tm tmUtc{};
+#ifdef _WIN32
+        gmtime_s(&tmUtc, &tt);
+#else
+        gmtime_r(&tt, &tmUtc);
+#endif
+        char buf[32];
+        if (std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc) == 0) {
+            return false;
+        }
+        outUtcIso = std::string(buf);
+        return true;
+    }
+
+    static bool deriveStoredClipUtcRangeDrakonFind_(
+        const fs::path& clipPath,
+        std::string& outStartUtcIso,
+        std::string& outEndUtcIso)
+    {
+        outStartUtcIso.clear();
+        outEndUtcIso.clear();
+
+        std::string startLocalTs;
+        std::string endLocalTs;
+        if (!parseStoredClipLocalRangeDrakonFind_(clipPath, startLocalTs, endLocalTs)) {
+            return false;
+        }
+
+        return convertCompactLocalTimestampToUtcIsoDrakonFind_(startLocalTs, outStartUtcIso) &&
+            convertCompactLocalTimestampToUtcIsoDrakonFind_(endLocalTs, outEndUtcIso);
+    }
+
+    static std::optional<std::string> getNewestStoredSixtySecondClipForCameraDrakonFind_(
+        int cameraId)
+    {
+        try {
+            std::error_code ec;
+            const fs::path camRoot = fs::path("frames") / ("cam_" + std::to_string(cameraId));
+            if (!fs::exists(camRoot, ec) || !fs::is_directory(camRoot, ec)) {
+                return std::nullopt;
+            }
+
+            fs::path bestPath;
+            fs::file_time_type bestTime{};
+            bool found = false;
+
+            for (fs::recursive_directory_iterator it(camRoot, ec), end; !ec && it != end; it.increment(ec)) {
+                if (ec) break;
+
+                const auto& entry = *it;
+                if (!entry.is_regular_file(ec)) {
+                    if (ec) break;
+                    continue;
+                }
+
+                const std::string filename = entry.path().filename().string();
+                if (!hasSuffixDrakonFind_(filename, "_60s.mp4")) {
+                    continue;
+                }
+                if (entry.path().string().find("_merge_failed") != std::string::npos) {
+                    continue;
+                }
+                std::string parsedCameraId;
+                std::string parsedStartTs;
+                std::string parsedEndTs;
+                int nominalSeconds = 0;
+                if (!parseClipNamePartsForAgent(
+                    entry.path().stem().string(),
+                    parsedCameraId,
+                    parsedStartTs,
+                    parsedEndTs,
+                    nominalSeconds))
+                {
+                    continue;
+                }
+                if (nominalSeconds < 50) {
+                    continue;
+                }
+
+                const auto t = entry.last_write_time(ec);
+                if (ec) break;
+
+                const auto nowFileClock = fs::file_time_type::clock::now();
+                if (t > nowFileClock) {
+                    continue;
+                }
+                if ((nowFileClock - t) < std::chrono::seconds(2)) {
+                    continue;
+                }
+
+                if (!found || t > bestTime) {
+                    bestPath = entry.path();
+                    bestTime = t;
+                    found = true;
+                }
+            }
+
+            if (ec || !found) {
+                return std::nullopt;
+            }
+            return bestPath.string();
+        }
+        catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    static bool recordVideoWindowFromWebcamDrakonFind_(
+        int webcamIndex,
+        int cameraId,
+        int windowSeconds,
+        int outputFps,
+        const std::atomic<bool>& cancelRequested,
+        EncodedVideoSegment& outSegment,
+        std::string& outError)
+    {
+        outSegment = EncodedVideoSegment{};
+        outError.clear();
+        const int safeOutputFps = clampRequestedModelFps_(outputFps);
+
+        cv::VideoCapture cap(webcamIndex, cv::CAP_DSHOW);
+        if (!cap.isOpened()) {
+            cap.open(webcamIndex, cv::CAP_ANY);
+        }
+        if (!cap.isOpened()) {
+            outError = "failed to open webcam index " + std::to_string(webcamIndex);
+            return false;
+        }
+
+        const fs::path tmpDir = ensureDrakonFindTempDir_();
+        const auto startedAt = std::chrono::system_clock::now();
+        const std::string startLocal = formatSystemClockAsCompactLocalTsDrakonFind_(startedAt);
+        const fs::path outPath =
+            tmpDir /
+            (std::to_string(cameraId) + "_" + startLocal + "_capture_60s.mp4");
+
+        cv::Mat firstFrame;
+        while (!cancelRequested.load()) {
+            if (cap.read(firstFrame) && !firstFrame.empty()) {
+                firstFrame = downscaleFrameForPromptEnhance(firstFrame);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        }
+
+        if (firstFrame.empty()) {
+            cap.release();
+            outError = cancelRequested.load()
+                ? "capture cancelled"
+                : "webcam capture produced no valid frames";
+            return false;
+        }
+
+        cv::VideoWriter writer;
+        if (!writer.open(
+            outPath.string(),
+            cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+            static_cast<double>(safeOutputFps),
+            firstFrame.size(),
+            true))
+        {
+            cap.release();
+            outError = "failed to open output file for webcam capture";
+            return false;
+        }
+
+        int writtenFrames = 0;
+        writer.write(firstFrame);
+        writtenFrames += 1;
+
+        const auto startSteady = std::chrono::steady_clock::now();
+        const double sampleIntervalMs = 1000.0 / static_cast<double>(safeOutputFps);
+        double nextSampleAtMs = sampleIntervalMs;
+        cv::Mat latestFrame = firstFrame.clone();
+
+        while (!cancelRequested.load()) {
+            const auto elapsedMs = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - startSteady
+                ).count()
+            );
+            const auto elapsedSeconds = static_cast<int>(elapsedMs / 1000.0);
+            if (elapsedSeconds >= windowSeconds) {
+                break;
+            }
+
+            cv::Mat frame;
+            if (cap.read(frame) && !frame.empty()) {
+                latestFrame = downscaleFrameForPromptEnhance(frame);
+            }
+            while (elapsedMs + 0.5 >= nextSampleAtMs && !latestFrame.empty()) {
+                writer.write(latestFrame);
+                writtenFrames += 1;
+                nextSampleAtMs += sampleIntervalMs;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+
+        cap.release();
+        writer.release();
+
+        if (cancelRequested.load()) {
+            std::error_code rmEc;
+            fs::remove(outPath, rmEc);
+            outError = "capture cancelled";
+            return false;
+        }
+        if (writtenFrames <= 0) {
+            std::error_code rmEc;
+            fs::remove(outPath, rmEc);
+            outError = "webcam capture wrote no frames";
+            return false;
+        }
+
+        const auto endedAt = startedAt + std::chrono::seconds(windowSeconds);
+        outSegment.cameraId = cameraId;
+        outSegment.sourceFilePath = outPath.string();
+        outSegment.isTempFile = true;
+        outSegment.startTs = formatSystemClockAsUtcIsoDrakonFind_(startedAt);
+        outSegment.endTs = formatSystemClockAsUtcIsoDrakonFind_(endedAt);
+        return true;
+    }
+
+    static bool recordVideoWindowFromRtspDrakonFind_(
+        const json& cameraPayload,
+        int cameraId,
+        int windowSeconds,
+        int outputFps,
+        const std::atomic<bool>& cancelRequested,
+        EncodedVideoSegment& outSegment,
+        std::string& outError)
+    {
+        outSegment = EncodedVideoSegment{};
+        outError.clear();
+        const int safeOutputFps = clampRequestedModelFps_(outputFps);
+
+        std::vector<std::string> urls = buildRtspCandidatesFromPayload(cameraPayload);
+        if (urls.empty()) {
+            outError = "no RTSP candidates available";
+            return false;
+        }
+
+        RtspOpenParams p;
+        p.open_timeout_ms = 5000;
+        p.read_timeout_ms = 3000;
+        p.force_tcp = true;
+        p.buffer_size_bytes = 4 * 1024 * 1024;
+        p.max_delay_us = 2'000'000;
+        p.enable_reconnect = true;
+        p.reconnect_max_delay_s = 5;
+        p.low_cpu_skip_nonref = false;
+
+        std::string lastError;
+        for (const auto& url : urls) {
+            p.url = url;
+            RtspCapture cap;
+            if (!cap.open(p)) {
+                lastError = cap.lastError();
+                continue;
+            }
+
+            const fs::path tmpDir = ensureDrakonFindTempDir_();
+            const auto startedAt = std::chrono::system_clock::now();
+            const std::string startLocal = formatSystemClockAsCompactLocalTsDrakonFind_(startedAt);
+            const fs::path outPath =
+                tmpDir /
+                (std::to_string(cameraId) + "_" + startLocal + "_capture_60s.mp4");
+
+            cv::Mat firstFrame;
+            while (!cancelRequested.load()) {
+                if (cap.read(firstFrame) && !firstFrame.empty()) {
+                    firstFrame = downscaleFrameForPromptEnhance(firstFrame);
+                    break;
+                }
+            }
+
+            if (firstFrame.empty()) {
+                cap.close();
+                lastError = cancelRequested.load()
+                    ? "capture cancelled"
+                    : "RTSP capture produced no valid frames";
+                continue;
+            }
+
+            cv::VideoWriter writer;
+            if (!writer.open(
+                outPath.string(),
+                cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                static_cast<double>(safeOutputFps),
+                firstFrame.size(),
+                true))
+            {
+                cap.close();
+                lastError = "failed to open output file for RTSP capture";
+                continue;
+            }
+
+            int writtenFrames = 0;
+            writer.write(firstFrame);
+            writtenFrames += 1;
+
+            const auto startSteady = std::chrono::steady_clock::now();
+            const double sampleIntervalMs = 1000.0 / static_cast<double>(safeOutputFps);
+            double nextSampleAtMs = sampleIntervalMs;
+            cv::Mat latestFrame = firstFrame.clone();
+
+            while (!cancelRequested.load()) {
+                const auto elapsedMs = static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - startSteady
+                    ).count()
+                );
+                const auto elapsedSeconds = static_cast<int>(elapsedMs / 1000.0);
+                if (elapsedSeconds >= windowSeconds) {
+                    break;
+                }
+
+                cv::Mat frame;
+                if (cap.read(frame) && !frame.empty()) {
+                    latestFrame = downscaleFrameForPromptEnhance(frame);
+                }
+                while (elapsedMs + 0.5 >= nextSampleAtMs && !latestFrame.empty()) {
+                    writer.write(latestFrame);
+                    writtenFrames += 1;
+                    nextSampleAtMs += sampleIntervalMs;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            }
+
+            cap.close();
+            writer.release();
+
+            if (cancelRequested.load()) {
+                std::error_code rmEc;
+                fs::remove(outPath, rmEc);
+                outError = "capture cancelled";
+                return false;
+            }
+            if (writtenFrames <= 0) {
+                std::error_code rmEc;
+                fs::remove(outPath, rmEc);
+                lastError = "RTSP capture wrote no frames";
+                continue;
+            }
+
+            const auto endedAt = startedAt + std::chrono::seconds(windowSeconds);
+            outSegment.cameraId = cameraId;
+            outSegment.sourceFilePath = outPath.string();
+            outSegment.isTempFile = true;
+            outSegment.startTs = formatSystemClockAsUtcIsoDrakonFind_(startedAt);
+            outSegment.endTs = formatSystemClockAsUtcIsoDrakonFind_(endedAt);
+            return true;
+        }
+
+        outError = lastError.empty() ? "RTSP capture produced no valid frames" : lastError;
+        return false;
+    }
+
+    static bool captureOnDemandVideoWindowDrakonFind_(
+        const json& cameraPayload,
+        int cameraId,
+        int windowSeconds,
+        int outputFps,
+        const std::atomic<bool>& cancelRequested,
+        EncodedVideoSegment& outSegment,
+        std::string& outError)
+    {
+        outSegment = EncodedVideoSegment{};
+        outError.clear();
+
+        if (!cameraPayload.is_object()) {
+            outError = "camera_payload is missing";
+            return false;
+        }
+
+        const int webcamIndex = jsonIntOrPromptEnhance(cameraPayload, "webcam_index", -1);
+        std::string connectionMethod;
+        if (cameraPayload.contains("connection_method") &&
+            cameraPayload["connection_method"].is_string())
+        {
+            connectionMethod = toLowerCopyPromptEnhance(
+                trimCopyPromptEnhance(cameraPayload["connection_method"].get<std::string>())
+            );
+        }
+        const bool preferWebcam = (webcamIndex >= 0) || connectionMethod == "webcam";
+
+        if (preferWebcam && webcamIndex >= 0) {
+            if (recordVideoWindowFromWebcamDrakonFind_(
+                webcamIndex,
+                cameraId,
+                windowSeconds,
+                outputFps,
+                cancelRequested,
+                outSegment,
+                outError))
+            {
+                return true;
+            }
+            if (cancelRequested.load()) return false;
+        }
+
+        return recordVideoWindowFromRtspDrakonFind_(
+            cameraPayload,
+            cameraId,
+            windowSeconds,
+            outputFps,
+            cancelRequested,
+            outSegment,
+            outError
+        );
+    }
+} // namespace
+
+
+
+bool AgentCore::isRunning() const {
+    return running_.load();
+}
+
+
+
+static int CurlAbortIfStopped(void* clientp,
+    curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+    curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    auto* self = static_cast<AgentCore*>(clientp);
+    return self && !self->isRunning() ? 1 : 0; // return non-zero => abort
+}
+
+
+static size_t WriteCb(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* s = static_cast<std::string*>(userdata);
+    s->append(static_cast<char*>(ptr), size * nmemb);
+    return size * nmemb;
+}
+
+// ---- constructor --------------------------------------------------
+
+AgentCore::AgentCore(const std::string& baseUrl,
+    const std::string& exeToken,
+    const std::string& clientId)
+    : baseUrl_(baseUrl),
+    exeToken_(exeToken),
+    clientId_(clientId),
+    machineTimezoneForBackend_(detectMachineTimezoneForBackendHeaders()),
+    running_(false)
+{
+    jobRuntime_ = std::make_unique<JobRuntime>(this);
+    chatV2Orchestrator_ = std::make_unique<chatv2::ChatV2Orchestrator>();
+}
+
+AgentCore::~AgentCore() = default;
+
+
+
+
+
+
+
+// ================================
+// Scheduler Tick (config)
+// ================================
+
+// Tick endpoint path on the Worker:
+static const char* kSchedulerTickPath = "/api/scheduler/tick";
+
+// How often the EXE should trigger the scheduler tick:
+static constexpr int kSchedulerTickIntervalSeconds = 60;
+
+// Uses EXE bearer token (same auth already used by /api/agent/* endpoints).
+
+
+
+
+// ---- start/stop ---------------------------------------------------
+
+void AgentCore::start() {
+    if (running_.exchange(true)) return;
+
+    if (chatV2Orchestrator_) {
+        chatV2Orchestrator_->start();
+    }
+
+    startTokenUsageWorker();
+    startCaptureMetricsWorker();
+    startOpenMonitorWorker(this);
+
+    // Start command polling thread
+    worker_ = std::thread([this]() {
+        try {
+            workerLoop_();
+        }
+        catch (const std::exception& ex) {
+            logAgentException_(
+                "agent",
+                "agent",
+                "AgentCore::start::workerThread",
+                "worker_loop",
+                json::object(),
+                ex
+            );
+        }
+        catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "agent",
+                "AgentCore::start::workerThread",
+                "worker_loop",
+                json::object()
+            );
+        }
+    });
+
+    // Start scheduler tick pinger whenever we have a valid EXE bearer token
+    if (!exeToken_.empty()) {
+        schedulerPingerRunning_ = true;
+        schedulerPingerThread_ = std::thread([this]() {
+            try {
+                schedulerPingLoop_();
+            }
+            catch (const std::exception& ex) {
+                logAgentException_(
+                    "agent",
+                    "agent",
+                    "AgentCore::start::schedulerThread",
+                    "scheduler_ping_loop",
+                    json::object(),
+                    ex
+                );
+            }
+            catch (...) {
+                logAgentUnknownException_(
+                    "agent",
+                    "agent",
+                    "AgentCore::start::schedulerThread",
+                    "scheduler_ping_loop",
+                    json::object()
+                );
+            }
+        });
+    }
+}
+
+
+void AgentCore::cleanupCompletedDrakonFindTasks_(bool joinAll)
+{
+    std::vector<std::unique_ptr<DrakonFindTask>> finished;
+    {
+        std::lock_guard<std::mutex> lk(drakonFindMu_);
+        for (auto it = drakonFindTasks_.begin(); it != drakonFindTasks_.end();) {
+            const bool shouldJoin =
+                joinAll ||
+                (it->second &&
+                 it->second->state &&
+                 it->second->state->done.load());
+            if (!shouldJoin) {
+                ++it;
+                continue;
+            }
+            finished.push_back(std::move(it->second));
+            it = drakonFindTasks_.erase(it);
+        }
+    }
+
+    for (auto& task : finished) {
+        if (task && task->worker.joinable()) {
+            task->worker.join();
+        }
+    }
+}
+
+
+
+void AgentCore::stop() {
+    running_ = false;
+
+    if (chatV2Orchestrator_) {
+        chatV2Orchestrator_->stop();
+    }
+
+    // Stop scheduler pinger thread
+    schedulerPingerRunning_ = false;
+    if (schedulerPingerThread_.joinable())
+        schedulerPingerThread_.join();
+
+    // Stop command polling thread
+    if (worker_.joinable())
+        worker_.join();
+
+    {
+        std::lock_guard<std::mutex> lk(drakonFindMu_);
+        for (auto& kv : drakonFindTasks_) {
+            if (kv.second && kv.second->state) {
+                kv.second->state->cancelRequested = true;
+            }
+        }
+    }
+    cleanupCompletedDrakonFindTasks_(true);
+
+    // stop all cameras on shutdown
+    for (auto& kv : sessions_) {
+        if (kv.second)
+            kv.second->stop();
+    }
+    sessions_.clear();
+
+    stopTokenUsageWorker();
+    stopCaptureMetricsWorker();
+    stopOpenMonitorWorker();
+}
+
+
+
+
+
+// ---- background loop: poll commands -------------------------------
+
+void AgentCore::workerLoop_() {
+    while (running_) {
+        try {
+            std::string url = baseUrl_ + "/api/agent/commands?client_id=" + clientId_;
+            std::string body;
+
+            CURL* curl = curl_easy_init();
+            if (curl) {
+                curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+                curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+
+                // critical: prevent infinite hangs
+                curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+                curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 15000L);
+
+                // allow stop() to interrupt quickly
+                curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+                curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, CurlAbortIfStopped);
+                curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
+
+                struct curl_slist* headers = nullptr;
+                std::string auth = "Authorization: Bearer " + exeToken_;
+                headers = curl_slist_append(headers, auth.c_str());
+                if (!machineTimezoneForBackend_.empty()) {
+                    std::string tzHeader = "X-EXE-Timezone: " + machineTimezoneForBackend_;
+                    headers = curl_slist_append(headers, tzHeader.c_str());
+                }
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+                CURLcode res = curl_easy_perform(curl);
+
+                long httpCode = 0;
+                if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+                if (res != CURLE_OK) {
+                    Logger::instance().logDebug("agent",
+                        std::string("workerLoop_: curl error: ") + curl_easy_strerror(res));
+                }
+                else if (httpCode >= 400) {
+                    Logger::instance().logDebug("agent",
+                        "workerLoop_: HTTP " + std::to_string(httpCode) + " bodySize=" + std::to_string(body.size()));
+                }
+
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+            }
+
+
+            json arr = json::parse(body, nullptr, false);
+            if (arr.is_array()) {
+                for (auto& cmd : arr) {
+                    processCommand_(cmd);
+                }
+            }
+        } catch (const std::exception& e) {
+            logAgentException_(
+                "agent",
+                "agent",
+                "AgentCore::workerLoop_",
+                "poll_commands",
+                {
+                    { "base_url", baseUrl_ },
+                    { "client_id_present", !clientId_.empty() }
+                },
+                e
+            );
+        } catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "agent",
+                "AgentCore::workerLoop_",
+                "poll_commands",
+                {
+                    { "base_url", baseUrl_ },
+                    { "client_id_present", !clientId_.empty() }
+                }
+            );
+        }
+        
+
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+    }
+}
+
+
+
+
+
+
+
+void AgentCore::updateCameraAlgorithms_(int cameraId,
+    const nlohmann::json& payload)
+{
+    auto it = sessions_.find(cameraId);
+    if (it == sessions_.end() || !it->second) {
+        Logger::instance().logDebug(
+            "agent",
+            "updateCameraAlgorithms_: camera not running, cameraId=" +
+            std::to_string(cameraId)
+        );
+        return;
+    }
+
+    CameraSession* session = it->second.get();
+
+    if (!payload.contains("enabled_algorithms") ||
+        !payload["enabled_algorithms"].is_array()) {
+        Logger::instance().logDebug(
+            "agent",
+            "updateCameraAlgorithms_: missing enabled_algorithms array"
+        );
+        return;
+    }
+
+    std::vector<AlgorithmConfig> newAlgos;
+    newAlgos.reserve(payload["enabled_algorithms"].size());
+
+    /*
+    for (const auto& a : payload["enabled_algorithms"]) {
+        AlgorithmConfig ac;
+        ac.type = a.value("algorithm_type", "");
+        ac.llmPrompt = a.value("llm_prompt", "");
+        
+
+        if (a.contains("config_json") && a["config_json"].is_object()) {
+            ac.displayName = a["config_json"].value("display_name", "");
+        }
+        else {
+            ac.displayName.clear();
+        }
+
+        // fallback
+        if (ac.displayName.empty()) {
+            ac.displayName = ac.type;
+        }
+
+
+        newAlgos.push_back(std::move(ac));
+    }
+    */
+
+
+    auto jsonStringOr = [](const json& node, const char* key, const std::string& fallback = std::string()) {
+        if (node.contains(key) && node[key].is_string()) return node[key].get<std::string>();
+        return fallback;
+    };
+    auto jsonIntOr = [](const json& node, const char* key, int fallback) {
+        if (node.contains(key) && node[key].is_number_integer()) return node[key].get<int>();
+        if (node.contains(key) && node[key].is_number()) {
+            try { return static_cast<int>(std::round(node[key].get<double>())); }
+            catch (...) {}
+        }
+        return fallback;
+    };
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+    auto lowerLocal = [&](const std::string& value) {
+        std::string out = trimLocal(value);
+        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+        return out;
+    };
+    auto jsonBoolOr = [](const json& node, const char* key, bool fallback) {
+        if (!node.contains(key)) return fallback;
+        const auto& v = node[key];
+        if (v.is_boolean()) return v.get<bool>();
+        if (v.is_number_integer()) return v.get<int>() != 0;
+        if (v.is_number()) return std::abs(v.get<double>()) > 1e-9;
+        if (v.is_string()) {
+            std::string s = v.get<std::string>();
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+                });
+            if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+            if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+        }
+        return fallback;
+    };
+
+    for (const auto& a : payload["enabled_algorithms"]) {
+        AlgorithmConfig ac;
+        ac.type = trimLocal(jsonStringOr(a, "algorithm_type"));
+        if (ac.type.empty()) continue;
+        ac.algorithmId = jsonIntOr(a, "algorithm_id", jsonIntOr(a, "id", -1));
+
+        ac.llmPrompt = jsonStringOr(a, "llm_prompt");
+        ac.promptTemplate = trimLocal(jsonStringOr(a, "prompt_template", ac.llmPrompt));
+        ac.alertCondition = trimLocal(jsonStringOr(a, "alert_condition"));
+        ac.negativeCondition = trimLocal(jsonStringOr(a, "negative_condition"));
+        normalizeEmbeddedPromptConditions_(
+            ac.promptTemplate,
+            ac.alertCondition,
+            ac.negativeCondition
+        );
+        ac.inputType = lowerLocal(jsonStringOr(a, "input_type", "video"));
+        if (ac.inputType.empty()) ac.inputType = "video";
+        ac.inferenceModel = lowerLocal(jsonStringOr(a, "inference_model", "ultra"));
+        if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
+        ac.runEverySeconds = jsonIntOr(a, "run_every", 60) <= 10 ? 10 : 60;
+        ac.runningResolution = jsonIntOr(
+            a,
+            "running_resolution",
+            jsonIntOr(a, "runningResolution", 640)
+        );
+        ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
+        ac.onlyCaptureOnMotion = jsonBoolOr(a, "only_capture_on_motion", true);
+        ac.modelFps = normalizeAlgorithmModelFps_(
+            jsonIntOr(a, "model_fps", 1),
+            ac.inferenceModel,
+            ac.inputType
+        );
+        ac.modelName = trimLocal(jsonStringOr(a, "model_name"));
+        if (ac.inferenceModel == "core") {
+            ac.inputType = "video";
+            ac.runEverySeconds = 60;
+            ac.modelFps = 1;
+            if (ac.modelName.empty()) ac.modelName = "GLM-4.6V-Flash";
+            ac.validatorModelName = trimLocal(
+                jsonStringOr(a, "validator_model_name", "GLM-4.6V-Flash")
+            );
+            if (ac.validatorModelName.empty()) ac.validatorModelName = "GLM-4.6V-Flash";
+        }
+        else {
+            if (ac.modelName.empty()) {
+                ac.modelName = (ac.inferenceModel == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+            }
+            ac.validatorModelName = trimLocal(jsonStringOr(a, "validator_model_name", "gpt-5.1"));
+            if (ac.validatorModelName.empty()) ac.validatorModelName = "gpt-5.1";
+        }
+        ac.modelApiKey = trimLocal(jsonStringOr(a, "model_api_key"));
+        if (ac.modelApiKey.empty()) {
+            ac.modelApiKey = trimLocal(jsonStringOr(a, "api_key"));
+        }
+        ac.validatorModelApiKey =
+            trimLocal(jsonStringOr(a, "validator_model_api_key", ac.modelApiKey));
+        ac.temporalPlanHash = trimLocal(jsonStringOr(a, "temporal_plan_hash"));
+        ac.temporalPlanVersion = trimLocal(jsonStringOr(a, "temporal_plan_version"));
+        ac.temporalCompiledAt = trimLocal(jsonStringOr(a, "temporal_compiled_at"));
+        ac.temporalCompileModel = trimLocal(jsonStringOr(a, "temporal_compile_model"));
+        ac.temporalPlanEnvelope = nlohmann::json::object();
+        if (a.contains("temporal_plan_json")) {
+            if (a["temporal_plan_json"].is_object()) {
+                ac.temporalPlanEnvelope = a["temporal_plan_json"];
+            }
+            else if (a["temporal_plan_json"].is_string()) {
+                try {
+                    nlohmann::json parsed = nlohmann::json::parse(
+                        a["temporal_plan_json"].get<std::string>(),
+                        nullptr,
+                        false
+                    );
+                    if (parsed.is_object()) {
+                        ac.temporalPlanEnvelope = std::move(parsed);
+                    }
+                }
+                catch (...) {}
+            }
+        }
+
+        if (a.contains("config_json") && a["config_json"].is_object()) {
+            ac.configJson = a["config_json"];
+            ac.displayName = a["config_json"].value("display_name", "");
+        }
+        else {
+            ac.configJson = nlohmann::json::object();
+        }
+        if (ac.displayName.empty()) ac.displayName = ac.type;
+
+        if (a.contains("face_targets") && a["face_targets"].is_array()) {
+            for (const auto& t : a["face_targets"]) {
+                if (!t.is_object()) continue;
+                AlgorithmConfig::FaceTarget ft;
+                ft.id = jsonIntOr(t, "id", -1);
+                ft.name = jsonStringOr(t, "name");
+                ft.description = jsonStringOr(t, "description");
+                if (t.contains("images") && t["images"].is_array()) {
+                    for (const auto& img : t["images"]) {
+                        if (!img.is_object()) continue;
+                        AlgorithmConfig::FaceTargetImage fti;
+                        fti.id = jsonIntOr(img, "id", -1);
+                        fti.imageUrl = jsonStringOr(img, "image_url");
+                        if (!fti.imageUrl.empty()) ft.images.push_back(std::move(fti));
+                    }
+                }
+                if (ft.id > 0) ac.faceTargets.push_back(std::move(ft));
+            }
+        }
+
+        if (a.contains("negative_reference_images") && a["negative_reference_images"].is_array()) {
+            for (const auto& img : a["negative_reference_images"]) {
+                if (!img.is_object()) continue;
+                AlgorithmConfig::NegativeReferenceImage ni;
+                ni.id = jsonIntOr(img, "id", -1);
+                ni.imageUrl = jsonStringOr(img, "image_url");
+                if (ni.id > 0 && !ni.imageUrl.empty()) {
+                    ac.negativeReferenceImages.push_back(std::move(ni));
+                }
+            }
+        }
+
+        if (a.contains("analysis_regions") && a["analysis_regions"].is_array()) {
+            for (const auto& r : a["analysis_regions"]) {
+                if (!r.is_object()) continue;
+                AlgorithmConfig::AnalysisRegion region;
+                region.regionId = trimLocal(jsonStringOr(r, "region_id"));
+                if (region.regionId.empty()) {
+                    region.regionId = trimLocal(jsonStringOr(r, "regionId"));
+                }
+                if (region.regionId.empty()) {
+                    region.regionId = "region-" + std::to_string(ac.analysisRegions.size() + 1);
+                }
+                region.label = trimLocal(jsonStringOr(r, "label", region.regionId));
+                if (region.label.empty()) region.label = region.regionId;
+                region.enabled = jsonBoolOr(r, "enabled", true);
+                region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
+                    for (const auto& pnt : r["polygon_norm"]) {
+                        if (!pnt.is_object()) continue;
+                        double x = 0.0;
+                        double y = 0.0;
+                        if (pnt.contains("x") && pnt["x"].is_number()) x = pnt["x"].get<double>();
+                        if (pnt.contains("y") && pnt["y"].is_number()) y = pnt["y"].get<double>();
+                        x = std::max(0.0, std::min(1.0, x));
+                        y = std::max(0.0, std::min(1.0, y));
+                        region.polygonNorm.push_back({ x, y });
+                    }
+                }
+                if (region.polygonNorm.size() < 3) {
+                    region.fullFrame = true;
+                    region.polygonNorm.clear();
+                }
+                ac.analysisRegions.push_back(std::move(region));
+            }
+        }
+
+        const bool isCustomType = (ac.type.rfind("custom_", 0) == 0);
+        ac.isCustomV2 = isCustomType && !ac.promptTemplate.empty() && !ac.alertCondition.empty();
+        if (ac.isCustomV2 && ac.analysisRegions.empty()) {
+            AlgorithmConfig::AnalysisRegion full;
+            full.regionId = "full-frame";
+            full.label = "Full frame";
+            full.enabled = true;
+            full.fullFrame = true;
+            ac.analysisRegions.push_back(std::move(full));
+        }
+
+        newAlgos.push_back(std::move(ac));
+    }
+
+
+
+    session->updateAlgorithms(std::move(newAlgos));
+
+    Logger::instance().logDebug(
+        "agent",
+        "updateCameraAlgorithms_: updated algorithms for cameraId=" +
+        std::to_string(cameraId)
+    );
+}
+
+
+
+
+
+/*
+void AgentCore::schedulerPingLoop_() {
+    // give the app a moment to fully boot
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    while (schedulerPingerRunning_) {
+        try {
+            triggerSchedulerTickOnce_();
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug(
+                "agent",
+                std::string("SchedulerTick exception: ") + e.what()
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug("agent", "SchedulerTick unknown exception");
+        }
+
+        // sleep in 1s slices so stop() is responsive
+        for (int i = 0; i < kSchedulerTickIntervalSeconds && schedulerPingerRunning_; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+*/
+
+
+
+
+void AgentCore::schedulerPingLoop_() {
+    using namespace std::chrono;
+
+    // give the app a moment to fully boot
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // Choose a fixed second <= 30 so we always start attempting early in the minute.
+    // 5 is a good default (gives the OS/network a moment after the minute flips).
+    constexpr int kTickSecondInMinute = 5; // MUST be <= 30
+
+    auto sleepResponsive = [&](steady_clock::duration d) {
+        // sleep in 1s slices so stop() is responsive
+        auto end = steady_clock::now() + d;
+        while (schedulerPingerRunning_) {
+            auto now = steady_clock::now();
+            if (now >= end) break;
+            auto remaining = end - now;
+            auto slice = (remaining > seconds(1)) ? seconds(1) : remaining;
+            std::this_thread::sleep_for(slice);
+        }
+        };
+
+    while (schedulerPingerRunning_) {
+        // --- Compute next tick wall time: "this minute at :kTickSecondInMinute",
+        // or if we've already passed it, "next minute at :kTickSecondInMinute".
+        auto nowWall = system_clock::now();
+        auto nowSec = time_point_cast<seconds>(nowWall);
+        auto epochSec = nowSec.time_since_epoch();
+        auto secCount = duration_cast<seconds>(epochSec).count();
+
+        // seconds since start of current minute (0..59)
+        int secInMinute = (int)(secCount % 60);
+
+        // wall time of start of current minute
+        auto minuteStart = nowSec - seconds(secInMinute);
+
+        // desired tick time in this minute
+        auto desired = minuteStart + seconds(kTickSecondInMinute);
+
+        // if already past desired, schedule next minute
+        //if (nowSec > desired) {
+            //desired += minutes(1);
+        //}
+
+
+        if (nowWall >= desired) {
+            desired += minutes(1);
+        }
+
+
+        // Sleep until desired (convert to steady_clock duration for reliable sleeps)
+        // We compute remaining using system_clock, then sleep that long.
+        auto nowWall2 = system_clock::now();
+        if (desired > nowWall2) {
+            auto remaining = duration_cast<steady_clock::duration>(desired - nowWall2);
+            sleepResponsive(remaining);
+        }
+
+        if (!schedulerPingerRunning_) break;
+
+        // Fire tick attempt (still only once per minute by construction)
+        try {
+            triggerSchedulerTickOnce_();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        catch (const std::exception& e) {
+            logAgentException_(
+                "agent",
+                "agent",
+                "AgentCore::schedulerPingLoop_",
+                "trigger_scheduler_tick",
+                json::object(),
+                e
+            );
+        }
+        catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "agent",
+                "AgentCore::schedulerPingLoop_",
+                "trigger_scheduler_tick",
+                json::object()
+            );
+        }
+
+        // Loop continues; next desired tick will be next minute at :05
+    }
+}
+
+
+
+
+
+void AgentCore::triggerSchedulerTickOnce_() {
+    if (exeToken_.empty()) return;
+
+    // Build full URL using the same baseUrl_ you already use for /api/agent/commands
+    const std::string url = baseUrl_ + kSchedulerTickPath;
+
+    Logger::instance().logDebug("agent", "SchedulerTick: POST " + url);
+
+    std::string headerLine = std::string("Authorization: Bearer ") + exeToken_;
+
+    const std::string body = "{}";
+
+    // 1 initial attempt + 2 retries on TIMEOUT
+    const int kMaxAttempts = 3;
+
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
+
+        std::string response;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, headerLine.c_str());
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        if (!machineTimezoneForBackend_.empty()) {
+            std::string tzHeader = "X-EXE-Timezone: " + machineTimezoneForBackend_;
+            headers = curl_slist_append(headers, tzHeader.c_str());
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+        // keep your existing timeouts (UNCHANGED)
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+
+        CURLcode res = curl_easy_perform(curl);
+
+        long httpCode = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        // Success path (unchanged)
+        if (res == CURLE_OK) {
+            if (httpCode < 200 || httpCode >= 300) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "SchedulerTick HTTP " + std::to_string(httpCode) + ", body=" + response
+                );
+            }
+            else {
+                Logger::instance().logDebug(
+                    "agent",
+                    "SchedulerTick HTTP " + std::to_string(httpCode) + " OK"
+                );
+            }
+            return;
+        }
+
+        // Error path
+        const bool isTimeout = (res == CURLE_OPERATION_TIMEDOUT);
+
+        Logger::instance().logDebug(
+            "agent",
+            std::string("SchedulerTick curl error: ") + curl_easy_strerror(res) +
+            " (attempt " + std::to_string(attempt) + "/" + std::to_string(kMaxAttempts) + ")"
+        );
+
+        // Retry only on TIMEOUT, and only if we still have attempts left
+        if (isTimeout && attempt < kMaxAttempts) {
+            // tiny backoff to avoid hammering (optional, but recommended)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        // For non-timeout errors OR if we're out of retries, stop.
+        return;
+    }
+}
+
+
+void AgentCore::jobsCaptureAcquire(
+    int cameraId,
+    int jobId,
+    int stepId,
+    bool needsVideo,
+    bool needsImage,
+    int requestedTenSecondVideoFps,
+    int requestedSixtySecondVideoFps,
+    bool onlyCaptureOnMotion) {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    JobStepKey k{ jobId, stepId };
+    auto& state = jobsCaptureByCamera_[cameraId][k];
+
+    const bool effectiveNeedsVideo = needsVideo || (!needsVideo && !needsImage);
+    const bool effectiveNeedsImage = needsImage;
+
+    if (state.refCount > 0 && !onlyCaptureOnMotion) {
+        // For duplicate acquires of the same job/step/camera, "always capture" wins.
+        state.onlyCaptureOnMotion = false;
+    } else if (state.refCount == 0) {
+        state.onlyCaptureOnMotion = onlyCaptureOnMotion;
+        // On each new acquire lifecycle, require one bootstrap frame even on motion-only jobs.
+        state.bootstrapPending = true;
+        state.needsVideo = false;
+        state.needsImage = false;
+        state.requestedTenSecondVideoFps = 0;
+        state.requestedSixtySecondVideoFps = 0;
+    }
+    state.needsVideo = state.needsVideo || effectiveNeedsVideo;
+    state.needsImage = state.needsImage || effectiveNeedsImage;
+    if (effectiveNeedsVideo) {
+        state.requestedTenSecondVideoFps = (std::max)(
+            state.requestedTenSecondVideoFps,
+            requestedTenSecondVideoFps > 0 ? clampRequestedModelFps_(requestedTenSecondVideoFps) : 0
+        );
+        state.requestedSixtySecondVideoFps = (std::max)(
+            state.requestedSixtySecondVideoFps,
+            requestedSixtySecondVideoFps > 0 ? clampRequestedModelFps_(requestedSixtySecondVideoFps) : 0
+        );
+    }
+    state.refCount += 1;
+}
+
+void AgentCore::jobsCaptureRelease(int cameraId, int jobId, int stepId) {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto itCam = jobsCaptureByCamera_.find(cameraId);
+    if (itCam == jobsCaptureByCamera_.end()) return;
+
+    JobStepKey k{ jobId, stepId };
+
+    auto& byKey = itCam->second;
+    auto it = byKey.find(k);
+    if (it == byKey.end()) return;
+
+    it->second.refCount -= 1;
+    if (it->second.refCount <= 0) byKey.erase(it);
+
+    if (byKey.empty()) jobsCaptureByCamera_.erase(itCam);
+}
+
+bool AgentCore::isJobsCaptureEnabled(int cameraId) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    return (it != jobsCaptureByCamera_.end() && !it->second.empty());
+}
+
+int AgentCore::getJobsRequestedVideoCaptureFps(int cameraId, int clipSeconds) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    if (it == jobsCaptureByCamera_.end()) return 0;
+
+    const int normalizedClipSeconds = normalizeCaptureClipSeconds_(clipSeconds);
+
+    int maxRequestedFps = 0;
+    for (const auto& kv : it->second) {
+        const JobsCaptureState& state = kv.second;
+        if (state.refCount <= 0 || !state.needsVideo) continue;
+        const int requestedFps = (normalizedClipSeconds > 10)
+            ? state.requestedSixtySecondVideoFps
+            : state.requestedTenSecondVideoFps;
+        if (requestedFps <= 0) continue;
+        maxRequestedFps = (std::max)(maxRequestedFps, clampRequestedModelFps_(requestedFps));
+    }
+    return maxRequestedFps;
+}
+
+bool AgentCore::shouldOnlyCaptureOnMotion(int cameraId) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    if (it == jobsCaptureByCamera_.end()) return true;
+    for (const auto& kv : it->second) {
+        if (kv.second.refCount > 0 && !kv.second.onlyCaptureOnMotion) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AgentCore::consumeJobsBootstrapCaptureIfRequested(int cameraId) {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    if (it == jobsCaptureByCamera_.end()) return false;
+
+    bool shouldCaptureNow = false;
+    for (auto& kv : it->second) {
+        auto& state = kv.second;
+        if (state.refCount > 0 && state.bootstrapPending) {
+            state.bootstrapPending = false;
+            shouldCaptureNow = true;
+        }
+    }
+    return shouldCaptureNow;
+}
+
+std::vector<FrameDiskWriter::JobsCopyTarget> AgentCore::getActiveJobStepsForCamera(int cameraId) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    std::vector<FrameDiskWriter::JobsCopyTarget> out;
+
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    if (it == jobsCaptureByCamera_.end()) return out;
+
+    out.reserve(it->second.size());
+    for (const auto& kv : it->second) {
+        if (kv.second.refCount > 0) {
+            out.push_back(FrameDiskWriter::JobsCopyTarget{
+                kv.first.jobId,
+                kv.first.stepId,
+                kv.second.needsVideo,
+                kv.second.requestedTenSecondVideoFps > 0,
+                kv.second.needsImage
+            });
+        }
+    }
+    return out;
+}
+
+std::vector<int> AgentCore::getActiveJobIdsForCamera(int cameraId) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    std::vector<int> out;
+
+    auto it = jobsCaptureByCamera_.find(cameraId);
+    if (it == jobsCaptureByCamera_.end()) return out;
+
+    std::set<int> uniqueJobIds;
+    for (const auto& kv : it->second) {
+        if (kv.second.refCount > 0 && kv.first.jobId > 0) {
+            uniqueJobIds.insert(kv.first.jobId);
+        }
+    }
+
+    out.assign(uniqueJobIds.begin(), uniqueJobIds.end());
+    return out;
+}
+
+
+
+
+/*
+
+void AgentCore::jobsCaptureAcquire(int cameraId) {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    jobsCaptureRefCount_[cameraId] += 1;
+}
+
+void AgentCore::jobsCaptureRelease(int cameraId) {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureRefCount_.find(cameraId);
+    if (it == jobsCaptureRefCount_.end()) return;
+    it->second -= 1;
+    if (it->second <= 0) jobsCaptureRefCount_.erase(it);
+}
+
+bool AgentCore::isJobsCaptureEnabled(int cameraId) const {
+    std::lock_guard<std::mutex> lk(jobsMu_);
+    auto it = jobsCaptureRefCount_.find(cameraId);
+    return (it != jobsCaptureRefCount_.end() && it->second > 0);
+}
+*/
+
+
+
+void AgentCore::processCommand_(const json& cmd) {
+    std::string type;
+    int cameraId = -1;
+    int commandId = -1;
+
+    try {
+        cleanupCompletedDrakonFindTasks_(false);
+        type = cmd.value("command_type", "");
+        commandId = cmd.value("id", -1);
+
+        if (cmd.contains("camera_id") && cmd["camera_id"].is_number_integer()) {
+            cameraId = cmd["camera_id"].get<int>();
+        }
+
+
+        // shirnk uploaded_image_base64 in log.
+        json cmdForLog = cmd;
+        try {
+            auto toLower = [](std::string s) -> std::string {
+                for (auto& ch : s) {
+                    ch = (char)std::tolower((unsigned char)ch);
+                }
+                return s;
+            };
+
+            std::function<void(json&)> maskSecrets = [&](json& node) {
+                if (node.is_object()) {
+                    for (auto it = node.begin(); it != node.end(); ++it) {
+                        const std::string key = toLower(it.key());
+                        if (it.value().is_string() &&
+                            (key == "password" ||
+                             key == "telegram_bot_token" ||
+                             key == "telegram_chat_id" ||
+                             key == "api_key" ||
+                             key == "model_api_key" ||
+                             key == "description_model_api_key" ||
+                             key == "validator_model_api_key" ||
+                             key == "router_api_key" ||
+                             key == "openai_api_key" ||
+                             key == "username" ||
+                             key == "ip"))
+                        {
+                            it.value() = "***";
+                            continue;
+                        }
+                        maskSecrets(it.value());
+                    }
+                    return;
+                }
+
+                if (node.is_array()) {
+                    for (auto& item : node) {
+                        maskSecrets(item);
+                    }
+                }
+            };
+
+            maskSecrets(cmdForLog);
+
+            auto truncateLargeLogField = [](nlohmann::json& value) {
+                if (!value.is_string()) return;
+                std::string full = value.get<std::string>();
+                const size_t keep = 20;
+                if (full.size() <= keep) return;
+                value = full.substr(0, keep) +
+                    "...[truncated, len=" + std::to_string(full.size()) + "]";
+            };
+
+            std::function<void(nlohmann::json&)> sanitizeCommandPayloadForLog =
+                [&](nlohmann::json& node) {
+                    if (node.is_object()) {
+                        for (auto it = node.begin(); it != node.end(); ++it) {
+                            const std::string key = it.key();
+                            if (key == "uploaded_image_base64" ||
+                                key == "data_url" ||
+                                key == "image_data_url" ||
+                                key == "snapshot_image_data_url" ||
+                                key == "video_mp4_base64" ||
+                                key == "image_url")
+                            {
+                                truncateLargeLogField(it.value());
+                            }
+                            else {
+                                sanitizeCommandPayloadForLog(it.value());
+                            }
+                        }
+                        return;
+                    }
+
+                    if (node.is_array()) {
+                        for (auto& item : node) {
+                            sanitizeCommandPayloadForLog(item);
+                        }
+                    }
+                };
+
+            sanitizeCommandPayloadForLog(cmdForLog);
+        }
+        catch (...) {
+            // if anything goes wrong, just fall back to normal logging
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "processCommand_: type=" + type +
+            ", cameraId=" + std::to_string(cameraId) +
+            ", cmd=" + cmdForLog.dump()
+        );
+
+
+        /*
+        Logger::instance().logDebug(
+            "agent",
+            "processCommand_: type=" + type +
+            ", cameraId=" + std::to_string(cameraId) +
+            ", cmd=" + cmd.dump()
+        );
+        */
+        json payload;
+        if (cmd.contains("payload")) {
+            if (cmd["payload"].is_string())
+                payload = json::parse(cmd["payload"].get<std::string>(), nullptr, false);
+            else
+                payload = cmd["payload"];
+        }
+
+        if (type == "start_camera") {
+            startCameraFromPayload_(cameraId, payload);
+        }
+        else if (type == "stop_camera") {
+            stopCamera_(cameraId);
+        }
+        else if (type == "job_start") {
+            const int commandId = cmd.value("id", -1);
+            std::string windowEndUtc;
+            std::string nowUtc;
+            if (shouldIgnoreExpiredScheduledJobStart_(payload, windowEndUtc, nowUtc)) {
+                int jobId = -1;
+                std::string jobName;
+                if (payload.is_object() && payload.contains("job") && payload["job"].is_object()) {
+                    const json& job = payload["job"];
+                    jobId = job.value("id", -1);
+                    jobName = trimAscii(job.value("name", std::string()));
+                }
+
+                Logger::instance().logDebug(
+                    "agent",
+                    "job_start ignored: expired_schedule_window" +
+                    std::string(jobId > 0 ? " jobId=" + std::to_string(jobId) : "") +
+                    std::string(jobName.empty() ? "" : " jobName=" + jobName) +
+                    std::string(windowEndUtc.empty() ? "" : " window_end_utc=" + windowEndUtc) +
+                    std::string(nowUtc.empty() ? "" : " now_utc=" + nowUtc)
+                );
+
+                if (commandId > 0) {
+                    nlohmann::json result;
+                    result["ignored"] = true;
+                    result["reason"] = "expired_schedule_window";
+                    if (jobId > 0) result["job_id"] = jobId;
+                    if (!jobName.empty()) result["job_name"] = jobName;
+                    if (!windowEndUtc.empty()) result["window_end_utc"] = windowEndUtc;
+                    if (!nowUtc.empty()) result["now_utc"] = nowUtc;
+                    postCommandResult_(commandId, "completed", result);
+                }
+                return;
+            }
+
+            if (jobRuntime_) {
+                jobRuntime_->onJobStartCommand(cmd);
+            }
+        }
+        else if (type == "job_stop") {
+            try {
+                if (jobRuntime_) {
+                    jobRuntime_->onJobStopCommand(cmd);
+                }
+
+                if (!payload.is_object()) {
+                    Logger::instance().logDebug("agent", "job_stop: payload is not an object");
+                    return;
+                }
+
+                if (!payload.contains("camera_ids") || !payload["camera_ids"].is_array()) {
+                    Logger::instance().logDebug("agent", "job_stop: missing/invalid payload.camera_ids");
+                    return;
+                }
+
+                const auto& arr = payload["camera_ids"];
+                for (const auto& v : arr) {
+                    if (!v.is_number_integer()) continue;
+
+                    int id = v.get<int>();
+                    if (id <= 0) continue;
+
+                    try {
+                        stopCamera_(id);
+                    }
+                    catch (const std::exception& e) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            std::string("job_stop: stopCamera_ failed for cameraId=") +
+                            std::to_string(id) + " err=" + e.what()
+                        );
+                    }
+                    catch (...) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            std::string("job_stop: stopCamera_ failed for cameraId=") +
+                            std::to_string(id) + " err=unknown"
+                        );
+                    }
+                }
+            }
+            catch (const std::exception& e) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("job_stop handler exception: ") + e.what()
+                );
+            }
+            catch (...) {
+                Logger::instance().logDebug("agent", "job_stop handler unknown exception");
+            }
+        }
+        else if (type == "prompt_enhance") {
+            std::thread([this, commandId, payload]() {
+                try {
+                    handlePromptEnhanceCommand_(commandId, payload);
+                }
+                catch (const std::exception& e) {
+                    logAgentException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::promptEnhanceThread",
+                        "prompt_enhance",
+                        {
+                            { "command_id", commandId }
+                        },
+                        e
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = std::string("prompt_enhance exception: ") + e.what();
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+                catch (...) {
+                    logAgentUnknownException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::promptEnhanceThread",
+                        "prompt_enhance",
+                        {
+                            { "command_id", commandId }
+                        }
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = "prompt_enhance unknown exception";
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+            }).detach();
+        }
+        else if (type == "refresh_thumbnail") {
+            std::thread([this, commandId, payload]() {
+                try {
+                    handleRefreshThumbnailCommand_(commandId, payload);
+                }
+                catch (const std::exception& e) {
+                    logAgentException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::refreshThumbnailThread",
+                        "refresh_thumbnail",
+                        {
+                            { "command_id", commandId }
+                        },
+                        e
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = std::string("refresh_thumbnail exception: ") + e.what();
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+                catch (...) {
+                    logAgentUnknownException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::refreshThumbnailThread",
+                        "refresh_thumbnail",
+                        {
+                            { "command_id", commandId }
+                        }
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = "refresh_thumbnail unknown exception";
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+            }).detach();
+        }
+        else if (type == "drakon_find_start") {
+            handleDrakonFindStartCommand_(commandId, payload);
+        }
+        else if (type == "drakon_find_cancel") {
+            handleDrakonFindCancelCommand_(commandId, payload);
+        }
+        else if (type == "chat_cancel") {
+            handleChatCancelCommand_(commandId, payload);
+        }
+        else if (type == "add_camera" || type == "update_camera") {
+            // optional: maintain a local config cache if you want
+        }
+        else if (type == "update_algorithms") {
+            updateCameraAlgorithms_(cameraId, payload);
+        }
+        else if (type == "chat_query") {
+            // Run chat routing in a background thread so we don't block workerLoop_
+            nlohmann::json chatPayload = payload.is_object() ? payload : nlohmann::json::object();
+            chatPayload["command_id"] = commandId;
+            const int chatSessionId =
+                chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+            auto chatTaskState = registerChatTask_(chatSessionId);
+
+            std::thread([this, chatPayload, chatTaskState]() {
+                try {
+                    handleChatQuery_(chatPayload);
+                }
+                catch (const std::exception& e) {
+                    const int chatSessionId =
+                        chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+                    logAgentException_(
+                        "agent",
+                        "chat",
+                        "AgentCore::processCommand_::chatQueryThread",
+                        "chat_query",
+                        {
+                            { "chat_session_id", chatSessionId }
+                        },
+                        e
+                    );
+                }
+                catch (...) {
+                    const int chatSessionId =
+                        chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+                    logAgentUnknownException_(
+                        "agent",
+                        "chat",
+                        "AgentCore::processCommand_::chatQueryThread",
+                        "chat_query",
+                        {
+                            { "chat_session_id", chatSessionId }
+                        }
+                    );
+                }
+                if (chatTaskState) {
+                    chatTaskState->done = true;
+                }
+                cleanupCompletedChatTasks_();
+                }).detach();
+        }
+        else if (type == "orchestrator_query") {
+            nlohmann::json chatPayload = payload.is_object() ? payload : nlohmann::json::object();
+            chatPayload["command_id"] = commandId;
+            const int chatSessionId =
+                chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+            auto chatTaskState = registerChatTask_(chatSessionId);
+
+            std::thread([this, chatPayload, chatTaskState]() {
+                try {
+                    handleOrchestratorQuery_(chatPayload);
+                }
+                catch (const std::exception& e) {
+                    const int chatSessionId =
+                        chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+                    logAgentException_(
+                        "agent",
+                        "chat",
+                        "AgentCore::processCommand_::orchestratorQueryThread",
+                        "orchestrator_query",
+                        {
+                            { "chat_session_id", chatSessionId }
+                        },
+                        e
+                    );
+                }
+                catch (...) {
+                    const int chatSessionId =
+                        chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+                    logAgentUnknownException_(
+                        "agent",
+                        "chat",
+                        "AgentCore::processCommand_::orchestratorQueryThread",
+                        "orchestrator_query",
+                        {
+                            { "chat_session_id", chatSessionId }
+                        }
+                    );
+                }
+                if (chatTaskState) {
+                    chatTaskState->done = true;
+                }
+                cleanupCompletedChatTasks_();
+            }).detach();
+        }
+    }
+    catch (const std::exception& e) {
+        logAgentException_(
+            sourceIdForCamera_(cameraId),
+            ((type == "chat_query") || (type == "orchestrator_query")) ? "chat" : (type.rfind("drakon_find", 0) == 0 ? "drakon_find" : "agent"),
+            "AgentCore::processCommand_",
+            type.empty() ? "process_command" : type,
+            {
+                { "command_id", commandId },
+                { "camera_id", cameraId },
+                { "command_type", type }
+            },
+            e
+        );
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            sourceIdForCamera_(cameraId),
+            ((type == "chat_query") || (type == "orchestrator_query")) ? "chat" : (type.rfind("drakon_find", 0) == 0 ? "drakon_find" : "agent"),
+            "AgentCore::processCommand_",
+            type.empty() ? "process_command" : type,
+            {
+                { "command_id", commandId },
+                { "camera_id", cameraId },
+                { "command_type", type }
+            }
+        );
+    }
+}
+
+
+
+
+
+CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& p) {
+    CameraConfig cfg;
+    cfg.id = std::to_string(cameraId);
+
+    if (p.contains("name") && p["name"].is_string()) {
+        cfg.name = p["name"].get<std::string>();
+    }
+    else {
+        cfg.name = "Camera " + cfg.id;
+    }
+
+    // parse storage settings from payload
+    cfg.storage.storeFrames = false;
+    cfg.storage.retentionDays = 0;
+    cfg.storage.hydrateExistingSegments = true;
+
+    if (p.contains("store_frames") && p["store_frames"].is_boolean()) {
+        cfg.storage.storeFrames = p["store_frames"].get<bool>();
+    }
+
+    if (p.contains("retention_days") && !p["retention_days"].is_null()) {
+        if (p["retention_days"].is_number_integer()) {
+            cfg.storage.retentionDays = p["retention_days"].get<int>();
+        }
+        else if (p["retention_days"].is_string()) {
+            // in case Mocha sends it as "3" (string)
+            try {
+                cfg.storage.retentionDays = std::stoi(p["retention_days"].get<std::string>());
+            }
+            catch (...) {
+                cfg.storage.retentionDays = 0; // fallback
+            }
+        }
+    }
+
+    if (p.contains("hydrate_existing_segments")) {
+        if (p["hydrate_existing_segments"].is_boolean()) {
+            cfg.storage.hydrateExistingSegments = p["hydrate_existing_segments"].get<bool>();
+        }
+        else if (p["hydrate_existing_segments"].is_number_integer()) {
+            cfg.storage.hydrateExistingSegments = p["hydrate_existing_segments"].get<int>() != 0;
+        }
+    }
+
+    if (p.value("drakon_find_temporary_session", false)) {
+        cfg.storage.hydrateExistingSegments = false;
+    }
+
+
+    cfg.telegramEnabled = false;
+    if (p.contains("telegram_enabled") && p["telegram_enabled"].is_boolean()) {
+        cfg.telegramEnabled = p["telegram_enabled"].get<bool>();
+    }
+
+    if (p.contains("telegram_bot_token") && p["telegram_bot_token"].is_string()) {
+        cfg.telegramBotToken = p["telegram_bot_token"].get<std::string>();
+    }
+
+    if (p.contains("telegram_chat_id") && p["telegram_chat_id"].is_string()) {
+        cfg.telegramChatId = p["telegram_chat_id"].get<std::string>();
+    }
+
+    if (cfg.telegramEnabled &&
+        (cfg.telegramBotToken.empty() || cfg.telegramChatId.empty())) {
+        Logger::instance().logDebug(
+            "agent",
+            "startCameraFromPayload_: telegram_enabled=true but missing bot_token/chat_id "
+            "for camera " + cfg.id
+        );
+    }
+
+
+    // Build list of RTSP candidates based on manufacturer/ip/user/pass
+    std::vector<std::string> urls = buildRtspCandidatesFromPayload(p);
+
+    // encode them in a single string separated by '|'
+    std::ostringstream joined;
+    for (size_t i = 0; i < urls.size(); ++i) {
+        if (i) joined << "|";
+        joined << urls[i];
+    }
+    cfg.rtspUrl = joined.str();
+
+
+    // --- NEW: webcam_index (0..5) or -1 (use RTSP)
+    if (p.contains("webcam_index") && p["webcam_index"].is_number_integer()) {
+        cfg.webcam_index = p["webcam_index"].get<int>();
+    }
+    else {
+        cfg.webcam_index = -1;   // default: usar RTSP
+    }
+
+
+    cfg.expectedFps = 1.0;
+    cfg.modelPath = "";
+    cfg.labelsPath = "";
+    cfg.useGpu = true;
+
+    bool startedByJob = false;
+    cfg.startOrigin.clear();
+    if (p.contains("start_origin") && p["start_origin"].is_string()) {
+        cfg.startOrigin = p["start_origin"].get<std::string>();
+        std::transform(cfg.startOrigin.begin(), cfg.startOrigin.end(), cfg.startOrigin.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        startedByJob = (cfg.startOrigin == "job");
+    }
+
+    cfg.isDrakonFindTemporarySession = false;
+    if (p.contains("drakon_find_temporary_session")) {
+        if (p["drakon_find_temporary_session"].is_boolean()) {
+            cfg.isDrakonFindTemporarySession = p["drakon_find_temporary_session"].get<bool>();
+        }
+        else if (p["drakon_find_temporary_session"].is_number_integer()) {
+            cfg.isDrakonFindTemporarySession = p["drakon_find_temporary_session"].get<int>() != 0;
+        }
+    }
+
+    // ---- NEW: parse enabled_algorithms from payload ----
+
+    cfg.enabledAlgorithms.clear();
+    cfg.algorithms.clear();
+
+    if (p.contains("enabled_algorithms") && p["enabled_algorithms"].is_array()) {
+        auto jsonStringOr = [](const json& node, const char* key, const std::string& fallback = std::string()) {
+            if (node.contains(key) && node[key].is_string()) return node[key].get<std::string>();
+            return fallback;
+        };
+        auto jsonIntOr = [](const json& node, const char* key, int fallback) {
+            if (node.contains(key) && node[key].is_number_integer()) return node[key].get<int>();
+            if (node.contains(key) && node[key].is_number()) {
+                try {
+                    return static_cast<int>(std::round(node[key].get<double>()));
+                }
+                catch (...) {
+                }
+            }
+            return fallback;
+        };
+        auto trimLocal = [](const std::string& value) {
+            const auto first = value.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) return std::string();
+            const auto last = value.find_last_not_of(" \t\r\n");
+            return value.substr(first, last - first + 1);
+        };
+        auto lowerLocal = [&](const std::string& value) {
+            std::string out = trimLocal(value);
+            std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+                });
+            return out;
+        };
+        auto jsonBoolOr = [](const json& node, const char* key, bool fallback) {
+            if (!node.contains(key)) return fallback;
+            const auto& v = node[key];
+            if (v.is_boolean()) return v.get<bool>();
+            if (v.is_number_integer()) return v.get<int>() != 0;
+            if (v.is_number()) return std::abs(v.get<double>()) > 1e-9;
+            if (v.is_string()) {
+                std::string s = v.get<std::string>();
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                    });
+                if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+                if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+            }
+            return fallback;
+        };
+
+        for (const auto& algo : p["enabled_algorithms"]) {
+            bool isEnabled = jsonBoolOr(algo, "is_enabled", false);
+            if (!isEnabled) continue;
+
+            AlgorithmConfig ac;
+            ac.type = trimLocal(jsonStringOr(algo, "algorithm_type"));
+            if (ac.type.empty()) continue;
+            ac.algorithmId = jsonIntOr(algo, "algorithm_id", jsonIntOr(algo, "id", -1));
+
+            ac.llmPrompt = jsonStringOr(algo, "llm_prompt");
+            ac.promptTemplate = trimLocal(jsonStringOr(algo, "prompt_template", ac.llmPrompt));
+            ac.alertCondition = trimLocal(jsonStringOr(algo, "alert_condition"));
+            ac.negativeCondition = trimLocal(jsonStringOr(algo, "negative_condition"));
+            normalizeEmbeddedPromptConditions_(
+                ac.promptTemplate,
+                ac.alertCondition,
+                ac.negativeCondition
+            );
+            ac.inputType = lowerLocal(jsonStringOr(algo, "input_type", "video"));
+            if (ac.inputType.empty()) ac.inputType = "video";
+            ac.inferenceModel = lowerLocal(jsonStringOr(algo, "inference_model", "ultra"));
+            if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
+            ac.runEverySeconds = jsonIntOr(algo, "run_every", 60) <= 10 ? 10 : 60;
+            ac.runningResolution = jsonIntOr(
+                algo,
+                "running_resolution",
+                jsonIntOr(algo, "runningResolution", 640)
+            );
+            ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
+            ac.onlyCaptureOnMotion = jsonBoolOr(algo, "only_capture_on_motion", true);
+        ac.modelFps = normalizeAlgorithmModelFps_(
+            jsonIntOr(algo, "model_fps", 1),
+            ac.inferenceModel,
+            ac.inputType
+        );
+            ac.modelName = trimLocal(jsonStringOr(algo, "model_name"));
+            if (ac.inferenceModel == "core") {
+                ac.inputType = "video";
+                ac.runEverySeconds = 60;
+                ac.modelFps = 1;
+                if (ac.modelName.empty()) ac.modelName = "GLM-4.6V-Flash";
+                ac.validatorModelName = trimLocal(
+                    jsonStringOr(algo, "validator_model_name", "GLM-4.6V-Flash")
+                );
+                if (ac.validatorModelName.empty()) ac.validatorModelName = "GLM-4.6V-Flash";
+            }
+            else {
+                if (ac.modelName.empty()) {
+                    ac.modelName = (ac.inferenceModel == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+                }
+                ac.validatorModelName = trimLocal(jsonStringOr(algo, "validator_model_name", "gpt-5.1"));
+                if (ac.validatorModelName.empty()) ac.validatorModelName = "gpt-5.1";
+            }
+            ac.modelApiKey = trimLocal(jsonStringOr(algo, "model_api_key"));
+            if (ac.modelApiKey.empty()) {
+                ac.modelApiKey = trimLocal(jsonStringOr(algo, "api_key"));
+            }
+            ac.validatorModelApiKey =
+                trimLocal(jsonStringOr(algo, "validator_model_api_key", ac.modelApiKey));
+            ac.temporalPlanHash = trimLocal(jsonStringOr(algo, "temporal_plan_hash"));
+            ac.temporalPlanVersion = trimLocal(jsonStringOr(algo, "temporal_plan_version"));
+            ac.temporalCompiledAt = trimLocal(jsonStringOr(algo, "temporal_compiled_at"));
+            ac.temporalCompileModel = trimLocal(jsonStringOr(algo, "temporal_compile_model"));
+            ac.temporalPlanEnvelope = nlohmann::json::object();
+            if (algo.contains("temporal_plan_json")) {
+                if (algo["temporal_plan_json"].is_object()) {
+                    ac.temporalPlanEnvelope = algo["temporal_plan_json"];
+                }
+                else if (algo["temporal_plan_json"].is_string()) {
+                    try {
+                        nlohmann::json parsed = nlohmann::json::parse(
+                            algo["temporal_plan_json"].get<std::string>(),
+                            nullptr,
+                            false
+                        );
+                        if (parsed.is_object()) {
+                            ac.temporalPlanEnvelope = std::move(parsed);
+                        }
+                    }
+                    catch (...) {}
+                }
+            }
+
+            ac.configJson = nlohmann::json::object();
+            if (algo.contains("config_json") && algo["config_json"].is_object()) {
+                ac.configJson = algo["config_json"];
+            }
+            if (ac.configJson.is_object() &&
+                ac.configJson.contains("display_name") &&
+                ac.configJson["display_name"].is_string()) {
+                ac.displayName = ac.configJson["display_name"].get<std::string>();
+            }
+            if (ac.displayName.empty()) ac.displayName = ac.type;
+
+            if (algo.contains("face_targets") && algo["face_targets"].is_array()) {
+                for (const auto& t : algo["face_targets"]) {
+                    if (!t.is_object()) continue;
+                    AlgorithmConfig::FaceTarget ft;
+                    ft.id = jsonIntOr(t, "id", -1);
+                    ft.name = jsonStringOr(t, "name");
+                    ft.description = jsonStringOr(t, "description");
+                    if (t.contains("images") && t["images"].is_array()) {
+                        for (const auto& img : t["images"]) {
+                            if (!img.is_object()) continue;
+                            AlgorithmConfig::FaceTargetImage fti;
+                            fti.id = jsonIntOr(img, "id", -1);
+                            fti.imageUrl = jsonStringOr(img, "image_url");
+                            if (!fti.imageUrl.empty()) ft.images.push_back(std::move(fti));
+                        }
+                    }
+                    if (ft.id > 0) ac.faceTargets.push_back(std::move(ft));
+                }
+            }
+
+            if (algo.contains("negative_reference_images") && algo["negative_reference_images"].is_array()) {
+                for (const auto& img : algo["negative_reference_images"]) {
+                    if (!img.is_object()) continue;
+                    AlgorithmConfig::NegativeReferenceImage ni;
+                    ni.id = jsonIntOr(img, "id", -1);
+                    ni.imageUrl = jsonStringOr(img, "image_url");
+                    if (ni.id > 0 && !ni.imageUrl.empty()) {
+                        ac.negativeReferenceImages.push_back(std::move(ni));
+                    }
+                }
+            }
+
+            if (algo.contains("analysis_regions") && algo["analysis_regions"].is_array()) {
+                for (const auto& r : algo["analysis_regions"]) {
+                    if (!r.is_object()) continue;
+                    AlgorithmConfig::AnalysisRegion region;
+                    region.regionId = trimLocal(jsonStringOr(r, "region_id"));
+                    if (region.regionId.empty()) {
+                        region.regionId = trimLocal(jsonStringOr(r, "regionId"));
+                    }
+                    if (region.regionId.empty()) {
+                        region.regionId = "region-" + std::to_string(ac.analysisRegions.size() + 1);
+                    }
+                    region.label = trimLocal(jsonStringOr(r, "label", region.regionId));
+                    if (region.label.empty()) region.label = region.regionId;
+                    region.enabled = jsonBoolOr(r, "enabled", true);
+                    region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                    if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
+                        for (const auto& pnt : r["polygon_norm"]) {
+                            if (!pnt.is_object()) continue;
+                            double x = 0.0;
+                            double y = 0.0;
+                            if (pnt.contains("x") && pnt["x"].is_number()) x = pnt["x"].get<double>();
+                            if (pnt.contains("y") && pnt["y"].is_number()) y = pnt["y"].get<double>();
+                            x = std::max(0.0, std::min(1.0, x));
+                            y = std::max(0.0, std::min(1.0, y));
+                            region.polygonNorm.push_back({ x, y });
+                        }
+                    }
+                    if (region.polygonNorm.size() < 3) {
+                        region.fullFrame = true;
+                        region.polygonNorm.clear();
+                    }
+                    ac.analysisRegions.push_back(std::move(region));
+                }
+            }
+
+            const bool isCustomType = (ac.type.rfind("custom_", 0) == 0);
+            ac.isCustomV2 = isCustomType && !ac.promptTemplate.empty() && !ac.alertCondition.empty();
+            if (ac.isCustomV2 && ac.analysisRegions.empty()) {
+                AlgorithmConfig::AnalysisRegion full;
+                full.regionId = "full-frame";
+                full.label = "Full frame";
+                full.enabled = true;
+                full.fullFrame = true;
+                ac.analysisRegions.push_back(std::move(full));
+            }
+
+            cfg.enabledAlgorithms.push_back(ac.type);
+            cfg.algorithms.push_back(std::move(ac));
+        }
+    }
+
+    cfg.forceVideoRecordingWithoutInference =
+        (!startedByJob && cfg.algorithms.empty() && !cfg.isDrakonFindTemporarySession);
+
+
+    int frameRatePayload = 3;  // default to 12 seconds if not present
+    if (p.contains("frame_rate") && !p["frame_rate"].is_null()) {
+        try {
+            frameRatePayload = p["frame_rate"].get<int>();
+        }
+        catch (...) {
+            frameRatePayload = 3;
+        }
+    }
+    if (frameRatePayload <= 0) {
+        frameRatePayload = 3;  // safety fallback
+    }
+    cfg.frameCaptureIntervalSeconds = frameRatePayload;
+
+    cfg.timeOffsetSeconds = timeOffsetSeconds_;
+    int analysisSpeedPayload = 3;
+    if (p.contains("analysis_speed") && p["analysis_speed"].is_number_integer()) {
+        analysisSpeedPayload = p["analysis_speed"].get<int>();
+        if (analysisSpeedPayload != 1 &&
+            analysisSpeedPayload != 3 &&
+            analysisSpeedPayload != 5 &&
+            analysisSpeedPayload != 10) {
+            analysisSpeedPayload = 3;  // safety clamp
+        }
+    }
+    cfg.analysisSpeed = analysisSpeedPayload;
+
+    // --- model_tier from payload ("light" | "plus" | "pro") ---
+    std::string tier = "light";
+    if (p.contains("model_tier") && p["model_tier"].is_string()) {
+        tier = p["model_tier"].get<std::string>();
+    }
+    // optional clamp/normalize
+    if (tier != "light" && tier != "plus" && tier != "pro") {
+        tier = "light";
+    }
+    cfg.modelTier = tier;
+
+    if (p.contains("description_model_name") && p["description_model_name"].is_string()) {
+        cfg.descriptionModelName = p["description_model_name"].get<std::string>();
+    }
+    if (cfg.descriptionModelName.empty()) {
+        cfg.descriptionModelName = "gpt-5.1";
+    }
+    if (p.contains("description_model_api_key") && p["description_model_api_key"].is_string()) {
+        cfg.descriptionModelApiKey = p["description_model_api_key"].get<std::string>();
+    }
+    if (cfg.descriptionModelApiKey.empty()) {
+        for (const auto& algoCfg : cfg.algorithms) {
+            if (!algoCfg.modelApiKey.empty()) {
+                cfg.descriptionModelApiKey = algoCfg.modelApiKey;
+                break;
+            }
+        }
+    }
+
+    return cfg;
+}
+
+void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
+    Logger::instance().logDebug(
+        "agent",
+        "startCameraFromPayload_: ENTER cameraId=" + std::to_string(cameraId) +
+        " payload=" + p.dump()
+    );
+
+    CameraConfig cfg = buildCameraConfigFromPayload_(cameraId, p);
+
+    // Idempotent start: if camera is already running with equivalent runtime
+    // settings and same connection parameters, keep the current RTSP session.
+    {
+        std::lock_guard<std::mutex> lk(sessionsMu_);
+        auto it = sessions_.find(cameraId);
+        if (it != sessions_.end() && it->second && it->second->matchesStartConfig(cfg)) {
+            it->second->updateAlgorithms(cfg.algorithms);
+            setCameraServiceRunning_(cameraId, true, "agentcore_idempotent_start");
+            Logger::instance().logDebug(
+                "agent",
+                "startCameraFromPayload_: reusing existing session for camera " +
+                std::to_string(cameraId) + " (idempotent start; no restart)"
+            );
+            return;
+        }
+    }
+
+    // If already running with different runtime settings, stop & restart.
+    // Do NOT hold sessionsMu_ while stopping (stop may join threads / block).
+    std::unique_ptr<CameraSession> oldSession;
+    {
+        std::lock_guard<std::mutex> lk(sessionsMu_);
+        auto it = sessions_.find(cameraId);
+        if (it != sessions_.end()) {
+            oldSession = std::move(it->second);
+            sessions_.erase(it);
+        }
+    }
+    if (oldSession) {
+        Logger::instance().logDebug(
+            "agent",
+            "startCameraFromPayload_: camera " + std::to_string(cameraId) +
+            " already has a session, stopping and erasing"
+        );
+        oldSession->stop();
+    }
+
+
+
+
+    Logger::instance().logDebug(
+        "agent",
+        "startCameraFromPayload_: built cfg for camera " + cfg.id +
+        " rtspUrlCandidates=" + cfg.rtspUrl +
+        " frameCaptureIntervalSeconds=" + std::to_string(cfg.frameCaptureIntervalSeconds) +
+        " timeOffsetSeconds=" + std::to_string(cfg.timeOffsetSeconds) +
+        " forceVideoRecordingWithoutInference=" +
+        std::string(cfg.forceVideoRecordingWithoutInference ? "true" : "false") +
+        " hydrateExistingSegments=" +
+        std::string(cfg.storage.hydrateExistingSegments ? "true" : "false") +
+        " descriptionModelName=" + cfg.descriptionModelName +
+        " descriptionModelApiKeyPresent=" + std::string(cfg.descriptionModelApiKey.empty() ? "false" : "true")
+    );
+
+    try {
+        auto session = std::make_unique<CameraSession>(
+            cfg,
+            nullptr,
+            nullptr
+        );
+
+        session->setOwner(this);
+        session->updateAlgorithms(cfg.algorithms);
+
+        Logger::instance().logDebug(
+            "agent",
+            "startCameraFromPayload_: calling CameraSession::start() for camera " + cfg.id
+        );
+
+        session->start();
+
+        Logger::instance().logDebug(
+            "agent",
+            "startCameraFromPayload_: CameraSession::start() returned for camera " + cfg.id
+        );
+
+        {
+            std::lock_guard<std::mutex> lk(sessionsMu_);
+            sessions_[cameraId] = std::move(session);
+        }
+
+        setCameraServiceRunning_(cameraId, true, "agentcore_start");
+    }
+    catch (const std::exception& e) {
+        setCameraServiceRunning_(cameraId, false, "agentcore_start_failed");
+        Logger::instance().logDebug(
+            "agent",
+            std::string("startCameraFromPayload_: exception for camera ") +
+            std::to_string(cameraId) + ": " + e.what()
+        );
+    }
+    catch (...) {
+        setCameraServiceRunning_(cameraId, false, "agentcore_start_failed_unknown");
+        Logger::instance().logDebug(
+            "agent",
+            "startCameraFromPayload_: unknown exception for camera " +
+            std::to_string(cameraId)
+        );
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "startCameraFromPayload_: EXIT cameraId=" + std::to_string(cameraId)
+    );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+void AgentCore::stopCamera_(int cameraId) {
+    Logger::instance().logDebug(
+        "agent",
+        "stopCamera_: ENTER cameraId=" + std::to_string(cameraId)
+    );
+
+    try {
+        std::unique_ptr<CameraSession> session;
+        {
+            std::lock_guard<std::mutex> lk(sessionsMu_);
+            auto it = sessions_.find(cameraId);
+            if (it != sessions_.end()) {
+                session = std::move(it->second);
+                sessions_.erase(it);
+            }
+        }
+
+        if (!session) {
+            setCameraServiceRunning_(cameraId, false, "agentcore_stop_no_session");
+            Logger::instance().logDebug(
+                "agent",
+                "stopCamera_: no session found for cameraId=" + std::to_string(cameraId)
+            );
+            return;
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "stopCamera_: found session, calling session->stop() for cameraId=" +
+            std::to_string(cameraId)
+        );
+
+        session->stop();
+        setCameraServiceRunning_(cameraId, false, "agentcore_stop");
+
+        Logger::instance().logDebug(
+            "agent",
+            "stopCamera_: session->stop() returned, erasing from map for cameraId=" +
+            std::to_string(cameraId)
+        );
+
+        Logger::instance().logDebug(
+            "agent",
+            "stopCamera_: EXIT ok cameraId=" + std::to_string(cameraId)
+        );
+    }
+    catch (const std::exception& e) {
+        setCameraServiceRunning_(cameraId, false, "agentcore_stop_failed");
+        Logger::instance().logDebug(
+            "agent",
+            std::string("stopCamera_: std::exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        setCameraServiceRunning_(cameraId, false, "agentcore_stop_failed_unknown");
+        Logger::instance().logDebug(
+            "agent",
+            "stopCamera_: unknown exception"
+        );
+    }
+}
+
+
+
+
+namespace {
+    // ---- HTTP timeouts + retry behavior (worker + Mocha endpoints) ----
+    constexpr long kHttpConnectTimeoutSec = 10;
+    constexpr long kHttpTimeoutSec = 30;
+    constexpr int  kHttpMaxAttempts = 3;
+
+    // Per-thread hook used to notify UI on the *first* retry (e.g. show "Still analyzing...").
+    thread_local std::function<void()> tl_onFirstRetry;
+    thread_local bool tl_firstRetryNotified = false;
+
+    inline void MaybeNotifyFirstRetry() {
+        if (!tl_firstRetryNotified && tl_onFirstRetry) {
+            tl_firstRetryNotified = true;
+            try { tl_onFirstRetry(); }
+            catch (...) { /* never let UI notification break retry logic */ }
+        }
+    }
+
+    struct RetryUiGuard {
+        std::function<void()> prev;
+        bool prevNotified;
+        explicit RetryUiGuard(std::function<void()> onFirstRetry)
+            : prev(std::move(tl_onFirstRetry)), prevNotified(tl_firstRetryNotified)
+        {
+            tl_onFirstRetry = std::move(onFirstRetry);
+            tl_firstRetryNotified = false;
+        }
+        ~RetryUiGuard() {
+            tl_onFirstRetry = std::move(prev);
+            tl_firstRetryNotified = prevNotified;
+        }
+    };
+} // namespace
+
+
+
+static long HttpGetJson(const std::string& url,
+    const std::string& bearerToken,
+    std::string& outResponse)
+{
+    auto isTransient = [](CURLcode r) {
+        return r == CURLE_OPERATION_TIMEDOUT || r == CURLE_COULDNT_CONNECT ||
+            r == CURLE_RECV_ERROR || r == CURLE_SEND_ERROR;
+        };
+
+    outResponse.clear();
+
+    for (int attempt = 1; attempt <= kHttpMaxAttempts; ++attempt) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return -1;
+
+        struct curl_slist* headers = nullptr;
+        if (!bearerToken.empty()) {
+            std::string auth = "Authorization: Bearer " + bearerToken;
+            headers = curl_slist_append(headers, auth.c_str());
+        }
+
+        outResponse.clear();
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outResponse);
+
+        // Hard timeouts (prevents "ghost mode" / hung threads)
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kHttpConnectTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, kHttpTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        long httpCode = 0;
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res == CURLE_OK) return httpCode;
+
+        Logger::instance().logDebug(
+            "agent",
+            "HttpGetJson: attempt=" + std::to_string(attempt) +
+            " failed: " + std::string(curl_easy_strerror(res)) +
+            " url=" + url
+        );
+
+        if (isTransient(res) && attempt < kHttpMaxAttempts) {
+            if (attempt == 1) MaybeNotifyFirstRetry();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+            continue;
+        }
+
+        return -1;
+    }
+
+    return -1;
+}
+
+
+
+
+
+
+static long HttpPostJson(const std::string& url,
+    const std::string& bearerToken,
+    const std::string& jsonBody,
+    std::string& outResponse) {
+    auto isTransient = [](CURLcode r) {
+        return r == CURLE_OPERATION_TIMEDOUT || r == CURLE_COULDNT_CONNECT ||
+            r == CURLE_RECV_ERROR || r == CURLE_SEND_ERROR;
+        };
+
+    outResponse.clear();
+
+    for (int attempt = 1; attempt <= kHttpMaxAttempts; ++attempt) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return -1;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        if (!bearerToken.empty()) {
+            std::string auth = "Authorization: Bearer " + bearerToken;
+            headers = curl_slist_append(headers, auth.c_str());
+        }
+
+        outResponse.clear();
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonBody.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)jsonBody.size());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outResponse);
+
+        // Hard timeouts
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kHttpConnectTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, kHttpTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+
+
+        // SIMPLY LOG THE POST
+        // --------------------------------------------------------------------------------------
+        try {
+            auto body = nlohmann::json::parse(jsonBody);
+
+            if (body.contains("vision_hits") && body["vision_hits"].is_array()) {
+                const auto& hits = body["vision_hits"];
+                Logger::instance().logDebug("agent",
+                    "HttpPostJson: vision_hits=" + std::to_string(hits.size())
+                );
+
+                int i = 0;
+                for (const auto& h : hits) {
+                    if (!h.is_object()) continue;
+
+                    int framesN = 0;
+                    size_t totalB64Chars = 0;
+
+                    if (h.contains("frames_jpeg_base64") && h["frames_jpeg_base64"].is_array()) {
+                        framesN = (int)h["frames_jpeg_base64"].size();
+                        for (const auto& s : h["frames_jpeg_base64"]) {
+                            if (s.is_string()) totalB64Chars += s.get<std::string>().size();
+                        }
+                    }
+
+                    Logger::instance().logDebug("agent",
+                        "HttpPostJson: hit[" + std::to_string(i) + "] frames=" + std::to_string(framesN) +
+                        " total_b64_chars=" + std::to_string(totalB64Chars)
+                    );
+
+                    if (++i >= 5) break;
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug("agent",
+                std::string("HttpPostJson: could not parse jsonBody for summary: ") + e.what()
+            );
+        }
+        // ----------------------------------------------------------------------------------
+
+
+
+        long httpCode = 0;
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        }
+
+
+        // ---- LOG response fully (this is your responseSize=121) ----
+        /*
+        Logger::instance().logDebug("agent",
+            "HttpPostJson: HTTP " + std::to_string(httpCode) +
+            " response bytes=" + std::to_string(outResponse.size()) +
+            " body=" + outResponse
+        );
+        */
+
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res == CURLE_OK) return httpCode;
+
+        Logger::instance().logDebug(
+            "agent",
+            "HttpPostJson: attempt=" + std::to_string(attempt) +
+            " failed: " + std::string(curl_easy_strerror(res)) +
+            " url=" + url
+        );
+
+        if (isTransient(res) && attempt < kHttpMaxAttempts) {
+            if (attempt == 1) MaybeNotifyFirstRetry();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+            continue;
+        }
+
+        return -1;
+    }
+
+    return -1;
+}
+
+
+
+
+
+
+
+static std::string urlEncodeForQuery_(const std::string& value)
+{
+    if (value.empty()) return std::string();
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return value;
+
+    char* escaped = curl_easy_escape(curl, value.c_str(), static_cast<int>(value.size()));
+    std::string encoded = escaped ? escaped : value;
+    if (escaped) {
+        curl_free(escaped);
+    }
+    curl_easy_cleanup(curl);
+    return encoded;
+}
+
+static long HttpPostBytes(const std::string& url,
+    const std::string& bearerToken,
+    const std::vector<uint8_t>& bodyBytes,
+    const std::string& contentType,
+    std::string& outResponse) {
+    auto isTransient = [](CURLcode r) {
+        return r == CURLE_OPERATION_TIMEDOUT || r == CURLE_COULDNT_CONNECT ||
+            r == CURLE_RECV_ERROR || r == CURLE_SEND_ERROR;
+        };
+
+    outResponse.clear();
+
+    for (int attempt = 1; attempt <= kHttpMaxAttempts; ++attempt) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return -1;
+
+        struct curl_slist* headers = nullptr;
+        const std::string contentTypeHeader = "Content-Type: " +
+            (contentType.empty() ? std::string("application/octet-stream") : contentType);
+        headers = curl_slist_append(headers, contentTypeHeader.c_str());
+        headers = curl_slist_append(headers, "Expect:");
+        if (!bearerToken.empty()) {
+            std::string auth = "Authorization: Bearer " + bearerToken;
+            headers = curl_slist_append(headers, auth.c_str());
+        }
+
+        outResponse.clear();
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, bodyBytes.empty() ? nullptr : bodyBytes.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(bodyBytes.size()));
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outResponse);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kHttpConnectTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, kHttpTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+        long httpCode = 0;
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        }
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res == CURLE_OK) return httpCode;
+
+        Logger::instance().logDebug(
+            "agent",
+            "HttpPostBytes: attempt=" + std::to_string(attempt) +
+            " failed: " + std::string(curl_easy_strerror(res)) +
+            " url=" + url
+        );
+
+        if (isTransient(res) && attempt < kHttpMaxAttempts) {
+            if (attempt == 1) MaybeNotifyFirstRetry();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+            continue;
+        }
+
+        return -1;
+    }
+
+    return -1;
+}
+
+/*
+static long HttpGetJson(const std::string& url,
+    const std::string& bearerToken,
+    std::string& outResponse)
+{
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        return -1;
+    }
+
+    struct curl_slist* headers = nullptr;
+
+    if (!bearerToken.empty()) {
+        std::string auth = "Authorization: Bearer " + bearerToken;
+        headers = curl_slist_append(headers, auth.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outResponse);
+
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30);
+
+    long httpCode = 0;
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return (res == CURLE_OK) ? httpCode : -1;
+}
+
+
+
+
+
+
+static long HttpPostJson(const std::string& url,
+    const std::string& bearerToken,
+    const std::string& jsonBody,
+    std::string& outResponse) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (!bearerToken.empty()) {
+        std::string auth = "Authorization: Bearer " + bearerToken;
+        headers = curl_slist_append(headers, auth.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonBody.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outResponse);
+
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30);
+
+
+    // SIMPLY LOG THE POST
+    // --------------------------------------------------------------------------------------
+    try {
+        auto body = nlohmann::json::parse(jsonBody);
+
+        if (body.contains("vision_hits") && body["vision_hits"].is_array()) {
+            const auto& hits = body["vision_hits"];
+            Logger::instance().logDebug("agent",
+                "HttpPostJson: vision_hits=" + std::to_string(hits.size())
+            );
+
+            int i = 0;
+            for (const auto& h : hits) {
+                if (!h.is_object()) continue;
+
+                int framesN = 0;
+                size_t totalB64Chars = 0;
+
+                if (h.contains("frames_jpeg_base64") && h["frames_jpeg_base64"].is_array()) {
+                    framesN = (int)h["frames_jpeg_base64"].size();
+                    for (const auto& s : h["frames_jpeg_base64"]) {
+                        if (s.is_string()) totalB64Chars += s.get<std::string>().size();
+                    }
+                }
+
+                Logger::instance().logDebug("agent",
+                    "HttpPostJson: hit[" + std::to_string(i) + "] frames=" + std::to_string(framesN) +
+                    " total_b64_chars=" + std::to_string(totalB64Chars)
+                );
+
+                if (++i >= 5) break;
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("HttpPostJson: could not parse jsonBody for summary: ") + e.what()
+        );
+    }
+    // ----------------------------------------------------------------------------------
+
+
+
+    long httpCode = 0;
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    }
+
+
+    // ---- LOG response fully (this is your responseSize=121) ----
+    
+    //Logger::instance().logDebug("agent",
+        //"HttpPostJson: HTTP " + std::to_string(httpCode) +
+        //" response bytes=" + std::to_string(outResponse.size()) +
+        //" body=" + outResponse
+    //);
+    
+    
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? httpCode : -1;
+}
+*/
+
+void AgentCore::notifyCameraConnectionError(const std::string& cameraId,
+    const std::string& rtspUrl,
+    const std::string& errorMessage,
+    const nlohmann::json& extraDetails) {
+    try {
+        std::string eventMessage = "Failed to connect to camera.";
+        if (!errorMessage.empty()) {
+            eventMessage = errorMessage;
+        }
+
+        json payload;
+        payload["camera_id"] = std::stoi(cameraId);  // your DB uses int
+        payload["event_type"] = "camera_connection_failed";
+        payload["message"] = eventMessage;
+        payload["details"] = {
+            { "rtsp_url", rtspUrl },
+            { "error",    errorMessage }
+        };
+        if (extraDetails.is_object()) {
+            for (auto it = extraDetails.begin(); it != extraDetails.end(); ++it) {
+                payload["details"][it.key()] = it.value();
+            }
+        }
+
+        std::string body = payload.dump();
+
+        // Same pattern as /api/agent/commands:
+        //   GET /api/agent/commands?client_id=...
+        std::string url = baseUrl_ + "/api/agent/events?client_id=" + clientId_;
+
+        Logger::instance().logDebug(
+            "agent",
+            "notifyCameraConnectionError: POST " + url + " body=" + body
+        );
+
+        std::string response;
+        long code = HttpPostJson(url, exeToken_, body, response);
+
+        Logger::instance().logDebug(
+            "agent",
+            "notifyCameraConnectionError: httpCode=" +
+            std::to_string(code) + " response=" + response
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("notifyCameraConnectionError exception: ") + e.what()
+        );
+    }
+}
+
+
+
+
+
+void AgentCore::postAgentEvent(
+    const std::string& eventType,
+    std::optional<int> cameraId,
+    const std::string& userId,
+    const std::string& message,
+    const nlohmann::json& details
+)
+{
+    (void)postAgentEventWithResult(eventType, cameraId, userId, message, details);
+}
+
+AgentCore::AgentEventPostResult AgentCore::postAgentEventWithResult(
+    const std::string& eventType,
+    std::optional<int> cameraId,
+    const std::string& userId,
+    const std::string& message,
+    const nlohmann::json& details
+)
+{
+    AgentEventPostResult result;
+
+    try {
+        nlohmann::json payload;
+        payload["event_type"] = eventType;
+        payload["message"] = message;
+
+        if (cameraId.has_value()) {
+            payload["camera_id"] = cameraId.value();
+        }
+
+        if (!userId.empty()) {
+            payload["user_id"] = userId;
+        }
+
+        payload["details"] = details.is_null() ? nlohmann::json::object() : details;
+
+        std::string body = payload.dump();
+
+        nlohmann::json payloadForLog = payload;
+        const std::size_t kBase64PreviewChars = 72;
+        auto truncateBase64FieldForLog = [&](nlohmann::json& value) {
+            if (!value.is_string()) return;
+            const std::string raw = value.get<std::string>();
+            if (raw.size() <= kBase64PreviewChars) return;
+            value =
+                raw.substr(0, kBase64PreviewChars) +
+                "...(truncated,len=" + std::to_string(raw.size()) + ")";
+        };
+
+        std::function<void(nlohmann::json&)> sanitizeLargeFieldsForLog =
+            [&](nlohmann::json& node) {
+                if (node.is_object()) {
+                    for (auto it = node.begin(); it != node.end(); ++it) {
+                        if (it.key() == "frame_jpeg_base64" ||
+                            it.key() == "video_mp4_base64" ||
+                            it.key() == "snapshot_image_data_url" ||
+                            it.key() == "image_data_url") {
+                            truncateBase64FieldForLog(it.value());
+                        }
+                        else {
+                            sanitizeLargeFieldsForLog(it.value());
+                        }
+                    }
+                    return;
+                }
+
+                if (node.is_array()) {
+                    for (auto& item : node) {
+                        sanitizeLargeFieldsForLog(item);
+                    }
+                }
+            };
+        sanitizeLargeFieldsForLog(payloadForLog);
+        const std::string bodyForLog = payloadForLog.dump();
+
+        std::string url = baseUrl_ + "/api/agent/events?client_id=" + clientId_;
+        Logger::instance().logDebug("agent", "postAgentEvent: POST " + url + " body=" + bodyForLog);
+
+        const auto shouldRetryHttpCode = [](long code) {
+            return code == 408 || code == 409 || code == 425 || code == 429 || (code >= 500 && code < 600);
+        };
+
+        constexpr int kEventPostMaxAttempts = 3;
+        for (int attempt = 1; attempt <= kEventPostMaxAttempts; ++attempt) {
+            result.response.clear();
+            result.httpCode = HttpPostJson(url, exeToken_, body, result.response);
+            result.ok = (result.httpCode >= 200 && result.httpCode < 300);
+
+            Logger::instance().logDebug(
+                "agent",
+                "postAgentEvent: attempt=" + std::to_string(attempt) +
+                " httpCode=" + std::to_string(result.httpCode) +
+                " response=" + result.response
+            );
+
+            if (result.ok) {
+                return result;
+            }
+
+            if (attempt >= kEventPostMaxAttempts || !shouldRetryHttpCode(result.httpCode)) {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(250 * attempt));
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent", std::string("postAgentEvent exception: ") + e.what());
+        result.response = e.what();
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "postAgentEvent unknown exception");
+        result.response = "unknown exception";
+    }
+
+    return result;
+}
+
+AgentCore::JobAlertVideoUploadResult AgentCore::uploadJobAlertVideo(
+    int cameraId,
+    int jobId,
+    int stepId,
+    const std::string& filePathUtf8
+)
+{
+    JobAlertVideoUploadResult result;
+
+    try {
+        constexpr std::uintmax_t kMaxJobAlertVideoUploadBytes = 25u * 1024u * 1024u;
+
+        if (filePathUtf8.empty()) {
+            result.error = "empty file path";
+            return result;
+        }
+
+        std::error_code ec;
+        const fs::path filePath(filePathUtf8);
+        if (!fs::exists(filePath, ec) || ec) {
+            result.error = "file does not exist";
+            return result;
+        }
+
+        result.fileSizeBytes = fs::file_size(filePath, ec);
+        if (ec) {
+            result.fileSizeBytes = 0;
+        }
+
+        if (result.fileSizeBytes > kMaxJobAlertVideoUploadBytes) {
+            result.skippedByBudget = true;
+            result.error =
+                "video exceeds upload budget bytes=" + std::to_string(result.fileSizeBytes) +
+                " max=" + std::to_string(kMaxJobAlertVideoUploadBytes);
+            Logger::instance().logDebug("agent", "uploadJobAlertVideo: " + result.error);
+            return result;
+        }
+
+        std::vector<std::uint8_t> bytes;
+        if (!readFileToBytes(filePathUtf8, bytes) || bytes.empty()) {
+            result.error = "failed to read video bytes";
+            return result;
+        }
+
+        result.fileSizeBytes = bytes.size();
+        if (result.fileSizeBytes > kMaxJobAlertVideoUploadBytes) {
+            result.skippedByBudget = true;
+            result.error =
+                "video exceeds upload budget after read bytes=" + std::to_string(result.fileSizeBytes) +
+                " max=" + std::to_string(kMaxJobAlertVideoUploadBytes);
+            Logger::instance().logDebug("agent", "uploadJobAlertVideo: " + result.error);
+            return result;
+        }
+
+        std::string url = baseUrl_ +
+            "/api/agent/job-alert-media?client_id=" + clientId_ +
+            "&camera_id=" + std::to_string(cameraId) +
+            "&job_id=" + urlEncodeForQuery_(std::to_string(jobId)) +
+            "&step_id=" + urlEncodeForQuery_(std::to_string(stepId));
+
+        Logger::instance().logDebug(
+            "agent",
+            "uploadJobAlertVideo: POST " + url +
+            " bytes=" + std::to_string(result.fileSizeBytes)
+        );
+
+        result.httpCode = HttpPostBytes(url, exeToken_, bytes, "video/mp4", result.response);
+        if (result.httpCode < 200 || result.httpCode >= 300) {
+            result.error =
+                "upload failed httpCode=" + std::to_string(result.httpCode) +
+                " response=" + result.response;
+            Logger::instance().logDebug("agent", "uploadJobAlertVideo: " + result.error);
+            return result;
+        }
+
+        const json parsed = json::parse(result.response, nullptr, false);
+        if (!parsed.is_object()) {
+            result.error = "upload response is not valid json";
+            return result;
+        }
+
+        result.videoKey = parsed.value("video_key", "");
+        result.videoUrl = parsed.value("video_url", "");
+        if (result.videoKey.empty() || result.videoUrl.empty()) {
+            result.error = "upload response missing video_key/video_url";
+            return result;
+        }
+
+        result.ok = true;
+        Logger::instance().logDebug(
+            "agent",
+            "uploadJobAlertVideo: httpCode=" + std::to_string(result.httpCode) +
+            " videoKey=" + result.videoKey
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent", std::string("uploadJobAlertVideo exception: ") + e.what());
+        result.error = e.what();
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "uploadJobAlertVideo unknown exception");
+        result.error = "unknown exception";
+    }
+
+    return result;
+}
+
+
+void AgentCore::setCameraServiceRunning_(int cameraId, bool running, const std::string& source)
+{
+    try {
+        nlohmann::json body;
+        body["is_service_running"] = running ? 1 : 0; // backend expects 0/1
+        body["source"] = source;
+
+        std::string url = baseUrl_
+            + "/api/agent/cameras/"
+            + std::to_string(cameraId)
+            + "/target_state?client_id="
+            + clientId_;
+
+        std::string response;
+        long code = HttpPostJson(url, exeToken_, body.dump(), response);
+
+        Logger::instance().logDebug(
+            "agent",
+            "setCameraServiceRunning_: httpCode=" + std::to_string(code) + " response=" + response
+        );
+
+        // (Optional) still log an audit event, but not required anymore:
+        // postAgentEvent("camera_target_state", std::optional<int>(cameraId), "", running ? "camera started" : "camera stopped", body);
+
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent", std::string("setCameraServiceRunning_ exception: ") + e.what());
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "setCameraServiceRunning_ unknown exception");
+    }
+}
+
+
+
+
+CameraSession* AgentCore::getCameraSession(int cameraId)
+{
+    std::lock_guard<std::mutex> lk(sessionsMu_);
+    auto it = sessions_.find(cameraId);
+    if (it == sessions_.end()) return nullptr;
+    return it->second.get();
+}
+
+bool AgentCore::isCameraStreamOnline(int cameraId) const
+{
+    std::lock_guard<std::mutex> lk(sessionsMu_);
+    auto it = sessions_.find(cameraId);
+    if (it == sessions_.end() || !it->second) return false;
+    return it->second->isStreamOnline();
+}
+
+std::vector<CameraSession::OpenMonitorSnapshot> AgentCore::collectOpenMonitorCameraSnapshots() const
+{
+    std::lock_guard<std::mutex> lk(sessionsMu_);
+    std::vector<CameraSession::OpenMonitorSnapshot> snapshots;
+    snapshots.reserve(sessions_.size());
+    for (const auto& kv : sessions_) {
+        if (!kv.second) continue;
+        snapshots.push_back(kv.second->getOpenMonitorSnapshot());
+    }
+    return snapshots;
+}
+
+void AgentCore::ensureCameraStartedForJob(int cameraId, const nlohmann::json& startPayload)
+{
+    // startCameraFromPayload_ already handles "restart if running".
+    startCameraFromPayload_(cameraId, startPayload);
+
+    if (getCameraSession(cameraId) != nullptr) {
+        setCameraServiceRunning_(cameraId, true, "jobrunner");
+    }
+}
+
+void AgentCore::stopCameraForJob(int cameraId)
+{
+    stopCamera_(cameraId);
+
+    if (getCameraSession(cameraId) == nullptr) {
+        setCameraServiceRunning_(cameraId, false, "jobrunner");
+    }
+}
+
+
+
+
+
+
+
+void AgentCore::initTimeSync()
+{
+    try {
+        using namespace std::chrono;
+
+        // 1) horÃƒÆ’Ã‚Â¡rio atual da mÃƒÆ’Ã‚Â¡quina (UTC)
+        auto now = system_clock::now();
+        std::time_t localUtc = system_clock::to_time_t(now);
+
+        // 2) TODO: pegar horÃƒÆ’Ã‚Â¡rio "real" do servidor (UTC)
+        // Aqui vocÃƒÆ’Ã‚Âª pode:
+        //  - chamar um endpoint no seu backend (ex: /api/agent/time)
+        //  - ou ler de um arquivo de config com offset manual
+        //
+        // Exemplo genÃƒÆ’Ã‚Â©rico usando HttpGetJson (ajuste URL e parsing):
+
+        std::string url = baseUrl_ + "/api/agent/time?client_id=" + clientId_;
+        std::string body;
+        long code = HttpGetJson(url, exeToken_, body);  // vocÃƒÆ’Ã‚Âª jÃƒÆ’Ã‚Â¡ tem HttpGetJson em AgentCore :contentReference[oaicite:1]{index=1}
+
+        if (code != 200) {
+            Logger::instance().logDebug(
+                "agent",
+                "initTimeSync: failed HTTP time, code=" + std::to_string(code) +
+                " body=" + body + " -> using offset=0"
+            );
+            timeOffsetSeconds_ = 0;
+            return;
+        }
+
+        // Supondo que o backend responda: { "utc_epoch_seconds": 1764519060 }
+        json j = json::parse(body, nullptr, false);
+        if (!j.is_object() || !j.contains("utc_epoch_seconds")) {
+            Logger::instance().logDebug(
+                "agent",
+                "initTimeSync: invalid JSON response, using offset=0"
+            );
+            timeOffsetSeconds_ = 0;
+            return;
+        }
+
+        std::time_t serverUtc = j["utc_epoch_seconds"].get<long long>();
+
+        long long offset = static_cast<long long>(serverUtc)
+            - static_cast<long long>(localUtc);
+
+        timeOffsetSeconds_ = offset;
+
+        Logger::instance().logDebug(
+            "agent",
+            "initTimeSync: localUtc=" + std::to_string(localUtc) +
+            " serverUtc=" + std::to_string(serverUtc) +
+            " offsetSeconds=" + std::to_string(timeOffsetSeconds_)
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("initTimeSync exception: ") + e.what()
+        );
+        timeOffsetSeconds_ = 0;
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "initTimeSync unknown exception"
+        );
+        timeOffsetSeconds_ = 0;
+    }
+}
+
+
+
+
+
+bool AgentCore::bootstrapCameras_()
+{
+    try {
+        // POST {} to /api/agent/bootstrap-cameras?client_id=...
+        std::string url = baseUrl_ + "/api/agent/bootstrap-cameras?client_id=" + clientId_;
+
+        json bodyJson = json::object();
+        std::string body = bodyJson.dump();
+
+        Logger::instance().logDebug(
+            "agent",
+            "bootstrapCameras_: POST " + url +
+            " bodySize=" + std::to_string(body.size())
+        );
+
+        std::string response;
+        long httpCode = HttpPostJson(url, exeToken_, body, response);
+
+        Logger::instance().logDebug(
+            "agent",
+            "bootstrapCameras_: HTTP " + std::to_string(httpCode) +
+            " responseSize=" + std::to_string(response.size()) +
+            " body=" + response
+        );
+
+        if (httpCode != 200) {
+            return false;
+        }
+
+        // Optional: parse response just for logging
+        try {
+            auto j = json::parse(response);
+            if (j.contains("enqueued_camera_ids") && j["enqueued_camera_ids"].is_array()) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "bootstrapCameras_: enqueued_camera_ids size=" +
+                    std::to_string(j["enqueued_camera_ids"].size())
+                );
+            }
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug(
+                "agent",
+                std::string("bootstrapCameras_: parse response error: ") + e.what()
+            );
+        }
+
+        return true;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("bootstrapCameras_ exception: ") + e.what()
+        );
+        return false;
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "bootstrapCameras_ unknown exception"
+        );
+        return false;
+    }
+}
+
+
+
+
+
+
+
+
+
+void AgentCore::sendThumbnail(const std::string& cameraId,
+    const std::string& jpegBase64) {
+    try {
+        json payload;
+        payload["camera_id"] = std::stoi(cameraId);
+        payload["jpeg_base64"] = jpegBase64;
+
+        std::string body = payload.dump();
+
+        // mesmo esquema de auth que /api/agent/events
+        std::string url = baseUrl_ + "/api/agent/thumbnails?client_id=" + clientId_;
+
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail: POST " + url +
+            " bodySize=" + std::to_string(body.size())
+        );
+
+        std::string response;
+        long code = HttpPostJson(url, exeToken_, body, response);
+
+        
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail: HTTP " + std::to_string(code) +
+            " responseSize=" + std::to_string(response.size())
+        );
+        
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("sendThumbnail std::exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail unknown exception"
+        );
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+void AgentCore::sendAlgoEvent(const std::string& cameraId,
+    const std::string& cameraName,
+    const std::string& algoType,
+    const std::string& timestampIso,
+    const std::string& mediaType,
+    const std::string& mediaBase64,
+    const nlohmann::json& extraDetails)
+{
+    try {
+        json payload;
+        payload["camera_id"] = std::stoi(cameraId);
+        payload["event_type"] = "ai_detection";
+
+        // Human-readable message
+        std::ostringstream msg;
+        msg << "Detection \"" << algoType << "\" = YES on camera \"" << cameraName << "\"";
+        payload["message"] = msg.str();
+
+        // Details used by Mocha UI / notifications
+        json details = {
+            { "algo_type",     algoType },
+            { "camera_name",   cameraName },
+            { "timestamp_iso", timestampIso },
+            { "media_type",    mediaType }
+        };
+
+        if (mediaType == "video") {
+            details["video_mp4_base64"] = std::string("data:video/mp4;base64,") + mediaBase64;
+        }
+        else {
+            // default to image to preserve old behavior
+            details["frame_jpeg_base64"] = std::string("data:image/jpeg;base64,") + mediaBase64;
+        }
+
+        if (extraDetails.is_object()) {
+            for (auto it = extraDetails.begin(); it != extraDetails.end(); ++it) {
+                details[it.key()] = it.value();
+            }
+        }
+
+        payload["details"] = details;
+
+        std::string body = payload.dump();
+        std::string url = baseUrl_ + "/api/agent/events?client_id=" + clientId_;
+
+        Logger::instance().logDebug(
+            "agent",
+            "sendAlgoEvent: POST " + url + " bodySize=" + std::to_string(body.size())
+        );
+
+        std::string response;
+        long code = HttpPostJson(url, exeToken_, body, response);
+
+        Logger::instance().logDebug(
+            "agent",
+            "sendAlgoEvent: HTTP " + std::to_string(code) +
+            " responseSize=" + std::to_string(response.size())
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent", std::string("sendAlgoEvent std::exception: ") + e.what());
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "sendAlgoEvent unknown exception");
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+std::string AgentCore::buildCameraRouterSystemPrompt_() const
+{
+    std::string s;
+    s += std::string("You are ") + AppBrand::kAssistantName + ", a router that maps user questions ";
+    s += "to security cameras.\n";
+    s += "You receive:\n";
+    s += "1) A user question in natural language.\n";
+    s += "2) A JSON array of the user's cameras. Each camera has fields:\n";
+    s += "   - id (number)\n";
+    s += "   - name (string)\n";
+    s += "   - description (string)\n";
+    s += "3) A field now_utc with the current UTC time in ISO 8601 format, ";
+    s += "   for example \"2025-12-01T13:03:43Z\".\n";
+    s += "\n";
+    s += "Your job is ONLY to:\n";
+    s += "- Decide which camera IDs the user is referring to.\n";
+    s += "- Infer a relative time window in minutes before now.\n";
+    s += "- Convert that window into an absolute start and end timestamp.\n";
+    s += "- Produce the list of storage search paths for the selected cameras.\n";
+    s += "- Produce a SHORT natural-language answer that mentions the camera names.\n";
+    s += "\n";
+    s += "FOCUS RULES:\n";
+    s += "- Use BOTH `name` and `description` to understand what each camera sees.\n";
+    s += "- Match synonyms: 'front door' ~ 'entrance', 'garage' ~ 'car parking',\n";
+    s += "  'office' ~ 'office_room', etc.\n";
+    s += "- Ignore details of the user's security question EXCEPT what helps you\n";
+    s += "  identify the camera(s) and the time period.\n";
+    s += "- If the user mentions 'all cameras', set all_cameras=true and include\n";
+    s += "  all relevant cameras.\n";
+    s += "- If you are NOT sure which camera(s) they mean, you may return an empty\n";
+    s += "  list of cameras, but in that case your `answer` MUST be a short\n";
+    s += "  clarifying question back to the user.\n";
+    s += "- Descriptions of people, clothing, or objects ALONE (for example\n";
+    s += "  'someone with a backpack', 'a man wearing a cap', 'a red car')\n";
+    s += "  DO NOT indicate a camera and MUST NOT be used by themselves to choose\n";
+    s += "  any camera. If the user only describes the event and does not mention\n";
+    s += "  any location, camera description, camera label/name or 'all cameras', you MUST NOT guess.\n";
+    s += "\n";
+    s += "TIME WINDOW RULES:\n";
+    s += "- There are two kinds of time expressions:\n";
+    s += "  1) Relative windows (\"last 5 minutes\", \"last 2 hours\", \"in the last 30 minutes\").\n";
+    s += "  2) Explicit intervals (\"between 10 and 11 am today\", \"from 7 am to 8 am\",\n";
+    s += "     \"entre 7 e 8 horas da manha de hoje\").\n";
+    s += "- 3) Calendar-day keywords (\"today/hoje\", \"yesterday/ontem\", \"this week/essa semana\").\n";
+    s += "     These imply a RANGE even if no hours are given.\n";
+    s += "\n";
+    s += "- If the user says \"today\" or \"hoje\" AND does NOT specify hours:\n";
+    s += "  - Set start_timestamp to TODAY 00:00:00 (camera local time)\n";
+    s += "  - Set end_timestamp to NOW (camera local time)\n";
+    s += "  - Set time_window_minutes_before_now to the duration in minutes (end-start),\n";
+    s += "    but DO NOT shrink it to 1 minute.\n";
+    s += "  - Example: query at 15:55 today -> start=YYYYMMDD_000000, end=YYYYMMDD_155500.\n";
+    s += "\n";
+    s += "- If the user says \"yesterday\" or \"ontem\" AND does NOT specify hours:\n";
+    s += "  - Set start_timestamp to YESTERDAY 00:00:00 (camera local time)\n";
+    s += "  - Set end_timestamp to YESTERDAY 23:59:59 (camera local time)\n";
+    s += "  - time_window_minutes_before_now should be 1440 (full day) approximately.\n";
+    s += "\n";
+    s += "- For RELATIVE WINDOWS:\n";
+    s += "  - Parse expressions like \"5 minutes ago\", \"last night\", \"yesterday at 3pm\",\n";
+    s += "    \"last 30 minutes\", etc.\n";
+    s += "  - Convert them into a relative time window in minutes before now.\n";
+    s += "    Examples:\n";
+    s += "      \"5 minutes ago\"   -> {\"time_window_minutes_before_now\": 5}\n";
+    s += "      \"last 2 hours\"    -> {\"time_window_minutes_before_now\": 120}\n";
+    s += "      \"last 30 minutes\" -> {\"time_window_minutes_before_now\": 30}\n";
+    s += "      No time mentioned  -> use 1 (minute) by default.\n";
+    s += "\n";
+    s += "- For EXPLICIT INTERVALS (\"between\" / \"from ... to ...\"):\n";
+    s += "  - You MUST treat the interval as a fixed start and end time.\n";
+    s += "    Examples:\n";
+    s += "      \"entre 10 e 11 horas da noite de ontem\" -> start 10:00, end 11:00 last night.\n";
+    s += "      \"entre 3 e 4 horas da tarde de hoje\"  -> start 15:00, end 16:00 today.\n";
+    s += "  - Do NOT reinterpret these as \"last N minutes\".\n";
+    s += "  - In this case, set time_window_minutes_before_now to the DURATION in minutes\n";
+    s += "    of the interval (end - start). For 10:00-11:00, use 60.\n";
+    s += "\n";
+    s += "- Use ONLY the provided now_utc as the current time reference and the implied\n";
+    s += "  local date (\"today\", \"yesterday\", etc.) when converting to timestamps.\n";
+    s += "\n";
+    s += "TIMESTAMP RULES:\n";
+    s += "- For RELATIVE WINDOWS (\"last N minutes/hours\"):\n";
+    s += "  - Let end_timestamp be approximately now_utc (converted to the camera's\n";
+    s += "    local time).\n";
+    s += "  - Let start_timestamp be end_timestamp minus time_window_minutes_before_now.\n";
+    s += "  - Example: now_utc = 2025-12-01T13:03:43Z and a 120 minute window ->\n";
+    s += "    start_timestamp=\"20251201_110343\", end_timestamp=\"20251201_130343\".\n";
+    s += "\n";
+    s += "- For EXPLICIT INTERVALS (\"between X and Y\", \"from X to Y\"):\n";
+    s += "  - You MUST compute start_timestamp and end_timestamp directly from the\n";
+    s += "    times given by the user (and any date words like \"today\", \"yesterday\").\n";
+    s += "  - Do NOT override these with a generic \"last N minutes\" window.\n";
+    s += "  - Example: question at 12:15 today: \"entre 7 e 8 horas da manha de hoje\" ->\n";
+    s += "      start_timestamp=\"20251204_070000\", end_timestamp=\"20251204_080000\".\n";
+    s += "    time_window_minutes_before_now should be 60 (the duration of the window),\n";
+    s += "    even though the start time is several hours before now.\n";
+    s += "- Format both timestamps as strings in the form YYYYMMDD_HHMMSS.\n";
+    s += "\n";
+    s += "STORAGE PATH RULES:\n";
+    s += "- Frames are stored under folders that follow this pattern:\n";
+    s += "    cam_<ID>/<YYYY>/<MM>/<DD>/...\n";
+    s += "  where <ID> is the numeric camera id.\n";
+    s += "- For every calendar day covered by [start_timestamp, end_timestamp]\n";
+    s += "  and every selected camera, you must output one search path string with\n";
+    s += "  this exact format. Example for camera id 3 on 2025-12-01:\n";
+    s += "    \"cam_3/2025/12/01\".\n";
+    s += "- If the window spans multiple days, include one entry per day, e.g.:\n";
+    s += "    [\"cam_3/2025/12/01\", \"cam_3/2025/12/02\"].\n";
+    s += "- search_paths is a flat list of strings for ALL selected cameras.\n";
+    s += "\n";
+    s += "ANSWER RULES:\n";
+    s += "- If you successfully identify one or more cameras, your `answer` should be\n";
+    s += "  something like: \"I will look into {user_question} on camera(s) NAME1,\n";
+    s += "  NAME2.\" Use the camera names from the JSON.\n";
+    s += "- Your `answer` MUST also explicitly mention the time range of the search.\n";
+    s += "  - If the user wrote a time phrase (for example \"in the last minute\",\n";
+    s += "    \"in the last 5 minutes\", \"in the last 30 minutes\"), reuse that exact\n";
+    s += "    phrase in your answer.\n";
+    s += "  - If the user did not write an time phrase (time frame), say something like\n";
+    s += "    \"in the last X minutes\", \"yesterday in the afternoon\",  where X is `time_window_minutes_before_now`.\n";
+    s += "  - If the user did not write an explicit time phrase, say something like\n";
+    s += "    \"in the last X minutes\", where X is `time_window_minutes_before_now`.\n";
+    s += "- Example: user asks \"I need you to check if in my living room have passed\n";
+    s += "  any childs in the last minute?\" and the chosen camera is\n";
+    s += "  \"hikvision_test_5\" ->\n";
+    s += "  answer: \"I will look into if any childs have passed in the living room on\n";
+    s += "  camera hikvision_test_5 in the last minute.\".\n";
+    s += "- If you are unsure which camera(s) to use OR the user did not specify\n";
+    s += "  any camera or 'all cameras', your `answer` MUST be a clarifying question\n";
+    s += "  back to the user, such as:\n";
+    s += "  \"I am not sure which camera to use. Could you please specify the\n";
+    s += "   location, description or camera name?\".\n";
+    s += "- If the user wrote an explicit interval (\"between 10 and 11 am today\",\n";
+    s += "  \"between 7 and 8am of today.\"), your `answer` MUST reuse that\n";
+    s += "  interval wording (\"between 10 and 11 am\", \"between last monday and today\")\n";
+    s += "  instead of phrases like \"in the last X minutes\".\n";
+    s += "\n";
+    s += "LANGUAGE RULES:\n";
+    s += "- Detect the language of the user question.\n";
+    s += "- All JSON field names must remain in English exactly as specified.\n";
+    s += "- The `answer` text MUST be written in the same language as the user question.\n";
+    s += "- If the user mixes languages, use the main language of the question for `answer`.\n";
+    s += "\n";
+    s += "OUTPUT FORMAT (JSON ONLY, NO MARKDOWN, NO CODE FENCES):\n";
+    s += "{\n";
+    s += "  \"camera_ids\": [<list of numbers>],\n";
+    s += "  \"camera_names\": [<list of strings, same order as camera_ids>],\n";
+    s += "  \"all_cameras\": <true|false>,\n";
+    s += "  \"time_window_minutes_before_now\": <integer>,\n";
+    s += "  \"start_timestamp\": \"YYYYMMDD_HHMMSS\",\n";
+    s += "  \"end_timestamp\": \"YYYYMMDD_HHMMSS\",\n";
+    s += "  \"search_paths\": [\"cam_<ID>/<YYYY>/<MM>/<DD>\", ...],\n";
+    s += "  \"answer\": \"<short natural-language sentence or question>\"\n";
+    s += "}\n";
+    s += "\n";
+    s += "IMPORTANT:\n";
+    s += "- DO NOT wrap the JSON in ``` or any other code fences.\n";
+    s += "- DO NOT add any keys beyond the ones specified.\n";
+    s += "- DO NOT output anything before or after the JSON object.\n";
+
+    return s;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+json AgentCore::fetchAgentCameras_()
+{
+    try {
+        // baseUrl_, exeToken_ and clientId_ already exist in AgentCore.
+        std::string url =
+            baseUrl_ + "/api/agent/cameras?client_id=" + clientId_;
+
+        std::string body;
+        long code = HttpGetJson(url, exeToken_, body);
+
+        Logger::instance().logDebug(
+            "agent",
+            "fetchAgentCameras_: HTTP " + std::to_string(code) +
+            " bodySize=" + std::to_string(body.size())
+        );
+
+        if (code != 200) {
+            Logger::instance().logDebug(
+                "agent",
+                "fetchAgentCameras_: non-200 response, returning empty array"
+            );
+            return json::array();
+        }
+
+        json parsed = json::parse(body, nullptr, false);
+        if (!parsed.is_array()) {
+            Logger::instance().logDebug(
+                "agent",
+                "fetchAgentCameras_: response is not array, returning empty"
+            );
+            return json::array();
+        }
+
+        return parsed;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("fetchAgentCameras_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "fetchAgentCameras_ unknown exception"
+        );
+    }
+
+    return json::array();
+}
+
+
+
+json AgentCore::routeQuestionToCamerasWithGemini_(
+    const std::string& userQuestion,
+    const json& cameras,
+    const std::string& geminiApiKey)
+{
+    // Default fallback if anything goes wrong
+    json fallback = {
+        { "camera_ids", json::array() },
+        { "camera_names", json::array() },
+        { "all_cameras", false },
+        { "time_window_minutes_before_now", 60 },
+        { "start_timestamp", "" },
+        { "end_timestamp", "" },
+        { "search_paths", json::array() },
+        { "answer", "Unable to route question to any camera (internal error)." },
+        { "model_prompt_tokens", 0 },
+        { "model_output_tokens", 0 },
+        { "model_total_tokens", 0 }
+    };
+
+
+    try {
+        const std::string apiKey = geminiApiKey;
+        if (apiKey.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "routeQuestionToCamerasWithGemini_: empty API key, returning fallback"
+            );
+            return fallback;
+        }
+
+        std::string system_rules = buildCameraRouterSystemPrompt_();
+
+
+        // add time now so model understands time.
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+        // convert to LOCAL time (same thing Windows uses for your image names)
+        std::tm tm_local;
+        #ifdef _WIN32
+            localtime_s(&tm_local, &now_t);
+        #else
+            localtime_r(&now_t, &tm_local);
+        #endif
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm_local);
+        std::string nowLocalIso = buf;
+
+
+
+
+        json routerUser;
+        routerUser["question"] = userQuestion;
+        routerUser["cameras"] = cameras;
+        routerUser["now_local"] = nowLocalIso;
+
+        std::string userContent = routerUser.dump(2);
+
+        json body = {
+            { "system_instruction", {
+                { "role", "system" },
+                { "parts", json::array({ json{{"text", system_rules}} }) }
+            }},
+            { "contents", json::array({
+                {
+                    { "role", "user" },
+                    { "parts", json::array({ json{{"text", userContent}} }) }
+                }
+            })},
+            { "generation_config", {
+                { "max_output_tokens", 256 },
+                { "temperature", 0.2 }
+            }}
+        };
+
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: sending body, question=" +
+            userQuestion
+        );
+
+        //std::string rawResp = httpPostJsonGemini(apiKey, "gemini-2.0-flash-lite", body);
+
+        std::string rawResp = httpPostJsonGemini(
+            apiKey,
+            "gemini-2.0-flash-lite",
+            body,
+            []() { MaybeNotifyFirstRetry(); }
+        );
+
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: rawResp size=" +
+            std::to_string(rawResp.size())
+        );
+
+        // Parse HTTP JSON response
+        json respJson = json::parse(rawResp, nullptr, false);
+        if (!respJson.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "routeQuestionToCamerasWithGemini_: resp not object, fallback"
+            );
+            return fallback;
+        }
+
+        // --- Token logging (input / output / total) ---
+        int promptTokens = 0;
+        int outputTokens = 0;
+        int totalTokens = 0;
+
+        if (respJson.contains("usageMetadata") &&
+            respJson["usageMetadata"].is_object())
+        {
+            const auto& u = respJson["usageMetadata"];
+            promptTokens = u.value("promptTokenCount", 0);
+            outputTokens = u.value("candidatesTokenCount", 0);
+            totalTokens = u.value("totalTokenCount", 0);
+
+            Logger::instance().logDebug(
+                "agent",
+                "Router (first) Answer tokens | prompt=" + std::to_string(promptTokens) +
+                " | output=" + std::to_string(outputTokens) +
+                " | total=" + std::to_string(totalTokens)
+            );
+        }
+
+        // Preserve token usage even when we later return fallback due parse issues.
+        fallback["model_prompt_tokens"] = promptTokens;
+        fallback["model_output_tokens"] = outputTokens;
+        fallback["model_total_tokens"] =
+            (totalTokens > 0) ? totalTokens : (promptTokens + outputTokens);
+
+        // Log first part of the parsed JSON to see the schema
+        std::string respDump = respJson.dump();
+        if (respDump.size() > 800) {
+            respDump = respDump.substr(0, 800) + "...(truncated)";
+        }
+        /*
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: respJson=" + respDump
+        );
+        */
+
+        // ======== TEXT EXTRACTION (candidates / choices) ========
+        std::string text;
+
+        // 1) Gemini generateContent style
+        if (respJson.contains("candidates") &&
+            respJson["candidates"].is_array() &&
+            !respJson["candidates"].empty())
+        {
+            const auto& c0 = respJson["candidates"][0];
+            if (c0.contains("content") && c0["content"].is_object()) {
+                const auto& content = c0["content"];
+                if (content.contains("parts") &&
+                    content["parts"].is_array() &&
+                    !content["parts"].empty())
+                {
+                    const auto& p0 = content["parts"][0];
+                    if (p0.contains("text") && p0["text"].is_string()) {
+                        text = p0["text"].get<std::string>();
+                    }
+                }
+            }
+        }
+
+        // 2) OpenAI-style chat completion (just in case)
+        if (text.empty() &&
+            respJson.contains("choices") &&
+            respJson["choices"].is_array() &&
+            !respJson["choices"].empty())
+        {
+            const auto& ch0 = respJson["choices"][0];
+            if (ch0.contains("message") && ch0["message"].is_object()) {
+                const auto& msg = ch0["message"];
+                if (msg.contains("content") && msg["content"].is_string()) {
+                    text = msg["content"].get<std::string>();
+                }
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "routeQuestionToCamerasWithGemini_: could not extract text, fallback"
+            );
+            return fallback;
+        }
+
+        /*
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: raw text=" + text
+        );
+        */
+
+        // ======== STRIP MARKDOWN FENCES / GARBAGE AROUND JSON ========
+        // Find first '{' and last '}' and keep only that slice
+        std::size_t firstBrace = text.find('{');
+        std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos || lastBrace == std::string::npos ||
+            lastBrace <= firstBrace)
+        {
+            Logger::instance().logDebug(
+                "agent",
+                "routeQuestionToCamerasWithGemini_: could not find JSON braces in text"
+            );
+            return fallback;
+        }
+
+        std::string jsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: jsonSlice=" + jsonSlice
+        );
+
+        json routerResult;
+        try {
+            routerResult = json::parse(jsonSlice);
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug(
+                "agent",
+                std::string("routeQuestionToCamerasWithGemini_: parse error: ") + e.what()
+            );
+            return fallback;
+        }
+
+        if (!routerResult.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "routeQuestionToCamerasWithGemini_: parsed JSON is not object"
+            );
+            return fallback;
+        }
+
+
+        routerResult["model_prompt_tokens"] = promptTokens;
+        routerResult["model_output_tokens"] = outputTokens;
+        routerResult["model_total_tokens"] = totalTokens;
+
+
+        // ======== NORMALIZE FIELDS ========
+        if (!routerResult.contains("camera_ids") ||
+            !routerResult["camera_ids"].is_array())
+        {
+            routerResult["camera_ids"] = json::array();
+        }
+
+
+
+        if (!routerResult.contains("camera_names") ||
+            !routerResult["camera_names"].is_array())
+        {
+            // build camera_names from IDs + original camera list if missing
+            json names = json::array();
+            for (const auto& cid : routerResult["camera_ids"]) {
+                if (!cid.is_number_integer()) continue;
+                int id = cid.get<int>();
+
+                // find in cameras array
+                std::string name = "Unknown";
+                if (cameras.is_array()) {
+                    for (const auto& cam : cameras) {
+                        if (cam.contains("id") && cam["id"].is_number_integer() &&
+                            cam["id"].get<int>() == id &&
+                            cam.contains("name") && cam["name"].is_string())
+                        {
+                            name = cam["name"].get<std::string>();
+                            break;
+                        }
+                    }
+                }
+                names.push_back(name);
+            }
+            routerResult["camera_names"] = names;
+        }
+
+        if (!routerResult.contains("all_cameras") ||
+            !routerResult["all_cameras"].is_boolean())
+        {
+            routerResult["all_cameras"] = false;
+        }
+
+        if (!routerResult.contains("time_window_minutes_before_now") ||
+            !routerResult["time_window_minutes_before_now"].is_number_integer())
+        {
+            routerResult["time_window_minutes_before_now"] = 60;
+        }
+
+        if (!routerResult.contains("answer") ||
+            !routerResult["answer"].is_string())
+        {
+            // default answer if model didn't provide one
+            routerResult["answer"] =
+                "I will look into your question on the selected cameras.";
+        }
+
+        if (!routerResult.contains("start_timestamp") ||
+            !routerResult["start_timestamp"].is_string()) {
+            routerResult["start_timestamp"] = "";
+        }
+        if (!routerResult.contains("end_timestamp") ||
+            !routerResult["end_timestamp"].is_string()) {
+            routerResult["end_timestamp"] = "";
+        }
+        if (!routerResult.contains("search_paths") ||
+            !routerResult["search_paths"].is_array()) {
+            routerResult["search_paths"] = json::array();
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_: final routerResult=" +
+            routerResult.dump()
+        );
+
+        return routerResult;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("routeQuestionToCamerasWithGemini_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "routeQuestionToCamerasWithGemini_ unknown exception"
+        );
+    }
+
+    return fallback;
+}
+
+
+
+
+
+
+
+
+static std::string ws2s(const std::wstring& ws)
+{
+    if (ws.empty()) return {};
+    int size = WideCharToMultiByte(
+        CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr
+    );
+    std::string s(size - 1, 0);
+    WideCharToMultiByte(
+        CP_UTF8, 0, ws.c_str(), -1, &s[0], size, nullptr, nullptr
+    );
+    return s;
+}
+
+
+
+
+
+
+static std::vector<uchar> extractFrameJpegAtTime(
+    const std::string& videoPath,
+    const std::string& timeStr,  // "MM:SS", "HH:MM:SS" or "HH:MM:SS.mmm"
+    const std::string& openAiModelName = std::string("gpt-5.1"),
+    int runningResolution = 640
+) {
+    std::vector<uchar> out;
+    runningResolution = (runningResolution == 1024) ? 1024 : 640;
+
+    // ---- 1) Normalize time string for ffmpeg (-ss expects HH:MM:SS[.mmm]) ----
+    std::string ffTimeStr;
+    if (timeStr.size() == 5 && timeStr[2] == ':') {
+        // "MM:SS" -> "00:MM:SS"
+        ffTimeStr = "00:" + timeStr;
+    }
+    else if (timeStr.find(':') != std::string::npos) {
+        // Accept "HH:MM:SS" and "HH:MM:SS.mmm" as-is.
+        ffTimeStr = timeStr;
+    }
+    else {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: invalid timeStr=" + timeStr
+        );
+        return out;
+    }
+
+#ifdef _WIN32
+    namespace fs = std::filesystem;
+
+    // ---- 2) Build temp dir for frame output (same style as your concat code) ----
+    fs::path tmpDir;
+    {
+        wchar_t buf[MAX_PATH];
+        DWORD len = GetTempPathW(MAX_PATH, buf);
+        if (len == 0 || len > MAX_PATH) {
+            tmpDir = fs::temp_directory_path() / AppBrand::kVideoSegmentsTempDirName;
+        }
+        else {
+            tmpDir = fs::path(buf) / AppBrand::kVideoSegmentsTempDirName;
+        }
+    }
+
+    std::error_code ec;
+    fs::create_directories(tmpDir, ec);
+    if (ec) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: failed to create tmpDir: " +
+            tmpDir.string() + " error=" + ec.message()
+        );
+        return out;
+    }
+
+    // Use a truly unique filename per extraction call to avoid cross-thread/camera collisions.
+    static std::atomic<unsigned long long> frameExtractCounter{ 0 };
+    const unsigned long long uniqueId =
+        frameExtractCounter.fetch_add(1, std::memory_order_relaxed);
+    std::string baseName =
+        "frame_at_" + ffTimeStr +
+        "_pid" + std::to_string(static_cast<unsigned long long>(GetCurrentProcessId())) +
+        "_tid" + std::to_string(static_cast<unsigned long long>(GetCurrentThreadId())) +
+        "_tick" + std::to_string(static_cast<unsigned long long>(GetTickCount64())) +
+        "_seq" + std::to_string(uniqueId) +
+        ".jpg";
+    for (char& c : baseName) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) &&
+            c != '_' && c != '-' && c != '.')
+        {
+            c = '_';
+        }
+    }
+
+    fs::path outJpegPath = tmpDir / baseName;
+
+    // ---- 3) Build ffmpeg command: extract single frame ----
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(videoPath);
+    std::wstring outW = utf8ToWide(outJpegPath.string());
+    std::wstring timeW = utf8ToWide(ffTimeStr);
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -ss " + timeW +
+        L" -i \"" + inW + L"\""
+        L" -frames:v 1 -q:v 2 \"" + outW + L"\"";
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+
+    if (!ok) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: CreateProcessW(ffmpeg) failed"
+        );
+        return out;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    auto normalizeModelNameLocal = [](std::string modelName) {
+        const auto first = std::find_if_not(modelName.begin(), modelName.end(),
+            [](unsigned char c) { return std::isspace(c) != 0; });
+        const auto last = std::find_if_not(modelName.rbegin(), modelName.rend(),
+            [](unsigned char c) { return std::isspace(c) != 0; }).base();
+        if (first >= last) {
+            modelName.clear();
+        }
+        else {
+            modelName.assign(first, last);
+        }
+        std::transform(modelName.begin(), modelName.end(), modelName.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        return modelName;
+    };
+
+    auto isZAiCoreModelLocal = [&](const std::string& modelName) {
+        const std::string normalized = normalizeModelNameLocal(modelName);
+        return normalized == "glm-4.6v-flash" ||
+            normalized.rfind("glm-4.6v-flash-", 0) == 0;
+    };
+
+    auto isGpt5NanoModelLocal = [&](const std::string& modelName) {
+        const std::string normalized = normalizeModelNameLocal(modelName);
+        return (normalized == "gpt-5-nano") || (normalized.rfind("gpt-5-nano-", 0) == 0);
+    };
+
+    auto encodeResizedJpeg = [&](const cv::Mat& src) -> bool {
+        if (src.empty()) return false;
+
+        const int width = src.cols;
+        const int height = src.rows;
+        if (width <= 0 || height <= 0) return false;
+
+        cv::Mat resized = src;
+        int jpegQuality = 82;
+        if (isZAiCoreModelLocal(openAiModelName)) {
+            // Core model input policy:
+            // - running_resolution=640  -> jpeg quality 65%
+            // - running_resolution=1024 -> jpeg quality 85%
+            jpegQuality = (runningResolution == 1024) ? 85 : 65;
+            const int targetLongestSide = (runningResolution == 1024) ? 1024 : 640;
+            const int longest = (std::max)(width, height);
+            if (longest > targetLongestSide) {
+                const double scale =
+                    static_cast<double>(targetLongestSide) /
+                    static_cast<double>(longest);
+                const int newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+                const int newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+                cv::resize(src, resized, cv::Size(newW, newH), 0.0, 0.0, cv::INTER_AREA);
+            }
+        }
+        else if (isGpt5NanoModelLocal(openAiModelName)) {
+            constexpr int kMaxSide = 1024;
+            const int longest = (std::max)(width, height);
+            if (longest > kMaxSide) {
+                const double scale = static_cast<double>(kMaxSide) / static_cast<double>(longest);
+                const int newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+                const int newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+                cv::resize(src, resized, cv::Size(newW, newH), 0.0, 0.0, cv::INTER_AREA);
+            }
+        }
+        else {
+            constexpr int kMaxW = 1280;
+            constexpr int kMaxH = 720;
+            if (width > kMaxW || height > kMaxH) {
+                const double scaleW = static_cast<double>(kMaxW) / static_cast<double>(width);
+                const double scaleH = static_cast<double>(kMaxH) / static_cast<double>(height);
+                const double scale = (std::min)(scaleW, scaleH);
+                const int newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+                const int newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+                cv::resize(src, resized, cv::Size(newW, newH), 0.0, 0.0, cv::INTER_AREA);
+            }
+        }
+
+        std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, jpegQuality };
+        return cv::imencode(".jpg", resized, out, params);
+    };
+
+    if (exitCode != 0) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: ffmpeg exited with code " +
+            std::to_string(exitCode) + " (trying OpenCV fallback)"
+        );
+
+        try {
+            cv::VideoCapture cap(videoPath);
+            if (cap.isOpened()) {
+                int hh = 0, mm = 0;
+                double ss = 0.0;
+                double targetMs = 0.0;
+
+                if (sscanf_s(ffTimeStr.c_str(), "%d:%d:%lf", &hh, &mm, &ss) == 3) {
+                    targetMs = (hh * 3600.0 + mm * 60.0 + ss) * 1000.0;
+                }
+                else if (sscanf_s(ffTimeStr.c_str(), "%d:%lf", &mm, &ss) == 2) {
+                    targetMs = (mm * 60.0 + ss) * 1000.0;
+                }
+                if (targetMs < 0.0) targetMs = 0.0;
+
+                cap.set(cv::CAP_PROP_POS_MSEC, targetMs);
+
+                cv::Mat fallbackFrame;
+                if (cap.read(fallbackFrame) && encodeResizedJpeg(fallbackFrame)) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "extractFrameJpegAtTime: OpenCV fallback succeeded at " + ffTimeStr
+                    );
+                    std::error_code delEc;
+                    fs::remove(outJpegPath, delEc);
+                    return out;
+                }
+            }
+        }
+        catch (...) {
+            Logger::instance().logDebug(
+                "agent",
+                "extractFrameJpegAtTime: OpenCV fallback unknown exception"
+            );
+        }
+
+        std::error_code delEc;
+        fs::remove(outJpegPath, delEc);
+        return out;
+    }
+
+    Logger::instance().logDebug("agent", videoPath);
+    Logger::instance().logDebug("agent", ws2s(outJpegPath));
+    Logger::instance().logDebug("agent", timeStr);
+
+    // ---- 4) Read the extracted JPEG into memory ----
+    std::vector<uint8_t> jpegBytes;
+    if (!readFileToBytes(outJpegPath.string(), jpegBytes)) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: failed to read extracted frame " +
+            outJpegPath.string()
+        );
+        std::error_code delEc;
+        fs::remove(outJpegPath, delEc);
+        return out;
+    }
+
+    {
+        std::error_code delEc;
+        fs::remove(outJpegPath, delEc);
+    }
+
+    cv::Mat frame = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
+    if (frame.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractFrameJpegAtTime: imdecode returned empty frame"
+        );
+        return out;
+    }
+
+    if (!encodeResizedJpeg(frame)) {
+        out.clear();
+    }
+
+    return out;
+
+#else
+    // Non-Windows: you can implement a similar ffmpeg call via popen or skip.
+    Logger::instance().logDebug(
+        "agent",
+        "extractFrameJpegAtTime: not implemented on this platform"
+    );
+    return out;
+#endif
+}
+
+
+
+
+
+
+
+
+static std::vector<std::vector<uchar>> extractFramesJpegAtTimes(
+    const std::string& videoPath,
+    const std::vector<std::string>& timeStrs   // ["MM:SS", "MM:SS", ...]
+) {
+    std::vector<std::vector<uchar>> frames;
+    frames.reserve(timeStrs.size());
+
+    for (const auto& t : timeStrs) {
+        try {
+            frames.push_back(extractFrameJpegAtTime(videoPath, t)); // reuse your existing function
+        }
+        catch (...) {
+            frames.emplace_back(); // keep alignment; empty => skip later
+        }
+    }
+
+    return frames;
+}
+
+
+
+
+static std::vector<std::pair<std::vector<unsigned char>, std::string>>
+extractFramesJpegAtTimesWithLabels(
+    const std::string& videoPath,
+    const std::vector<std::string>& times)
+{
+    std::vector<std::pair<std::vector<unsigned char>, std::string>> out;
+    out.reserve(times.size());
+
+    for (const auto& t : times) {
+        std::vector<unsigned char> jpeg = extractFrameJpegAtTime(videoPath, t); // your existing function
+        if (!jpeg.empty()) {
+            out.emplace_back(std::move(jpeg), t);
+        }
+    }
+    return out;
+}
+
+
+
+
+
+
+
+
+
+
+static bool parseMMSS(const std::string& value, int& outSeconds) {
+    outSeconds = 0;
+
+    std::string s = value;
+    auto trimInPlace = [](std::string& x) {
+        auto notSpace = [](int ch) { return !std::isspace(ch); };
+        x.erase(x.begin(), std::find_if(x.begin(), x.end(), notSpace));
+        x.erase(std::find_if(x.rbegin(), x.rend(), notSpace).base(), x.end());
+    };
+    trimInPlace(s);
+    if (s.empty()) return false;
+
+    std::vector<std::string> parts;
+    {
+        std::stringstream ss(s);
+        std::string token;
+        while (std::getline(ss, token, ':')) {
+            parts.push_back(token);
+        }
+    }
+
+    // Supports:
+    // - MM:SS
+    // - MM:SS.mmm
+    // - HH:MM:SS
+    // - HH:MM:SS.mmm
+    if (parts.size() != 2 && parts.size() != 3) {
+        return false;
+    }
+
+    auto parseInt = [](const std::string& x, int& out) -> bool {
+        if (x.empty()) return false;
+        try {
+            size_t idx = 0;
+            int v = std::stoi(x, &idx);
+            if (idx != x.size()) return false;
+            out = v;
+            return true;
+        }
+        catch (...) {
+            return false;
+        }
+    };
+
+    auto parseSec = [](const std::string& x, double& out) -> bool {
+        if (x.empty()) return false;
+        try {
+            size_t idx = 0;
+            double v = std::stod(x, &idx);
+            if (idx != x.size()) return false;
+            out = v;
+            return true;
+        }
+        catch (...) {
+            return false;
+        }
+    };
+
+    int hh = 0;
+    int mm = 0;
+    double ss = 0.0;
+
+    if (parts.size() == 2) {
+        if (!parseInt(parts[0], mm)) return false;
+        if (!parseSec(parts[1], ss)) return false;
+    }
+    else {
+        if (!parseInt(parts[0], hh)) return false;
+        if (!parseInt(parts[1], mm)) return false;
+        if (!parseSec(parts[2], ss)) return false;
+        if (mm < 0 || mm > 59) return false;
+    }
+
+    if (hh < 0 || mm < 0 || ss < 0.0 || ss >= 60.0) return false;
+
+    // Floor keeps "00:09.667" mapped to second 9 for clip/frame extraction.
+    const int secInt = (int)std::floor(ss);
+    outSeconds = hh * 3600 + mm * 60 + secInt;
+    return true;
+}
+
+static std::string secondsToHHMMSS(int totalSec) {
+    if (totalSec < 0) totalSec = 0;
+    int hh = totalSec / 3600;
+    int mm = (totalSec % 3600) / 60;
+    int ss = totalSec % 60;
+    char buf[32];
+    sprintf_s(buf, "%02d:%02d:%02d", hh, mm, ss);
+    return buf;
+}
+
+namespace {
+
+struct PromptVideoFrame {
+    int frameIndex = -1;
+    std::string timestampName;
+    std::string frameTimestampInSegment;
+    std::string jpegBase64;
+    bool hasAbsoluteTimestamp = false;
+    std::chrono::system_clock::time_point absoluteTimestamp{};
+};
+
+static std::string buildPromptVideoFrameMetaText_(const PromptVideoFrame& frame)
+{
+    nlohmann::json meta = {
+        { "frame_index", frame.frameIndex },
+        { "frame_timestamp_in_segment", frame.frameTimestampInSegment }
+    };
+    if (!frame.timestampName.empty()) {
+        meta["timestamp_name"] = frame.timestampName;
+    }
+    return std::string("FRAME_META_JSON: ") + meta.dump();
+}
+
+struct ResolvedPromptFrameReference_ {
+    bool matched = false;
+    int frameIndex = -1;
+    std::string timestampName;
+    std::string frameTimestampInSegment;
+    std::string utcIso;
+    std::string localIso;
+    bool hasTimePoint = false;
+    std::chrono::system_clock::time_point timePoint{};
+};
+
+struct TemporalVideoSegmentContext_ {
+    bool hasBounds = false;
+    std::chrono::system_clock::time_point startTp{};
+    std::chrono::system_clock::time_point endTp{};
+    std::string startUtcIso;
+    std::string endUtcIso;
+    std::string fallbackUtcIso;
+};
+
+static bool isLikelyTimestampFieldKey_(const std::string& rawKey)
+{
+    std::string key = trimAscii(rawKey);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (key == "ts" || key == "ts_utc" || key == "timestamp" || key == "time") return true;
+    if (key == "snapshot_ts_utc_iso") return true;
+    if (key == "last_seen_ts" || key == "last_seen_ts_utc") return true;
+    if (key == "first_seen_ts" || key == "first_seen_ts_utc") return true;
+    if (key == "confirmed_at_utc") return true;
+    if (key.find("_ts") != std::string::npos) return true;
+    return false;
+}
+
+static bool deriveTemporalVideoSegmentContext_(
+    const std::string& rawStart,
+    const std::string& rawEnd,
+    const std::string& sourceFilePath,
+    const std::string& fallbackUtcIso,
+    TemporalVideoSegmentContext_& out)
+{
+    out = TemporalVideoSegmentContext_{};
+    out.fallbackUtcIso = trimAscii(fallbackUtcIso);
+
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    bool parsedBounds =
+        parseSegmentTimestampToTimePointPreferLocal_(rawStart, startTp) &&
+        parseSegmentTimestampToTimePointPreferLocal_(rawEnd, endTp);
+
+    if ((!parsedBounds || endTp <= startTp) && !sourceFilePath.empty()) {
+        std::string derivedStartUtc;
+        std::string derivedEndUtc;
+        if (deriveSegmentRangeFromPathForPrompt_(sourceFilePath, derivedStartUtc, derivedEndUtc) &&
+            temporal::parseFlexibleTs(derivedStartUtc, startTp) &&
+            temporal::parseFlexibleTs(derivedEndUtc, endTp) &&
+            endTp > startTp)
+        {
+            parsedBounds = true;
+        }
+    }
+
+    if (parsedBounds && endTp > startTp) {
+        out.hasBounds = true;
+        out.startTp = startTp;
+        out.endTp = endTp;
+        out.startUtcIso = formatTimePointToIsoUtcZ_(startTp);
+        out.endUtcIso = formatTimePointToIsoUtcZ_(endTp);
+    }
+
+    return out.hasBounds;
+}
+
+static bool timePointWithinSegmentBounds_(
+    const std::chrono::system_clock::time_point& tp,
+    const TemporalVideoSegmentContext_& ctx)
+{
+    if (!ctx.hasBounds) return true;
+    const auto tol = std::chrono::seconds(5);
+    return tp + tol >= ctx.startTp && tp <= ctx.endTp + tol;
+}
+
+static bool tryReadFrameIndexField_(
+    const nlohmann::json& node,
+    int& outFrameIndex)
+{
+    outFrameIndex = -1;
+    if (!node.is_object() || !node.contains("frame_index")) return false;
+
+    const nlohmann::json& value = node["frame_index"];
+    try {
+        if (value.is_number_integer()) {
+            outFrameIndex = value.get<int>();
+            return outFrameIndex >= 0;
+        }
+        if (value.is_string()) {
+            const std::string raw = trimAscii(value.get<std::string>());
+            if (raw.empty()) return false;
+            outFrameIndex = std::stoi(raw);
+            return outFrameIndex >= 0;
+        }
+    }
+    catch (...) {
+        outFrameIndex = -1;
+    }
+
+    return false;
+}
+
+static bool deriveTimePointFromSegmentOffset_(
+    const std::string& offsetText,
+    const TemporalVideoSegmentContext_& ctx,
+    std::chrono::system_clock::time_point& outTp)
+{
+    outTp = {};
+    if (!ctx.hasBounds) return false;
+
+    std::chrono::milliseconds offsetMs(0);
+    if (!parseVideoOffsetToDurationMs_(offsetText, offsetMs)) return false;
+
+    outTp = ctx.startTp + offsetMs;
+    if (outTp > ctx.endTp) outTp = ctx.endTp;
+    return true;
+}
+
+static const PromptVideoFrame* findPromptVideoFrameByFrameIndex_(
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    int frameIndex)
+{
+    if (frameCatalog == nullptr || frameIndex < 0) return nullptr;
+    if (static_cast<std::size_t>(frameIndex) < frameCatalog->size()) {
+        const PromptVideoFrame& candidate = (*frameCatalog)[static_cast<std::size_t>(frameIndex)];
+        if (candidate.frameIndex == frameIndex) {
+            return &candidate;
+        }
+    }
+    for (const auto& frame : *frameCatalog) {
+        if (frame.frameIndex == frameIndex) {
+            return &frame;
+        }
+    }
+    return nullptr;
+}
+
+static const PromptVideoFrame* findPromptVideoFrameByTimestampName_(
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& timestampName)
+{
+    if (frameCatalog == nullptr) return nullptr;
+    const std::string target = trimAscii(timestampName);
+    if (target.empty()) return nullptr;
+    for (const auto& frame : *frameCatalog) {
+        if (frame.timestampName == target) {
+            return &frame;
+        }
+    }
+    return nullptr;
+}
+
+static const PromptVideoFrame* findPromptVideoFrameBySegmentOffset_(
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& offsetText)
+{
+    if (frameCatalog == nullptr) return nullptr;
+    const std::string target = trimAscii(offsetText);
+    if (target.empty()) return nullptr;
+    for (const auto& frame : *frameCatalog) {
+        if (frame.frameTimestampInSegment == target) {
+            return &frame;
+        }
+    }
+    return nullptr;
+}
+
+static void fillResolvedPromptFrameReferenceFromTimePoint_(
+    const std::chrono::system_clock::time_point& tp,
+    int frameIndex,
+    const std::string& timestampName,
+    const std::string& frameTimestampInSegment,
+    ResolvedPromptFrameReference_& out)
+{
+    out.matched = true;
+    out.frameIndex = frameIndex;
+    out.timePoint = tp;
+    out.hasTimePoint = true;
+    out.timestampName = !timestampName.empty()
+        ? timestampName
+        : formatTimePointToCompactLocalTimestampWithMillis_(tp);
+    out.frameTimestampInSegment = frameTimestampInSegment;
+    out.utcIso = formatTimePointToIsoUtcZ_(tp);
+    out.localIso = formatTimePointToLocalIso_(tp);
+}
+
+static bool resolvePromptFrameReferenceFromObject_(
+    const nlohmann::json& node,
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const TemporalVideoSegmentContext_& ctx,
+    ResolvedPromptFrameReference_& out)
+{
+    out = ResolvedPromptFrameReference_{};
+    if (!node.is_object()) return false;
+
+    const std::string timestampName =
+        node.contains("timestamp_name") && node["timestamp_name"].is_string()
+            ? trimAscii(node["timestamp_name"].get<std::string>())
+            : std::string();
+    const std::string frameTimestampInSegment =
+        node.contains("frame_timestamp_in_segment") && node["frame_timestamp_in_segment"].is_string()
+            ? trimAscii(node["frame_timestamp_in_segment"].get<std::string>())
+            : (node.contains("time_in_video") && node["time_in_video"].is_string()
+                ? trimAscii(node["time_in_video"].get<std::string>())
+                : std::string());
+
+    int frameIndex = -1;
+    const bool hasFrameIndex = tryReadFrameIndexField_(node, frameIndex);
+
+    const PromptVideoFrame* matchedFrame = nullptr;
+    if (hasFrameIndex) {
+        matchedFrame = findPromptVideoFrameByFrameIndex_(frameCatalog, frameIndex);
+    }
+    if (matchedFrame == nullptr && !timestampName.empty()) {
+        matchedFrame = findPromptVideoFrameByTimestampName_(frameCatalog, timestampName);
+    }
+    if (matchedFrame == nullptr && !frameTimestampInSegment.empty()) {
+        matchedFrame = findPromptVideoFrameBySegmentOffset_(frameCatalog, frameTimestampInSegment);
+    }
+
+    if (matchedFrame != nullptr && matchedFrame->hasAbsoluteTimestamp) {
+        fillResolvedPromptFrameReferenceFromTimePoint_(
+            matchedFrame->absoluteTimestamp,
+            matchedFrame->frameIndex,
+            matchedFrame->timestampName,
+            matchedFrame->frameTimestampInSegment,
+            out
+        );
+        return true;
+    }
+
+    std::chrono::system_clock::time_point tp;
+    if (!timestampName.empty() &&
+        parseCompactLocalTimestampWithMillisToTimePoint_(timestampName, tp) &&
+        timePointWithinSegmentBounds_(tp, ctx))
+    {
+        fillResolvedPromptFrameReferenceFromTimePoint_(
+            tp,
+            frameIndex,
+            timestampName,
+            frameTimestampInSegment,
+            out
+        );
+        return true;
+    }
+
+    if (!frameTimestampInSegment.empty() && deriveTimePointFromSegmentOffset_(frameTimestampInSegment, ctx, tp)) {
+        fillResolvedPromptFrameReferenceFromTimePoint_(
+            tp,
+            frameIndex,
+            timestampName,
+            frameTimestampInSegment,
+            out
+        );
+        return true;
+    }
+
+    return false;
+}
+
+static bool deriveUtcIsoFromSegmentOffset_(
+    const std::string& offsetText,
+    const TemporalVideoSegmentContext_& ctx,
+    std::string& outUtcIso)
+{
+    outUtcIso.clear();
+    std::chrono::system_clock::time_point tp;
+    if (!deriveTimePointFromSegmentOffset_(offsetText, ctx, tp)) return false;
+    outUtcIso = formatTimePointToIsoUtcZ_(tp);
+    return !outUtcIso.empty();
+}
+
+static bool normalizeRawTimestampForVideo_(
+    const std::string& rawTimestamp,
+    const TemporalVideoSegmentContext_& ctx,
+    std::string& outUtcIso)
+{
+    outUtcIso.clear();
+    const std::string raw = trimAscii(rawTimestamp);
+    if (raw.empty()) return false;
+
+    std::chrono::system_clock::time_point tp;
+    if (temporal::parseFlexibleTs(raw, tp) && timePointWithinSegmentBounds_(tp, ctx)) {
+        outUtcIso = formatTimePointToIsoUtcZ_(tp);
+        return !outUtcIso.empty();
+    }
+
+    if (parseIsoWallClockAsLocalTimePoint_(raw, tp) && timePointWithinSegmentBounds_(tp, ctx)) {
+        outUtcIso = formatTimePointToIsoUtcZ_(tp);
+        return !outUtcIso.empty();
+    }
+
+    if (parsePrettyLocalTimestampToTimePoint_(raw, tp) && timePointWithinSegmentBounds_(tp, ctx)) {
+        outUtcIso = formatTimePointToIsoUtcZ_(tp);
+        return !outUtcIso.empty();
+    }
+
+    if (parseCompactLocalTimestampWithMillisToTimePoint_(raw, tp) && timePointWithinSegmentBounds_(tp, ctx)) {
+        outUtcIso = formatTimePointToIsoUtcZ_(tp);
+        return !outUtcIso.empty();
+    }
+
+    return false;
+}
+
+static void normalizeTimestampFieldsInObjectForVideo_(
+    nlohmann::json& node,
+    const TemporalVideoSegmentContext_& ctx)
+{
+    if (!node.is_object()) return;
+
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        if (!it.value().is_string()) continue;
+        if (!isLikelyTimestampFieldKey_(it.key())) continue;
+
+        std::string normalized;
+        if (normalizeRawTimestampForVideo_(it.value().get<std::string>(), ctx, normalized)) {
+            it.value() = normalized;
+        }
+    }
+}
+
+static std::string readTemporalEvidenceEventName_(
+    const nlohmann::json& node,
+    const std::string& fallbackEventName = std::string())
+{
+    if (!node.is_object()) return trimAscii(fallbackEventName);
+
+    const auto readStringField = [&](const char* key) -> std::string {
+        return node.contains(key) && node[key].is_string()
+            ? trimAscii(node[key].get<std::string>())
+            : std::string();
+    };
+
+    std::string eventName = readStringField("event");
+    if (eventName.empty()) eventName = readStringField("type");
+    if (eventName.empty()) eventName = readStringField("event_type");
+    if (eventName.empty() && node.contains("event/type") && node["event/type"].is_string()) {
+        eventName = trimAscii(node["event/type"].get<std::string>());
+    }
+    if (eventName.empty()) {
+        eventName = trimAscii(fallbackEventName);
+    }
+    return eventName;
+}
+
+static std::string readTemporalEvidenceEntityId_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+
+    const auto readStringField = [&](const char* key) -> std::string {
+        return node.contains(key) && node[key].is_string()
+            ? trimAscii(node[key].get<std::string>())
+            : std::string();
+    };
+
+    std::string entityId = readStringField("entity_id");
+    if (entityId.empty()) entityId = readStringField("entity_key");
+    if (entityId.empty()) entityId = readStringField("entity_type");
+    return entityId;
+}
+
+static std::string readTemporalEvidenceZone_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+
+    const auto readStringField = [&](const char* key) -> std::string {
+        return node.contains(key) && node[key].is_string()
+            ? trimAscii(node[key].get<std::string>())
+            : std::string();
+    };
+
+    std::string zone = readStringField("zone");
+    if (zone.empty()) zone = readStringField("zone_id");
+    if (zone.empty()) zone = readStringField("zone_key");
+    if (zone.empty()) zone = readStringField("region");
+    if (zone.empty()) zone = readStringField("region_id");
+    if (zone.empty()) zone = readStringField("region_key");
+    return zone;
+}
+
+static std::string readTemporalEvidenceReason_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+
+    const std::array<const char*, 5> reasonFields = {
+        "reason",
+        "description",
+        "note",
+        "entity_description",
+        "person_description"
+    };
+
+    for (const char* key : reasonFields) {
+        if (node.contains(key) && node[key].is_string()) {
+            const std::string value = trimAscii(node[key].get<std::string>());
+            if (!value.empty()) return value;
+        }
+    }
+    return std::string();
+}
+
+static std::string buildTemporalEvidenceKey_(
+    const std::string& eventName,
+    const std::string& entityId,
+    int frameIndex,
+    const std::string& timestampName,
+    const std::string& frameTimestampInSegment,
+    const std::string& timestampUtcIso)
+{
+    const std::string normalizedEvent = trimAscii(eventName);
+    const std::string normalizedEntity = trimAscii(entityId);
+    const std::string normalizedTimestampName = trimAscii(timestampName);
+    const std::string normalizedOffset = trimAscii(frameTimestampInSegment);
+    const std::string normalizedUtcIso = trimAscii(timestampUtcIso);
+
+    if (normalizedEvent.empty() &&
+        normalizedEntity.empty() &&
+        frameIndex < 0 &&
+        normalizedTimestampName.empty() &&
+        normalizedOffset.empty() &&
+        normalizedUtcIso.empty())
+    {
+        return std::string();
+    }
+
+    return lowerAsciiCopy_(normalizedEvent) + "|" +
+        lowerAsciiCopy_(normalizedEntity) + "|" +
+        std::to_string(frameIndex) + "|" +
+        normalizedTimestampName + "|" +
+        normalizedOffset + "|" +
+        normalizedUtcIso;
+}
+
+static const PromptVideoFrame* findPromptVideoFrameForNode_(
+    const nlohmann::json& node,
+    const std::vector<PromptVideoFrame>* frameCatalog)
+{
+    int frameIndex = -1;
+    if (tryReadFrameIndexField_(node, frameIndex)) {
+        if (const PromptVideoFrame* byIndex =
+            findPromptVideoFrameByFrameIndex_(frameCatalog, frameIndex))
+        {
+            return byIndex;
+        }
+    }
+
+    if (node.is_object() &&
+        node.contains("timestamp_name") &&
+        node["timestamp_name"].is_string())
+    {
+        if (const PromptVideoFrame* byTimestampName =
+            findPromptVideoFrameByTimestampName_(
+                frameCatalog,
+                trimAscii(node["timestamp_name"].get<std::string>())))
+        {
+            return byTimestampName;
+        }
+    }
+
+    if (node.is_object() &&
+        node.contains("frame_timestamp_in_segment") &&
+        node["frame_timestamp_in_segment"].is_string())
+    {
+        if (const PromptVideoFrame* byOffset =
+            findPromptVideoFrameBySegmentOffset_(
+                frameCatalog,
+                trimAscii(node["frame_timestamp_in_segment"].get<std::string>())))
+        {
+            return byOffset;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool buildTemporalEvidenceCandidateFromNode_(
+    const nlohmann::json& node,
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const TemporalVideoSegmentContext_& ctx,
+    const std::string& fallbackEventName,
+    TemporalEvidenceCandidate& outCandidate)
+{
+    outCandidate = TemporalEvidenceCandidate{};
+    if (!node.is_object() || frameCatalog == nullptr) return false;
+
+    const PromptVideoFrame* matchedFrame = findPromptVideoFrameForNode_(node, frameCatalog);
+    if (matchedFrame == nullptr || matchedFrame->jpegBase64.empty()) {
+        return false;
+    }
+
+    ResolvedPromptFrameReference_ resolved;
+    const bool hasResolvedRef =
+        resolvePromptFrameReferenceFromObject_(node, frameCatalog, ctx, resolved);
+
+    outCandidate.frameIndex = matchedFrame->frameIndex;
+    outCandidate.frameTimestampInSegment = !matchedFrame->frameTimestampInSegment.empty()
+        ? matchedFrame->frameTimestampInSegment
+        : (hasResolvedRef ? resolved.frameTimestampInSegment : std::string());
+    outCandidate.timestampName = !matchedFrame->timestampName.empty()
+        ? matchedFrame->timestampName
+        : (hasResolvedRef ? resolved.timestampName : std::string());
+
+    if (node.contains("frame_timestamp_in_segment") && node["frame_timestamp_in_segment"].is_string()) {
+        const std::string rawOffset = trimAscii(node["frame_timestamp_in_segment"].get<std::string>());
+        if (!rawOffset.empty()) outCandidate.frameTimestampInSegment = rawOffset;
+    }
+    if (node.contains("timestamp_name") && node["timestamp_name"].is_string()) {
+        const std::string rawTimestampName = trimAscii(node["timestamp_name"].get<std::string>());
+        if (!rawTimestampName.empty()) outCandidate.timestampName = rawTimestampName;
+    }
+
+    if (hasResolvedRef) {
+        if (resolved.frameIndex >= 0) outCandidate.frameIndex = resolved.frameIndex;
+        if (!resolved.frameTimestampInSegment.empty()) {
+            outCandidate.frameTimestampInSegment = resolved.frameTimestampInSegment;
+        }
+        if (!resolved.timestampName.empty()) {
+            outCandidate.timestampName = resolved.timestampName;
+        }
+        outCandidate.timestampUtcIso = resolved.utcIso;
+        outCandidate.timestampLocalIso = resolved.localIso;
+    }
+
+    if (outCandidate.timestampUtcIso.empty()) {
+        if (node.contains("ts_utc") && node["ts_utc"].is_string()) {
+            outCandidate.timestampUtcIso = trimAscii(node["ts_utc"].get<std::string>());
+        } else if (matchedFrame->hasAbsoluteTimestamp) {
+            outCandidate.timestampUtcIso = formatTimePointToIsoUtcZ_(matchedFrame->absoluteTimestamp);
+        }
+    }
+
+    if (outCandidate.timestampLocalIso.empty()) {
+        if (matchedFrame->hasAbsoluteTimestamp) {
+            outCandidate.timestampLocalIso = formatTimePointToLocalIso_(matchedFrame->absoluteTimestamp);
+        } else if (!outCandidate.timestampUtcIso.empty()) {
+            std::chrono::system_clock::time_point tp;
+            if (temporal::parseFlexibleTs(outCandidate.timestampUtcIso, tp)) {
+                outCandidate.timestampLocalIso = formatTimePointToLocalIso_(tp);
+            }
+        }
+    }
+
+    if (outCandidate.timestampName.empty() && matchedFrame->hasAbsoluteTimestamp) {
+        outCandidate.timestampName =
+            formatTimePointToCompactLocalTimestampWithMillis_(matchedFrame->absoluteTimestamp);
+    }
+
+    outCandidate.eventName = readTemporalEvidenceEventName_(node, fallbackEventName);
+    outCandidate.entityId = readTemporalEvidenceEntityId_(node);
+    outCandidate.zone = readTemporalEvidenceZone_(node);
+    outCandidate.reason = readTemporalEvidenceReason_(node);
+    outCandidate.imageJpegBase64 = matchedFrame->jpegBase64;
+
+    if (node.contains("temporal_evidence_key") && node["temporal_evidence_key"].is_string()) {
+        outCandidate.evidenceKey = trimAscii(node["temporal_evidence_key"].get<std::string>());
+    }
+    if (outCandidate.evidenceKey.empty()) {
+        outCandidate.evidenceKey = buildTemporalEvidenceKey_(
+            outCandidate.eventName,
+            outCandidate.entityId,
+            outCandidate.frameIndex,
+            outCandidate.timestampName,
+            outCandidate.frameTimestampInSegment,
+            outCandidate.timestampUtcIso
+        );
+    }
+
+    return !outCandidate.evidenceKey.empty() && !outCandidate.imageJpegBase64.empty();
+}
+
+static void normalizeTemporalPayloadForStill_(
+    VideoHit& hit,
+    const std::string& snapshotTsUtcIso)
+{
+    const std::string snapshotUtc = trimAscii(snapshotTsUtcIso);
+    if (snapshotUtc.empty()) return;
+    hit.temporalEvidenceCandidates.clear();
+
+    std::set<std::string> seenEvidenceKeys;
+    auto appendStillEvidenceCandidate = [&](const nlohmann::json& node, const std::string& fallbackEventName) {
+        if (!node.is_object()) return;
+
+        TemporalEvidenceCandidate candidate;
+        candidate.eventName = readTemporalEvidenceEventName_(node, fallbackEventName);
+        candidate.entityId = readTemporalEvidenceEntityId_(node);
+        candidate.zone = readTemporalEvidenceZone_(node);
+        candidate.reason = readTemporalEvidenceReason_(node);
+        candidate.timestampUtcIso =
+            node.contains("ts_utc") && node["ts_utc"].is_string()
+                ? trimAscii(node["ts_utc"].get<std::string>())
+                : snapshotUtc;
+        candidate.timestampLocalIso = candidate.timestampUtcIso;
+        if (node.contains("frame_timestamp_in_segment") && node["frame_timestamp_in_segment"].is_string()) {
+            candidate.frameTimestampInSegment =
+                trimAscii(node["frame_timestamp_in_segment"].get<std::string>());
+        }
+        if (node.contains("timestamp_name") && node["timestamp_name"].is_string()) {
+            candidate.timestampName = trimAscii(node["timestamp_name"].get<std::string>());
+        }
+        if (node.contains("frame_index") && node["frame_index"].is_number_integer()) {
+            candidate.frameIndex = node["frame_index"].get<int>();
+        }
+
+        if (node.contains("temporal_evidence_key") && node["temporal_evidence_key"].is_string()) {
+            candidate.evidenceKey = trimAscii(node["temporal_evidence_key"].get<std::string>());
+        }
+        if (candidate.evidenceKey.empty()) {
+            candidate.evidenceKey = buildTemporalEvidenceKey_(
+                candidate.eventName,
+                candidate.entityId,
+                candidate.frameIndex,
+                candidate.timestampName,
+                candidate.frameTimestampInSegment,
+                candidate.timestampUtcIso
+            );
+        }
+        if (trimAscii(candidate.evidenceKey).empty()) return;
+        if (!seenEvidenceKeys.insert(candidate.evidenceKey).second) return;
+        hit.temporalEvidenceCandidates.push_back(std::move(candidate));
+    };
+
+    auto forceEventArray = [&](nlohmann::json& eventsNode,
+                               const std::string& parentEntityId,
+                               const std::string& parentEntityKey,
+                               const std::string& parentEntityType) {
+        if (!eventsNode.is_array()) return;
+        for (auto& ev : eventsNode) {
+            if (ev.is_string()) {
+                const std::string eventName = trimAscii(ev.get<std::string>());
+                ev = nlohmann::json{
+                    { "event", eventName },
+                    { "ts_utc", snapshotUtc }
+                };
+                if (!parentEntityId.empty()) ev["entity_id"] = parentEntityId;
+                if (!parentEntityKey.empty()) ev["entity_key"] = parentEntityKey;
+                if (!parentEntityType.empty()) ev["entity_type"] = parentEntityType;
+                appendStillEvidenceCandidate(ev, eventName);
+                continue;
+            }
+            if (!ev.is_object()) continue;
+            ev["ts_utc"] = snapshotUtc;
+            if ((!ev.contains("entity_id") || !ev["entity_id"].is_string()) && !parentEntityId.empty()) {
+                ev["entity_id"] = parentEntityId;
+            }
+            if ((!ev.contains("entity_key") || !ev["entity_key"].is_string()) && !parentEntityKey.empty()) {
+                ev["entity_key"] = parentEntityKey;
+            }
+            if ((!ev.contains("entity_type") || !ev["entity_type"].is_string()) && !parentEntityType.empty()) {
+                ev["entity_type"] = parentEntityType;
+            }
+            normalizeTimestampFieldsInObjectForVideo_(ev, TemporalVideoSegmentContext_{});
+            appendStillEvidenceCandidate(ev, readTemporalEvidenceEventName_(ev));
+        }
+    };
+
+    if (hit.identityPatch.is_array()) {
+        for (auto& item : hit.identityPatch) {
+            if (!item.is_object()) continue;
+            normalizeTimestampFieldsInObjectForVideo_(item, TemporalVideoSegmentContext_{});
+            item["last_seen_ts_utc"] = snapshotUtc;
+            if (item.contains("events")) {
+                forceEventArray(
+                    item["events"],
+                    item.contains("entity_id") && item["entity_id"].is_string()
+                        ? trimAscii(item["entity_id"].get<std::string>())
+                        : std::string(),
+                    item.contains("entity_key") && item["entity_key"].is_string()
+                        ? trimAscii(item["entity_key"].get<std::string>())
+                        : std::string(),
+                    item.contains("entity_type") && item["entity_type"].is_string()
+                        ? trimAscii(item["entity_type"].get<std::string>())
+                        : std::string()
+                );
+            }
+            appendStillEvidenceCandidate(item, "present");
+        }
+    }
+
+    if (hit.observations.is_array()) {
+        for (auto& item : hit.observations) {
+            if (!item.is_object()) continue;
+            item["ts_utc"] = snapshotUtc;
+            normalizeTimestampFieldsInObjectForVideo_(item, TemporalVideoSegmentContext_{});
+            appendStillEvidenceCandidate(item, readTemporalEvidenceEventName_(item, "present"));
+        }
+    }
+}
+
+static void normalizeTemporalPayloadForVideo_(
+    VideoHit& hit,
+    const std::string& sourceFilePath,
+    const std::string& fallbackUtcIso,
+    const std::string& logStreamId,
+    const std::string& scopeTag,
+    const std::vector<PromptVideoFrame>* frameCatalog = nullptr)
+{
+    hit.temporalEvidenceCandidates.clear();
+
+    TemporalVideoSegmentContext_ ctx;
+    deriveTemporalVideoSegmentContext_(
+        hit.segmentStartTs,
+        hit.segmentEndTs,
+        sourceFilePath,
+        fallbackUtcIso,
+        ctx
+    );
+
+    if (ctx.hasBounds) {
+        hit.segmentStartTs = ctx.startUtcIso;
+        hit.segmentEndTs = ctx.endUtcIso;
+    }
+
+    std::vector<std::string> detectionUtcTimes;
+    detectionUtcTimes.reserve(hit.detectionTimeInVideo.size());
+    for (const auto& t : hit.detectionTimeInVideo) {
+        std::string derived;
+        if (deriveUtcIsoFromSegmentOffset_(t, ctx, derived)) {
+            detectionUtcTimes.push_back(std::move(derived));
+        }
+    }
+    std::size_t detectionCursor = 0;
+
+    auto nextDetectionUtc = [&]() -> std::string {
+        if (detectionCursor >= detectionUtcTimes.size()) return "";
+        return detectionUtcTimes[detectionCursor++];
+    };
+
+    auto fallbackTs = [&]() -> std::string {
+        if (ctx.hasBounds && !ctx.endUtcIso.empty()) return ctx.endUtcIso;
+        return ctx.fallbackUtcIso;
+    };
+
+    ResolvedPromptFrameReference_ bestAlertReference;
+
+    auto considerAlertReference = [&](const ResolvedPromptFrameReference_& candidate) {
+        if (!candidate.matched || !candidate.hasTimePoint) return;
+        if (!bestAlertReference.matched ||
+            !bestAlertReference.hasTimePoint ||
+            candidate.timePoint > bestAlertReference.timePoint)
+        {
+            bestAlertReference = candidate;
+        }
+    };
+
+    auto buildAlertReferenceFromUtc = [&](const nlohmann::json& node) {
+        if (!node.is_object()) return;
+        std::string utcIso =
+            node.contains("ts_utc") && node["ts_utc"].is_string()
+                ? trimAscii(node["ts_utc"].get<std::string>())
+                : (node.contains("timestamp") && node["timestamp"].is_string()
+                    ? trimAscii(node["timestamp"].get<std::string>())
+                    : (node.contains("time") && node["time"].is_string()
+                        ? trimAscii(node["time"].get<std::string>())
+                        : std::string()));
+        if (utcIso.empty()) return;
+
+        std::chrono::system_clock::time_point tp;
+        if (!temporal::parseFlexibleTs(utcIso, tp)) return;
+
+        ResolvedPromptFrameReference_ candidate;
+        candidate.matched = true;
+        candidate.hasTimePoint = true;
+        candidate.timePoint = tp;
+        candidate.utcIso = formatTimePointToIsoUtcZ_(tp);
+        candidate.localIso = formatTimePointToLocalIso_(tp);
+        candidate.timestampName = formatTimePointToCompactLocalTimestampWithMillis_(tp);
+        if (tryReadFrameIndexField_(node, candidate.frameIndex) && candidate.frameIndex < 0) {
+            candidate.frameIndex = -1;
+        }
+        if (node.contains("frame_timestamp_in_segment") && node["frame_timestamp_in_segment"].is_string()) {
+            candidate.frameTimestampInSegment =
+                trimAscii(node["frame_timestamp_in_segment"].get<std::string>());
+        } else if (node.contains("time_in_video") && node["time_in_video"].is_string()) {
+            candidate.frameTimestampInSegment =
+                trimAscii(node["time_in_video"].get<std::string>());
+        }
+        if (node.contains("timestamp_name") && node["timestamp_name"].is_string()) {
+            const std::string rawTimestampName = trimAscii(node["timestamp_name"].get<std::string>());
+            if (!rawTimestampName.empty()) {
+                candidate.timestampName = rawTimestampName;
+            }
+        }
+        considerAlertReference(candidate);
+    };
+
+    auto applyResolvedReference = [&](nlohmann::json& node) -> std::string {
+        if (!node.is_object()) return std::string();
+
+        ResolvedPromptFrameReference_ resolved;
+        if (!resolvePromptFrameReferenceFromObject_(node, frameCatalog, ctx, resolved)) {
+            return std::string();
+        }
+
+        if (resolved.frameIndex >= 0) {
+            node["frame_index"] = resolved.frameIndex;
+        }
+        if (!resolved.timestampName.empty()) {
+            node["timestamp_name"] = resolved.timestampName;
+        }
+        if (!resolved.frameTimestampInSegment.empty()) {
+            node["frame_timestamp_in_segment"] = resolved.frameTimestampInSegment;
+        }
+        if (!resolved.utcIso.empty()) {
+            node["ts_utc"] = resolved.utcIso;
+        }
+        considerAlertReference(resolved);
+        return resolved.utcIso;
+    };
+
+    std::set<std::string> seenEvidenceKeys;
+    auto appendEvidenceCandidateFromNode = [&](nlohmann::json& node, const std::string& fallbackEventName) {
+        if (!node.is_object()) return;
+
+        TemporalEvidenceCandidate candidate;
+        if (!buildTemporalEvidenceCandidateFromNode_(node, frameCatalog, ctx, fallbackEventName, candidate)) {
+            return;
+        }
+
+        node["temporal_evidence_key"] = candidate.evidenceKey;
+        if (seenEvidenceKeys.insert(candidate.evidenceKey).second) {
+            hit.temporalEvidenceCandidates.push_back(std::move(candidate));
+        }
+    };
+
+    auto normalizeEventArray = [&](nlohmann::json& eventsNode,
+                                   const std::string& parentEntityId,
+                                   const std::string& parentEntityKey,
+                                   const std::string& parentEntityType) {
+        if (!eventsNode.is_array()) return;
+        for (auto& ev : eventsNode) {
+            if (ev.is_string()) {
+                const std::string eventName = trimAscii(ev.get<std::string>());
+                const std::string fallback = nextDetectionUtc().empty() ? fallbackTs() : detectionUtcTimes[detectionCursor - 1];
+                if (fallback.empty()) continue;
+                ev = nlohmann::json{
+                    { "event", eventName },
+                    { "ts_utc", fallback }
+                };
+                if (!parentEntityId.empty()) ev["entity_id"] = parentEntityId;
+                if (!parentEntityKey.empty()) ev["entity_key"] = parentEntityKey;
+                if (!parentEntityType.empty()) ev["entity_type"] = parentEntityType;
+                appendEvidenceCandidateFromNode(ev, eventName);
+                continue;
+            }
+            if (!ev.is_object()) continue;
+            if ((!ev.contains("entity_id") || !ev["entity_id"].is_string()) && !parentEntityId.empty()) {
+                ev["entity_id"] = parentEntityId;
+            }
+            if ((!ev.contains("entity_key") || !ev["entity_key"].is_string()) && !parentEntityKey.empty()) {
+                ev["entity_key"] = parentEntityKey;
+            }
+            if ((!ev.contains("entity_type") || !ev["entity_type"].is_string()) && !parentEntityType.empty()) {
+                ev["entity_type"] = parentEntityType;
+            }
+
+            std::string normalized = applyResolvedReference(ev);
+            const std::string offsetHint =
+                ev.contains("frame_timestamp_in_segment") && ev["frame_timestamp_in_segment"].is_string()
+                    ? trimAscii(ev["frame_timestamp_in_segment"].get<std::string>())
+                    : (ev.contains("time_in_video") && ev["time_in_video"].is_string()
+                        ? trimAscii(ev["time_in_video"].get<std::string>())
+                        : std::string());
+
+            if (normalized.empty() && !offsetHint.empty()) {
+                deriveUtcIsoFromSegmentOffset_(offsetHint, ctx, normalized);
+            }
+            if (normalized.empty()) {
+                const std::string rawTs =
+                    ev.contains("ts_utc") && ev["ts_utc"].is_string()
+                        ? ev["ts_utc"].get<std::string>()
+                        : (ev.contains("timestamp") && ev["timestamp"].is_string()
+                            ? ev["timestamp"].get<std::string>()
+                            : (ev.contains("time") && ev["time"].is_string()
+                                ? ev["time"].get<std::string>()
+                                : std::string()));
+                normalizeRawTimestampForVideo_(rawTs, ctx, normalized);
+            }
+            if (normalized.empty()) {
+                normalized = nextDetectionUtc();
+            }
+            if (normalized.empty()) {
+                normalized = fallbackTs();
+            }
+            if (!normalized.empty()) {
+                ev["ts_utc"] = normalized;
+            }
+            normalizeTimestampFieldsInObjectForVideo_(ev, ctx);
+            buildAlertReferenceFromUtc(ev);
+            appendEvidenceCandidateFromNode(ev, readTemporalEvidenceEventName_(ev));
+        }
+    };
+
+    if (hit.identityPatch.is_array()) {
+        for (auto& item : hit.identityPatch) {
+            if (!item.is_object()) continue;
+            applyResolvedReference(item);
+            normalizeTimestampFieldsInObjectForVideo_(item, ctx);
+            if (item.contains("events")) {
+                normalizeEventArray(
+                    item["events"],
+                    item.contains("entity_id") && item["entity_id"].is_string()
+                        ? trimAscii(item["entity_id"].get<std::string>())
+                        : std::string(),
+                    item.contains("entity_key") && item["entity_key"].is_string()
+                        ? trimAscii(item["entity_key"].get<std::string>())
+                        : std::string(),
+                    item.contains("entity_type") && item["entity_type"].is_string()
+                        ? trimAscii(item["entity_type"].get<std::string>())
+                        : std::string()
+                );
+            }
+            const std::string fallback = fallbackTs();
+            if (!fallback.empty()) {
+                if (!item.contains("last_seen_ts_utc") || !item["last_seen_ts_utc"].is_string()) {
+                    item["last_seen_ts_utc"] = fallback;
+                }
+            }
+            buildAlertReferenceFromUtc(item);
+            appendEvidenceCandidateFromNode(item, "present");
+        }
+    }
+
+    if (hit.observations.is_array()) {
+        for (auto& item : hit.observations) {
+            if (!item.is_object()) continue;
+
+            std::string normalized = applyResolvedReference(item);
+            const std::string offsetHint =
+                item.contains("frame_timestamp_in_segment") && item["frame_timestamp_in_segment"].is_string()
+                    ? trimAscii(item["frame_timestamp_in_segment"].get<std::string>())
+                    : (item.contains("time_in_video") && item["time_in_video"].is_string()
+                        ? trimAscii(item["time_in_video"].get<std::string>())
+                        : std::string());
+
+            if (normalized.empty() && !offsetHint.empty()) {
+                deriveUtcIsoFromSegmentOffset_(offsetHint, ctx, normalized);
+            }
+            if (normalized.empty()) {
+                const std::string rawTs =
+                    item.contains("ts_utc") && item["ts_utc"].is_string()
+                        ? item["ts_utc"].get<std::string>()
+                        : (item.contains("timestamp") && item["timestamp"].is_string()
+                            ? item["timestamp"].get<std::string>()
+                            : (item.contains("time") && item["time"].is_string()
+                                ? item["time"].get<std::string>()
+                                : std::string()));
+                normalizeRawTimestampForVideo_(rawTs, ctx, normalized);
+            }
+            if (normalized.empty()) {
+                normalized = nextDetectionUtc();
+            }
+            if (normalized.empty()) {
+                normalized = fallbackTs();
+            }
+            if (!normalized.empty()) {
+                item["ts_utc"] = normalized;
+            }
+            normalizeTimestampFieldsInObjectForVideo_(item, ctx);
+            buildAlertReferenceFromUtc(item);
+            appendEvidenceCandidateFromNode(item, readTemporalEvidenceEventName_(item, "present"));
+        }
+    }
+
+    hit.eventFrameIndex = -1;
+    hit.eventTimestampName.clear();
+    hit.eventFrameTimestampInSegment.clear();
+    hit.eventTimestampUtcIso.clear();
+    hit.eventTimestampLocalIso.clear();
+
+    if (bestAlertReference.matched) {
+        hit.eventFrameIndex = bestAlertReference.frameIndex;
+        hit.eventTimestampName = bestAlertReference.timestampName;
+        hit.eventFrameTimestampInSegment = bestAlertReference.frameTimestampInSegment;
+        hit.eventTimestampUtcIso = bestAlertReference.utcIso;
+        hit.eventTimestampLocalIso = bestAlertReference.localIso;
+    }
+    else if (!hit.detectionTimeInVideo.empty()) {
+        std::chrono::system_clock::time_point detectionTp;
+        const std::string& detectionOffset = hit.detectionTimeInVideo.back();
+        if (deriveTimePointFromSegmentOffset_(detectionOffset, ctx, detectionTp)) {
+            hit.eventFrameTimestampInSegment = detectionOffset;
+            hit.eventTimestampUtcIso = formatTimePointToIsoUtcZ_(detectionTp);
+            hit.eventTimestampLocalIso = formatTimePointToLocalIso_(detectionTp);
+            hit.eventTimestampName = formatTimePointToCompactLocalTimestampWithMillis_(detectionTp);
+        }
+    }
+
+    if (!logStreamId.empty() && !scopeTag.empty() &&
+        (ctx.hasBounds || !detectionUtcTimes.empty()))
+    {
+        Logger::instance().logDebug(
+            logStreamId,
+            scopeTag + ": normalized temporal video timestamps has_bounds=" +
+            std::string(ctx.hasBounds ? "true" : "false") +
+                " detection_times=" +
+                std::to_string(static_cast<unsigned long long>(detectionUtcTimes.size())) +
+                " segment_start_utc=" + (ctx.startUtcIso.empty() ? "unknown" : ctx.startUtcIso) +
+                " segment_end_utc=" + (ctx.endUtcIso.empty() ? "unknown" : ctx.endUtcIso) +
+                " event_timestamp_name=" +
+                (hit.eventTimestampName.empty() ? std::string("unknown") : hit.eventTimestampName)
+        );
+    }
+}
+
+} // namespace
+
+static std::vector<uint8_t> extractMp4ClipAtTime(
+    const std::string& videoPath,
+    const std::string& timeStrMMSS,   // "MM:SS"
+    int clipSeconds = 10,
+    int preRollSeconds = 2            // start a bit earlier to tolerate timestamp drift
+) {
+    std::vector<uint8_t> out;
+
+#ifdef _WIN32
+    int tSec = 0;
+    if (!parseMMSS(timeStrMMSS, tSec)) {
+        Logger::instance().logDebug("agent", "extractMp4ClipAtTime: invalid time=" + timeStrMMSS);
+        return out;
+    }
+
+    int startSec = (std::max)(0, tSec - preRollSeconds);
+    std::string ffStart = secondsToHHMMSS(startSec);
+
+    namespace fs = std::filesystem;
+
+    // temp dir
+    fs::path tmpDir;
+    {
+        wchar_t buf[MAX_PATH];
+        DWORD len = GetTempPathW(MAX_PATH, buf);
+        tmpDir = (len == 0 || len > MAX_PATH)
+            ? fs::temp_directory_path() / AppBrand::kVideoSegmentsTempDirName
+            : fs::path(buf) / AppBrand::kVideoSegmentsTempDirName;
+    }
+    std::error_code ec;
+    fs::create_directories(tmpDir, ec);
+
+    // unique name
+    std::string baseName = "clip_at_" + ffStart + "_dur_" + std::to_string(clipSeconds) + ".mp4";
+    for (char& c : baseName) if (c == ':' || c == ' ') c = '_';
+
+    fs::path outMp4Path = tmpDir / baseName;
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(videoPath);
+    std::wstring outW = utf8ToWide(outMp4Path.string());
+    std::wstring ssW = utf8ToWide(ffStart);
+
+    // IMPORTANT:
+    // - map video always, audio optionally (0:a?) so cameras w/ no audio wonÃƒÂ¢Ã‚â‚¬Ã‚â„¢t fail
+    // - re-encode for accurate cut (copy can snap to keyframes and shift timing)
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y"
+        L" -ss " + ssW +
+        L" -i \"" + inW + L"\""
+        L" -t " + utf8ToWide(std::to_string(clipSeconds)) +
+        L" -map 0:v:0 -an "
+        L" -c:v libx264 -preset veryfast -crf 28 "
+        L" -movflags +faststart "
+        L" \"" + outW + L"\"";
+
+        //L" -map 0:v:0 -map 0:a? "
+        //L" -c:v libx264 -preset veryfast -crf 28 "
+        //L" -c:a aac -b:a 96k "
+        //L" -movflags +faststart "
+
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) {
+        Logger::instance().logDebug("agent", "extractMp4ClipAtTime: CreateProcessW(ffmpeg) failed");
+        return out;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (exitCode != 0) {
+        Logger::instance().logDebug("agent", "extractMp4ClipAtTime: ffmpeg exit=" + std::to_string(exitCode));
+        fs::remove(outMp4Path, ec);
+        return out;
+    }
+
+    // read mp4 bytes
+    if (!readFileToBytes(outMp4Path.string(), out)) {
+        Logger::instance().logDebug("agent", "extractMp4ClipAtTime: failed reading " + outMp4Path.string());
+        fs::remove(outMp4Path, ec);
+        out.clear();
+        return out;
+    }
+
+    // cleanup
+    fs::remove(outMp4Path, ec);
+    return out;
+#else
+    Logger::instance().logDebug("agent", "extractMp4ClipAtTime: not implemented on this platform");
+    return out;
+#endif
+}
+
+
+
+
+static std::vector<std::pair<std::vector<uint8_t>, std::string>>
+extractMp4ClipsAtTimesWithLabels(
+    const std::string& videoPath,
+    const std::vector<std::string>& times,
+    int clipSeconds = 10,
+    int preRollSeconds = 2
+) {
+    std::vector<std::pair<std::vector<uint8_t>, std::string>> out;
+    out.reserve(times.size());
+    for (const auto& t : times) {
+        auto clip = extractMp4ClipAtTime(videoPath, t, clipSeconds, preRollSeconds);
+        if (!clip.empty()) out.emplace_back(std::move(clip), t);
+    }
+    return out;
+}
+
+
+
+
+
+bool AgentCore::sendHitVideosAndGetUrls_(
+    int cameraId,
+    int chatSessionId,
+    const std::vector<std::pair<std::vector<uint8_t>, std::string>>& mp4AndTimes, // (mp4Bytes, "MM:SS")
+    std::vector<HitVideoUpload>& outUploaded)
+{
+    outUploaded.clear();
+    if (mp4AndTimes.empty()) return true;
+
+    Logger::instance().logDebug(
+        "agent",
+        "sendHitVideosAndGetUrls_: uploading videos count=" + std::to_string(mp4AndTimes.size()) +
+        " camera_id=" + std::to_string(cameraId) +
+        " chat_session_id=" + std::to_string(chatSessionId)
+    );
+
+    // Build JSON body
+    nlohmann::json body;
+    body["camera_id"] = cameraId;
+    body["chat_session_id"] = chatSessionId;
+
+    // hit-media supports both; we send only videos here
+    body["images"] = nlohmann::json::array();
+    body["videos"] = nlohmann::json::array();
+
+    for (const auto& it : mp4AndTimes) {
+        const auto& mp4Bytes = it.first;
+        const auto& timeStr = it.second;
+
+        std::string bytesStr(mp4Bytes.begin(), mp4Bytes.end());
+        std::string b64 = base64Encode(bytesStr);
+
+        nlohmann::json vid;
+        vid["mp4_base64"] = std::string("data:video/mp4;base64,") + b64;
+        if (!timeStr.empty()) vid["time_in_video"] = timeStr;
+
+        body["videos"].push_back(std::move(vid));
+    }
+
+    // POST
+    const std::string url =
+        baseUrl_ + "/api/agent/hit-media?client_id=" + clientId_;
+
+    std::string respBody;
+    long httpCode = HttpPostJson(url, exeToken_, body.dump(), respBody);
+
+    if (httpCode != 200) {
+        Logger::instance().logDebug("agent",
+            "sendHitVideosAndGetUrls_: HTTP " + std::to_string(httpCode) + " resp=" + respBody);
+        return false;
+    }
+
+    // Parse response
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(respBody); }
+    catch (...) {
+        Logger::instance().logDebug("agent", "sendHitVideosAndGetUrls_: failed to parse JSON");
+        return false;
+    }
+
+    if (!j.value("ok", false)) return false;
+
+    // Mocha might return "items" for hit-media; your old style returns "uploaded"
+    nlohmann::json arr;
+    if (j.contains("items") && j["items"].is_array()) arr = j["items"];
+    else if (j.contains("uploaded") && j["uploaded"].is_array()) arr = j["uploaded"];
+    else {
+        Logger::instance().logDebug("agent", "sendHitVideosAndGetUrls_: response has no items/uploaded array");
+        return true;
+    }
+
+    for (auto& u : arr) {
+        // Filter just in case backend returns mixed media
+        std::string mt = u.value("media_type", "");
+        if (!mt.empty() && mt != "video") continue;
+
+        HitVideoUpload hv;
+        hv.key = u.value("key", "");
+        hv.url = u.value("url", "");
+        hv.timeInVideo = u.value("time_in_video", "");
+        outUploaded.push_back(std::move(hv));
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "sendHitVideosAndGetUrls_: response_items=" + std::to_string(arr.size()) +
+        " parsed_uploaded_videos=" + std::to_string(outUploaded.size())
+    );
+
+    return true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bool AgentCore::uploadDrakonFindHitMedia_(
+    int searchId,
+    int cameraId,
+    int attemptCount,
+    const std::string& mediaType,
+    const std::string& contentType,
+    const std::vector<std::uint8_t>& bytes,
+    const std::string& timeInVideo,
+    std::string& outKey,
+    std::string& outUrl)
+{
+    outKey.clear();
+    outUrl.clear();
+
+    if (searchId <= 0 || cameraId <= 0 || bytes.empty()) {
+        return false;
+    }
+
+    const std::string normalizedMediaType = mediaType == "image" ? "image" : "video";
+    std::string url = baseUrl_ + "/api/agent/drakon-find-hit-media?client_id=" + clientId_ +
+        "&search_id=" + std::to_string(searchId) +
+        "&camera_id=" + std::to_string(cameraId) +
+        "&attempt_count=" + std::to_string((std::max)(1, attemptCount)) +
+        "&media_type=" + urlEncodeForQuery_(normalizedMediaType);
+    if (!timeInVideo.empty()) {
+        url += "&time_in_video=" + urlEncodeForQuery_(timeInVideo);
+    }
+
+    const std::string effectiveContentType = contentType.empty()
+        ? (normalizedMediaType == "image" ? std::string("image/jpeg") : std::string("video/mp4"))
+        : contentType;
+
+    Logger::instance().logDebug(
+        "agent",
+        "uploadDrakonFindHitMedia_: type=" + normalizedMediaType +
+        " search_id=" + std::to_string(searchId) +
+        " camera_id=" + std::to_string(cameraId) +
+        " bytes=" + std::to_string(bytes.size()) +
+        (timeInVideo.empty() ? std::string() : (" time_in_video=" + timeInVideo))
+    );
+
+    std::string response;
+    const long httpCode = HttpPostBytes(url, exeToken_, bytes, effectiveContentType, response);
+    if (httpCode != 200) {
+        Logger::instance().logDebug(
+            "agent",
+            "uploadDrakonFindHitMedia_: HTTP " + std::to_string(httpCode) + " resp=" + response
+        );
+        return false;
+    }
+
+    try {
+        const auto parsed = nlohmann::json::parse(response);
+        if (!parsed.is_object() || !parsed.value("success", false)) {
+            Logger::instance().logDebug("agent", "uploadDrakonFindHitMedia_: backend did not confirm success");
+            return false;
+        }
+
+        outKey = parsed.value("key", std::string());
+        outUrl = parsed.value("url", std::string());
+        if (outUrl.empty()) {
+            outUrl = parsed.value("video_url", std::string());
+        }
+        if (outUrl.empty()) {
+            outUrl = parsed.value("image_url", std::string());
+        }
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("uploadDrakonFindHitMedia_: failed to parse response: ") + e.what()
+        );
+        return false;
+    }
+
+    const bool ok = !outKey.empty() && !outUrl.empty();
+    Logger::instance().logDebug(
+        "agent",
+        "uploadDrakonFindHitMedia_: result=" + std::string(ok ? "ok" : "missing_fields") +
+        " key=" + outKey +
+        " url=" + outUrl
+    );
+    return ok;
+}
+
+static bool stripAudioWithFfmpeg(const std::string& inputPath, const std::string& outputPath)
+{
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(inputPath);
+    std::wstring outW = utf8ToWide(outputPath);
+
+    // Command: ffmpeg -y -i input.mp4 -map 0:v:0 -c:v copy -an output.mp4
+    // -map 0:v:0 : Select only the first video stream
+    // -c:v copy  : Copy video stream (fast, no quality loss)
+    // -an        : Disable audio specifically
+    // -sn -dn    : Disable subtitles and data streams (save tokens)
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -i \"" + inW + L"\""
+        L" -map 0:v:0 -c:v copy -an -sn -dn"
+        L" \"" + outW + L"\"";
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    return (exitCode == 0) && fs::exists(outputPath);
+}
+
+
+
+
+
+
+
+static void writeDebugMergedClip(
+    const std::vector<EncodedVideoSegment>& encodedSegments,
+    const std::string& outputPath)
+{
+    if (encodedSegments.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "writeDebugMergedClip: no segments to merge"
+        );
+        return;
+    }
+
+    // Create temp directory
+    fs::path tempDir = fs::temp_directory_path() / AppBrand::kDebugConcatTempDirName;
+    if (!fs::exists(tempDir)) {
+        fs::create_directories(tempDir);
+    }
+
+    std::vector<fs::path> tempFiles;
+    tempFiles.reserve(encodedSegments.size());
+
+    // Write each segment to a temp mp4 file
+    for (size_t i = 0; i < encodedSegments.size(); ++i) {
+        fs::path partPath = tempDir / ("part_" + std::to_string(i) + ".mp4");
+        std::ofstream ofs(partPath, std::ios::binary);
+        ofs.write(
+            reinterpret_cast<const char*>(encodedSegments[i].bytes.data()),
+            encodedSegments[i].bytes.size()
+        );
+        ofs.close();
+        tempFiles.push_back(partPath);
+    }
+
+    // Build FFmpeg concat file
+    fs::path concatList = tempDir / "concat.txt";
+    {
+        std::ofstream listFile(concatList);
+        for (const auto& p : tempFiles) {
+            listFile << "file '" << p.string() << "'\n";
+        }
+        listFile.close();
+    }
+
+    // Build FFmpeg command
+    std::stringstream cmd;
+    cmd << "ffmpeg -y -f concat -safe 0 -i \""
+        << concatList.string()
+        << "\" -map 0:v:0 -c:v copy -an \""
+        << outputPath
+        << "\"";
+
+        //<< "\" -c copy \""
+
+    Logger::instance().logDebug(
+        "agent",
+        "writeDebugMergedClip: running: " + cmd.str()
+    );
+
+    // Execute FFmpeg
+    int ret = system(cmd.str().c_str());
+    Logger::instance().logDebug(
+        "agent",
+        "writeDebugMergedClip: ffmpeg returned code " + std::to_string(ret)
+    );
+
+    Logger::instance().logDebug(
+        "agent",
+        "writeDebugMergedClip: output written to " + outputPath
+    );
+}
+
+
+
+
+
+static size_t WriteCbBytes(void* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    auto* out = static_cast<std::vector<uint8_t>*>(userdata);
+    size_t total = size * nmemb;
+    uint8_t* p = static_cast<uint8_t*>(ptr);
+    out->insert(out->end(), p, p + total);
+    return total;
+}
+
+
+
+
+
+
+bool AgentCore::downloadUrlToBytes_(const std::string& url, std::vector<uint8_t>& outBytes)
+{
+    outBytes.clear();
+
+    // Normalize relative URLs like "/api/..." into absolute
+    std::string fullUrl = url;
+    if (!fullUrl.empty() &&
+        (fullUrl.rfind("http://", 0) != 0) &&
+        (fullUrl.rfind("https://", 0) != 0))
+    {
+        // If it's "/api/..." or similar, prefix baseUrl_
+        if (!baseUrl_.empty() && fullUrl[0] == '/') {
+            if (baseUrl_.back() == '/')
+                fullUrl = baseUrl_.substr(0, baseUrl_.size() - 1) + fullUrl;
+            else
+                fullUrl = baseUrl_ + fullUrl;
+        }
+    }
+
+
+    const bool needsClientId =
+        fullUrl.find("/api/agent/faceid-images/") != std::string::npos ||
+        fullUrl.find("/api/agent/face-target-images/") != std::string::npos;
+
+    if (needsClientId) {
+        const std::string key = "client_id=";
+        if (fullUrl.find(key) == std::string::npos) {
+            char sep = (fullUrl.find('?') == std::string::npos) ? '?' : '&';
+            fullUrl += sep;
+            fullUrl += "client_id=" + clientId_;
+        }
+    }
+
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    struct curl_slist* headers = nullptr;
+    std::string auth = "Authorization: Bearer " + exeToken_;
+    headers = curl_slist_append(headers, auth.c_str());
+
+    curl_easy_setopt(curl, CURLOPT_URL, fullUrl.c_str());   // use fullUrl now
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCbBytes);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &outBytes);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || httpCode < 200 || httpCode >= 300) {
+        Logger::instance().logDebug("agent",
+            "downloadUrlToBytes_: failed url=" + fullUrl +
+            " curl=" + std::string(curl_easy_strerror(res)) +
+            " http=" + std::to_string(httpCode));
+        outBytes.clear();
+        return false;
+    }
+
+    return !outBytes.empty();
+}
+
+
+
+
+
+
+
+
+
+bool AgentCore::sendHitImagesAndGetUrls_(
+    int cameraId,
+    int chatSessionId,
+    const std::vector<std::pair<std::vector<unsigned char>, std::string>>& jpegAndTimes, // (jpegBytes, "MM:SS")
+    std::vector<HitImageUpload>& outUploaded)
+{
+    outUploaded.clear();
+    if (jpegAndTimes.empty()) return true;
+
+    Logger::instance().logDebug(
+        "agent",
+        "sendHitImagesAndGetUrls_: uploading images count=" + std::to_string(jpegAndTimes.size()) +
+        " camera_id=" + std::to_string(cameraId) +
+        " chat_session_id=" + std::to_string(chatSessionId)
+    );
+
+    // Build JSON body
+    nlohmann::json body;
+    body["camera_id"] = cameraId;
+    body["chat_session_id"] = chatSessionId;
+
+    body["images"] = nlohmann::json::array();
+
+    for (const auto& it : jpegAndTimes) {
+        const auto& jpegBytes = it.first;
+        const auto& timeStr = it.second;
+
+        std::string bytesStr(jpegBytes.begin(), jpegBytes.end());
+        std::string b64 = base64Encode(bytesStr);
+        nlohmann::json img;
+        img["jpeg_base64"] = std::string("data:image/jpeg;base64,") + b64;
+        if (!timeStr.empty()) img["time_in_video"] = timeStr;
+        body["images"].push_back(std::move(img));
+    }
+
+    // POST
+    const std::string url =
+        baseUrl_ + "/api/agent/hit-images?client_id=" + clientId_;
+
+    std::string resp;
+
+    // Use same auth header style you use in thumbnails/router/chat-response
+    std::vector<std::pair<std::string, std::string>> headers = {
+        {"Authorization", std::string("Bearer ") + exeToken_},
+        {"Content-Type", "application/json"}
+    };
+
+    std::string respBody;
+    long httpCode = HttpPostJson(url, exeToken_, body.dump(), respBody);
+
+    if (httpCode != 200) {
+        Logger::instance().logDebug("agent",
+            "sendHitImagesAndGetUrls_: HTTP " + std::to_string(httpCode) + " resp=" + respBody);
+        return false;
+    }
+
+    // Parse response
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(respBody); }
+    catch (...) {
+        Logger::instance().logDebug("agent", "sendHitImagesAndGetUrls_: failed to parse JSON");
+        return false;
+    }
+
+    if (!j.value("ok", false)) return false;
+    if (!j.contains("uploaded") || !j["uploaded"].is_array()) {
+        Logger::instance().logDebug("agent", "sendHitImagesAndGetUrls_: response has no uploaded array");
+        return true;
+    }
+
+    for (auto& u : j["uploaded"]) {
+        HitImageUpload hi;
+        hi.key = u.value("key", "");
+        hi.url = u.value("url", "");
+        hi.timeInVideo = u.value("time_in_video", "");
+        outUploaded.push_back(std::move(hi));
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "sendHitImagesAndGetUrls_: response_items=" + std::to_string(j["uploaded"].size()) +
+        " parsed_uploaded_images=" + std::to_string(outUploaded.size())
+    );
+    return true;
+}
+
+
+
+
+static std::string formatTsHumanBR(const std::string& ts) {
+    std::chrono::system_clock::time_point tp;
+    if (parseSegmentTimestampToTimePointPreferLocal_(ts, tp)) {
+        const std::time_t tt = std::chrono::system_clock::to_time_t(tp);
+        std::tm tmLocal{};
+#if defined(_WIN32)
+        localtime_s(&tmLocal, &tt);
+#else
+        localtime_r(&tt, &tmLocal);
+#endif
+        char buf[32];
+        std::snprintf(
+            buf,
+            sizeof(buf),
+            "%02d/%02d/%04d %02d:%02d:%02d",
+            tmLocal.tm_mday,
+            tmLocal.tm_mon + 1,
+            tmLocal.tm_year + 1900,
+            tmLocal.tm_hour,
+            tmLocal.tm_min,
+            tmLocal.tm_sec
+        );
+        return std::string(buf);
+    }
+    return ts; // fallback (ex: "UPLOADED_VIDEO")
+}
+
+
+
+
+static std::string normalizeChatModelTierName(std::string tier)
+{
+    for (auto& c : tier) {
+        c = (char)std::tolower((unsigned char)c);
+    }
+
+    if (tier == "legacy" || tier == "pro" || tier == "ultra" || tier == "core") {
+        return tier;
+    }
+    if (tier == "light") {
+        return "legacy";
+    }
+    if (tier == "plus") {
+        return "pro";
+    }
+    return "ultra";
+}
+
+static int defaultFpsForChatModelTier(const std::string& tier)
+{
+    (void)tier;
+    return 1;
+}
+
+int AgentCore::acquireChatVideoCapture_(int cameraId, int requestedVideoFps, int requestedClipSeconds)
+{
+    if (cameraId <= 0) return -1;
+    std::lock_guard<std::mutex> lk(chatCaptureMu_);
+    const int requestId = nextChatCaptureRequestId_++;
+    chatCaptureRequestsByCamera_[cameraId][requestId] = ChatCaptureRequest{
+        clampRequestedModelFps_(requestedVideoFps),
+        normalizeCaptureClipSeconds_(requestedClipSeconds)
+    };
+    return requestId;
+}
+
+void AgentCore::releaseChatVideoCapture_(int cameraId, int requestId)
+{
+    if (cameraId <= 0 || requestId <= 0) return;
+    std::lock_guard<std::mutex> lk(chatCaptureMu_);
+    auto itCamera = chatCaptureRequestsByCamera_.find(cameraId);
+    if (itCamera == chatCaptureRequestsByCamera_.end()) return;
+
+    itCamera->second.erase(requestId);
+    if (itCamera->second.empty()) {
+        chatCaptureRequestsByCamera_.erase(itCamera);
+    }
+}
+
+int AgentCore::getChatRequestedVideoCaptureFps(int cameraId, int clipSeconds) const
+{
+    std::lock_guard<std::mutex> lk(chatCaptureMu_);
+    auto itCamera = chatCaptureRequestsByCamera_.find(cameraId);
+    if (itCamera == chatCaptureRequestsByCamera_.end()) return 0;
+
+    const int normalizedClipSeconds = normalizeCaptureClipSeconds_(clipSeconds);
+    int maxRequestedFps = 0;
+    for (const auto& kv : itCamera->second) {
+        if (normalizeCaptureClipSeconds_(kv.second.clipSeconds) != normalizedClipSeconds) {
+            continue;
+        }
+        maxRequestedFps = (std::max)(maxRequestedFps, clampRequestedModelFps_(kv.second.requestedVideoFps));
+    }
+    return maxRequestedFps;
+}
+
+int AgentCore::acquireDrakonFindVideoCapture_(
+    int searchId,
+    int cameraId,
+    int requestedVideoFps,
+    int requestedClipSeconds)
+{
+    if (cameraId <= 0) return -1;
+    std::lock_guard<std::mutex> lk(drakonFindCaptureMu_);
+    const int requestId = nextDrakonFindCaptureRequestId_++;
+    drakonFindCaptureRequestsByCamera_[cameraId][requestId] = DrakonFindCaptureRequest{
+        searchId,
+        clampRequestedModelFps_(requestedVideoFps),
+        normalizeCaptureClipSeconds_(requestedClipSeconds)
+    };
+    return requestId;
+}
+
+void AgentCore::releaseDrakonFindVideoCapture_(int cameraId, int requestId)
+{
+    if (cameraId <= 0 || requestId <= 0) return;
+    std::lock_guard<std::mutex> lk(drakonFindCaptureMu_);
+    auto itCamera = drakonFindCaptureRequestsByCamera_.find(cameraId);
+    if (itCamera == drakonFindCaptureRequestsByCamera_.end()) return;
+
+    itCamera->second.erase(requestId);
+    if (itCamera->second.empty()) {
+        drakonFindCaptureRequestsByCamera_.erase(itCamera);
+    }
+}
+
+int AgentCore::getDrakonFindRequestedVideoCaptureFps(int cameraId, int clipSeconds) const
+{
+    std::lock_guard<std::mutex> lk(drakonFindCaptureMu_);
+    auto itCamera = drakonFindCaptureRequestsByCamera_.find(cameraId);
+    if (itCamera == drakonFindCaptureRequestsByCamera_.end()) return 0;
+
+    const int normalizedClipSeconds = normalizeCaptureClipSeconds_(clipSeconds);
+    int maxRequestedFps = 0;
+    for (const auto& kv : itCamera->second) {
+        if (normalizeCaptureClipSeconds_(kv.second.clipSeconds) != normalizedClipSeconds) {
+            continue;
+        }
+        maxRequestedFps = (std::max)(maxRequestedFps, clampRequestedModelFps_(kv.second.requestedVideoFps));
+    }
+    return maxRequestedFps;
+}
+
+static int normalizeChatModelFpsValue_(int requestedFps, const std::string& tier)
+{
+    const std::string normalizedTier = normalizeChatModelTierName(tier);
+    if (requestedFps <= 0) {
+        return defaultFpsForChatModelTier(normalizedTier);
+    }
+    return clampRequestedModelFps_(requestedFps);
+}
+
+static int normalizeChatRunningResolutionValue(int value)
+{
+    return (value == 1024) ? 1024 : 640;
+}
+
+
+
+
+static bool isOpenAIChatModelTier(const std::string& tier)
+{
+    const std::string normalized = normalizeChatModelTierName(tier);
+    return normalized == "pro" || normalized == "ultra" || normalized == "core";
+}
+
+static std::string chatOpenAIModelNameForTier(const std::string& tier)
+{
+    const std::string normalized = normalizeChatModelTierName(tier);
+    if (normalized == "core") return "GLM-4.6V-Flash";
+    return (normalized == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+}
+
+void AgentCore::handleOrchestratorQuery_(const json& payload)
+{
+    if (!chatV2Orchestrator_) {
+        Logger::instance().logDebug(
+            "agent",
+            "handleOrchestratorQuery_: chatV2Orchestrator_ not initialized, falling back to video_search"
+        );
+        executeVideoSearchPipeline(payload);
+        return;
+    }
+
+    chatV2Orchestrator_->handleQuery(*this, payload);
+}
+
+void AgentCore::handleChatQuery_(const json& payload)
+{
+    if (chatV2Orchestrator_) {
+        std::thread([this, payload]() {
+            try {
+                chatV2Orchestrator_->handleShadowQuery(*this, payload, "chat_query");
+            }
+            catch (const std::exception& e) {
+                const int chatSessionId =
+                    payload.is_object() ? payload.value("chat_session_id", -1) : -1;
+                logAgentException_(
+                    "agent",
+                    "chat",
+                    "AgentCore::handleChatQuery_::shadowThread",
+                    "chat_query_shadow",
+                    {
+                        { "chat_session_id", chatSessionId }
+                    },
+                    e
+                );
+            }
+            catch (...) {
+                const int chatSessionId =
+                    payload.is_object() ? payload.value("chat_session_id", -1) : -1;
+                logAgentUnknownException_(
+                    "agent",
+                    "chat",
+                    "AgentCore::handleChatQuery_::shadowThread",
+                    "chat_query_shadow",
+                    {
+                        { "chat_session_id", chatSessionId }
+                    }
+                );
+            }
+        }).detach();
+    }
+
+    executeVideoSearchPipeline(payload);
+}
+
+void AgentCore::executeVideoSearchPipeline(const json& payload)
+{
+    std::string userQuestion;
+    int chatSessionId = -1;
+    int commandId = -1;
+    auto makeChatContext = [&](const std::string& operation) {
+        return json{
+            { "chat_session_id", chatSessionId },
+            { "command_id", commandId },
+            { "has_query", !userQuestion.empty() },
+            { "operation", operation }
+        };
+    };
+
+    try {
+        userQuestion = payload.value("query", "");
+        chatSessionId = payload.value("chat_session_id", -1);
+        commandId = payload.value("command_id", -1);
+
+        auto isCancelled = [&]() {
+            return isChatCancellationRequested_(chatSessionId);
+        };
+        auto abortIfCancelled = [&](const std::string& stage) {
+            if (!isCancelled()) {
+                return false;
+            }
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: cancellation requested chat_session_id=" +
+                std::to_string(chatSessionId) +
+                " command_id=" + std::to_string(commandId) +
+                " stage=" + stage
+            );
+            return true;
+        };
+        auto postVideoSearchProgress = [&](const std::string& phase, int sequence, int stepIndex) {
+            chatv2::postChatProgress(
+                *this,
+                payload,
+                chatv2::makeProgressUpdate(
+                    chatv2::progressLanguageFromPayload(payload),
+                    "video_search",
+                    phase,
+                    sequence,
+                    stepIndex,
+                    5));
+        };
+
+        // optional user uploaded image for search
+        std::string uploadedImageBase64;
+        if (payload.contains("uploaded_image_base64") &&
+            payload["uploaded_image_base64"].is_string())
+        {
+            uploadedImageBase64 = payload["uploaded_image_base64"].get<std::string>();
+        }
+
+        // optional user uploaded video for search
+        std::string uploadedVideoUrl;
+        if (payload.contains("uploaded_video_url") &&
+            payload["uploaded_video_url"].is_string())
+        {
+            uploadedVideoUrl = payload["uploaded_video_url"].get<std::string>();
+        }
+
+        std::string userLocale = payload.value("language", std::string("en"));
+        Lang currentUserLang = langFromLocale(userLocale);
+
+
+        std::string modelTier = normalizeChatModelTierName(
+            payload.value("model_tier", std::string("legacy"))
+        );
+
+        int modelInputFps = 0;
+        if (payload.contains("model_fps")) {
+            try {
+                modelInputFps = payload["model_fps"].get<int>();
+            }
+            catch (...) {
+                modelInputFps = 0;
+            }
+        }
+        modelInputFps = normalizeChatModelFpsValue_(modelInputFps, modelTier);
+
+        int runningResolution = 640;
+        if (payload.contains("running_resolution")) {
+            try {
+                runningResolution = payload["running_resolution"].get<int>();
+            }
+            catch (...) {
+                runningResolution = 640;
+            }
+        }
+        runningResolution = normalizeChatRunningResolutionValue(runningResolution);
+        if (modelTier != "core") {
+            runningResolution = 640;
+        }
+
+        std::string modelApiKey;
+        if (payload.contains("model_api_key") && payload["model_api_key"].is_string()) {
+            modelApiKey = payload["model_api_key"].get<std::string>();
+        }
+        else if (payload.contains("api_key") && payload["api_key"].is_string()) {
+            modelApiKey = payload["api_key"].get<std::string>();
+        }
+
+        std::string routerApiKey;
+        if (payload.contains("router_api_key") && payload["router_api_key"].is_string()) {
+            routerApiKey = payload["router_api_key"].get<std::string>();
+        }
+        if (routerApiKey.empty() && modelTier == "legacy") {
+            routerApiKey = modelApiKey;
+        }
+
+
+        if (userQuestion.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: empty query in payload, skipping"
+            );
+            return;
+        }
+
+        if (abortIfCancelled("before_start")) {
+            return;
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "handleChatQuery_: received query=\"" + userQuestion +
+            "\" chat_session_id=" + std::to_string(chatSessionId) +
+            " model_tier=" + modelTier +
+            " model_fps=" + std::to_string(modelInputFps) +
+            " running_resolution=" + std::to_string(runningResolution) +
+            " model_api_key_present=" + std::string(modelApiKey.empty() ? "false" : "true") +
+            " router_api_key_present=" + std::string(routerApiKey.empty() ? "false" : "true")
+        );
+
+        pruneChatTemporalSessions_();
+        bool chatTemporalActive = false;
+        bool chatTemporalAlert = false;
+        bool chatTemporalReport = false;
+        nlohmann::json chatTemporalOperatorResults = nlohmann::json::array();
+        std::string chatTemporalSummary;
+        ChatTemporalState chatTemporalState;
+        std::string userQuestionForVision = userQuestion;
+        std::vector<std::pair<int, int>> chatCaptureRegistrations;
+        struct ScopeExit_ {
+            std::function<void()> fn;
+            ~ScopeExit_() {
+                if (fn) fn();
+            }
+        };
+        ScopeExit_ releaseChatCaptureGuard{
+            [this, &chatCaptureRegistrations]() {
+                for (const auto& registration : chatCaptureRegistrations) {
+                    releaseChatVideoCapture_(registration.first, registration.second);
+                }
+            }
+        };
+        if (chatSessionId > 0) {
+            {
+                std::lock_guard<std::mutex> lock(chatTemporalMu_);
+                auto itTemporal = chatTemporalBySession_.find(chatSessionId);
+                if (itTemporal != chatTemporalBySession_.end()) {
+                    chatTemporalState = itTemporal->second;
+                }
+            }
+            if (!chatTemporalState.state.is_object() || chatTemporalState.state.empty()) {
+                chatTemporalState.state = temporal::defaultState();
+            }
+
+            nlohmann::json envelope = chatTemporalState.planEnvelope;
+            const std::string modelFamily = (modelTier == "core") ? "core" : "ultra";
+            const bool temporalReady = ensureTemporalPlanForRuntime(
+                "chat_session",
+                chatSessionId,
+                userQuestion,
+                "",
+                "",
+                (!uploadedVideoUrl.empty()) ? "video" : "image",
+                userLocale.empty() ? "en" : userLocale,
+                modelFamily,
+                modelApiKey,
+                envelope,
+                false
+            );
+            if (temporalReady && temporal::planUsable(envelope)) {
+                chatTemporalState.planEnvelope = envelope;
+                const nlohmann::json temporalInput = temporal::buildInferenceInput(
+                    chatTemporalState.planEnvelope,
+                    chatTemporalState.state,
+                    -1,
+                    temporal::nowIso()
+                );
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: temporal input injected chat_session_id=" +
+                    std::to_string(chatSessionId) +
+                    " now_utc=" +
+                    temporalInput.value("time_context", nlohmann::json::object()).value("now_utc", "") +
+                    " payload=" + temporalInput.dump()
+                );
+                userQuestionForVision += temporal::runtimePromptAppendix(temporalInput);
+                chatTemporalActive = true;
+            }
+        }
+
+
+
+        // If any HTTP call hits a timeout and we retry, notify the frontend once.
+        // Mocha UI can map this to "Still analyzing..." instead of being stuck on the old spinner.
+        auto postStillAnalyzing = [&]() {
+            try {
+                if (abortIfCancelled("still_analyzing")) {
+                    return;
+                }
+                json interim;
+                interim["chat_session_id"] = chatSessionId;
+                interim["command_id"] = commandId;
+                interim["status"] = "processing";
+                interim["answer"] = "Still analyzing...";
+                interim["original_query"] = userQuestion;
+
+                std::string url = baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                std::string resp;
+                long code = HttpPostJson(url, exeToken_, interim.dump(), resp);
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: still-analyzing chat-response HTTP " + std::to_string(code) +
+                    " responseSize=" + std::to_string(resp.size())
+                );
+            }
+            catch (...) {
+                // never throw from UI notification
+            }
+            };
+        RetryUiGuard retryUiGuard(postStillAnalyzing);
+
+
+
+        // ------------------------------------------------------------
+        // Router step (conditional): skip entirely for uploaded video
+        // ------------------------------------------------------------
+        json cameras = json::array();
+        json routerResult;
+        int routerPromptTokens = 0;
+        int routerOutputTokens = 0;
+        int routerTotalTokens = 0;
+
+        const bool hasUploadedVideo = !uploadedVideoUrl.empty();
+
+        postVideoSearchProgress("searching_footage", 2, 2);
+
+        if (!hasUploadedVideo) {
+            // Normal path: 1) fetch cameras 2) route question -> window/cameras
+            cameras = fetchAgentCameras_();
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: cameras.size()=" +
+                std::to_string(cameras.is_array() ? cameras.size() : 0)
+            );
+
+            routerResult = routeQuestionToCamerasWithGemini_(userQuestion, cameras, routerApiKey);
+        }
+        else {
+            // Uploaded video path: fabricate a minimal routerResult so frontend stays happy
+            routerResult = json::object();
+            routerResult["camera_ids"] = json::array();
+            routerResult["camera_names"] = json::array();
+            routerResult["all_cameras"] = false;
+            routerResult["time_window_minutes_before_now"] = 0;
+            routerResult["start_timestamp"] = "";
+            routerResult["end_timestamp"] = "";
+            routerResult["search_paths"] = json::array();
+            routerResult["answer"] = "Analyzing the uploaded video...";
+        }
+
+        if (abortIfCancelled("after_router")) {
+            return;
+        }
+
+        routerPromptTokens = routerResult.value("model_prompt_tokens", 0);
+        routerOutputTokens = routerResult.value("model_output_tokens", 0);
+        routerTotalTokens = routerResult.value(
+            "model_total_tokens",
+            routerPromptTokens + routerOutputTokens
+        );
+
+        Logger::instance().logDebug(
+            "agent",
+            "handleChatQuery_: router token usage | prompt=" +
+            std::to_string(routerPromptTokens) +
+            " | output=" + std::to_string(routerOutputTokens) +
+            " | total=" + std::to_string(routerTotalTokens)
+        );
+
+        if (!hasUploadedVideo && modelInputFps > 1) {
+            std::unordered_set<int> uniqueCameraIds;
+            const json routerCameraIds = routerResult.value("camera_ids", json::array());
+            if (routerCameraIds.is_array()) {
+                for (const auto& cameraNode : routerCameraIds) {
+                    if (!cameraNode.is_number_integer()) continue;
+                    const int requestedCameraId = cameraNode.get<int>();
+                    if (requestedCameraId > 0) {
+                        uniqueCameraIds.insert(requestedCameraId);
+                    }
+                }
+            }
+            for (int requestedCameraId : uniqueCameraIds) {
+                const int requestId = acquireChatVideoCapture_(requestedCameraId, modelInputFps, 10);
+                if (requestId > 0) {
+                    chatCaptureRegistrations.emplace_back(requestedCameraId, requestId);
+                }
+            }
+        }
+
+        // Always post router result (keeps UI consistent, even for uploaded video)
+        try {
+            if (abortIfCancelled("before_router_result_post")) {
+                return;
+            }
+            json postBody;
+            postBody["chat_session_id"] = chatSessionId;
+            postBody["command_id"] = commandId;
+            postBody["original_query"] = userQuestion;
+            postBody["camera_ids"] = routerResult.value("camera_ids", json::array());
+            postBody["camera_names"] = routerResult.value("camera_names", json::array());
+            postBody["all_cameras"] = routerResult.value("all_cameras", false);
+            postBody["time_window_minutes_before_now"] =
+                routerResult.value("time_window_minutes_before_now", 60);
+            postBody["answer"] = routerResult.value("answer", "");
+            postBody["start_timestamp"] = routerResult.value("start_timestamp", "");
+            postBody["end_timestamp"] = routerResult.value("end_timestamp", "");
+            postBody["search_paths"] = routerResult.value("search_paths", json::array());
+
+            postBody["model_prompt_tokens"] = routerPromptTokens;
+            postBody["model_output_tokens"] = routerOutputTokens;
+            postBody["model_total_tokens"] = routerTotalTokens;
+
+            std::string url =
+                baseUrl_ + "/api/agent/chat-router-result?client_id=" + clientId_;
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: POSTing router result to " + url
+            );
+
+            std::string postBodyStr = postBody.dump();
+            std::string respBody;
+            long httpCode = HttpPostJson(url, exeToken_, postBodyStr, respBody);
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: chat-router-result HTTP " +
+                std::to_string(httpCode) +
+                " responseSize=" + std::to_string(respBody.size())
+            );
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug(
+                "agent",
+                std::string("handleChatQuery_ post exception: ") + e.what()
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_ post unknown exception"
+            );
+        }
+
+        postVideoSearchProgress("searching_footage", 2, 2);
+
+        // ------------------------------------------------------------
+        // Build encodedVideos (conditional)
+        // ------------------------------------------------------------
+        std::vector<EncodedVideoSegment> encodedVideos;
+
+        if (!hasUploadedVideo) {
+            // Existing behavior: find MP4 clips on disk based on routerResult
+            // (keep EXACTLY your existing root variable here)
+            const std::string clipsRoot = "frames";
+            encodedVideos = buildEncodedVideosFromMp4Clips(clipsRoot, routerResult);
+
+            // Race-safe fallback for the default "last minute" query:
+            // if the newest 10s clip is being finalized right now, first scan can miss it.
+            if (encodedVideos.empty()) {
+                const int timeWindowMinutes =
+                    routerResult.value("time_window_minutes_before_now", 0);
+                const std::string startTs = routerResult.value("start_timestamp", "");
+                const std::string endTs = routerResult.value("end_timestamp", "");
+
+                std::chrono::system_clock::time_point startTp, endTp;
+                const bool parsedWindow =
+                    parseTimestampToTimePoint(startTs, startTp) &&
+                    parseTimestampToTimePoint(endTs, endTp);
+
+                const long long windowSec = parsedWindow
+                    ? std::chrono::duration_cast<std::chrono::seconds>(endTp - startTp).count()
+                    : 0;
+
+                const long long nowDeltaSec = parsedWindow
+                    ? ([&]() {
+                        const long long d =
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now() - endTp).count();
+                        return (d >= 0) ? d : -d;
+                    })()
+                    : 0;
+
+                const bool shouldApplyLastMinuteFallback =
+                    parsedWindow &&
+                    timeWindowMinutes == 1 &&
+                    windowSec > 0 && windowSec <= 70 &&
+                    nowDeltaSec <= 180;
+
+                if (shouldApplyLastMinuteFallback) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: no clips in initial last-minute scan; retrying after short grace"
+                    );
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1400));
+                    if (abortIfCancelled("after_retry_grace")) {
+                        return;
+                    }
+                    encodedVideos = buildEncodedVideosFromMp4Clips(clipsRoot, routerResult);
+
+                    if (encodedVideos.empty()) {
+                        // If still empty, widen backward a bit and force preference for 10s clips.
+                        const auto fallbackStartTp = endTp - std::chrono::seconds(90);
+                        const std::string fallbackStartTs =
+                            formatTimePointToTimestampUtc(fallbackStartTp);
+
+                        if (!fallbackStartTs.empty()) {
+                            json fallbackRouter = routerResult;
+                            fallbackRouter["start_timestamp"] = fallbackStartTs;
+                            fallbackRouter["end_timestamp"] = endTs;
+
+                            Logger::instance().logDebug(
+                                "agent",
+                                "handleChatQuery_: applying 10s fallback window start=" +
+                                fallbackStartTs + " end=" + endTs
+                            );
+
+                            encodedVideos = buildEncodedVideosFromMp4Clips(
+                                clipsRoot,
+                                fallbackRouter,
+                                /*preferTenSecondClips=*/true
+                            );
+                        }
+                    }
+                }
+            }
+
+            if (encodedVideos.empty()) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: no stored frames for requested window; sending 'no frames' answer to chat"
+                );
+
+                json postBody;
+                postBody["chat_session_id"] = chatSessionId;
+                postBody["command_id"] = commandId;
+                postBody["original_query"] = userQuestion;
+                postBody["camera_ids"] = routerResult.value("camera_ids", json::array());
+                postBody["camera_names"] = routerResult.value("camera_names", json::array());
+                postBody["all_cameras"] = routerResult.value("all_cameras", false);
+                postBody["time_window_minutes_before_now"] =
+                    routerResult.value("time_window_minutes_before_now", 0);
+                postBody["start_timestamp"] = routerResult.value("start_timestamp", "");
+                postBody["end_timestamp"] = routerResult.value("end_timestamp", "");
+                postBody["search_paths"] = routerResult.value("search_paths", json::array());
+
+                std::string noFramesAnswer =
+                    "I couldn't find stored video/frames in the requested time window. "
+                    "Try increasing the time range and ask again.";
+                if (userLocale.rfind("pt", 0) == 0) {
+                    noFramesAnswer =
+                        "Nao encontrei videos/frames armazenados no intervalo de tempo solicitado. "
+                        "Tente aumentar a janela de tempo e perguntar novamente.";
+                }
+
+                postBody["answer"] = noFramesAnswer;
+                postBody["model_prompt_tokens"] = 0;
+                postBody["model_output_tokens"] = 0;
+                postBody["model_total_tokens"] = 0;
+                postBody["vision_hits"] = json::array();
+                postBody["status"] = "vision_done";
+
+                try {
+                    if (abortIfCancelled("before_no_frames_post")) {
+                        return;
+                    }
+                    std::string url = baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                    std::string respBody;
+                    long httpCode = HttpPostJson(url, exeToken_, postBody.dump(), respBody);
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: no-frames chat-response HTTP " +
+                        std::to_string(httpCode) +
+                        " responseSize=" + std::to_string(respBody.size())
+                    );
+                }
+                catch (...) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: no-frames chat-response post exception"
+                    );
+                }
+                return;
+            }
+        }
+        else {
+            // Uploaded video behavior: download bytes + write a temp MP4 so we can extract frames
+            std::vector<uint8_t> bytes;
+            if (!downloadUrlToBytes_(uploadedVideoUrl, bytes)) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: failed to download uploaded video"
+                );
+
+                // respond gracefully
+                json postBody;
+                postBody["chat_session_id"] = chatSessionId;
+                postBody["command_id"] = commandId;
+                postBody["original_query"] = userQuestion;
+                postBody["camera_ids"] = json::array();
+                postBody["camera_names"] = json::array();
+                postBody["all_cameras"] = false;
+                postBody["time_window_minutes_before_now"] = 0;
+                postBody["start_timestamp"] = "";
+                postBody["end_timestamp"] = "";
+                postBody["search_paths"] = json::array();
+                postBody["answer"] = "I couldn't download the uploaded video. Please try again.";
+
+                postBody["model_prompt_tokens"] = 0;
+                postBody["model_output_tokens"] = 0;
+                postBody["model_total_tokens"] = 0;
+                postBody["vision_hits"] = json::array();
+                postBody["status"] = "vision_done";
+
+                std::string url =
+                    baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                std::string respBody;
+                if (abortIfCancelled("before_uploaded_video_error_post")) {
+                    return;
+                }
+                HttpPostJson(url, exeToken_, postBody.dump(), respBody);
+                return;
+            }
+
+#ifdef _WIN32
+            // temp dir
+            fs::path tmpDir = fs::temp_directory_path() / AppBrand::kUploadedVideosTempDirName;
+            std::error_code ec;
+            fs::create_directories(tmpDir, ec);
+
+            // temp file name
+            std::string fname =
+                std::string("upload_") + std::to_string(chatSessionId) + "_" +
+                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()) +
+                ".mp4";
+
+            fs::path tmpMp4 = tmpDir / fname;
+
+            // write bytes
+            {
+                std::ofstream ofs(tmpMp4, std::ios::binary);
+                if (!ofs.is_open()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: failed to open temp mp4 for writing: " + tmpMp4.string()
+                    );
+                    return;
+                }
+                ofs.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            }
+
+
+            // ---------------------------------------------------------
+            // FIX: STRIP AUDIO HERE
+            // ---------------------------------------------------------
+            fs::path cleanMp4 = tmpDir / ("clean_" + fname);
+
+            // Run ffmpeg to strip audio/data (-an -sn -dn)
+            if (stripAudioWithFfmpeg(tmpMp4.string(), cleanMp4.string())) {
+                Logger::instance().logDebug("agent", "handleChatQuery_: successfully stripped audio from upload");
+
+                // Read the CLEAN bytes back into memory
+                std::vector<uint8_t> cleanBytes;
+                if (readFileToBytes(cleanMp4.string(), cleanBytes)) {
+                    bytes = std::move(cleanBytes); // Replace dirty bytes with clean ones
+
+                    // Remove the dirty file
+                    fs::remove(tmpMp4, ec);
+
+                    // Point tmpMp4 to the clean file so 'sourceFilePath' is correct below
+                    tmpMp4 = cleanMp4;
+                }
+                else {
+                    Logger::instance().logDebug("agent", "handleChatQuery_: failed to read clean file");
+                }
+            }
+            else {
+                Logger::instance().logDebug("agent", "handleChatQuery_: failed to strip audio via ffmpeg, using raw");
+            }
+            // ---------------------------------------------------------
+
+
+            EncodedVideoSegment seg;
+            seg.bytes = std::move(bytes);
+
+            // so hit-builder can extract jpeg frames:
+            seg.sourceFilePath = tmpMp4.string();
+            seg.isTempFile = true;
+
+            // timestamps are optional for uploaded videos; keep something non-empty for logs
+            seg.startTs = "UPLOADED_VIDEO";
+            seg.endTs = "UPLOADED_VIDEO";
+
+            encodedVideos.push_back(std::move(seg));
+#else
+            // If you need non-Windows support later, you can implement same logic with std::filesystem + ofstream.
+            Logger::instance().logDebug("agent", "handleChatQuery_: uploaded video path not implemented on this platform");
+            return;
+#endif
+        }
+
+        // ------------------------------------------------------------
+        // Vision step (unchanged)
+        // ------------------------------------------------------------
+        postVideoSearchProgress("analyzing", 3, 3);
+
+        int visionPromptTokens = 0;
+        int visionOutputTokens = 0;
+        int visionTotalTokens = 0;
+        std::string visionAnswer;
+
+        std::vector<VideoHit> videoHits;
+        if (isOpenAIChatModelTier(modelTier)) {
+            const std::string openAiModelName = chatOpenAIModelNameForTier(modelTier);
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: vision provider=openai model=" + openAiModelName +
+                " fps=" + std::to_string(modelInputFps)
+            );
+            videoHits = analyzeVideosWithOpenAI_(
+                encodedVideos,
+                userQuestionForVision,
+                /*stopOnFirstHit=*/false,
+                uploadedImageBase64,
+                openAiModelName,
+                modelApiKey,
+                modelInputFps,
+                runningResolution,
+                visionPromptTokens,
+                visionOutputTokens,
+                visionTotalTokens,
+                visionAnswer
+            );
+        }
+        else {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: vision provider=gemini model_tier=" + modelTier
+            );
+            videoHits = analyzeVideosWithGemini_(
+                encodedVideos,
+                userQuestionForVision,
+                /*stopOnFirstHit=*/false,
+                uploadedImageBase64,
+                modelTier,
+                modelApiKey,
+                visionPromptTokens,
+                visionOutputTokens,
+                visionTotalTokens,
+                visionAnswer
+            );
+        }
+
+        if (chatTemporalActive) {
+            for (const auto& hitTemporal : videoHits) {
+                const std::string temporalDecisionNowIso =
+                    temporal::decisionAnchorUtc(temporal::nowIso(), hitTemporal.segmentEndTs);
+                temporal::applyRound(
+                    chatTemporalState.state,
+                    chatTemporalState.planEnvelope,
+                    hitTemporal.identityPatch,
+                    hitTemporal.observations,
+                    hitTemporal.temporalEvidenceCandidates,
+                    temporalDecisionNowIso,
+                    hitTemporal.segmentStartTs,
+                    hitTemporal.segmentEndTs,
+                    hitTemporal.faceIdentityMatches
+                );
+                const nlohmann::json candidateDecisions =
+                    temporal::extractLastRoundCandidateDecisions(chatTemporalState.state);
+                if (candidateDecisions.is_array() && !candidateDecisions.empty()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: temporal candidate decisions decisions=" +
+                        candidateDecisions.dump()
+                    );
+                }
+                const temporal::EvalResult eval = temporal::evaluate(
+                    chatTemporalState.state,
+                    chatTemporalState.planEnvelope,
+                    temporalDecisionNowIso
+                );
+                if (eval.alert) chatTemporalAlert = true;
+                if (eval.report) chatTemporalReport = true;
+                if (eval.operatorResults.is_array() && !eval.operatorResults.empty()) {
+                    chatTemporalOperatorResults = eval.operatorResults;
+                }
+                if (!eval.summary.empty()) {
+                    chatTemporalSummary = eval.summary;
+                }
+            }
+            chatTemporalState.touchedAt = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(chatTemporalMu_);
+                chatTemporalBySession_[chatSessionId] = chatTemporalState;
+            }
+        }
+
+        // Build final natural-language answer (keep your existing logic)
+        std::string finalAnswer;
+        if (!videoHits.empty()) {
+            // (Opcional) ordenar por comeÃƒÆ’Ã‚Â§o do segmento pra ficar bonito
+            std::vector<VideoHit> sorted = videoHits;
+            std::sort(sorted.begin(), sorted.end(),
+                [](const VideoHit& a, const VideoHit& b) {
+                    return a.segmentStartTs < b.segmentStartTs;
+                });
+
+            std::ostringstream oss;
+            for (const auto& h : sorted) {
+                if (h.answer.empty()) continue;
+
+                // Para uploads, segmentStartTs pode ser "UPLOADED_VIDEO"
+                std::string startHuman = formatTsHumanBR(h.segmentStartTs);
+                std::string endHuman = formatTsHumanBR(h.segmentEndTs);
+
+                // 1 linha por segmento, com range na frente
+                //oss << " | " << startHuman << " - " << endHuman
+                    //<< " | : " << h.answer << "<br/><br/>";
+
+                const std::string camLabel = !h.cameraName.empty()
+                    ? h.cameraName
+                    : ("camera " + std::to_string(h.cameraId));
+
+                // 1 linha por segmento, com cÃƒÆ’Ã‚Â¢mera + range + resposta
+                oss << "Camera: " << camLabel << "<br/>"
+                    << startHuman << " - " << endHuman
+                    << " | " << h.answer
+                    << "<br/><br/>";
+
+            }
+
+            finalAnswer = oss.str();
+
+            // tira o \n final (opcional)
+            while (!finalAnswer.empty() && (finalAnswer.back() == '\n' || finalAnswer.back() == '\r')) {
+                finalAnswer.pop_back();
+            }
+        }
+
+
+        if (finalAnswer.empty()) {
+            if (!visionAnswer.empty()) finalAnswer = visionAnswer;
+            else finalAnswer = "I could not determine what is happening in the video.";
+        }
+        if (chatTemporalActive && (chatTemporalAlert || chatTemporalReport)) {
+            std::ostringstream temporalSuffix;
+            temporalSuffix << "<br/><br/>Temporal engine: ";
+            if (!chatTemporalSummary.empty()) {
+                temporalSuffix << chatTemporalSummary;
+                if (chatTemporalAlert || chatTemporalReport) temporalSuffix << ". ";
+            }
+            if (chatTemporalAlert) {
+                temporalSuffix << "Final alert = true";
+                if (chatTemporalReport) temporalSuffix << "; ";
+            }
+            if (chatTemporalReport) {
+                temporalSuffix << "report window reached";
+            }
+            if (chatTemporalOperatorResults.is_array() && !chatTemporalOperatorResults.empty()) {
+                temporalSuffix << ". Operator results: " << chatTemporalOperatorResults.dump();
+            }
+            finalAnswer += temporalSuffix.str();
+        }
+
+        if (abortIfCancelled("before_final_post")) {
+            return;
+        }
+
+        // THEN build postBody and send to /chat-response (keep your existing hit JSON logic)
+        json postBody;
+        postBody["chat_session_id"] = chatSessionId;
+        postBody["command_id"] = commandId;
+        postBody["original_query"] = userQuestion;
+
+        // For uploaded video: empty camera fields
+        postBody["camera_ids"] = routerResult.value("camera_ids", json::array());
+        postBody["camera_names"] = routerResult.value("camera_names", json::array());
+        postBody["all_cameras"] = routerResult.value("all_cameras", false);
+        postBody["time_window_minutes_before_now"] =
+            routerResult.value("time_window_minutes_before_now", 0);
+        postBody["start_timestamp"] = routerResult.value("start_timestamp", "");
+        postBody["end_timestamp"] = routerResult.value("end_timestamp", "");
+        postBody["search_paths"] = routerResult.value("search_paths", json::array());
+
+        postBody["answer"] = finalAnswer;
+        postBody["model_prompt_tokens"] = visionPromptTokens;
+        postBody["model_output_tokens"] = visionOutputTokens;
+        postBody["model_total_tokens"] = visionTotalTokens;
+
+
+
+        int cameraIdInt = 0;
+
+        if (routerResult.contains("camera_ids") &&
+            routerResult["camera_ids"].is_array() &&
+            !routerResult["camera_ids"].empty() &&
+            routerResult["camera_ids"][0].is_number_integer())
+        {
+            cameraIdInt = routerResult["camera_ids"][0].get<int>();
+        }
+
+
+
+        nlohmann::json hitsJson = nlohmann::json::array();
+
+        postVideoSearchProgress("uploading_media", 4, 4);
+
+
+        const int kMaxTotalFrames = 50;
+        int totalFrames = 0;
+        
+
+
+        for (const auto& h : videoHits) {
+            nlohmann::json hitObj;
+            hitObj["segment_start_ts"] = h.segmentStartTs;
+            hitObj["segment_end_ts"] = h.segmentEndTs;
+            hitObj["answer"] = h.answer;
+            hitObj["camera_id"] = h.cameraId;
+            hitObj["camera_name"] = h.cameraName;
+
+
+            // Try uploading video clips first; fallback to image frames if needed.
+            std::vector<HitImageUpload> uploadedImages;
+            std::vector<HitVideoUpload> uploadedVideos;
+            std::vector<std::pair<std::vector<unsigned char>, std::string>> fallbackLocalImages;
+            std::vector<std::pair<std::vector<uint8_t>, std::string>> fallbackLocalVideos;
+
+
+            if (!h.detectionTimeInVideo.empty() &&
+                h.segmentIndex < encodedVideos.size())
+            {
+                const auto& seg = encodedVideos[h.segmentIndex];
+
+                const std::string& mediaSourcePath = seg.sourceFilePath;
+
+                if (!mediaSourcePath.empty() && fs::exists(mediaSourcePath)) {
+                    try {
+                        auto mp4AndTimes = extractMp4ClipsAtTimesWithLabels(
+                            mediaSourcePath,
+                            h.detectionTimeInVideo,
+                            /*clipSeconds=*/10,
+                            /*preRollSeconds=*/2
+                        );
+
+
+                        // 2) Enforce global cap (kMaxTotalFrames) BEFORE uploading
+                        /*
+                        int remaining = kMaxTotalFrames - totalFrames;
+                        if (remaining <= 0) {
+                            jpegAndTimes.clear();
+                        }
+                        else if ((int)jpegAndTimes.size() > remaining) {
+                            jpegAndTimes.resize(remaining);
+                        }
+                        */
+
+                        int remaining = kMaxTotalFrames - totalFrames;
+                        if (remaining <= 0) mp4AndTimes.clear();
+                        else if ((int)mp4AndTimes.size() > remaining) mp4AndTimes.resize(remaining);
+
+                        fallbackLocalVideos = mp4AndTimes;
+
+                        // 3) One upload call to /api/agent/hit-media
+                        if (!mp4AndTimes.empty()) {
+                            
+                            //bool ok = sendHitVideosAndGetUrls_(cameraIdInt, chatSessionId, mp4AndTimes, uploadedVideos);
+
+                            int uploadCamId = seg.cameraId;               // preferÃƒÆ’Ã‚Â­vel (correto por segmento)
+                            if (uploadCamId <= 0) uploadCamId = h.cameraId; // fallback se necessÃƒÆ’Ã‚Â¡rio
+
+                            bool ok = sendHitVideosAndGetUrls_(uploadCamId, chatSessionId, mp4AndTimes, uploadedVideos);
+
+                            if (!ok) {
+                                Logger::instance().logDebug("agent", "sendHitVideosAndGetUrls_: failed");
+                            }
+                            else {
+                                totalFrames += (int)uploadedVideos.size();
+                            }
+                        }
+
+                        // Fallback: if no video URL was uploaded, send JPEG frames instead.
+                        if (uploadedVideos.empty()) {
+                            auto jpegAndTimes = extractFramesJpegAtTimesWithLabels(
+                                mediaSourcePath,
+                                h.detectionTimeInVideo
+                            );
+
+                            int imgRemaining = kMaxTotalFrames - totalFrames;
+                            if (imgRemaining <= 0) jpegAndTimes.clear();
+                            else if ((int)jpegAndTimes.size() > imgRemaining) jpegAndTimes.resize(imgRemaining);
+
+                            fallbackLocalImages = jpegAndTimes;
+
+                            if (!jpegAndTimes.empty()) {
+                                int uploadCamId = seg.cameraId;
+                                if (uploadCamId <= 0) uploadCamId = h.cameraId;
+
+                                bool okImg = sendHitImagesAndGetUrls_(uploadCamId, chatSessionId, jpegAndTimes, uploadedImages);
+                                if (!okImg) {
+                                    Logger::instance().logDebug("agent", "sendHitImagesAndGetUrls_: failed");
+                                }
+                                else {
+                                    totalFrames += (int)uploadedImages.size();
+                                }
+                            }
+                        }
+
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: hit media upload result videos=" +
+                            std::to_string(uploadedVideos.size()) +
+                            " images=" + std::to_string(uploadedImages.size())
+                        );
+                    }
+                    catch (...) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: exception extracting/uploading hit images"
+                        );
+                    }
+                }
+
+                // keep the raw times returned by Gemini
+                hitObj["detection_time_in_video"] = h.detectionTimeInVideo;
+            }
+
+            // Attach uploaded image URLs to this hit
+            if (!uploadedImages.empty()) {
+                nlohmann::json hitImgs = nlohmann::json::array();
+                for (const auto& u : uploadedImages) {
+                    nlohmann::json x;
+                    if (!u.timeInVideo.empty()) x["time_in_video"] = u.timeInVideo;
+                    if (!u.url.empty())         x["url"] = u.url;
+                    if (!u.key.empty())         x["key"] = u.key;
+                    x["media_type"] = "image";
+                    hitImgs.push_back(std::move(x));
+                }
+                hitObj["hit_images"] = std::move(hitImgs);
+
+                nlohmann::json urlsArr = nlohmann::json::array();
+                for (const auto& u : uploadedImages) if (!u.url.empty()) urlsArr.push_back(u.url);
+                if (!urlsArr.empty()) {
+                    hitObj["frames_image_urls"] = urlsArr;
+                    hitObj["frame_image_url"] = urlsArr[0];
+                }
+            }
+
+            // Attach uploaded video URLs to this hit
+            if (!uploadedVideos.empty()) {
+                nlohmann::json hitVids = nlohmann::json::array();
+                for (const auto& u : uploadedVideos) {
+                    nlohmann::json x;
+                    if (!u.timeInVideo.empty()) x["time_in_video"] = u.timeInVideo;
+                    if (!u.url.empty())         x["url"] = u.url;
+                    if (!u.key.empty())         x["key"] = u.key;
+                    x["media_type"] = "video";
+                    hitVids.push_back(std::move(x));
+                }
+                hitObj["hit_videos"] = std::move(hitVids);
+
+                // optional convenience arrays if your UI wants them
+                nlohmann::json urlsArr = nlohmann::json::array();
+                for (const auto& u : uploadedVideos) if (!u.url.empty()) urlsArr.push_back(u.url);
+                if (!urlsArr.empty()) {
+                    hitObj["frames_video_urls"] = urlsArr;
+                    hitObj["frame_video_url"] = urlsArr[0];
+                }
+            }
+
+            // Fallback for video proof: keep one inline MP4 when URL upload returns empty.
+            if (uploadedVideos.empty() && !fallbackLocalVideos.empty()) {
+                const auto& firstVid = fallbackLocalVideos.front();
+                const auto& mp4Bytes = firstVid.first;
+                const auto& t = firstVid.second;
+                if (!mp4Bytes.empty()) {
+                    std::string bytesStr(
+                        reinterpret_cast<const char*>(mp4Bytes.data()),
+                        mp4Bytes.size()
+                    );
+                    std::string b64 = base64Encode(bytesStr);
+                    if (!b64.empty()) {
+                        const std::string dataUrl = "data:video/mp4;base64," + b64;
+                        nlohmann::json hitVids = nlohmann::json::array();
+                        nlohmann::json x;
+                        if (!t.empty()) x["time_in_video"] = t;
+                        x["url"] = dataUrl;
+                        x["media_type"] = "video";
+                        hitVids.push_back(std::move(x));
+                        hitObj["hit_videos"] = hitVids;
+
+                        nlohmann::json urlsArr = nlohmann::json::array();
+                        urlsArr.push_back(dataUrl);
+                        hitObj["frames_video_urls"] = urlsArr;
+                        hitObj["frame_video_url"] = dataUrl;
+
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: media upload empty, using inline video fallback"
+                        );
+                    }
+                }
+            }
+
+            // Last fallback: if URL upload failed, keep inline image proof in message payload.
+            if (uploadedImages.empty() && uploadedVideos.empty() && !fallbackLocalImages.empty()) {
+                const size_t kInlineFallbackMax = 3;
+                nlohmann::json inlineHitImgs = nlohmann::json::array();
+                nlohmann::json inlineB64Arr = nlohmann::json::array();
+
+                size_t added = 0;
+                for (const auto& it : fallbackLocalImages) {
+                    if (added >= kInlineFallbackMax) break;
+                    const auto& jpegBytes = it.first;
+                    const auto& t = it.second;
+                    if (jpegBytes.empty()) continue;
+
+                    std::string bytesStr(
+                        reinterpret_cast<const char*>(jpegBytes.data()),
+                        jpegBytes.size()
+                    );
+                    std::string b64 = base64Encode(bytesStr);
+                    if (b64.empty()) continue;
+
+                    const std::string dataUrl = "data:image/jpeg;base64," + b64;
+
+                    nlohmann::json x;
+                    if (!t.empty()) x["time_in_video"] = t;
+                    x["url"] = dataUrl;
+                    x["media_type"] = "image";
+                    inlineHitImgs.push_back(std::move(x));
+                    inlineB64Arr.push_back(dataUrl);
+                    ++added;
+                }
+
+                if (!inlineHitImgs.empty()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: media upload empty, using inline image fallback count=" +
+                        std::to_string(inlineHitImgs.size())
+                    );
+                    hitObj["hit_images"] = inlineHitImgs;
+                    hitObj["frames_jpeg_base64"] = inlineB64Arr;
+                    hitObj["frames_image_urls"] = inlineB64Arr;
+                    hitObj["frame_jpeg_base64"] = inlineB64Arr[0];
+                    hitObj["frame_image_url"] = inlineB64Arr[0];
+                }
+            }
+
+
+            hitsJson.push_back(std::move(hitObj));
+        }
+
+        postBody["vision_hits"] = hitsJson;
+        postBody["status"] = "vision_done";
+
+        postVideoSearchProgress("finalizing", 5, 5);
+
+        try {
+            std::string url =
+                baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: POSTing VISION result to " + url
+            );
+
+            std::string postBodyStr = postBody.dump();
+            std::string respBody;
+            long httpCode = HttpPostJson(url, exeToken_, postBodyStr, respBody);
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: vision chat-response HTTP " +
+                std::to_string(httpCode) +
+                " responseSize=" + std::to_string(respBody.size())
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_ vision post exception"
+            );
+        }
+
+        // cleanup temp segments (your existing block already does this)
+#ifdef _WIN32
+        {
+            std::error_code delEc;
+            for (const auto& seg : encodedVideos) {
+                if (seg.isTempFile && !seg.sourceFilePath.empty()) {
+                    fs::remove(seg.sourceFilePath, delEc);
+                    if (delEc) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "cleanupTempSegments: failed to remove " +
+                            seg.sourceFilePath + " error=" + delEc.message()
+                        );
+                    }
+                }
+            }
+        }
+#endif
+    }
+    catch (const std::exception& e) {
+        logAgentException_(
+            "agent",
+            "chat",
+            "AgentCore::handleChatQuery_",
+            "handle_chat_query",
+            makeChatContext("handle_chat_query"),
+            e
+        );
+
+        // Best-effort: notify frontend so it doesn't spin forever.
+        try {
+            if (!userQuestion.empty() && chatSessionId >= 0) {
+                json err;
+                err["chat_session_id"] = chatSessionId;
+                err["command_id"] = commandId;
+                err["status"] = "error";
+                err["answer"] = "Communication issue while contacting servers. Please try again.";
+                err["original_query"] = userQuestion;
+
+                std::string url = baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                std::string resp;
+                long code = HttpPostJson(url, exeToken_, err.dump(), resp);
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: error chat-response HTTP " + std::to_string(code) +
+                    " responseSize=" + std::to_string(resp.size())
+                );
+            }
+        }
+        catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "chat",
+                "AgentCore::handleChatQuery_",
+                "post_error_response",
+                makeChatContext("post_error_response")
+            );
+        }
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            "agent",
+            "chat",
+            "AgentCore::handleChatQuery_",
+            "handle_chat_query",
+            makeChatContext("handle_chat_query")
+        );
+
+        // Best-effort: notify frontend so it doesn't spin forever.
+        try {
+            if (!userQuestion.empty() && chatSessionId >= 0) {
+                json err;
+                err["chat_session_id"] = chatSessionId;
+                err["command_id"] = commandId;
+                err["status"] = "error";
+                err["answer"] = "Communication issue while contacting servers. Please try again.";
+                err["original_query"] = userQuestion;
+
+                std::string url = baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                std::string resp;
+                HttpPostJson(url, exeToken_, err.dump(), resp);
+            }
+        }
+        catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "chat",
+                "AgentCore::handleChatQuery_",
+                "post_error_response",
+                makeChatContext("post_error_response")
+            );
+        }
+    }
+}
+
+
+
+    /*
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("handleChatQuery_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "handleChatQuery_ unknown exception"
+        );
+    }
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void logJsonCandidatesOnly(const std::string& prefix, const nlohmann::json& j)
+{
+    if (j.is_discarded()) {
+        Logger::instance().logDebug("agent", prefix + ": <discarded JSON>");
+        return;
+    }
+
+    // Find "candidates" and log only that
+    auto it = j.find("candidates");
+    if (it == j.end()) {
+        Logger::instance().logDebug("agent", prefix + ": <no 'candidates' key>");
+        return;
+    }
+
+    // Safe dump with truncation so logs don't explode
+    std::string dump;
+    try {
+        dump = it->dump(2);  // pretty-print candidates
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", prefix + ": <error dumping 'candidates'>");
+        return;
+    }
+
+    const std::size_t MAX_LOG = 4000; // pick what you like
+    if (dump.size() > MAX_LOG) {
+        dump = dump.substr(0, MAX_LOG) + "...(truncated)";
+    }
+
+    Logger::instance().logDebug("agent", prefix + " candidates=" + dump);
+}
+
+static void stripJsonKeyRecursive_(nlohmann::json& node, const char* key)
+{
+    if (node.is_object()) {
+        node.erase(key);
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            stripJsonKeyRecursive_(it.value(), key);
+        }
+        return;
+    }
+
+    if (node.is_array()) {
+        for (auto& item : node) {
+            stripJsonKeyRecursive_(item, key);
+        }
+    }
+}
+
+static std::string sanitizeModelRawRespForLog_(const std::string& rawResp)
+{
+    if (rawResp.empty()) return rawResp;
+
+    nlohmann::json parsed = nlohmann::json::parse(rawResp, nullptr, false);
+    if (parsed.is_discarded()) {
+        return rawResp;
+    }
+
+    stripJsonKeyRecursive_(parsed, "thoughtSignature");
+    try {
+        return parsed.dump();
+    }
+    catch (...) {
+        return rawResp;
+    }
+}
+
+static std::string buildGroupInputSourceSummary_(const std::vector<GroupImageInput>& inputs)
+{
+    std::ostringstream oss;
+    bool wroteAny = false;
+
+    for (const auto& in : inputs) {
+        if (in.cameraId <= 0) continue;
+        if (wroteAny) oss << ", ";
+        wroteAny = true;
+        oss << "cam" << in.cameraId;
+        if (!in.regionId.empty()) {
+            oss << "/region=" << in.regionId;
+        }
+        oss << "=" << (in.sourceTag.empty() ? "unknown" : in.sourceTag);
+    }
+
+    if (!wroteAny) return "none";
+    return oss.str();
+}
+
+static void logGroupCameraDebug_(
+    const std::vector<GroupImageInput>& inputs,
+    const std::string& message,
+    bool forceCameraStream = false)
+{
+    std::vector<std::string> logIds;
+    logIds.reserve(inputs.size());
+
+    for (const auto& in : inputs) {
+        if (in.cameraId <= 0) continue;
+        const std::string id = std::to_string(in.cameraId);
+        if (std::find(logIds.begin(), logIds.end(), id) == logIds.end()) {
+            logIds.push_back(id);
+        }
+    }
+
+    if (logIds.empty()) {
+        if (forceCameraStream) Logger::instance().logDebugNoEscalation("agent", message);
+        else Logger::instance().logDebug("agent", message);
+        return;
+    }
+
+    for (const auto& id : logIds) {
+        if (forceCameraStream) Logger::instance().logDebugNoEscalation(id, message);
+        else Logger::instance().logDebug(id, message);
+    }
+}
+
+
+
+
+
+
+static bool addOneSecondToMMSS(std::string& mmss)
+{
+    int mm = 0, ss = 0;
+
+    // Accept "MM:SS" (your contract). If it doesn't match, don't touch it.
+    if (sscanf_s(mmss.c_str(), "%d:%d", &mm, &ss) != 2) {
+        return false;
+    }
+    if (mm < 0 || ss < 0 || ss > 59) {
+        return false;
+    }
+
+    int total = mm * 60 + ss;
+    total += 1; // add one second
+
+    mm = total / 60;
+    ss = total % 60;
+
+    char buf[16];
+    sprintf_s(buf, "%02d:%02d", mm, ss);
+    mmss = buf;
+    return true;
+}
+
+
+
+
+
+
+
+static std::string pickGeminiModelName(
+    const std::string& modelTier,
+    bool hasReferenceImage)
+{
+    const std::string t = normalizeChatModelTierName(modelTier);
+
+    if (t == "legacy") {
+        return "gemini-3-flash-preview";
+    }
+    if (t == "ultra") {
+        return "gemini-3-flash-preview";
+    }
+    if (t == "pro") {
+        return "gemini-2.5-flash"; //"gemini-2.0-flash";
+    }
+    // legacy (default)
+    // If user provided a reference image, you may want to auto-bump
+    // to 2.5 for stronger face matching.
+    if (hasReferenceImage) {
+        return "gemini-3-flash-preview"; //"gemini-2.5-flash";
+    }
+    return "gemini-2.0-flash-lite";
+}
+
+
+
+
+
+
+
+static bool convertToVideoOnlyWebmWithFfmpeg(const std::string& inputPathMp4, const std::string& outputPathWebm)
+{
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(inputPathMp4);
+    std::wstring outW = utf8ToWide(outputPathWebm);
+
+    // Convert MP4 -> WebM (VP9) and FORCE no audio.
+    // -map 0:v:0 : take only video stream
+    // -an        : ensure no audio stream
+    // VP9 params: -b:v 0 -crf 32 (reasonable quality/size)
+    //
+    // If performance is too slow, IÃƒÂ¢Ã‚â‚¬Ã‚â„¢ll give you a VP8 variant.
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -hide_banner -loglevel error -y"
+        L" -i \"" + inW + L"\""
+        L" -map 0:v:0"
+        L" -c:v libvpx-vp9 -b:v 0 -crf 32"
+        L" -an"
+        L" \"" + outW + L"\"";
+
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr, nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr, nullptr,
+        &si,
+        &pi
+    );
+    if (!ok) return false;
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    return (exitCode == 0) && fs::exists(outputPathWebm) && (fs::file_size(outputPathWebm) > 1024);
+}
+
+
+
+
+
+
+
+
+namespace {
+
+    static bool isTransientOpenAIHttpCode(long httpCode)
+    {
+        return httpCode == 408 || httpCode == 409 || httpCode == 425 ||
+            httpCode == 429 || (httpCode >= 500 && httpCode <= 599);
+    }
+
+    static std::string truncateForLog_(const std::string& s, std::size_t maxLen = 1000)
+    {
+        if (s.size() <= maxLen) return s;
+        return s.substr(0, maxLen) + "...(truncated)";
+    }
+
+    static int parseOpenAIHttpStatusFromError_(const std::string& errorText)
+    {
+        const std::string marker = "OpenAI HTTP ";
+        const std::size_t pos = errorText.find(marker);
+        if (pos == std::string::npos) return 0;
+
+        std::size_t cursor = pos + marker.size();
+        std::size_t end = cursor;
+        while (end < errorText.size() && std::isdigit(static_cast<unsigned char>(errorText[end]))) {
+            ++end;
+        }
+
+        if (end <= cursor) return 0;
+        try {
+            return std::stoi(errorText.substr(cursor, end - cursor));
+        }
+        catch (...) {
+            return 0;
+        }
+    }
+
+    static std::string extractOpenAIErrorBodyFromError_(const std::string& errorText)
+    {
+        const std::string marker = " body=";
+        const std::size_t pos = errorText.find(marker);
+        if (pos == std::string::npos) return "";
+        return trimAscii(errorText.substr(pos + marker.size()));
+    }
+
+    static void extractOpenAIErrorFields_(
+        const std::string& errorBody,
+        std::string& outCode,
+        std::string& outType,
+        std::string& outMessage)
+    {
+        outCode.clear();
+        outType.clear();
+        outMessage.clear();
+        if (errorBody.empty()) return;
+
+        nlohmann::json bodyJson = nlohmann::json::parse(errorBody, nullptr, false);
+        if (bodyJson.is_discarded()) return;
+
+        const nlohmann::json* err = nullptr;
+        if (bodyJson.is_object() && bodyJson.contains("error") && bodyJson["error"].is_object()) {
+            err = &bodyJson["error"];
+        }
+        else if (bodyJson.is_object()) {
+            err = &bodyJson;
+        }
+        if (!err) return;
+
+        if (err->contains("code") && (*err)["code"].is_string()) {
+            outCode = trimAscii((*err)["code"].get<std::string>());
+        }
+        if (err->contains("type") && (*err)["type"].is_string()) {
+            outType = trimAscii((*err)["type"].get<std::string>());
+        }
+        if (err->contains("message") && (*err)["message"].is_string()) {
+            outMessage = trimAscii((*err)["message"].get<std::string>());
+        }
+    }
+
+    static bool shouldEmitAgentApiErrorEvent_(
+        const std::string& key,
+        std::chrono::seconds dedupeWindow = std::chrono::seconds(20))
+    {
+        static std::mutex s_mu;
+        static std::unordered_map<std::string, std::chrono::steady_clock::time_point> s_lastByKey;
+
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(s_mu);
+
+        auto it = s_lastByKey.find(key);
+        if (it != s_lastByKey.end()) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
+            if (elapsed < dedupeWindow) {
+                return false;
+            }
+            it->second = now;
+        }
+        else {
+            s_lastByKey[key] = now;
+        }
+
+        if (s_lastByKey.size() > 512) {
+            for (auto iter = s_lastByKey.begin(); iter != s_lastByKey.end();) {
+                const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - iter->second);
+                if (age > std::chrono::seconds(180)) {
+                    iter = s_lastByKey.erase(iter);
+                }
+                else {
+                    ++iter;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    static void emitAgentApiErrorEvent_(
+        AgentCore* owner,
+        std::optional<int> cameraId,
+        const std::string& source,
+        const std::string& stage,
+        const std::string& modelName,
+        const std::string& rawError,
+        const nlohmann::json& extraDetails = nlohmann::json::object())
+    {
+        if (!owner) return;
+
+        const std::string cleanedRaw = trimAscii(rawError);
+        const int httpStatus = parseOpenAIHttpStatusFromError_(cleanedRaw);
+        const std::string errorBody = extractOpenAIErrorBodyFromError_(cleanedRaw);
+
+        std::string apiCode;
+        std::string apiType;
+        std::string apiMessage;
+        extractOpenAIErrorFields_(errorBody, apiCode, apiType, apiMessage);
+
+        std::string toastMessage;
+        const std::string normalizedCode = apiCode;
+        if (normalizedCode == "insufficient_quota") {
+            toastMessage = "OpenAI API quota exceeded. Check plan and billing details.";
+        }
+        else if (normalizedCode == "invalid_api_key" || httpStatus == 401) {
+            toastMessage = "OpenAI API key is invalid or unauthorized.";
+        }
+        else if (httpStatus == 429) {
+            toastMessage = "OpenAI API rate limit/quota reached. Try again shortly.";
+        }
+        else if (!apiMessage.empty()) {
+            toastMessage = "OpenAI API error: " + truncateForLog_(apiMessage, 260);
+        }
+        else if (!cleanedRaw.empty()) {
+            toastMessage = "OpenAI API request failed: " + truncateForLog_(cleanedRaw, 260);
+        }
+        else {
+            toastMessage = "OpenAI API request failed.";
+        }
+
+        const std::string dedupeKey =
+            "agent_api_error|" + source + "|" + stage + "|" + modelName + "|" +
+            std::to_string(cameraId.value_or(-1)) + "|" + std::to_string(httpStatus) + "|" + apiCode;
+        if (!shouldEmitAgentApiErrorEvent_(dedupeKey)) {
+            return;
+        }
+
+        nlohmann::json details = nlohmann::json::object();
+        if (extraDetails.is_object()) {
+            details = extraDetails;
+        }
+        details["provider"] = "openai";
+        if (!source.empty()) details["source"] = source;
+        if (!stage.empty()) details["stage"] = stage;
+        if (!modelName.empty()) details["model"] = modelName;
+        if (httpStatus > 0) details["http_status"] = httpStatus;
+        if (!apiCode.empty()) details["api_error_code"] = apiCode;
+        if (!apiType.empty()) details["api_error_type"] = apiType;
+        if (!apiMessage.empty()) details["api_error_message"] = truncateForLog_(apiMessage, 400);
+        if (!cleanedRaw.empty()) details["raw_error"] = truncateForLog_(cleanedRaw, 600);
+
+        owner->postAgentEvent(
+            "agent_api_error",
+            cameraId,
+            /*userId*/ "",
+            toastMessage,
+            details
+        );
+    }
+
+    // Mirrors Gemini retry behavior for OpenAI /v1/chat/completions.
+    static std::string httpPostJsonOpenAI(
+        const std::string& apiKey,
+        const nlohmann::json& bodyJson,
+        const std::function<void()>& onFirstRetry,
+        const std::string& cameraLogId = "")
+    {
+        const std::string modelName = bodyJson.value("model", std::string());
+        auto isZAiCoreModelLocal = [](std::string m) {
+            const auto first = std::find_if_not(m.begin(), m.end(),
+                [](unsigned char c) { return std::isspace(c) != 0; });
+            const auto last = std::find_if_not(m.rbegin(), m.rend(),
+                [](unsigned char c) { return std::isspace(c) != 0; }).base();
+            if (first >= last) {
+                m.clear();
+            }
+            else {
+                m.assign(first, last);
+            }
+            std::transform(m.begin(), m.end(), m.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            return m == "glm-4.6v-flash" || (m.rfind("glm-4.6v-flash-", 0) == 0);
+        };
+        const bool useZAiCore = isZAiCoreModelLocal(modelName);
+        std::string normalizedModelName = modelName;
+        {
+            const auto first = std::find_if_not(normalizedModelName.begin(), normalizedModelName.end(),
+                [](unsigned char c) { return std::isspace(c) != 0; });
+            const auto last = std::find_if_not(normalizedModelName.rbegin(), normalizedModelName.rend(),
+                [](unsigned char c) { return std::isspace(c) != 0; }).base();
+            if (first >= last) {
+                normalizedModelName.clear();
+            }
+            else {
+                normalizedModelName.assign(first, last);
+            }
+            std::transform(normalizedModelName.begin(), normalizedModelName.end(), normalizedModelName.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+        }
+        const bool isGpt5Family = normalizedModelName.rfind("gpt-5", 0) == 0;
+        int requestedOutputBudget = 0;
+        if (bodyJson.contains("max_completion_tokens")) {
+            const auto& v = bodyJson["max_completion_tokens"];
+            if (v.is_number_integer()) requestedOutputBudget = v.get<int>();
+            else if (v.is_number()) requestedOutputBudget = static_cast<int>(std::llround(v.get<double>()));
+        }
+        if (requestedOutputBudget <= 0 && bodyJson.contains("max_tokens")) {
+            const auto& v = bodyJson["max_tokens"];
+            if (v.is_number_integer()) requestedOutputBudget = v.get<int>();
+            else if (v.is_number()) requestedOutputBudget = static_cast<int>(std::llround(v.get<double>()));
+        }
+
+        long requestTimeoutSec = 120L;
+        int maxAttempts = 3;
+        if (!useZAiCore && isGpt5Family) {
+            // GPT-5 vision calls can legitimately take longer, especially with large completion budgets.
+            if (requestedOutputBudget >= 4000) requestTimeoutSec = 360L;
+            else if (requestedOutputBudget >= 3000) requestTimeoutSec = 300L;
+            else if (requestedOutputBudget >= 2200) requestTimeoutSec = 240L;
+            else requestTimeoutSec = 180L;
+
+            // Avoid excessive stalls when one long request already timed out.
+            maxAttempts = 2;
+        }
+
+        const std::string url = useZAiCore
+            ? "https://api.z.ai/api/paas/v4/chat/completions"
+            : "https://api.openai.com/v1/chat/completions";
+        const std::string providerLabel = useZAiCore ? "Z.ai" : "OpenAI";
+        const std::string body = bodyJson.dump();
+        auto logCoreLatency = [&](const std::string& msg) {
+            if (cameraLogId.empty() || cameraLogId == "agent") return;
+            Logger::instance().logDebug(cameraLogId, msg);
+        };
+
+        auto isTransientCurl = [](CURLcode c) {
+            switch (c) {
+            case CURLE_OPERATION_TIMEDOUT:
+            case CURLE_COULDNT_CONNECT:
+            case CURLE_COULDNT_RESOLVE_HOST:
+            case CURLE_SEND_ERROR:
+            case CURLE_RECV_ERROR:
+                return true;
+            default:
+                return false;
+            }
+            };
+
+        bool notified = false;
+        std::string lastErr;
+        const auto requestCycleStart = std::chrono::steady_clock::now();
+
+        for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+            CURL* curl = curl_easy_init();
+            if (!curl) throw std::runtime_error("curl_easy_init failed");
+
+            std::string response;
+            long httpCode = 0;
+
+            struct curl_slist* headers = nullptr;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            headers = curl_slist_append(headers, "Accept: application/json");
+            headers = curl_slist_append(headers, ("Authorization: Bearer " + apiKey).c_str());
+
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+            // Keep bounded and similar to Gemini path.
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, requestTimeoutSec);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+            const auto attemptStart = std::chrono::steady_clock::now();
+            const CURLcode res = curl_easy_perform(curl);
+            const auto attemptEnd = std::chrono::steady_clock::now();
+            const auto attemptLatencyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(attemptEnd - attemptStart).count();
+            if (res == CURLE_OK) {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+            }
+
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+
+            if (useZAiCore) {
+                logCoreLatency(
+                    "core_inference_http_latency_ms model=" +
+                    (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                    " provider=" + providerLabel +
+                    " attempt=" + std::to_string(attempt) +
+                    " latency_ms=" + std::to_string(attemptLatencyMs) +
+                    " http_status=" + std::to_string(httpCode) +
+                    " curl_code=" + std::to_string(static_cast<int>(res))
+                );
+            }
+
+            if (res == CURLE_OK && httpCode >= 200 && httpCode < 300) {
+                if (useZAiCore) {
+                    const auto totalLatencyMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - requestCycleStart).count();
+                    logCoreLatency(
+                        "core_inference_http_total_latency_ms model=" +
+                        (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                        " provider=" + providerLabel +
+                        " attempts=" + std::to_string(attempt) +
+                        " total_latency_ms=" + std::to_string(totalLatencyMs) +
+                        " status=success"
+                    );
+                }
+                return response;
+            }
+
+            bool shouldRetry = false;
+            if (res != CURLE_OK) {
+                shouldRetry = isTransientCurl(res);
+                lastErr = providerLabel + " curl error: " + curl_easy_strerror(res);
+            }
+            else {
+                shouldRetry = isTransientOpenAIHttpCode(httpCode);
+                lastErr = providerLabel + " HTTP " + std::to_string(httpCode) +
+                    " body=" + truncateForLog_(response);
+            }
+
+            if (attempt < maxAttempts && shouldRetry) {
+                if (!notified && onFirstRetry) {
+                    notified = true;
+                    try { onFirstRetry(); }
+                    catch (...) {}
+                }
+                int backoffMs = (attempt == 1) ? 300 : 700;
+                if (res == CURLE_OK && httpCode == 429) {
+                    backoffMs = (attempt == 1) ? 3000 : 10000;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+                continue;
+            }
+
+            if (useZAiCore) {
+                const auto totalLatencyMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - requestCycleStart).count();
+                logCoreLatency(
+                    "core_inference_http_total_latency_ms model=" +
+                    (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                    " provider=" + providerLabel +
+                    " attempts=" + std::to_string(attempt) +
+                    " total_latency_ms=" + std::to_string(totalLatencyMs) +
+                    " status=error reason=" + truncateForLog_(lastErr, 200)
+                );
+            }
+            throw std::runtime_error(lastErr);
+        }
+
+        if (useZAiCore) {
+            const auto totalLatencyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - requestCycleStart).count();
+            logCoreLatency(
+                "core_inference_http_total_latency_ms model=" +
+                (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                " provider=" + providerLabel +
+                " attempts=" + std::to_string(maxAttempts) +
+                " total_latency_ms=" + std::to_string(totalLatencyMs) +
+                " status=error reason=loop_exhausted"
+            );
+        }
+        throw std::runtime_error(lastErr.empty() ? "httpPostJsonOpenAI failed" : lastErr);
+    }
+
+    static void extractOpenAIUsageTokens(
+        const nlohmann::json& respJson,
+        int& outPromptTokens,
+        int& outOutputTokens,
+        int& outTotalTokens)
+    {
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        if (!respJson.contains("usage") || !respJson["usage"].is_object()) return;
+
+        const auto& u = respJson["usage"];
+        outPromptTokens = u.value("prompt_tokens", 0);
+        outOutputTokens = u.value("completion_tokens", 0);
+        outTotalTokens = u.value("total_tokens", 0);
+    }
+
+    static std::string extractOpenAIFinishReason(const nlohmann::json& respJson)
+    {
+        if (!respJson.contains("choices") ||
+            !respJson["choices"].is_array() ||
+            respJson["choices"].empty())
+        {
+            return "";
+        }
+
+        const auto& c0 = respJson["choices"][0];
+        if (!c0.is_object()) return "";
+        if (!c0.contains("finish_reason") || !c0["finish_reason"].is_string()) return "";
+        return c0["finish_reason"].get<std::string>();
+    }
+
+    static std::string extractOpenAITextFromResponse(const nlohmann::json& respJson)
+    {
+        if (!respJson.contains("choices") ||
+            !respJson["choices"].is_array() ||
+            respJson["choices"].empty())
+        {
+            return "";
+        }
+
+        const auto& c0 = respJson["choices"][0];
+        if (!c0.contains("message") || !c0["message"].is_object()) return "";
+
+        const auto& msg = c0["message"];
+        if (!msg.contains("content")) return "";
+
+        const auto& content = msg["content"];
+        if (content.is_string()) {
+            return content.get<std::string>();
+        }
+
+        if (!content.is_array()) return "";
+
+        std::string text;
+        for (const auto& part : content) {
+            if (part.is_string()) {
+                text += part.get<std::string>();
+                continue;
+            }
+            if (!part.is_object()) continue;
+            if (part.contains("text") && part["text"].is_string()) {
+                text += part["text"].get<std::string>();
+                continue;
+            }
+            if (part.contains("type") && part["type"].is_string()) {
+                const std::string type = part["type"].get<std::string>();
+                if ((type == "text" || type == "output_text") &&
+                    part.contains("text") && part["text"].is_string())
+                {
+                    text += part["text"].get<std::string>();
+                }
+            }
+        }
+        return text;
+    }
+
+    static bool tryExtractJsonObjectSlice(const std::string& text, std::string& outJsonSlice)
+    {
+        const std::size_t firstBrace = text.find('{');
+        const std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos ||
+            lastBrace == std::string::npos ||
+            lastBrace <= firstBrace)
+        {
+            return false;
+        }
+
+        outJsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+        return true;
+    }
+
+    static nlohmann::json makeOpenAIImageContentFromBareJpeg(const std::string& bareJpegBase64)
+    {
+        return nlohmann::json{
+            { "type", "image_url" },
+            { "image_url", {
+                { "url", "data:image/jpeg;base64," + bareJpegBase64 },
+                { "detail", "low" }
+            }}
+        };
+    }
+
+    static std::string normalizeOpenAIFrameJpegBase64ForModel_(
+        const std::string& bareJpegBase64,
+        const std::string& modelName)
+    {
+        if (bareJpegBase64.empty()) return bareJpegBase64;
+
+#ifdef _WIN32
+        auto normalizeModelNameLocal = [](std::string m) {
+            const auto first = std::find_if_not(m.begin(), m.end(),
+                [](unsigned char c) { return std::isspace(c) != 0; });
+            const auto last = std::find_if_not(m.rbegin(), m.rend(),
+                [](unsigned char c) { return std::isspace(c) != 0; }).base();
+            if (first >= last) {
+                m.clear();
+            }
+            else {
+                m.assign(first, last);
+            }
+            std::transform(m.begin(), m.end(), m.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            return m;
+        };
+        auto isGpt5NanoModelLocal = [&](const std::string& m) {
+            const std::string normalized = normalizeModelNameLocal(m);
+            return (normalized == "gpt-5-nano") || (normalized.rfind("gpt-5-nano-", 0) == 0);
+        };
+        auto isZAiCoreModelLocal = [&](const std::string& m) {
+            const std::string normalized = normalizeModelNameLocal(m);
+            return normalized == "glm-4.6v-flash" || (normalized.rfind("glm-4.6v-flash-", 0) == 0);
+        };
+
+        if (isZAiCoreModelLocal(modelName)) {
+            // Core frames are already normalized at extraction time.
+            return bareJpegBase64;
+        }
+
+        std::vector<unsigned char> bytes;
+        std::string err;
+        if (!decodeBase64ToBytesForPromptEnhance_(bareJpegBase64, bytes, &err) || bytes.empty()) {
+            return bareJpegBase64;
+        }
+
+        cv::Mat decoded = cv::imdecode(bytes, cv::IMREAD_COLOR);
+        if (decoded.empty()) {
+            return bareJpegBase64;
+        }
+
+        const int width = decoded.cols;
+        const int height = decoded.rows;
+        if (width <= 0 || height <= 0) {
+            return bareJpegBase64;
+        }
+
+        int newW = width;
+        int newH = height;
+
+        if (isGpt5NanoModelLocal(modelName)) {
+            constexpr int kMaxSide = 1024;
+            const int longestSide = (std::max)(width, height);
+            if (longestSide <= kMaxSide) {
+                return bareJpegBase64;
+            }
+            const double scale = static_cast<double>(kMaxSide) / static_cast<double>(longestSide);
+            newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+            newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+        }
+        else {
+            constexpr int kMaxW = 1280;
+            constexpr int kMaxH = 720;
+            if (width <= kMaxW && height <= kMaxH) {
+                return bareJpegBase64;
+            }
+            const double scaleW = static_cast<double>(kMaxW) / static_cast<double>(width);
+            const double scaleH = static_cast<double>(kMaxH) / static_cast<double>(height);
+            const double scale = (std::min)(scaleW, scaleH);
+            newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+            newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+        }
+
+        cv::Mat resized;
+        cv::resize(decoded, resized, cv::Size(newW, newH), 0.0, 0.0, cv::INTER_AREA);
+
+        std::vector<unsigned char> jpeg;
+        const std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 82 };
+        if (!cv::imencode(".jpg", resized, jpeg, params) || jpeg.empty()) {
+            return bareJpegBase64;
+        }
+
+        const std::string bytesStr(
+            reinterpret_cast<const char*>(jpeg.data()),
+            reinterpret_cast<const char*>(jpeg.data()) + jpeg.size()
+        );
+        return base64Encode(bytesStr);
+#else
+        return bareJpegBase64;
+#endif
+    }
+
+    static nlohmann::json makeOpenAIFrameImageContentFromBareJpeg(
+        const std::string& bareJpegBase64,
+        const std::string& modelName)
+    {
+        const std::string normalized =
+            normalizeOpenAIFrameJpegBase64ForModel_(bareJpegBase64, modelName);
+        return makeOpenAIImageContentFromBareJpeg(normalized.empty() ? bareJpegBase64 : normalized);
+    }
+
+    static std::vector<FaceReferenceImage> buildEffectiveFaceReferences_(
+        const std::vector<FaceReferenceImage>& faceReferences,
+        const std::string& uploadedImageBase64 = "")
+    {
+        std::vector<FaceReferenceImage> out;
+        out.reserve(faceReferences.size() + 1);
+
+        for (const auto& ref : faceReferences) {
+            const std::string data = stripDataUrlPrefix(ref.imageDataUrl);
+            if (data.empty()) continue;
+            FaceReferenceImage normalized = ref;
+            normalized.imageDataUrl = "data:image/jpeg;base64," + data;
+            out.push_back(std::move(normalized));
+        }
+
+        if (out.empty() && !uploadedImageBase64.empty()) {
+            const std::string fallbackData = stripDataUrlPrefix(uploadedImageBase64);
+            if (!fallbackData.empty()) {
+                FaceReferenceImage fallback;
+                fallback.targetId = -1;
+                fallback.targetName = "reference_face";
+                fallback.targetDescription = "User-provided face reference";
+                fallback.imageDataUrl = "data:image/jpeg;base64," + fallbackData;
+                out.push_back(std::move(fallback));
+            }
+        }
+
+        return out;
+    }
+
+    static void appendUniqueTrimmedTargetName_(
+        std::vector<std::string>& outNames,
+        const std::string& rawName)
+    {
+        auto trimCopy = [](std::string s) {
+            auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+            while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
+            while (!s.empty() && isSpace((unsigned char)s.back())) s.pop_back();
+            return s;
+        };
+
+        const std::string name = trimCopy(rawName);
+        if (name.empty()) return;
+        if (std::find(outNames.begin(), outNames.end(), name) != outNames.end()) return;
+        outNames.push_back(name);
+    }
+
+    static std::vector<std::string> collectTargetNamesFromFaceReferences_(
+        const std::vector<FaceReferenceImage>& references)
+    {
+        std::vector<std::string> names;
+        for (const auto& ref : references) {
+            appendUniqueTrimmedTargetName_(names, ref.targetName);
+        }
+        return names;
+    }
+
+    static nlohmann::json buildFaceIdentityMatchesFromReferences_(
+        const std::vector<FaceReferenceImage>& references,
+        const std::vector<std::string>& matchedTargetNames,
+        const std::string& source)
+    {
+        nlohmann::json out = nlohmann::json::array();
+        if (matchedTargetNames.empty()) return out;
+
+        auto trimCopy = [](std::string s) {
+            auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+            while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
+            while (!s.empty() && isSpace((unsigned char)s.back())) s.pop_back();
+            return s;
+        };
+        auto lowerCopy = [&](const std::string& raw) {
+            std::string s = trimCopy(raw);
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return s;
+        };
+
+        std::unordered_set<std::string> emitted;
+        for (const auto& matchedNameRaw : matchedTargetNames) {
+            const std::string matchedName = trimCopy(matchedNameRaw);
+            if (matchedName.empty()) continue;
+            const std::string matchKey = lowerCopy(matchedName);
+            if (!emitted.insert(matchKey).second) continue;
+
+            nlohmann::json item = {
+                { "target_name", matchedName },
+                { "source", trimCopy(source).empty() ? std::string("face_target_match") : trimCopy(source) },
+                { "reference_image_urls", nlohmann::json::array() }
+            };
+
+            std::unordered_set<std::string> seenUrls;
+            for (const auto& ref : references) {
+                if (lowerCopy(ref.targetName) != matchKey) continue;
+                if (ref.targetId > 0) item["target_id"] = ref.targetId;
+                const std::string description = trimCopy(ref.targetDescription);
+                if (!description.empty() && !item.contains("target_description")) {
+                    item["target_description"] = description;
+                }
+                const std::string imageUrl = trimCopy(ref.referenceImageUrl);
+                if (!imageUrl.empty() && seenUrls.insert(imageUrl).second) {
+                    item["reference_image_urls"].push_back(imageUrl);
+                }
+            }
+
+            out.push_back(std::move(item));
+        }
+        return out;
+    }
+
+    static std::vector<std::string> parseFaceIdTargetNamesFromJson_(
+        const nlohmann::json& node)
+    {
+        std::vector<std::string> names;
+        if (!node.is_object()) return names;
+
+        auto consumeField = [&](const char* key) {
+            if (!node.contains(key)) return;
+            const auto& field = node[key];
+            if (field.is_string()) {
+                appendUniqueTrimmedTargetName_(names, field.get<std::string>());
+                return;
+            }
+            if (field.is_array()) {
+                for (const auto& it : field) {
+                    if (!it.is_string()) continue;
+                    appendUniqueTrimmedTargetName_(names, it.get<std::string>());
+                }
+            }
+        };
+
+        consumeField("faceid_target_names");
+        consumeField("matched_target_names");
+        consumeField("matched_target_name");
+        consumeField("target_names");
+
+        return names;
+    }
+
+    static void appendUniqueTrimmedText_(
+        std::vector<std::string>& out,
+        const std::string& rawText)
+    {
+        auto trimCopy = [](std::string s) {
+            auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+            while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
+            while (!s.empty() && isSpace((unsigned char)s.back())) s.pop_back();
+            return s;
+        };
+
+        const std::string text = trimCopy(rawText);
+        if (text.empty()) return;
+        if (std::find(out.begin(), out.end(), text) != out.end()) return;
+        out.push_back(text);
+    }
+
+    static std::vector<std::string> parseAlertRegionIdsFromJson_(
+        const nlohmann::json& node)
+    {
+        std::vector<std::string> regionIds;
+        if (!node.is_object()) return regionIds;
+
+        auto consumeField = [&](const char* key) {
+            if (!node.contains(key)) return;
+            const auto& field = node[key];
+            if (field.is_string()) {
+                appendUniqueTrimmedText_(regionIds, field.get<std::string>());
+                return;
+            }
+            if (field.is_number_integer()) {
+                appendUniqueTrimmedText_(regionIds, std::to_string(field.get<int>()));
+                return;
+            }
+            if (field.is_array()) {
+                for (const auto& it : field) {
+                    if (it.is_string()) {
+                        appendUniqueTrimmedText_(regionIds, it.get<std::string>());
+                    }
+                    else if (it.is_number_integer()) {
+                        appendUniqueTrimmedText_(regionIds, std::to_string(it.get<int>()));
+                    }
+                }
+            }
+        };
+
+        consumeField("alert_region_ids");
+        consumeField("alert_region_id");
+        consumeField("region_ids");
+        consumeField("region_id");
+
+        return regionIds;
+    }
+
+    static bool promptHasTemporalRuntimeInput_(const std::string& userQuestion)
+    {
+        const std::string q = temporal::lower(trimAscii(userQuestion));
+        return q.find("temporal_runtime_input_json") != std::string::npos;
+    }
+
+    static bool promptHasCrossCameraWatchlist_(const std::string& userQuestion)
+    {
+        const std::string q = temporal::lower(trimAscii(userQuestion));
+        return q.find("\"cross_camera_watchlist\"") != std::string::npos ||
+            q.find("cross_camera_watchlist") != std::string::npos;
+    }
+
+    static nlohmann::json parseCrossCameraWatchlistMatchesFromJson_(const nlohmann::json& node)
+    {
+        if (!node.is_object() ||
+            !node.contains("cross_camera_watchlist_matches") ||
+            !node["cross_camera_watchlist_matches"].is_array())
+        {
+            return nlohmann::json::array();
+        }
+
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& item : node["cross_camera_watchlist_matches"]) {
+            if (!item.is_object()) continue;
+            nlohmann::json normalized = nlohmann::json::object();
+            const std::string huntId =
+                item.contains("hunt_id") && item["hunt_id"].is_string()
+                    ? trimAscii(item["hunt_id"].get<std::string>())
+                    : std::string();
+            if (!huntId.empty()) normalized["hunt_id"] = huntId;
+            std::string matchedEntityId;
+            if (item.contains("matched_entity_id") && item["matched_entity_id"].is_string()) {
+                matchedEntityId = trimAscii(item["matched_entity_id"].get<std::string>());
+            }
+            else if (item.contains("entity_id") && item["entity_id"].is_string()) {
+                matchedEntityId = trimAscii(item["entity_id"].get<std::string>());
+            }
+            if (!matchedEntityId.empty()) normalized["matched_entity_id"] = matchedEntityId;
+            if (item.contains("confidence") && item["confidence"].is_number()) {
+                normalized["confidence"] = item["confidence"];
+            }
+            const std::string reason =
+                item.contains("reason") && item["reason"].is_string()
+                    ? trimAscii(item["reason"].get<std::string>())
+                    : std::string();
+            if (!reason.empty()) normalized["reason"] = reason;
+            if (item.contains("matched_target_name") && item["matched_target_name"].is_string()) {
+                normalized["matched_target_name"] = item["matched_target_name"];
+            }
+            if (item.contains("matched_entity_type") && item["matched_entity_type"].is_string()) {
+                normalized["matched_entity_type"] = item["matched_entity_type"];
+            }
+            if (!normalized.empty()) out.push_back(std::move(normalized));
+        }
+        return out;
+    }
+
+    static void parseTemporalFieldsFromJson_(
+        const nlohmann::json& node,
+        VideoHit& hit)
+    {
+        temporal::extractOutputTemporalFields(
+            node,
+            hit.identityPatch,
+            hit.observations,
+            hit.unknownReasons,
+            hit.temporalPayloadPresent
+        );
+    }
+
+    static bool parseStartConditionStepIdField(
+        const nlohmann::json& scid,
+        int& outStepId);
+
+    static void parseDetectionTimeInVideoFromJson_(
+        const nlohmann::json& node,
+        VideoHit& hit)
+    {
+        hit.detectionTimeInVideo.clear();
+
+        auto trimInPlace = [](std::string& s) {
+            auto notSpace = [](int ch) { return !std::isspace(ch); };
+            s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
+            s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
+        };
+
+        auto pushTime = [&](std::string t) {
+            trimInPlace(t);
+            if (t.empty()) return;
+            addOneSecondToMMSS(t);
+            hit.detectionTimeInVideo.push_back(std::move(t));
+        };
+
+        if (!node.contains("detection_time_in_video")) {
+            return;
+        }
+
+        const auto& dt = node["detection_time_in_video"];
+        if (dt.is_string()) {
+            pushTime(dt.get<std::string>());
+            return;
+        }
+        if (!dt.is_array()) {
+            return;
+        }
+
+        for (const auto& item : dt) {
+            if (!item.is_string()) continue;
+            pushTime(item.get<std::string>());
+        }
+    }
+
+    static void parseStructuredVisionResponseIntoHit_(
+        const nlohmann::json& node,
+        VideoHit& hit,
+        bool includeDetectionTimeInVideo,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string())
+    {
+        if (!node.is_object()) return;
+
+        if (node.contains("answer") && node["answer"].is_string()) {
+            hit.answer = node["answer"].get<std::string>();
+        }
+        if (node.contains("alert_condition") && node["alert_condition"].is_boolean()) {
+            hit.alertCondition = node["alert_condition"].get<bool>();
+        }
+
+        hit.alertRegionIds = parseAlertRegionIdsFromJson_(node);
+        parseTemporalFieldsFromJson_(node, hit);
+        hit.crossCameraWatchlistMatches = parseCrossCameraWatchlistMatchesFromJson_(node);
+
+        const std::size_t rawCrossCameraMatchCount =
+            node.contains("cross_camera_watchlist_matches") &&
+            node["cross_camera_watchlist_matches"].is_array()
+                ? node["cross_camera_watchlist_matches"].size()
+                : 0;
+        const std::size_t parsedCrossCameraMatchCount =
+            hit.crossCameraWatchlistMatches.is_array()
+                ? hit.crossCameraWatchlistMatches.size()
+                : 0;
+        if (!logStreamId.empty() &&
+            !scopeTag.empty() &&
+            (rawCrossCameraMatchCount > 0 || parsedCrossCameraMatchCount > 0))
+        {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag + ": parsed cross_camera_watchlist_matches raw_count=" +
+                std::to_string(static_cast<unsigned long long>(rawCrossCameraMatchCount)) +
+                " parsed_count=" +
+                std::to_string(static_cast<unsigned long long>(parsedCrossCameraMatchCount))
+            );
+        }
+
+        if (node.contains("start_condition_step_id")) {
+            int stepId = -1;
+            if (parseStartConditionStepIdField(node["start_condition_step_id"], stepId)) {
+                hit.startConditionStepId = stepId;
+            }
+            else if (node["start_condition_step_id"].is_boolean() &&
+                     !node["start_condition_step_id"].get<bool>())
+            {
+                hit.startConditionStepId = -1;
+            }
+        }
+
+        if (includeDetectionTimeInVideo) {
+            parseDetectionTimeInVideoFromJson_(node, hit);
+        }
+        else {
+            hit.detectionTimeInVideo.clear();
+        }
+    }
+
+    static bool hitHasStructuredMatch_(const VideoHit& hit)
+    {
+        const bool hasCrossCameraMatches =
+            hit.crossCameraWatchlistMatches.is_array() &&
+            !hit.crossCameraWatchlistMatches.empty();
+        return !hit.detectionTimeInVideo.empty() ||
+            hit.alertCondition ||
+            (hit.startConditionStepId >= 0) ||
+            hit.temporalPayloadPresent ||
+            hasCrossCameraMatches;
+    }
+
+    static void appendGeminiFaceReferenceParts_(
+        nlohmann::json& parts,
+        const std::vector<FaceReferenceImage>& references)
+    {
+        for (const auto& ref : references) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+
+            std::ostringstream label;
+            label << "USER_REFERENCE_IMAGE";
+            if (ref.targetId > 0) {
+                label << " TARGET_ID=" << ref.targetId;
+            }
+            if (!ref.targetName.empty()) {
+                label << " TARGET_NAME=" << ref.targetName;
+            }
+
+            parts.push_back({ { "text", label.str() } });
+            parts.push_back({
+                { "inline_data", {
+                    { "mime_type", "image/jpeg" },
+                    { "data", bare }
+                }}
+            });
+        }
+    }
+
+    static void appendOpenAIFaceReferenceContent_(
+        nlohmann::json& content,
+        const std::vector<FaceReferenceImage>& references)
+    {
+        for (const auto& ref : references) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+
+            std::ostringstream label;
+            label << "USER_REFERENCE_IMAGE";
+            if (ref.targetId > 0) {
+                label << " TARGET_ID=" << ref.targetId;
+            }
+            if (!ref.targetName.empty()) {
+                label << " TARGET_NAME=" << ref.targetName;
+            }
+
+            content.push_back({ { "type", "text" }, { "text", label.str() } });
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+        }
+    }
+
+    static std::vector<NegativeReferenceImage> buildEffectiveNegativeReferences_(
+        const std::vector<NegativeReferenceImage>& negativeReferences)
+    {
+        std::vector<NegativeReferenceImage> out;
+        out.reserve(negativeReferences.size());
+        for (const auto& ref : negativeReferences) {
+            const std::string data = stripDataUrlPrefix(ref.imageDataUrl);
+            if (data.empty()) continue;
+            NegativeReferenceImage normalized = ref;
+            normalized.imageDataUrl = "data:image/jpeg;base64," + data;
+            out.push_back(std::move(normalized));
+        }
+        return out;
+    }
+
+    static void appendGeminiNegativeReferenceParts_(
+        nlohmann::json& parts,
+        const std::vector<NegativeReferenceImage>& references)
+    {
+        for (const auto& ref : references) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+
+            std::ostringstream label;
+            label << "NEGATIVE_REFERENCE_IMAGE";
+            if (ref.imageId > 0) {
+                label << " NEGATIVE_IMAGE_ID=" << ref.imageId;
+            }
+
+            parts.push_back({ { "text", label.str() } });
+            parts.push_back({
+                { "inline_data", {
+                    { "mime_type", "image/jpeg" },
+                    { "data", bare }
+                }}
+            });
+        }
+    }
+
+    static void appendOpenAINegativeReferenceContent_(
+        nlohmann::json& content,
+        const std::vector<NegativeReferenceImage>& references)
+    {
+        for (const auto& ref : references) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+
+            std::ostringstream label;
+            label << "NEGATIVE_REFERENCE_IMAGE";
+            if (ref.imageId > 0) {
+                label << " NEGATIVE_IMAGE_ID=" << ref.imageId;
+            }
+
+            content.push_back({ { "type", "text" }, { "text", label.str() } });
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+        }
+    }
+
+    static bool usesOpenAIMaxCompletionTokensField_(std::string modelName)
+    {
+        std::transform(modelName.begin(), modelName.end(), modelName.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        return modelName.rfind("gpt-5", 0) == 0;
+    }
+
+    static std::string normalizeOpenAIModelName_(std::string modelName)
+    {
+        const auto first = std::find_if_not(modelName.begin(), modelName.end(),
+            [](unsigned char c) { return std::isspace(c) != 0; });
+        const auto last = std::find_if_not(modelName.rbegin(), modelName.rend(),
+            [](unsigned char c) { return std::isspace(c) != 0; }).base();
+
+        if (first >= last) {
+            modelName.clear();
+        }
+        else {
+            modelName.assign(first, last);
+        }
+
+        std::transform(modelName.begin(), modelName.end(), modelName.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        return modelName;
+    }
+
+    static bool isZAiCoreModelName_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return normalized == "glm-4.6v-flash" ||
+            normalized.rfind("glm-4.6v-flash-", 0) == 0;
+    }
+
+    static bool isGpt5MiniModel_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return (normalized == "gpt-5-mini") || (normalized.rfind("gpt-5-mini-", 0) == 0);
+    }
+
+    static bool isGpt5NanoModel_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return (normalized == "gpt-5-nano") || (normalized.rfind("gpt-5-nano-", 0) == 0);
+    }
+
+    static int resolveOpenAITokenLimitForModel_(const std::string& modelName, int tokenLimit)
+    {
+        int effectiveLimit = std::max(1, tokenLimit);
+        if (isGpt5NanoModel_(modelName)) {
+            effectiveLimit = std::max(effectiveLimit, 4000);
+        }
+        else if (isGpt5MiniModel_(modelName)) {
+            effectiveLimit = std::max(effectiveLimit, 1600);
+        }
+        return effectiveLimit;
+    }
+
+    static void applyOpenAITokenLimitField_(
+        nlohmann::json& body,
+        const std::string& modelName,
+        int tokenLimit)
+    {
+        if (isZAiCoreModelName_(modelName)) {
+            body.erase("max_tokens");
+            body.erase("max_completion_tokens");
+            body["max_tokens"] = 3000;
+            return;
+        }
+
+        const int effectiveTokenLimit = resolveOpenAITokenLimitForModel_(modelName, tokenLimit);
+        body.erase("max_tokens");
+        body.erase("max_completion_tokens");
+        if (usesOpenAIMaxCompletionTokensField_(modelName)) {
+            body["max_completion_tokens"] = effectiveTokenLimit;
+        }
+        else {
+            body["max_tokens"] = effectiveTokenLimit;
+        }
+    }
+
+    static bool usesOpenAIFixedDefaultTemperature_(std::string modelName)
+    {
+        const auto first = std::find_if_not(modelName.begin(), modelName.end(),
+            [](unsigned char c) { return std::isspace(c) != 0; });
+        const auto last = std::find_if_not(modelName.rbegin(), modelName.rend(),
+            [](unsigned char c) { return std::isspace(c) != 0; }).base();
+        if (first >= last) {
+            modelName.clear();
+        }
+        else {
+            modelName.assign(first, last);
+        }
+
+        return isGpt5MiniModel_(modelName) || isGpt5NanoModel_(modelName);
+    }
+
+    static void applyOpenAITemperatureField_(
+        nlohmann::json& body,
+        const std::string& modelName,
+        double fallbackTemperature)
+    {
+        if (isZAiCoreModelName_(modelName)) {
+            body["temperature"] = 0.2;
+            return;
+        }
+
+        body["temperature"] = usesOpenAIFixedDefaultTemperature_(modelName)
+            ? 1.0
+            : fallbackTemperature;
+    }
+
+    static bool parseStartConditionStepIdField(
+        const nlohmann::json& scid,
+        int& outStepId)
+    {
+        outStepId = -1;
+        if (scid.is_number_integer()) {
+            outStepId = scid.get<int>();
+            return true;
+        }
+        if (scid.is_string()) {
+            const std::string s = scid.get<std::string>();
+            if (!s.empty()) {
+                try {
+                    outStepId = std::stoi(s);
+                    return true;
+                }
+                catch (...) {}
+            }
+        }
+        return false;
+    }
+
+    // Returns ordered frames with metadata for the exact sampled frame sent to the model.
+    static std::vector<PromptVideoFrame> buildOpenAIVideoFrameInputs(
+        const std::string& videoPath,
+        int maxFrames,
+        int modelInputFps,
+        const std::string& openAiModelName,
+        int expectedWindowSeconds = 0,
+        int runningResolution = 640,
+        const std::string& logStreamId = "",
+        const std::string& segmentStartTs = "",
+        const std::string& segmentEndTs = "",
+        double* outAnalyzedDurationSeconds = nullptr)
+    {
+        std::vector<PromptVideoFrame> out;
+        if (outAnalyzedDurationSeconds) *outAnalyzedDurationSeconds = 0.0;
+        if (videoPath.empty() || maxFrames <= 0) return out;
+
+        const bool useZAiCoreModel = isZAiCoreModelName_(openAiModelName);
+        runningResolution = (runningResolution == 1024) ? 1024 : 640;
+
+        auto normalizeFps = [](int fps) -> int {
+            return clampRequestedModelFps_(fps);
+        };
+        const int requestedFps = normalizeFps(modelInputFps);
+        const bool hasExpectedWindow = expectedWindowSeconds > 0;
+        if (expectedWindowSeconds < 0) expectedWindowSeconds = 0;
+
+        double durationSec = 10.0; // safe fallback
+        double sourceFps = 0.0;
+        double sourceFrameCount = 0.0;
+        bool durationFromOpenCv = false;
+        {
+            cv::VideoCapture cap(videoPath);
+            if (cap.isOpened()) {
+                const double fps = cap.get(cv::CAP_PROP_FPS);
+                const double frameCount = cap.get(cv::CAP_PROP_FRAME_COUNT);
+                sourceFps = fps;
+                sourceFrameCount = frameCount;
+                if (fps > 0.0 && frameCount > 0.0) {
+                    const double rawDur = frameCount / fps;
+                    if (rawDur > 0.0) {
+                        durationSec = rawDur;
+                        durationFromOpenCv = true;
+                    }
+                }
+                cap.release();
+            }
+        }
+
+        int clipNominalSeconds = 0;
+        double clipRangeSeconds = 0.0;
+        const double clipDurationFromName = deriveNominalDurationSecondsFromClipPath_(
+            videoPath,
+            &clipNominalSeconds,
+            &clipRangeSeconds
+        );
+        const double clipDurationFromSegmentBounds =
+            deriveDurationSecondsFromSegmentBounds_(segmentStartTs, segmentEndTs);
+        bool durationAdjustedFromName = false;
+        bool durationAdjustedFromSegmentBounds = false;
+
+        if (clipDurationFromName > 0.0) {
+            const bool suspiciousShortDuration =
+                hasExpectedWindow &&
+                (durationSec + 0.5 < static_cast<double>((std::max)(1, expectedWindowSeconds)));
+            const bool clipNameSuggestsExpectedWindow =
+                hasExpectedWindow &&
+                (clipDurationFromName + 0.5 >= static_cast<double>((std::max)(1, expectedWindowSeconds)));
+
+            // Guard against transient/partial metadata reads (seen as 10s for 60s clips).
+            if (!durationFromOpenCv || (suspiciousShortDuration && clipNameSuggestsExpectedWindow)) {
+                durationSec = clipDurationFromName;
+                durationAdjustedFromName = true;
+            }
+        }
+
+        if (clipDurationFromSegmentBounds > 0.0) {
+            const bool suspiciousShortDuration =
+                hasExpectedWindow &&
+                (durationSec + 0.5 < static_cast<double>((std::max)(1, expectedWindowSeconds)));
+            const bool segmentBoundsSuggestExpectedWindow =
+                hasExpectedWindow &&
+                (clipDurationFromSegmentBounds + 0.5 >= static_cast<double>((std::max)(1, expectedWindowSeconds)));
+
+            if (!durationFromOpenCv || (suspiciousShortDuration && segmentBoundsSuggestExpectedWindow)) {
+                durationSec = clipDurationFromSegmentBounds;
+                durationAdjustedFromSegmentBounds = true;
+            }
+        }
+
+        if (durationSec < 1.0) durationSec = 1.0;
+        if (durationSec > 300.0) durationSec = 300.0;
+
+        if (!logStreamId.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                "buildOpenAIVideoFrameInputs: video=" + videoPath +
+                " expected_window_s=" + std::to_string(expectedWindowSeconds) +
+                " source_fps=" + std::to_string(sourceFps) +
+                " source_frame_count=" + std::to_string(sourceFrameCount) +
+                " duration_sec_final=" + std::to_string(durationSec) +
+                " clip_nominal_s=" + std::to_string(clipNominalSeconds) +
+                " clip_range_s=" + std::to_string(clipRangeSeconds) +
+                " segment_range_s=" + std::to_string(clipDurationFromSegmentBounds) +
+                " duration_from_opencv=" + std::string(durationFromOpenCv ? "true" : "false") +
+                " duration_adjusted_from_name=" + std::string(durationAdjustedFromName ? "true" : "false") +
+                " duration_adjusted_from_segment_bounds=" +
+                std::string(durationAdjustedFromSegmentBounds ? "true" : "false")
+            );
+        }
+
+        const double timelineSeconds = hasExpectedWindow
+            ? static_cast<double>((std::max)(1, expectedWindowSeconds))
+            : durationSec;
+        const double extractableSeconds = (std::max)(0.001, (std::min)(durationSec, timelineSeconds));
+        if (outAnalyzedDurationSeconds) {
+            *outAnalyzedDurationSeconds = extractableSeconds;
+        }
+
+        std::chrono::system_clock::time_point segmentStartTp{};
+        std::chrono::system_clock::time_point segmentEndTp{};
+        bool hasSegmentStartTp =
+            parseSegmentTimestampToTimePointPreferLocal_(trimAscii(segmentStartTs), segmentStartTp);
+        bool hasSegmentEndTp =
+            parseSegmentTimestampToTimePointPreferLocal_(trimAscii(segmentEndTs), segmentEndTp);
+
+        if ((!hasSegmentStartTp || !hasSegmentEndTp || segmentEndTp <= segmentStartTp) && !videoPath.empty()) {
+            std::string derivedStartTs;
+            std::string derivedEndTs;
+            if (deriveSegmentRangeFromPathForPrompt_(videoPath, derivedStartTs, derivedEndTs)) {
+                if (!hasSegmentStartTp) {
+                    hasSegmentStartTp =
+                        parseSegmentTimestampToTimePointPreferLocal_(derivedStartTs, segmentStartTp);
+                }
+                if (!hasSegmentEndTp) {
+                    hasSegmentEndTp =
+                        parseSegmentTimestampToTimePointPreferLocal_(derivedEndTs, segmentEndTp);
+                }
+            }
+        }
+
+        const auto analyzedWindowMs = std::chrono::milliseconds(
+            static_cast<long long>(std::llround(extractableSeconds * 1000.0))
+        );
+        if (!hasSegmentStartTp && hasSegmentEndTp && analyzedWindowMs.count() > 0) {
+            segmentStartTp = segmentEndTp - analyzedWindowMs;
+            hasSegmentStartTp = true;
+        }
+        if (hasSegmentStartTp && !hasSegmentEndTp && analyzedWindowMs.count() > 0) {
+            segmentEndTp = segmentStartTp + analyzedWindowMs;
+            hasSegmentEndTp = true;
+        }
+
+        auto toHHMMSSms = [](double sec) -> std::string {
+            if (sec < 0.0) sec = 0.0;
+            long long totalMs = (long long)(sec * 1000.0 + 0.5);
+            int hh = (int)(totalMs / 3600000LL);
+            int mm = (int)((totalMs % 3600000LL) / 60000LL);
+            int ss = (int)((totalMs % 60000LL) / 1000LL);
+            int ms = (int)(totalMs % 1000LL);
+            char buf[32];
+            sprintf_s(buf, "%02d:%02d:%02d.%03d", hh, mm, ss, ms);
+            return std::string(buf);
+            };
+
+        auto toMMSSmsLabel = [](double sec) -> std::string {
+            if (sec < 0.0) sec = 0.0;
+            long long totalMs = (long long)(sec * 1000.0 + 0.5);
+            int totalSec = (int)(totalMs / 1000LL);
+            int mm = totalSec / 60;
+            int ss = totalSec % 60;
+            int ms = (int)(totalMs % 1000LL);
+            char buf[32];
+            sprintf_s(buf, "%02d:%02d.%03d", mm, ss, ms);
+            return std::string(buf);
+            };
+
+        std::vector<double> sampleSeconds;
+        if (useZAiCoreModel) {
+            if (runningResolution == 1024) {
+                // Core/1024: ~1 frame every 3s (20 frames per 60s), uniformly sampled.
+                int desiredCount = 0;
+                if (hasExpectedWindow) {
+                    desiredCount = (std::max)(1, (expectedWindowSeconds + 2) / 3); // ceil(window/3)
+                }
+                else {
+                    desiredCount = (std::max)(1, (int)std::floor(durationSec / 3.0));
+                }
+                desiredCount = (std::min)(desiredCount, maxFrames);
+                sampleSeconds.reserve(desiredCount);
+                for (int i = 0; i < desiredCount; ++i) {
+                    const double sec = extractableSeconds * (static_cast<double>(i) / static_cast<double>(desiredCount));
+                    sampleSeconds.push_back(sec);
+                }
+            }
+            else {
+                // Core/640: 1 frame per second.
+                int desiredCount = 0;
+                if (hasExpectedWindow) {
+                    desiredCount = (std::max)(1, expectedWindowSeconds);
+                }
+                else {
+                    desiredCount = (std::max)(1, (int)std::floor(durationSec + 1e-6));
+                }
+                desiredCount = (std::min)(desiredCount, maxFrames);
+                sampleSeconds.reserve(desiredCount);
+                for (int i = 0; i < desiredCount; ++i) {
+                    sampleSeconds.push_back(static_cast<double>(i));
+                }
+            }
+        }
+        else {
+            int effectiveFps = requestedFps;
+            if (sourceFps > 0.0) {
+                const int srcRounded = (std::max)(1, (int)(sourceFps + 0.5));
+                effectiveFps = (std::min)(requestedFps, srcRounded);
+            }
+            if (effectiveFps < 1) effectiveFps = 1;
+
+            int sampleCount = 0;
+            if (hasExpectedWindow) {
+                sampleCount = (std::max)(1, expectedWindowSeconds * effectiveFps);
+            }
+            else {
+                sampleCount = (int)(durationSec * (double)effectiveFps + 1e-6);
+                if (sampleCount < 1) sampleCount = 1;
+            }
+            sampleCount = (std::min)(sampleCount, maxFrames);
+            sampleSeconds.reserve(sampleCount);
+            for (int i = 0; i < sampleCount; ++i) {
+                sampleSeconds.push_back(static_cast<double>(i) / static_cast<double>(effectiveFps));
+            }
+        }
+
+        out.reserve(sampleSeconds.size());
+        int missingFrames = 0;
+        for (double sec : sampleSeconds) {
+            if (sec > extractableSeconds) {
+                sec = (std::max)(0.0, extractableSeconds - 0.001);
+            }
+
+            const std::string ffTime = toHHMMSSms(sec);
+            std::vector<unsigned char> jpeg =
+                extractFrameJpegAtTime(videoPath, ffTime, openAiModelName, runningResolution);
+            if (jpeg.empty()) {
+                ++missingFrames;
+                continue;
+            }
+
+            const std::string bytesStr(
+                reinterpret_cast<const char*>(jpeg.data()),
+                jpeg.size());
+            PromptVideoFrame frame;
+            frame.frameIndex = static_cast<int>(out.size());
+            frame.frameTimestampInSegment = toMMSSmsLabel(sec);
+            frame.jpegBase64 = base64Encode(bytesStr);
+
+            if (hasSegmentStartTp) {
+                const auto offsetMs = std::chrono::milliseconds(
+                    static_cast<long long>(std::llround(sec * 1000.0))
+                );
+                auto frameTp = segmentStartTp + offsetMs;
+                if (hasSegmentEndTp && frameTp > segmentEndTp) {
+                    frameTp = segmentEndTp;
+                }
+                frame.hasAbsoluteTimestamp = true;
+                frame.absoluteTimestamp = frameTp;
+                frame.timestampName = formatTimePointToCompactLocalTimestampWithMillis_(frameTp);
+            }
+
+            out.push_back(std::move(frame));
+        }
+
+        if ((int)out.size() < (int)sampleSeconds.size()) {
+            if (logStreamId.empty()) {
+                return out;
+            }
+            Logger::instance().logDebug(
+                logStreamId,
+                "buildOpenAIVideoFrameInputs: extracted " +
+                std::to_string(out.size()) + "/" + std::to_string(sampleSeconds.size()) +
+                " frames for expected_window_s=" + std::to_string(expectedWindowSeconds) +
+                " (missing=" + std::to_string(missingFrames) + "), video=" + videoPath
+            );
+        }
+
+        return out;
+    }
+
+    static bool writeBytesToTempMp4ForOpenAI(
+        const std::vector<std::uint8_t>& bytes,
+        std::string& outTempPath)
+    {
+        outTempPath.clear();
+        if (bytes.empty()) return false;
+
+#ifdef _WIN32
+        fs::path tmpDir;
+        {
+            wchar_t buf[MAX_PATH];
+            DWORD len = GetTempPathW(MAX_PATH, buf);
+            if (len == 0 || len > MAX_PATH) {
+                tmpDir = fs::temp_directory_path() / AppBrand::kVideoSegmentsTempDirName;
+            }
+            else {
+                tmpDir = fs::path(buf) / AppBrand::kVideoSegmentsTempDirName;
+            }
+        }
+
+        std::error_code ec;
+        fs::create_directories(tmpDir, ec);
+        if (ec) return false;
+
+        const std::string fileName =
+            "openai_job_" +
+            std::to_string((unsigned long)GetCurrentProcessId()) + "_" +
+            std::to_string((unsigned long long)GetTickCount64()) + ".mp4";
+
+        const fs::path outPath = tmpDir / fileName;
+        std::ofstream ofs(outPath, std::ios::binary);
+        if (!ofs) return false;
+
+        ofs.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+        ofs.close();
+        if (!ofs.good()) return false;
+
+        outTempPath = outPath.string();
+        return true;
+#else
+        return false;
+#endif
+    }
+} // namespace
+
+
+
+VideoHit AgentCore::callGeminiVisionVideoSegment_(
+    const EncodedVideoSegment& segment,
+    const std::string& userQuestion,
+    const std::string& uploadedImageBase64,
+    const std::string& modelTier,
+    const std::string& geminiApiKey,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    hit.segmentStartTs = segment.startTs;
+    hit.segmentEndTs = segment.endTs;
+
+    hit.cameraId = segment.cameraId;
+    hit.cameraName = segment.cameraName;
+
+    hit.segmentStartTs = segment.startTs;
+    hit.segmentEndTs = segment.endTs;
+
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+
+    if (segment.bytes.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegment_: empty video bytes"
+        );
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(std::vector<FaceReferenceImage>{}, uploadedImageBase64);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+
+    // 1) Build parts
+    //nlohmann::json parts = nlohmann::json::array();
+
+    try {
+        nlohmann::json parts = nlohmann::json::array();
+        // Prompt
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV video segment.\n";
+            prompt << "This video covers part of the time window from "
+                << segment.startTs << " to " << segment.endTs << ".\n\n";
+
+
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question "
+                "for `answer`.\n\n";
+
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- The video you receive is ONLY A PART of the full time window requested by the user.\n";
+            prompt << "- You MUST assume this video does NOT necessarily cover the entire user-requested time range.\n";
+            prompt << "- NEVER state or imply that your answer refers to the full period requested by the user (e.g. 'last 10 minutes').\n";
+            prompt << "- Your answer MUST refer ONLY to what happens inside THIS analyzed video segment.\n";
+
+
+            if (hasFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- Sometimes the user provides ONE reference image before the CCTV frames. "
+                    << "This image is tagged as USER_REFERENCE_IMAGE.\n";
+                prompt << "- Whenever a reference image is present, it is ALWAYS a "
+                    << "close-up selfie or a crop of a single HUMAN FACE.\n";
+                prompt << "- Treat this reference face as the target person.\n";
+                prompt << "- Your job is to check if a VERY SIMILAR FACE appears in the video at any moment.\n";
+                prompt << "INSTRUCTIONS FOR FACE MATCHING:\n";
+                prompt << "1. First, analyze the USER_REFERENCE_IMAGE . List distinct features ('Bald head', 'Beard style', 'Hair style', 'Glasses', "
+                    << "'Hair color', 'Ethnicity', 'Gender', 'Age', 'Facial hair style', 'Facial hair color').\n";
+                prompt << "2. For each CCTV frame, analyze every person's face visible.\n";
+                prompt << "3. COMPARE specifically:\n";
+                prompt << "   - Hair vs Baldness.\n";
+                prompt << "   - Hair style.\n";
+                prompt << "   - Hair color.\n";
+                prompt << "   - Ethnicity.\n";
+                prompt << "   - Gender.\n";
+                prompt << "   - Age.\n";
+                prompt << "   - Facial hair style.\n";
+                prompt << "   - Facial hair color.\n";
+                prompt << "4. If the person in the CCTV video is facing away (back turned) and you cannot see the face clearly, do not attempt to classify.\n";
+                prompt << "5. If you are not very sure about the match do not classify positivly.\n\n";
+            }
+
+            prompt << "RESPONSE FORMAT:\n";
+            prompt << "Return ONLY a single JSON object with this behavior:\n";
+            prompt << "- Always include the field \"answer\".\n";
+            prompt << "- If the event/person/object IS FOUND, you MUST include \"detection_time_in_video\".\n";
+            prompt << "- If NOT found or not confident, you MUST NOT include \"detection_time_in_video\".\n";
+
+
+            prompt << "ANSWER WRITING RULES:\n";
+            prompt << "- The answer text MUST NOT mention the full user-requested time window.\n";
+            prompt << "- The answer text MUST NOT repeat phrases like 'last X minutes' or absolute time ranges.\n";
+            prompt << "- The answer MUST describe ONLY what is visible inside the analyzed video segment.\n";
+            prompt << "- Always assume the analyzed video is PARTIAL.\n\n";
+
+
+            prompt << "Positive detection (event FOUND):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short answer describing ONLY what happened in the analyzed segment>\",\n";
+            prompt << "  \"detection_time_in_video\": [\"MM:SS\", \"MM:SS\"]\n";
+            prompt << "}\n\n";
+
+            prompt << "Negative detection (event NOT FOUND or not confident):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short direct negative answer to the user question>\"\n";
+            prompt << "}\n\n";
+
+            prompt << "RULES FOR detection_time_in_video:\n";
+            prompt << "- Only include \"detection_time_in_video\" when the requested event/person/object CLEARLY appears in the video.\n";
+            prompt << "- The value MUST be a JSON array of one or more timestamps (strings).\n";
+            prompt << "- Include MULTIPLE timestamps if the event happens multiple times in this SAME video segment.\n";
+            prompt << "- Each timestamp is measured from the start of this video segment.\n";
+            prompt << "- Format: \"MM:SS\" (minutes and seconds, zero-padded; example: \"01:38\").\n";
+            prompt << "- Do NOT include hours.\n";
+
+            prompt << "GENERAL RULES:\n";
+            prompt << "- Do not add any fields other than \"answer\" and the OPTIONAL \"detection_time_in_video\".\n";
+            prompt << "- If the event is not found or you are not confident, DO NOT include \"detection_time_in_video\" at all.\n";
+            prompt << "- Do not include Markdown, backticks, or code fences. Output RAW JSON only, without comments or trailing commas.\n";
+
+            prompt << "DETECTION RULES:\n";
+            prompt << "- If the requested event/person/object clearly occurs at least once in the video, answer positively and include \"detection_time_in_video\".\n";
+            prompt << "- If it does not occur, or you are not confident, answer negatively and DO NOT include \"detection_time_in_video\".\n";
+            prompt << "- Keep the answer short and use the same language as the user question.\n";
+
+
+            parts.push_back({ { "text", prompt.str() } });
+        }
+
+        if (hasFaceReferences) {
+            appendGeminiFaceReferenceParts_(parts, effectiveFaceReferences);
+        }
+
+        std::string modelName = pickGeminiModelName(modelTier, hasFaceReferences);
+
+
+
+        // video inline_data
+        std::string videoB64 = base64Encode(
+            std::string(reinterpret_cast<const char*>(segment.bytes.data()),
+                segment.bytes.size()));
+
+
+
+        parts.push_back({
+            { "inline_data", {
+                { "mime_type", "video/mp4" },
+                { "data",      videoB64 }
+            }}
+            });
+
+        nlohmann::json body = {
+            { "contents", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "parts", parts }
+                }
+            })},
+            { "generation_config", {
+                { "max_output_tokens", 7500 },
+                { "temperature", 0.0 }
+            }}
+        };
+
+        const std::string apiKey = geminiApiKey;
+        if (apiKey.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegment_: missing Gemini api key"
+            );
+            return hit;
+        }
+        
+        //std::string rawResp = httpPostJsonGemini(apiKey, modelName, body);
+
+        //std::string rawResp;
+        //try {
+            //rawResp = httpPostJsonGemini(apiKey, modelName, body);
+        //}
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonGemini(
+                apiKey,
+                modelName,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug("agent",
+                std::string("callGeminiVisionVideoSegment_: httpPostJsonGemini exception: ") + e.what());
+            return hit; // IMPORTANT: no throw
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegment_: rawResp size=" +
+            std::to_string(rawResp.size())
+        );
+
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegment_: rawResp = " + rawResp
+        );
+
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent",
+                "callGeminiVisionVideoSegment_: response JSON invalid/discarded (likely timeout/HTML/partial).");
+            return hit;
+        }
+
+        //logJsonCandidatesOnly("callGeminiVisionVideoSegment_", respJson);
+
+        // usageMetadata
+        if (respJson.contains("usageMetadata") &&
+            respJson["usageMetadata"].is_object())
+        {
+            const auto& u = respJson["usageMetadata"];
+            int promptTokens = u.value("promptTokenCount", 0);
+            int outputTokens = u.value("candidatesTokenCount", 0);
+            int totalTokens = u.value("totalTokenCount", 0);
+
+            Logger::instance().logDebug(
+                "agent",
+                "Video tokens | prompt=" + std::to_string(promptTokens) +
+                " | output=" + std::to_string(outputTokens) +
+                " | total=" + std::to_string(totalTokens)
+            );
+
+            outPromptTokens = promptTokens;
+            outOutputTokens = outputTokens;
+            outTotalTokens = totalTokens;
+        }
+
+        // extract text
+        std::string text;
+        if (respJson.contains("candidates") &&
+            respJson["candidates"].is_array() &&
+            !respJson["candidates"].empty())
+        {
+            const auto& c0 = respJson["candidates"][0];
+            if (c0.contains("content") && c0["content"].is_object()) {
+                const auto& content = c0["content"];
+                if (content.contains("parts") &&
+                    content["parts"].is_array() &&
+                    !content["parts"].empty())
+                {
+                    const auto& p0 = content["parts"][0];
+                    if (p0.contains("text") && p0["text"].is_string()) {
+                        text = p0["text"].get<std::string>();
+                    }
+                }
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegment_: empty text"
+            );
+            return hit;
+        }
+
+        // Strip to JSON braces
+        std::size_t firstBrace = text.find('{');
+        std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos ||
+            lastBrace == std::string::npos ||
+            lastBrace <= firstBrace)
+        {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegment_: no JSON braces"
+            );
+            return hit;
+        }
+
+        std::string jsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+        nlohmann::json videoResult = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!videoResult.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegment_: invalid JSON object"
+            );
+            return hit;
+        }
+
+        parseStructuredVisionResponseIntoHit_(
+            videoResult,
+            hit,
+            /*includeDetectionTimeInVideo*/ true,
+            "agent",
+            "callGeminiVisionVideoSegment_"
+        );
+        normalizeTemporalPayloadForVideo_(
+            hit,
+            segment.sourceFilePath,
+            temporal::nowIso(),
+            "agent",
+            "callGeminiVisionVideoSegment_"
+        );
+        if (videoResult.contains("faceid_match") && videoResult["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = videoResult["faceid_match"].get<bool>();
+        }
+        if (hasFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(videoResult);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    "chat_face_reference"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+
+        // logging (join list -> "MM:SS, MM:SS")
+        std::string joined;
+        for (size_t i = 0; i < hit.detectionTimeInVideo.size(); ++i) {
+            if (i) joined += ", ";
+            joined += hit.detectionTimeInVideo[i];
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegment_: answer=\"" + hit.answer +
+            "\" detection_time_in_video=[" + joined +
+            "] hasMatch=" + std::string(hit.hasMatch ? "true" : "false")
+        );
+
+
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callGeminiVisionVideoSegment_: UNHANDLED exception: ") + e.what());
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callGeminiVisionVideoSegment_: UNHANDLED unknown exception");
+        return hit;
+    }
+}
+
+
+
+
+
+
+
+VideoHit AgentCore::callGeminiVisionVideoSegmentJOB_(
+    const EncodedVideoSegment& segment,
+    const std::string& userQuestion,
+    const std::string& uploadedImageBase64,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& modelTier,
+    const std::string& geminiApiKey,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    hit.segmentStartTs = segment.startTs;
+    hit.segmentEndTs = segment.endTs;
+
+    hit.cameraId = segment.cameraId;
+    hit.cameraName = segment.cameraName;
+
+    hit.segmentStartTs = segment.startTs;
+    hit.segmentEndTs = segment.endTs;
+
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+
+    if (segment.bytes.empty()) {
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegmentJOB_: empty video bytes"
+        );
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences, uploadedImageBase64);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+
+    // 1) Build parts
+    //nlohmann::json parts = nlohmann::json::array();
+
+    try {
+        nlohmann::json parts = nlohmann::json::array();
+
+        std::string promptStr;
+
+        // Prompt
+        {
+            std::ostringstream prompt;
+
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV video segment.\n";
+            prompt << "This video covers part of the time window from "
+                << segment.startTs << " to " << segment.endTs << ".\n\n";
+
+            // --------------------------------------------------------------------
+            // JOB STEP MODE
+            // --------------------------------------------------------------------
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            // --------------------------------------------------------------------
+            // LANGUAGE RULES
+            // --------------------------------------------------------------------
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question "
+                "for `answer`.\n\n";
+
+            // --------------------------------------------------------------------
+            // IMPORTANT CONTEXT RULE (PARTIAL WINDOW)
+            // --------------------------------------------------------------------
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- The video you receive is ONLY A PART of the full time window requested by the user.\n";
+            prompt << "- You MUST assume this video does NOT necessarily cover the entire user-requested time range.\n";
+            prompt << "- NEVER state or imply that your answer refers to the full period requested by the user (e.g. 'last 10 minutes').\n";
+            prompt << "- Your answer MUST refer ONLY to what happens inside THIS analyzed video segment.\n\n";
+
+            // --------------------------------------------------------------------
+            // OPTIONAL FACE MATCHING (REFERENCE IMAGE)
+            // --------------------------------------------------------------------
+            if (hasFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
+                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
+                prompt << "- Treat them as target identities to search in this CCTV segment.\n";
+                prompt << "- Match faces conservatively (angle/light may vary, identity must remain highly consistent).\n";
+                prompt << "INSTRUCTIONS FOR FACE MATCHING:\n";
+                prompt << "1. For each target reference, build a robust identity profile from visible facial traits.\n";
+                prompt << "2. For each CCTV frame, analyze every visible face candidate.\n";
+                prompt << "3. COMPARE specifically:\n";
+                prompt << "   - Hair vs Baldness.\n";
+                prompt << "   - Hair style.\n";
+                prompt << "   - Hair color.\n";
+                prompt << "   - Ethnicity.\n";
+                prompt << "   - Gender.\n";
+                prompt << "   - Age.\n";
+                prompt << "   - Facial hair style.\n";
+                prompt << "   - Facial hair color.\n";
+                prompt << "4. If the person in the CCTV video is facing away (back turned) and you cannot see the face clearly, do not attempt to classify.\n";
+                prompt << "5. If you are not very sure about the match, do not classify positively.\n";
+                prompt << "6. If ANY reference face matches, set faceid_match=true and force alert_condition=true.\n\n";
+                prompt << "7. If faceid_match=true, include the matched TARGET_NAME values in faceid_target_names.\n\n";
+            }
+
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These are scenes that SHOULD NOT trigger an alert by themselves.\n";
+                prompt << "- If the CCTV segment strongly matches these negative references and no explicit severe risk exists, keep alert_condition=false.\n";
+                prompt << "- Use them only as guidance to reduce false positives; do not ignore clear dangerous evidence.\n\n";
+            }
+
+            // --------------------------------------------------------------------
+            // CONDITIONS (INJECTED BY JOBRUNNER)
+            // --------------------------------------------------------------------
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            prompt << "- You MUST evaluate the two conditions below based ONLY on what is visible in THIS video segment.\n";
+            prompt << "- If you are not confident, keep the booleans as false.\n\n";
+
+            prompt << "ALERT CONDITION (controls the JSON field \"alert_condition\"):\n";
+            if (!alertConditionText.empty()) {
+                prompt << alertConditionText << "\n\n";
+            }
+            else {
+                prompt << "(No alert condition provided. You MUST keep \"alert_condition\" as false.)\n\n";
+            }
+
+            prompt << "START CONDITION (controls the JSON field \"start_condition_step_id\"):\n";
+            if (!startConditionText.empty()) {
+                prompt << startConditionText << "\n\n";
+            }
+            else {
+                prompt << "(No start condition provided. You MUST keep \"start_condition_step_id\" as false.)\n\n";
+            }
+
+            // --------------------------------------------------------------------            // --------------------------------------------------------------------
+            // RESPONSE FORMAT (NEW CONTRACT FOR STEPS)
+            // --------------------------------------------------------------------
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY a single JSON object with EXACTLY these fields (no more, no less):\n";
+            prompt << "1) \"answer\": string\n";
+            prompt << "2) \"alert_condition\": boolean (REQUIRED)\n";
+            prompt << "3) \"start_condition_step_id\": false OR integer (REQUIRED)\n";
+            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
+            if (hasFaceReferences) {
+                prompt << "5) \"faceid_match\": boolean (REQUIRED)\n";
+                prompt << "6) \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
+            }
+            prompt << "\n";
+
+            prompt << "DEFAULT VALUES RULE:\n";
+            prompt << "- \"alert_condition\" MUST default to false.\n";
+            prompt << "- \"start_condition_step_id\" MUST default to false (boolean false).\n";
+            if (hasFaceReferences) {
+                prompt << "- \"faceid_match\" MUST default to false.\n";
+                prompt << "- If faceid_match is true, \"alert_condition\" MUST be true.\n";
+                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in \"faceid_target_names\".\n";
+            }
+            prompt << "- Set \"alert_condition\" to true ONLY if the alert condition is clearly satisfied in this segment.\n";
+            prompt << "- Set \"start_condition_step_id\" to the INTEGER step id ONLY if the start condition is clearly satisfied in this segment; otherwise keep it as false.\n\n";
+
+            // --------------------------------------------------------------------
+            // ANSWER WRITING RULES
+            // --------------------------------------------------------------------
+            prompt << "ANSWER WRITING RULES:\n";
+            prompt << "- The answer text MUST NOT mention the full user-requested time window.\n";
+            prompt << "- The answer text MUST NOT repeat phrases like 'last X minutes' or absolute time ranges.\n";
+            prompt << "- The answer MUST describe ONLY what is visible inside the analyzed video segment.\n";
+            prompt << "- Always assume the analyzed video is PARTIAL.\n";
+            prompt << "- Keep the answer short and use the same language as the user question.\n\n";
+            if (hasFaceReferences) {
+                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n\n";
+            }
+
+            // --------------------------------------------------------------------
+            // EVALUATION RULES FOR BOOLEAN FIELDS
+            // --------------------------------------------------------------------
+            prompt << "BOOLEAN EVALUATION RULES:\n";
+            prompt << "- Evaluate each condition independently.\n";
+            prompt << "- If the ALERT CONDITION is satisfied at least once in this segment, set \"alert_condition\": true, else false.\n";
+            prompt << "- If the START CONDITION is satisfied at least once in this segment, set \"start_condition_step_id\" to the INTEGER step id referenced in START CONDITION; otherwise keep it as false.\n";
+            if (hasFaceReferences) {
+                prompt << "- Set \"faceid_match\" to true only if at least one reference identity is confidently present.\n";
+            }
+            if (hasNegativeReferences) {
+                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping \"alert_condition\" as false unless explicit severe risk is visible.\n";
+            }
+            prompt << "- If \"alert_condition\" is true and region overlays are visible, include matching ids in \"alert_region_ids\".\n";
+            prompt << "- If you are not confident about a condition, keep it false.\n\n";
+
+            // --------------------------------------------------------------------
+            // EXAMPLES (ANCHOR)
+            // --------------------------------------------------------------------
+            prompt << "EXAMPLE OUTPUT (not found / not confident):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short direct negative answer to the user question>\",\n";
+            prompt << "  \"alert_condition\": false,\n";
+            prompt << "  \"start_condition_step_id\": false";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": false\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "EXAMPLE OUTPUT (alert condition satisfied, start condition not satisfied):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short answer describing ONLY what happened in the analyzed segment>\",\n";
+            prompt << "  \"alert_condition\": true,\n";
+            prompt << "  \"start_condition_step_id\": false";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": true\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "EXAMPLE OUTPUT (start condition satisfied, alert condition not satisfied):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short answer describing ONLY what happened in the analyzed segment>\",\n";
+            prompt << "  \"alert_condition\": false,\n";
+            prompt << "  \"start_condition_step_id\": 123";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": false\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "GENERAL OUTPUT RULES:\n";
+            if (hasFaceReferences) {
+                prompt << "- Do not add any fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", and optional \"faceid_target_names\".\n";
+            }
+            else {
+                prompt << "- Do not add any fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", and optional \"alert_region_ids\".\n";
+            }
+            prompt << "- Do not include Markdown, backticks, or code fences.\n";
+            prompt << "- Output RAW JSON only, without comments or trailing commas.\n";
+
+            //parts.push_back({ { "text", prompt.str() } });
+
+            promptStr = prompt.str();
+            parts.push_back({ { "text", promptStr } });
+
+        }
+
+        if (hasFaceReferences) {
+            appendGeminiFaceReferenceParts_(parts, effectiveFaceReferences);
+        }
+        if (hasNegativeReferences) {
+            appendGeminiNegativeReferenceParts_(parts, effectiveNegativeReferences);
+        }
+
+        std::string modelName = pickGeminiModelName(
+            modelTier,
+            hasFaceReferences || hasNegativeReferences
+        );
+
+
+        const std::string camLogId = std::to_string(segment.cameraId);
+        Logger::instance().logDebug(
+            camLogId,
+            "callGeminiVisionVideoSegmentJOB_: GEMINI PROMPT (model=" + modelName +
+            ", segment=" + segment.startTs + "->" + segment.endTs + ")\n" +
+            promptStr
+        );
+
+
+        // video inline_data
+        std::string videoB64 = base64Encode(
+            std::string(reinterpret_cast<const char*>(segment.bytes.data()),
+                segment.bytes.size()));
+
+
+
+        parts.push_back({
+            { "inline_data", {
+                { "mime_type", "video/mp4" },
+                { "data",      videoB64 }
+            }}
+            });
+
+        nlohmann::json body = {
+            { "contents", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "parts", parts }
+                }
+            })},
+            { "generation_config", {
+                { "max_output_tokens", 7500 },
+                { "temperature", 0.0 }
+            }}
+        };
+
+        const std::string apiKey = geminiApiKey.empty()
+            ? "AIzaSyA_c5lgj1--kFYMDL0y4d58hXnT5-J-7M0"
+            : geminiApiKey;
+
+        //std::string rawResp = httpPostJsonGemini(apiKey, modelName, body);
+
+        //std::string rawResp;
+        //try {
+            //rawResp = httpPostJsonGemini(apiKey, modelName, body);
+        //}
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonGemini(
+                apiKey,
+                modelName,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug("agent",
+                std::string("callGeminiVisionVideoSegmentJOB_: httpPostJsonGemini exception: ") + e.what());
+            return hit; // IMPORTANT: no throw
+        }
+
+        /*
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegmentJOB_: rawResp size=" +
+            std::to_string(rawResp.size())
+        );
+        */
+        Logger::instance().logDebug(
+            camLogId,
+            "callGeminiVisionVideoSegmentJOB_: rawResp = " + sanitizeModelRawRespForLog_(rawResp)
+        );
+        
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent",
+                "callGeminiVisionVideoSegmentJOB_: response JSON invalid/discarded (likely timeout/HTML/partial).");
+            return hit;
+        }
+
+        //logJsonCandidatesOnly("callGeminiVisionVideoSegmentJOB_", respJson);
+
+        // usageMetadata
+        if (respJson.contains("usageMetadata") &&
+            respJson["usageMetadata"].is_object())
+        {
+            const auto& u = respJson["usageMetadata"];
+            int promptTokens = u.value("promptTokenCount", 0);
+            int outputTokens = u.value("candidatesTokenCount", 0);
+            int totalTokens = u.value("totalTokenCount", 0);
+
+            Logger::instance().logDebug(
+                camLogId,
+                "Video tokens | prompt=" + std::to_string(promptTokens) +
+                " | output=" + std::to_string(outputTokens) +
+                " | total=" + std::to_string(totalTokens)
+            );
+
+            outPromptTokens = promptTokens;
+            outOutputTokens = outputTokens;
+            outTotalTokens = totalTokens;
+        }
+
+        // extract text
+        std::string text;
+        if (respJson.contains("candidates") &&
+            respJson["candidates"].is_array() &&
+            !respJson["candidates"].empty())
+        {
+            const auto& c0 = respJson["candidates"][0];
+            if (c0.contains("content") && c0["content"].is_object()) {
+                const auto& content = c0["content"];
+                if (content.contains("parts") &&
+                    content["parts"].is_array() &&
+                    !content["parts"].empty())
+                {
+                    const auto& p0 = content["parts"][0];
+                    if (p0.contains("text") && p0["text"].is_string()) {
+                        text = p0["text"].get<std::string>();
+                    }
+                }
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegmentJOB_: empty text"
+            );
+            return hit;
+        }
+
+        // Strip to JSON braces
+        std::size_t firstBrace = text.find('{');
+        std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos ||
+            lastBrace == std::string::npos ||
+            lastBrace <= firstBrace)
+        {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegmentJOB_: no JSON braces"
+            );
+            return hit;
+        }
+
+        std::string jsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+        nlohmann::json videoResult = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!videoResult.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "callGeminiVisionVideoSegmentJOB_: invalid JSON object"
+            );
+            return hit;
+        }
+        parseStructuredVisionResponseIntoHit_(
+            videoResult,
+            hit,
+            /*includeDetectionTimeInVideo*/ true,
+            camLogId,
+            "callGeminiVisionVideoSegmentJOB_"
+        );
+        normalizeTemporalPayloadForVideo_(
+            hit,
+            segment.sourceFilePath,
+            temporal::nowIso(),
+            camLogId,
+            "callGeminiVisionVideoSegmentJOB_"
+        );
+        if (videoResult.contains("faceid_match") && videoResult["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = videoResult["faceid_match"].get<bool>();
+        }
+        if (hasFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(videoResult);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    faceReferences.empty() && !uploadedImageBase64.empty()
+                        ? "chat_face_reference"
+                        : "face_target_match"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+
+        // logging (join list -> "MM:SS, MM:SS")
+        std::string joined;
+        for (size_t i = 0; i < hit.detectionTimeInVideo.size(); ++i) {
+            if (i) joined += ", ";
+            joined += hit.detectionTimeInVideo[i];
+        }
+
+        Logger::instance().logDebug(
+            "agent",
+            "callGeminiVisionVideoSegmentJOB_: answer=\"" + hit.answer +
+            "\" detection_time_in_video=[" + joined +
+            "] hasMatch=" + std::string(hit.hasMatch ? "true" : "false")
+        );
+
+
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callGeminiVisionVideoSegmentJOB_: UNHANDLED exception: ") + e.what());
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callGeminiVisionVideoSegmentJOB_: UNHANDLED unknown exception");
+        return hit;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+VideoHit AgentCore::callGeminiVisionImageJOB_(
+    int cameraId,
+    const std::string& jpegBase64,
+    const std::string& userQuestion,
+    const std::string& uploadedImageBase64,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& modelTier,
+    const std::string& geminiApiKey,
+    const std::string& snapshotTsUtcIso,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    if (jpegBase64.empty()) {
+        Logger::instance().logDebug("agent", "callGeminiVisionImageJOB_: empty jpeg base64");
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences, uploadedImageBase64);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+
+    try {
+        nlohmann::json parts = nlohmann::json::array();
+        std::string promptStr;
+
+        // Prompt
+        // Prompt
+        {
+            std::ostringstream prompt;
+
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV IMAGE snapshot.\n";
+            prompt << "This is a single moment in time.\n\n";
+            prompt << "Snapshot timestamp (UTC): "
+                   << (snapshotTsUtcIso.empty() ? "unknown" : snapshotTsUtcIso)
+                   << "\n\n";
+
+            // --------------------------------------------------------------------
+            // JOB STEP MODE
+            // --------------------------------------------------------------------
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            // --------------------------------------------------------------------
+            // LANGUAGE RULES
+            // --------------------------------------------------------------------
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
+
+            // --------------------------------------------------------------------
+            // IMPORTANT CONTEXT RULE (SINGLE SNAPSHOT)
+            // --------------------------------------------------------------------
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- The image you receive is a SINGLE SNAPSHOT (one instant), not a continuous video.\n";
+            prompt << "- NEVER imply you observed events over time (e.g. 'then', 'after', 'for 10 seconds').\n";
+            prompt << "- Your answer MUST refer ONLY to what is visible in THIS snapshot.\n\n";
+
+            // --------------------------------------------------------------------
+            // OPTIONAL FACE MATCHING (REFERENCE IMAGE)
+            // --------------------------------------------------------------------
+            if (hasFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
+                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
+                prompt << "- Treat them as target identities to search in this CCTV snapshot.\n";
+                prompt << "- Match faces conservatively (angle/light may vary, identity must remain highly consistent).\n";
+                prompt << "INSTRUCTIONS FOR FACE MATCHING:\n";
+                prompt << "1. For each target reference, build a robust identity profile from visible facial traits.\n";
+                prompt << "2. In the CCTV snapshot, analyze every visible face candidate.\n";
+                prompt << "3. COMPARE specifically:\n";
+                prompt << "   - Hair vs Baldness.\n";
+                prompt << "   - Hair style.\n";
+                prompt << "   - Hair color.\n";
+                prompt << "   - Ethnicity.\n";
+                prompt << "   - Gender.\n";
+                prompt << "   - Age.\n";
+                prompt << "   - Facial hair style.\n";
+                prompt << "   - Facial hair color.\n";
+                prompt << "4. If the person in the CCTV snapshot is facing away (back turned) and you cannot see the face clearly, do not attempt to classify.\n";
+                prompt << "5. If you are not very sure about the match, do not classify positively.\n";
+                prompt << "6. If ANY reference face matches, set faceid_match=true and force alert_condition=true.\n\n";
+                prompt << "7. If faceid_match=true, include the matched TARGET_NAME values in faceid_target_names.\n\n";
+            }
+
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These examples represent scenes that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If this snapshot strongly matches those negative references and no explicit severe risk exists, keep alert_condition=false.\n";
+                prompt << "- Use them to reduce false positives only; never ignore clear dangerous evidence.\n\n";
+            }
+
+            // --------------------------------------------------------------------
+            // CONDITIONS (INJECTED BY JOBRUNNER)
+            // --------------------------------------------------------------------
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            prompt << "- You MUST evaluate the two conditions below based ONLY on what is visible in THIS snapshot.\n";
+            prompt << "- If you are not confident, keep the booleans as false.\n\n";
+
+            prompt << "ALERT CONDITION (controls the JSON field \"alert_condition\"):\n";
+            if (!alertConditionText.empty()) {
+                prompt << alertConditionText << "\n\n";
+            }
+            else {
+                prompt << "(No alert condition provided. You MUST keep \"alert_condition\" as false.)\n\n";
+            }
+
+            prompt << "START CONDITION (controls the JSON field \"start_condition_step_id\"):\n";
+            if (!startConditionText.empty()) {
+                prompt << startConditionText << "\n\n";
+            }
+            else {
+                prompt << "(No start condition provided. You MUST keep \"start_condition_step_id\" as false.)\n\n";
+            }
+
+            // --------------------------------------------------------------------
+            // RESPONSE FORMAT (NEW CONTRACT FOR STEPS)
+            // --------------------------------------------------------------------
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY a single JSON object with EXACTLY these fields (no more, no less):\n";
+            prompt << "1) \"answer\": string\n";
+            prompt << "2) \"alert_condition\": boolean (REQUIRED)\n";
+            prompt << "3) \"start_condition_step_id\": false OR integer (REQUIRED)\n";
+            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
+            if (hasFaceReferences) {
+                prompt << "5) \"faceid_match\": boolean (REQUIRED)\n";
+                prompt << "6) \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
+            }
+            prompt << "\n";
+
+            prompt << "DEFAULT VALUES RULE:\n";
+            prompt << "- \"alert_condition\" MUST default to false.\n";
+            prompt << "- \"start_condition_step_id\" MUST default to false (boolean false).\n";
+            if (hasFaceReferences) {
+                prompt << "- \"faceid_match\" MUST default to false.\n";
+                prompt << "- If faceid_match is true, \"alert_condition\" MUST be true.\n";
+                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in \"faceid_target_names\".\n";
+            }
+            prompt << "- Set \"alert_condition\" to true ONLY if the alert condition is clearly satisfied in this snapshot.\n";
+            prompt << "- Set \"start_condition_step_id\" to the INTEGER step id ONLY if the start condition is clearly satisfied in this snapshot; otherwise keep it as false.\n\n";
+
+            // --------------------------------------------------------------------
+            // ANSWER WRITING RULES
+            // --------------------------------------------------------------------
+            prompt << "ANSWER WRITING RULES:\n";
+            prompt << "- The answer text MUST NOT imply any duration or sequence of events.\n";
+            prompt << "- The answer MUST describe ONLY what is visible inside the snapshot.\n";
+            prompt << "- Do not claim something happened before/after unless it is directly visible (e.g., a person mid-step is okay, but 'they entered' is not).\n";
+            prompt << "- Keep the answer short and use the same language as the user question.\n\n";
+            if (hasFaceReferences) {
+                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n\n";
+            }
+
+            // --------------------------------------------------------------------
+            // EVALUATION RULES FOR BOOLEAN FIELDS
+            // --------------------------------------------------------------------
+            prompt << "BOOLEAN EVALUATION RULES:\n";
+            prompt << "- Evaluate each condition independently.\n";
+            prompt << "- If the ALERT CONDITION is satisfied in this snapshot, set \"alert_condition\": true, else false.\n";
+            prompt << "- If the START CONDITION is satisfied in this snapshot, set \"start_condition_step_id\" to the INTEGER step id referenced in START CONDITION; otherwise keep it as false.\n";
+            if (hasFaceReferences) {
+                prompt << "- Set \"faceid_match\" to true only if at least one reference identity is confidently present.\n";
+            }
+            if (hasNegativeReferences) {
+                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping \"alert_condition\" as false unless explicit severe risk is visible.\n";
+            }
+            prompt << "- If \"alert_condition\" is true and region overlays are visible, include matching ids in \"alert_region_ids\".\n";
+            prompt << "- If you are not confident about a condition, keep it false.\n\n";
+
+            // --------------------------------------------------------------------
+            // EXAMPLES (ANCHOR)
+            // --------------------------------------------------------------------
+            prompt << "EXAMPLE OUTPUT (not found / not confident):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short direct negative answer to the user question>\",\n";
+            prompt << "  \"alert_condition\": false,\n";
+            prompt << "  \"start_condition_step_id\": false";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": false\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "EXAMPLE OUTPUT (alert condition satisfied, start condition not satisfied):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short answer describing ONLY what is visible in the snapshot>\",\n";
+            prompt << "  \"alert_condition\": true,\n";
+            prompt << "  \"start_condition_step_id\": false";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": true\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "EXAMPLE OUTPUT (start condition satisfied, alert condition not satisfied):\n";
+            prompt << "{\n";
+            prompt << "  \"answer\": \"<short answer describing ONLY what is visible in the snapshot>\",\n";
+            prompt << "  \"alert_condition\": false,\n";
+            prompt << "  \"start_condition_step_id\": 123";
+            if (hasFaceReferences) {
+                prompt << ",\n  \"faceid_match\": false\n";
+            } else {
+                prompt << "\n";
+            }
+            prompt << "}\n\n";
+
+            prompt << "GENERAL OUTPUT RULES:\n";
+            if (hasFaceReferences) {
+                prompt << "- Do not add any fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", and optional \"faceid_target_names\".\n";
+            }
+            else {
+                prompt << "- Do not add any fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", and optional \"alert_region_ids\".\n";
+            }
+            prompt << "- Do not include Markdown, backticks, or code fences.\n";
+            prompt << "- Output RAW JSON only, without comments or trailing commas.\n";
+
+            promptStr = prompt.str();
+            parts.push_back({ { "text", promptStr } });
+        }
+
+
+        if (hasFaceReferences) {
+            appendGeminiFaceReferenceParts_(parts, effectiveFaceReferences);
+        }
+        if (hasNegativeReferences) {
+            appendGeminiNegativeReferenceParts_(parts, effectiveNegativeReferences);
+        }
+
+        // Model selection (always has image)
+        std::string modelName = pickGeminiModelName(modelTier, /*hasImage*/ true);
+
+        const std::string camLogId = std::to_string(cameraId);
+
+        Logger::instance().logDebug(
+            camLogId,
+            "callGeminiVisionImageJOB_: GEMINI PROMPT (model=" + modelName + ")\n" + promptStr
+        );
+
+        // CCTV snapshot
+        std::string bare = stripDataUrlPrefix(jpegBase64);
+        parts.push_back({
+            { "inline_data", {
+                { "mime_type", "image/jpeg" },
+                { "data", bare }
+            }}
+            });
+
+        nlohmann::json body = {
+            { "contents", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "parts", parts }
+                }
+            })},
+            { "generation_config", {
+                { "max_output_tokens", 7500 },
+                { "temperature", 0.0 }
+            }}
+        };
+
+        const std::string apiKey = geminiApiKey.empty()
+            ? "AIzaSyA_c5lgj1--kFYMDL0y4d58hXnT5-J-7M0"
+            : geminiApiKey;
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonGemini(
+                apiKey,
+                modelName,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug("agent",
+                std::string("callGeminiVisionImageJOB_: httpPostJsonGemini exception: ") + e.what());
+            return hit;
+        }
+
+        Logger::instance().logDebug(
+            camLogId,
+            "callGeminiVisionImageJOB_: rawResp = " + sanitizeModelRawRespForLog_(rawResp)
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent",
+                "callGeminiVisionImageJOB_: response JSON invalid/discarded.");
+            return hit;
+        }
+
+        // usageMetadata
+        if (respJson.contains("usageMetadata") && respJson["usageMetadata"].is_object()) {
+            const auto& u = respJson["usageMetadata"];
+            outPromptTokens = u.value("promptTokenCount", 0);
+            outOutputTokens = u.value("candidatesTokenCount", 0);
+            outTotalTokens = u.value("totalTokenCount", 0);
+
+            Logger::instance().logDebug(
+                "agent",
+                "Image tokens | prompt=" + std::to_string(outPromptTokens) +
+                " | output=" + std::to_string(outOutputTokens) +
+                " | total=" + std::to_string(outTotalTokens)
+            );
+        }
+
+        // extract text
+        std::string text;
+        if (respJson.contains("candidates") && respJson["candidates"].is_array() && !respJson["candidates"].empty()) {
+            const auto& c0 = respJson["candidates"][0];
+            if (c0.contains("content") && c0["content"].is_object()) {
+                const auto& content = c0["content"];
+                if (content.contains("parts") && content["parts"].is_array() && !content["parts"].empty()) {
+                    const auto& p0 = content["parts"][0];
+                    if (p0.contains("text") && p0["text"].is_string()) {
+                        text = p0["text"].get<std::string>();
+                    }
+                }
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageJOB_: empty text");
+            return hit;
+        }
+
+        // Strip to JSON braces
+        std::size_t firstBrace = text.find('{');
+        std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos || lastBrace == std::string::npos || lastBrace <= firstBrace) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageJOB_: no JSON braces");
+            return hit;
+        }
+
+        std::string jsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageJOB_: invalid JSON object");
+            return hit;
+        }
+
+        parseStructuredVisionResponseIntoHit_(
+            res,
+            hit,
+            /*includeDetectionTimeInVideo*/ false
+        );
+        normalizeTemporalPayloadForStill_(hit, snapshotTsUtcIso);
+        if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = res["faceid_match"].get<bool>();
+        }
+        if (hasFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(res);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    faceReferences.empty() && !uploadedImageBase64.empty()
+                        ? "chat_face_reference"
+                        : "face_target_match"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callGeminiVisionImageJOB_: UNHANDLED exception: ") + e.what());
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callGeminiVisionImageJOB_: UNHANDLED unknown exception");
+        return hit;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+VideoHit AgentCore::callGeminiVisionImageGroupJOB_(
+    const std::vector<GroupImageInput>& inputs,
+    const std::string& groupPrompt,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& modelTier,
+    const std::string& geminiApiKey,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens
+) {
+    VideoHit hit;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    if (inputs.empty()) {
+        Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: empty inputs");
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<std::string> fallbackFaceTargetNames =
+        collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+
+    try {
+        nlohmann::json parts = nlohmann::json::array();
+
+        if (hasFaceReferences) {
+            parts.push_back({ {"text", "FACE TARGET REFERENCES BEGIN"} });
+            appendGeminiFaceReferenceParts_(parts, effectiveFaceReferences);
+            parts.push_back({ {"text", "FACE TARGET REFERENCES END"} });
+        }
+        if (hasNegativeReferences) {
+            parts.push_back({ {"text", "NEGATIVE REFERENCE IMAGES BEGIN"} });
+            appendGeminiNegativeReferenceParts_(parts, effectiveNegativeReferences);
+            parts.push_back({ {"text", "NEGATIVE REFERENCE IMAGES END"} });
+        }
+
+        // ------------------------------------------------------------
+        // 1) For each camera: text header + inline image
+        // ------------------------------------------------------------
+        int validCount = 0;
+        for (const auto& in : inputs) {
+            if (in.jpegBase64.empty()) continue;
+
+            if (!in.injectedInput.empty() && in.injectedInput != "__MISSING_INPUT__") {
+                std::ostringstream pin;
+                pin << "PIPELINE_INPUT_FOR_CAMERA " << in.cameraId;
+                if (!in.regionId.empty()) pin << " REGION " << in.regionId;
+                pin << ":\n" << in.injectedInput << "\n";
+                parts.push_back({ {"text", pin.str()} });
+            }
+
+            std::ostringstream hdr;
+            hdr << "CAMERA " << in.cameraId;
+            if (!in.regionId.empty()) {
+                hdr << " | REGION_ID " << in.regionId;
+            }
+            if (!in.regionLabel.empty()) {
+                hdr << " | REGION_LABEL " << in.regionLabel;
+            }
+            if (!in.cameraName.empty()) hdr << " (" << in.cameraName << ")";
+            hdr << "\nFull frame: " << (in.fullFrame ? "true" : "false");
+            hdr << "\nSnapshot timestamp (UTC): " << (in.snapshotTsUtcIso.empty() ? "unknown" : in.snapshotTsUtcIso);
+            parts.push_back({ {"text", hdr.str()} });
+
+            std::string bare = stripDataUrlPrefix(in.jpegBase64);
+            parts.push_back({
+                { "inline_data", {
+                    { "mime_type", "image/jpeg" },
+                    { "data", bare }
+                }}
+                });
+
+            validCount++;
+        }
+
+        if (validCount == 0) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: no valid jpeg inputs");
+            return hit;
+        }
+        const std::string inputSourceSummary = buildGroupInputSourceSummary_(inputs);
+
+        // ------------------------------------------------------------
+        // 2) Prompt + contract (MUST be last, per your spec)
+        // ------------------------------------------------------------
+        std::string promptStr;
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << groupPrompt << "\".\n\n";
+            prompt << "You will receive MULTIPLE CCTV IMAGE snapshots from different cameras and optional analysis regions.\n";
+            prompt << "Each snapshot is a SINGLE moment in time (not video).\n\n";
+
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n\n";
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- Each image is a SINGLE SNAPSHOT.\n";
+            prompt << "- NEVER imply you observed events over time.\n";
+            prompt << "- Your answer MUST refer ONLY to what is visible in each snapshot.\n\n";
+
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These represent visual patterns that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If a camera snapshot strongly matches those references and no explicit severe risk is visible, keep that camera alert_condition=false.\n";
+                prompt << "- Use this to reduce false positives only.\n\n";
+            }
+
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            prompt << "- Evaluate alert + start conditions PER INPUT ITEM (camera + optional region) based only on that snapshot.\n";
+            prompt << "- If not confident, keep booleans false.\n\n";
+
+            prompt << "ALERT CONDITION (controls each results[i].alert_condition):\n";
+            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+            else prompt << "(No alert condition provided. Keep alert_condition as false.)\n\n";
+
+            prompt << "START CONDITION (controls each results[i].start_condition_step_id):\n";
+            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+            else prompt << "(No start condition provided. Keep start_condition_step_id as false.)\n\n";
+
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY a single JSON object with EXACTLY this structure:\n";
+            prompt << "{\n";
+            prompt << "  \"results\": [\n";
+            prompt << "    {\"camera_id\": 123, \"region_id\": \"region-1\", \"answer\": \"...\", \"alert_condition\": false, \"start_condition_step_id\": false, \"alert_region_ids\": []";
+            if (hasFaceReferences) {
+                prompt << ", \"faceid_match\": false, \"faceid_target_names\": []";
+            }
+            prompt << "}\n";
+            prompt << "  ],\n";
+            prompt << "  \"alert_camera_ids\": [123, 456]\n";
+            prompt << "}\n\n";
+            prompt << "Where:\n";
+            prompt << "- alert_camera_ids MUST contain ONLY the camera_id values whose results[i].alert_condition is true.\n";
+            prompt << "- If none are true, alert_camera_ids MUST be an empty array [].\n\n";
+
+            prompt << "RULES:\n";
+            prompt << "- You MUST output one results entry for every INPUT ITEM you received.\n";
+            prompt << "- camera_id MUST match the camera id in the corresponding input.\n";
+            prompt << "- region_id MUST match the corresponding input region_id when present; use \"full-frame\" when no region_id is provided.\n";
+            prompt << "- start_condition_step_id MUST be false OR an integer.\n";
+            prompt << "- If results[i].alert_condition is true and region overlays are visible, include matching region ids in results[i].alert_region_ids.\n";
+            if (hasNegativeReferences) {
+                prompt << "- If a snapshot strongly matches NEGATIVE_REFERENCE_IMAGE and no explicit severe risk is visible, keep that camera's alert_condition=false.\n";
+            }
+            if (hasFaceReferences) {
+                prompt << "- results[i].faceid_match MUST be boolean.\n";
+                prompt << "- If results[i].faceid_match is true, results[i].alert_condition MUST be true.\n";
+                prompt << "- If results[i].faceid_match is true and TARGET_NAME metadata exists, include results[i].faceid_target_names as an array of matched names.\n";
+            }
+            prompt << "- Do not add extra fields inside results[i] beyond camera_id, region_id, answer, alert_condition, start_condition_step_id, optional alert_region_ids";
+            if (hasFaceReferences) {
+                prompt << ", faceid_match and optional faceid_target_names";
+            }
+            prompt << ".\n";
+            prompt << "- Do not add extra top-level fields beyond \"results\" and \"alert_camera_ids\".\n";
+            prompt << "- No markdown. RAW JSON only.\n";
+
+            promptStr = prompt.str();
+        }
+
+        parts.push_back({ {"text", promptStr} });
+
+        // ------------------------------------------------------------
+        // 3) Model selection + request
+        // ------------------------------------------------------------
+        std::string modelName = pickGeminiModelName(modelTier, /*hasImage*/ true);
+
+        logGroupCameraDebug_(
+            inputs,
+            "callGeminiVisionImageGroupJOB_: GEMINI PROMPT (model=" + modelName +
+            ", input_sources=" + inputSourceSummary + ")\n" + promptStr,
+            /*forceCameraStream*/ true
+        );
+
+        nlohmann::json body = {
+            { "contents", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "parts", parts }
+                }
+            })},
+            { "generation_config", {
+                { "max_output_tokens", 7500 },
+                { "temperature", 0.0 }
+            }}
+        };
+
+        const std::string apiKey = geminiApiKey.empty()
+            ? "AIzaSyA_c5lgj1--kFYMDL0y4d58hXnT5-J-7M0"
+            : geminiApiKey;
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonGemini(
+                apiKey,
+                modelName,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            logGroupCameraDebug_(
+                inputs,
+                std::string("callGeminiVisionImageGroupJOB_: httpPostJsonGemini exception: ") + e.what() +
+                " (input_sources=" + inputSourceSummary + ")",
+                /*forceCameraStream*/ true
+            );
+            return hit;
+        }
+
+        logGroupCameraDebug_(
+            inputs,
+            "callGeminiVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ") = " +
+            sanitizeModelRawRespForLog_(rawResp),
+            /*forceCameraStream*/ true
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: invalid JSON response");
+            return hit;
+        }
+
+        // usageMetadata
+        if (respJson.contains("usageMetadata") && respJson["usageMetadata"].is_object()) {
+            const auto& u = respJson["usageMetadata"];
+            outPromptTokens = u.value("promptTokenCount", 0);
+            outOutputTokens = u.value("candidatesTokenCount", 0);
+            outTotalTokens = u.value("totalTokenCount", 0);
+        }
+
+        // Extract text (same pattern as callGeminiVisionImageJOB_)
+        std::string text;
+        if (respJson.contains("candidates") && respJson["candidates"].is_array() && !respJson["candidates"].empty()) {
+            const auto& c0 = respJson["candidates"][0];
+            if (c0.contains("content") && c0["content"].is_object()) {
+                const auto& content = c0["content"];
+                if (content.contains("parts") && content["parts"].is_array() && !content["parts"].empty()) {
+                    const auto& p0 = content["parts"][0];
+                    if (p0.contains("text") && p0["text"].is_string()) {
+                        text = p0["text"].get<std::string>();
+                    }
+                }
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: empty text");
+            return hit;
+        }
+
+        // Strip to JSON braces (we return RAW JSON to the caller)
+        std::size_t firstBrace = text.find('{');
+        std::size_t lastBrace = text.rfind('}');
+        if (firstBrace == std::string::npos || lastBrace == std::string::npos || lastBrace <= firstBrace) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: no JSON braces");
+            return hit;
+        }
+
+        std::string jsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callGeminiVisionImageGroupJOB_: invalid JSON object");
+            return hit;
+        }
+
+        if (hasFaceReferences && res.contains("results") && res["results"].is_array()) {
+            nlohmann::json rebuiltAlertCameraIds = nlohmann::json::array();
+            for (auto& item : res["results"]) {
+                if (!item.is_object()) continue;
+                const bool faceMatch =
+                    item.contains("faceid_match") && item["faceid_match"].is_boolean() &&
+                    item["faceid_match"].get<bool>();
+                const std::vector<std::string> parsedNames = parseFaceIdTargetNamesFromJson_(item);
+                if (!parsedNames.empty()) {
+                    item["faceid_target_names"] = parsedNames;
+                }
+                else if (faceMatch && !fallbackFaceTargetNames.empty()) {
+                    item["faceid_target_names"] = fallbackFaceTargetNames;
+                }
+                if (faceMatch) {
+                    item["alert_condition"] = true;
+                }
+                if (item.contains("alert_condition") && item["alert_condition"].is_boolean() &&
+                    item["alert_condition"].get<bool>() &&
+                    item.contains("camera_id") && item["camera_id"].is_number_integer())
+                {
+                    rebuiltAlertCameraIds.push_back(item["camera_id"]);
+                }
+            }
+            res["alert_camera_ids"] = rebuiltAlertCameraIds;
+        }
+
+        hit.hasMatch = true;
+        hit.answer = res.dump(); // RAW JSON string with { "results": [...], ... }
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callGeminiVisionImageGroupJOB_: exception: ") + e.what());
+        return hit;
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+VideoHit AgentCore::callOpenAIVisionVideoSegment_(
+    const EncodedVideoSegment& segment,
+    const std::string& userQuestion,
+    const std::string& uploadedImageBase64,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int modelInputFps,
+    int expectedWindowSeconds,
+    int runningResolution,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    hit.segmentStartTs = segment.startTs;
+    hit.segmentEndTs = segment.endTs;
+    hit.cameraId = segment.cameraId;
+    hit.cameraName = segment.cameraName;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    modelInputFps = clampRequestedModelFps_(modelInputFps);
+    if (expectedWindowSeconds < 0) expectedWindowSeconds = 0;
+    runningResolution = (runningResolution == 1024) ? 1024 : 640;
+
+    if (openAiApiKey.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: missing OpenAI api key");
+        return hit;
+    }
+
+    if (segment.bytes.empty() && segment.sourceFilePath.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: empty video input");
+        return hit;
+    }
+
+    std::string segmentStartForPrompt = trimAscii(segment.startTs);
+    std::string segmentEndForPrompt = trimAscii(segment.endTs);
+    if (segmentStartForPrompt.empty() || segmentEndForPrompt.empty()) {
+        std::string derivedStartTs;
+        std::string derivedEndTs;
+        if (deriveSegmentRangeFromPathForPrompt_(segment.sourceFilePath, derivedStartTs, derivedEndTs)) {
+            if (segmentStartForPrompt.empty()) segmentStartForPrompt = derivedStartTs;
+            if (segmentEndForPrompt.empty()) segmentEndForPrompt = derivedEndTs;
+            Logger::instance().logDebug(
+                std::to_string(segment.cameraId),
+                "callOpenAIVisionVideoSegment_: derived segment range from source path start=" +
+                segmentStartForPrompt + " end=" + segmentEndForPrompt +
+                " source=" + segment.sourceFilePath
+            );
+        }
+    }
+    if (segmentStartForPrompt.empty()) segmentStartForPrompt = "UNKNOWN_START";
+    if (segmentEndForPrompt.empty()) segmentEndForPrompt = "UNKNOWN_END";
+    hit.segmentStartTs = segmentStartForPrompt;
+    hit.segmentEndTs = segmentEndForPrompt;
+
+    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences);
+    const bool hasStructuredFaceReferences = !effectiveFaceReferences.empty();
+    const bool hasLegacySingleFaceReference =
+        !uploadedImageBase64.empty() && !hasStructuredFaceReferences;
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const std::vector<std::string> fallbackFaceTargetNames =
+        collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+    const bool cameraStyleFlow =
+        !trimAscii(alertConditionText).empty() ||
+        !trimAscii(startConditionText).empty() ||
+        !faceReferences.empty() ||
+        !negativeReferences.empty();
+    const std::string errorSource = cameraStyleFlow ? "job_or_camera_video" : "chat_video";
+
+    try {
+        std::string videoPath = segment.sourceFilePath;
+
+        struct TempFileGuard {
+            std::string path;
+            ~TempFileGuard() {
+                if (!path.empty()) {
+                    std::error_code ec;
+                    fs::remove(path, ec);
+                }
+            }
+        } tmpGuard;
+
+        if (videoPath.empty() || !fs::exists(videoPath)) {
+            if (!writeBytesToTempMp4ForOpenAI(segment.bytes, videoPath)) {
+                Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: failed to materialize mp4");
+                return hit;
+            }
+            tmpGuard.path = videoPath;
+        }
+
+        const std::string camLogId = std::to_string(segment.cameraId);
+        const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
+        double analyzedDurationSeconds = 0.0;
+        const std::vector<PromptVideoFrame> frames =
+            buildOpenAIVideoFrameInputs(
+                videoPath,
+                300,
+                modelInputFps,
+                modelName,
+                expectedWindowSeconds,
+                runningResolution,
+                camLogId,
+                segment.startTs,
+                segment.endTs,
+                &analyzedDurationSeconds
+            );
+
+        if (frames.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: no frames extracted");
+            return hit;
+        }
+
+        clampSegmentRangeToAnalyzedWindow_(
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            analyzedDurationSeconds,
+            camLogId,
+            "callOpenAIVisionVideoSegment_"
+        );
+        hit.segmentStartTs = segmentStartForPrompt;
+        hit.segmentEndTs = segmentEndForPrompt;
+
+        std::string promptStr;
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV video segment as an ORDERED sequence of frames.\n";
+            prompt << "Each frame is preceded by FRAME_META_JSON with frame_index, timestamp_name, and frame_timestamp_in_segment.\n";
+            prompt << "- frame_index is the stable ordinal of the sampled frame in this batch.\n";
+            prompt << "- timestamp_name is the real local camera/EXE timestamp for that frame.\n";
+            prompt << "- frame_timestamp_in_segment is the elapsed time from the start of this segment.\n";
+            prompt << "This segment covers: " << segmentStartForPrompt << " to " << segmentEndForPrompt << ".\n";
+            prompt << "Treat this segment range as the authoritative absolute timeline for this batch.\n\n";
+            prompt << "Frames were sampled at approximately " << modelInputFps << " FPS for this model.\n\n";
+
+            prompt << "DIRECT CAMERA/CHAT VIDEO MODE:\n";
+            prompt << "- This inference can run in direct camera monitoring or ad-hoc video analysis.\n";
+            prompt << "- Follow RESPONSE FORMAT exactly.\n\n";
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- The analyzed segment is only PART of the full requested time window.\n";
+            prompt << "- NEVER imply your answer covers the entire requested window.\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this frame sequence for NEW observations in this batch.\n";
+                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
+                prompt << "- answer and alert_condition may combine this batch with that prior state when needed.\n";
+                prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
+            }
+            else {
+                prompt << "- Refer ONLY to what is visible in these frames.\n\n";
+            }
+
+            if (hasStructuredFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
+                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
+                prompt << "- Search these identities in the CCTV frames conservatively.\n";
+                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
+                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
+            }
+            else if (hasLegacySingleFaceReference) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- Sometimes the user provides ONE reference image before the CCTV frames. ";
+                prompt << "This image is tagged as USER_REFERENCE_IMAGE.\n";
+                prompt << "- Whenever a reference image is present, it is ALWAYS a close-up selfie or a crop of a single HUMAN FACE.\n";
+                prompt << "- Treat this reference face as the target person.\n";
+                prompt << "- Your job is to check if a VERY SIMILAR FACE appears in the frame sequence.\n";
+                prompt << "INSTRUCTIONS FOR FACE MATCHING:\n";
+                prompt << "1. First, analyze the USER_REFERENCE_IMAGE and list distinct facial features.\n";
+                prompt << "2. For each CCTV frame, analyze every visible face.\n";
+                prompt << "3. Compare hair/baldness, hairstyle, hair color, ethnicity, gender, age, facial hair style/color.\n";
+                prompt << "4. If face is not clearly visible, do not classify.\n";
+                prompt << "5. If not very confident, do not classify positively.\n\n";
+            }
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If current frames strongly match those references and no explicit severe risk is visible, keep alert_condition=false.\n";
+                prompt << "- Use this only to reduce false positives.\n\n";
+            }
+
+            prompt << "CONDITIONS TO EVALUATE:\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this frame sequence for current-batch evidence.\n";
+                prompt << "- For alert_condition, you MAY combine current-batch evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
+                prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
+                prompt << "- If not confident about new observations, keep booleans false.\n\n";
+            }
+            else {
+                prompt << "- Evaluate the two conditions below using ONLY this frame sequence.\n";
+                prompt << "- If not confident, keep booleans false.\n\n";
+            }
+
+            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
+            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false unless explicit strong evidence for user's request.)\n\n";
+
+            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
+            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
+
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
+            prompt << "1) \"answer\": string\n";
+            prompt << "2) \"alert_condition\": boolean\n";
+            prompt << "3) \"start_condition_step_id\": false OR integer\n";
+            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
+                prompt << "6) \"observations\": array (OPTIONAL)\n";
+                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
+            }
+            if (hasStructuredFaceReferences) {
+                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
+                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
+            }
+            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n\n";
+
+            prompt << "RULES:\n";
+            if (hasNegativeReferences) {
+                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
+            }
+            prompt << "- If alert_condition=true and region overlays are visible, include matching region ids in \"alert_region_ids\".\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
+                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
+                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
+                prompt << "- For frame-specific video evidence, use frame_index as the primary reference and include frame_timestamp_in_segment whenever possible.\n";
+                prompt << "- If you include timestamp_name, copy it exactly from FRAME_META_JSON and never invent or reformat it.\n";
+                prompt << "- Do not invent ts_utc from frame metadata; the backend will resolve the absolute time.\n";
+                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
+            }
+            if (hasStructuredFaceReferences) {
+                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
+                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
+                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\", optional \"detection_time_in_video\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                prompt << ".\n";
+            }
+            else {
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", and optional \"detection_time_in_video\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                prompt << ".\n";
+            }
+            prompt << "- No Markdown.\n";
+            prompt << "- Output RAW JSON only.\n";
+
+            promptStr = prompt.str();
+        }
+
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionVideoSegment_: OPENAI PROMPT (model=" + modelName +
+            ", frames=" + std::to_string(frames.size()) +
+            ", expected_window_s=" + std::to_string(expectedWindowSeconds) + ")\n" + promptStr
+        );
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", promptStr } });
+
+        if (hasStructuredFaceReferences) {
+            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
+        }
+        else if (hasLegacySingleFaceReference) {
+            content.push_back({
+                { "type", "text" },
+                { "text", "USER_REFERENCE_IMAGE: target FACE of the person to search in the CCTV video." }
+            });
+            content.push_back(makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(uploadedImageBase64)));
+        }
+        if (hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
+        }
+
+        for (const auto& frame : frames) {
+            content.push_back({
+                { "type", "text" },
+                { "text", buildPromptVideoFrameMetaText_(frame) }
+            });
+            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, modelName));
+        }
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.0);
+        applyOpenAITokenLimitField_(body, modelName, 4000);
+        const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const auto coreRequestStart = std::chrono::steady_clock::now();
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonOpenAI(
+                openAiApiKey,
+                body,
+                []() { MaybeNotifyFirstRetry(); },
+                camLogId
+            );
+        }
+        catch (const std::exception& e) {
+            if (useCoreModel) {
+                const auto latencyMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - coreRequestStart).count();
+                Logger::instance().logDebug(
+                    camLogId,
+                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=error model=" +
+                    modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                    " latency_ms=" + std::to_string(latencyMs)
+                );
+            }
+            Logger::instance().logDebug(camLogId,
+                std::string("callOpenAIVisionVideoSegment_: httpPostJsonOpenAI exception: ") + e.what());
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                errorSource,
+                "http_post",
+                modelName,
+                e.what(),
+                nlohmann::json{
+                    { "segment_start_ts", segmentStartForPrompt },
+                    { "segment_end_ts", segmentEndForPrompt },
+                    { "expected_window_seconds", expectedWindowSeconds }
+                }
+            );
+            return hit;
+        }
+        if (useCoreModel) {
+            const auto latencyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - coreRequestStart).count();
+            Logger::instance().logDebug(
+                camLogId,
+                "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=success model=" +
+                modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                " latency_ms=" + std::to_string(latencyMs)
+            );
+        }
+
+        Logger::instance().logDebug(camLogId, "callOpenAIVisionVideoSegment_: rawResp = " + rawResp);
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON response");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                errorSource,
+                "invalid_json_response",
+                modelName,
+                "OpenAI returned invalid JSON response"
+            );
+            return hit;
+        }
+
+        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: empty text");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                errorSource,
+                "empty_text",
+                modelName,
+                "OpenAI returned empty text response"
+            );
+            return hit;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: no JSON braces");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                errorSource,
+                "no_json_object",
+                modelName,
+                "OpenAI text response did not contain JSON object"
+            );
+            return hit;
+        }
+
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON object");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                errorSource,
+                "invalid_json_object",
+                modelName,
+                "OpenAI returned malformed JSON object"
+            );
+            return hit;
+        }
+
+        parseStructuredVisionResponseIntoHit_(
+            res,
+            hit,
+            /*includeDetectionTimeInVideo*/ true,
+            camLogId,
+            "callOpenAIVisionVideoSegment_"
+        );
+        normalizeTemporalPayloadForVideo_(
+            hit,
+            segment.sourceFilePath,
+            temporal::nowIso(),
+            camLogId,
+            "callOpenAIVisionVideoSegment_",
+            &frames
+        );
+        if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = res["faceid_match"].get<bool>();
+        }
+        if (hasStructuredFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(res);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = fallbackFaceTargetNames;
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    "face_target_match"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callOpenAIVisionVideoSegment_: UNHANDLED exception: ") + e.what());
+        emitAgentApiErrorEvent_(
+            this,
+            segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+            errorSource,
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            e.what()
+        );
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callOpenAIVisionVideoSegment_: UNHANDLED unknown exception");
+        emitAgentApiErrorEvent_(
+            this,
+            segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+            errorSource,
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            "Unhandled unknown exception while calling OpenAI"
+        );
+        return hit;
+    }
+}
+
+
+
+
+
+
+
+
+VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
+    const EncodedVideoSegment& segment,
+    const std::string& userQuestion,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int modelInputFps,
+    int expectedWindowSeconds,
+    int runningResolution,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    hit.cameraId = segment.cameraId;
+    hit.cameraName = segment.cameraName;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    modelInputFps = clampRequestedModelFps_(modelInputFps);
+    runningResolution = (runningResolution == 1024) ? 1024 : 640;
+    const std::string camLogId = std::to_string(segment.cameraId);
+
+    std::string segmentStartForPrompt = trimAscii(segment.startTs);
+    std::string segmentEndForPrompt = trimAscii(segment.endTs);
+    if (segmentStartForPrompt.empty() || segmentEndForPrompt.empty()) {
+        std::string derivedStartTs;
+        std::string derivedEndTs;
+        if (deriveSegmentRangeFromPathForPrompt_(segment.sourceFilePath, derivedStartTs, derivedEndTs)) {
+            if (segmentStartForPrompt.empty()) segmentStartForPrompt = derivedStartTs;
+            if (segmentEndForPrompt.empty()) segmentEndForPrompt = derivedEndTs;
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegmentJOB_: derived segment range from source path start=" +
+                segmentStartForPrompt + " end=" + segmentEndForPrompt +
+                " source=" + segment.sourceFilePath
+            );
+        }
+    }
+    if (segmentStartForPrompt.empty()) segmentStartForPrompt = "UNKNOWN_START";
+    if (segmentEndForPrompt.empty()) segmentEndForPrompt = "UNKNOWN_END";
+    hit.segmentStartTs = segmentStartForPrompt;
+    hit.segmentEndTs = segmentEndForPrompt;
+
+    if (openAiApiKey.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: missing OpenAI api key");
+        return hit;
+    }
+
+    if (segment.bytes.empty() && segment.sourceFilePath.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: empty video input");
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
+    const bool hasCrossCameraWatchlist = promptHasCrossCameraWatchlist_(userQuestion);
+    const std::vector<std::string> fallbackFaceTargetNames =
+        collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+    if (faceReferences.empty()) {
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_: FaceID disabled (no face_targets in job_start payload)"
+        );
+    }
+    else if (!hasFaceReferences) {
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_: FaceID disabled (face_targets exist but no usable images)"
+        );
+    }
+    else {
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_: FaceID enabled with " +
+            std::to_string(effectiveFaceReferences.size()) + " reference image(s)"
+        );
+    }
+
+    try {
+        std::string videoPath = segment.sourceFilePath;
+
+        struct TempFileGuard {
+            std::string path;
+            ~TempFileGuard() {
+                if (!path.empty()) {
+                    std::error_code ec;
+                    fs::remove(path, ec);
+                }
+            }
+        } tmpGuard;
+
+        if (videoPath.empty() || !fs::exists(videoPath)) {
+            if (!writeBytesToTempMp4ForOpenAI(segment.bytes, videoPath)) {
+                Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: failed to materialize mp4");
+                return hit;
+            }
+            tmpGuard.path = videoPath;
+        }
+
+        const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
+        double analyzedDurationSeconds = 0.0;
+        const std::vector<PromptVideoFrame> frames =
+            buildOpenAIVideoFrameInputs(
+                videoPath,
+                300,
+                modelInputFps,
+                modelName,
+                expectedWindowSeconds,
+                runningResolution,
+                camLogId,
+                segment.startTs,
+                segment.endTs,
+                &analyzedDurationSeconds
+            );
+
+        if (frames.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: no frames extracted");
+            return hit;
+        }
+
+        clampSegmentRangeToAnalyzedWindow_(
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            analyzedDurationSeconds,
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_"
+        );
+        hit.segmentStartTs = segmentStartForPrompt;
+        hit.segmentEndTs = segmentEndForPrompt;
+
+        std::string promptStr;
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV video segment as an ORDERED sequence of frames.\n";
+            prompt << "Each frame is preceded by FRAME_META_JSON with frame_index, timestamp_name, and frame_timestamp_in_segment.\n";
+            prompt << "- frame_index is the stable ordinal of the sampled frame in this batch.\n";
+            prompt << "- timestamp_name is the real local camera/EXE timestamp for that frame.\n";
+            prompt << "- frame_timestamp_in_segment is the elapsed time from the start of this segment.\n";
+            prompt << "This segment covers: " << segmentStartForPrompt << " to " << segmentEndForPrompt << ".\n";
+            prompt << "Treat this segment range as the authoritative absolute timeline for this batch.\n\n";
+            prompt << "Frames were sampled at approximately " << modelInputFps << " FPS for this model.\n\n";
+
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- The analyzed segment is only PART of the full requested time window.\n";
+            prompt << "- NEVER imply your answer covers the entire requested window.\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this frame sequence for NEW observations in this batch.\n";
+                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
+                prompt << "- answer and alert_condition may combine this batch with that prior state when needed.\n";
+                prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
+            }
+            else {
+                prompt << "- Refer ONLY to what is visible in these frames.\n\n";
+            }
+
+            if (hasFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
+                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
+                prompt << "- Search these identities in the CCTV frames conservatively.\n";
+                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
+                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
+            }
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If current frames strongly match those references and no explicit severe risk is visible, keep alert_condition=false.\n";
+                prompt << "- Use this only to reduce false positives.\n\n";
+            }
+
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this frame sequence for current-batch evidence.\n";
+                prompt << "- For alert_condition, you MAY combine current-batch evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
+                prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
+                prompt << "- If not confident about new observations, keep booleans false.\n\n";
+            }
+            else {
+                prompt << "- Evaluate the two conditions below using ONLY this frame sequence.\n";
+                prompt << "- If not confident, keep booleans false.\n\n";
+            }
+
+            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
+            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false.)\n\n";
+
+            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
+            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
+
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
+            prompt << "1) \"answer\": string\n";
+            prompt << "2) \"alert_condition\": boolean\n";
+            prompt << "3) \"start_condition_step_id\": false OR integer\n";
+            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
+                prompt << "6) \"observations\": array (OPTIONAL)\n";
+                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
+            }
+            if (hasFaceReferences) {
+                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
+                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
+            }
+            if (hasCrossCameraWatchlist) {
+                prompt << "10) \"cross_camera_watchlist_matches\": array (OPTIONAL; include when the current batch strongly matches a shared watchlist entry, even if local alert_condition remains false)\n";
+            }
+            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n\n";
+
+            prompt << "RULES:\n";
+            if (hasNegativeReferences) {
+                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
+            }
+            prompt << "- If alert_condition=true and region overlays are visible, include matching region ids in \"alert_region_ids\".\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
+                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
+                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
+                prompt << "- For frame-specific video evidence, use frame_index as the primary reference and include frame_timestamp_in_segment whenever possible.\n";
+                prompt << "- If you include timestamp_name, copy it exactly from FRAME_META_JSON and never invent or reformat it.\n";
+                prompt << "- Do not invent ts_utc from frame metadata; the backend will resolve the absolute time.\n";
+                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
+            }
+            if (hasCrossCameraWatchlist) {
+                prompt << "- Evaluate TEMPORAL_RUNTIME_INPUT_JSON.cross_camera_watchlist independently from the local alert_condition and start condition.\n";
+                prompt << "- If a watchlist entry provides target_entity, entities, or search_prompt, use those fields as the authoritative description of what to look for.\n";
+                prompt << "- target_entity.entity_id and source_entity_id identify the source-camera target that triggered the hunt; they are not the local entity_id for this camera.\n";
+                prompt << "- If TEMPORAL_RUNTIME_INPUT_JSON contains cross_camera_watchlist and the current batch strongly matches one or more hunt entries, include cross_camera_watchlist_matches even when local alert_condition stays false.\n";
+                prompt << "- Allow for normal cross-camera differences in angle, lighting, background, scale, and pose when comparing the current batch with the shared target metadata.\n";
+                prompt << "- Each cross_camera_watchlist_matches item must be a JSON object with hunt_id, matched_entity_id, confidence, and optional reason.\n";
+                prompt << "- matched_entity_id must be the local entity_id from this camera when available; never copy target_entity.entity_id into matched_entity_id unless the same local ID is genuinely in use here.\n";
+            }
+            if (hasFaceReferences) {
+                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
+                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
+                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\", optional \"detection_time_in_video\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                if (hasCrossCameraWatchlist) {
+                    prompt << ", optional \"cross_camera_watchlist_matches\"";
+                }
+                prompt << ".\n";
+            }
+            else {
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", and optional \"detection_time_in_video\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                if (hasCrossCameraWatchlist) {
+                    prompt << ", optional \"cross_camera_watchlist_matches\"";
+                }
+                prompt << ".\n";
+            }
+            prompt << "- No Markdown.\n";
+            prompt << "- Output RAW JSON only.\n";
+
+            promptStr = prompt.str();
+        }
+
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_: OPENAI PROMPT (model=" + modelName +
+            ", frames=" + std::to_string(frames.size()) +
+            ", expected_window_s=" + std::to_string(expectedWindowSeconds) + ")\n" + promptStr
+        );
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", promptStr } });
+        if (hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
+        }
+        if (hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
+        }
+
+        for (const auto& frame : frames) {
+            content.push_back({
+                { "type", "text" },
+                { "text", buildPromptVideoFrameMetaText_(frame) }
+            });
+            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, modelName));
+        }
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.0);
+        applyOpenAITokenLimitField_(body, modelName, 4000);
+        const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const auto coreRequestStart = std::chrono::steady_clock::now();
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonOpenAI(
+                openAiApiKey,
+                body,
+                []() { MaybeNotifyFirstRetry(); },
+                camLogId
+            );
+        }
+        catch (const std::exception& e) {
+            if (useCoreModel) {
+                const auto latencyMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - coreRequestStart).count();
+                Logger::instance().logDebug(
+                    camLogId,
+                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=error model=" +
+                    modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                    " latency_ms=" + std::to_string(latencyMs)
+                );
+            }
+            Logger::instance().logDebug(camLogId,
+                std::string("callOpenAIVisionVideoSegmentJOB_: httpPostJsonOpenAI exception: ") + e.what());
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                "job_or_camera_video",
+                "http_post",
+                modelName,
+                e.what(),
+                nlohmann::json{
+                    { "segment_start_ts", segmentStartForPrompt },
+                    { "segment_end_ts", segmentEndForPrompt },
+                    { "expected_window_seconds", expectedWindowSeconds }
+                }
+            );
+            return hit;
+        }
+        if (useCoreModel) {
+            const auto latencyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - coreRequestStart).count();
+            Logger::instance().logDebug(
+                camLogId,
+                "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=success model=" +
+                modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                " latency_ms=" + std::to_string(latencyMs)
+            );
+        }
+
+        Logger::instance().logDebug(camLogId, "callOpenAIVisionVideoSegmentJOB_: rawResp = " + rawResp);
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON response");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                "job_or_camera_video",
+                "invalid_json_response",
+                modelName,
+                "OpenAI returned invalid JSON response"
+            );
+            return hit;
+        }
+
+        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: empty text");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                "job_or_camera_video",
+                "empty_text",
+                modelName,
+                "OpenAI returned empty text response"
+            );
+            return hit;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: no JSON braces");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                "job_or_camera_video",
+                "no_json_object",
+                modelName,
+                "OpenAI text response did not contain JSON object"
+            );
+            return hit;
+        }
+
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON object");
+            emitAgentApiErrorEvent_(
+                this,
+                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                "job_or_camera_video",
+                "invalid_json_object",
+                modelName,
+                "OpenAI returned malformed JSON object"
+            );
+            return hit;
+        }
+
+        parseStructuredVisionResponseIntoHit_(
+            res,
+            hit,
+            /*includeDetectionTimeInVideo*/ true,
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_"
+        );
+        normalizeTemporalPayloadForVideo_(
+            hit,
+            segment.sourceFilePath,
+            temporal::nowIso(),
+            camLogId,
+            "callOpenAIVisionVideoSegmentJOB_",
+            &frames
+        );
+        if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = res["faceid_match"].get<bool>();
+        }
+        if (hasFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(res);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = fallbackFaceTargetNames;
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    "face_target_match"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callOpenAIVisionVideoSegmentJOB_: UNHANDLED exception: ") + e.what());
+        emitAgentApiErrorEvent_(
+            this,
+            segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+            "job_or_camera_video",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            e.what()
+        );
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callOpenAIVisionVideoSegmentJOB_: UNHANDLED unknown exception");
+        emitAgentApiErrorEvent_(
+            this,
+            segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+            "job_or_camera_video",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            "Unhandled unknown exception while calling OpenAI"
+        );
+        return hit;
+    }
+}
+
+
+
+
+VideoHit AgentCore::runCameraCustomVideoInference(
+    const EncodedVideoSegment& segment,
+    const std::string& promptTemplate,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& modelName,
+    const std::string& modelApiKey,
+    int modelInputFps,
+    int runningResolution,
+    int expectedWindowSeconds,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    const std::string safeModelName =
+        trimLocal(modelName).empty() ? std::string("gpt-5.1") : trimLocal(modelName);
+    const int safeFps = clampRequestedModelFps_(modelInputFps);
+    const int safeRunningResolution = (runningResolution == 1024) ? 1024 : 640;
+    int safeWindow = expectedWindowSeconds <= 0 ? 60 : expectedWindowSeconds;
+
+    // For direct camera inference, prefer the actual clip nominal duration from filename
+    // (e.g., 10s clip should not request a 60s frame window).
+    if (!segment.sourceFilePath.empty()) {
+        try {
+            std::string clipCameraId;
+            std::string clipStartTs;
+            std::string clipEndTs;
+            int clipNominalSeconds = 0;
+            const std::string clipStem = fs::path(segment.sourceFilePath).stem().string();
+            if (parseClipNamePartsForAgent(
+                clipStem,
+                clipCameraId,
+                clipStartTs,
+                clipEndTs,
+                clipNominalSeconds
+            ) && clipNominalSeconds > 0) {
+                safeWindow = clipNominalSeconds;
+            }
+        }
+        catch (...) {
+            // Keep caller-provided safeWindow on parse failures.
+        }
+    }
+
+    try {
+        hit = callOpenAIVisionVideoSegment_(
+            segment,
+            promptTemplate,
+            /*uploadedImageBase64*/ std::string(),
+            faceReferences,
+            negativeReferences,
+            alertConditionText,
+            /*startConditionText*/ std::string(),
+            safeModelName,
+            modelApiKey,
+            safeFps,
+            safeWindow,
+            safeRunningResolution,
+            outPromptTokens,
+            outOutputTokens,
+            outTotalTokens
+        );
+    }
+    catch (const std::exception& ex) {
+        logAgentException_(
+            sourceIdForCamera_(segment.cameraId),
+            "ai_agent",
+            "AgentCore::runCameraCustomVideoInference",
+            "run_video_inference",
+            {
+                { "camera_id", segment.cameraId },
+                { "camera_name", segment.cameraName },
+                { "segment_start_ts", segment.startTs },
+                { "segment_end_ts", segment.endTs },
+                { "segment_source_file", segment.sourceFilePath },
+                { "model_name", safeModelName }
+            },
+            ex
+        );
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        return VideoHit{};
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            sourceIdForCamera_(segment.cameraId),
+            "ai_agent",
+            "AgentCore::runCameraCustomVideoInference",
+            "run_video_inference",
+            {
+                { "camera_id", segment.cameraId },
+                { "camera_name", segment.cameraName },
+                { "segment_start_ts", segment.startTs },
+                { "segment_end_ts", segment.endTs },
+                { "segment_source_file", segment.sourceFilePath },
+                { "model_name", safeModelName }
+            }
+        );
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        return VideoHit{};
+    }
+
+    return hit;
+}
+
+VideoHit AgentCore::runCameraCustomImageInference(
+    int cameraId,
+    const std::string& jpegBase64,
+    const std::string& promptTemplate,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& modelName,
+    const std::string& modelApiKey,
+    const std::string& snapshotTsUtcIso,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    VideoHit hit;
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    const std::string safeModelName =
+        trimLocal(modelName).empty() ? std::string("gpt-5.1") : trimLocal(modelName);
+
+    try {
+        hit = callOpenAIVisionImageJOB_(
+            cameraId,
+            jpegBase64,
+            promptTemplate,
+            faceReferences,
+            negativeReferences,
+            alertConditionText,
+            /*startConditionText*/ std::string(),
+            safeModelName,
+            modelApiKey,
+            snapshotTsUtcIso,
+            outPromptTokens,
+            outOutputTokens,
+            outTotalTokens
+        );
+    }
+    catch (const std::exception& ex) {
+        logAgentException_(
+            sourceIdForCamera_(cameraId),
+            "ai_agent",
+            "AgentCore::runCameraCustomImageInference",
+            "run_image_inference",
+            {
+                { "camera_id", cameraId },
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso },
+                { "model_name", safeModelName }
+            },
+            ex
+        );
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        return VideoHit{};
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            sourceIdForCamera_(cameraId),
+            "ai_agent",
+            "AgentCore::runCameraCustomImageInference",
+            "run_image_inference",
+            {
+                { "camera_id", cameraId },
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso },
+                { "model_name", safeModelName }
+            }
+        );
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        return VideoHit{};
+    }
+
+    return hit;
+}
+
+DrakonFindInferenceResult AgentCore::runDrakonFindImageInference_(
+    int cameraId,
+    const std::string& jpegBase64,
+    const std::string& searchPrompt,
+    const std::vector<DrakonFindReferenceImage>& referenceImages,
+    const std::string& modelName,
+    const std::string& modelApiKey,
+    const std::string& snapshotTsUtcIso,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    DrakonFindInferenceResult result;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    if (jpegBase64.empty()) {
+        Logger::instance().logError(
+            sourceIdForCamera_(cameraId),
+            "empty jpeg base64",
+            makeAgentErrorContext_(
+                "drakon_find",
+                "AgentCore::runDrakonFindImageInference_",
+                "validate_input",
+                {
+                    { "camera_id", cameraId }
+                }
+            )
+        );
+        return result;
+    }
+    if (modelApiKey.empty()) {
+        Logger::instance().logError(
+            sourceIdForCamera_(cameraId),
+            "missing OpenAI api key",
+            makeAgentErrorContext_(
+                "drakon_find",
+                "AgentCore::runDrakonFindImageInference_",
+                "validate_input",
+                {
+                    { "camera_id", cameraId }
+                }
+            )
+        );
+        return result;
+    }
+
+    const std::string safeModelName =
+        trimLocal(modelName).empty() ? std::string("gpt-5.1") : trimLocal(modelName);
+
+    try {
+        std::ostringstream prompt;
+        prompt << "You are Drakon Find, a CCTV visual search assistant.\n";
+        prompt << "You will receive ONE current CCTV snapshot plus zero or more TARGET_REFERENCE_IMAGE samples.\n";
+        prompt << "Search brief: \"" << searchPrompt << "\".\n";
+        prompt << "Snapshot timestamp (UTC): "
+               << (snapshotTsUtcIso.empty() ? "unknown" : snapshotTsUtcIso) << "\n\n";
+        prompt << "TASK:\n";
+        prompt << "- Decide whether the current snapshot contains the same target described in the brief and reference images.\n";
+        prompt << "- Targets may be people, vehicles, animals, objects, or custom visual entities.\n";
+        prompt << "- Treat the reference images as generic visual references, not face-only identity references.\n";
+        prompt << "- Allow normal changes in viewpoint, lighting, distance, scale, blur, and partial occlusion.\n";
+        prompt << "- If evidence is weak, ambiguous, or insufficient, return match=false.\n\n";
+        prompt << "OUTPUT RULES:\n";
+        prompt << "- Respond in the same language as the search brief.\n";
+        prompt << "- Return RAW JSON only. No markdown.\n";
+        prompt << "- confidence must be a number between 0 and 1.\n";
+        prompt << "- observed_traits should list short visual cues that support your decision.\n\n";
+        prompt << "RESPONSE FORMAT:\n";
+        prompt << "{\n";
+        prompt << "  \"match\": boolean,\n";
+        prompt << "  \"confidence\": number,\n";
+        prompt << "  \"summary\": string,\n";
+        prompt << "  \"observed_traits\": array of strings\n";
+        prompt << "}\n";
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", prompt.str() } });
+
+        int referenceIndex = 0;
+        for (const auto& reference : referenceImages) {
+            const std::string bare = stripDataUrlPrefix(reference.imageDataUrl);
+            if (bare.empty()) continue;
+            ++referenceIndex;
+            std::ostringstream label;
+            label << "TARGET_REFERENCE_IMAGE #" << referenceIndex;
+            if (!reference.imageUrl.empty()) {
+                label << " (" << reference.imageUrl << ")";
+            }
+            content.push_back({ { "type", "text" }, { "text", label.str() } });
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+        }
+
+        content.push_back({ { "type", "text" }, { "text", "LIVE_CAMERA_SNAPSHOT" } });
+        content.push_back(
+            makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(jpegBase64), safeModelName)
+        );
+
+        nlohmann::json body = {
+            { "model", safeModelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, safeModelName, 0.05);
+        applyOpenAITokenLimitField_(body, safeModelName, 900);
+
+        std::string rawResp = httpPostJsonOpenAI(
+            modelApiKey,
+            body,
+            []() { MaybeNotifyFirstRetry(); }
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindImageInference_: invalid JSON response from OpenAI"
+            );
+            return result;
+        }
+
+        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindImageInference_: empty text response from OpenAI"
+            );
+            return result;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindImageInference_: could not extract JSON object from model text"
+            );
+            return result;
+        }
+
+        nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!parsed.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindImageInference_: parsed response is not a JSON object"
+            );
+            return result;
+        }
+
+        const double rawConfidence =
+            parsed.contains("confidence") && parsed["confidence"].is_number()
+                ? parsed["confidence"].get<double>()
+                : 0.0;
+        result.hasMatch = parsed.value("match", false);
+        result.confidence = (std::max)(0.0, (std::min)(1.0, rawConfidence));
+        result.summary = trimLocal(parsed.value("summary", std::string()));
+        if (result.summary.empty()) {
+            result.summary = result.hasMatch
+                ? "Match visual identificado na snapshot atual."
+                : "Sem match confiavel na snapshot atual.";
+        }
+        if (parsed.contains("observed_traits") && parsed["observed_traits"].is_array()) {
+            result.observedTraits = parsed["observed_traits"];
+        }
+        result.raw = parsed;
+    }
+    catch (const std::exception& e) {
+        logAgentException_(
+            sourceIdForCamera_(cameraId),
+            "drakon_find",
+            "AgentCore::runDrakonFindImageInference_",
+            "infer_snapshot",
+            {
+                { "camera_id", cameraId },
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+            },
+            e
+        );
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            sourceIdForCamera_(cameraId),
+            "drakon_find",
+            "AgentCore::runDrakonFindImageInference_",
+            "infer_snapshot",
+            {
+                { "camera_id", cameraId },
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+            }
+        );
+    }
+
+    return result;
+}
+
+DrakonFindInferenceResult AgentCore::runDrakonFindVideoInference_(
+    const EncodedVideoSegment& segment,
+    const std::string& searchPrompt,
+    const std::vector<DrakonFindReferenceImage>& referenceImages,
+    const std::string& modelName,
+    const std::string& modelApiKey,
+    int modelInputFps,
+    int expectedWindowSeconds,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens)
+{
+    DrakonFindInferenceResult result;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    const std::string safeModelName =
+        trimLocal(modelName).empty() ? std::string("gpt-5.1") : trimLocal(modelName);
+    const int safeWindow = expectedWindowSeconds <= 0 ? 60 : expectedWindowSeconds;
+
+    if (modelApiKey.empty()) {
+        Logger::instance().logError(
+            sourceIdForCamera_(segment.cameraId),
+            "missing OpenAI api key",
+            makeAgentErrorContext_(
+                "drakon_find",
+                "AgentCore::runDrakonFindVideoInference_",
+                "validate_input",
+                {
+                    { "camera_id", segment.cameraId },
+                    { "segment_source_file", segment.sourceFilePath }
+                }
+            )
+        );
+        return result;
+    }
+    if (segment.bytes.empty() && segment.sourceFilePath.empty()) {
+        Logger::instance().logError(
+            sourceIdForCamera_(segment.cameraId),
+            "empty video input",
+            makeAgentErrorContext_(
+                "drakon_find",
+                "AgentCore::runDrakonFindVideoInference_",
+                "validate_input",
+                {
+                    { "camera_id", segment.cameraId }
+                }
+            )
+        );
+        return result;
+    }
+
+    try {
+        std::string videoPath = segment.sourceFilePath;
+        struct TempFileGuard {
+            std::string path;
+            ~TempFileGuard() {
+                if (!path.empty()) {
+                    std::error_code ec;
+                    fs::remove(path, ec);
+                }
+            }
+        } tempGuard;
+
+        if (videoPath.empty() || !fs::exists(videoPath)) {
+            if (!writeBytesToTempMp4ForOpenAI(segment.bytes, videoPath)) {
+                Logger::instance().logDebug("agent", "runDrakonFindVideoInference_: failed to materialize mp4");
+                return result;
+            }
+            tempGuard.path = videoPath;
+        }
+
+        const std::string camLogId = segment.cameraId > 0
+            ? std::to_string(segment.cameraId)
+            : std::string("agent");
+        double analyzedDurationSeconds = 0.0;
+        const std::vector<PromptVideoFrame> frames =
+            buildOpenAIVideoFrameInputs(
+                videoPath,
+                300,
+                clampRequestedModelFps_(modelInputFps),
+                safeModelName,
+                safeWindow,
+                640,
+                camLogId,
+                segment.startTs,
+                segment.endTs,
+                &analyzedDurationSeconds
+            );
+        if (frames.empty()) {
+            Logger::instance().logDebug("agent", "runDrakonFindVideoInference_: no frames extracted");
+            return result;
+        }
+
+        std::string segmentStartForPrompt = trimAscii(segment.startTs);
+        std::string segmentEndForPrompt = trimAscii(segment.endTs);
+        if (segmentStartForPrompt.empty() || segmentEndForPrompt.empty()) {
+            std::string derivedStartTs;
+            std::string derivedEndTs;
+            if (deriveSegmentRangeFromPathForPrompt_(videoPath, derivedStartTs, derivedEndTs)) {
+                if (segmentStartForPrompt.empty()) segmentStartForPrompt = derivedStartTs;
+                if (segmentEndForPrompt.empty()) segmentEndForPrompt = derivedEndTs;
+            }
+        }
+        if (segmentStartForPrompt.empty()) segmentStartForPrompt = "UNKNOWN_START";
+        if (segmentEndForPrompt.empty()) segmentEndForPrompt = "UNKNOWN_END";
+        clampSegmentRangeToAnalyzedWindow_(
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            analyzedDurationSeconds,
+            camLogId,
+            "runDrakonFindVideoInference_"
+        );
+
+        std::ostringstream prompt;
+        prompt << "You are Drakon Find, a CCTV visual search assistant.\n";
+        prompt << "You will receive ONE CCTV video segment as an ORDERED sequence of frames plus zero or more TARGET_REFERENCE_IMAGE samples.\n";
+        prompt << "Search brief: \"" << searchPrompt << "\".\n";
+        prompt << "Each frame is preceded by FRAME_META_JSON with frame_index, timestamp_name, and frame_timestamp_in_segment.\n";
+        prompt << "This segment covers: " << segmentStartForPrompt << " to " << segmentEndForPrompt << ".\n";
+        prompt << "Treat this segment range as the authoritative timeline for this batch.\n";
+        prompt << "Frames were sampled at approximately 1 FPS from a 60-second window.\n\n";
+        prompt << "TASK:\n";
+        prompt << "- Decide whether this segment contains the same target described in the brief and reference images.\n";
+        prompt << "- Targets may be people, vehicles, animals, objects, or custom visual entities.\n";
+        prompt << "- Treat the reference images as generic visual references, not face-only identity references.\n";
+        prompt << "- Allow normal changes in viewpoint, lighting, motion blur, distance, scale, and partial occlusion.\n";
+        prompt << "- If evidence is weak, ambiguous, or insufficient, return match=false.\n";
+        prompt << "- If the target appears, include one or more approximate MM:SS timestamps inside detection_time_in_video.\n\n";
+        prompt << "OUTPUT RULES:\n";
+        prompt << "- Respond in the same language as the search brief.\n";
+        prompt << "- Return RAW JSON only. No markdown.\n";
+        prompt << "- confidence must be a number between 0 and 1.\n";
+        prompt << "- observed_traits should list short visual cues that support your decision.\n";
+        prompt << "- detection_time_in_video should be an array of MM:SS timestamps when the target is visible.\n\n";
+        prompt << "RESPONSE FORMAT:\n";
+        prompt << "{\n";
+        prompt << "  \"match\": boolean,\n";
+        prompt << "  \"confidence\": number,\n";
+        prompt << "  \"summary\": string,\n";
+        prompt << "  \"observed_traits\": array of strings,\n";
+        prompt << "  \"detection_time_in_video\": array of strings\n";
+        prompt << "}\n";
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", prompt.str() } });
+
+        int referenceIndex = 0;
+        for (const auto& reference : referenceImages) {
+            const std::string bare = stripDataUrlPrefix(reference.imageDataUrl);
+            if (bare.empty()) continue;
+            ++referenceIndex;
+            std::ostringstream label;
+            label << "TARGET_REFERENCE_IMAGE #" << referenceIndex;
+            if (!reference.imageUrl.empty()) {
+                label << " (" << reference.imageUrl << ")";
+            }
+            content.push_back({ { "type", "text" }, { "text", label.str() } });
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+        }
+
+        for (const auto& frame : frames) {
+            content.push_back({
+                { "type", "text" },
+                { "text", buildPromptVideoFrameMetaText_(frame) }
+            });
+            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, safeModelName));
+        }
+
+        nlohmann::json body = {
+            { "model", safeModelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, safeModelName, 0.0);
+        applyOpenAITokenLimitField_(body, safeModelName, 2200);
+
+        std::string rawResp = httpPostJsonOpenAI(
+            modelApiKey,
+            body,
+            []() { MaybeNotifyFirstRetry(); },
+            camLogId
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindVideoInference_: invalid JSON response from OpenAI"
+            );
+            return result;
+        }
+
+        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindVideoInference_: empty text response from OpenAI"
+            );
+            return result;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindVideoInference_: could not extract JSON object from model text"
+            );
+            return result;
+        }
+
+        nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!parsed.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "runDrakonFindVideoInference_: parsed response is not a JSON object"
+            );
+            return result;
+        }
+
+        const double rawConfidence =
+            parsed.contains("confidence") && parsed["confidence"].is_number()
+                ? parsed["confidence"].get<double>()
+                : 0.0;
+        result.hasMatch = parsed.value("match", false);
+        result.confidence = (std::max)(0.0, (std::min)(1.0, rawConfidence));
+        result.summary = trimLocal(parsed.value("summary", std::string()));
+        if (result.summary.empty()) {
+            result.summary = result.hasMatch
+                ? "Match visual identificado na janela de video."
+                : "Sem match confiavel na janela de video.";
+        }
+        if (parsed.contains("observed_traits") && parsed["observed_traits"].is_array()) {
+            result.observedTraits = parsed["observed_traits"];
+        }
+        if (parsed.contains("detection_time_in_video")) {
+            if (parsed["detection_time_in_video"].is_array()) {
+                result.detectionTimeInVideo = parsed["detection_time_in_video"];
+            }
+            else if (parsed["detection_time_in_video"].is_string()) {
+                result.detectionTimeInVideo = nlohmann::json::array(
+                    { parsed["detection_time_in_video"] }
+                );
+            }
+        }
+        result.raw = parsed;
+    }
+    catch (const std::exception& e) {
+        logAgentException_(
+            sourceIdForCamera_(segment.cameraId),
+            "drakon_find",
+            "AgentCore::runDrakonFindVideoInference_",
+            "infer_video_window",
+            {
+                { "camera_id", segment.cameraId },
+                { "segment_start_ts", segment.startTs },
+                { "segment_end_ts", segment.endTs },
+                { "segment_source_file", segment.sourceFilePath }
+            },
+            e
+        );
+    }
+    catch (...) {
+        logAgentUnknownException_(
+            sourceIdForCamera_(segment.cameraId),
+            "drakon_find",
+            "AgentCore::runDrakonFindVideoInference_",
+            "infer_video_window",
+            {
+                { "camera_id", segment.cameraId },
+                { "segment_start_ts", segment.startTs },
+                { "segment_end_ts", segment.endTs },
+                { "segment_source_file", segment.sourceFilePath }
+            }
+        );
+    }
+
+    return result;
+}
+
+
+VideoHit AgentCore::callOpenAIVisionImageJOB_(
+    int cameraId,
+    const std::string& jpegBase64,
+    const std::string& userQuestion,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    const std::string& snapshotTsUtcIso,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens
+)
+{
+    VideoHit hit;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    if (jpegBase64.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: empty jpeg base64");
+        return hit;
+    }
+    if (openAiApiKey.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: missing OpenAI api key");
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
+    const bool hasCrossCameraWatchlist = promptHasCrossCameraWatchlist_(userQuestion);
+    const std::vector<std::string> fallbackFaceTargetNames =
+        collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+
+    try {
+        std::string promptStr;
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << userQuestion << "\".\n\n";
+            prompt << "You will receive ONE CCTV IMAGE snapshot.\n";
+            prompt << "This is a single moment in time.\n";
+            prompt << "Snapshot timestamp (UTC): "
+                << (snapshotTsUtcIso.empty() ? "unknown" : snapshotTsUtcIso) << "\n\n";
+
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
+            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- This is a SINGLE SNAPSHOT.\n";
+            prompt << "- NEVER imply events over time.\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this snapshot only for NEW observations visible right now.\n";
+                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
+                prompt << "- answer and alert_condition may combine this snapshot with that prior state when needed.\n";
+                prompt << "- Do not invent motion or duration that is not supported by this snapshot plus TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
+            }
+            else {
+                prompt << "- Refer only to what is visible in this image.\n\n";
+            }
+
+            if (hasFaceReferences) {
+                prompt << "REFERENCE IMAGE LOGIC:\n";
+                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
+                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
+                prompt << "- Search these identities in this snapshot conservatively.\n";
+                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
+                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
+            }
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If this snapshot strongly matches those references and no explicit severe risk is visible, keep alert_condition=false.\n";
+                prompt << "- Use this to reduce false positives only.\n\n";
+            }
+
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- Use this snapshot for current-batch evidence only.\n";
+                prompt << "- For alert_condition, you MAY combine current snapshot evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
+                prompt << "- For start_condition_step_id, prefer evidence visible in this snapshot unless the condition explicitly depends on prior temporal state.\n";
+                prompt << "- If not confident about new observations, keep booleans false.\n\n";
+            }
+            else {
+                prompt << "- Evaluate the two conditions below using only this snapshot.\n";
+                prompt << "- If not confident, keep booleans false.\n\n";
+            }
+
+            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
+            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false.)\n\n";
+
+            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
+            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
+
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
+            prompt << "1) \"answer\": string\n";
+            prompt << "2) \"alert_condition\": boolean\n";
+            prompt << "3) \"start_condition_step_id\": false OR integer\n";
+            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
+                prompt << "6) \"observations\": array (OPTIONAL)\n";
+                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
+            }
+            if (hasFaceReferences) {
+                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
+                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
+            }
+            if (hasCrossCameraWatchlist) {
+                prompt << "10) \"cross_camera_watchlist_matches\": array (OPTIONAL; include when the current snapshot strongly matches a shared watchlist entry, even if local alert_condition remains false)\n";
+            }
+            prompt << "\n";
+
+            prompt << "RULES:\n";
+            if (hasNegativeReferences) {
+                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
+            }
+            prompt << "- If alert_condition=true and region overlays are visible, include the matching region ids in \"alert_region_ids\".\n";
+            if (hasTemporalRuntimeHint) {
+                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
+                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
+                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
+                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
+            }
+            if (hasCrossCameraWatchlist) {
+                prompt << "- Evaluate TEMPORAL_RUNTIME_INPUT_JSON.cross_camera_watchlist independently from the local alert_condition and start condition.\n";
+                prompt << "- If a watchlist entry provides target_entity, entities, or search_prompt, use those fields as the authoritative description of what to look for.\n";
+                prompt << "- target_entity.entity_id and source_entity_id identify the source-camera target that triggered the hunt; they are not the local entity_id for this camera.\n";
+                prompt << "- If TEMPORAL_RUNTIME_INPUT_JSON contains cross_camera_watchlist and the current snapshot strongly matches one or more hunt entries, include cross_camera_watchlist_matches even when local alert_condition stays false.\n";
+                prompt << "- Allow for normal cross-camera differences in angle, lighting, background, scale, and pose when comparing the current snapshot with the shared target metadata.\n";
+                prompt << "- Each cross_camera_watchlist_matches item must be a JSON object with hunt_id, matched_entity_id, confidence, and optional reason.\n";
+                prompt << "- matched_entity_id must be the local entity_id from this camera when available; never copy target_entity.entity_id into matched_entity_id unless the same local ID is genuinely in use here.\n";
+            }
+            if (hasFaceReferences) {
+                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
+                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
+                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                if (hasCrossCameraWatchlist) {
+                    prompt << ", optional \"cross_camera_watchlist_matches\"";
+                }
+                prompt << ".\n";
+            }
+            else {
+                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", and optional \"alert_region_ids\"";
+                if (hasTemporalRuntimeHint) {
+                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
+                }
+                if (hasCrossCameraWatchlist) {
+                    prompt << ", optional \"cross_camera_watchlist_matches\"";
+                }
+                prompt << ".\n";
+            }
+            prompt << "- No Markdown.\n";
+            prompt << "- Output RAW JSON only.\n";
+
+            promptStr = prompt.str();
+        }
+
+        const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
+        const std::string camLogId = std::to_string(cameraId);
+        Logger::instance().logDebug(
+            camLogId,
+            "callOpenAIVisionImageJOB_: OPENAI PROMPT (model=" + modelName + ")\n" + promptStr
+        );
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", promptStr } });
+        if (hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
+        }
+        if (hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
+        }
+        content.push_back(makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(jpegBase64), modelName));
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.0);
+        const int baseRequestedLimit = 1200;
+        const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, baseRequestedLimit);
+        const int secondEffectiveLimit = std::min(3000, firstEffectiveLimit + 800);
+        const bool useCoreModel = isZAiCoreModelName_(modelName);
+
+        std::string rawResp;
+        nlohmann::json respJson;
+
+        auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            nlohmann::json reqBody = body;
+            applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
+            const auto coreRequestStart = std::chrono::steady_clock::now();
+
+            try {
+                rawResp = httpPostJsonOpenAI(
+                    openAiApiKey,
+                    reqBody,
+                    []() { MaybeNotifyFirstRetry(); },
+                    camLogId
+                );
+            }
+            catch (const std::exception& e) {
+                if (useCoreModel) {
+                    const auto latencyMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - coreRequestStart).count();
+                    Logger::instance().logDebug(
+                        camLogId,
+                        "core_inference_context_latency_ms scope=callOpenAIVisionImageJOB_ status=error model=" +
+                        modelName + " camera_id=" + std::to_string(cameraId) +
+                        " attempt=" + std::to_string(attemptNo) +
+                        " latency_ms=" + std::to_string(latencyMs)
+                    );
+                }
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionImageJOB_: httpPostJsonOpenAI exception (attempt=" +
+                    std::to_string(attemptNo) + "): " + e.what());
+                emitAgentApiErrorEvent_(
+                    this,
+                    cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                    "job_or_camera_image",
+                    "http_post",
+                    modelName,
+                    e.what(),
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                    }
+                );
+                return false;
+            }
+            if (useCoreModel) {
+                const auto latencyMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - coreRequestStart).count();
+                Logger::instance().logDebug(
+                    camLogId,
+                    "core_inference_context_latency_ms scope=callOpenAIVisionImageJOB_ status=success model=" +
+                    modelName + " camera_id=" + std::to_string(cameraId) +
+                    " attempt=" + std::to_string(attemptNo) +
+                    " latency_ms=" + std::to_string(latencyMs)
+                );
+            }
+
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionImageJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " + rawResp
+            );
+
+            respJson = nlohmann::json::parse(rawResp, nullptr, false);
+            if (respJson.is_discarded() || !respJson.is_object()) {
+                Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: invalid JSON response");
+                emitAgentApiErrorEvent_(
+                    this,
+                    cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                    "job_or_camera_image",
+                    "invalid_json_response",
+                    modelName,
+                    "OpenAI returned invalid JSON response",
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                    }
+                );
+                return false;
+            }
+
+            int p = 0, o = 0, t = 0;
+            extractOpenAIUsageTokens(respJson, p, o, t);
+            outPromptTokens += p;
+            outOutputTokens += o;
+            outTotalTokens += t;
+            return true;
+            };
+
+        if (!postAndParse(firstEffectiveLimit, 1)) {
+            return hit;
+        }
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        std::string finishReason = extractOpenAIFinishReason(respJson);
+        if (text.empty() && finishReason == "length" && secondEffectiveLimit > firstEffectiveLimit) {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionImageJOB_: empty text with finish_reason=length; retrying once with higher token limit " +
+                std::to_string(secondEffectiveLimit));
+
+            if (!postAndParse(secondEffectiveLimit, 2)) {
+                return hit;
+            }
+
+            text = extractOpenAITextFromResponse(respJson);
+            finishReason = extractOpenAIFinishReason(respJson);
+            if (text.empty() && finishReason == "length") {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionImageJOB_: second attempt also returned finish_reason=length with empty text; giving up for this inference");
+                emitAgentApiErrorEvent_(
+                    this,
+                    cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                    "job_or_camera_image",
+                    "finish_reason_length",
+                    modelName,
+                    "OpenAI returned finish_reason=length with empty text after retry",
+                    nlohmann::json{
+                        { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                    }
+                );
+                return hit;
+            }
+        }
+
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: empty text");
+            emitAgentApiErrorEvent_(
+                this,
+                cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                "job_or_camera_image",
+                "empty_text",
+                modelName,
+                "OpenAI returned empty text response",
+                nlohmann::json{
+                    { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                }
+            );
+            return hit;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: no JSON braces");
+            emitAgentApiErrorEvent_(
+                this,
+                cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                "job_or_camera_image",
+                "no_json_object",
+                modelName,
+                "OpenAI text response did not contain JSON object",
+                nlohmann::json{
+                    { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                }
+            );
+            return hit;
+        }
+
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: invalid JSON object");
+            emitAgentApiErrorEvent_(
+                this,
+                cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                "job_or_camera_image",
+                "invalid_json_object",
+                modelName,
+                "OpenAI returned malformed JSON object",
+                nlohmann::json{
+                    { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                }
+            );
+            return hit;
+        }
+
+        parseStructuredVisionResponseIntoHit_(
+            res,
+            hit,
+            /*includeDetectionTimeInVideo*/ false
+        );
+        normalizeTemporalPayloadForStill_(hit, snapshotTsUtcIso);
+        if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
+            hit.faceIdMatch = res["faceid_match"].get<bool>();
+        }
+        if (hasFaceReferences) {
+            hit.faceIdTargetNames = parseFaceIdTargetNamesFromJson_(res);
+            if (hit.faceIdMatch && hit.faceIdTargetNames.empty()) {
+                hit.faceIdTargetNames = fallbackFaceTargetNames;
+            }
+            if (hit.faceIdMatch) {
+                hit.faceIdentityMatches = buildFaceIdentityMatchesFromReferences_(
+                    effectiveFaceReferences,
+                    hit.faceIdTargetNames,
+                    "face_target_match"
+                );
+            }
+        }
+        if (hit.faceIdMatch) {
+            hit.alertCondition = true;
+        }
+        hit.hasMatch = hitHasStructuredMatch_(hit);
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callOpenAIVisionImageJOB_: UNHANDLED exception: ") + e.what());
+        emitAgentApiErrorEvent_(
+            this,
+            cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+            "job_or_camera_image",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            e.what(),
+            nlohmann::json{
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+            }
+        );
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callOpenAIVisionImageJOB_: UNHANDLED unknown exception");
+        emitAgentApiErrorEvent_(
+            this,
+            cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+            "job_or_camera_image",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            "Unhandled unknown exception while calling OpenAI",
+            nlohmann::json{
+                { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+            }
+        );
+        return hit;
+    }
+}
+
+
+
+
+VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
+    const std::vector<GroupImageInput>& inputs,
+    const std::string& groupPrompt,
+    const std::vector<FaceReferenceImage>& faceReferences,
+    const std::vector<NegativeReferenceImage>& negativeReferences,
+    const std::string& alertConditionText,
+    const std::string& startConditionText,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens
+)
+{
+    VideoHit hit;
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+
+    if (inputs.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: empty inputs");
+        return hit;
+    }
+    if (openAiApiKey.empty()) {
+        Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: missing OpenAI api key");
+        return hit;
+    }
+
+    const std::vector<FaceReferenceImage> effectiveFaceReferences =
+        buildEffectiveFaceReferences_(faceReferences);
+    const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
+        buildEffectiveNegativeReferences_(negativeReferences);
+    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const std::vector<std::string> fallbackFaceTargetNames =
+        collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+
+    try {
+        const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
+        nlohmann::json content = nlohmann::json::array();
+        int validCount = 0;
+
+        if (hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
+        }
+        if (hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
+        }
+
+        for (const auto& in : inputs) {
+            if (in.jpegBase64.empty()) continue;
+
+            if (!in.injectedInput.empty() && in.injectedInput != "__MISSING_INPUT__") {
+                std::ostringstream pin;
+                pin << "PIPELINE_INPUT_FOR_CAMERA " << in.cameraId;
+                if (!in.regionId.empty()) pin << " REGION " << in.regionId;
+                pin << ":\n" << in.injectedInput << "\n";
+                content.push_back({ { "type", "text" }, { "text", pin.str() } });
+            }
+
+            std::ostringstream hdr;
+            hdr << "CAMERA " << in.cameraId;
+            if (!in.regionId.empty()) {
+                hdr << " | REGION_ID " << in.regionId;
+            }
+            if (!in.regionLabel.empty()) {
+                hdr << " | REGION_LABEL " << in.regionLabel;
+            }
+            if (!in.cameraName.empty()) hdr << " (" << in.cameraName << ")";
+            hdr << "\nFull frame: " << (in.fullFrame ? "true" : "false");
+            hdr << "\nSnapshot timestamp (UTC): " << (in.snapshotTsUtcIso.empty() ? "unknown" : in.snapshotTsUtcIso);
+            content.push_back({ { "type", "text" }, { "text", hdr.str() } });
+            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(in.jpegBase64), modelName));
+            validCount++;
+        }
+
+        if (validCount == 0) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: no valid jpeg inputs");
+            return hit;
+        }
+        const std::string inputSourceSummary = buildGroupInputSourceSummary_(inputs);
+
+        std::string promptStr;
+        {
+            std::ostringstream prompt;
+            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+            prompt << "User question: \"" << groupPrompt << "\".\n\n";
+            prompt << "You will receive MULTIPLE CCTV IMAGE snapshots from different cameras and optional analysis regions.\n";
+            prompt << "Each snapshot is a single moment in time.\n\n";
+
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
+            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
+
+            prompt << "LANGUAGE RULES:\n";
+            prompt << "- Detect the language of the user question.\n";
+            prompt << "- All JSON field names must remain in English exactly as specified.\n";
+            prompt << "- The `answer` text MUST be written in the same language as the user question.\n\n";
+
+            prompt << "IMPORTANT CONTEXT RULE:\n";
+            prompt << "- Each image is a single snapshot.\n";
+            prompt << "- NEVER imply temporal continuity.\n";
+            prompt << "- Refer only to what is visible in each snapshot.\n\n";
+
+            if (hasNegativeReferences) {
+                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
+                prompt << "- These represent visual patterns that SHOULD NOT trigger alerts by themselves.\n";
+                prompt << "- If a camera snapshot strongly matches those references and no explicit severe risk is visible, keep that camera alert_condition=false.\n";
+                prompt << "- Use this only to reduce false positives.\n\n";
+            }
+
+            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
+            prompt << "- Evaluate alert + start conditions PER INPUT ITEM (camera + optional region) based only on that snapshot.\n";
+            prompt << "- If not confident, keep booleans false.\n\n";
+
+            prompt << "ALERT CONDITION (controls each results[i].alert_condition):\n";
+            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+            else prompt << "(No alert condition provided. Keep alert_condition as false.)\n\n";
+
+            prompt << "START CONDITION (controls each results[i].start_condition_step_id):\n";
+            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+            else prompt << "(No start condition provided. Keep start_condition_step_id as false.)\n\n";
+
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+            prompt << "Return ONLY a single JSON object with EXACTLY this structure:\n";
+            prompt << "{\n";
+            prompt << "  \"results\": [\n";
+            prompt << "    {\"camera_id\": 123, \"region_id\": \"region-1\", \"answer\": \"...\", \"alert_condition\": false, \"start_condition_step_id\": false, \"alert_region_ids\": []";
+            if (hasFaceReferences) {
+                prompt << ", \"faceid_match\": false, \"faceid_target_names\": []";
+            }
+            prompt << "}\n";
+            prompt << "  ],\n";
+            prompt << "  \"alert_camera_ids\": [123, 456]\n";
+            prompt << "}\n\n";
+            prompt << "RULES:\n";
+            prompt << "- You MUST output one results entry for every INPUT ITEM received.\n";
+            prompt << "- camera_id MUST match the corresponding input camera id.\n";
+            prompt << "- region_id MUST match the corresponding input region_id when present; use \"full-frame\" when no region_id is provided.\n";
+            prompt << "- start_condition_step_id MUST be false OR integer.\n";
+            prompt << "- If results[i].alert_condition is true and region overlays are visible, include matching region ids in results[i].alert_region_ids.\n";
+            if (hasNegativeReferences) {
+                prompt << "- If a snapshot strongly matches NEGATIVE_REFERENCE_IMAGE and no explicit severe risk is visible, keep that camera's alert_condition=false.\n";
+            }
+            if (hasFaceReferences) {
+                prompt << "- results[i].faceid_match MUST be boolean.\n";
+                prompt << "- If results[i].faceid_match is true, results[i].alert_condition MUST be true.\n";
+                prompt << "- If results[i].faceid_match is true and TARGET_NAME metadata exists, include results[i].faceid_target_names as an array of matched names.\n";
+                prompt << "- Do not add fields inside results[i] other than camera_id, region_id, answer, alert_condition, start_condition_step_id, optional alert_region_ids, faceid_match, and optional faceid_target_names.\n";
+            }
+            else {
+                prompt << "- Do not add fields inside results[i] other than camera_id, region_id, answer, alert_condition, start_condition_step_id, and optional alert_region_ids.\n";
+            }
+            prompt << "- No Markdown. RAW JSON only.\n";
+
+            promptStr = prompt.str();
+        }
+
+        content.push_back({ { "type", "text" }, { "text", promptStr } });
+
+        logGroupCameraDebug_(
+            inputs,
+            "callOpenAIVisionImageGroupJOB_: OPENAI PROMPT (model=" + modelName +
+            ", input_sources=" + inputSourceSummary + ")\n" + promptStr,
+            /*forceCameraStream*/ true
+        );
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.0);
+        applyOpenAITokenLimitField_(body, modelName, 4000);
+        const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const auto coreRequestStart = std::chrono::steady_clock::now();
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonOpenAI(
+                openAiApiKey,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            if (useCoreModel) {
+                const auto latencyMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - coreRequestStart).count();
+                logGroupCameraDebug_(
+                    inputs,
+                    "core_inference_context_latency_ms scope=callOpenAIVisionImageGroupJOB_ status=error model=" +
+                    modelName + " latency_ms=" + std::to_string(latencyMs) +
+                    " input_sources=" + inputSourceSummary,
+                    /*forceCameraStream*/ true
+                );
+            }
+            logGroupCameraDebug_(
+                inputs,
+                std::string("callOpenAIVisionImageGroupJOB_: httpPostJsonOpenAI exception: ") + e.what() +
+                " (input_sources=" + inputSourceSummary + ")",
+                /*forceCameraStream*/ true
+            );
+            nlohmann::json extra = nlohmann::json::object();
+            extra["input_sources"] = inputSourceSummary;
+            extra["input_count"] = static_cast<int>(inputs.size());
+            nlohmann::json cameraIds = nlohmann::json::array();
+            for (const auto& in : inputs) {
+                if (in.cameraId > 0) cameraIds.push_back(in.cameraId);
+            }
+            if (!cameraIds.empty()) {
+                extra["camera_ids"] = cameraIds;
+            }
+            emitAgentApiErrorEvent_(
+                this,
+                std::nullopt,
+                "job_group_image",
+                "http_post",
+                modelName,
+                e.what(),
+                extra
+            );
+            return hit;
+        }
+        if (useCoreModel) {
+            const auto latencyMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - coreRequestStart).count();
+            logGroupCameraDebug_(
+                inputs,
+                "core_inference_context_latency_ms scope=callOpenAIVisionImageGroupJOB_ status=success model=" +
+                modelName + " latency_ms=" + std::to_string(latencyMs) +
+                " input_sources=" + inputSourceSummary,
+                /*forceCameraStream*/ true
+            );
+        }
+
+        logGroupCameraDebug_(
+            inputs,
+            "callOpenAIVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ") = " + rawResp,
+            /*forceCameraStream*/ true
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: invalid JSON response");
+            emitAgentApiErrorEvent_(
+                this,
+                std::nullopt,
+                "job_group_image",
+                "invalid_json_response",
+                modelName,
+                "OpenAI returned invalid JSON response",
+                nlohmann::json{
+                    { "input_sources", inputSourceSummary },
+                    { "input_count", static_cast<int>(inputs.size()) }
+                }
+            );
+            return hit;
+        }
+
+        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: empty text");
+            emitAgentApiErrorEvent_(
+                this,
+                std::nullopt,
+                "job_group_image",
+                "empty_text",
+                modelName,
+                "OpenAI returned empty text response",
+                nlohmann::json{
+                    { "input_sources", inputSourceSummary },
+                    { "input_count", static_cast<int>(inputs.size()) }
+                }
+            );
+            return hit;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: no JSON braces");
+            emitAgentApiErrorEvent_(
+                this,
+                std::nullopt,
+                "job_group_image",
+                "no_json_object",
+                modelName,
+                "OpenAI text response did not contain JSON object",
+                nlohmann::json{
+                    { "input_sources", inputSourceSummary },
+                    { "input_count", static_cast<int>(inputs.size()) }
+                }
+            );
+            return hit;
+        }
+
+        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!res.is_object()) {
+            Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: invalid JSON object");
+            emitAgentApiErrorEvent_(
+                this,
+                std::nullopt,
+                "job_group_image",
+                "invalid_json_object",
+                modelName,
+                "OpenAI returned malformed JSON object",
+                nlohmann::json{
+                    { "input_sources", inputSourceSummary },
+                    { "input_count", static_cast<int>(inputs.size()) }
+                }
+            );
+            return hit;
+        }
+
+        if (hasFaceReferences && res.contains("results") && res["results"].is_array()) {
+            nlohmann::json rebuiltAlertCameraIds = nlohmann::json::array();
+            for (auto& item : res["results"]) {
+                if (!item.is_object()) continue;
+                const bool faceMatch =
+                    item.contains("faceid_match") && item["faceid_match"].is_boolean() &&
+                    item["faceid_match"].get<bool>();
+                const std::vector<std::string> parsedNames = parseFaceIdTargetNamesFromJson_(item);
+                if (!parsedNames.empty()) {
+                    item["faceid_target_names"] = parsedNames;
+                }
+                else if (faceMatch && !fallbackFaceTargetNames.empty()) {
+                    item["faceid_target_names"] = fallbackFaceTargetNames;
+                }
+                if (faceMatch) {
+                    item["alert_condition"] = true;
+                }
+                if (item.contains("alert_condition") && item["alert_condition"].is_boolean() &&
+                    item["alert_condition"].get<bool>() &&
+                    item.contains("camera_id") && item["camera_id"].is_number_integer())
+                {
+                    rebuiltAlertCameraIds.push_back(item["camera_id"]);
+                }
+            }
+            res["alert_camera_ids"] = rebuiltAlertCameraIds;
+        }
+
+        hit.hasMatch = true;
+        hit.answer = res.dump();
+        return hit;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent",
+            std::string("callOpenAIVisionImageGroupJOB_: UNHANDLED exception: ") + e.what());
+        emitAgentApiErrorEvent_(
+            this,
+            std::nullopt,
+            "job_group_image",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            e.what(),
+            nlohmann::json{
+                { "input_count", static_cast<int>(inputs.size()) }
+            }
+        );
+        return hit;
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent",
+            "callOpenAIVisionImageGroupJOB_: UNHANDLED unknown exception");
+        emitAgentApiErrorEvent_(
+            this,
+            std::nullopt,
+            "job_group_image",
+            "unhandled_exception",
+            openAiModelName.empty() ? "gpt-5-mini" : openAiModelName,
+            "Unhandled unknown exception while calling OpenAI",
+            nlohmann::json{
+                { "input_count", static_cast<int>(inputs.size()) }
+            }
+        );
+        return hit;
+    }
+}
+
+
+
+
+void AgentCore::postCommandResult_(
+    int commandId,
+    const std::string& status,
+    const nlohmann::json& resultPayload)
+{
+    if (commandId <= 0) return;
+
+    try {
+        nlohmann::json body;
+        body["status"] = status;
+        body["result"] = resultPayload.is_null() ? nlohmann::json::object() : resultPayload;
+
+        if (status == "failed") {
+            if (resultPayload.is_object() &&
+                resultPayload.contains("error") &&
+                resultPayload["error"].is_string())
+            {
+                body["error"] = resultPayload["error"].get<std::string>();
+            }
+            else {
+                body["error"] = "command failed";
+            }
+        }
+
+        const std::string url = baseUrl_ +
+            "/api/agent/commands/" + std::to_string(commandId) +
+            "/result?client_id=" + clientId_;
+
+        std::string response;
+        const long code = HttpPostJson(url, exeToken_, body.dump(), response);
+
+        Logger::instance().logDebug(
+            "agent",
+            "postCommandResult_: commandId=" + std::to_string(commandId) +
+            " status=" + status +
+            " httpCode=" + std::to_string(code) +
+            " response=" + response
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("postCommandResult_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "postCommandResult_ unknown exception");
+    }
+}
+
+void AgentCore::handleDrakonFindCancelCommand_(int commandId, const nlohmann::json& payload)
+{
+    const int searchId = payload.value("search_id", -1);
+    if (searchId <= 0) {
+        if (commandId > 0) {
+            nlohmann::json err;
+            err["error"] = "search_id is required";
+            postCommandResult_(commandId, "failed", err);
+        }
+        return;
+    }
+
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> lk(drakonFindMu_);
+        auto it = drakonFindTasks_.find(searchId);
+        if (it != drakonFindTasks_.end() && it->second && it->second->state) {
+            it->second->state->cancelRequested = true;
+            accepted = true;
+        }
+    }
+
+    if (commandId > 0) {
+        nlohmann::json result;
+        result["search_id"] = searchId;
+        result["accepted"] = accepted;
+        postCommandResult_(commandId, "completed", result);
+    }
+}
+
+std::shared_ptr<AgentCore::ChatTaskState> AgentCore::registerChatTask_(int chatSessionId)
+{
+    if (chatSessionId <= 0) {
+        return nullptr;
+    }
+
+    auto taskState = std::make_shared<ChatTaskState>();
+    std::lock_guard<std::mutex> lock(chatTasksMu_);
+    chatTasksBySession_[chatSessionId] = taskState;
+    return taskState;
+}
+
+bool AgentCore::isChatCancellationRequested_(int chatSessionId) const
+{
+    if (chatSessionId <= 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(chatTasksMu_);
+    const auto it = chatTasksBySession_.find(chatSessionId);
+    if (it == chatTasksBySession_.end() || !it->second) {
+        return false;
+    }
+    return it->second->cancelRequested.load();
+}
+
+void AgentCore::cleanupCompletedChatTasks_()
+{
+    std::lock_guard<std::mutex> lock(chatTasksMu_);
+    for (auto it = chatTasksBySession_.begin(); it != chatTasksBySession_.end();) {
+        if (!it->second || it->second->done.load()) {
+            it = chatTasksBySession_.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+void AgentCore::handleChatCancelCommand_(int commandId, const nlohmann::json& payload)
+{
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        if (commandId > 0) {
+            nlohmann::json err;
+            err["error"] = "chat_session_id is required";
+            postCommandResult_(commandId, "failed", err);
+        }
+        return;
+    }
+
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> lock(chatTasksMu_);
+        const auto it = chatTasksBySession_.find(chatSessionId);
+        if (it != chatTasksBySession_.end() && it->second) {
+            it->second->cancelRequested = true;
+            accepted = true;
+        }
+    }
+
+    if (commandId > 0) {
+        nlohmann::json result;
+        result["chat_session_id"] = chatSessionId;
+        result["accepted"] = accepted;
+        postCommandResult_(commandId, "completed", result);
+    }
+}
+
+void AgentCore::handleDrakonFindStartCommand_(int commandId, const nlohmann::json& payload)
+{
+    auto fail = [&](const std::string& reason) {
+        if (commandId > 0) {
+            nlohmann::json err;
+            err["error"] = reason;
+            postCommandResult_(commandId, "failed", err);
+        }
+    };
+
+    cleanupCompletedDrakonFindTasks_(false);
+
+    const int searchId = payload.value("search_id", -1);
+    const int targetId = payload.value("target_id", -1);
+    const int attemptCount = (std::max)(1, payload.value("attempt_count", 1));
+    const std::string operatorUserId = payload.value("operator_user_id", std::string());
+    std::string searchPrompt = payload.value("search_prompt", std::string());
+    std::string modelName = payload.value("model_name", std::string("gpt-5.1"));
+    std::string modelApiKey = payload.value("model_api_key", std::string());
+    const int modelInputFps = clampRequestedModelFps_(payload.value("model_fps", 1));
+
+    auto trimLocal = [](const std::string& value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string();
+        const auto last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    searchPrompt = trimLocal(searchPrompt);
+    modelName = trimLocal(modelName);
+    modelApiKey = trimLocal(modelApiKey);
+
+    if (searchId <= 0) {
+        fail("search_id is required");
+        return;
+    }
+    if (searchPrompt.empty()) {
+        fail("search_prompt is required");
+        return;
+    }
+    if (modelApiKey.empty()) {
+        fail("model_api_key is required");
+        return;
+    }
+
+    std::string targetName;
+    if (payload.contains("target") && payload["target"].is_object()) {
+        targetName = payload["target"].value("name", std::string());
+    }
+    targetName = trimLocal(targetName);
+
+    struct CameraAssignmentLocal {
+        int cameraId = -1;
+        std::string cameraName;
+        std::string cameraOwnerUserId;
+        std::string city;
+        std::string stateCode;
+        std::string countryCode;
+        bool wasServiceRunning = false;
+        nlohmann::json cameraPayload = nlohmann::json::object();
+    };
+
+    std::vector<CameraAssignmentLocal> cameraAssignments;
+    if (payload.contains("camera_assignments") && payload["camera_assignments"].is_array()) {
+        for (const auto& item : payload["camera_assignments"]) {
+            if (!item.is_object()) continue;
+            CameraAssignmentLocal row;
+            row.cameraId = item.value("camera_id", -1);
+            row.cameraName = trimLocal(item.value("camera_name", std::string()));
+            row.cameraOwnerUserId = trimLocal(item.value("camera_owner_user_id", std::string()));
+            row.city = trimLocal(item.value("city", std::string()));
+            row.stateCode = trimLocal(item.value("state_code", std::string()));
+            row.countryCode = trimLocal(item.value("country_code", std::string()));
+            if (item.contains("was_service_running")) {
+                if (item["was_service_running"].is_boolean()) {
+                    row.wasServiceRunning = item["was_service_running"].get<bool>();
+                }
+                else if (item["was_service_running"].is_number_integer()) {
+                    row.wasServiceRunning = item["was_service_running"].get<int>() != 0;
+                }
+            }
+            if (item.contains("camera_payload") && item["camera_payload"].is_object()) {
+                row.cameraPayload = item["camera_payload"];
+            }
+            if (row.cameraId > 0) {
+                cameraAssignments.push_back(std::move(row));
+            }
+        }
+    }
+    if (cameraAssignments.empty()) {
+        fail("camera_assignments is required");
+        return;
+    }
+
+    std::vector<DrakonFindReferenceImage> referenceImages;
+    if (payload.contains("reference_images") && payload["reference_images"].is_array()) {
+        for (const auto& item : payload["reference_images"]) {
+            if (!item.is_object()) continue;
+            DrakonFindReferenceImage reference;
+            reference.imageId = item.value("image_id", -1);
+            reference.imageUrl = trimLocal(item.value("image_url", std::string()));
+            reference.contentType = trimLocal(item.value("content_type", std::string()));
+            reference.imageDataUrl = trimLocal(item.value("data_url", std::string()));
+            if (!reference.imageDataUrl.empty()) {
+                referenceImages.push_back(std::move(reference));
+            }
+        }
+    }
+
+    std::string runtimeMode = payload.value("runtime_mode", std::string("continuous_video_60s"));
+    std::string inputType = payload.value("input_type", std::string("video"));
+    runtimeMode = trimLocal(runtimeMode);
+    inputType = trimLocal(inputType);
+    if (runtimeMode.empty()) runtimeMode = "continuous_video_60s";
+    if (inputType.empty()) inputType = "video";
+
+    const int windowSeconds = (std::max)(1, payload.value("window_seconds", 60));
+    const int durationSeconds = (std::max)(
+        windowSeconds,
+        payload.value("duration_seconds", 1800)
+    );
+
+    auto taskState = std::make_shared<DrakonFindTaskState>();
+    {
+        std::lock_guard<std::mutex> lk(drakonFindMu_);
+        auto it = drakonFindTasks_.find(searchId);
+        if (it != drakonFindTasks_.end() &&
+            it->second &&
+            it->second->state &&
+            !it->second->state->done.load())
+        {
+            fail("search is already running on this EXE");
+            return;
+        }
+    }
+
+    auto task = std::make_unique<DrakonFindTask>();
+    task->state = taskState;
+    task->worker = std::thread(
+        [this,
+         commandId,
+         searchId,
+         targetId,
+         attemptCount,
+         operatorUserId,
+         targetName,
+         searchPrompt,
+         modelName,
+         modelApiKey,
+         modelInputFps,
+         runtimeMode,
+         inputType,
+         windowSeconds,
+         durationSeconds,
+         trimLocal,
+         referenceImages,
+         cameraAssignments,
+         taskState]() {
+            auto postSearchEvent = [&](const std::string& eventType,
+                                       const std::string& message,
+                                       const nlohmann::json& extra = nlohmann::json::object()) {
+                nlohmann::json details = extra;
+                details["search_id"] = searchId;
+                details["target_id"] = targetId;
+                details["attempt_count"] = attemptCount;
+                if (!targetName.empty()) details["target_name"] = targetName;
+                postAgentEvent(eventType, std::nullopt, operatorUserId, message, details);
+            };
+
+            auto postCameraEvent = [&](const std::string& eventType,
+                                       const CameraAssignmentLocal& camera,
+                                       const std::string& message,
+                                       const nlohmann::json& extra = nlohmann::json::object()) {
+                nlohmann::json details = extra;
+                details["search_id"] = searchId;
+                details["target_id"] = targetId;
+                details["attempt_count"] = attemptCount;
+                details["camera_id"] = camera.cameraId;
+                details["camera_name"] = camera.cameraName;
+                details["camera_owner_user_id"] = camera.cameraOwnerUserId;
+                details["city"] = camera.city;
+                details["state_code"] = camera.stateCode;
+                details["country_code"] = camera.countryCode;
+                if (!targetName.empty()) details["target_name"] = targetName;
+                postAgentEvent(eventType, std::optional<int>(camera.cameraId), operatorUserId, message, details);
+            };
+
+            auto stopTemporarySessionIfSafe = [&](const CameraAssignmentLocal& camera,
+                                                  bool temporarySessionStarted,
+                                                  const std::optional<CameraConfig>& temporaryCfg) {
+                if (!temporarySessionStarted) return;
+                if (camera.wasServiceRunning) return;
+                if (!temporaryCfg.has_value()) return;
+
+                CameraSession* currentSession = getCameraSession(camera.cameraId);
+                if (!currentSession) return;
+                if (!currentSession->matchesStartConfig(*temporaryCfg)) return;
+
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleDrakonFindStartCommand_: stopping temporary Drakon Find session for camera " +
+                    std::to_string(camera.cameraId)
+                );
+                stopCamera_(camera.cameraId);
+            };
+
+            auto waitForNewStoredClip = [&](int cameraId,
+                                            const std::string& lastProcessedPath,
+                                            const std::chrono::steady_clock::time_point& deadline,
+                                            std::string& outClipPath) -> bool {
+                outClipPath.clear();
+
+                while (running_ && !taskState->cancelRequested.load()) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        break;
+                    }
+
+                    const auto newestClip = getNewestStoredSixtySecondClipForCameraDrakonFind_(cameraId);
+                    if (newestClip.has_value() &&
+                        !newestClip->empty() &&
+                        *newestClip != lastProcessedPath)
+                    {
+                        outClipPath = *newestClip;
+                        return true;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+
+                const auto newestClip = getNewestStoredSixtySecondClipForCameraDrakonFind_(cameraId);
+                if (newestClip.has_value() &&
+                    !newestClip->empty() &&
+                    *newestClip != lastProcessedPath)
+                {
+                    outClipPath = *newestClip;
+                    return true;
+                }
+
+                return false;
+            };
+
+            auto buildStoredClipSegment = [&](const CameraAssignmentLocal& camera,
+                                              const std::string& clipPath,
+                                              EncodedVideoSegment& outSegment,
+                                              std::string& outError) -> bool {
+                outSegment = EncodedVideoSegment{};
+                outError.clear();
+
+                if (clipPath.empty()) {
+                    outError = "stored clip path is empty";
+                    return false;
+                }
+
+                std::error_code ec;
+                if (!fs::exists(clipPath, ec) || ec) {
+                    outError = "stored 60s clip is not available on disk";
+                    return false;
+                }
+
+                outSegment.cameraId = camera.cameraId;
+                outSegment.cameraName = camera.cameraName;
+                outSegment.sourceFilePath = clipPath;
+                outSegment.isTempFile = false;
+
+                if (!deriveStoredClipUtcRangeDrakonFind_(
+                    fs::path(clipPath),
+                    outSegment.startTs,
+                    outSegment.endTs))
+                {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleDrakonFindStartCommand_: could not derive UTC range from stored clip " + clipPath
+                    );
+                }
+
+                return true;
+            };
+
+            auto buildDetectionTimeHint = [&](const nlohmann::json& detectionTimeInVideo) -> std::string {
+                if (detectionTimeInVideo.is_string()) {
+                    return trimAscii(detectionTimeInVideo.get<std::string>());
+                }
+                if (!detectionTimeInVideo.is_array()) {
+                    return std::string();
+                }
+                for (const auto& item : detectionTimeInVideo) {
+                    if (item.is_string()) {
+                        const std::string value = trimAscii(item.get<std::string>());
+                        if (!value.empty()) return value;
+                    }
+                }
+                return std::string();
+            };
+
+            auto cleanupTempSegmentFile = [&](const EncodedVideoSegment& segment) {
+                if (!segment.isTempFile || segment.sourceFilePath.empty()) return;
+                std::error_code rmEc;
+                fs::remove(segment.sourceFilePath, rmEc);
+            };
+
+            std::atomic<int> matchedCameraCount{ 0 };
+            std::atomic<int> completedCameraCount{ 0 };
+            std::atomic<int> failedCameraCount{ 0 };
+            std::atomic<int> cancelledCameraCount{ 0 };
+            std::atomic<int> totalPromptTokens{ 0 };
+            std::atomic<int> totalOutputTokens{ 0 };
+            std::atomic<int> totalTokens{ 0 };
+            const auto searchStartedAtSteady = std::chrono::steady_clock::now();
+            const auto searchDeadlineSteady =
+                searchStartedAtSteady + std::chrono::seconds(durationSeconds);
+            std::vector<std::thread> cameraWorkers;
+            cameraWorkers.reserve(cameraAssignments.size());
+
+            try {
+                postSearchEvent(
+                    "drakon_find_search_started",
+                    "Drakon Find search started",
+                    {
+                        { "camera_count", static_cast<int>(cameraAssignments.size()) },
+                        { "reference_image_count", static_cast<int>(referenceImages.size()) },
+                        { "runtime_mode", runtimeMode },
+                        { "input_type", inputType },
+                        { "window_seconds", windowSeconds },
+                        { "duration_seconds", durationSeconds }
+                    }
+                );
+
+                for (const auto& camera : cameraAssignments) {
+                    cameraWorkers.emplace_back([&, camera]() {
+                        bool temporarySessionStarted = false;
+                        std::optional<CameraConfig> temporaryCfg;
+                        int analyzedWindowCount = 0;
+                        int cameraHitCount = 0;
+                        int cameraPromptTokens = 0;
+                        int cameraOutputTokens = 0;
+                        int cameraUsedTokens = 0;
+                        int consecutiveWindowFailures = 0;
+                        std::string lastProcessedStoredClipPath;
+                        std::string lastSegmentSource;
+                        std::string lastSummary;
+                        std::string lastErrorForCamera;
+                        std::unordered_set<std::string> processedSegmentKeys;
+
+                        auto buildRuntimeDetails = [&](const std::string& status) {
+                            nlohmann::json details = {
+                                { "status", status },
+                                { "runtime_mode", runtimeMode },
+                                { "input_type", inputType },
+                                { "window_seconds", windowSeconds },
+                                { "duration_seconds", durationSeconds },
+                                { "analyzed_window_count", analyzedWindowCount },
+                                { "camera_hit_count", cameraHitCount },
+                                { "prompt_tokens", cameraPromptTokens },
+                                { "output_tokens", cameraOutputTokens },
+                                { "total_tokens", cameraUsedTokens }
+                            };
+                            if (!lastSegmentSource.empty()) details["segment_source"] = lastSegmentSource;
+                            if (!lastErrorForCamera.empty()) details["error"] = lastErrorForCamera;
+                            return details;
+                        };
+                        auto buildSegmentIdentityKey = [&](const EncodedVideoSegment& segment) -> std::string {
+                            std::string startTs = trimAscii(segment.startTs);
+                            std::string endTs = trimAscii(segment.endTs);
+                            if ((startTs.empty() || endTs.empty()) && !segment.sourceFilePath.empty()) {
+                                std::string clipCameraId;
+                                std::string clipStartTs;
+                                std::string clipEndTs;
+                                int clipNominalSeconds = 0;
+                                if (parseClipNamePartsForAgent(
+                                    fs::path(segment.sourceFilePath).stem().string(),
+                                    clipCameraId,
+                                    clipStartTs,
+                                    clipEndTs,
+                                    clipNominalSeconds))
+                                {
+                                    if (startTs.empty()) startTs = clipStartTs;
+                                    if (endTs.empty()) endTs = clipEndTs;
+                                }
+                            }
+                            if (!startTs.empty() && !endTs.empty()) {
+                                return startTs + "|" + endTs;
+                            }
+                            return trimAscii(segment.sourceFilePath);
+                        };
+
+                        int drakonFindCaptureRequestId = -1;
+                        auto releaseDrakonFindCaptureRequest = [&](int* requestIdPtr) {
+                            if (!requestIdPtr || *requestIdPtr <= 0) return;
+                            releaseDrakonFindVideoCapture_(camera.cameraId, *requestIdPtr);
+                            *requestIdPtr = -1;
+                        };
+                        std::unique_ptr<int, decltype(releaseDrakonFindCaptureRequest)> drakonFindCaptureGuard(
+                            nullptr,
+                            releaseDrakonFindCaptureRequest
+                        );
+
+                        try {
+                            postCameraEvent(
+                                "drakon_find_camera_started",
+                                camera,
+                                "Camera assigned to continuous Drakon Find runtime",
+                                {
+                                    { "runtime_mode", runtimeMode },
+                                    { "input_type", inputType },
+                                    { "window_seconds", windowSeconds },
+                                    { "duration_seconds", durationSeconds }
+                                }
+                            );
+
+                            const bool shouldAcquireDrakonFindVideoCapture =
+                                inputType == "video" &&
+                                normalizeCaptureClipSeconds_(windowSeconds) > 10;
+                            if (shouldAcquireDrakonFindVideoCapture) {
+                                drakonFindCaptureRequestId = acquireDrakonFindVideoCapture_(
+                                    searchId,
+                                    camera.cameraId,
+                                    modelInputFps,
+                                    windowSeconds
+                                );
+                                if (drakonFindCaptureRequestId > 0) {
+                                    drakonFindCaptureGuard.reset(&drakonFindCaptureRequestId);
+                                }
+                            }
+
+                            CameraSession* session = getCameraSession(camera.cameraId);
+                            if (!session && camera.cameraPayload.is_object()) {
+                                postCameraEvent(
+                                    "drakon_find_camera_progress",
+                                    camera,
+                                    "Starting temporary camera session for Drakon Find",
+                                    {
+                                        { "runtime_mode", runtimeMode },
+                                        { "input_type", inputType },
+                                        { "window_seconds", windowSeconds },
+                                        { "duration_seconds", durationSeconds }
+                                    }
+                                );
+                                nlohmann::json temporaryCameraPayload = camera.cameraPayload;
+                                temporaryCameraPayload["drakon_find_temporary_session"] = true;
+                                temporaryCameraPayload["hydrate_existing_segments"] = false;
+                                try {
+                                    temporaryCfg = buildCameraConfigFromPayload_(camera.cameraId, temporaryCameraPayload);
+                                }
+                                catch (...) {
+                                    temporaryCfg.reset();
+                                }
+                                startCameraFromPayload_(camera.cameraId, temporaryCameraPayload);
+                                session = getCameraSession(camera.cameraId);
+                                if (session) {
+                                    temporarySessionStarted = true;
+                                    lastSegmentSource = "temporary_session";
+                                    postCameraEvent(
+                                        "drakon_find_camera_progress",
+                                        camera,
+                                        "Temporary camera session started for Drakon Find",
+                                        {
+                                            { "segment_source", lastSegmentSource },
+                                            { "runtime_mode", runtimeMode },
+                                            { "input_type", inputType },
+                                            { "window_seconds", windowSeconds },
+                                            { "duration_seconds", durationSeconds }
+                                        }
+                                    );
+                                }
+                            }
+
+                            if (const auto newestClip = getNewestStoredSixtySecondClipForCameraDrakonFind_(camera.cameraId);
+                                newestClip.has_value())
+                            {
+                                lastProcessedStoredClipPath = *newestClip;
+                            }
+
+                            if (!session && !camera.cameraPayload.is_object()) {
+                                lastErrorForCamera = "camera session is not available on this EXE";
+                                failedCameraCount.fetch_add(1);
+                                postCameraEvent(
+                                    "drakon_find_camera_failed",
+                                    camera,
+                                    "Camera session is not available on this EXE",
+                                    buildRuntimeDetails("failed")
+                                );
+                                return;
+                            }
+
+                            while (running_ && !taskState->cancelRequested.load()) {
+                                const auto nowSteady = std::chrono::steady_clock::now();
+                                if (nowSteady >= searchDeadlineSteady) break;
+                                const auto remainingSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                    searchDeadlineSteady - nowSteady
+                                ).count();
+                                if (remainingSeconds < windowSeconds) break;
+
+                                EncodedVideoSegment segment;
+                                std::string acquisitionError;
+                                bool haveSegment = false;
+                                std::string newestClipPath;
+                                const bool preferOnDemandCapture =
+                                    modelInputFps > 1 && camera.cameraPayload.is_object();
+                                const auto storedClipWait = temporarySessionStarted
+                                    ? std::chrono::seconds(windowSeconds + 20)
+                                    : std::chrono::seconds(5);
+                                const auto clipWaitDeadline = (std::min)(
+                                    searchDeadlineSteady,
+                                    nowSteady + storedClipWait
+                                );
+
+                                if (!preferOnDemandCapture &&
+                                    waitForNewStoredClip(
+                                        camera.cameraId,
+                                        lastProcessedStoredClipPath,
+                                        clipWaitDeadline,
+                                        newestClipPath))
+                                {
+                                    haveSegment = buildStoredClipSegment(
+                                        camera,
+                                        newestClipPath,
+                                        segment,
+                                        acquisitionError
+                                    );
+                                    if (haveSegment) {
+                                        lastProcessedStoredClipPath = newestClipPath;
+                                        lastSegmentSource = temporarySessionStarted
+                                            ? "stored_clip_temporary_session"
+                                            : "stored_clip_running_session";
+                                    }
+                                }
+
+                                if (!haveSegment && camera.cameraPayload.is_object()) {
+                                    postCameraEvent(
+                                        "drakon_find_camera_progress",
+                                        camera,
+                                        "Capturing a 60-second video window for Drakon Find",
+                                        {
+                                            { "runtime_mode", runtimeMode },
+                                            { "input_type", inputType },
+                                            { "window_seconds", windowSeconds },
+                                            { "duration_seconds", durationSeconds }
+                                        }
+                                    );
+
+                                    haveSegment = captureOnDemandVideoWindowDrakonFind_(
+                                        camera.cameraPayload,
+                                        camera.cameraId,
+                                        windowSeconds,
+                                        modelInputFps,
+                                        taskState->cancelRequested,
+                                        segment,
+                                        acquisitionError
+                                    );
+                                    if (haveSegment) {
+                                        segment.cameraName = camera.cameraName;
+                                        lastSegmentSource = "on_demand_video_window";
+                                    }
+                                }
+
+                                if (!haveSegment) {
+                                    if (taskState->cancelRequested.load() || !running_) break;
+
+                                    lastErrorForCamera = acquisitionError.empty()
+                                        ? "failed to capture a 60-second video window"
+                                        : acquisitionError;
+                                    consecutiveWindowFailures += 1;
+                                    postCameraEvent(
+                                        "drakon_find_camera_progress",
+                                        camera,
+                                        "Unable to acquire the next 60-second window; retrying",
+                                        {
+                                            { "error", lastErrorForCamera },
+                                            { "consecutive_failures", consecutiveWindowFailures },
+                                            { "runtime_mode", runtimeMode },
+                                            { "input_type", inputType },
+                                            { "window_seconds", windowSeconds },
+                                            { "duration_seconds", durationSeconds }
+                                        }
+                                    );
+                                    if (consecutiveWindowFailures >= 3) break;
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                    continue;
+                                }
+
+                                if (taskState->cancelRequested.load() || !running_) {
+                                    cleanupTempSegmentFile(segment);
+                                    break;
+                                }
+
+                                const std::string segmentIdentityKey = buildSegmentIdentityKey(segment);
+                                if (!segmentIdentityKey.empty() &&
+                                    !processedSegmentKeys.insert(segmentIdentityKey).second)
+                                {
+                                    cleanupTempSegmentFile(segment);
+                                    continue;
+                                }
+
+                                consecutiveWindowFailures = 0;
+
+                                int promptTokens = 0;
+                                int outputTokens = 0;
+                                int usedTokens = 0;
+                                const DrakonFindInferenceResult inference = runDrakonFindVideoInference_(
+                                    segment,
+                                    searchPrompt,
+                                    referenceImages,
+                                    modelName,
+                                    modelApiKey,
+                                    modelInputFps,
+                                    windowSeconds,
+                                    promptTokens,
+                                    outputTokens,
+                                    usedTokens
+                                );
+
+                                totalPromptTokens.fetch_add(promptTokens);
+                                totalOutputTokens.fetch_add(outputTokens);
+                                totalTokens.fetch_add(usedTokens);
+                                cameraPromptTokens += promptTokens;
+                                cameraOutputTokens += outputTokens;
+                                cameraUsedTokens += usedTokens;
+                                analyzedWindowCount += 1;
+
+                                const std::string safeSummary = inference.summary.empty()
+                                    ? (inference.hasMatch
+                                        ? std::string("Match visual identificado na janela de video.")
+                                        : std::string("Sem match confiavel na janela de video."))
+                                    : inference.summary;
+                                lastSummary = safeSummary;
+                                lastErrorForCamera.clear();
+
+                                nlohmann::json windowDetails = {
+                                    { "match", inference.hasMatch },
+                                    { "confidence", inference.confidence },
+                                    { "summary", safeSummary },
+                                    { "runtime_mode", runtimeMode },
+                                    { "input_type", inputType },
+                                    { "window_seconds", windowSeconds },
+                                    { "duration_seconds", durationSeconds },
+                                    { "analyzed_window_count", analyzedWindowCount },
+                                    { "camera_hit_count", cameraHitCount },
+                                    { "prompt_tokens", promptTokens },
+                                    { "output_tokens", outputTokens },
+                                    { "total_tokens", usedTokens },
+                                    { "segment_source", lastSegmentSource }
+                                };
+                                if (!segment.startTs.empty()) windowDetails["segment_start_ts"] = segment.startTs;
+                                if (!segment.endTs.empty()) windowDetails["segment_end_ts"] = segment.endTs;
+                                if (!inference.observedTraits.is_null()) windowDetails["observed_traits"] = inference.observedTraits;
+                                if (!inference.detectionTimeInVideo.is_null() && !inference.detectionTimeInVideo.empty()) {
+                                    windowDetails["detection_time_in_video"] = inference.detectionTimeInVideo;
+                                }
+                                if (!inference.raw.is_null() && !inference.raw.empty()) {
+                                    windowDetails["model_output"] = inference.raw;
+                                }
+
+                                if (inference.hasMatch) {
+                                    cameraHitCount += 1;
+                                    windowDetails["camera_hit_count"] = cameraHitCount;
+
+                                    const std::string detectionTimeHint =
+                                        buildDetectionTimeHint(inference.detectionTimeInVideo);
+                                    const std::string clipTimeHint =
+                                        !detectionTimeHint.empty() ? detectionTimeHint : std::string("00:00");
+
+                                    std::vector<std::uint8_t> matchedVideoBytes;
+                                    if (!segment.sourceFilePath.empty()) {
+                                        matchedVideoBytes = extractMp4ClipAtTime(
+                                            segment.sourceFilePath,
+                                            clipTimeHint,
+                                            /*clipSeconds=*/10,
+                                            detectionTimeHint.empty() ? 0 : 2
+                                        );
+                                    }
+
+                                    std::string uploadedVideoKey;
+                                    std::string uploadedVideoUrl;
+                                    if (!matchedVideoBytes.empty() &&
+                                        uploadDrakonFindHitMedia_(
+                                            searchId,
+                                            camera.cameraId,
+                                            attemptCount,
+                                            "video",
+                                            "video/mp4",
+                                            matchedVideoBytes,
+                                            clipTimeHint,
+                                            uploadedVideoKey,
+                                            uploadedVideoUrl))
+                                    {
+                                        windowDetails["video_key"] = uploadedVideoKey;
+                                        windowDetails["video_url"] = uploadedVideoUrl;
+                                        windowDetails["clip_url"] = uploadedVideoUrl;
+                                    }
+
+                                    std::string representativeFrameDataUrl;
+                                    if (buildRepresentativeFrameDataUrlForDrakonFind_(
+                                        segment.sourceFilePath,
+                                        clipTimeHint,
+                                        representativeFrameDataUrl) &&
+                                        !representativeFrameDataUrl.empty())
+                                    {
+                                        windowDetails["snapshot_image_data_url"] = representativeFrameDataUrl;
+                                    }
+
+                                    postCameraEvent("drakon_find_hit", camera, safeSummary, windowDetails);
+                                }
+                                else {
+                                    postCameraEvent(
+                                        "drakon_find_camera_progress",
+                                        camera,
+                                        "60-second video window analyzed without a confident match",
+                                        windowDetails
+                                    );
+                                }
+
+                                cleanupTempSegmentFile(segment);
+                            }
+
+                            stopTemporarySessionIfSafe(camera, temporarySessionStarted, temporaryCfg);
+
+                            if (taskState->cancelRequested.load() || !running_) {
+                                cancelledCameraCount.fetch_add(1);
+                                postCameraEvent(
+                                    "drakon_find_camera_cancelled",
+                                    camera,
+                                    analyzedWindowCount > 0
+                                        ? "Camera search cancelled during the live video runtime"
+                                        : "Camera search cancelled before a full 60-second window was analyzed",
+                                    buildRuntimeDetails("cancelled")
+                                );
+                                return;
+                            }
+
+                            if (analyzedWindowCount <= 0) {
+                                lastErrorForCamera = lastErrorForCamera.empty()
+                                    ? "no 60-second video window could be analyzed for this camera"
+                                    : lastErrorForCamera;
+                                failedCameraCount.fetch_add(1);
+                                postCameraEvent(
+                                    "drakon_find_camera_failed",
+                                    camera,
+                                    "No 60-second video window could be analyzed for this camera",
+                                    buildRuntimeDetails("failed")
+                                );
+                                return;
+                            }
+
+                            completedCameraCount.fetch_add(1);
+                            if (cameraHitCount > 0) matchedCameraCount.fetch_add(1);
+
+                            nlohmann::json completionDetails = buildRuntimeDetails("completed");
+                            if (!lastSummary.empty()) completionDetails["summary"] = lastSummary;
+                            postCameraEvent(
+                                "drakon_find_camera_completed",
+                                camera,
+                                lastSummary.empty()
+                                    ? "Configured duration finished for this camera."
+                                    : lastSummary,
+                                completionDetails
+                            );
+                        }
+                        catch (const std::exception& e) {
+                            logAgentException_(
+                                sourceIdForCamera_(camera.cameraId),
+                                "drakon_find",
+                                "AgentCore::handleDrakonFindStartCommand_::cameraWorker",
+                                "camera_runtime",
+                                {
+                                    { "search_id", searchId },
+                                    { "target_id", targetId },
+                                    { "camera_id", camera.cameraId },
+                                    { "camera_name", camera.cameraName },
+                                    { "runtime_mode", runtimeMode },
+                                    { "input_type", inputType },
+                                    { "attempt_count", attemptCount }
+                                },
+                                e
+                            );
+                            stopTemporarySessionIfSafe(camera, temporarySessionStarted, temporaryCfg);
+                            lastErrorForCamera = e.what();
+                            failedCameraCount.fetch_add(1);
+                            postCameraEvent(
+                                "drakon_find_camera_failed",
+                                camera,
+                                "Camera runtime failed on this EXE",
+                                buildRuntimeDetails("failed")
+                            );
+                        }
+                        catch (...) {
+                            logAgentUnknownException_(
+                                sourceIdForCamera_(camera.cameraId),
+                                "drakon_find",
+                                "AgentCore::handleDrakonFindStartCommand_::cameraWorker",
+                                "camera_runtime",
+                                {
+                                    { "search_id", searchId },
+                                    { "target_id", targetId },
+                                    { "camera_id", camera.cameraId },
+                                    { "camera_name", camera.cameraName },
+                                    { "runtime_mode", runtimeMode },
+                                    { "input_type", inputType },
+                                    { "attempt_count", attemptCount }
+                                }
+                            );
+                            stopTemporarySessionIfSafe(camera, temporarySessionStarted, temporaryCfg);
+                            lastErrorForCamera = "unknown exception";
+                            failedCameraCount.fetch_add(1);
+                            postCameraEvent(
+                                "drakon_find_camera_failed",
+                                camera,
+                                "Camera runtime failed on this EXE",
+                                buildRuntimeDetails("failed")
+                            );
+                        }
+                    });
+                }
+
+                for (auto& cameraWorker : cameraWorkers) {
+                    if (cameraWorker.joinable()) {
+                        cameraWorker.join();
+                    }
+                }
+
+                const int processed = completedCameraCount.load();
+                const int matches = matchedCameraCount.load();
+                const int failures = failedCameraCount.load();
+                const int cancelled = cancelledCameraCount.load();
+                const bool wasCancelled = taskState->cancelRequested.load() || !running_;
+                const bool allFailed = processed == 0 && failures > 0 && !wasCancelled;
+
+                if (wasCancelled) {
+                    postSearchEvent(
+                        "drakon_find_search_cancelled",
+                        "Drakon Find search cancelled",
+                        {
+                            { "processed_cameras", processed },
+                            { "matched_cameras", matches },
+                            { "failed_cameras", failures },
+                            { "cancelled_cameras", cancelled },
+                            { "runtime_mode", runtimeMode },
+                            { "input_type", inputType },
+                            { "window_seconds", windowSeconds },
+                            { "duration_seconds", durationSeconds }
+                        }
+                    );
+                }
+                else if (allFailed) {
+                    postSearchEvent(
+                        "drakon_find_search_failed",
+                        "Drakon Find search failed on all assigned cameras",
+                        {
+                            { "processed_cameras", processed },
+                            { "matched_cameras", matches },
+                            { "failed_cameras", failures },
+                            { "cancelled_cameras", cancelled },
+                            { "runtime_mode", runtimeMode },
+                            { "input_type", inputType },
+                            { "window_seconds", windowSeconds },
+                            { "duration_seconds", durationSeconds }
+                        }
+                    );
+                }
+                else {
+                    postSearchEvent(
+                        "drakon_find_search_completed",
+                        "Drakon Find search completed on this EXE",
+                        {
+                            { "processed_cameras", processed },
+                            { "matched_cameras", matches },
+                            { "failed_cameras", failures },
+                            { "cancelled_cameras", cancelled },
+                            { "runtime_mode", runtimeMode },
+                            { "input_type", inputType },
+                            { "window_seconds", windowSeconds },
+                            { "duration_seconds", durationSeconds }
+                        }
+                    );
+                }
+
+                nlohmann::json result;
+                result["search_id"] = searchId;
+                result["status"] = wasCancelled ? "cancelled" : (allFailed ? "failed" : "completed");
+                result["processed_cameras"] = processed;
+                result["matched_cameras"] = matches;
+                result["failed_cameras"] = failures;
+                result["cancelled_cameras"] = cancelled;
+                result["runtime_mode"] = runtimeMode;
+                result["input_type"] = inputType;
+                result["window_seconds"] = windowSeconds;
+                result["duration_seconds"] = durationSeconds;
+                result["prompt_tokens"] = totalPromptTokens.load();
+                result["output_tokens"] = totalOutputTokens.load();
+                result["total_tokens"] = totalTokens.load();
+                if (commandId > 0) {
+                    postCommandResult_(
+                        commandId,
+                        wasCancelled ? "completed" : (allFailed ? "failed" : "completed"),
+                        result
+                    );
+                }
+            }
+            catch (const std::exception& e) {
+                logAgentException_(
+                    "agent",
+                    "drakon_find",
+                    "AgentCore::handleDrakonFindStartCommand_::searchWorker",
+                    "search_runtime",
+                    {
+                        { "search_id", searchId },
+                        { "target_id", targetId },
+                        { "attempt_count", attemptCount },
+                        { "runtime_mode", runtimeMode },
+                        { "input_type", inputType }
+                    },
+                    e
+                );
+                for (auto& cameraWorker : cameraWorkers) {
+                    if (cameraWorker.joinable()) {
+                        cameraWorker.join();
+                    }
+                }
+                postSearchEvent(
+                    "drakon_find_search_failed",
+                    "Drakon Find search crashed on the EXE",
+                    { { "error", e.what() } }
+                );
+                if (commandId > 0) {
+                    nlohmann::json err;
+                    err["error"] = std::string("drakon_find_start exception: ") + e.what();
+                    postCommandResult_(commandId, "failed", err);
+                }
+            }
+            catch (...) {
+                logAgentUnknownException_(
+                    "agent",
+                    "drakon_find",
+                    "AgentCore::handleDrakonFindStartCommand_::searchWorker",
+                    "search_runtime",
+                    {
+                        { "search_id", searchId },
+                        { "target_id", targetId },
+                        { "attempt_count", attemptCount },
+                        { "runtime_mode", runtimeMode },
+                        { "input_type", inputType }
+                    }
+                );
+                for (auto& cameraWorker : cameraWorkers) {
+                    if (cameraWorker.joinable()) {
+                        cameraWorker.join();
+                    }
+                }
+                postSearchEvent(
+                    "drakon_find_search_failed",
+                    "Drakon Find search crashed on the EXE",
+                    { { "error", "unknown exception" } }
+                );
+                if (commandId > 0) {
+                    nlohmann::json err;
+                    err["error"] = "drakon_find_start unknown exception";
+                    postCommandResult_(commandId, "failed", err);
+                }
+            }
+
+            taskState->done = true;
+        }
+    );
+
+    {
+        std::lock_guard<std::mutex> lk(drakonFindMu_);
+        drakonFindTasks_[searchId] = std::move(task);
+    }
+}
+
+void AgentCore::handleRefreshThumbnailCommand_(
+    int commandId,
+    const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        Logger::instance().logDebug("agent", "handleRefreshThumbnailCommand_: missing command id");
+        return;
+    }
+
+    auto fail = [&](const std::string& reason) {
+        nlohmann::json err;
+        err["error"] = reason;
+        postCommandResult_(commandId, "failed", err);
+    };
+
+    try {
+        const int cameraId = payload.value("camera_id", -1);
+        if (cameraId <= 0) {
+            fail("camera_id is required");
+            return;
+        }
+
+        int warmupSeconds = 4;
+        int targetSecond = 3;
+        int maxCaptureSeconds = 8;
+        bool requireSnapshot = true;
+
+        if (payload.contains("snapshot_strategy") && payload["snapshot_strategy"].is_object()) {
+            const auto& strategy = payload["snapshot_strategy"];
+            warmupSeconds = jsonIntOrPromptEnhance(strategy, "warmup_seconds", warmupSeconds);
+            targetSecond = jsonIntOrPromptEnhance(strategy, "target_second", targetSecond);
+            maxCaptureSeconds =
+                jsonIntOrPromptEnhance(strategy, "max_capture_seconds", maxCaptureSeconds);
+            if (strategy.contains("require_snapshot") && strategy["require_snapshot"].is_boolean()) {
+                requireSnapshot = strategy["require_snapshot"].get<bool>();
+            }
+        }
+
+        if (warmupSeconds < 2) warmupSeconds = 2;
+        if (maxCaptureSeconds < warmupSeconds) maxCaptureSeconds = warmupSeconds;
+        if (maxCaptureSeconds < 2) maxCaptureSeconds = 2;
+        if (targetSecond < 0) targetSecond = 0;
+        if (targetSecond >= maxCaptureSeconds) targetSecond = (std::max)(0, maxCaptureSeconds - 1);
+
+        std::string snapshotDataUrl;
+        std::string snapshotTsUtcIso;
+        std::string snapshotSource;
+
+        {
+            CameraSession* session = getCameraSession(cameraId);
+            if (session) {
+                snapshotDataUrl = trimCopyPromptEnhance(session->getLastJobStillJpegBase64());
+                snapshotTsUtcIso = trimCopyPromptEnhance(session->getLastJobStillTsUtcIso());
+                if (!snapshotDataUrl.empty()) {
+                    if (snapshotDataUrl.rfind("data:image", 0) != 0) {
+                        snapshotDataUrl = "data:image/jpeg;base64," + stripDataUrlPrefix(snapshotDataUrl);
+                    }
+                    snapshotSource = "running_session";
+                }
+            }
+        }
+
+        if (snapshotDataUrl.empty()) {
+            if (!payload.contains("camera_payload") || !payload["camera_payload"].is_object()) {
+                fail("snapshot required, but camera_payload is missing");
+                return;
+            }
+
+            const auto& cameraPayload = payload["camera_payload"];
+            const int webcamIndex = jsonIntOrPromptEnhance(cameraPayload, "webcam_index", -1);
+            std::string connectionMethod;
+            if (cameraPayload.contains("connection_method") &&
+                cameraPayload["connection_method"].is_string())
+            {
+                connectionMethod = toLowerCopyPromptEnhance(
+                    trimCopyPromptEnhance(cameraPayload["connection_method"].get<std::string>())
+                );
+            }
+            const bool preferWebcam = (webcamIndex >= 0) || connectionMethod == "webcam";
+
+            cv::Mat capturedFrame;
+            std::string captureError;
+            bool captured = false;
+
+            if (preferWebcam && webcamIndex >= 0) {
+                captured = captureStableWebcamSnapshotPromptEnhance(
+                    webcamIndex,
+                    targetSecond,
+                    maxCaptureSeconds,
+                    capturedFrame,
+                    captureError
+                );
+                if (captured) {
+                    snapshotSource = "on_demand_webcam";
+                }
+            }
+
+            if (!captured) {
+                captured = captureStableRtspSnapshotPromptEnhance(
+                    cameraPayload,
+                    targetSecond,
+                    maxCaptureSeconds,
+                    capturedFrame,
+                    captureError
+                );
+                if (captured) {
+                    snapshotSource = "on_demand_rtsp";
+                }
+            }
+
+            if (!captured || capturedFrame.empty()) {
+                fail(
+                    "snapshot capture failed: " +
+                    (captureError.empty() ? std::string("no valid frame captured") : captureError)
+                );
+                return;
+            }
+
+            if (!encodeJpegDataUrlForPromptEnhance(capturedFrame, snapshotDataUrl)) {
+                fail("failed to encode snapshot");
+                return;
+            }
+
+            snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+        }
+
+        if (snapshotDataUrl.empty() && requireSnapshot) {
+            fail("snapshot is empty");
+            return;
+        }
+
+        if (snapshotTsUtcIso.empty()) {
+            snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+        }
+        if (snapshotSource.empty()) {
+            snapshotSource = "unknown";
+        }
+
+        sendThumbnail(std::to_string(cameraId), snapshotDataUrl);
+
+        nlohmann::json result;
+        result["camera_id"] = cameraId;
+        result["snapshot_source"] = snapshotSource;
+        result["snapshot_ts_utc_iso"] = snapshotTsUtcIso;
+        result["thumbnail_refresh_requested"] = true;
+
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        fail(std::string("refresh_thumbnail failed: ") + e.what());
+    }
+    catch (...) {
+        fail("refresh_thumbnail failed with unknown error");
+    }
+}
+
+void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        Logger::instance().logDebug("agent", "handlePromptEnhanceCommand_: missing command id");
+        return;
+    }
+
+    auto fail = [&](const std::string& reason) {
+        nlohmann::json err;
+        err["error"] = reason;
+        postCommandResult_(commandId, "failed", err);
+    };
+
+    try {
+        const int cameraId = payload.value("camera_id", -1);
+        if (cameraId <= 0) {
+            fail("camera_id is required");
+            return;
+        }
+
+        std::string promptCore = payload.value("prompt_core", std::string());
+        std::string alertCondition = payload.value("alert_condition", std::string());
+        std::string negativeCondition = payload.value("negative_condition", std::string());
+        std::string languageHint = payload.value("user_language", std::string("pt-BR"));
+        std::string modelName = payload.value("model_name", std::string("gpt-5.1"));
+        std::string modelApiKey = payload.value("model_api_key", std::string());
+        std::string cameraName = payload.value("camera_name", std::string());
+        std::string cameraDescription = payload.value("camera_description", std::string());
+        const std::vector<PromptEnhanceRegion_> overlayRegions =
+            parsePromptEnhanceOverlayRegions_(payload);
+
+        promptCore = trimCopyPromptEnhance(promptCore);
+        alertCondition = trimCopyPromptEnhance(alertCondition);
+        negativeCondition = trimCopyPromptEnhance(negativeCondition);
+        languageHint = trimCopyPromptEnhance(languageHint);
+        modelName = trimCopyPromptEnhance(modelName);
+        modelApiKey = trimCopyPromptEnhance(modelApiKey);
+        cameraName = trimCopyPromptEnhance(cameraName);
+        cameraDescription = trimCopyPromptEnhance(cameraDescription);
+
+        if (promptCore.empty()) {
+            fail("prompt_core is required");
+            return;
+        }
+        if (alertCondition.empty()) {
+            fail("alert_condition is required");
+            return;
+        }
+        if (modelApiKey.empty()) {
+            fail("model_api_key is required");
+            return;
+        }
+        if (modelName.empty()) {
+            modelName = "gpt-5.1";
+        }
+        if (languageHint.empty()) {
+            languageHint = "pt-BR";
+        }
+
+        int warmupSeconds = 6;
+        int targetSecond = 5;
+        int maxCaptureSeconds = 12;
+        bool requireSnapshot = true;
+
+        if (payload.contains("snapshot_strategy") && payload["snapshot_strategy"].is_object()) {
+            const auto& strategy = payload["snapshot_strategy"];
+            warmupSeconds = jsonIntOrPromptEnhance(strategy, "warmup_seconds", warmupSeconds);
+            targetSecond = jsonIntOrPromptEnhance(strategy, "target_second", targetSecond);
+            maxCaptureSeconds = jsonIntOrPromptEnhance(strategy, "max_capture_seconds", maxCaptureSeconds);
+            if (strategy.contains("require_snapshot") && strategy["require_snapshot"].is_boolean()) {
+                requireSnapshot = strategy["require_snapshot"].get<bool>();
+            }
+        }
+
+        if (warmupSeconds < 2) warmupSeconds = 2;
+        if (maxCaptureSeconds < warmupSeconds) maxCaptureSeconds = warmupSeconds;
+        if (maxCaptureSeconds < 2) maxCaptureSeconds = 2;
+        if (targetSecond < 0) targetSecond = 0;
+        if (targetSecond >= maxCaptureSeconds) targetSecond = (std::max)(0, maxCaptureSeconds - 1);
+
+        std::string snapshotDataUrl;
+        std::string snapshotTsUtcIso;
+        std::string snapshotSource;
+
+        {
+            CameraSession* session = getCameraSession(cameraId);
+            if (session) {
+                snapshotDataUrl = trimCopyPromptEnhance(session->getLastJobStillJpegBase64());
+                snapshotTsUtcIso = trimCopyPromptEnhance(session->getLastJobStillTsUtcIso());
+                if (!snapshotDataUrl.empty()) {
+                    if (snapshotDataUrl.rfind("data:image", 0) != 0) {
+                        snapshotDataUrl = "data:image/jpeg;base64," + stripDataUrlPrefix(snapshotDataUrl);
+                    }
+                    snapshotSource = "running_session";
+                }
+            }
+        }
+
+        if (snapshotDataUrl.empty()) {
+            if (!payload.contains("camera_payload") || !payload["camera_payload"].is_object()) {
+                fail("snapshot required (fallback A), but camera_payload is missing");
+                return;
+            }
+
+            const auto& cameraPayload = payload["camera_payload"];
+            if (cameraName.empty() && cameraPayload.contains("name") && cameraPayload["name"].is_string()) {
+                cameraName = trimCopyPromptEnhance(cameraPayload["name"].get<std::string>());
+            }
+            if (cameraDescription.empty() &&
+                cameraPayload.contains("description") &&
+                cameraPayload["description"].is_string())
+            {
+                cameraDescription = trimCopyPromptEnhance(cameraPayload["description"].get<std::string>());
+            }
+
+            const int webcamIndex = jsonIntOrPromptEnhance(cameraPayload, "webcam_index", -1);
+            std::string connectionMethod;
+            if (cameraPayload.contains("connection_method") && cameraPayload["connection_method"].is_string()) {
+                connectionMethod = toLowerCopyPromptEnhance(
+                    trimCopyPromptEnhance(cameraPayload["connection_method"].get<std::string>())
+                );
+            }
+            const bool preferWebcam = (webcamIndex >= 0) || connectionMethod == "webcam";
+
+            cv::Mat capturedFrame;
+            std::string captureError;
+            bool captured = false;
+
+            if (preferWebcam && webcamIndex >= 0) {
+                captured = captureStableWebcamSnapshotPromptEnhance(
+                    webcamIndex,
+                    targetSecond,
+                    maxCaptureSeconds,
+                    capturedFrame,
+                    captureError
+                );
+                if (captured) {
+                    snapshotSource = "on_demand_webcam";
+                }
+            }
+
+            if (!captured) {
+                captured = captureStableRtspSnapshotPromptEnhance(
+                    cameraPayload,
+                    targetSecond,
+                    maxCaptureSeconds,
+                    capturedFrame,
+                    captureError
+                );
+                if (captured) {
+                    snapshotSource = "on_demand_rtsp";
+                }
+            }
+
+            if (!captured || capturedFrame.empty()) {
+                fail(
+                    "snapshot required (fallback A), capture failed: " +
+                    (captureError.empty() ? std::string("no valid frame captured") : captureError)
+                );
+                return;
+            }
+
+            if (!encodeJpegDataUrlForPromptEnhance(capturedFrame, snapshotDataUrl)) {
+                fail("snapshot required (fallback A), failed to encode snapshot");
+                return;
+            }
+
+            snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+        }
+
+        if (snapshotDataUrl.empty() && requireSnapshot) {
+            fail("snapshot required (fallback A), but snapshot is empty");
+            return;
+        }
+
+        if (snapshotTsUtcIso.empty()) {
+            snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+        }
+        if (snapshotSource.empty()) {
+            snapshotSource = "unknown";
+        }
+
+        int overlayRegionsDrawn = 0;
+        if (!overlayRegions.empty()) {
+            cv::Mat overlayFrame;
+            std::string overlayErr;
+            if (!decodePromptEnhanceSnapshotToMat_(snapshotDataUrl, overlayFrame, &overlayErr)) {
+                fail(
+                    "snapshot required (fallback A), failed to decode snapshot for polygon overlay: " +
+                    (overlayErr.empty() ? std::string("invalid image data") : overlayErr)
+                );
+                return;
+            }
+
+            if (!drawPromptEnhanceRegionsOnFrame_(overlayFrame, overlayRegions, overlayRegionsDrawn)) {
+                fail("snapshot required (fallback A), failed to draw polygon overlay");
+                return;
+            }
+
+            if (overlayRegionsDrawn > 0) {
+                if (!encodeJpegDataUrlForPromptEnhance(overlayFrame, snapshotDataUrl)) {
+                    fail("snapshot required (fallback A), failed to encode snapshot with polygon overlay");
+                    return;
+                }
+                snapshotSource += "+polygon_overlay";
+                Logger::instance().logDebug(
+                    "agent",
+                    "handlePromptEnhanceCommand_: overlay regions drawn=" +
+                    std::to_string(overlayRegionsDrawn) +
+                    " camera_id=" + std::to_string(cameraId)
+                );
+            }
+        }
+
+        std::ostringstream prompt;
+        prompt << "You are a CCTV prompt enhancement assistant.\n";
+        prompt << "Your task is to improve the user's detection specification.\n\n";
+
+        prompt << "INPUT FIELDS:\n";
+        prompt << "1) prompt_core\n";
+        prompt << "2) alert_condition\n";
+        prompt << "3) negative_condition (optional)\n\n";
+
+        prompt << "CURRENT VALUES:\n";
+        prompt << "prompt_core:\n" << promptCore << "\n\n";
+        prompt << "alert_condition:\n" << alertCondition << "\n\n";
+        prompt << "negative_condition:\n"
+               << (negativeCondition.empty() ? "(empty)" : negativeCondition) << "\n\n";
+
+        if (!cameraName.empty() || !cameraDescription.empty()) {
+            prompt << "CAMERA CONTEXT:\n";
+            if (!cameraName.empty()) {
+                prompt << "camera_name: " << cameraName << "\n";
+            }
+            if (!cameraDescription.empty()) {
+                prompt << "camera_description: " << cameraDescription << "\n";
+            }
+            prompt << "\n";
+        }
+
+        prompt << "IMAGE CONTEXT:\n";
+        prompt << "- You will receive ONE snapshot from the camera.\n";
+        prompt << "- Use the visible context to reduce false positives.\n\n";
+        if (overlayRegionsDrawn > 0) {
+            prompt << "REGION OVERLAY CONTEXT:\n";
+            prompt << "- Polygon overlays with labels are drawn directly on the snapshot.\n";
+            prompt << "- Treat each polygon label as a named area of interest.\n";
+            prompt << "- Use those labels when refining prompt_core / alert_condition / negative_condition.\n\n";
+        }
+
+        prompt << "MANDATORY RULES:\n";
+        prompt << "- Respond in the same language as the user inputs.\n";
+        prompt << "- Keep JSON field names in English.\n";
+        prompt << "- Produce binary and testable conditions.\n";
+        prompt << "- Avoid vague expressions.\n";
+        prompt << "- Do not invent objects/areas not clearly visible.\n";
+        prompt << "- Use snapshot context to reduce false positives.\n";
+        prompt << "- If negative_condition is empty, you may propose one.\n";
+        prompt << "- Output must be valid JSON only. No markdown.\n";
+        prompt << "- prompt_template and alert_condition must be non-empty.\n\n";
+
+        prompt << "OUTPUT FORMAT (EXACT KEYS):\n";
+        prompt << "{\n";
+        prompt << "  \"prompt_template\": \"...\",\n";
+        prompt << "  \"alert_condition\": \"...\",\n";
+        prompt << "  \"negative_condition\": \"...\"\n";
+        prompt << "}\n\n";
+
+        prompt << "Language hint from user: " << languageHint << "\n";
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", prompt.str() } });
+        content.push_back(
+            makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(snapshotDataUrl))
+        );
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.1);
+        applyOpenAITokenLimitField_(body, modelName, 1400);
+
+        std::string rawResp;
+        try {
+            rawResp = httpPostJsonOpenAI(
+                modelApiKey,
+                body,
+                []() { MaybeNotifyFirstRetry(); }
+            );
+        }
+        catch (const std::exception& e) {
+            fail(std::string("OpenAI enhancement request failed: ") + e.what());
+            return;
+        }
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            fail("OpenAI enhancement returned invalid JSON response");
+            return;
+        }
+
+        std::string text = extractOpenAITextFromResponse(respJson);
+        if (text.empty()) {
+            fail("OpenAI enhancement returned empty text");
+            return;
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            fail("OpenAI enhancement did not return a JSON object");
+            return;
+        }
+
+        nlohmann::json enhanced = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!enhanced.is_object()) {
+            fail("OpenAI enhancement returned malformed JSON object");
+            return;
+        }
+
+        auto getTextField = [&](const char* key) -> std::string {
+            if (enhanced.contains(key) && enhanced[key].is_string()) {
+                return trimCopyPromptEnhance(enhanced[key].get<std::string>());
+            }
+            return std::string();
+        };
+
+        std::string enhancedPrompt = getTextField("prompt_template");
+        if (enhancedPrompt.empty()) {
+            enhancedPrompt = getTextField("prompt_core");
+        }
+        if (enhancedPrompt.empty()) {
+            enhancedPrompt = getTextField("prompt");
+        }
+
+        std::string enhancedAlert = getTextField("alert_condition");
+        std::string enhancedNegative = getTextField("negative_condition");
+
+        if (enhancedPrompt.empty() || enhancedAlert.empty()) {
+            fail("OpenAI enhancement returned empty required fields");
+            return;
+        }
+
+        nlohmann::json result;
+        result["suggestion"] = {
+            { "prompt_template", enhancedPrompt },
+            { "alert_condition", enhancedAlert },
+            { "negative_condition", enhancedNegative }
+        };
+        result["model_name"] = modelName;
+        result["snapshot_source"] = snapshotSource;
+        result["snapshot_ts_utc_iso"] = snapshotTsUtcIso;
+        result["fallback_option"] = "A";
+
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        fail(std::string("prompt_enhance failed: ") + e.what());
+    }
+    catch (...) {
+        fail("prompt_enhance failed with unknown error");
+    }
+}
+
+bool AgentCore::compileTemporalPlanWithModel_(
+    const std::string& compileModelName,
+    const std::string& compileApiKey,
+    const nlohmann::json& compileInput,
+    nlohmann::json& outEnvelope,
+    const std::string& runtimeLogId,
+    std::string* outFailureReason)
+{
+    outEnvelope = nlohmann::json::object();
+    if (outFailureReason) *outFailureReason = "";
+
+    auto logCompile = [&](const std::string& msg) {
+        const std::string& logId = runtimeLogId.empty() ? std::string("agent") : runtimeLogId;
+        Logger::instance().logDebug(logId, msg);
+    };
+
+    auto failWithReason = [&](const std::string& reason, const std::string& msg) -> bool {
+        if (outFailureReason) *outFailureReason = reason;
+        logCompile(msg);
+        return false;
+    };
+
+    if (trimAscii(compileApiKey).empty()) {
+        return failWithReason(
+            "missing_api_key",
+            "compileTemporalPlanWithModel_: missing compile api key"
+        );
+    }
+
+    try {
+        nlohmann::json body = {
+            { "model", compileModelName.empty() ? "gpt-5.1" : compileModelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "system" },
+                    { "content", temporal::compilerSystemPrompt() }
+                },
+                {
+                    { "role", "user" },
+                    { "content", temporal::compilerUserPrompt(compileInput) }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, compileModelName, 0.0);
+        applyOpenAITokenLimitField_(body, compileModelName, 2200);
+
+        std::string rawResp = httpPostJsonOpenAI(
+            compileApiKey,
+            body,
+            []() { MaybeNotifyFirstRetry(); }
+        );
+
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        const std::string finishReason = extractOpenAIFinishReason(respJson);
+        const std::string extractedContent =
+            (respJson.is_discarded() || !respJson.is_object())
+                ? std::string()
+                : extractOpenAITextFromResponse(respJson);
+        logCompile(
+            "compileTemporalPlanWithModel_: response model=" +
+            (compileModelName.empty() ? std::string("gpt-5.1") : compileModelName) +
+            " finish_reason=" + (finishReason.empty() ? std::string("<empty>") : finishReason) +
+            " message_content_len=" + std::to_string(extractedContent.size()) +
+            " raw_response=" + truncateForLog_(rawResp, 2500)
+        );
+        if (respJson.is_discarded() || !respJson.is_object()) {
+            return failWithReason(
+                "invalid_raw_response_json",
+                "compileTemporalPlanWithModel_: invalid raw response JSON"
+            );
+        }
+
+        std::string text = extractedContent;
+        logCompile(
+            "compileTemporalPlanWithModel_: extracted_text model=" +
+            (compileModelName.empty() ? std::string("gpt-5.1") : compileModelName) +
+            " finish_reason=" + (finishReason.empty() ? std::string("<empty>") : finishReason) +
+            " text_len=" + std::to_string(text.size()) +
+            " text_preview=" + truncateForLog_(text, 1200)
+        );
+        if (text.empty()) {
+            return failWithReason(
+                "empty_text",
+                "compileTemporalPlanWithModel_: empty model text"
+            );
+        }
+
+        std::string jsonSlice;
+        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+            return failWithReason(
+                "no_json",
+                "compileTemporalPlanWithModel_: no JSON object in model text"
+            );
+        }
+
+        nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
+        if (!parsed.is_object()) {
+            return failWithReason(
+                "malformed_envelope_json",
+                "compileTemporalPlanWithModel_: malformed envelope JSON"
+            );
+        }
+        outEnvelope = std::move(parsed);
+        return true;
+    }
+    catch (const std::exception& e) {
+        return failWithReason(
+            "exception",
+            std::string("compileTemporalPlanWithModel_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        return failWithReason(
+            "unknown_exception",
+            "compileTemporalPlanWithModel_ unknown exception"
+        );
+    }
+}
+
+void AgentCore::postTemporalCompileResultEvent_(
+    const std::string& sourceType,
+    int sourceId,
+    const nlohmann::json& envelope,
+    const std::string& compileModel)
+{
+    if (sourceType.empty() || sourceId <= 0) return;
+    if (sourceType != "camera_algorithm" && sourceType != "job_step_agent") return;
+
+    const nlohmann::json canonicalEnvelope = temporal::canonicalizePlanEnvelope(envelope);
+    nlohmann::json plan = temporal::extractPlan(canonicalEnvelope);
+    nlohmann::json details = {
+        { "source_type", sourceType },
+        { "source_id", sourceId },
+        { "compile_status", canonicalEnvelope.is_object() ? canonicalEnvelope.value("compile_status", std::string("ok")) : "ok" },
+        { "compile_confidence", canonicalEnvelope.is_object() ? canonicalEnvelope.value("compile_confidence", 0.0) : 0.0 },
+        { "compile_model", compileModel },
+        { "compiled_at", temporal::nowIso() },
+        { "plan_hash", plan.is_object() ? plan.value("plan_hash", std::string()) : std::string() },
+        { "plan_version", plan.is_object() ? plan.value("schema_version", std::string("temporal-plan/1.0")) : std::string("temporal-plan/1.0") },
+        { "plan_envelope", canonicalEnvelope }
+    };
+    postAgentEvent("temporal_compile_result", std::nullopt, "", "", details);
+}
+
+void AgentCore::pruneChatTemporalSessions_()
+{
+    std::lock_guard<std::mutex> lock(chatTemporalMu_);
+    const auto now = std::chrono::steady_clock::now();
+    const auto ttl = std::chrono::minutes(30);
+    for (auto it = chatTemporalBySession_.begin(); it != chatTemporalBySession_.end();) {
+        if (it->second.touchedAt.time_since_epoch().count() == 0 ||
+            (now - it->second.touchedAt) > ttl) {
+            it = chatTemporalBySession_.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+bool AgentCore::ensureTemporalPlanForRuntime(
+    const std::string& sourceType,
+    int sourceId,
+    const std::string& promptCore,
+    const std::string& alertCondition,
+    const std::string& negativeCondition,
+    const std::string& inputType,
+    const std::string& language,
+    const std::string& modelFamily,
+    const std::string& compileApiKey,
+    nlohmann::json& inOutPlanEnvelope,
+    bool persistResult,
+    const std::string& runtimeLogId)
+{
+    const std::string schemaVersion = "temporal-plan/1.0";
+    const std::string promptHash =
+        temporal::computePromptRevisionHash(promptCore, alertCondition);
+    const std::string mergedTemporalPrompt =
+        temporal::lower(temporal::trim(promptCore + " " + alertCondition + " " + negativeCondition));
+    const std::string compileModel = temporal::compileModelForFamily(modelFamily);
+    const TemporalRuntimeGuardConfig_& runtimeGuardConfig = temporalRuntimeGuardConfig_();
+    const bool runtimeGuardSelected =
+        temporalRuntimeGuardApplies_(runtimeGuardConfig, sourceType, sourceId);
+    const bool runtimeGuardEnforced =
+        runtimeGuardConfig.failClosedEnabled && runtimeGuardSelected && !runtimeGuardConfig.shadowOnly;
+    const bool runtimeGuardShadow =
+        runtimeGuardConfig.failClosedEnabled && !runtimeGuardEnforced;
+
+    auto logTemporal = [&](const std::string& msg) {
+        const std::string& logId = runtimeLogId.empty() ? std::string("agent") : runtimeLogId;
+        Logger::instance().logDebug(logId, msg);
+    };
+    auto emitRuntimeGuardDecision = [&](const std::string& stageTag,
+                                        const std::string& reason,
+                                        bool enforced,
+                                        const std::string& modelTag) {
+        const std::string mode = enforced ? "enforced" : "shadow";
+        logTemporal(
+            "ensureTemporalPlanForRuntime: fail_closed_" + mode +
+            " source_type=" + sourceType +
+            " source_id=" + std::to_string(sourceId) +
+            " stage=" + stageTag +
+            " reason=" + reason +
+            " prompt_hash=" + promptHash
+        );
+        if (persistResult) {
+            postTemporalCompileResultEvent_(
+                sourceType,
+                sourceId,
+                makeTemporalRuntimeGuardEnvelope_(
+                    enforced ? "runtime_guard_blocked" : "runtime_guard_shadow",
+                    mode,
+                    stageTag,
+                    reason,
+                    promptHash,
+                    promptCore,
+                    alertCondition,
+                    negativeCondition,
+                    inputType,
+                    language
+                ),
+                modelTag.empty() ? std::string("temporal_guard") : modelTag
+            );
+        }
+    };
+
+    auto envelopeMatchesPromptRevision = [&](const nlohmann::json& env) -> bool {
+        return temporal::planMatchesPromptRevision(env, promptCore, alertCondition);
+    };
+    auto envelopeHasUnsafeThreatShortcut = [&](const nlohmann::json& env) -> bool {
+        return temporal::looksLikeThreatEvidencePrompt(mergedTemporalPrompt) &&
+               temporal::planHasUnsafeLocalAlertShortcutForThreatPrompt(temporal::extractPlan(env));
+    };
+    auto compilerSelectedLegacy = [&](const nlohmann::json& env) -> bool {
+        return temporal::compileStatusValue(env, std::string()) == "not_temporal";
+    };
+    auto annotateCompilerEnvelope = [&](nlohmann::json& env) {
+        if (!env.is_object()) env = nlohmann::json::object();
+        const std::string compileStatus = temporal::compileStatusValue(env, "ok");
+        env["compile_status"] = compileStatus.empty() ? std::string("ok") : compileStatus;
+        env["prompt_fingerprint"] = temporal::makePromptFingerprint(
+            promptCore,
+            alertCondition,
+            negativeCondition,
+            inputType,
+            language
+        );
+        if (compileStatus == "ok") {
+            nlohmann::json plan = temporal::extractPlan(env);
+            if (!plan.is_object()) plan = nlohmann::json::object();
+            plan["plan_hash"] = promptHash;
+            plan["schema_version"] = schemaVersion;
+            plan["prompt_fingerprint"] = env["prompt_fingerprint"];
+            env["plan_json"] = std::move(plan);
+        } else {
+            env.erase("plan_json");
+        }
+        env = temporal::canonicalizePlanEnvelope(env);
+    };
+
+    if (temporal::decisionCacheable(inOutPlanEnvelope) && envelopeMatchesPromptRevision(inOutPlanEnvelope)) {
+        nlohmann::json canonicalEnvelope = inOutPlanEnvelope;
+        annotateCompilerEnvelope(canonicalEnvelope);
+        std::string cachedDecisionReason;
+        const bool cachedDecisionOk = temporal::validateCompilerDecisionConsistency(
+            canonicalEnvelope,
+            &cachedDecisionReason
+        );
+        if (temporal::compileStatusValue(canonicalEnvelope, std::string()) == "ok" &&
+            envelopeHasUnsafeThreatShortcut(canonicalEnvelope))
+        {
+            logTemporal(
+                "ensureTemporalPlanForRuntime: rejecting cached temporal plan with unsafe threat shortcut source_type=" +
+                sourceType + " source_id=" + std::to_string(sourceId) +
+                " plan_hash=" + promptHash
+            );
+            inOutPlanEnvelope = nlohmann::json::object();
+        }
+        else if (!cachedDecisionOk) {
+            if (runtimeGuardEnforced) {
+                emitRuntimeGuardDecision("cached_plan", cachedDecisionReason, true, "cached_plan");
+            } else if (runtimeGuardShadow) {
+                emitRuntimeGuardDecision("cached_plan", cachedDecisionReason, false, "cached_plan");
+            }
+            inOutPlanEnvelope = nlohmann::json::object();
+        }
+        else {
+            const bool changed = canonicalEnvelope != inOutPlanEnvelope;
+            inOutPlanEnvelope = canonicalEnvelope;
+            if (changed) {
+                logTemporal(
+                    "ensureTemporalPlanForRuntime: canonicalized cached temporal plan source_type=" +
+                    sourceType + " source_id=" + std::to_string(sourceId) +
+                    " plan_hash=" + promptHash
+                );
+                if (persistResult) {
+                    postTemporalCompileResultEvent_(
+                        sourceType,
+                        sourceId,
+                        inOutPlanEnvelope,
+                        compilerSelectedLegacy(inOutPlanEnvelope)
+                            ? "cached_not_temporal"
+                            : "canonicalized_cached_plan"
+                    );
+                }
+            }
+            if (compilerSelectedLegacy(inOutPlanEnvelope)) {
+                logTemporal(
+                    "ensureTemporalPlanForRuntime: cached compiler decision selected legacy source_type=" +
+                    sourceType + " source_id=" + std::to_string(sourceId) +
+                    " prompt_hash=" + promptHash
+                );
+                return false;
+            }
+            return temporal::planUsable(inOutPlanEnvelope);
+        }
+    }
+
+    const nlohmann::json in = temporal::compileInput(
+        promptCore,
+        promptCore,
+        alertCondition,
+        negativeCondition,
+        inputType,
+        language,
+        sourceType,
+        sourceId,
+        machineTimezoneForBackend_.empty() ? "UTC" : machineTimezoneForBackend_
+    );
+
+    nlohmann::json envelope = nlohmann::json::object();
+    std::string compileFailureReason;
+    logTemporal(
+        "ensureTemporalPlanForRuntime: compile request source_type=" + sourceType +
+        " source_id=" + std::to_string(sourceId) +
+        " compile_model=" + compileModel +
+        " model_family=" + modelFamily +
+        " prompt_hash=" + promptHash +
+        " input_type=" + inputType +
+        " prompt_core_clean=" + truncateForLog_(trimAscii(promptCore), 1200) +
+        " alert_condition=" + truncateForLog_(trimAscii(alertCondition), 800) +
+        " negative_condition=" + truncateForLog_(trimAscii(negativeCondition), 800)
+    );
+    const bool compiled = compileTemporalPlanWithModel_(
+        compileModel,
+        compileApiKey,
+        in,
+        envelope,
+        runtimeLogId,
+        &compileFailureReason
+    );
+
+    if (compiled) {
+        annotateCompilerEnvelope(envelope);
+    }
+
+    std::string invalidReason;
+    bool compilerDecisionUsable =
+        compiled && temporal::validateCompilerDecisionConsistency(envelope, &invalidReason);
+    const std::string compiledStatus =
+        compiled ? temporal::compileStatusValue(envelope, std::string()) : std::string();
+    if (compiled &&
+        compilerDecisionUsable &&
+        compiledStatus == "ok" &&
+        envelopeHasUnsafeThreatShortcut(envelope))
+    {
+        invalidReason = "threat_prompt_requires_explicit_threat_evidence";
+        compilerDecisionUsable = false;
+    }
+    if (compiled &&
+        compilerDecisionUsable &&
+        compiledStatus != "ok" &&
+        compiledStatus != "not_temporal")
+    {
+        invalidReason = "compile_status_" + compiledStatus;
+        compilerDecisionUsable = false;
+    }
+    if (compiled && !compilerDecisionUsable) {
+        logTemporal(
+            "ensureTemporalPlanForRuntime: compiled envelope rejected source_type=" + sourceType +
+            " source_id=" + std::to_string(sourceId) +
+            " compile_model=" + compileModel +
+            " prompt_hash=" + promptHash +
+            " reason=" + (invalidReason.empty() ? std::string("<empty>") : invalidReason) +
+            " envelope_preview=" + truncateForLog_(envelope.dump(), 2500)
+        );
+    }
+
+    if (!compiled || !compilerDecisionUsable) {
+        const std::string fallbackReason =
+            !compiled
+                ? (compileFailureReason.empty() ? std::string("parse_failed") : compileFailureReason)
+                : std::string("invalid_compiler_decision:") +
+                    (invalidReason.empty() ? std::string("unknown") : invalidReason);
+        if (compiled && persistResult) {
+            postTemporalCompileResultEvent_(sourceType, sourceId, envelope, compileModel);
+        }
+        if (runtimeGuardEnforced && !runtimeGuardConfig.allowSafeFallback) {
+            emitRuntimeGuardDecision("legacy_fallback_blocked", fallbackReason, true, compileModel);
+        } else if (runtimeGuardShadow) {
+            emitRuntimeGuardDecision("legacy_fallback", fallbackReason, false, compileModel);
+        }
+        logTemporal(
+            "ensureTemporalPlanForRuntime: using legacy path source_type=" + sourceType +
+            " source_id=" + std::to_string(sourceId) +
+            " compile_model=" + compileModel +
+            " prompt_hash=" + promptHash +
+            " reason=" + fallbackReason
+        );
+        inOutPlanEnvelope = nlohmann::json::object();
+        return false;
+    }
+
+    inOutPlanEnvelope = envelope;
+
+    if (compilerSelectedLegacy(inOutPlanEnvelope)) {
+        if (persistResult) {
+            postTemporalCompileResultEvent_(sourceType, sourceId, inOutPlanEnvelope, compileModel);
+        }
+        logTemporal(
+            "ensureTemporalPlanForRuntime: compiler selected legacy path source_type=" + sourceType +
+            " source_id=" + std::to_string(sourceId) +
+            " prompt_hash=" + promptHash
+        );
+        return false;
+    }
+
+    if (persistResult) {
+        postTemporalCompileResultEvent_(sourceType, sourceId, inOutPlanEnvelope, compileModel);
+    }
+    return temporal::planUsable(inOutPlanEnvelope);
+}
+
+std::vector<VideoHit> AgentCore::analyzeVideosWithGemini_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const std::string& userQuestion,
+    bool stopOnFirstHit,
+    const std::string& uploadedImageBase64,
+    const std::string& modelTier,
+    const std::string& geminiApiKey,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens,
+    std::string& outModelAnswer)
+{
+    std::vector<VideoHit> allHits;
+    if (videos.empty()) {
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        outModelAnswer.clear();
+        return allHits;
+    }
+
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    outModelAnswer.clear();
+
+    // Spawn at most 8 workers, but never more than the number of videos.
+    const int kMaxThreads = 8;
+    const int numWorkers = std::min<int>((int)videos.size(), kMaxThreads);
+
+    std::mutex hitsMutex;
+
+    std::atomic<size_t> nextIndex{ 0 };
+    std::atomic<bool> stopEarly{ false };
+
+    std::atomic<int> totalPrompt{ 0 };
+    std::atomic<int> totalOutput{ 0 };
+    std::atomic<int> totalTotal{ 0 };
+
+    auto worker = [&]() {
+        for (;;) {
+            if (stopOnFirstHit && stopEarly.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            size_t idx = nextIndex.fetch_add(1, std::memory_order_acq_rel);
+            if (idx >= videos.size()) break;
+
+            try {
+                int batchPrompt = 0, batchOutput = 0, batchTotal = 0;
+
+                auto hit = callGeminiVisionVideoSegment_(
+                    videos[idx],
+                    userQuestion,
+                    uploadedImageBase64,
+                    modelTier,
+                    geminiApiKey,
+                    batchPrompt,
+                    batchOutput,
+                    batchTotal
+                );
+
+                hit.segmentIndex = idx;
+
+                totalPrompt.fetch_add(batchPrompt, std::memory_order_relaxed);
+                totalOutput.fetch_add(batchOutput, std::memory_order_relaxed);
+                totalTotal.fetch_add(batchTotal, std::memory_order_relaxed);
+
+                // Keep the latest non-empty model answer (thread-safe).
+                if (!hit.answer.empty()) {
+                    std::lock_guard<std::mutex> lock(hitsMutex);
+                    outModelAnswer = hit.answer;
+                }
+
+                if (!hit.hasMatch) {
+                    continue;
+                }
+
+                if (stopOnFirstHit) {
+                    bool expected = false;
+                    if (stopEarly.compare_exchange_strong(
+                        expected, true,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+                    {
+                        std::lock_guard<std::mutex> lock(hitsMutex);
+                        allHits.push_back(hit);
+                        if (!hit.answer.empty()) {
+                            outModelAnswer = hit.answer;
+                        }
+                    }
+                    break;
+                }
+                else {
+                    std::lock_guard<std::mutex> lock(hitsMutex);
+                    allHits.push_back(hit);
+                }
+            }
+            catch (const std::exception& e) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("analyzeVideosWithGemini_ worker exception idx=") +
+                    std::to_string(idx) + ": " + e.what()
+                );
+                // continue; do not kill the process
+            }
+            catch (...) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("analyzeVideosWithGemini_ worker unknown exception idx=") +
+                    std::to_string(idx)
+                );
+                // continue; do not kill the process
+            }
+        }
+        };
+
+    std::vector<std::thread> threads;
+    threads.reserve(numWorkers);
+    for (int i = 0; i < numWorkers; ++i) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    outPromptTokens = totalPrompt.load(std::memory_order_relaxed);
+    outOutputTokens = totalOutput.load(std::memory_order_relaxed);
+    outTotalTokens = totalTotal.load(std::memory_order_relaxed);
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithGemini_: videos=" + std::to_string(videos.size()) +
+        " workers=" + std::to_string(numWorkers) +
+        " total hits=" + std::to_string(allHits.size())
+    );
+
+    return allHits;
+}
+
+std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const std::string& userQuestion,
+    bool stopOnFirstHit,
+    const std::string& uploadedImageBase64,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int modelInputFps,
+    int runningResolution,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens,
+    std::string& outModelAnswer)
+{
+    std::vector<VideoHit> allHits;
+    if (videos.empty()) {
+        outPromptTokens = outOutputTokens = outTotalTokens = 0;
+        outModelAnswer.clear();
+        return allHits;
+    }
+
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    outModelAnswer.clear();
+
+    const int kMaxThreads = 8;
+    const int numWorkers = std::min<int>((int)videos.size(), kMaxThreads);
+
+    std::mutex hitsMutex;
+    std::atomic<size_t> nextIndex{ 0 };
+    std::atomic<bool> stopEarly{ false };
+
+    std::atomic<int> totalPrompt{ 0 };
+    std::atomic<int> totalOutput{ 0 };
+    std::atomic<int> totalTotal{ 0 };
+
+    auto worker = [&]() {
+        for (;;) {
+            if (stopOnFirstHit && stopEarly.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            size_t idx = nextIndex.fetch_add(1, std::memory_order_acq_rel);
+            if (idx >= videos.size()) break;
+
+            try {
+                int batchPrompt = 0, batchOutput = 0, batchTotal = 0;
+
+                auto hit = callOpenAIVisionVideoSegment_(
+                    videos[idx],
+                    userQuestion,
+                    uploadedImageBase64,
+                    std::vector<FaceReferenceImage>{},
+                    std::vector<NegativeReferenceImage>{},
+                    std::string(),
+                    std::string(),
+                    openAiModelName,
+                    openAiApiKey,
+                    modelInputFps,
+                    /*expectedWindowSeconds*/ 0,
+                    runningResolution,
+                    batchPrompt,
+                    batchOutput,
+                    batchTotal
+                );
+
+                hit.segmentIndex = idx;
+
+                totalPrompt.fetch_add(batchPrompt, std::memory_order_relaxed);
+                totalOutput.fetch_add(batchOutput, std::memory_order_relaxed);
+                totalTotal.fetch_add(batchTotal, std::memory_order_relaxed);
+
+                if (!hit.answer.empty()) {
+                    std::lock_guard<std::mutex> lock(hitsMutex);
+                    outModelAnswer = hit.answer;
+                }
+
+                if (!hit.hasMatch) {
+                    continue;
+                }
+
+                if (stopOnFirstHit) {
+                    bool expected = false;
+                    if (stopEarly.compare_exchange_strong(
+                        expected, true,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+                    {
+                        std::lock_guard<std::mutex> lock(hitsMutex);
+                        allHits.push_back(hit);
+                        if (!hit.answer.empty()) {
+                            outModelAnswer = hit.answer;
+                        }
+                    }
+                    break;
+                }
+                else {
+                    std::lock_guard<std::mutex> lock(hitsMutex);
+                    allHits.push_back(hit);
+                }
+            }
+            catch (const std::exception& e) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("analyzeVideosWithOpenAI_ worker exception idx=") +
+                    std::to_string(idx) + ": " + e.what()
+                );
+            }
+            catch (...) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("analyzeVideosWithOpenAI_ worker unknown exception idx=") +
+                    std::to_string(idx)
+                );
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(numWorkers);
+    for (int i = 0; i < numWorkers; ++i) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    outPromptTokens = totalPrompt.load(std::memory_order_relaxed);
+    outOutputTokens = totalOutput.load(std::memory_order_relaxed);
+    outTotalTokens = totalTotal.load(std::memory_order_relaxed);
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithOpenAI_: videos=" + std::to_string(videos.size()) +
+        " workers=" + std::to_string(numWorkers) +
+        " total hits=" + std::to_string(allHits.size()) +
+        " model=" + (openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName) +
+        " fps=" + std::to_string(modelInputFps) +
+        " running_resolution=" + std::to_string(runningResolution)
+    );
+
+    return allHits;
+}
+
+
+
+
+
+
+
+
+
+
+/*
+std::vector<VideoHit> AgentCore::analyzeVideosWithGemini_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const std::string& userQuestion,
+    bool stopOnFirstHit,
+    const std::string& uploadedImageBase64,
+    const std::string& modelTier,
+    int& outPromptTokens,
+    int& outOutputTokens,
+    int& outTotalTokens,
+    std::string& outModelAnswer)
+{
+    std::vector<VideoHit> allHits;
+    if (videos.empty()) return allHits;
+
+    outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    outModelAnswer.clear();
+
+    const int maxParallel = 8;
+
+    std::mutex hitsMutex;
+    std::atomic<size_t> nextIndex(0);
+    std::atomic<bool> stopEarly(false);
+
+    std::atomic<int> totalPrompt(0);
+    std::atomic<int> totalOutput(0);
+    std::atomic<int> totalTotal(0);
+
+    auto worker = [&]() {
+        for (;;) {
+            if (stopOnFirstHit && stopEarly.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            size_t idx = nextIndex.fetch_add(1, std::memory_order_acq_rel);
+            if (idx >= videos.size()) break;
+
+            int batchPrompt = 0, batchOutput = 0, batchTotal = 0;
+
+            auto hit = callGeminiVisionVideoSegment_(
+                videos[idx],
+                userQuestion,
+                uploadedImageBase64,
+                modelTier,
+                batchPrompt,
+                batchOutput,
+                batchTotal
+            );
+
+            hit.segmentIndex = idx;
+
+            totalPrompt.fetch_add(batchPrompt, std::memory_order_relaxed);
+            totalOutput.fetch_add(batchOutput, std::memory_order_relaxed);
+            totalTotal.fetch_add(batchTotal, std::memory_order_relaxed);
+
+            if (!hit.answer.empty()) {
+                std::lock_guard<std::mutex> lock(hitsMutex);
+                // last non-empty answer wins for now
+                outModelAnswer = hit.answer;
+            }
+
+            if (!hit.hasMatch) {
+                continue;
+            }
+
+            if (stopOnFirstHit) {
+                bool expected = false;
+                if (stopEarly.compare_exchange_strong(
+                    expected, true,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                {
+                    std::lock_guard<std::mutex> lock(hitsMutex);
+                    allHits.push_back(hit);
+                    if (!hit.answer.empty()) {
+                        outModelAnswer = hit.answer;
+                    }
+                }
+                break;
+            }
+            else {
+                std::lock_guard<std::mutex> lock(hitsMutex);
+                allHits.push_back(hit);
+            }
+        }
+        };
+
+    std::vector<std::thread> threads;
+    threads.reserve(maxParallel);
+    for (int i = 0; i < maxParallel; ++i) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    outPromptTokens = totalPrompt.load(std::memory_order_relaxed);
+    outOutputTokens = totalOutput.load(std::memory_order_relaxed);
+    outTotalTokens = totalTotal.load(std::memory_order_relaxed);
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithGemini_: total hits=" +
+        std::to_string(allHits.size())
+    );
+
+    return allHits;
+}
+*/

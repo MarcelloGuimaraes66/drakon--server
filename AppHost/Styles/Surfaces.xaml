@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <SolidColorBrush x:Key="DrakonPanelBrush" Color="{ThemeResource DrakonPanelColor}" />
+    <SolidColorBrush x:Key="DrakonPanelAltBrush" Color="{ThemeResource DrakonPanelAltColor}" />
+    <SolidColorBrush x:Key="DrakonPanelBorderBrush" Color="{ThemeResource DrakonPanelBorderColor}" />
+    <SolidColorBrush x:Key="DrakonHeroBrush" Color="{ThemeResource DrakonHeroColor}" />
+    <SolidColorBrush x:Key="DrakonAccentBrush" Color="{ThemeResource DrakonAccentColor}" />
+    <SolidColorBrush x:Key="DrakonSecondaryTextBrush" Color="{ThemeResource DrakonSecondaryTextColor}" />
+    <SolidColorBrush x:Key="DrakonStrongTextBrush" Color="{ThemeResource DrakonStrongTextColor}" />
+    <SolidColorBrush x:Key="DrakonSuccessBrush" Color="{ThemeResource DrakonSuccessColor}" />
+    <SolidColorBrush x:Key="DrakonDangerBrush" Color="{ThemeResource DrakonDangerColor}" />
+    <SolidColorBrush x:Key="DrakonWarningBrush" Color="{ThemeResource DrakonWarningColor}" />
+    <SolidColorBrush x:Key="DrakonMutedBrush" Color="{ThemeResource DrakonMutedColor}" />
+    <SolidColorBrush x:Key="DrakonShellBackgroundBrush" Color="{ThemeResource DrakonShellBackgroundColor}" />
+    <SolidColorBrush x:Key="DrakonShellSidebarBrush" Color="{ThemeResource DrakonShellSidebarColor}" />
+    <SolidColorBrush x:Key="DrakonShellHeaderBrush" Color="{ThemeResource DrakonShellHeaderColor}" />
+    <SolidColorBrush x:Key="DrakonShellHoverBrush" Color="{ThemeResource DrakonShellHoverColor}" />
+    <SolidColorBrush x:Key="DrakonShellActiveBrush" Color="{ThemeResource DrakonShellActiveColor}" />
+    <SolidColorBrush x:Key="DrakonShellActiveBorderBrush" Color="{ThemeResource DrakonShellActiveBorderColor}" />
+    <SolidColorBrush x:Key="DrakonShellChipBrush" Color="{ThemeResource DrakonShellChipColor}" />
+    <SolidColorBrush x:Key="DrakonShellChipBorderBrush" Color="{ThemeResource DrakonShellChipBorderColor}" />
+    <SolidColorBrush x:Key="DrakonOverlayBrush" Color="{ThemeResource DrakonOverlayColor}" />
+
+</ResourceDictionary>

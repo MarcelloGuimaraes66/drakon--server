@@ -1,0 +1,70 @@
+.codex/
+.codex-logs/
+.repo-backups/
+_tmp*/
+brand.txt
+*.obj
+*.log
+
+# Legacy nested git repositories to be flattened into the root repo
+DrakonSite/.git/
+Perceptrum/.git/
+
+# Visual Studio and compiler outputs
+**/.vs/
+**/bin/
+**/obj/
+**/Debug/
+**/Release/
+**/x64/
+**/*.user
+**/*.aps
+**/*.idb
+**/*.ipdb
+**/*.iobj
+**/*.pdb
+**/*.recipe
+**/*.tlog
+**/*.lastbuildstate
+**/*.FileListAbsolute.txt
+
+# Root workspace artifacts
+_temporal_regression_check.obj
+temporal_engine_smoke.obj
+
+# AppHost generated and packaged outputs
+AppHost/dist/
+AppHost/stage/
+AppHost/generated/
+AppHost/_icon_debug/
+AppHost/*_h.h
+
+# DrakonSite local build/runtime artifacts
+DrakonSite/.codex-logs/
+DrakonSite/.wrangler/
+DrakonSite/.dev.vars
+DrakonSite/dist/
+DrakonSite/node_modules/
+DrakonSite/storage/
+DrakonSite/index.html
+DrakonSite/src/shared/generated/
+DrakonSite/public/branding/current/
+DrakonSite/tmp_docx_extract/
+DrakonSite/tmp_investigation/
+DrakonSite/tmp_*
+DrakonSite/_deploy_payload/
+DrakonSite/_partner_zip/
+DrakonSite/_diff_jobruntime.patch
+DrakonSite/__pycache__/
+DrakonSite/*.docx
+DrakonSite/**/*.bak*
+DrakonSite/.env
+DrakonSite/.env*
+DrakonSite/env.dev
+!DrakonSite/.env.example
+!DrakonSite/.env.*.example
+
+# Perceptrum local runtime/build artifacts
+Perceptrum/.local/
+Perceptrum/Perceptrum/generated/
+Perceptrum/Perceptrum/gcm-diagnose.log
