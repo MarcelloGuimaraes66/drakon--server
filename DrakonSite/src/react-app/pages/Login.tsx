@@ -243,11 +243,40 @@ export default function Login() {
     return emailRegex.test(email);
   };
 
+  const isEmailValid = validateEmail(email);
+  const hasSelectedCountry = Boolean(detectedCountry || countryCode);
+  const signupBlockingReasons = useMemo(() => {
+    const reasons: string[] = [];
+
+    if (!isEmailValid) {
+      reasons.push(t("login.errorInvalidEmail"));
+    }
+
+    if (password.length < 8) {
+      reasons.push(t("login.errorPasswordLength"));
+    }
+
+    if (!hasSelectedCountry) {
+      reasons.push(t("login.errorSelectCountry"));
+    }
+
+    if (!agreeTerms) {
+      reasons.push(t("login.errorAgreeTerms"));
+    }
+
+    return reasons;
+  }, [agreeTerms, hasSelectedCountry, isEmailValid, password.length, t]);
+
+  const isFormValid =
+    activeTab === "login"
+      ? isEmailValid && password.length > 0
+      : signupBlockingReasons.length === 0;
+
   const handleLocalSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
 
-    if (!validateEmail(email)) {
+    if (!isEmailValid) {
       setError(t("login.errorInvalidEmail"));
       return;
     }
@@ -262,7 +291,7 @@ export default function Login() {
       return;
     }
 
-    if (!detectedCountry && !countryCode) {
+    if (!hasSelectedCountry) {
       setError(t("login.errorSelectCountry"));
       return;
     }
@@ -300,7 +329,7 @@ export default function Login() {
     e.preventDefault();
     setError("");
 
-    if (!validateEmail(email)) {
+    if (!isEmailValid) {
       setError(t("login.errorInvalidEmail"));
       return;
     }
@@ -332,19 +361,6 @@ export default function Login() {
     } catch (err) {
       setError(t("login.errorNetwork"));
       setIsLoading(false);
-    }
-  };
-
-  const isFormValid = () => {
-    if (activeTab === "login") {
-      return validateEmail(email) && password.length > 0;
-    } else {
-      return (
-        validateEmail(email) &&
-        password.length >= 8 &&
-        agreeTerms &&
-        (detectedCountry || countryCode)
-      );
     }
   };
 
@@ -542,7 +558,7 @@ export default function Login() {
 
               <button
                 type="submit"
-                disabled={!isFormValid() || isLoading || isGoogleLoading}
+                disabled={!isFormValid || isLoading || isGoogleLoading}
                 className={`${primaryButtonClass} flex items-center justify-center gap-2 px-6`}
               >
                 {isLoading ? (
@@ -730,9 +746,33 @@ export default function Login() {
                 </button>
               </div>
 
+              {signupBlockingReasons.length > 0 && !isLoading && !isGoogleLoading && (
+                <div
+                  id="signup-blocking-reasons"
+                  className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-4 py-3 text-sm text-amber-100"
+                >
+                  <ul className="space-y-1.5">
+                    {signupBlockingReasons.map((reason) => (
+                      <li key={reason} className="flex items-start gap-2">
+                        <span
+                          aria-hidden="true"
+                          className="mt-1.5 h-1.5 w-1.5 flex-none rounded-full bg-amber-300"
+                        />
+                        <span>{reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <button
                 type="submit"
-                disabled={!isFormValid() || isLoading || isGoogleLoading}
+                disabled={!isFormValid || isLoading || isGoogleLoading}
+                aria-describedby={
+                  signupBlockingReasons.length > 0 && !isLoading && !isGoogleLoading
+                    ? "signup-blocking-reasons"
+                    : undefined
+                }
                 className={`${primaryButtonClass} flex items-center justify-center gap-2 px-6`}
               >
                 {isLoading ? (

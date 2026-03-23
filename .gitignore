@@ -5,6 +5,8 @@ _tmp*/
 brand.txt
 *.obj
 *.log
+backup/
+backup.zip
 
 # Legacy nested git repositories to be flattened into the root repo
 DrakonSite/.git/

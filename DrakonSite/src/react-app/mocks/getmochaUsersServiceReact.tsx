@@ -26,6 +26,21 @@ type AuthContextValue = {
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
+function isDesktopHostedShell(): boolean {
+  const desktopWindow =
+    typeof window !== "undefined"
+      ? (window as Window & {
+          chrome?: { webview?: unknown };
+          __drakonDesktopShell?: boolean;
+        })
+      : null;
+  return (
+    desktopWindow?.__drakonDesktopShell === true ||
+    (Boolean(desktopWindow?.chrome) &&
+      typeof desktopWindow?.chrome?.webview !== "undefined")
+  );
+}
+
 async function fetchCurrentUser(): Promise<AuthUser | null> {
   try {
     const response = await fetch("/api/auth/me", { credentials: "include" });
@@ -58,19 +73,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [loadUser]);
 
   const redirectToLogin = useCallback(async () => {
-    const desktopWindow =
-      typeof window !== "undefined"
-        ? (window as Window & { chrome?: { webview?: unknown } })
-        : null;
-    const isDesktopHosted =
-      Boolean(desktopWindow?.chrome) &&
-      typeof desktopWindow?.chrome?.webview !== "undefined";
+    const isDesktopHosted = isDesktopHostedShell();
     const endpoint = isDesktopHosted
       ? "/api/oauth/google/redirect_url?desktop_host=1"
       : "/api/oauth/google/redirect_url";
 
     const response = await fetch(endpoint, {
       credentials: "include",
+      headers: isDesktopHosted
+        ? {
+            "X-Drakon-Desktop-Host": "1",
+          }
+        : undefined,
     });
 
     let payload: { redirectUrl?: string; error?: string } | null = null;

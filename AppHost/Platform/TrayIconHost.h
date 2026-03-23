@@ -26,21 +26,22 @@ namespace DrakonDesktop::platform
         static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
         LRESULT HandleWindowMessage(UINT message, WPARAM wParam, LPARAM lParam);
-        void ToggleWindowVisibility() const;
+        void ToggleWindowVisibility();
         void ShowWindowFromTray() const;
-        void HideWindowToTray() const;
+        void HideWindowToTray();
         void ShowContextMenu();
         void RequestExit();
 
         bool CreateTrayIcon();
         void RemoveTrayIcon();
-        void ShowStartupBalloon() const;
+        void ShowBackgroundBalloon() const;
         void ReleaseLoadedIcons();
 
         HWND m_hwnd{ nullptr };
         WNDPROC m_originalWindowProc{ nullptr };
         bool m_trayIconVisible{ false };
         bool m_allowClose{ false };
+        bool m_backgroundBalloonShown{ false };
         HICON m_trayIcon{ nullptr };
         HICON m_balloonIcon{ nullptr };
     };

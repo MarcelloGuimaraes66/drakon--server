@@ -5391,10 +5391,14 @@ function resolveAuthoritativeGoogleRedirectUri(): string {
 
 function isDesktopHostedGoogleLoginRequest(c: any): boolean {
   try {
-    return new URL(c.req.url).searchParams.get("desktop_host") === "1";
+    if (new URL(c.req.url).searchParams.get("desktop_host") === "1") {
+      return true;
+    }
   } catch {
-    return false;
   }
+
+  const desktopHeader = String(c.req.header("x-drakon-desktop-host") || "").trim().toLowerCase();
+  return desktopHeader === "1" || desktopHeader === "true" || desktopHeader === "yes";
 }
 
 function resolveGoogleRedirectUri(c: any, options?: { preferAuthoritative?: boolean }): string {
@@ -5588,13 +5592,20 @@ async function markAppUserAsGoogleLinked(
 async function createGoogleOAuthRedirectUrl(c: any): Promise<string> {
   const { clientId } = getGoogleOAuthConfig(c.env);
   const discovery = await getGoogleOidcDiscovery();
+  const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
   const redirectUri = resolveGoogleRedirectUri(c, {
-    preferAuthoritative: isDesktopHostedGoogleLoginRequest(c),
+    preferAuthoritative: desktopHosted,
   });
   const state = generateRandomBase64Url(24);
   const nonce = generateRandomBase64Url(24);
   const codeVerifier = generateRandomBase64Url(48);
   const codeChallenge = await sha256Base64Url(codeVerifier);
+
+  if (AUTH_DEBUG) {
+    console.log(
+      `[GOOGLE LOGIN] redirect_uri=${redirectUri} desktop_hosted=${desktopHosted} request_origin=${resolveBrowserOrigin(c)}`
+    );
+  }
 
   setSessionCookie(c, GOOGLE_OAUTH_STATE_COOKIE_NAME, state, GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS);
   setSessionCookie(c, GOOGLE_OAUTH_NONCE_COOKIE_NAME, nonce, GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS);
@@ -6308,7 +6319,10 @@ app.use("*", async (c, next) => {
         c.header("Vary", "Origin");
         c.header("Access-Control-Allow-Credentials", "true");
         c.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-        c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        c.header(
+          "Access-Control-Allow-Headers",
+          "Content-Type, Authorization, X-Drakon-Desktop-Host"
+        );
         c.header("Access-Control-Max-Age", "86400");
       }
     }
@@ -6322,7 +6336,10 @@ app.use("*", async (c, next) => {
     c.header("Vary", "Origin");
     c.header("Access-Control-Allow-Credentials", "true");
     c.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-    c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    c.header(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Drakon-Desktop-Host"
+    );
     c.header("Access-Control-Max-Age", "86400");
   }
   
@@ -6456,6 +6473,12 @@ function isValidPassword(password: string): boolean {
 function normalizeOptionalCameraField(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeCameraTransportField(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = String(value).trim();
   return trimmed.length > 0 ? trimmed : null;
 }
 
@@ -10493,7 +10516,7 @@ app.post("/api/cameras", anyAuthMiddleware, zValidator("json", CreateCameraSchem
     .bind(
       user.id,
       cameraName,
-      connectionMethod === "WEBCAM" ? "" : (data.ip_address || ""),
+      connectionMethod === "WEBCAM" ? "" : (normalizeCameraTransportField(data.ip_address) ?? ""),
       connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.rtsp_port),
       connectionMethod === "WEBCAM" ? "Webcam" : normalizeOptionalCameraField(data.manufacturer),
       connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.username),
@@ -10604,19 +10627,19 @@ app.post("/api/cameras/:cameraId/refresh-thumbnail", anyAuthMiddleware, async (c
       camera_id: cameraId,
       name: typeof cam.name === "string" ? cam.name : `Camera ${cameraId}`,
       description: typeof cam.description === "string" ? cam.description : "",
-      ip: typeof cam.ip_address === "string" ? cam.ip_address : "",
-      port: cam.rtsp_port ?? null,
-      username: typeof cam.username === "string" ? cam.username : "",
+      ip: normalizeCameraTransportField(cam.ip_address) ?? "",
+      port: normalizeCameraTransportField(cam.rtsp_port),
+      username: normalizeCameraTransportField(cam.username) ?? "",
       password: typeof cam.password === "string" ? cam.password : "",
-      manufacturer: typeof cam.manufacturer === "string" ? cam.manufacturer : "",
+      manufacturer: normalizeCameraTransportField(cam.manufacturer) ?? "",
       connection_method:
-        typeof cam.connection_method === "string" ? cam.connection_method : "",
+        normalizeCameraTransportField(cam.connection_method) ?? "",
       webcam_index:
         cam.webcam_index === null || cam.webcam_index === undefined
           ? null
           : Number(cam.webcam_index),
-      channel: cam.channel === null || cam.channel === undefined ? null : String(cam.channel),
-      subtype: cam.subtype === null || cam.subtype === undefined ? null : String(cam.subtype),
+      channel: normalizeCameraTransportField(cam.channel),
+      subtype: normalizeCameraTransportField(cam.subtype),
     },
   };
 
@@ -10722,6 +10745,9 @@ app.patch("/api/cameras/:id", anyAuthMiddleware, zValidator("json", UpdateCamera
       if (value === null) return;
       updates.push(`${key} = ?`);
       values.push(value);
+    } else if (key === "ip_address") {
+      updates.push(`${key} = ?`);
+      values.push(normalizeCameraTransportField(value) ?? "");
     } else if (key === "name") {
       // Normalize name for webcam cameras: ensure "Webcam " prefix
       let normalizedName = (value as string).trim();
@@ -11041,14 +11067,14 @@ async function enqueueStartCameraCommand(
     const payload = {
       camera_id: cam.id,
       name: cam.name,
-      ip: cam.ip_address,
-      port: cam.rtsp_port,
-      username: cam.username,
+      ip: normalizeCameraTransportField(cam.ip_address) ?? "",
+      port: normalizeCameraTransportField(cam.rtsp_port),
+      username: normalizeCameraTransportField(cam.username) ?? "",
       password: cam.password,
-      channel: cam.channel,
-      subtype: cam.subtype,
-      manufacturer: cam.manufacturer,
-      connection_method: cam.connection_method,
+      channel: normalizeCameraTransportField(cam.channel),
+      subtype: normalizeCameraTransportField(cam.subtype),
+      manufacturer: normalizeCameraTransportField(cam.manufacturer),
+      connection_method: normalizeCameraTransportField(cam.connection_method),
       start_origin: "direct",
       enabled_algorithms: enabledAlgorithms,
       store_frames: cam.store_frames === 1,
@@ -12925,19 +12951,19 @@ app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddlewar
       camera_id: cameraId,
       name: typeof cam.name === "string" ? cam.name : `Camera ${cameraId}`,
       description: typeof cam.description === "string" ? cam.description : "",
-      ip: typeof cam.ip_address === "string" ? cam.ip_address : "",
-      port: cam.rtsp_port ?? null,
-      username: typeof cam.username === "string" ? cam.username : "",
+      ip: normalizeCameraTransportField(cam.ip_address) ?? "",
+      port: normalizeCameraTransportField(cam.rtsp_port),
+      username: normalizeCameraTransportField(cam.username) ?? "",
       password: typeof cam.password === "string" ? cam.password : "",
-      manufacturer: typeof cam.manufacturer === "string" ? cam.manufacturer : "",
+      manufacturer: normalizeCameraTransportField(cam.manufacturer) ?? "",
       connection_method:
-        typeof cam.connection_method === "string" ? cam.connection_method : "",
+        normalizeCameraTransportField(cam.connection_method) ?? "",
       webcam_index:
         cam.webcam_index === null || cam.webcam_index === undefined
           ? null
           : Number(cam.webcam_index),
-      channel: cam.channel === null || cam.channel === undefined ? null : String(cam.channel),
-      subtype: cam.subtype === null || cam.subtype === undefined ? null : String(cam.subtype),
+      channel: normalizeCameraTransportField(cam.channel),
+      subtype: normalizeCameraTransportField(cam.subtype),
     },
   };
 
@@ -27774,19 +27800,19 @@ app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, asyn
       camera_id: cameraId,
       name: typeof cam.name === "string" ? cam.name : `Camera ${cameraId}`,
       description: typeof cam.description === "string" ? cam.description : "",
-      ip: typeof cam.ip_address === "string" ? cam.ip_address : "",
-      port: cam.rtsp_port ?? null,
-      username: typeof cam.username === "string" ? cam.username : "",
+      ip: normalizeCameraTransportField(cam.ip_address) ?? "",
+      port: normalizeCameraTransportField(cam.rtsp_port),
+      username: normalizeCameraTransportField(cam.username) ?? "",
       password: typeof cam.password === "string" ? cam.password : "",
-      manufacturer: typeof cam.manufacturer === "string" ? cam.manufacturer : "",
+      manufacturer: normalizeCameraTransportField(cam.manufacturer) ?? "",
       connection_method:
-        typeof cam.connection_method === "string" ? cam.connection_method : "",
+        normalizeCameraTransportField(cam.connection_method) ?? "",
       webcam_index:
         cam.webcam_index === null || cam.webcam_index === undefined
           ? null
           : Number(cam.webcam_index),
-      channel: cam.channel === null || cam.channel === undefined ? null : String(cam.channel),
-      subtype: cam.subtype === null || cam.subtype === undefined ? null : String(cam.subtype),
+      channel: normalizeCameraTransportField(cam.channel),
+      subtype: normalizeCameraTransportField(cam.subtype),
     },
   };
 

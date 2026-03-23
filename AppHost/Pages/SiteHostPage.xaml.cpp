@@ -29,6 +29,7 @@ namespace winrt::DrakonDesktop::implementation
   }
 
   window.__drakonDesktopNativeBridgeInstalled = true;
+  window.__drakonDesktopShell = true;
   let busy = false;
   let completed = Boolean(window.__drakonDesktopPairRuntimeCompleted);
 

@@ -2271,6 +2271,32 @@ namespace {
         return s;
     }
 
+    std::string percentEncodeUrlComponent(const std::string& value)
+    {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        std::string encoded;
+        encoded.reserve(value.size() * 3);
+
+        for (unsigned char ch : value) {
+            const bool isUnreserved =
+                (ch >= 'A' && ch <= 'Z') ||
+                (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') ||
+                ch == '-' || ch == '.' || ch == '_' || ch == '~';
+
+            if (isUnreserved) {
+                encoded.push_back(static_cast<char>(ch));
+                continue;
+            }
+
+            encoded.push_back('%');
+            encoded.push_back(kHex[(ch >> 4) & 0x0F]);
+            encoded.push_back(kHex[ch & 0x0F]);
+        }
+
+        return encoded;
+    }
+
 
     std::vector<std::string> buildRtspCandidatesFromPayload(const json& p)
     {
@@ -2347,9 +2373,9 @@ namespace {
             }
             };
 
-        std::string manufacturer = getStringSafe("manufacturer");
-        std::string ip = getStringSafe("ip");
-        std::string username = getStringSafe("username");
+        std::string manufacturer = trimCopy(getStringSafe("manufacturer"));
+        std::string ip = trimCopy(getStringSafe("ip"));
+        std::string username = trimCopy(getStringSafe("username"));
         std::string password = getStringSafe("password");
         std::string channelOverride = normalizeNumericToken(getStringSafe("channel"));
         std::string subtypeOverride = normalizeNumericToken(getStringSafe("subtype"));
@@ -2363,10 +2389,17 @@ namespace {
                 portStr = std::to_string(p["port"].get<int>());
             }
         }
+        portStr = normalizeNumericToken(portStr);
+        if (portStr.empty()) {
+            portStr = "554";
+        }
+
+        const std::string encodedUsername = percentEncodeUrlComponent(username);
+        const std::string encodedPassword = percentEncodeUrlComponent(password);
 
         auto make = [&](std::string tmpl) -> std::string {
-            tmpl = replaceAll(tmpl, "USUARIO", username);
-            tmpl = replaceAll(tmpl, "SENHA", password);
+            tmpl = replaceAll(tmpl, "USUARIO", encodedUsername);
+            tmpl = replaceAll(tmpl, "SENHA", encodedPassword);
             tmpl = replaceAll(tmpl, "IP", ip);
             return tmpl;
             };
@@ -2398,7 +2431,7 @@ namespace {
         if (urls.empty() && !ip.empty()) {
             if (!username.empty() || !password.empty()) {
                 urls.push_back(
-                    "rtsp://" + username + ":" + password + "@" +
+                    "rtsp://" + encodedUsername + ":" + encodedPassword + "@" +
                     ip + ":" + portStr + "/Streaming/Channels/101"
                 );
             }

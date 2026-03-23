@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronUp, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Eye, EyeOff, X } from "lucide-react";
 
 const CAMERA_LABEL_OPTIONS = [
   { value: "kitchen", label: "Kitchen" },
@@ -302,6 +302,7 @@ export default function CameraEditorModal({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [showPublicAccessModal, setShowPublicAccessModal] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
     if (!isOpen) {
@@ -313,6 +314,7 @@ export default function CameraEditorModal({
     setIsAddressExpanded(false);
     setIsSubmitting(false);
     setShowPublicAccessModal(false);
+    setShowPassword(false);
 
     if (camera) {
       const isWebcam = camera.connection_method === "WEBCAM" || camera.webcam_index != null;
@@ -902,20 +904,34 @@ export default function CameraEditorModal({
 
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Password *</label>
-                  <input
-                    type="password"
-                    name={isEditing ? "password" : "camera_auth_password"}
-                    value={rtspFields?.password || ""}
-                    onChange={(e) => updateCurrentFormData({ password: e.target.value })}
-                    autoComplete={isEditing ? "current-password" : "new-password"}
-                    data-lpignore="true"
-                    data-1p-ignore="true"
-                    data-form-type="other"
-                    className={`w-full px-4 py-2.5 bg-gray-800 border ${
-                      addressErrors.password ? "border-red-500" : "border-gray-700"
-                    } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
-                    placeholder="********"
-                  />
+                  <div className="relative">
+                    <input
+                      type={showPassword ? "text" : "password"}
+                      name={isEditing ? "password" : "camera_auth_password"}
+                      value={rtspFields?.password || ""}
+                      onChange={(e) => updateCurrentFormData({ password: e.target.value })}
+                      autoComplete={isEditing ? "current-password" : "new-password"}
+                      data-lpignore="true"
+                      data-1p-ignore="true"
+                      data-form-type="other"
+                      className={`w-full px-4 py-2.5 pr-12 bg-gray-800 border ${
+                        addressErrors.password ? "border-red-500" : "border-gray-700"
+                      } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
+                      placeholder="********"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((current) => !current)}
+                      className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-500 transition-colors hover:text-white"
+                      aria-label={showPassword ? "Hide password" : "Show password"}
+                    >
+                      {showPassword ? (
+                        <EyeOff className="h-5 w-5" />
+                      ) : (
+                        <Eye className="h-5 w-5" />
+                      )}
+                    </button>
+                  </div>
                   {addressErrors.password && (
                     <p className="text-red-400 text-xs mt-1">Password is required</p>
                   )}

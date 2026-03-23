@@ -44,9 +44,6 @@ const appBaseUrl = process.env.APP_BASE_URL || `http://${bindHost}:${port}`;
 const serviceSessionDir = process.env.APP_SERVICE_SESSION_DIR
   ? path.resolve(process.env.APP_SERVICE_SESSION_DIR)
   : path.resolve(storageRoot, "desktop-session");
-const defaultLocalGoogleRedirectUri = isServerRuntime
-  ? ""
-  : `http://localhost:${port}/auth/callback`;
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
 const runtimeHealthRoute = "/api/runtime/health";
@@ -115,8 +112,9 @@ function createWorkerEnv(DB) {
     R2_BUCKET,
     GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
     GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
-    GOOGLE_OAUTH_REDIRECT_URI:
-      configuredGoogleRedirectUri || defaultLocalGoogleRedirectUri,
+    // Leave the redirect unset unless it was explicitly configured so the
+    // worker can choose the correct callback per request (desktop vs browser).
+    GOOGLE_OAUTH_REDIRECT_URI: configuredGoogleRedirectUri,
     CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
     STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",

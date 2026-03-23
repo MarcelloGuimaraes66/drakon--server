@@ -76,7 +76,7 @@ namespace DrakonDesktop::platform
         m_allowClose = false;
         if (CreateTrayIcon())
         {
-            ShowStartupBalloon();
+            m_backgroundBalloonShown = false;
             AppendBootstrapTrace("tray: attached");
             return true;
         }
@@ -104,6 +104,7 @@ namespace DrakonDesktop::platform
         RemovePropW(m_hwnd, HostPropertyName());
         m_hwnd = nullptr;
         m_allowClose = false;
+        m_backgroundBalloonShown = false;
         AppendBootstrapTrace("tray: detached");
     }
 
@@ -174,7 +175,7 @@ namespace DrakonDesktop::platform
         return CallWindowProcW(m_originalWindowProc, m_hwnd, message, wParam, lParam);
     }
 
-    void TrayIconHost::ToggleWindowVisibility() const
+    void TrayIconHost::ToggleWindowVisibility()
     {
         if (m_hwnd == nullptr)
         {
@@ -202,7 +203,7 @@ namespace DrakonDesktop::platform
         AppendBootstrapTrace("tray: show window");
     }
 
-    void TrayIconHost::HideWindowToTray() const
+    void TrayIconHost::HideWindowToTray()
     {
         if (m_hwnd == nullptr)
         {
@@ -210,6 +211,11 @@ namespace DrakonDesktop::platform
         }
 
         ShowWindow(m_hwnd, SW_HIDE);
+        if (!m_backgroundBalloonShown)
+        {
+            ShowBackgroundBalloon();
+            m_backgroundBalloonShown = true;
+        }
     }
 
     void TrayIconHost::ShowContextMenu()
@@ -323,7 +329,7 @@ namespace DrakonDesktop::platform
         m_trayIconVisible = false;
     }
 
-    void TrayIconHost::ShowStartupBalloon() const
+    void TrayIconHost::ShowBackgroundBalloon() const
     {
         if (!m_trayIconVisible || m_hwnd == nullptr)
         {
