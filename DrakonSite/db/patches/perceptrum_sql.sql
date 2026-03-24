@@ -259,7 +259,8 @@ CREATE TABLE public.chat_messages (
     model_output_tokens integer DEFAULT 0,
     model_total_tokens integer DEFAULT 0,
     camera_selection_json text,
-    uploaded_image_base64 text
+    uploaded_image_base64 text,
+    usage_recorded_at text
 );
 
 
@@ -4805,6 +4806,14 @@ CREATE INDEX idx_chat_messages_user_id ON public.chat_messages USING btree (user
 
 
 --
+-- TOC entry 5105 (class 1259 OID 43266)
+-- Name: idx_chat_messages_user_usage_recorded_at; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_chat_messages_user_usage_recorded_at ON public.chat_messages USING btree (user_id, usage_recorded_at);
+
+
+--
 -- TOC entry 5107 (class 1259 OID 43267)
 -- Name: idx_chat_sessions_user_id; Type: INDEX; Schema: public; Owner: postgres
 --
@@ -5226,6 +5235,14 @@ CREATE UNIQUE INDEX idx_stripe_customers_user_id ON public.stripe_customers USIN
 --
 
 CREATE INDEX idx_subscription_token_usage_subscription_id ON public.subscription_token_usage USING btree (subscription_id);
+
+
+--
+-- TOC entry 5223 (class 1259 OID 43318)
+-- Name: idx_subscription_token_usage_subscription_event_time; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_subscription_token_usage_subscription_event_time ON public.subscription_token_usage USING btree (subscription_id, event_time);
 
 
 --

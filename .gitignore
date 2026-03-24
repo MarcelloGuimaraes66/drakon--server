@@ -38,6 +38,7 @@ tmp-dbs/
 # AppHost generated and packaged outputs
 AppHost/dist/
 AppHost/stage/
+AppHost/artifacts/
 AppHost/generated/
 AppHost/_icon_debug/
 AppHost/*_h.h

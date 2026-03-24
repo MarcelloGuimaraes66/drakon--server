@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
-import { Camera, Plus, Wifi } from "lucide-react";
+import { Camera, Play, Plus, Square, Wifi } from "lucide-react";
+import CameraStartAttentionToast from "@/react-app/components/CameraStartAttentionToast";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
@@ -9,20 +10,24 @@ import CameraEditorModal, {
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
 import { Camera as CameraType } from "@/shared/types";
 
 type CamerasContentProps = {
   cameras: CameraType[];
   refreshCameras: () => Promise<void>;
+  patchCamera: (cameraId: number, patch: Partial<CameraType>) => void;
 };
 
-function CamerasContent({ cameras, refreshCameras }: CamerasContentProps) {
+function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContentProps) {
   const { t } = useTranslation();
   const billingEnabled = brand.features.billingEnabled;
   const [searchParams, setSearchParams] = useSearchParams();
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editorCamera, setEditorCamera] = useState<CameraEditorCamera | null>(null);
+  const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
+  const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast } = useEvents();
 
@@ -121,6 +126,48 @@ function CamerasContent({ cameras, refreshCameras }: CamerasContentProps) {
     }
   };
 
+  const updatePendingCameraState = (cameraId: number, isPending: boolean) => {
+    setPendingCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
+  const handleToggleService = async (camera: CameraType) => {
+    if (pendingCameraIds.has(camera.id)) {
+      return;
+    }
+
+    const isRunning = camera.is_service_running === 1;
+    updatePendingCameraState(camera.id, true);
+
+    try {
+      const result = await toggleCameraService({
+        cameraId: camera.id,
+        isRunning,
+      });
+
+      if (result.agentsDisabledNoSubscription) {
+        setSubscriptionToastCameraId(camera.id);
+      }
+
+      patchCamera(camera.id, {
+        is_service_running: result.nextRunning,
+      });
+
+      void refreshCameras();
+    } catch (error) {
+      console.error("Failed to toggle service:", error);
+    } finally {
+      updatePendingCameraState(camera.id, false);
+    }
+  };
+
   return (
     <>
       <div className="max-w-7xl mx-auto">
@@ -190,6 +237,30 @@ function CamerasContent({ cameras, refreshCameras }: CamerasContentProps) {
                     <td className="px-6 py-4 text-right">
                       <div className="flex items-center justify-end gap-2">
                         <button
+                          onClick={() => handleToggleService(camera)}
+                          disabled={pendingCameraIds.has(camera.id)}
+                          aria-busy={pendingCameraIds.has(camera.id)}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                            camera.is_service_running === 1
+                              ? "text-red-400 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                              : "text-green-400 hover:bg-green-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                          }`}
+                        >
+                          {pendingCameraIds.has(camera.id) ? (
+                            t("common.loading")
+                          ) : camera.is_service_running === 1 ? (
+                            <>
+                              <Square className="w-4 h-4" />
+                              {t("dashboard.stop")}
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-4 h-4" />
+                              {t("dashboard.start")}
+                            </>
+                          )}
+                        </button>
+                        <button
                           onClick={() => openEditModal(camera)}
                           className="px-3 py-1.5 text-sm text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors"
                         >
@@ -227,6 +298,14 @@ function CamerasContent({ cameras, refreshCameras }: CamerasContentProps) {
 
       <CameraEventToast toasts={toasts} onDismiss={dismissToast} />
 
+      {subscriptionToastCameraId !== null && (
+        <CameraStartAttentionToast
+          cameraId={subscriptionToastCameraId}
+          billingEnabled={billingEnabled}
+          onDismiss={() => setSubscriptionToastCameraId(null)}
+        />
+      )}
+
       {billingEnabled && showBillingModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
@@ -261,6 +340,12 @@ function CamerasContent({ cameras, refreshCameras }: CamerasContentProps) {
 export default function Cameras() {
   const [cameras, setCameras] = useState<CameraType[]>([]);
 
+  const patchCamera = useCallback((cameraId: number, patch: Partial<CameraType>) => {
+    setCameras((current) =>
+      current.map((camera) => (camera.id === cameraId ? { ...camera, ...patch } : camera))
+    );
+  }, []);
+
   const refreshCameras = useCallback(async () => {
     try {
       const response = await fetch("/api/cameras", {
@@ -285,7 +370,11 @@ export default function Cameras() {
   return (
     <Layout>
       <EventsProvider cameras={cameras}>
-        <CamerasContent cameras={cameras} refreshCameras={refreshCameras} />
+        <CamerasContent
+          cameras={cameras}
+          refreshCameras={refreshCameras}
+          patchCamera={patchCamera}
+        />
       </EventsProvider>
     </Layout>
   );

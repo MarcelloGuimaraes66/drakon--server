@@ -1,4 +1,5 @@
 import type { KeyboardEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { Map, Zap } from "lucide-react";
 import { getBrazilStateName } from "@/shared/brazilStates";
 import {
@@ -19,6 +20,7 @@ export default function BrazilStateTileMap({
   stateCounts = {},
   disabled = false,
 }: BrazilStateTileMapProps) {
+  const { t } = useTranslation();
   const selected = new Set(selectedStates);
 
   const handleKeyDown = (event: KeyboardEvent<SVGGElement>, stateCode: string) => {
@@ -40,16 +42,16 @@ export default function BrazilStateTileMap({
       <div className="relative z-10 mb-5 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-200/70">
-            Geofence Brasil
+            {t("drakonFind.map.region")}
           </p>
           <div className="flex items-center gap-2">
             <Map className="h-4 w-4 text-cyan-300" />
-            <h3 className="text-lg font-semibold text-gray-100">Selecione os estados da busca</h3>
+            <h3 className="text-lg font-semibold text-gray-100">{t("drakonFind.map.title")}</h3>
           </div>
         </div>
         <div className="flex items-center gap-2 rounded-full border border-cyan-500/20 bg-gray-950/60 px-3 py-1.5 text-xs text-gray-300">
           <Zap className="h-3.5 w-3.5 text-cyan-300" />
-          Clique para ligar ou desligar a cobertura
+          {t("drakonFind.map.hint")}
         </div>
       </div>
 
@@ -99,7 +101,9 @@ export default function BrazilStateTileMap({
               role="button"
               tabIndex={disabled ? -1 : 0}
               aria-pressed={isSelected}
-              aria-label={`${stateName} ${cameraCount > 0 ? `${cameraCount} cameras` : "without cameras preview"}`}
+              aria-label={cameraCount > 0
+                ? t("drakonFind.map.ariaWithCameras", { state: stateName, count: cameraCount })
+                : t("drakonFind.map.ariaWithoutCameras", { state: stateName })}
               className={disabled ? "pointer-events-none" : "cursor-pointer"}
               onClick={() => {
                 if (!disabled) {
@@ -147,7 +151,7 @@ export default function BrazilStateTileMap({
                   fontSize="11"
                   fontWeight="600"
                 >
-                  {cameraCount} cam
+                  {cameraCount} {t("drakonFind.map.cameraShort")}
                 </text>
               )}
             </g>

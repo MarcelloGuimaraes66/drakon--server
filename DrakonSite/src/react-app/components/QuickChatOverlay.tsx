@@ -4,6 +4,7 @@ import { useQuickChat } from "@/react-app/hooks/useQuickChat";
 import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import { ChatMessage } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
@@ -84,13 +85,11 @@ export default function QuickChatOverlay() {
     originalName: string;
     sizeBytes: number;
   } | null>(null);
-  const [showTokenWarning, setShowTokenWarning] = useState(false);
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
   const [modelFps, setModelFps] = useState<number>(DEFAULT_ULTRA_VIDEO_MODEL_FPS);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
-  const chatTokensSectionTitle = `${brand.chatName} Tokens`;
   const modelLabels: Record<ChatModelTier, string> = {
     ultra: "Ultra",
     core: "Core",
@@ -205,24 +204,6 @@ export default function QuickChatOverlay() {
   const handleSend = async () => {
     if ((!input.trim() && !uploadedImage && !uploadedVideo) || !sessionId) return;
 
-    // Check token balance before sending
-    try {
-      const balanceResponse = await fetch("/api/token-balance");
-      const balance = await balanceResponse.json();
-      
-      const inputBalance = balance.input_balance || 0;
-      const outputBalance = balance.output_balance || 0;
-      const minRequired = 1_000_000;
-      
-      if (inputBalance < minRequired || outputBalance < minRequired) {
-        setShowTokenWarning(true);
-        return;
-      }
-    } catch (error) {
-      console.error("Failed to check token balance:", error);
-      // Continue anyway if balance check fails
-    }
-
     const userMessage = input;
     const imageBase64 = uploadedImage;
     const videoId = uploadedVideo?.id;
@@ -319,36 +300,6 @@ export default function QuickChatOverlay() {
 
   return (
     <>
-      {/* Token Warning Modal */}
-      {showTokenWarning && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
-          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 max-w-md w-full shadow-2xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-3">
-              Insufficient Token Balance
-            </h3>
-            <p className="text-sm text-gray-400 mb-6">
-              {`You need at least 1M input tokens AND 1M output tokens to use ${brand.chatName}. Please purchase more tokens in the ${chatTokensSectionTitle} section.`}
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setShowTokenWarning(false)}
-                className="flex-1 px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
-              >
-                Cancel
-              </button>
-              {billingEnabled ? (
-                <a
-                  href="/billing"
-                  className="flex-1 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors text-center"
-                >
-                  Buy Tokens
-                </a>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40 bg-black/18 backdrop-blur-[1.5px] transition-opacity"
@@ -396,6 +347,7 @@ export default function QuickChatOverlay() {
               <div className="rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100">
                 <span className="mr-2 text-gray-400">Model</span>
                 <span className="text-blue-300">{modelLabels[modelTier]}</span>
+                <ModelHostingBadge modelTier={modelTier} compact className="ml-2 align-middle" />
               </div>
               <button
                 onClick={handleOpenFullChat}

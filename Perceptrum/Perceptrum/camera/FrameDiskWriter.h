@@ -191,6 +191,23 @@ private:
         std::deque<std::string>& clipPaths,
         const TimeParts& endTp,
         const std::string& durationSuffix);
+    void discardOpenClip_(
+        SegmentWriter& writer,
+        int& framesInClip,
+        std::deque<std::string>& clipPaths,
+        std::chrono::steady_clock::time_point& lastWriteAt,
+        TimeParts& lastWriteTp,
+        bool& hasLastWriteTp);
+    bool finalizeOpenClip_(
+        SegmentWriter& writer,
+        int clipSeconds,
+        int& framesInClip,
+        std::deque<std::string>& clipPaths,
+        std::chrono::steady_clock::time_point& lastWriteAt,
+        TimeParts& lastWriteTp,
+        bool& hasLastWriteTp,
+        const std::vector<JobsCopyTarget>& jobsTargets,
+        bool shouldCopyInferenceVideo);
 
     // merge helpers (re-encode from existing short clips)
     bool mergeTenSecondClipsInto60_(const cv::Size& size);

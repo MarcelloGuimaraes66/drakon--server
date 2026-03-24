@@ -118,6 +118,11 @@ static std::string lowerAsciiCopy_(std::string value)
     return value;
 }
 
+class CoreModelLeaseAborted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct TemporalRuntimeGuardConfig_ {
     bool failClosedEnabled = true;
     bool shadowOnly = false;
@@ -3800,6 +3805,140 @@ AgentCore::AgentCore(const std::string& baseUrl,
 
 AgentCore::~AgentCore() = default;
 
+AgentCore::CoreModelExecutionLease::CoreModelExecutionLease(AgentCore* ownerIn, bool activeIn)
+    : owner(ownerIn), active(activeIn)
+{
+}
+
+AgentCore::CoreModelExecutionLease::CoreModelExecutionLease(CoreModelExecutionLease&& other) noexcept
+    : owner(other.owner), active(other.active)
+{
+    other.owner = nullptr;
+    other.active = false;
+}
+
+AgentCore::CoreModelExecutionLease&
+AgentCore::CoreModelExecutionLease::operator=(CoreModelExecutionLease&& other) noexcept
+{
+    if (this != &other) {
+        release();
+        owner = other.owner;
+        active = other.active;
+        other.owner = nullptr;
+        other.active = false;
+    }
+    return *this;
+}
+
+AgentCore::CoreModelExecutionLease::~CoreModelExecutionLease()
+{
+    release();
+}
+
+void AgentCore::CoreModelExecutionLease::release()
+{
+    if (!active || !owner) {
+        owner = nullptr;
+        active = false;
+        return;
+    }
+    owner->releaseCoreModelExecutionLease_();
+    owner = nullptr;
+    active = false;
+}
+
+AgentCore::CoreChatPriorityReservation::CoreChatPriorityReservation(AgentCore* ownerIn, bool activeIn)
+    : owner(ownerIn), active(activeIn)
+{
+}
+
+AgentCore::CoreChatPriorityReservation::CoreChatPriorityReservation(
+    CoreChatPriorityReservation&& other) noexcept
+    : owner(other.owner), active(other.active)
+{
+    other.owner = nullptr;
+    other.active = false;
+}
+
+AgentCore::CoreChatPriorityReservation&
+AgentCore::CoreChatPriorityReservation::operator=(CoreChatPriorityReservation&& other) noexcept
+{
+    if (this != &other) {
+        release();
+        owner = other.owner;
+        active = other.active;
+        other.owner = nullptr;
+        other.active = false;
+    }
+    return *this;
+}
+
+AgentCore::CoreChatPriorityReservation::~CoreChatPriorityReservation()
+{
+    release();
+}
+
+void AgentCore::CoreChatPriorityReservation::release()
+{
+    if (!active || !owner) {
+        owner = nullptr;
+        active = false;
+        return;
+    }
+    owner->releaseCoreChatPriorityReservation_();
+    owner = nullptr;
+    active = false;
+}
+
+AgentCore::CoreChatPriorityReservation AgentCore::reserveCoreChatPriority_(int chatSessionId)
+{
+    if (chatSessionId <= 0) {
+        return {};
+    }
+
+    int reservationCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(coreModelArbiterMu_);
+        reservationCount = ++activeCoreChatPriorityReservations_;
+    }
+    coreModelArbiterCv_.notify_all();
+
+    Logger::instance().logDebug(
+        "agent",
+        "core_model_chat_priority_reserved chat_session_id=" + std::to_string(chatSessionId) +
+        " active_reservations=" + std::to_string(reservationCount)
+    );
+    return CoreChatPriorityReservation(this, true);
+}
+
+void AgentCore::releaseCoreModelExecutionLease_()
+{
+    {
+        std::lock_guard<std::mutex> lock(coreModelArbiterMu_);
+        coreModelExecutionInFlight_ = false;
+    }
+    coreModelArbiterCv_.notify_all();
+}
+
+void AgentCore::releaseCoreChatPriorityReservation_()
+{
+    int reservationCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(coreModelArbiterMu_);
+        if (activeCoreChatPriorityReservations_ > 0) {
+            --activeCoreChatPriorityReservations_;
+        }
+        reservationCount = activeCoreChatPriorityReservations_;
+    }
+    coreModelArbiterCv_.notify_all();
+
+    Logger::instance().logDebug(
+        "agent",
+        "core_model_chat_priority_released active_reservations=" +
+        std::to_string(reservationCount)
+    );
+}
+
 
 
 
@@ -3922,6 +4061,7 @@ void AgentCore::cleanupCompletedDrakonFindTasks_(bool joinAll)
 
 void AgentCore::stop() {
     running_ = false;
+    coreModelArbiterCv_.notify_all();
 
     if (chatV2Orchestrator_) {
         chatV2Orchestrator_->stop();
@@ -6402,7 +6542,7 @@ AgentCore::JobAlertVideoUploadResult AgentCore::uploadJobAlertVideo(
     JobAlertVideoUploadResult result;
 
     try {
-        constexpr std::uintmax_t kMaxJobAlertVideoUploadBytes = 25u * 1024u * 1024u;
+        constexpr std::uintmax_t kMaxJobAlertVideoUploadBytes = 100u * 1024u * 1024u;
 
         if (filePathUtf8.empty()) {
             result.error = "empty file path";
@@ -7101,13 +7241,13 @@ json AgentCore::fetchAgentCameras_()
 
     return json::array();
 }
-
-
-
-json AgentCore::routeQuestionToCamerasWithGemini_(
+json AgentCore::routeQuestionToCamerasWithLlm_(
     const std::string& userQuestion,
     const json& cameras,
-    const std::string& geminiApiKey)
+    const std::string& routerModelTier,
+    const std::string& routerApiKey,
+    bool requestCoreChatPriority,
+    const std::function<bool()>& shouldAbort)
 {
     // Default fallback if anything goes wrong
     json fallback = {
@@ -7126,14 +7266,90 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
 
 
     try {
-        const std::string apiKey = geminiApiKey;
+        const std::string apiKey = routerApiKey;
         if (apiKey.empty()) {
             Logger::instance().logDebug(
                 "agent",
-                "routeQuestionToCamerasWithGemini_: empty API key, returning fallback"
+                "routeQuestionToCamerasWithLlm_: empty API key, returning fallback"
             );
             return fallback;
         }
+
+        auto normalizeRouterTier = [](std::string tier) {
+            const auto first = std::find_if_not(tier.begin(), tier.end(),
+                [](unsigned char c) { return std::isspace(c) != 0; });
+            const auto last = std::find_if_not(tier.rbegin(), tier.rend(),
+                [](unsigned char c) { return std::isspace(c) != 0; }).base();
+            if (first >= last) {
+                tier.clear();
+            }
+            else {
+                tier.assign(first, last);
+            }
+            std::transform(tier.begin(), tier.end(), tier.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+            if (tier == "core" || tier == "ultra" || tier == "pro" || tier == "legacy") {
+                return tier;
+            }
+            return std::string("ultra");
+        };
+        const std::string normalizedTier = normalizeRouterTier(routerModelTier);
+        const std::string modelName =
+            (normalizedTier == "core")
+            ? std::string("GLM-4.6V-Flash")
+            : ((normalizedTier == "ultra") ? std::string("gpt-5.1") : std::string("gpt-5-mini"));
+        auto extractRouterText = [](const json& responseJson) {
+            if (!responseJson.contains("choices") ||
+                !responseJson["choices"].is_array() ||
+                responseJson["choices"].empty())
+            {
+                return std::string();
+            }
+
+            const auto& choice = responseJson["choices"][0];
+            if (!choice.is_object() ||
+                !choice.contains("message") ||
+                !choice["message"].is_object())
+            {
+                return std::string();
+            }
+
+            const auto& message = choice["message"];
+            if (!message.contains("content")) {
+                return std::string();
+            }
+
+            const auto& content = message["content"];
+            if (content.is_string()) {
+                return content.get<std::string>();
+            }
+
+            if (!content.is_array()) {
+                return std::string();
+            }
+
+            std::string text;
+            for (const auto& part : content) {
+                if (part.is_string()) {
+                    text += part.get<std::string>();
+                    continue;
+                }
+                if (!part.is_object()) continue;
+                if (part.contains("text") && part["text"].is_string()) {
+                    text += part["text"].get<std::string>();
+                    continue;
+                }
+                if (part.contains("type") && part["type"].is_string()) {
+                    const std::string type = part["type"].get<std::string>();
+                    if ((type == "text" || type == "output_text") &&
+                        part.contains("text") && part["text"].is_string())
+                    {
+                        text += part["text"].get<std::string>();
+                    }
+                }
+            }
+            return text;
+        };
 
         std::string system_rules = buildCameraRouterSystemPrompt_();
 
@@ -7164,40 +7380,46 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         std::string userContent = routerUser.dump(2);
 
         json body = {
-            { "system_instruction", {
-                { "role", "system" },
-                { "parts", json::array({ json{{"text", system_rules}} }) }
-            }},
-            { "contents", json::array({
+            { "model", modelName },
+            { "messages", json::array({
+                {
+                    { "role", "system" },
+                    { "content", system_rules }
+                },
                 {
                     { "role", "user" },
-                    { "parts", json::array({ json{{"text", userContent}} }) }
+                    { "content", userContent }
                 }
             })},
-            { "generation_config", {
-                { "max_output_tokens", 256 },
-                { "temperature", 0.2 }
-            }}
+            { "temperature", 0.2 }
         };
+        if (normalizedTier == "core") {
+            body["max_tokens"] = 256;
+        }
+        else {
+            body["max_completion_tokens"] = 256;
+        }
 
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: sending body, question=" +
-            userQuestion
+            "routeQuestionToCamerasWithLlm_: sending body, model=" + modelName +
+            " tier=" + normalizedTier +
+            " question=" + userQuestion
         );
 
-        //std::string rawResp = httpPostJsonGemini(apiKey, "gemini-2.0-flash-lite", body);
-
-        std::string rawResp = httpPostJsonGemini(
+        std::string rawResp = postOpenAIChatCompletionsWithCoreLease_(
             apiKey,
-            "gemini-2.0-flash-lite",
             body,
-            []() { MaybeNotifyFirstRetry(); }
+            []() { MaybeNotifyFirstRetry(); },
+            requestCoreChatPriority && normalizedTier == "core",
+            shouldAbort,
+            "chat_router",
+            "agent"
         );
 
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: rawResp size=" +
+            "routeQuestionToCamerasWithLlm_: rawResp size=" +
             std::to_string(rawResp.size())
         );
 
@@ -7206,7 +7428,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         if (!respJson.is_object()) {
             Logger::instance().logDebug(
                 "agent",
-                "routeQuestionToCamerasWithGemini_: resp not object, fallback"
+                "routeQuestionToCamerasWithLlm_: resp not object, fallback"
             );
             return fallback;
         }
@@ -7216,17 +7438,17 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         int outputTokens = 0;
         int totalTokens = 0;
 
-        if (respJson.contains("usageMetadata") &&
-            respJson["usageMetadata"].is_object())
+        if (respJson.contains("usage") &&
+            respJson["usage"].is_object())
         {
-            const auto& u = respJson["usageMetadata"];
-            promptTokens = u.value("promptTokenCount", 0);
-            outputTokens = u.value("candidatesTokenCount", 0);
-            totalTokens = u.value("totalTokenCount", 0);
+            const auto& u = respJson["usage"];
+            promptTokens = u.value("prompt_tokens", 0);
+            outputTokens = u.value("completion_tokens", 0);
+            totalTokens = u.value("total_tokens", 0);
 
             Logger::instance().logDebug(
                 "agent",
-                "Router (first) Answer tokens | prompt=" + std::to_string(promptTokens) +
+                "Router answer tokens | prompt=" + std::to_string(promptTokens) +
                 " | output=" + std::to_string(outputTokens) +
                 " | total=" + std::to_string(totalTokens)
             );
@@ -7246,52 +7468,16 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         /*
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: respJson=" + respDump
+            "routeQuestionToCamerasWithLlm_: respJson=" + respDump
         );
         */
 
-        // ======== TEXT EXTRACTION (candidates / choices) ========
-        std::string text;
-
-        // 1) Gemini generateContent style
-        if (respJson.contains("candidates") &&
-            respJson["candidates"].is_array() &&
-            !respJson["candidates"].empty())
-        {
-            const auto& c0 = respJson["candidates"][0];
-            if (c0.contains("content") && c0["content"].is_object()) {
-                const auto& content = c0["content"];
-                if (content.contains("parts") &&
-                    content["parts"].is_array() &&
-                    !content["parts"].empty())
-                {
-                    const auto& p0 = content["parts"][0];
-                    if (p0.contains("text") && p0["text"].is_string()) {
-                        text = p0["text"].get<std::string>();
-                    }
-                }
-            }
-        }
-
-        // 2) OpenAI-style chat completion (just in case)
-        if (text.empty() &&
-            respJson.contains("choices") &&
-            respJson["choices"].is_array() &&
-            !respJson["choices"].empty())
-        {
-            const auto& ch0 = respJson["choices"][0];
-            if (ch0.contains("message") && ch0["message"].is_object()) {
-                const auto& msg = ch0["message"];
-                if (msg.contains("content") && msg["content"].is_string()) {
-                    text = msg["content"].get<std::string>();
-                }
-            }
-        }
-
+        // ======== TEXT EXTRACTION ========
+        std::string text = extractRouterText(respJson);
         if (text.empty()) {
             Logger::instance().logDebug(
                 "agent",
-                "routeQuestionToCamerasWithGemini_: could not extract text, fallback"
+                "routeQuestionToCamerasWithLlm_: could not extract text, fallback"
             );
             return fallback;
         }
@@ -7299,7 +7485,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         /*
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: raw text=" + text
+            "routeQuestionToCamerasWithLlm_: raw text=" + text
         );
         */
 
@@ -7312,7 +7498,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         {
             Logger::instance().logDebug(
                 "agent",
-                "routeQuestionToCamerasWithGemini_: could not find JSON braces in text"
+                "routeQuestionToCamerasWithLlm_: could not find JSON braces in text"
             );
             return fallback;
         }
@@ -7321,7 +7507,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
 
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: jsonSlice=" + jsonSlice
+            "routeQuestionToCamerasWithLlm_: jsonSlice=" + jsonSlice
         );
 
         json routerResult;
@@ -7331,7 +7517,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         catch (const std::exception& e) {
             Logger::instance().logDebug(
                 "agent",
-                std::string("routeQuestionToCamerasWithGemini_: parse error: ") + e.what()
+                std::string("routeQuestionToCamerasWithLlm_: parse error: ") + e.what()
             );
             return fallback;
         }
@@ -7339,7 +7525,7 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
         if (!routerResult.is_object()) {
             Logger::instance().logDebug(
                 "agent",
-                "routeQuestionToCamerasWithGemini_: parsed JSON is not object"
+                "routeQuestionToCamerasWithLlm_: parsed JSON is not object"
             );
             return fallback;
         }
@@ -7421,22 +7607,25 @@ json AgentCore::routeQuestionToCamerasWithGemini_(
 
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_: final routerResult=" +
+            "routeQuestionToCamerasWithLlm_: final routerResult=" +
             routerResult.dump()
         );
 
         return routerResult;
     }
+    catch (const CoreModelLeaseAborted&) {
+        throw;
+    }
     catch (const std::exception& e) {
         Logger::instance().logDebug(
             "agent",
-            std::string("routeQuestionToCamerasWithGemini_ exception: ") + e.what()
+            std::string("routeQuestionToCamerasWithLlm_ exception: ") + e.what()
         );
     }
     catch (...) {
         Logger::instance().logDebug(
             "agent",
-            "routeQuestionToCamerasWithGemini_ unknown exception"
+            "routeQuestionToCamerasWithLlm_ unknown exception"
         );
     }
 
@@ -9884,6 +10073,9 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         std::string modelTier = normalizeChatModelTierName(
             payload.value("model_tier", std::string("legacy"))
         );
+        std::string routerModelTier = normalizeChatModelTierName(
+            payload.value("router_model_tier", modelTier)
+        );
 
         int modelInputFps = 0;
         if (payload.contains("model_fps")) {
@@ -9922,7 +10114,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         if (payload.contains("router_api_key") && payload["router_api_key"].is_string()) {
             routerApiKey = payload["router_api_key"].get<std::string>();
         }
-        if (routerApiKey.empty() && modelTier == "legacy") {
+        if (routerApiKey.empty()) {
             routerApiKey = modelApiKey;
         }
 
@@ -9944,6 +10136,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             "handleChatQuery_: received query=\"" + userQuestion +
             "\" chat_session_id=" + std::to_string(chatSessionId) +
             " model_tier=" + modelTier +
+            " router_model_tier=" + routerModelTier +
             " model_fps=" + std::to_string(modelInputFps) +
             " running_resolution=" + std::to_string(runningResolution) +
             " model_api_key_present=" + std::string(modelApiKey.empty() ? "false" : "true") +
@@ -10020,6 +10213,11 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             }
         }
 
+        const bool coreChatPriorityActive = (modelTier == "core" || routerModelTier == "core");
+        auto coreChatPriorityReservation = coreChatPriorityActive
+            ? reserveCoreChatPriority_(chatSessionId)
+            : CoreChatPriorityReservation{};
+
 
 
         // If any HTTP call hits a timeout and we retry, notify the frontend once.
@@ -10076,7 +10274,13 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 std::to_string(cameras.is_array() ? cameras.size() : 0)
             );
 
-            routerResult = routeQuestionToCamerasWithGemini_(userQuestion, cameras, routerApiKey);
+            routerResult = routeQuestionToCamerasWithLlm_(
+                userQuestion,
+                cameras,
+                routerModelTier,
+                routerApiKey,
+                coreChatPriorityActive,
+                isCancelled);
         }
         else {
             // Uploaded video path: fabricate a minimal routerResult so frontend stays happy
@@ -10474,7 +10678,9 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 visionPromptTokens,
                 visionOutputTokens,
                 visionTotalTokens,
-                visionAnswer
+                visionAnswer,
+                coreChatPriorityActive,
+                isCancelled
             );
         }
         else {
@@ -10496,6 +10702,10 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             );
         }
 
+        if (abortIfCancelled("after_vision")) {
+            return;
+        }
+
         if (chatTemporalActive) {
             for (const auto& hitTemporal : videoHits) {
                 const std::string temporalDecisionNowIso =
@@ -10507,6 +10717,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     hitTemporal.observations,
                     hitTemporal.temporalEvidenceCandidates,
                     temporalDecisionNowIso,
+                    hitTemporal.answer,
+                    hitTemporal.unknownReasons,
                     hitTemporal.segmentStartTs,
                     hitTemporal.segmentEndTs,
                     hitTemporal.faceIdentityMatches
@@ -10664,27 +10876,178 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             hitObj["answer"] = h.answer;
             hitObj["camera_id"] = h.cameraId;
             hitObj["camera_name"] = h.cameraName;
+            if (!h.detectionTimeInVideo.empty()) {
+                hitObj["detection_time_in_video"] = h.detectionTimeInVideo;
+            }
+            if (!h.eventFrameTimestampInSegment.empty()) {
+                hitObj["event_frame_timestamp_in_segment"] = h.eventFrameTimestampInSegment;
+            }
+            if (!h.eventTimestampName.empty()) {
+                hitObj["event_timestamp_name"] = h.eventTimestampName;
+            }
+            if (!h.eventTimestampUtcIso.empty()) {
+                hitObj["event_timestamp_utc_iso"] = h.eventTimestampUtcIso;
+            }
+            if (!h.eventTimestampLocalIso.empty()) {
+                hitObj["event_timestamp_local_iso"] = h.eventTimestampLocalIso;
+            }
+            if (!h.temporalEvidenceCandidates.empty()) {
+                nlohmann::json evidenceMeta = nlohmann::json::array();
+                for (const auto& candidate : h.temporalEvidenceCandidates) {
+                    nlohmann::json item;
+                    if (!candidate.evidenceKey.empty()) item["evidence_key"] = candidate.evidenceKey;
+                    if (!candidate.eventName.empty()) item["event_name"] = candidate.eventName;
+                    if (!candidate.reason.empty()) item["reason"] = candidate.reason;
+                    if (!candidate.entityId.empty()) item["entity_id"] = candidate.entityId;
+                    if (!candidate.zone.empty()) item["zone"] = candidate.zone;
+                    if (!candidate.frameTimestampInSegment.empty()) {
+                        item["frame_timestamp_in_segment"] = candidate.frameTimestampInSegment;
+                    }
+                    if (!candidate.timestampName.empty()) item["timestamp_name"] = candidate.timestampName;
+                    if (!candidate.timestampUtcIso.empty()) item["timestamp_utc_iso"] = candidate.timestampUtcIso;
+                    if (!candidate.timestampLocalIso.empty()) item["timestamp_local_iso"] = candidate.timestampLocalIso;
+                    if (candidate.frameIndex >= 0) item["frame_index"] = candidate.frameIndex;
+                    evidenceMeta.push_back(std::move(item));
+                }
+                if (!evidenceMeta.empty()) {
+                    hitObj["temporal_evidence"] = std::move(evidenceMeta);
+                }
+            }
 
 
-            // Try uploading video clips first; fallback to image frames if needed.
+            // Prefer chat evidence snapshots first; keep short video clips as a fallback.
             std::vector<HitImageUpload> uploadedImages;
             std::vector<HitVideoUpload> uploadedVideos;
             std::vector<std::pair<std::vector<unsigned char>, std::string>> fallbackLocalImages;
             std::vector<std::pair<std::vector<uint8_t>, std::string>> fallbackLocalVideos;
+            const EncodedVideoSegment* hitSegment =
+                (h.segmentIndex < encodedVideos.size()) ? &encodedVideos[h.segmentIndex] : nullptr;
+            const std::string mediaSourcePath =
+                (hitSegment != nullptr) ? hitSegment->sourceFilePath : std::string();
+            const int uploadCamId =
+                (hitSegment != nullptr && hitSegment->cameraId > 0) ? hitSegment->cameraId : h.cameraId;
 
+            std::vector<std::string> evidenceTimes;
+            auto appendEvidenceTime = [&](const std::string& rawTime) {
+                const std::string value = trimAscii(rawTime);
+                if (value.empty()) return;
+                if (std::find(evidenceTimes.begin(), evidenceTimes.end(), value) != evidenceTimes.end()) return;
+                evidenceTimes.push_back(value);
+            };
+            for (const auto& t : h.detectionTimeInVideo) {
+                appendEvidenceTime(t);
+            }
+            appendEvidenceTime(h.eventFrameTimestampInSegment);
+            for (const auto& candidate : h.temporalEvidenceCandidates) {
+                appendEvidenceTime(candidate.frameTimestampInSegment);
+            }
 
-            if (!h.detectionTimeInVideo.empty() &&
-                h.segmentIndex < encodedVideos.size())
+            std::vector<std::pair<std::vector<unsigned char>, std::string>> directEvidenceImages;
             {
-                const auto& seg = encodedVideos[h.segmentIndex];
+                std::set<std::string> seenEvidenceImages;
+                for (const auto& candidate : h.temporalEvidenceCandidates) {
+                    const std::string rawImage = trimAscii(candidate.imageJpegBase64);
+                    if (rawImage.empty()) continue;
 
-                const std::string& mediaSourcePath = seg.sourceFilePath;
+                    std::string dedupeKey = trimAscii(candidate.evidenceKey);
+                    if (dedupeKey.empty()) dedupeKey = trimAscii(candidate.frameTimestampInSegment);
+                    if (dedupeKey.empty()) dedupeKey = trimAscii(candidate.timestampName);
+                    if (dedupeKey.empty()) {
+                        dedupeKey = rawImage.substr(
+                            0,
+                            (std::min<std::size_t>)(rawImage.size(), static_cast<std::size_t>(64))
+                        );
+                    }
+                    if (!seenEvidenceImages.insert(dedupeKey).second) continue;
+
+                    std::vector<unsigned char> jpegBytes;
+                    std::string decodeErr;
+                    if (!decodeBase64ToBytesForPromptEnhance_(rawImage, jpegBytes, &decodeErr) || jpegBytes.empty()) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: failed decoding temporal evidence image err=" + decodeErr
+                        );
+                        continue;
+                    }
+
+                    std::string label = trimAscii(candidate.frameTimestampInSegment);
+                    if (label.empty()) label = trimAscii(candidate.timestampName);
+                    if (label.empty()) label = trimAscii(candidate.timestampLocalIso);
+                    directEvidenceImages.emplace_back(std::move(jpegBytes), std::move(label));
+                }
+            }
+
+            auto appendFallbackImages = [&](const std::vector<std::pair<std::vector<unsigned char>, std::string>>& batch) {
+                for (const auto& item : batch) {
+                    if (item.first.empty()) continue;
+                    fallbackLocalImages.push_back(item);
+                }
+            };
+
+            auto uploadImageBatch = [&](const std::vector<std::pair<std::vector<unsigned char>, std::string>>& sourceBatch,
+                                        const std::string& sourceTag) {
+                if (sourceBatch.empty()) return;
+
+                int remaining = kMaxTotalFrames - totalFrames;
+                if (remaining <= 0) return;
+
+                auto batch = sourceBatch;
+                if (static_cast<int>(batch.size()) > remaining) {
+                    batch.resize(static_cast<std::size_t>(remaining));
+                }
+                appendFallbackImages(batch);
+                if (batch.empty()) return;
+
+                std::vector<HitImageUpload> batchUploaded;
+                const bool okImg = sendHitImagesAndGetUrls_(uploadCamId, chatSessionId, batch, batchUploaded);
+                if (!okImg) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: sendHitImagesAndGetUrls_ failed for " + sourceTag
+                    );
+                    return;
+                }
+
+                totalFrames += static_cast<int>(batchUploaded.size());
+                uploadedImages.insert(uploadedImages.end(), batchUploaded.begin(), batchUploaded.end());
+            };
+
+            if (!directEvidenceImages.empty()) {
+                uploadImageBatch(directEvidenceImages, "temporal_evidence");
+            }
+
+            if (uploadedImages.empty() &&
+                !evidenceTimes.empty() &&
+                !mediaSourcePath.empty() &&
+                fs::exists(mediaSourcePath))
+            {
+                try {
+                    auto jpegAndTimes = extractFramesJpegAtTimesWithLabels(
+                        mediaSourcePath,
+                        evidenceTimes
+                    );
+                    uploadImageBatch(jpegAndTimes, "extracted_snapshots");
+                }
+                catch (...) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: exception extracting snapshot evidence images"
+                    );
+                }
+            }
+
+
+            if (uploadedImages.empty() &&
+                !evidenceTimes.empty() &&
+                hitSegment != nullptr)
+            {
+                const auto& seg = *hitSegment;
 
                 if (!mediaSourcePath.empty() && fs::exists(mediaSourcePath)) {
                     try {
                         auto mp4AndTimes = extractMp4ClipsAtTimesWithLabels(
                             mediaSourcePath,
-                            h.detectionTimeInVideo,
+                            evidenceTimes,
                             /*clipSeconds=*/10,
                             /*preRollSeconds=*/2
                         );
@@ -10729,14 +11092,14 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                         if (uploadedVideos.empty()) {
                             auto jpegAndTimes = extractFramesJpegAtTimesWithLabels(
                                 mediaSourcePath,
-                                h.detectionTimeInVideo
+                                evidenceTimes
                             );
 
                             int imgRemaining = kMaxTotalFrames - totalFrames;
                             if (imgRemaining <= 0) jpegAndTimes.clear();
                             else if ((int)jpegAndTimes.size() > imgRemaining) jpegAndTimes.resize(imgRemaining);
 
-                            fallbackLocalImages = jpegAndTimes;
+                            appendFallbackImages(jpegAndTimes);
 
                             if (!jpegAndTimes.empty()) {
                                 int uploadCamId = seg.cameraId;
@@ -10767,8 +11130,6 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     }
                 }
 
-                // keep the raw times returned by Gemini
-                hitObj["detection_time_in_video"] = h.detectionTimeInVideo;
             }
 
             // Attach uploaded image URLs to this hit
@@ -10848,8 +11209,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 }
             }
 
-            // Last fallback: if URL upload failed, keep inline image proof in message payload.
-            if (uploadedImages.empty() && uploadedVideos.empty() && !fallbackLocalImages.empty()) {
+            // Last fallback: if image upload failed, keep inline image proof in message payload.
+            if (uploadedImages.empty() && !fallbackLocalImages.empty()) {
                 const size_t kInlineFallbackMax = 3;
                 nlohmann::json inlineHitImgs = nlohmann::json::array();
                 nlohmann::json inlineB64Arr = nlohmann::json::array();
@@ -10947,6 +11308,16 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             }
         }
 #endif
+    }
+    catch (const CoreModelLeaseAborted& e) {
+        Logger::instance().logDebug(
+            "agent",
+            "handleChatQuery_: core model wait aborted chat_session_id=" +
+            std::to_string(chatSessionId) +
+            " command_id=" + std::to_string(commandId) +
+            " reason=" + e.what()
+        );
+        return;
     }
     catch (const std::exception& e) {
         logAgentException_(
@@ -12987,6 +13358,7 @@ VideoHit AgentCore::callGeminiVisionVideoSegment_(
             prompt << "- Each timestamp is measured from the start of this video segment.\n";
             prompt << "- Format: \"MM:SS\" (minutes and seconds, zero-padded; example: \"01:38\").\n";
             prompt << "- Do NOT include hours.\n";
+            prompt << "- If your answer describes a visible person/object/activity that is relevant to the question, you MUST include at least one supporting timestamp.\n";
 
             prompt << "GENERAL RULES:\n";
             prompt << "- Do not add any fields other than \"answer\" and the OPTIONAL \"detection_time_in_video\".\n";
@@ -14486,6 +14858,97 @@ VideoHit AgentCore::callGeminiVisionImageGroupJOB_(
 
 
 
+AgentCore::CoreModelExecutionLease AgentCore::acquireCoreModelExecutionLease_(
+    const std::string& modelName,
+    bool requestChatPriority,
+    const std::function<bool()>& shouldAbort,
+    const std::string& waitScope,
+    const std::string& logId)
+{
+    if (!isZAiCoreModelName_(modelName)) {
+        return {};
+    }
+
+    const std::string scope = waitScope.empty() ? std::string("core_request") : waitScope;
+    const std::string targetLogId = logId.empty() ? std::string("agent") : logId;
+    const auto waitStart = std::chrono::steady_clock::now();
+
+    std::unique_lock<std::mutex> lock(coreModelArbiterMu_);
+    bool loggedWait = false;
+    auto shouldWait = [&]() {
+        if (coreModelExecutionInFlight_) {
+            return true;
+        }
+        if (!requestChatPriority && activeCoreChatPriorityReservations_ > 0) {
+            return true;
+        }
+        return false;
+    };
+
+    while (shouldWait()) {
+        if (!running_) {
+            throw CoreModelLeaseAborted("core model request aborted because agent is stopping");
+        }
+        if (shouldAbort && shouldAbort()) {
+            throw CoreModelLeaseAborted("core model request aborted while waiting for priority slot");
+        }
+
+        if (!loggedWait) {
+            loggedWait = true;
+            Logger::instance().logDebug(
+                targetLogId,
+                "core_model_waiting scope=" + scope +
+                " requester=" + std::string(requestChatPriority ? "chat" : "background") +
+                " execution_in_flight=" + std::string(coreModelExecutionInFlight_ ? "true" : "false") +
+                " active_chat_reservations=" + std::to_string(activeCoreChatPriorityReservations_)
+            );
+        }
+
+        coreModelArbiterCv_.wait_for(lock, std::chrono::milliseconds(150));
+    }
+
+    if (!running_) {
+        throw CoreModelLeaseAborted("core model request aborted because agent is stopping");
+    }
+
+    coreModelExecutionInFlight_ = true;
+    const int activeReservations = activeCoreChatPriorityReservations_;
+    lock.unlock();
+
+    if (loggedWait) {
+        const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - waitStart).count();
+        Logger::instance().logDebug(
+            targetLogId,
+            "core_model_wait_complete scope=" + scope +
+            " requester=" + std::string(requestChatPriority ? "chat" : "background") +
+            " waited_ms=" + std::to_string(waitedMs) +
+            " active_chat_reservations=" + std::to_string(activeReservations)
+        );
+    }
+
+    return CoreModelExecutionLease(this, true);
+}
+
+std::string AgentCore::postOpenAIChatCompletionsWithCoreLease_(
+    const std::string& apiKey,
+    const nlohmann::json& bodyJson,
+    const std::function<void()>& onFirstRetry,
+    bool requestChatPriority,
+    const std::function<bool()>& shouldAbort,
+    const std::string& waitScope,
+    const std::string& cameraLogId)
+{
+    auto lease = acquireCoreModelExecutionLease_(
+        bodyJson.value("model", std::string()),
+        requestChatPriority,
+        shouldAbort,
+        waitScope,
+        cameraLogId
+    );
+    return httpPostJsonOpenAI(apiKey, bodyJson, onFirstRetry, cameraLogId);
+}
+
 VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     const EncodedVideoSegment& segment,
     const std::string& userQuestion,
@@ -14501,7 +14964,9 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     int runningResolution,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens)
+    int& outTotalTokens,
+    bool requestCoreChatPriority,
+    const std::function<bool()>& shouldAbort)
 {
     VideoHit hit;
     hit.segmentStartTs = segment.startTs;
@@ -14645,7 +15110,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             if (hasTemporalRuntimeHint) {
                 prompt << "- Use this frame sequence for NEW observations in this batch.\n";
                 prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
-                prompt << "- answer and alert_condition may combine this batch with that prior state when needed.\n";
+                prompt << "- answer may mention authoritative prior state when needed, but alert_condition must reflect only what this batch itself shows.\n";
                 prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
             }
             else {
@@ -14685,7 +15150,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             prompt << "CONDITIONS TO EVALUATE:\n";
             if (hasTemporalRuntimeHint) {
                 prompt << "- Use this frame sequence for current-batch evidence.\n";
-                prompt << "- For alert_condition, you MAY combine current-batch evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
+                prompt << "- For alert_condition, use ONLY current-batch evidence. Use TEMPORAL_RUNTIME_INPUT_JSON only for explanation, identity continuity, and structured temporal fields.\n";
                 prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
                 prompt << "- If not confident about new observations, keep booleans false.\n\n";
             }
@@ -14717,13 +15182,21 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                 prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
                 prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
             }
-            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n\n";
+            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n";
+            if (!cameraStyleFlow) {
+                prompt << "For direct chat answers, if the answer describes visible content relevant to the question, include at least one supporting timestamp in \"detection_time_in_video\".\n";
+            }
+            prompt << "\n";
 
             prompt << "RULES:\n";
             if (hasNegativeReferences) {
                 prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
             }
             prompt << "- If alert_condition=true and region overlays are visible, include matching region ids in \"alert_region_ids\".\n";
+            if (!cameraStyleFlow) {
+                prompt << "- In direct chat mode, whenever the answer mentions a relevant visible person/object/activity, \"detection_time_in_video\" is REQUIRED.\n";
+                prompt << "- Use the best one or more timestamps that support the main statement in the answer.\n";
+            }
             if (hasTemporalRuntimeHint) {
                 prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
                 prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
@@ -14804,10 +15277,13 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
 
         std::string rawResp;
         try {
-            rawResp = httpPostJsonOpenAI(
+            rawResp = postOpenAIChatCompletionsWithCoreLease_(
                 openAiApiKey,
                 body,
                 []() { MaybeNotifyFirstRetry(); },
+                requestCoreChatPriority,
+                shouldAbort,
+                requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
                 camLogId
             );
         }
@@ -14948,6 +15424,9 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         }
         hit.hasMatch = hitHasStructuredMatch_(hit);
         return hit;
+    }
+    catch (const CoreModelLeaseAborted&) {
+        throw;
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug("agent",
@@ -15152,7 +15631,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             if (hasTemporalRuntimeHint) {
                 prompt << "- Use this frame sequence for NEW observations in this batch.\n";
                 prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
-                prompt << "- answer and alert_condition may combine this batch with that prior state when needed.\n";
+                prompt << "- answer may mention authoritative prior state when needed, but alert_condition must reflect only what this batch itself shows.\n";
                 prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
             }
             else {
@@ -15178,7 +15657,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
             if (hasTemporalRuntimeHint) {
                 prompt << "- Use this frame sequence for current-batch evidence.\n";
-                prompt << "- For alert_condition, you MAY combine current-batch evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
+                prompt << "- For alert_condition, use ONLY current-batch evidence. Use TEMPORAL_RUNTIME_INPUT_JSON only for explanation, identity continuity, and structured temporal fields.\n";
                 prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
                 prompt << "- If not confident about new observations, keep booleans false.\n\n";
             }
@@ -15307,10 +15786,13 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
 
         std::string rawResp;
         try {
-            rawResp = httpPostJsonOpenAI(
+            rawResp = postOpenAIChatCompletionsWithCoreLease_(
                 openAiApiKey,
                 body,
                 []() { MaybeNotifyFirstRetry(); },
+                false,
+                {},
+                "background_video_segment_job",
                 camLogId
             );
         }
@@ -15790,10 +16272,13 @@ DrakonFindInferenceResult AgentCore::runDrakonFindImageInference_(
         applyOpenAITemperatureField_(body, safeModelName, 0.05);
         applyOpenAITokenLimitField_(body, safeModelName, 900);
 
-        std::string rawResp = httpPostJsonOpenAI(
+        std::string rawResp = postOpenAIChatCompletionsWithCoreLease_(
             modelApiKey,
             body,
-            []() { MaybeNotifyFirstRetry(); }
+            []() { MaybeNotifyFirstRetry(); },
+            false,
+            {},
+            "drakon_find_image"
         );
 
         nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
@@ -16067,10 +16552,13 @@ DrakonFindInferenceResult AgentCore::runDrakonFindVideoInference_(
         applyOpenAITemperatureField_(body, safeModelName, 0.0);
         applyOpenAITokenLimitField_(body, safeModelName, 2200);
 
-        std::string rawResp = httpPostJsonOpenAI(
+        std::string rawResp = postOpenAIChatCompletionsWithCoreLease_(
             modelApiKey,
             body,
             []() { MaybeNotifyFirstRetry(); },
+            false,
+            {},
+            "drakon_find_video",
             camLogId
         );
 
@@ -16393,10 +16881,13 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             const auto coreRequestStart = std::chrono::steady_clock::now();
 
             try {
-                rawResp = httpPostJsonOpenAI(
+                rawResp = postOpenAIChatCompletionsWithCoreLease_(
                     openAiApiKey,
                     reqBody,
                     []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "background_image_job",
                     camLogId
                 );
             }
@@ -16810,10 +17301,13 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
 
         std::string rawResp;
         try {
-            rawResp = httpPostJsonOpenAI(
+            rawResp = postOpenAIChatCompletionsWithCoreLease_(
                 openAiApiKey,
                 body,
-                []() { MaybeNotifyFirstRetry(); }
+                []() { MaybeNotifyFirstRetry(); },
+                false,
+                {},
+                "background_image_group_job"
             );
         }
         catch (const std::exception& e) {
@@ -17156,6 +17650,9 @@ void AgentCore::handleChatCancelCommand_(int commandId, const nlohmann::json& pa
             it->second->cancelRequested = true;
             accepted = true;
         }
+    }
+    if (accepted) {
+        coreModelArbiterCv_.notify_all();
     }
 
     if (commandId > 0) {
@@ -18581,10 +19078,13 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
 
         std::string rawResp;
         try {
-            rawResp = httpPostJsonOpenAI(
+            rawResp = postOpenAIChatCompletionsWithCoreLease_(
                 modelApiKey,
                 body,
-                []() { MaybeNotifyFirstRetry(); }
+                []() { MaybeNotifyFirstRetry(); },
+                false,
+                {},
+                "prompt_enhance"
             );
         }
         catch (const std::exception& e) {
@@ -18706,10 +19206,14 @@ bool AgentCore::compileTemporalPlanWithModel_(
         applyOpenAITemperatureField_(body, compileModelName, 0.0);
         applyOpenAITokenLimitField_(body, compileModelName, 2200);
 
-        std::string rawResp = httpPostJsonOpenAI(
+        std::string rawResp = postOpenAIChatCompletionsWithCoreLease_(
             compileApiKey,
             body,
-            []() { MaybeNotifyFirstRetry(); }
+            []() { MaybeNotifyFirstRetry(); },
+            false,
+            {},
+            "compile_temporal_plan",
+            runtimeLogId
         );
 
         nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
@@ -19229,6 +19733,7 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithGemini_(
     return allHits;
 }
 
+
 std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
     const std::vector<EncodedVideoSegment>& videos,
     const std::string& userQuestion,
@@ -19241,7 +19746,9 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
     int& outPromptTokens,
     int& outOutputTokens,
     int& outTotalTokens,
-    std::string& outModelAnswer)
+    std::string& outModelAnswer,
+    bool requestCoreChatPriority,
+    const std::function<bool()>& shouldAbort)
 {
     std::vector<VideoHit> allHits;
     if (videos.empty()) {
@@ -19254,11 +19761,15 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
     outModelAnswer.clear();
 
     const int kMaxThreads = 8;
-    const int numWorkers = std::min<int>((int)videos.size(), kMaxThreads);
+    const std::string effectiveModelName =
+        openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName;
+    const bool useCoreModel = isZAiCoreModelName_(effectiveModelName);
+    const int numWorkers = std::min<int>((int)videos.size(), useCoreModel ? 1 : kMaxThreads);
 
     std::mutex hitsMutex;
     std::atomic<size_t> nextIndex{ 0 };
     std::atomic<bool> stopEarly{ false };
+    std::atomic<bool> aborted{ false };
 
     std::atomic<int> totalPrompt{ 0 };
     std::atomic<int> totalOutput{ 0 };
@@ -19266,6 +19777,13 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
 
     auto worker = [&]() {
         for (;;) {
+            if (aborted.load(std::memory_order_acquire)) {
+                break;
+            }
+            if (shouldAbort && shouldAbort()) {
+                aborted.store(true, std::memory_order_release);
+                break;
+            }
             if (stopOnFirstHit && stopEarly.load(std::memory_order_acquire)) {
                 break;
             }
@@ -19291,7 +19809,9 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
                     runningResolution,
                     batchPrompt,
                     batchOutput,
-                    batchTotal
+                    batchTotal,
+                    requestCoreChatPriority,
+                    shouldAbort
                 );
 
                 hit.segmentIndex = idx;
@@ -19329,6 +19849,10 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
                     allHits.push_back(hit);
                 }
             }
+            catch (const CoreModelLeaseAborted&) {
+                aborted.store(true, std::memory_order_release);
+                break;
+            }
             catch (const std::exception& e) {
                 Logger::instance().logDebug(
                     "agent",
@@ -19364,7 +19888,7 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
         "analyzeVideosWithOpenAI_: videos=" + std::to_string(videos.size()) +
         " workers=" + std::to_string(numWorkers) +
         " total hits=" + std::to_string(allHits.size()) +
-        " model=" + (openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName) +
+        " model=" + effectiveModelName +
         " fps=" + std::to_string(modelInputFps) +
         " running_resolution=" + std::to_string(runningResolution)
     );

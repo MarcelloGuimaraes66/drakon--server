@@ -2256,6 +2256,20 @@ void CameraSession::captureLoop_() {
                 captureEnabled_.store(captureEnabled, std::memory_order_relaxed);
                 inferenceEnabled_.store(recent, std::memory_order_relaxed);
 
+                if (config_.storage.storeFrames) {
+                    try {
+                        frameDiskWriter_.flushVideoClipIfIdle(std::chrono::seconds(10));
+                    }
+                    catch (const std::exception& e) {
+                        Logger::instance().logDebug(config_.id,
+                            std::string("frameDiskWriter_.flushVideoClipIfIdle() EXCEPTION: ") + e.what());
+                    }
+                    catch (...) {
+                        Logger::instance().logDebug(config_.id,
+                            "frameDiskWriter_.flushVideoClipIfIdle() UNKNOWN EXCEPTION");
+                    }
+                }
+
                 // Decide se vamos pular frames por inatividade prolongada
                 bool idleLong = (now - lastMotionSeen_) >= kIdlePurgeDelay;
                 skipFrames_.store(idleLong, std::memory_order_relaxed);
@@ -2918,6 +2932,20 @@ void CameraSession::captureLoop_() {
             }
             captureEnabled_.store(captureEnabled, std::memory_order_relaxed);
             inferenceEnabled_.store(recent, std::memory_order_relaxed);
+
+            if (config_.storage.storeFrames) {
+                try {
+                    frameDiskWriter_.flushVideoClipIfIdle(std::chrono::seconds(10));
+                }
+                catch (const std::exception& e) {
+                    Logger::instance().logDebug(config_.id,
+                        std::string("frameDiskWriter_.flushVideoClipIfIdle() EXCEPTION: ") + e.what());
+                }
+                catch (...) {
+                    Logger::instance().logDebug(config_.id,
+                        "frameDiskWriter_.flushVideoClipIfIdle() UNKNOWN EXCEPTION");
+                }
+            }
 
             // Decide if we should skip sending frames to inference
             bool idleLong = (now - lastMotionSeen_) >= kIdlePurgeDelay;

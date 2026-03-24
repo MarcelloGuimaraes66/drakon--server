@@ -14,8 +14,6 @@ using namespace Windows::Foundation;
 
 namespace
 {
-    constexpr int64_t MinimumChatTokenBalance = 1'000'000;
-
     Brush LookupBrush(winrt::hstring const& key)
     {
         return Application::Current().Resources().Lookup(box_value(key)).as<Brush>();
@@ -1002,25 +1000,6 @@ namespace winrt::DrakonDesktop::implementation
         if (request.content.empty())
         {
             ShowStatus(L"Type a prompt before sending.", InfoBarSeverity::Warning);
-            co_return;
-        }
-
-        if (m_authState.isAuthenticated &&
-            (m_tokenBalance.inputBalance < MinimumChatTokenBalance || m_tokenBalance.outputBalance < MinimumChatTokenBalance))
-        {
-            ContentDialog dialog;
-            dialog.XamlRoot(XamlRoot());
-            dialog.RequestedTheme(ElementTheme::Dark);
-            dialog.Title(box_value(L"Insufficient token balance"));
-            dialog.Content(box_value(L"You need at least 1M input tokens and 1M output tokens to use chat with the authenticated backend. Open Billing to purchase more tokens."));
-            dialog.PrimaryButtonText(L"Go to Billing");
-            dialog.CloseButtonText(L"Cancel");
-
-            auto result = co_await dialog.ShowAsync();
-            if (result == ContentDialogResult::Primary)
-            {
-                NavigateToBilling();
-            }
             co_return;
         }
 

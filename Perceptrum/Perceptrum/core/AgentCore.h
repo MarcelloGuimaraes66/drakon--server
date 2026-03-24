@@ -8,6 +8,8 @@
 #include <vector>
 #include <cstdint>
 #include <optional>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -339,6 +341,38 @@ private:
         std::atomic<bool> done{ false };
     };
 
+    struct CoreModelExecutionLease {
+        AgentCore* owner = nullptr;
+        bool active = false;
+
+        CoreModelExecutionLease() = default;
+        CoreModelExecutionLease(AgentCore* owner, bool active);
+        CoreModelExecutionLease(const CoreModelExecutionLease&) = delete;
+        CoreModelExecutionLease& operator=(const CoreModelExecutionLease&) = delete;
+        CoreModelExecutionLease(CoreModelExecutionLease&& other) noexcept;
+        CoreModelExecutionLease& operator=(CoreModelExecutionLease&& other) noexcept;
+        ~CoreModelExecutionLease();
+
+        explicit operator bool() const noexcept { return active; }
+        void release();
+    };
+
+    struct CoreChatPriorityReservation {
+        AgentCore* owner = nullptr;
+        bool active = false;
+
+        CoreChatPriorityReservation() = default;
+        CoreChatPriorityReservation(AgentCore* owner, bool active);
+        CoreChatPriorityReservation(const CoreChatPriorityReservation&) = delete;
+        CoreChatPriorityReservation& operator=(const CoreChatPriorityReservation&) = delete;
+        CoreChatPriorityReservation(CoreChatPriorityReservation&& other) noexcept;
+        CoreChatPriorityReservation& operator=(CoreChatPriorityReservation&& other) noexcept;
+        ~CoreChatPriorityReservation();
+
+        explicit operator bool() const noexcept { return active; }
+        void release();
+    };
+
     void workerLoop_();
     void processCommand_(const nlohmann::json& cmd);
     void handlePromptEnhanceCommand_(int commandId, const nlohmann::json& payload);
@@ -420,6 +454,10 @@ private:
     mutable std::mutex jobsMu_;
     mutable std::mutex chatTasksMu_;
     std::unordered_map<int, std::shared_ptr<ChatTaskState>> chatTasksBySession_;
+    mutable std::mutex coreModelArbiterMu_;
+    std::condition_variable coreModelArbiterCv_;
+    bool coreModelExecutionInFlight_ = false;
+    int activeCoreChatPriorityReservations_ = 0;
     //std::unordered_map<int, int> jobsCaptureRefCount_; // cameraId -> count
 
     void setCameraServiceRunning_(int cameraId, bool running, const std::string& source);
@@ -427,11 +465,31 @@ private:
     void handleOrchestratorQuery_(const nlohmann::json& payload);
     void handleChatQuery_(const nlohmann::json& payload);
     nlohmann::json fetchAgentCameras_();
-    nlohmann::json routeQuestionToCamerasWithGemini_(
+    nlohmann::json routeQuestionToCamerasWithLlm_(
         const std::string& userQuestion,
         const nlohmann::json& cameras,
-        const std::string& geminiApiKey);
+        const std::string& routerModelTier,
+        const std::string& routerApiKey,
+        bool requestCoreChatPriority = false,
+        const std::function<bool()>& shouldAbort = {});
     std::string buildCameraRouterSystemPrompt_() const;
+    CoreChatPriorityReservation reserveCoreChatPriority_(int chatSessionId);
+    CoreModelExecutionLease acquireCoreModelExecutionLease_(
+        const std::string& modelName,
+        bool requestChatPriority,
+        const std::function<bool()>& shouldAbort,
+        const std::string& waitScope,
+        const std::string& logId = "");
+    void releaseCoreModelExecutionLease_();
+    void releaseCoreChatPriorityReservation_();
+    std::string postOpenAIChatCompletionsWithCoreLease_(
+        const std::string& apiKey,
+        const nlohmann::json& bodyJson,
+        const std::function<void()>& onFirstRetry,
+        bool requestChatPriority = false,
+        const std::function<bool()>& shouldAbort = {},
+        const std::string& waitScope = "",
+        const std::string& cameraLogId = "");
 
     long long timeOffsetSeconds_ = 0;
 
@@ -508,7 +566,9 @@ private:
         int runningResolution,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens);
+        int& outTotalTokens,
+        bool requestCoreChatPriority = false,
+        const std::function<bool()>& shouldAbort = {});
 
 
 
@@ -630,7 +690,9 @@ private:
         int& outPromptTokens,
         int& outOutputTokens,
         int& outTotalTokens,
-        std::string& outModelAnswer);
+        std::string& outModelAnswer,
+        bool requestCoreChatPriority = false,
+        const std::function<bool()>& shouldAbort = {});
 
     void updateCameraAlgorithms_(int cameraId, const nlohmann::json& payload);
 

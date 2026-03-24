@@ -2,7 +2,7 @@
  * DashboardSummaryStore - Centralized state for dashboard data
  * 
  * Polls /api/dashboard-summary endpoint once and shares the result with:
- * - Layout (for unreadCount and tokenBalance)
+ * - Layout (for unreadCount, token balance and monthly token usage)
  * - Dashboard (for cameras list)
  * 
  * Only polls when authenticated user is present.
@@ -29,6 +29,35 @@ export interface TokenBalance {
   total_spent: number;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface MonthlyTokenUsageSummary {
+  timezone_iana: string;
+  local_month: string;
+  local_month_start: string;
+  next_local_month_start: string;
+  start_utc: string;
+  end_utc: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  breakdown?: {
+    chat: {
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens: number;
+    };
+    agents: {
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens: number;
+    };
+    jobs: {
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens: number;
+    };
+  };
 }
 
 export interface DashboardPayload {
@@ -124,6 +153,9 @@ export interface DashboardPayload {
     unreadCount: number;
     inputBalance: number;
     outputBalance: number;
+    monthlyUsageLocalMonth: string;
+    monthlyUsageInputTokens: number;
+    monthlyUsageOutputTokens: number;
     jobsUpdatedAtMax: number;
     captureMetricsUpdatedAtMax: number;
   };
@@ -133,6 +165,7 @@ export interface DashboardSummary {
   cameras: Camera[];
   unreadCount: number;
   tokenBalance: TokenBalance | null;
+  tokenUsageMonth: MonthlyTokenUsageSummary | null;
   lastUpdatedAt: string | null;
   dashboard?: DashboardPayload;
 }
@@ -144,6 +177,7 @@ class DashboardSummaryStore {
     cameras: [],
     unreadCount: 0,
     tokenBalance: null,
+    tokenUsageMonth: null,
     lastUpdatedAt: null,
   };
 
@@ -225,6 +259,7 @@ class DashboardSummaryStore {
         const cameras = data.cameras || [];
         const unreadCount = data.unreadCount ?? 0;
         const tokenBalance = data.tokenBalance || null;
+        const tokenUsageMonth = data.tokenUsageMonth || null;
         const dashboard = data.dashboard || null;
 
         // Use etagHints for efficient change detection if available
@@ -241,6 +276,9 @@ class DashboardSummaryStore {
               oldHints.unreadCount !== newHints.unreadCount ||
               oldHints.inputBalance !== newHints.inputBalance ||
               oldHints.outputBalance !== newHints.outputBalance ||
+              oldHints.monthlyUsageLocalMonth !== newHints.monthlyUsageLocalMonth ||
+              oldHints.monthlyUsageInputTokens !== newHints.monthlyUsageInputTokens ||
+              oldHints.monthlyUsageOutputTokens !== newHints.monthlyUsageOutputTokens ||
               oldHints.jobsUpdatedAtMax !== newHints.jobsUpdatedAtMax ||
               oldHints.captureMetricsUpdatedAtMax !== newHints.captureMetricsUpdatedAtMax
             );
@@ -251,6 +289,7 @@ class DashboardSummaryStore {
             JSON.stringify(cameras) !== JSON.stringify(this.summary.cameras) ||
             unreadCount !== this.summary.unreadCount ||
             JSON.stringify(tokenBalance) !== JSON.stringify(this.summary.tokenBalance) ||
+            JSON.stringify(tokenUsageMonth) !== JSON.stringify(this.summary.tokenUsageMonth) ||
             JSON.stringify(dashboard) !== JSON.stringify(this.summary.dashboard)
           );
         })();
@@ -260,6 +299,7 @@ class DashboardSummaryStore {
             cameras,
             unreadCount,
             tokenBalance,
+            tokenUsageMonth,
             dashboard,
             lastUpdatedAt: new Date().toISOString(),
           };

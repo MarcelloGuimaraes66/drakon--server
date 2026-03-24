@@ -2459,6 +2459,54 @@ static std::string buildFaceIdOnlyShortAnswer_(
     return oss.str();
 }
 
+struct LocalAlertNormalization_ {
+    bool alertCondition = false;
+    std::string reason;
+};
+
+static LocalAlertNormalization_ normalizeConflictingLocalAlert_(
+    bool rawAlertCondition,
+    const std::string& alertConditionText,
+    const VideoHit& hit)
+{
+    LocalAlertNormalization_ normalized{ rawAlertCondition, std::string() };
+    if (!rawAlertCondition || hit.faceIdMatch) {
+        return normalized;
+    }
+
+    const bool threatPrompt =
+        temporal::looksLikeThreatEvidencePrompt(alertConditionText) ||
+        temporal::looksLikeThreatEvidencePrompt(hit.answer);
+    if (!threatPrompt) {
+        return normalized;
+    }
+
+    const bool explicitNegativeCurrentBatch =
+        temporal::textSuggestsNoVisiblePerson(hit.answer) ||
+        temporal::textSuggestsNoVisibleTarget(hit.answer) ||
+        temporal::textSuggestsInactionableVisibility(hit.answer) ||
+        temporal::nodeSuggestsNoVisiblePerson(hit.identityPatch) ||
+        temporal::nodeSuggestsNoVisibleTarget(hit.identityPatch) ||
+        temporal::nodeSuggestsInactionableVisibility(hit.identityPatch) ||
+        temporal::nodeSuggestsNoVisiblePerson(hit.observations) ||
+        temporal::nodeSuggestsNoVisibleTarget(hit.observations) ||
+        temporal::nodeSuggestsInactionableVisibility(hit.observations) ||
+        temporal::nodeSuggestsNoVisiblePerson(hit.unknownReasons) ||
+        temporal::nodeSuggestsNoVisibleTarget(hit.unknownReasons) ||
+        temporal::nodeSuggestsInactionableVisibility(hit.unknownReasons);
+    if (!explicitNegativeCurrentBatch) {
+        return normalized;
+    }
+
+    if (temporal::currentBatchHasEntityEvidence(hit.identityPatch, hit.observations)) {
+        return normalized;
+    }
+
+    normalized.alertCondition = false;
+    normalized.reason = "negative_current_batch_without_entity_evidence";
+    return normalized;
+}
+
 static std::string buildHiddenFaceIdPrompt_(const std::vector<JobFaceTarget>& faceTargets) {
     if (!hasUsableFaceTargets_(faceTargets)) {
         return "";
@@ -6940,6 +6988,16 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             }
         }
 
+        const LocalAlertNormalization_ normalizedLocalAlert =
+            normalizeConflictingLocalAlert_(hit.alertCondition, alertConditionText, hit);
+        if (normalizedLocalAlert.alertCondition != hit.alertCondition) {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: downgraded contradictory local alert (image) cameraId=" +
+                std::to_string(cameraId) + " reason=" + normalizedLocalAlert.reason
+            );
+            hit.alertCondition = normalizedLocalAlert.alertCondition;
+        }
         const bool localAlertSignal = hit.alertCondition;
         const std::string localDecisionSource = decisionSource;
         if (temporalPlanActive) {
@@ -6950,6 +7008,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 hit.observations,
                 hit.temporalEvidenceCandidates,
                 nowIsoForInference,
+                hit.answer,
+                hit.unknownReasons,
                 std::string(),
                 std::string(),
                 hit.faceIdentityMatches
@@ -7713,6 +7773,16 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
     }
 
+    const LocalAlertNormalization_ normalizedLocalAlert =
+        normalizeConflictingLocalAlert_(hit.alertCondition, alertConditionText, hit);
+    if (normalizedLocalAlert.alertCondition != hit.alertCondition) {
+        Logger::instance().logDebug(
+            "job",
+            "runAgentInferenceOnCamera_: downgraded contradictory local alert (video) cameraId=" +
+            std::to_string(cameraId) + " reason=" + normalizedLocalAlert.reason
+        );
+        hit.alertCondition = normalizedLocalAlert.alertCondition;
+    }
     const bool localAlertSignal = hit.alertCondition;
     const std::string localDecisionSource = decisionSource;
     if (temporalPlanActive) {
@@ -7723,6 +7793,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             hit.observations,
             hit.temporalEvidenceCandidates,
             temporalDecisionNowIso,
+            hit.answer,
+            hit.unknownReasons,
             seg.startTs,
             seg.endTs,
             hit.faceIdentityMatches

@@ -49,6 +49,11 @@ import {
   isOpenAiKeyRequiredError,
   isZAiKeyRequiredError,
 } from "@/react-app/utils/openAiKeyGuard";
+import {
+  getCoreModelNoticeCopy,
+  shouldShowCoreModelNotice,
+} from "@/react-app/utils/coreModelNotice";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import { brand } from "@/shared/brand";
 
 interface Job {
@@ -7143,7 +7148,13 @@ function StepCard({
                           <select
                             value={normalizeAgentInferenceModel(agentForm.inference_model)}
                             onChange={(e) => {
+                              const previousModel = normalizeAgentInferenceModel(
+                                agentForm.inference_model
+                              );
                               const nextModel = normalizeAgentInferenceModel(e.target.value);
+                              if (shouldShowCoreModelNotice(nextModel, previousModel)) {
+                                onShowToast(getCoreModelNoticeCopy(stepLocale).message, "info");
+                              }
                               setAgentForm((prev) => {
                                 const constrained = applyAgentExecutionConstraints(
                                   prev.inference_model === "core" ? "video" : promptEditorTargetInputType,
@@ -7175,6 +7186,9 @@ function StepCard({
                             <option value="core">{t("jobs.inferenceModelOption.core")}</option>
                             <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
                           </select>
+                          <ModelHostingBadge
+                            modelTier={normalizeAgentInferenceModel(agentForm.inference_model)}
+                          />
                           <select
                             value={promptEditorTargetInputType}
                             onChange={(e) => {

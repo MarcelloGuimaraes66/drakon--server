@@ -11,11 +11,8 @@ import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
 import { Camera as CameraType, dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
+import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
-import {
-  emitOpenAiKeyRequiredPrompt,
-  isOpenAiKeyRequiredError,
-} from "@/react-app/utils/openAiKeyGuard";
 import {
   Camera,
   Plus,
@@ -32,10 +29,7 @@ function AIAgentsContent() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const billingEnabled = brand.features.billingEnabled;
-  const [subscriptionToast, setSubscriptionToast] = useState<{
-    show: boolean;
-    cameraId: number;
-  } | null>(null);
+  const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast } = useEvents();
   
@@ -45,6 +39,7 @@ function AIAgentsContent() {
   const [searchTerm, setSearchTerm] = useState("");
   const [editingCamera, setEditingCamera] = useState<CameraEditorCamera | null>(null);
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
+  const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const editRequestCameraId = useRef<number | null>(null);
 
   const normalizedSearch = searchTerm.trim().toLowerCase();
@@ -67,60 +62,45 @@ function AIAgentsContent() {
     [filteredCameras]
   );
 
-  const toggleService = async (cameraId: number, isRunning: boolean) => {
-    try {
-      const nextRunning = isRunning ? 0 : 1;
-
-      await fetch(`/api/cameras/${cameraId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_service_running: nextRunning }),
-        credentials: "include",
-      });
-      
-      if (!isRunning) {
-        const response = await fetch(`/api/cameras/${cameraId}/start`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-        });
-        
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          if (isOpenAiKeyRequiredError(result)) {
-            emitOpenAiKeyRequiredPrompt();
-          }
-          throw new Error(result?.error || "Failed to start camera");
-        }
-        
-        if (result.agents_disabled_no_subscription) {
-          setSubscriptionToast({ show: true, cameraId });
-          setTimeout(() => setSubscriptionToast(null), 10000);
-        }
+  const updatePendingCameraState = (cameraId: number, isPending: boolean) => {
+    setPendingCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
       } else {
-        await fetch("/api/commands", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            camera_id: cameraId,
-            command_type: "stop_camera",
-            payload: JSON.stringify({ camera_id: cameraId }),
-          }),
-          credentials: "include",
-        });
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
+  const toggleService = async (cameraId: number, isRunning: boolean) => {
+    if (pendingCameraIds.has(cameraId)) {
+      return;
+    }
+
+    updatePendingCameraState(cameraId, true);
+
+    try {
+      const result = await toggleCameraService({ cameraId, isRunning });
+
+      if (result.agentsDisabledNoSubscription) {
+        setSubscriptionToastCameraId(cameraId);
       }
 
       // ✅ instant UI update (button flips immediately)
       dashboardSummaryStore.patchCameraLocal(cameraId, {
-        is_service_running: nextRunning,
-        // optional but recommended: stop showing stale thumbnail immediately
-        ...(nextRunning === 0 ? { thumbnail_url: null, last_thumbnail_update: null } : {}),
+        is_service_running: result.nextRunning,
+        ...(result.nextRunning === 0
+          ? { thumbnail_url: null, last_thumbnail_update: null }
+          : {}),
       });
 
-      // optional: also force a refresh for guaranteed server-truth reconciliation
       dashboardSummaryStore.refresh();
     } catch (error) {
       console.error("Failed to toggle service:", error);
+    } finally {
+      updatePendingCameraState(cameraId, false);
     }
   };
 
@@ -191,6 +171,8 @@ function AIAgentsContent() {
     mode: "default" | "overlay" = "default"
   ) => {
     const isOverlay = mode === "overlay";
+    const isRunning = camera.is_service_running === 1;
+    const isTogglePending = pendingCameraIds.has(camera.id);
 
     return (
       <div
@@ -215,17 +197,21 @@ function AIAgentsContent() {
 
         <button
           onClick={() => toggleService(camera.id, camera.is_service_running === 1)}
+          disabled={isTogglePending}
+          aria-busy={isTogglePending}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
-            camera.is_service_running
+            isRunning
               ? isOverlay
-                ? "min-h-[40px] rounded-xl border border-red-400/20 bg-red-500/20 px-3 py-2 text-red-100 backdrop-blur-sm hover:bg-red-500/30"
-                : "min-h-[44px] rounded-lg bg-red-500/10 px-3 py-2.5 text-red-400 hover:bg-red-500/20 md:min-h-0 md:py-2"
+                ? "min-h-[40px] rounded-xl border border-red-400/20 bg-red-500/20 px-3 py-2 text-red-100 backdrop-blur-sm hover:bg-red-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                : "min-h-[44px] rounded-lg bg-red-500/10 px-3 py-2.5 text-red-400 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
               : isOverlay
-              ? "min-h-[40px] rounded-xl border border-green-400/20 bg-green-500/20 px-3 py-2 text-green-100 backdrop-blur-sm hover:bg-green-500/30"
-              : "min-h-[44px] rounded-lg bg-green-500/10 px-3 py-2.5 text-green-400 hover:bg-green-500/20 md:min-h-0 md:py-2"
+              ? "min-h-[40px] rounded-xl border border-green-400/20 bg-green-500/20 px-3 py-2 text-green-100 backdrop-blur-sm hover:bg-green-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+              : "min-h-[44px] rounded-lg bg-green-500/10 px-3 py-2.5 text-green-400 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
           }`}
         >
-          {camera.is_service_running ? (
+          {isTogglePending ? (
+            t("common.loading")
+          ) : isRunning ? (
             <>
               <Square className="w-4 h-4" />
               {t("dashboard.stop")}
@@ -450,7 +436,7 @@ function AIAgentsContent() {
       <CameraEventToast toasts={toasts} onDismiss={dismissToast} />
 
       {/* Subscription required toast */}
-      {subscriptionToast?.show && (
+      {subscriptionToastCameraId !== null && (
         <div className="fixed bottom-4 right-4 z-50 max-w-md pointer-events-none">
           <div className="bg-gradient-to-br from-orange-900/95 to-orange-950/95 backdrop-blur-xl border border-orange-700/50 rounded-xl shadow-2xl shadow-orange-500/20 p-4 pointer-events-auto animate-slide-in">
             <div className="flex items-start gap-3">
@@ -460,13 +446,13 @@ function AIAgentsContent() {
               
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-semibold text-gray-100 mb-1">
-                  Subscription Required
+                  Agent Start Needs Attention
                 </h4>
                 <p className="text-sm text-gray-300 mb-2">
-                  AI agents have been disabled for Camera #{subscriptionToast.cameraId}.
+                  Some agents for Camera #{subscriptionToastCameraId} were skipped during startup.
                 </p>
                 <p className="text-xs text-gray-400 mb-3">
-                  You need an active subscription to use AI detection features.
+                  Review the provider API keys and agent settings if detections do not begin.
                 </p>
                 {billingEnabled ? (
                   <button
@@ -479,7 +465,7 @@ function AIAgentsContent() {
               </div>
 
               <button
-                onClick={() => setSubscriptionToast(null)}
+                onClick={() => setSubscriptionToastCameraId(null)}
                 className="p-1.5 text-gray-400 hover:text-gray-200 hover:bg-orange-800/30 rounded-lg transition-colors flex-shrink-0"
               >
                 <X className="w-4 h-4" />

@@ -7,7 +7,10 @@ import { promisify } from "node:util";
 const workspaceRoot = path.resolve(import.meta.dirname, "..", "..");
 const appHostRoot = path.join(workspaceRoot, "AppHost");
 const drakonSiteRoot = path.join(workspaceRoot, "DrakonSite");
-const stageRoot = path.join(appHostRoot, "stage");
+const cliArgs = parseArgs(process.argv.slice(2));
+const stageRoot = cliArgs.out
+  ? path.resolve(cliArgs.out)
+  : path.join(appHostRoot, "stage");
 const runtimeRoot = path.join(stageRoot, "runtime");
 const runtimeWebRoot = path.join(runtimeRoot, "web");
 const runtimeBrandingRoot = path.join(runtimeRoot, "branding");
@@ -31,6 +34,20 @@ const desktopRuntimeEnvKeys = [
   "USD_TO_BRL",
   "SCHEDULER_TICK_SECRET",
 ];
+
+function parseArgs(argv) {
+  const args = { out: "" };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--out" || token === "-o") {
+      args.out = argv[index + 1] ?? "";
+      index += 1;
+    }
+  }
+
+  return args;
+}
 
 const config = JSON.parse(await fs.readFile(configPath, "utf8"));
 const activeBrandId = String(config.activeBrand || "perceptrum").trim().toLowerCase();

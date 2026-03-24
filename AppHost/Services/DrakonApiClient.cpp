@@ -497,6 +497,17 @@ namespace
         return snapshot;
     }
 
+    winrt::DrakonDesktop::services::MonthlyTokenUsageSummarySnapshot ParseMonthlyTokenUsageSummary(json const& object)
+    {
+        winrt::DrakonDesktop::services::MonthlyTokenUsageSummarySnapshot snapshot;
+        snapshot.inputTokens = JsonInt64(object, "input_tokens", 0);
+        snapshot.outputTokens = JsonInt64(object, "output_tokens", 0);
+        snapshot.totalTokens = JsonInt64(object, "total_tokens", 0);
+        snapshot.localMonth = JsonString(object, "local_month");
+        snapshot.timezoneIana = JsonString(object, "timezone_iana");
+        return snapshot;
+    }
+
     winrt::DrakonDesktop::services::PaymentRecord ParsePaymentRecord(json const& object)
     {
         winrt::DrakonDesktop::services::PaymentRecord record;
@@ -1759,6 +1770,37 @@ namespace winrt::DrakonDesktop::services
         catch (...)
         {
             result.error = "Invalid token balance response";
+            return result;
+        }
+    }
+
+    ServiceValueResponse<MonthlyTokenUsageSummarySnapshot> DrakonApiClient::GetMonthlyTokenUsageSummary()
+    {
+        ServiceValueResponse<MonthlyTokenUsageSummarySnapshot> result;
+        auto response = SendRequest("GET", "/api/token-usage-summary", std::nullopt, true);
+        result.statusCode = response.statusCode;
+
+        if (!response.transportOk)
+        {
+            result.error = response.error;
+            return result;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300)
+        {
+            result.error = JsonErrorMessage(response.body, response.statusCode, "Failed to load monthly token usage");
+            return result;
+        }
+
+        try
+        {
+            result.value = ParseMonthlyTokenUsageSummary(json::parse(response.body));
+            result.success = true;
+            return result;
+        }
+        catch (...)
+        {
+            result.error = "Invalid monthly token usage response";
             return result;
         }
     }

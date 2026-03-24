@@ -322,7 +322,7 @@ namespace winrt::DrakonDesktop::implementation
         title.TextAlignment(TextAlignment::Center);
 
         auto body = TextBlock();
-        body.Text(L"Same entry-point used by the web grid. Billing gate stays in place before the editor opens.");
+        body.Text(L"Same entry-point used by the web grid. New accounts can add cameras immediately and configure providers later.");
         body.Style(LookupStyle(L"DrakonCaptionTextStyle"));
         body.TextAlignment(TextAlignment::Center);
         body.TextWrapping(TextWrapping::WrapWholeWords);
@@ -637,7 +637,7 @@ namespace winrt::DrakonDesktop::implementation
                     if (startResponse.value.agentsDisabledNoSubscription)
                     {
                         ShowStatus(
-                            L"Start request was accepted, but the backend reported subscription restrictions. Open Billing to restore the full runtime.",
+                            L"Start request was accepted, but the backend skipped one or more agents for this camera. Review provider and agent settings if detections do not start.",
                             InfoBarSeverity::Warning);
                     }
                     else

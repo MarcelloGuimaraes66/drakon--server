@@ -36,6 +36,17 @@ interface LegacyVideoSearchSection {
   body: string;
 }
 
+const SENTENCE_BOUNDARY_PATTERN = /(?<=[.!?])\s+/u;
+const STRUCTURED_MARKDOWN_LINE_PATTERN =
+  /^(?:#{1,6}\s|[-*+]\s|>\s|\d+\.\s|```|~~~|\|)/m;
+const PARAGRAPH_CUE_PATTERN =
+  /^(?:so|then|therefore|however|also|finally|in practice|important|summary|in short|entao|na pratica|alem disso|por outro lado|por fim|em resumo|resumo|no entanto)\b/i;
+
+const LARGE_PARAGRAPH_MIN_LENGTH = 220;
+const TARGET_PARAGRAPH_LENGTH = 210;
+const MAX_PARAGRAPH_LENGTH = 320;
+const MAX_SENTENCES_PER_PARAGRAPH = 2;
+
 export function stripTemporalEngineDiagnostics(content: string): string {
   if (!content) return content;
   return content.replace(TEMPORAL_ENGINE_SUFFIX_PATTERN, "").trimEnd();
@@ -82,6 +93,129 @@ function applyGenericAssistantSpacing(content: string): string {
   return formatted.trim();
 }
 
+function normalizeNarrativeBlock(block: string): string {
+  return block.replace(/\s*\n\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
+function splitOverlongSingleSentence(block: string): string[] {
+  const fragments = block
+    .split(/(?<=[;:])\s+/u)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+
+  if (fragments.length < 2) {
+    return [block];
+  }
+
+  const paragraphs: string[] = [];
+  let current = "";
+
+  fragments.forEach((fragment) => {
+    if (
+      current &&
+      (current.length >= TARGET_PARAGRAPH_LENGTH ||
+        current.length + fragment.length + 1 > MAX_PARAGRAPH_LENGTH)
+    ) {
+      paragraphs.push(current.trim());
+      current = fragment;
+      return;
+    }
+
+    current = current ? `${current} ${fragment}` : fragment;
+  });
+
+  if (current) {
+    paragraphs.push(current.trim());
+  }
+
+  return paragraphs.length > 1 ? paragraphs : [block];
+}
+
+function splitNarrativeBlockIntoParagraphs(block: string): string[] {
+  const normalized = normalizeNarrativeBlock(block);
+  if (!normalized) {
+    return [];
+  }
+
+  const sentences = normalized
+    .split(SENTENCE_BOUNDARY_PATTERN)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+
+  if (sentences.length <= 1) {
+    return normalized.length >= MAX_PARAGRAPH_LENGTH
+      ? splitOverlongSingleSentence(normalized)
+      : [normalized];
+  }
+
+  if (sentences.length < 3 && normalized.length < LARGE_PARAGRAPH_MIN_LENGTH) {
+    return [normalized];
+  }
+
+  const paragraphs: string[] = [];
+  let current = "";
+  let sentenceCount = 0;
+
+  sentences.forEach((sentence) => {
+    const shouldBreakBefore =
+      current.length > 0 &&
+      ((sentenceCount >= MAX_SENTENCES_PER_PARAGRAPH && current.length >= 100) ||
+        current.length >= TARGET_PARAGRAPH_LENGTH ||
+        (PARAGRAPH_CUE_PATTERN.test(sentence) && current.length >= 80));
+
+    if (shouldBreakBefore) {
+      paragraphs.push(current.trim());
+      current = sentence;
+      sentenceCount = 1;
+    } else {
+      current = current ? `${current} ${sentence}` : sentence;
+      sentenceCount += 1;
+    }
+
+    if (current.endsWith(":") && current.length <= 120) {
+      paragraphs.push(current.trim());
+      current = "";
+      sentenceCount = 0;
+      return;
+    }
+
+    if (current.length >= MAX_PARAGRAPH_LENGTH) {
+      paragraphs.push(current.trim());
+      current = "";
+      sentenceCount = 0;
+    }
+  });
+
+  if (current) {
+    paragraphs.push(current.trim());
+  }
+
+  return paragraphs.length > 0 ? paragraphs : [normalized];
+}
+
+function reflowAssistantNarrativeParagraphs(content: string): string {
+  const blocks = content.split(/\n{2,}/);
+
+  const reformattedBlocks = blocks.map((block) => {
+    const trimmed = block.trim();
+    if (!trimmed) {
+      return "";
+    }
+
+    if (STRUCTURED_MARKDOWN_LINE_PATTERN.test(trimmed)) {
+      return trimmed;
+    }
+
+    return splitNarrativeBlockIntoParagraphs(trimmed).join("\n\n");
+  });
+
+  return reformattedBlocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function formatPlainAssistantBody(content: string): string {
+  return reflowAssistantNarrativeParagraphs(applyGenericAssistantSpacing(content));
+}
+
 function parseLegacyVideoSearchSections(content: string): LegacyVideoSearchSection[] {
   const sections: LegacyVideoSearchSection[] = [];
   let match: RegExpExecArray | null;
@@ -90,7 +224,7 @@ function parseLegacyVideoSearchSections(content: string): LegacyVideoSearchSecti
   while ((match = LEGACY_VIDEO_SEARCH_SECTION_PATTERN.exec(content)) !== null) {
     const cameraLabel = (match[1] || "").trim();
     const timeRange = (match[2] || "").trim();
-    const body = applyGenericAssistantSpacing((match[3] || "").trim());
+    const body = formatPlainAssistantBody((match[3] || "").trim());
 
     if (!cameraLabel || !timeRange || !body) {
       continue;
@@ -129,7 +263,7 @@ export function formatAssistantMessageContent(content: string): string {
       .trim();
   }
 
-  return applyGenericAssistantSpacing(normalized);
+  return formatPlainAssistantBody(normalized);
 }
 
 /**

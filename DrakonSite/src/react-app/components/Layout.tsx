@@ -82,7 +82,7 @@ export default function Layout({ children }: LayoutProps) {
       : "h-8 w-8 object-contain rounded-md";
   
   // Use unified dashboard summary hook
-  const { cameras, dashboard, unreadCount, tokenBalance } = useDashboardSummary();
+  const { cameras, dashboard, unreadCount, tokenUsageMonth } = useDashboardSummary();
   const hasUnreadNotifications = unreadCount > 0;
 
   // Auto-close drawer on route change
@@ -603,14 +603,14 @@ export default function Layout({ children }: LayoutProps) {
           </nav>
 
           <div className="flex items-center gap-3 flex-shrink-0">
-            {/* Token Balance */}
-            {tokenBalance && (
+            {/* Monthly Token Usage */}
+            {tokenUsageMonth && (
               <div className="hidden sm:flex items-center gap-3 px-3 py-1.5 bg-gray-800/50 rounded-lg border border-gray-700/50">
                 <div className="flex items-center gap-1.5">
                   <div className="w-1.5 h-1.5 rounded-full bg-blue-400"></div>
                   <span className="text-xs text-gray-400">In:</span>
                   <span className="text-sm font-semibold text-gray-200">
-                    {(tokenBalance.input_balance / 1_000_000).toFixed(1)}M
+                    {(tokenUsageMonth.input_tokens / 1_000_000).toFixed(1)}M
                   </span>
                 </div>
                 <div className="w-px h-4 bg-gray-700"></div>
@@ -618,7 +618,7 @@ export default function Layout({ children }: LayoutProps) {
                   <div className="w-1.5 h-1.5 rounded-full bg-purple-400"></div>
                   <span className="text-xs text-gray-400">Out:</span>
                   <span className="text-sm font-semibold text-gray-200">
-                    {(tokenBalance.output_balance / 1_000_000).toFixed(1)}M
+                    {(tokenUsageMonth.output_tokens / 1_000_000).toFixed(1)}M
                   </span>
                 </div>
               </div>

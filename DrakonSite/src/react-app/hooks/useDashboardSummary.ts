@@ -27,6 +27,7 @@ export function useDashboardSummary() {
     dashboard: summary.dashboard,
     unreadCount: summary.unreadCount,
     tokenBalance: summary.tokenBalance,
+    tokenUsageMonth: summary.tokenUsageMonth,
     lastUpdatedAt: summary.lastUpdatedAt,
     refresh: () => dashboardSummaryStore.refresh(),
   };

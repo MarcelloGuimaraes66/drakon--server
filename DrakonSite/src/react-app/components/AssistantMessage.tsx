@@ -22,11 +22,13 @@ interface AssistantMessageProps {
 }
 
 function assistantMarkdownComponents(compact: boolean) {
-  const baseText = compact ? "text-sm leading-6" : "text-[15px] leading-7 md:text-base";
-  const paragraphSpacing = compact ? "mb-3 last:mb-0" : "mb-4 last:mb-0";
-  const headingSpacing = compact ? "mt-4 mb-2 first:mt-0" : "mt-5 mb-2.5 first:mt-0";
-  const listSpacing = compact ? "space-y-1.5" : "space-y-2";
-  const blockSpacing = compact ? "my-3" : "my-4";
+  const baseText = compact
+    ? "text-[15px] leading-7 tracking-[0.01em]"
+    : "text-[16px] leading-[1.85] tracking-[0.005em] md:text-[17px]";
+  const paragraphSpacing = compact ? "mb-4 last:mb-0" : "mb-5 last:mb-0";
+  const headingSpacing = compact ? "mt-5 mb-2.5 first:mt-0" : "mt-6 mb-3 first:mt-0";
+  const listSpacing = compact ? "space-y-2.5" : "space-y-3";
+  const blockSpacing = compact ? "my-4" : "my-5";
 
   return {
     h1: ({ children }: any) => (
@@ -45,7 +47,7 @@ function assistantMarkdownComponents(compact: boolean) {
       </h3>
     ),
     p: ({ children }: any) => (
-      <p className={`${baseText} ${paragraphSpacing} text-gray-100 whitespace-pre-wrap break-words`}>
+      <p className={`${baseText} ${paragraphSpacing} break-words whitespace-pre-wrap text-gray-100`}>
         {children}
       </p>
     ),
@@ -60,7 +62,7 @@ function assistantMarkdownComponents(compact: boolean) {
       </ol>
     ),
     li: ({ children }: any) => (
-      <li className="pl-1 text-gray-100">
+      <li className="pl-1 text-gray-100 leading-[1.85]">
         {children}
       </li>
     ),
@@ -153,9 +155,10 @@ export default function AssistantMessage({
   const markdown = formatAssistantMessageContent(content);
   const suppressCameraFooter = shouldSuppressAssistantCameraFooter(content);
   const isChatPageVariant = variant === "chat-page";
+  const contentWidthClasses = compact ? "max-w-[34rem]" : "max-w-[68ch]";
   const bubbleClasses = compact
     ? "max-w-[82%] px-4 py-3"
-    : "w-full max-w-full px-4 py-4 md:max-w-[46rem] md:px-6 xl:max-w-[52rem]";
+    : "w-full max-w-full px-5 py-4 md:max-w-[50rem] md:px-7 md:py-5 xl:max-w-[54rem]";
 
   return (
     <div className={`flex justify-start ${compact ? "gap-3" : "gap-4"}`}>
@@ -179,13 +182,15 @@ export default function AssistantMessage({
             : "min-w-0 overflow-hidden rounded-[26px] border border-gray-700/60 bg-gradient-to-br from-gray-800/95 via-gray-800/90 to-gray-900/95 text-gray-100 shadow-[0_20px_60px_-24px_rgba(0,0,0,0.8)] backdrop-blur-sm",
         ].join(" ")}
       >
-        <div className={compact ? "space-y-3" : "space-y-4"}>
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkBreaks]}
-            components={assistantMarkdownComponents(compact)}
-          >
-            {markdown}
-          </ReactMarkdown>
+        <div className={compact ? "space-y-3" : "space-y-5"}>
+          <div className={contentWidthClasses}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkBreaks]}
+              components={assistantMarkdownComponents(compact)}
+            >
+              {markdown}
+            </ReactMarkdown>
+          </div>
 
           {hitMedia.length > 0 && <HitMediaAlbum items={hitMedia} />}
 

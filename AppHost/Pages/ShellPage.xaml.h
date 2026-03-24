@@ -9,6 +9,7 @@ namespace winrt::DrakonDesktop::implementation
     struct ShellPage : winrt::Microsoft::UI::Xaml::Controls::PageT<ShellPage>
     {
         ShellPage();
+        ~ShellPage();
 
         void InitializeComponent();
 
@@ -20,6 +21,9 @@ namespace winrt::DrakonDesktop::implementation
         void ApplySidebarState(bool collapsed);
         void UpdateResponsiveState(double width);
         winrt::fire_and_forget LoadShellChromeAsync();
+        void OnHeaderRefreshTick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Windows::Foundation::IInspectable const& args);
         void OnShellSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
@@ -36,7 +40,9 @@ namespace winrt::DrakonDesktop::implementation
         bool m_initialized{ false };
         bool m_userCollapsedSidebar{ false };
         bool m_effectiveSidebarCollapsed{ false };
+        bool m_shellChromeRefreshInFlight{ false };
         winrt::hstring m_currentDestination{ L"dashboard" };
         winrt::Microsoft::UI::Xaml::Controls::Frame m_contentFrame{ nullptr };
+        winrt::Microsoft::UI::Xaml::DispatcherTimer m_headerRefreshTimer{ nullptr };
     };
 }

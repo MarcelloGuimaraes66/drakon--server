@@ -214,7 +214,7 @@ async function hashToken(token: string): Promise<string> {
 const EXE_HEARTBEAT_STALE_AFTER_MS = 35_000;
 const CHAT_DESKTOP_AGENT_REQUIRED_FRESH_AFTER_MS = 25_000;
 const SUPPORTED_CHAT_LANGUAGE_CODES = ["en", "es", "pt", "fr", "zh", "ar"] as const;
-const JOB_ALERT_MEDIA_MAX_VIDEO_BYTES = 25 * 1024 * 1024;
+const JOB_ALERT_MEDIA_MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 
 function normalizeSupportedChatLanguage(value: unknown, fallback: string = "en"): string {
   const fallbackLanguage = typeof fallback === "string" && fallback.trim() ? fallback.trim().toLowerCase() : "en";
@@ -753,6 +753,96 @@ function deriveJobStartWindowBoundaryUtc(
   return localDateTimeInTimezoneToUtcIso(localDate, boundaryTime, timezone);
 }
 
+async function getMonthlyTokenUsageSummary(
+  db: D1Database,
+  userId: string,
+  timezoneInput?: string | null
+): Promise<MonthlyTokenUsageSummary> {
+  const timezoneIana = normalizeTimezoneInput(timezoneInput) || (await resolveUserGlobalTimezone(db, userId));
+  const period = getMonthlyUsagePeriodForTimezone(timezoneIana);
+
+  const chatUsageRow = await db.prepare(
+    `SELECT
+       COALESCE(SUM(model_prompt_tokens), 0) AS input_tokens,
+       COALESCE(SUM(model_output_tokens), 0) AS output_tokens,
+       COALESCE(
+         SUM(
+           CASE
+             WHEN COALESCE(model_total_tokens, 0) > 0 THEN model_total_tokens
+             ELSE COALESCE(model_prompt_tokens, 0) + COALESCE(model_output_tokens, 0)
+           END
+         ),
+         0
+       ) AS total_tokens
+     FROM chat_messages
+     WHERE user_id = ?
+       AND role = 'assistant'
+       AND message_type IN ('router_ack', 'final')
+       AND usage_recorded_at IS NOT NULL
+       AND usage_recorded_at >= ?
+       AND usage_recorded_at < ?`
+  )
+    .bind(userId, period.startUtc, period.endUtc)
+    .first();
+
+  const subscriptionUsageResults = await db.prepare(
+    `SELECT
+       COALESCE(NULLIF(TRIM(stu.source), ''), 'agent') AS source_key,
+       COALESCE(SUM(stu.prompt_tokens), 0) AS input_tokens,
+       COALESCE(SUM(stu.output_tokens), 0) AS output_tokens,
+       COALESCE(SUM(stu.total_tokens), 0) AS total_tokens
+     FROM subscription_token_usage stu
+     JOIN subscriptions s ON s.id = stu.subscription_id
+     WHERE s.user_id = ?
+       AND stu.event_time >= ?
+       AND stu.event_time < ?
+     GROUP BY COALESCE(NULLIF(TRIM(stu.source), ''), 'agent')`
+  )
+    .bind(userId, period.startUtc, period.endUtc)
+    .all();
+
+  const chat = normalizeTokenUsageAggregate(chatUsageRow);
+  const agents: TokenUsageAggregate = {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  };
+  const jobs: TokenUsageAggregate = {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  };
+
+  for (const row of subscriptionUsageResults.results || []) {
+    const aggregate = normalizeTokenUsageAggregate(row);
+    const sourceKey =
+      typeof (row as any)?.source_key === "string"
+        ? String((row as any).source_key).trim().toLowerCase()
+        : "";
+    const bucket = sourceKey === "job" ? jobs : agents;
+    bucket.input_tokens += aggregate.input_tokens;
+    bucket.output_tokens += aggregate.output_tokens;
+    bucket.total_tokens += aggregate.total_tokens;
+  }
+
+  return {
+    timezone_iana: period.timezoneIana,
+    local_month: period.localMonth,
+    local_month_start: period.localMonthStart,
+    next_local_month_start: period.nextLocalMonthStart,
+    start_utc: period.startUtc,
+    end_utc: period.endUtc,
+    input_tokens: chat.input_tokens + agents.input_tokens + jobs.input_tokens,
+    output_tokens: chat.output_tokens + agents.output_tokens + jobs.output_tokens,
+    total_tokens: chat.total_tokens + agents.total_tokens + jobs.total_tokens,
+    breakdown: {
+      chat,
+      agents,
+      jobs,
+    },
+  };
+}
+
 async function setUserGlobalTimezone(
   db: D1Database,
   userId: string,
@@ -991,7 +1081,7 @@ const DRAKON_FIND_MIN_DURATION_SECONDS = 1800;
 const DRAKON_FIND_MAX_DURATION_SECONDS = 2_592_000;
 const DRAKON_FIND_WINDOW_SECONDS = 60;
 const DRAKON_FIND_RUNTIME_MODE: DrakonFindRuntimeMode = "continuous_video_60s";
-const DRAKON_FIND_AGENT_MEDIA_MAX_BYTES = 25 * 1024 * 1024;
+const DRAKON_FIND_AGENT_MEDIA_MAX_BYTES = 100 * 1024 * 1024;
 
 
 function requireDrakonFindEnabled(c: any) {
@@ -3940,6 +4030,35 @@ async function ensureSchema(db: D1Database): Promise<void> {
 
       if (await tableExists("chat_messages")) {
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN progress_json TEXT`);
+        await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN usage_recorded_at TEXT`);
+        await db.prepare(
+          `UPDATE chat_messages
+           SET usage_recorded_at = COALESCE(updated_at, created_at)
+           WHERE usage_recorded_at IS NULL
+             AND role = 'assistant'
+             AND (
+               message_type = 'router_ack'
+               OR (
+                 message_type = 'final'
+                 AND (
+                   COALESCE(model_prompt_tokens, 0) > 0
+                   OR COALESCE(model_output_tokens, 0) > 0
+                   OR COALESCE(tokens_used, 0) > 0
+                 )
+               )
+             )`
+        ).run();
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_chat_messages_user_usage_recorded_at
+          ON chat_messages(user_id, usage_recorded_at)
+        `).run();
+      }
+
+      if (await tableExists("subscription_token_usage")) {
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_subscription_token_usage_subscription_event_time
+          ON subscription_token_usage(subscription_id, event_time)
+        `).run();
       }
 
       await db.prepare(`
@@ -5226,6 +5345,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
 
       if (await tableExists("chat_messages")) {
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN progress_json TEXT`);
+        await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN usage_recorded_at TEXT`);
       }
     })();
   }
@@ -7964,6 +8084,46 @@ function getLocalTimeInTimezoneAt(timezone: string, date: Date = new Date()): Lo
   };
 }
 
+type TokenUsageAggregate = {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+};
+
+type MonthlyTokenUsageSummary = {
+  timezone_iana: string;
+  local_month: string;
+  local_month_start: string;
+  next_local_month_start: string;
+  start_utc: string;
+  end_utc: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  breakdown: {
+    chat: TokenUsageAggregate;
+    agents: TokenUsageAggregate;
+    jobs: TokenUsageAggregate;
+  };
+};
+
+const toUsageInt = (value: unknown): number => {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.floor(numeric));
+};
+
+const normalizeTokenUsageAggregate = (row: any): TokenUsageAggregate => {
+  const inputTokens = toUsageInt(row?.input_tokens);
+  const outputTokens = toUsageInt(row?.output_tokens);
+  const totalTokensRaw = toUsageInt(row?.total_tokens);
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokensRaw > 0 ? totalTokensRaw : inputTokens + outputTokens,
+  };
+};
+
 const normalizeTimeHHMM = (time: string): string | null => {
   if (!time) return null;
   const trimmed = String(time).trim();
@@ -7989,6 +8149,41 @@ const formatLocalDate = (y: number, m: number, d: number): string => {
   const dd = String(d).padStart(2, "0");
   return `${y}-${mm}-${dd}`;
 };
+
+function getMonthlyUsagePeriodForTimezone(
+  timezoneInput: string,
+  atDate: Date = new Date()
+): {
+  timezoneIana: string;
+  localMonth: string;
+  localMonthStart: string;
+  nextLocalMonthStart: string;
+  startUtc: string;
+  endUtc: string;
+} {
+  const timezoneIana = normalizeTimezoneInput(timezoneInput) || DEFAULT_GLOBAL_TIMEZONE;
+  const localNow = getLocalTimeInTimezoneAt(timezoneIana, atDate);
+  const localMonth = `${String(localNow.year).padStart(4, "0")}-${String(localNow.monthOfYear).padStart(2, "0")}`;
+  const localMonthStart = formatLocalDate(localNow.year, localNow.monthOfYear, 1);
+  const nextMonthYear = localNow.monthOfYear === 12 ? localNow.year + 1 : localNow.year;
+  const nextMonth = localNow.monthOfYear === 12 ? 1 : localNow.monthOfYear + 1;
+  const nextLocalMonthStart = formatLocalDate(nextMonthYear, nextMonth, 1);
+  const startUtc =
+    localDateTimeInTimezoneToUtcIso(localMonthStart, "00:00", timezoneIana) ||
+    new Date(Date.UTC(localNow.year, localNow.monthOfYear - 1, 1, 0, 0, 0, 0)).toISOString();
+  const endUtc =
+    localDateTimeInTimezoneToUtcIso(nextLocalMonthStart, "00:00", timezoneIana) ||
+    new Date(Date.UTC(nextMonthYear, nextMonth - 1, 1, 0, 0, 0, 0)).toISOString();
+
+  return {
+    timezoneIana,
+    localMonth,
+    localMonthStart,
+    nextLocalMonthStart,
+    startUtc,
+    endUtc,
+  };
+}
 
 const parseLocalDate = (dateStr: string): { year: number; month: number; day: number } | null => {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
@@ -8857,6 +9052,7 @@ const buildCoreModelChatContentionWarning = (
 
 // Combined dashboard endpoint - returns cameras, token balance, and unread count in one request
 app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
 
   // Fetch cameras
@@ -8897,6 +9093,7 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
     .first();
 
   const unreadCount = (unreadResult as any)?.count || 0;
+  const tokenUsageMonth = await getMonthlyTokenUsageSummary(c.env.DB, user.id);
 
   // Build dashboard payload (NEW)
   const cameraIds = camerasWithOffset.map((c: any) => c.id);
@@ -9604,12 +9801,15 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
     unreadCount,
     inputBalance: (balance as any).input_balance,
     outputBalance: (balance as any).output_balance,
+    monthlyUsageLocalMonth: tokenUsageMonth.local_month,
+    monthlyUsageInputTokens: tokenUsageMonth.input_tokens,
+    monthlyUsageOutputTokens: tokenUsageMonth.output_tokens,
     jobsUpdatedAtMax,
     captureMetricsUpdatedAtMax,
   };
 
   // Build improved ETag
-  const etag = `"dashboard-${user.id}-${etagHints.camerasUpdatedAtMax}-${etagHints.lastEventId}-${etagHints.lastDetectionId}-${etagHints.lastJobFireId}-${etagHints.jobAlertCount}-${etagHints.pendingCommandsCount}-${etagHints.unreadCount}-${etagHints.inputBalance}-${etagHints.outputBalance}-${etagHints.jobsUpdatedAtMax}-${etagHints.captureMetricsUpdatedAtMax}"`;
+  const etag = `"dashboard-${user.id}-${etagHints.camerasUpdatedAtMax}-${etagHints.lastEventId}-${etagHints.lastDetectionId}-${etagHints.lastJobFireId}-${etagHints.jobAlertCount}-${etagHints.pendingCommandsCount}-${etagHints.unreadCount}-${etagHints.inputBalance}-${etagHints.outputBalance}-${etagHints.monthlyUsageLocalMonth}-${etagHints.monthlyUsageInputTokens}-${etagHints.monthlyUsageOutputTokens}-${etagHints.jobsUpdatedAtMax}-${etagHints.captureMetricsUpdatedAtMax}"`;
   
   // Check If-None-Match for conditional GET
   const ifNoneMatch = c.req.header("if-none-match");
@@ -9643,6 +9843,7 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
   return c.json({
     cameras: camerasWithOffset,
     tokenBalance: balance,
+    tokenUsageMonth,
     unreadCount,
     dashboard: {
       stats,
@@ -10956,51 +11157,14 @@ async function enqueueStartCameraCommand(
       }
     }
 
-    // Fetch enabled algorithms for this camera
-    const { results: algos } = await env.DB.prepare(
-      "SELECT id FROM camera_algorithms WHERE camera_id = ? AND is_enabled = 1"
-    )
-      .bind(cameraId)
-      .all();
-
-    // Check if user has subscription - if not and there are enabled algorithms, disable them
-    let enabledAlgorithms: any[] = [];
-    let agentsDisabledDueToNoSubscription = false;
-    
-    if (!hasActiveSubscription && (algos || []).length > 0) {
-      // User has no subscription but has enabled algorithms - disable them all
-      console.log(`[START CAMERA] No subscription found - disabling ${(algos || []).length} enabled algorithms`);
-      
-      agentsDisabledDueToNoSubscription = true;
-      
-      // Disable all algorithms in the database
-      await env.DB.prepare(
-        `UPDATE camera_algorithms 
-         SET is_enabled = 0, updated_at = CURRENT_TIMESTAMP
-         WHERE camera_id = ? AND is_enabled = 1`
-      )
-        .bind(cameraId)
-        .run();
-      
-      // Create notification for user
-      const now = new Date().toISOString();
-      await env.DB.prepare(
-        `INSERT INTO notifications (user_id, camera_id, type, title, message, created_at, is_read)
-         VALUES (?, ?, 'warning', 'Subscription Required', 'AI agents have been disabled for Camera #${cameraId}. You need an active subscription to use AI detection features.', ?, 0)`
-      )
-        .bind(userId, cameraId, now)
-        .run();
-      
-      // enabled_algorithms remains empty array
-      enabledAlgorithms = [];
-    } else {
-      // User has subscription or no enabled algorithms - proceed normally.
-      enabledAlgorithms = await buildEnabledAlgorithmsPayloadForCamera(
-        env.DB,
-        userId,
-        cameraId
-      );
-    }
+    // Billing no longer disables AI agents. Keep the configured agents active
+    // as long as their provider keys are available.
+    const enabledAlgorithms = await buildEnabledAlgorithmsPayloadForCamera(
+      env.DB,
+      userId,
+      cameraId
+    );
+    const agentsDisabledDueToNoSubscription = false;
 
     // Fetch user's frame_rate (default to 12 if not set)
     const frameRateData = await env.DB.prepare(
@@ -16172,7 +16336,8 @@ app.get("/api/billing/status", anyAuthMiddleware, async (c) => {
   return c.json({
     hasActiveSubscription: !!activeSubscription,
     hasActiveCard: !!activeCard,
-    canAddCameras: !!activeSubscription || !!activeCard,
+    // New accounts can add cameras without billing setup.
+    canAddCameras: true,
     subscription: subscriptionData,
     active_cameras: activeCamerasCount,
   });
@@ -16180,6 +16345,7 @@ app.get("/api/billing/status", anyAuthMiddleware, async (c) => {
 
 // Token balance endpoints
 app.get("/api/token-balance", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
 
   let balance = await c.env.DB.prepare(
@@ -16218,6 +16384,32 @@ app.get("/api/token-balance", anyAuthMiddleware, async (c) => {
   }
 
   return c.json(balance, {
+    headers: {
+      "etag": etag,
+      "cache-control": "private, no-cache, max-age=0, must-revalidate",
+    },
+  });
+});
+
+app.get("/api/token-usage-summary", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+  const user = c.get("user")!;
+  const summary = await getMonthlyTokenUsageSummary(c.env.DB, user.id);
+  const etag =
+    `"token-usage-${user.id}-${summary.local_month}-${summary.input_tokens}-${summary.output_tokens}-${summary.total_tokens}-${summary.breakdown.chat.input_tokens}-${summary.breakdown.agents.input_tokens}-${summary.breakdown.jobs.input_tokens}"`;
+  const ifNoneMatch = c.req.header("if-none-match");
+
+  if (ifNoneMatch === etag) {
+    return c.body(null, {
+      status: 304,
+      headers: {
+        "etag": etag,
+        "cache-control": "private, no-cache, max-age=0, must-revalidate",
+      },
+    });
+  }
+
+  return c.json(summary, {
     headers: {
       "etag": etag,
       "cache-control": "private, no-cache, max-age=0, must-revalidate",
@@ -16561,8 +16753,9 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const normalizedChatModelTier = normalizeChatModelTier(body.model_tier);
   const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
   const userZAiApiKey = await getUserZAIApiKey(c.env.DB, user.id);
-  const chatRouterRuntimeConfig = await loadChatModelRuntimeConfig(c.env.DB, "legacy");
   const chatModelApiKey = normalizedChatModelTier === "core" ? userZAiApiKey : userOpenAiApiKey;
+  const chatRouterModelTier = normalizedChatModelTier;
+  const chatRouterApiKey = chatModelApiKey;
   const normalizedChatModelFps = normalizeChatModelFps(body.model_fps, normalizedChatModelTier);
   const normalizedChatRunningResolution =
     normalizedChatModelTier === "core"
@@ -16579,42 +16772,6 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     );
   }
 
-  if (!chatV2Enabled && !chatRouterRuntimeConfig.apiKey) {
-    return c.json(
-      {
-        error: "Router Gemini API key is not configured in model_api_keys for tier 'legacy'.",
-      },
-      400
-    );
-  }
-
-  // Check if user can use chat (has subscription OR tokens OR active payment method)
-  const activeSubscription = await c.env.DB.prepare(
-    "SELECT * FROM subscriptions WHERE user_id = ? AND is_active = 1 LIMIT 1"
-  )
-    .bind(user.id)
-    .first();
-
-  const balance = await c.env.DB.prepare(
-    "SELECT * FROM token_balances WHERE user_id = ?"
-  )
-    .bind(user.id)
-    .first();
-
-  const activeCard = await c.env.DB.prepare(
-    "SELECT * FROM active_cards WHERE user_id = ? LIMIT 1"
-  )
-    .bind(user.id)
-    .first();
-
-  const hasSubscription = !!activeSubscription;
-  const hasTokens = balance && (balance as any).balance > 0;
-  const hasActiveCard = !!activeCard;
-
-  if (!chatV2Enabled && !hasSubscription && !hasTokens && !hasActiveCard) {
-    return c.json({ error: `You need either a subscription, chat tokens, or an active payment method to use ${brand.chatName}.` }, 402);
-  }
-
   let videoSearchBlockReason: string | null = null;
   let videoSearchBlockMessage: string | null = null;
   if (!chatModelApiKey) {
@@ -16623,13 +16780,6 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
       normalizedChatModelTier === "core"
         ? "Z.ai API key is required in Settings before using video search."
         : "OpenAI API key is required in Settings before using video search.";
-  } else if (!chatRouterRuntimeConfig.apiKey) {
-    videoSearchBlockReason = "ROUTER_API_KEY_REQUIRED";
-    videoSearchBlockMessage =
-      "Router Gemini API key is not configured in model_api_keys for tier 'legacy'.";
-  } else if (!hasSubscription && !hasTokens && !hasActiveCard) {
-    videoSearchBlockReason = "VIDEO_SEARCH_ACCESS_REQUIRED";
-    videoSearchBlockMessage = `You need either a subscription, chat tokens, or an active payment method to use ${brand.chatName} video search.`;
   }
   const videoSearchAllowed = !videoSearchBlockReason;
 
@@ -16824,7 +16974,8 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     model_fps: normalizedChatModelFps,
     running_resolution: normalizedChatRunningResolution,
     model_api_key: chatModelApiKey || null,
-    router_api_key: chatRouterRuntimeConfig.apiKey || null,
+    router_model_tier: chatRouterModelTier,
+    router_api_key: chatRouterApiKey || null,
     video_search_allowed: videoSearchAllowed,
     video_search_block_reason: videoSearchBlockReason,
     video_search_block_message: videoSearchBlockMessage,
@@ -17139,29 +17290,10 @@ app.post("/api/chat/messages", anyAuthMiddleware, zValidator("json", SendChatMes
   const user = c.get("user")!;
   const data = c.req.valid("json");
   const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
-  const routerRuntime = await loadChatModelRuntimeConfig(c.env.DB, "legacy");
   const modelApiKey = userOpenAiApiKey;
 
   if (!modelApiKey) {
     return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
-  }
-
-  if (!routerRuntime.apiKey) {
-    return c.json(
-      { error: "Router Gemini API key is not configured in model_api_keys for tier 'legacy'." },
-      400
-    );
-  }
-
-  // Check token balance
-  const balance = await c.env.DB.prepare(
-    "SELECT * FROM token_balances WHERE user_id = ?"
-  )
-    .bind(user.id)
-    .first();
-
-  if (!balance || (balance as any).balance <= 0) {
-    return c.json({ error: "Insufficient token balance" }, 402);
   }
 
   // Store user message
@@ -17186,28 +17318,21 @@ app.post("/api/chat/messages", anyAuthMiddleware, zValidator("json", SendChatMes
         model_tier: "ultra",
         model_fps: normalizeChatModelFps(undefined, "ultra"),
         model_api_key: modelApiKey,
-        router_api_key: routerRuntime.apiKey,
+        router_model_tier: "ultra",
+        router_api_key: modelApiKey,
       })
     )
     .run();
 
   // Placeholder response
   const mockResponse = "Processing your query. The local executable will analyze the camera feed and respond shortly.";
-  const tokensUsed = 10;
+  const tokensUsed = 0;
 
   await c.env.DB.prepare(
     `INSERT INTO chat_messages (user_id, role, content, camera_ids, tokens_used)
      VALUES (?, 'assistant', ?, ?, ?)`
   )
     .bind(user.id, mockResponse, data.camera_id ? String(data.camera_id) : null, tokensUsed)
-    .run();
-
-  // Deduct tokens
-  await c.env.DB.prepare(
-    `UPDATE token_balances SET balance = balance - ?, total_spent = total_spent + ?, updated_at = CURRENT_TIMESTAMP
-     WHERE user_id = ?`
-  )
-    .bind(tokensUsed, tokensUsed, user.id)
     .run();
 
   const { results } = await c.env.DB.prepare(
@@ -20433,6 +20558,7 @@ app.post("/api/agent/chat-progress", async (c) => {
 
 // EXE chat router result endpoint (called by desktop agent)
 app.post("/api/agent/chat-router-result", async (c) => {
+  await ensureSchema(c.env.DB);
   const url = new URL(c.req.url);
   const clientId = url.searchParams.get("client_id");
 
@@ -20513,6 +20639,8 @@ app.post("/api/agent/chat-router-result", async (c) => {
   }
 
   const now = new Date().toISOString();
+  const usageRecordedAt =
+    tokens_prompt > 0 || tokens_output > 0 || tokens_total > 0 ? now : null;
 
   // Verify session belongs to this user
   const session = await c.env.DB.prepare(
@@ -20594,6 +20722,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
          model_prompt_tokens = ?,
          model_output_tokens = ?,
          model_total_tokens = ?,
+         usage_recorded_at = ?,
          message_type = ?,
          is_pending = 0,
          progress_json = NULL,
@@ -20608,6 +20737,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
         tokens_prompt || 0,
         tokens_output || 0,
         tokens_total || 0,
+        usageRecordedAt,
         hasFramesToAnalyze ? "router_ack" : "final",
         now,
         (pendingMessage as any).id
@@ -20673,6 +20803,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
 
 // EXE chat response endpoint (called by desktop agent)
 app.post("/api/agent/chat-response", async (c) => {
+  await ensureSchema(c.env.DB);
   const url = new URL(c.req.url);
   const clientId = url.searchParams.get("client_id");
 
@@ -20771,6 +20902,10 @@ app.post("/api/agent/chat-response", async (c) => {
     }
 
     const now = new Date().toISOString();
+    const usageRecordedAt =
+      model_prompt_tokens > 0 || model_output_tokens > 0 || model_total_tokens > 0
+        ? now
+        : null;
 
     // Verify session belongs to this user
     console.log("[CHAT RESPONSE] Verifying session ownership...");
@@ -20951,6 +21086,7 @@ app.post("/api/agent/chat-response", async (c) => {
                model_prompt_tokens = ?,
                model_output_tokens = ?,
                model_total_tokens = ?,
+               usage_recorded_at = ?,
                is_pending = 0,
                progress_json = NULL,
                updated_at = ?
@@ -20963,6 +21099,7 @@ app.post("/api/agent/chat-response", async (c) => {
             model_prompt_tokens,
             model_output_tokens,
             model_total_tokens,
+            usageRecordedAt,
             now,
             (pendingMessage as any).id
           )
@@ -21010,6 +21147,7 @@ app.post("/api/agent/chat-response", async (c) => {
                model_prompt_tokens = ?,
                model_output_tokens = ?,
                model_total_tokens = ?,
+               usage_recorded_at = ?,
                message_type = 'final',
                is_pending = 0,
                progress_json = NULL,
@@ -21024,6 +21162,7 @@ app.post("/api/agent/chat-response", async (c) => {
             model_prompt_tokens,
             model_output_tokens,
             model_total_tokens,
+            usageRecordedAt,
             now,
             (pendingMessage as any).id
           )
@@ -21045,8 +21184,8 @@ app.post("/api/agent/chat-response", async (c) => {
         
         // If no pending message found, create a new final message anyway
         const insertResult = await c.env.DB.prepare(
-          `INSERT INTO chat_messages (user_id, session_id, role, content, camera_ids, camera_selection_json, tokens_used, model_prompt_tokens, model_output_tokens, model_total_tokens, message_type, is_pending, created_at, updated_at)
-           VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, 'final', 0, ?, ?)`
+          `INSERT INTO chat_messages (user_id, session_id, role, content, camera_ids, camera_selection_json, tokens_used, model_prompt_tokens, model_output_tokens, model_total_tokens, usage_recorded_at, message_type, is_pending, created_at, updated_at)
+           VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, 'final', 0, ?, ?)`
         )
           .bind(
             userId,
@@ -21058,6 +21197,7 @@ app.post("/api/agent/chat-response", async (c) => {
             model_prompt_tokens,
             model_output_tokens,
             model_total_tokens,
+            usageRecordedAt,
             now,
             now
           )
@@ -22690,7 +22830,6 @@ app.get("/api/agent/orchestrator/state", async (c) => {
     tokenBalanceRow,
     userOpenAiApiKey,
     userZAiApiKey,
-    routerRuntimeConfig,
   ] = await Promise.all([
     c.env.DB.prepare(
       `SELECT id, name, description, is_online, is_service_running, created_at, updated_at
@@ -22794,7 +22933,6 @@ app.get("/api/agent/orchestrator/state", async (c) => {
       .first(),
     getUserOpenAIApiKey(c.env.DB, userId),
     getUserZAIApiKey(c.env.DB, userId),
-    loadChatModelRuntimeConfig(c.env.DB, "legacy"),
   ]);
 
   const cameras = (camerasResult.results || []).map((row: any) => ({
@@ -22872,7 +23010,6 @@ app.get("/api/agent/orchestrator/state", async (c) => {
 
   const hasActiveSubscription = !!activeSubscription;
   const hasTokens = tokenBalance.balance > 0;
-  const hasActiveCard = cardsCount > 0;
 
   return c.json({
     generated_at: new Date().toISOString(),
@@ -22919,7 +23056,7 @@ app.get("/api/agent/orchestrator/state", async (c) => {
       active_cards_count: cardsCount,
       has_tokens: hasTokens,
       token_balance: tokenBalance,
-      chat_access: hasActiveSubscription || hasTokens || hasActiveCard,
+      chat_access: true,
       subscription: activeSubscription
         ? {
             id: Number((activeSubscription as any).id ?? 0),
@@ -22937,13 +23074,12 @@ app.get("/api/agent/orchestrator/state", async (c) => {
     api_keys: {
       openai_configured: !!userOpenAiApiKey,
       zai_configured: !!userZAiApiKey,
-      legacy_router_configured: !!routerRuntimeConfig.apiKey,
+      legacy_router_configured: !!userOpenAiApiKey || !!userZAiApiKey,
+      router_uses_chat_model_credentials: true,
     },
     capabilities: {
-      video_search_ultra_available:
-        !!userOpenAiApiKey && !!routerRuntimeConfig.apiKey && (hasActiveSubscription || hasTokens || hasActiveCard),
-      video_search_core_available:
-        !!userZAiApiKey && !!routerRuntimeConfig.apiKey && (hasActiveSubscription || hasTokens || hasActiveCard),
+      video_search_ultra_available: !!userOpenAiApiKey,
+      video_search_core_available: !!userZAiApiKey,
       chatv2_enabled:
         String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "1" ||
         String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "true" ||

@@ -1,6 +1,7 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { deepReplaceKnownBrandTokens } from "@/shared/brand";
+import { drakonFindOverrides } from "@/react-app/drakonFindI18n";
 
 const resources = {
   en: {
@@ -3838,6 +3839,10 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.scheduleBuilder.summaryTitle": "\u0645\u0644\u062e\u0635 \u0627\u0644\u062c\u062f\u0648\u0644",
   },
 };
+
+for (const [lang, entries] of Object.entries(drakonFindOverrides)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
 
 const brandedResources = deepReplaceKnownBrandTokens(resources);
 

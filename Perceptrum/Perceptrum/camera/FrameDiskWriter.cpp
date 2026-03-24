@@ -845,43 +845,10 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
         }
     }
 
-    auto discardOpenClip = [&](SegmentWriter& writer,
-                               int& framesInClip,
-                               std::deque<std::string>& clipPaths,
-                               std::chrono::steady_clock::time_point& lastWriteAt,
-                               TimeParts& lastWriteTp,
-                               bool& hasLastWriteTp) {
-        if (!writer.isOpened()) return;
-
-        const std::string danglingPath = writer.path;
-        closeWriter_(writer);
-        framesInClip = 0;
-        lastWriteAt = Clock::time_point{};
-        lastWriteTp = TimeParts{};
-        hasLastWriteTp = false;
-
-        if (!danglingPath.empty()) {
-            auto it = std::find(clipPaths.begin(), clipPaths.end(), danglingPath);
-            if (it != clipPaths.end()) {
-                clipPaths.erase(it);
-            }
-
-            std::error_code rmEc;
-            fs::remove(danglingPath, rmEc);
-            if (rmEc) {
-                Logger::instance().logDebug(
-                    cameraId_,
-                    "FrameDiskWriter: failed removing discarded partial clip " +
-                    danglingPath + " err=" + rmEc.message()
-                );
-            }
-        }
-    };
-
     if ((capture10Enabled_ && new10Fps != capture10Fps_) || (!capture10Enabled_ && new10Fps > 0) ||
         (capture10Enabled_ && new10Fps == 0))
     {
-        discardOpenClip(
+        discardOpenClip_(
             writer10_,
             framesIn10_,
             tenSecondPaths_,
@@ -894,7 +861,7 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
     if ((capture60Enabled_ && new60Fps != capture60Fps_) || (!capture60Enabled_ && new60Fps > 0) ||
         (capture60Enabled_ && new60Fps == 0))
     {
-        discardOpenClip(
+        discardOpenClip_(
             writer60_,
             framesIn60_,
             sixtySecondPaths_,
@@ -2161,6 +2128,112 @@ void FrameDiskWriter::finalizeLastClipName_(
     );
 }
 
+void FrameDiskWriter::discardOpenClip_(
+    SegmentWriter& writer,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp)
+{
+    if (!writer.isOpened()) return;
+
+    const std::string danglingPath = writer.path;
+    closeWriter_(writer);
+    framesInClip = 0;
+    lastWriteAt = Clock::time_point{};
+    lastWriteTp = TimeParts{};
+    hasLastWriteTp = false;
+
+    if (!danglingPath.empty()) {
+        auto it = std::find(clipPaths.begin(), clipPaths.end(), danglingPath);
+        if (it != clipPaths.end()) {
+            clipPaths.erase(it);
+        }
+
+        std::error_code rmEc;
+        fs::remove(danglingPath, rmEc);
+        if (rmEc) {
+            Logger::instance().logDebug(
+                cameraId_,
+                "FrameDiskWriter: failed removing discarded partial clip " +
+                danglingPath + " err=" + rmEc.message()
+            );
+        }
+    }
+}
+
+bool FrameDiskWriter::finalizeOpenClip_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo)
+{
+    if (!writer.isOpened()) {
+        return false;
+    }
+
+    if (framesInClip <= 0) {
+        discardOpenClip_(writer, framesInClip, clipPaths, lastWriteAt, lastWriteTp, hasLastWriteTp);
+        return false;
+    }
+
+    const TimeParts endTp = hasLastWriteTp ? lastWriteTp : getTimeParts_();
+    closeWriter_(writer);
+    framesInClip = 0;
+    lastWriteAt = Clock::time_point{};
+    lastWriteTp = TimeParts{};
+    hasLastWriteTp = false;
+
+    const std::string durationSuffix =
+        (clipSeconds >= 60) ? "_60s.mp4" : "_10s.mp4";
+    finalizeLastClipName_(clipPaths, endTp, durationSuffix);
+    if (!clipPaths.empty()) {
+        std::error_code fileSizeEc;
+        const auto clipSize = fs::file_size(clipPaths.back(), fileSizeEc);
+        if (!fileSizeEc) {
+            recordWriteTelemetry_(static_cast<std::uint64_t>(clipSize), 0);
+        }
+    }
+
+    if (clipSeconds < 60 && !clipPaths.empty()) {
+        const std::string& last10sPath = clipPaths.back();
+        std::error_code clipSizeEc;
+        const auto last10sClipSize = fs::file_size(last10sPath, clipSizeEc);
+        const std::uint64_t last10sBytes = clipSizeEc ? 0 : static_cast<std::uint64_t>(last10sClipSize);
+        if (shouldCopyInferenceVideo) {
+            const auto copyStartedAt = Clock::now();
+            const bool copied = copyTenSecondClipToInferenceTemp(cameraId_, last10sPath);
+            if (copied && last10sBytes > 0) {
+                const auto latencyUs = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
+                );
+                recordWriteTelemetry_(last10sBytes, latencyUs);
+            }
+        }
+        for (const auto& t : jobsTargets) {
+            if (t.jobId > 0 && t.stepId > 0 && t.copyVideo) {
+                const auto copyStartedAt = Clock::now();
+                const bool copied =
+                    copyTenSecondClipToJobsTemp(t.jobId, t.stepId, cameraId_, last10sPath);
+                if (copied && last10sBytes > 0) {
+                    const auto latencyUs = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
+                    );
+                    recordWriteTelemetry_(last10sBytes, latencyUs);
+                }
+            }
+        }
+    }
+
+    return !clipPaths.empty();
+}
+
 
 
 
@@ -2582,41 +2655,8 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
         }
     };
 
-    auto discardOpenClip = [&](SegmentWriter& writer,
-                               int& framesInClip,
-                               std::deque<std::string>& clipPaths,
-                               std::chrono::steady_clock::time_point& lastWriteAt,
-                               TimeParts& lastWriteTp,
-                               bool& hasLastWriteTp) {
-        if (!writer.isOpened()) return;
-
-        const std::string danglingPath = writer.path;
-        closeWriter_(writer);
-        framesInClip = 0;
-        lastWriteAt = Clock::time_point{};
-        lastWriteTp = TimeParts{};
-        hasLastWriteTp = false;
-
-        if (!danglingPath.empty()) {
-            auto it = std::find(clipPaths.begin(), clipPaths.end(), danglingPath);
-            if (it != clipPaths.end()) {
-                clipPaths.erase(it);
-            }
-
-            std::error_code rmEc;
-            fs::remove(danglingPath, rmEc);
-            if (rmEc) {
-                Logger::instance().logDebug(
-                    cameraId_,
-                    "FrameDiskWriter: failed to remove discarded partial clip " +
-                    danglingPath + " err=" + rmEc.message()
-                );
-            }
-        }
-    };
-
     if (!hasVideoDemand) {
-        discardOpenClip(
+        discardOpenClip_(
             writer10_,
             framesIn10_,
             tenSecondPaths_,
@@ -2624,7 +2664,7 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
             lastVideoFrameWriteTp10_,
             hasLastVideoFrameWriteTp10_
         );
-        discardOpenClip(
+        discardOpenClip_(
             writer60_,
             framesIn60_,
             sixtySecondPaths_,
@@ -2680,52 +2720,17 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
             return;
         }
 
-        const TimeParts endTp = hasLastWriteTp ? lastWriteTp : tp;
-        closeWriter_(writer);
-        framesInClip = 0;
-        hasLastWriteTp = false;
-        lastWriteAt = Clock::time_point{};
-
-        const std::string durationSuffix =
-            (clipSeconds >= 60) ? "_60s.mp4" : "_10s.mp4";
-        finalizeLastClipName_(clipPaths, endTp, durationSuffix);
-        if (!clipPaths.empty()) {
-            std::error_code fileSizeEc;
-            const auto clipSize = fs::file_size(clipPaths.back(), fileSizeEc);
-            if (!fileSizeEc) {
-                recordWriteTelemetry_(static_cast<std::uint64_t>(clipSize), 0);
-            }
-        }
-
-        if (clipSeconds < 60 && !clipPaths.empty()) {
-            const std::string& last10sPath = clipPaths.back();
-            std::error_code clipSizeEc;
-            const auto last10sClipSize = fs::file_size(last10sPath, clipSizeEc);
-            const std::uint64_t last10sBytes = clipSizeEc ? 0 : static_cast<std::uint64_t>(last10sClipSize);
-            if (shouldCopyInferenceVideo) {
-                const auto copyStartedAt = Clock::now();
-                const bool copied = copyTenSecondClipToInferenceTemp(cameraId_, last10sPath);
-                if (copied && last10sBytes > 0) {
-                    const auto latencyUs = static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
-                    );
-                    recordWriteTelemetry_(last10sBytes, latencyUs);
-                }
-            }
-            for (const auto& t : jobsTargets) {
-                if (t.jobId > 0 && t.stepId > 0 && t.copyVideo) {
-                    const auto copyStartedAt = Clock::now();
-                    const bool copied =
-                        copyTenSecondClipToJobsTemp(t.jobId, t.stepId, cameraId_, last10sPath);
-                    if (copied && last10sBytes > 0) {
-                        const auto latencyUs = static_cast<std::uint64_t>(
-                            std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - copyStartedAt).count()
-                        );
-                        recordWriteTelemetry_(last10sBytes, latencyUs);
-                    }
-                }
-            }
-        }
+        finalizeOpenClip_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            jobsTargets,
+            shouldCopyInferenceVideo
+        );
     };
 
     writeProfileIfDue(
@@ -2762,9 +2767,91 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
 
 void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold)
 {
-    (void)idleThreshold;
-    // Intentionally disabled: partial clip flush would create <10s files (e.g. *_5s.mp4).
-    // We now persist video clips only when 10-frame batches are completed in save().
+    if (idleThreshold.count() <= 0) {
+        return;
+    }
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    const auto now = Clock::now();
+    auto flushProfileIfIdle = [&](int clipSeconds,
+                                  SegmentWriter& writer,
+                                  int& framesInClip,
+                                  std::deque<std::string>& clipPaths,
+                                  std::chrono::steady_clock::time_point& lastWriteAt,
+                                  TimeParts& lastWriteTp,
+                                  bool& hasLastWriteTp) {
+        if (!writer.isOpened()) return;
+
+        if (!hasLastWriteTp || lastWriteAt.time_since_epoch().count() == 0) {
+            discardOpenClip_(writer, framesInClip, clipPaths, lastWriteAt, lastWriteTp, hasLastWriteTp);
+            return;
+        }
+
+        const auto idleFor = now - lastWriteAt;
+        if (idleFor < idleThreshold) {
+            return;
+        }
+
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: flushing idle open clip profile=" + std::to_string(clipSeconds) +
+            "s frames=" + std::to_string(framesInClip) +
+            " idle_ms=" + std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(idleFor).count()
+            )
+        );
+
+        finalizeOpenClip_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            jobsTargets,
+            shouldCopyInferenceVideo
+        );
+    };
+
+    flushProfileIfIdle(
+        10,
+        writer10_,
+        framesIn10_,
+        tenSecondPaths_,
+        lastVideoFrameWriteAt10_,
+        lastVideoFrameWriteTp10_,
+        hasLastVideoFrameWriteTp10_
+    );
+
+    flushProfileIfIdle(
+        60,
+        writer60_,
+        framesIn60_,
+        sixtySecondPaths_,
+        lastVideoFrameWriteAt60_,
+        lastVideoFrameWriteTp60_,
+        hasLastVideoFrameWriteTp60_
+    );
 }
 
 

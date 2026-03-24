@@ -1,5 +1,7 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import Toast from "@/react-app/components/Toast";
 import BrazilStateTileMap from "@/react-app/components/BrazilStateTileMap";
@@ -37,34 +39,19 @@ type ToastState = {
   type: "success" | "error" | "warning" | "info";
 } | null;
 
-const ENTITY_TYPE_OPTIONS = [
-  { value: "person", label: "Pessoa" },
-  { value: "object", label: "Objeto" },
-  { value: "car", label: "Carro" },
-  { value: "motorcycle", label: "Moto" },
-  { value: "animal", label: "Animal" },
-  { value: "custom", label: "Outro / custom" },
-];
+const ENTITY_TYPE_OPTIONS = ["person", "object", "car", "motorcycle", "animal", "custom"] as const;
 
-const SEARCH_DURATION_OPTIONS = [
-  { value: 1800, label: "30 min" },
-  { value: 3600, label: "1 h" },
-  { value: 21600, label: "6 h" },
-  { value: 43200, label: "12 h" },
-  { value: 86400, label: "24 h" },
-  { value: 604800, label: "7 dias" },
-  { value: 2592000, label: "30 dias" },
-];
+const SEARCH_DURATION_OPTIONS = [1800, 3600, 21600, 43200, 86400, 604800, 2592000] as const;
 
 const ACTIVE_SEARCH_STATUSES = ["queued", "dispatching", "running"];
-const STATUS_LABELS: Record<string, string> = {
-  queued: "Na fila",
-  dispatching: "Despachando",
-  running: "Ao vivo",
-  completed: "Concluida",
-  cancelled: "Cancelada",
-  failed: "Falhou",
-  paused: "Pausada",
+const STATUS_TRANSLATION_KEYS: Record<string, string> = {
+  queued: "drakonFind.status.queued",
+  dispatching: "drakonFind.status.dispatching",
+  running: "drakonFind.status.running",
+  completed: "drakonFind.status.completed",
+  cancelled: "drakonFind.status.cancelled",
+  failed: "drakonFind.status.failed",
+  paused: "drakonFind.status.paused",
 };
 const STATUS_STYLES: Record<string, string> = {
   queued: "border-cyan-500/30 bg-cyan-500/10 text-cyan-200",
@@ -75,26 +62,91 @@ const STATUS_STYLES: Record<string, string> = {
   failed: "border-red-500/30 bg-red-500/10 text-red-100",
   paused: "border-amber-500/30 bg-amber-500/10 text-amber-100",
 };
+
+const SEARCH_DURATION_TRANSLATION_KEYS: Record<number, string> = {
+  1800: "drakonFind.searchComposer.durationOption.1800",
+  3600: "drakonFind.searchComposer.durationOption.3600",
+  21600: "drakonFind.searchComposer.durationOption.21600",
+  43200: "drakonFind.searchComposer.durationOption.43200",
+  86400: "drakonFind.searchComposer.durationOption.86400",
+  604800: "drakonFind.searchComposer.durationOption.604800",
+  2592000: "drakonFind.searchComposer.durationOption.2592000",
+};
+
+const SEARCH_MESSAGE_TRANSLATION_KEYS: Record<string, string> = {
+  "Uma parte do escopo ja esta ao vivo; outras cameras aguardam slot livre nos clientes elegiveis.":
+    "drakonFind.runtime.wait.runningBlockedClient",
+  "Uma parte do escopo ja esta ao vivo; outras cameras ainda aguardam roteamento para um cliente elegivel.":
+    "drakonFind.runtime.wait.runningUnresolvedAssignment",
+  "Parte do escopo ja foi despachada; outras cameras aguardam slot livre nos clientes elegiveis.":
+    "drakonFind.runtime.wait.dispatchingBlockedClient",
+  "Parte do escopo ja foi despachada; outras cameras ainda aguardam roteamento para um cliente elegivel.":
+    "drakonFind.runtime.wait.dispatchingUnresolvedAssignment",
+  "Aguardando slot livre nos clientes elegiveis para continuar a distribuicao.":
+    "drakonFind.runtime.wait.queuedBlockedClient",
+  "Ainda existem cameras aguardando roteamento para um cliente elegivel.":
+    "drakonFind.runtime.wait.queuedUnresolvedAssignment",
+};
+
 const DRAKON_FIND_MAX_TARGET_IMAGES = 6;
 const DRAKON_FIND_TARGET_IMAGE_MAX_BYTES = 1_500_000;
+
+function getLocaleTag(language?: string) {
+  const normalized = String(language || "en").toLowerCase();
+  if (normalized.startsWith("pt")) return "pt-BR";
+  if (normalized.startsWith("es")) return "es-ES";
+  if (normalized.startsWith("fr")) return "fr-FR";
+  if (normalized.startsWith("zh")) return "zh-CN";
+  if (normalized.startsWith("ar")) return "ar";
+  return "en-US";
+}
 
 function formatMegabyteLimit(bytes: number) {
   const megabytes = bytes / 1_000_000;
   return `${Number.isInteger(megabytes) ? megabytes.toFixed(0) : megabytes.toFixed(1)}MB`;
 }
 
-function getDrakonFindTargetImageUploadError(files: File[], existingCount = 0) {
+function getEntityTypeLabel(value: string, t: TFunction) {
+  const key = `drakonFind.targetForm.entityType.${value}`;
+  const translated = t(key);
+  return translated === key ? value : translated;
+}
+
+function getSearchDurationLabel(seconds: number | null | undefined, t?: TFunction) {
+  const numeric = typeof seconds === "number" ? seconds : Number(seconds);
+  const key = SEARCH_DURATION_TRANSLATION_KEYS[numeric];
+  if (key && t) return t(key);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "--";
+  if (!t) {
+    if (numeric % 86400 === 0) return `${numeric / 86400} day(s)`;
+    if (numeric % 3600 === 0) return `${numeric / 3600} h`;
+    return `${Math.round(numeric / 60)} min`;
+  }
+  if (numeric % 86400 === 0) return t("drakonFind.searchComposer.durationDays", { count: numeric / 86400 });
+  if (numeric % 3600 === 0) return t("drakonFind.searchComposer.durationHours", { count: numeric / 3600 });
+  return t("drakonFind.searchComposer.durationMinutes", { count: Math.round(numeric / 60) });
+}
+
+function getStatusLabel(status: string, t: TFunction) {
+  const key = STATUS_TRANSLATION_KEYS[status];
+  return key ? t(key) : status;
+}
+
+function getDrakonFindTargetImageUploadError(files: File[], t: TFunction, existingCount = 0) {
   if (!files.length) return null;
   if (existingCount + files.length > DRAKON_FIND_MAX_TARGET_IMAGES) {
-    return `Cada target suporta ate ${DRAKON_FIND_MAX_TARGET_IMAGES} imagens de referencia.`;
+    return t("drakonFind.validation.maxImages", { count: DRAKON_FIND_MAX_TARGET_IMAGES });
   }
   for (const file of files) {
-    const fileName = file?.name?.trim() || "arquivo";
+    const fileName = file?.name?.trim() || t("drakonFind.validation.fileFallback");
     if (!String(file?.type || "").toLowerCase().startsWith("image/")) {
-      return `${fileName} nao e uma imagem valida.`;
+      return t("drakonFind.validation.invalidImage", { fileName });
     }
     if (typeof file?.size === "number" && file.size > DRAKON_FIND_TARGET_IMAGE_MAX_BYTES) {
-      return `${fileName} excede o limite de ${formatMegabyteLimit(DRAKON_FIND_TARGET_IMAGE_MAX_BYTES)}.`;
+      return t("drakonFind.validation.imageTooLarge", {
+        fileName,
+        limit: formatMegabyteLimit(DRAKON_FIND_TARGET_IMAGE_MAX_BYTES),
+      });
     }
   }
   return null;
@@ -150,24 +202,27 @@ function normalizeDrakonFindTarget(value: unknown): DrakonFindTarget | null {
   };
 }
 
-function formatDateTime(value?: string | null) {
+function formatDateTime(value?: string | null, localeTag = "en-US") {
   if (!value) return "--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--";
-  return new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(date);
+  return new Intl.DateTimeFormat(localeTag, { dateStyle: "short", timeStyle: "short" }).format(date);
 }
 
-function formatRelative(value?: string | null) {
+function formatRelative(value?: string | null, localeTag = "en-US") {
   if (!value) return "--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--";
-  const diff = Date.now() - date.getTime();
-  const mins = Math.floor(diff / 60000);
-  const hours = Math.floor(diff / 3600000);
-  if (mins < 1) return "agora";
-  if (mins < 60) return `${mins} min`;
-  if (hours < 24) return `${hours} h`;
-  return formatDateTime(value);
+  const diff = date.getTime() - Date.now();
+  const mins = Math.round(diff / 60000);
+  if (Math.abs(mins) < 60) {
+    return new Intl.RelativeTimeFormat(localeTag, { numeric: "auto" }).format(mins, "minute");
+  }
+  const hours = Math.round(diff / 3600000);
+  if (Math.abs(hours) < 24) {
+    return new Intl.RelativeTimeFormat(localeTag, { numeric: "auto" }).format(hours, "hour");
+  }
+  return formatDateTime(value, localeTag);
 }
 
 function formatConfidence(value?: number | null) {
@@ -176,37 +231,28 @@ function formatConfidence(value?: number | null) {
   return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}%`;
 }
 
-function formatAssignedClientLabel(count: number) {
-  return count === 1 ? "1 cliente atribuido" : `${count} clientes atribuidos`;
+function formatAssignedClientLabel(count: number, t: TFunction) {
+  return t("drakonFind.operations.clientsAssigned", { count });
 }
 
 function isInformationalSearchMessage(value?: string | null) {
   if (!value) return false;
-  return [
-    "Aguardando slot livre",
-    "Ainda existem cameras aguardando roteamento",
-    "Uma parte do escopo ja esta ao vivo",
-    "Parte do escopo ja foi despachada",
-  ].some((prefix) => value.startsWith(prefix));
+  return Object.keys(SEARCH_MESSAGE_TRANSLATION_KEYS).some((message) => value.startsWith(message));
 }
 
-function formatDurationLabel(seconds?: number | null) {
-  const numeric = typeof seconds === "number" ? seconds : Number(seconds);
-  const option = SEARCH_DURATION_OPTIONS.find((item) => item.value === numeric);
-  if (option) return option.label;
-  if (!Number.isFinite(numeric) || numeric <= 0) return "--";
-  if (numeric % 86400 === 0) return `${numeric / 86400} dia(s)`;
-  if (numeric % 3600 === 0) return `${numeric / 3600} h`;
-  return `${Math.round(numeric / 60)} min`;
+function translateSearchMessage(value: string | null | undefined, t: TFunction) {
+  if (!value) return "";
+  const key = SEARCH_MESSAGE_TRANSLATION_KEYS[value];
+  return key ? t(key) : value;
 }
 
-function getTargetDeletionBlockReason(target?: DrakonFindTarget | null) {
+function getTargetDeletionBlockReason(target: DrakonFindTarget | null | undefined, t: TFunction) {
   if (!target) return null;
   const linkedSearchCount = Number(target.search_count || 0);
   if (linkedSearchCount <= 0) return null;
   return linkedSearchCount === 1
-    ? "Remova a busca vinculada antes de excluir este target."
-    : `Remova as ${linkedSearchCount} buscas vinculadas antes de excluir este target.`;
+    ? t("drakonFind.validation.removeLinkedSearchBeforeDelete")
+    : t("drakonFind.validation.removeLinkedSearchesBeforeDelete", { count: linkedSearchCount });
 }
 
 function findNearestScrollContainer(element: HTMLElement | null) {
@@ -249,9 +295,10 @@ function MetricCard({
 }
 
 function StatusBadge({ status }: { status: string }) {
+  const { t } = useTranslation();
   return (
     <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${STATUS_STYLES[status] || "border-gray-700 bg-gray-800 text-gray-200"}`}>
-      {STATUS_LABELS[status] || status}
+      {getStatusLabel(status, t)}
     </span>
   );
 }
@@ -265,14 +312,19 @@ function ImageGrid({
   deletingImageId: number | null;
   onDelete: (imageId: number) => void;
 }) {
+  const { t } = useTranslation();
   if (!images.length) {
-    return <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Nenhuma imagem de referencia carregada.</div>;
+    return (
+      <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">
+        {t("drakonFind.generic.noReferenceImages")}
+      </div>
+    );
   }
   return (
     <div className="grid gap-3 sm:grid-cols-2">
       {images.map((image) => (
         <div key={image.id} className="relative overflow-hidden rounded-[20px] border border-gray-800 bg-gray-950/70">
-          <img src={image.image_url} alt="Target" className="h-36 w-full object-cover" />
+          <img src={image.image_url} alt={t("drakonFind.generic.targetImageAlt")} className="h-36 w-full object-cover" />
           <button
             type="button"
             onClick={() => onDelete(image.id)}
@@ -294,6 +346,7 @@ function HitVideoModal({
   hit: DrakonFindHit | null;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   if (!hit?.video_url) return null;
 
   return (
@@ -313,7 +366,7 @@ function HitVideoModal({
           <X className="h-4 w-4" />
         </button>
         <div className="mb-4 pr-12">
-          <div className="text-lg font-semibold text-gray-100">{hit.camera_name || "Camera sem nome"}</div>
+          <div className="text-lg font-semibold text-gray-100">{hit.camera_name || t("drakonFind.generic.unnamedCamera")}</div>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-300">{hit.summary}</p>
         </div>
         <div className="overflow-hidden rounded-[24px] border border-white/10 bg-black">
@@ -333,6 +386,9 @@ function HitVideoModal({
 }
 
 export default function DrakonFindPage() {
+  const { t, i18n } = useTranslation();
+  const currentLanguage = i18n.resolvedLanguage || i18n.language || "en";
+  const localeTag = useMemo(() => getLocaleTag(currentLanguage), [currentLanguage]);
   const createTargetCardRef = useRef<HTMLDivElement | null>(null);
   const selectedTargetCardRef = useRef<HTMLDivElement | null>(null);
   const scrollRestoreRef = useRef<{ container: HTMLElement | null; top: number; left: number } | null>(null);
@@ -390,8 +446,14 @@ export default function DrakonFindPage() {
     acc[hit.search_id] = (acc[hit.search_id] || 0) + 1;
     return acc;
   }, {}), [hits]);
+  const heroCards = [
+    { icon: ShieldCheck, title: t("drakonFind.hero.dispatchTitle"), text: t("drakonFind.hero.dispatchText") },
+    { icon: ImagePlus, title: t("drakonFind.hero.visualTitle"), text: t("drakonFind.hero.visualText") },
+    { icon: Activity, title: t("drakonFind.hero.runtimeTitle"), text: t("drakonFind.hero.runtimeText") },
+    { icon: FileText, title: t("drakonFind.hero.auditTitle"), text: t("drakonFind.hero.auditText") },
+  ];
   const validateTargetImageFiles = (files: File[], existingCount = 0) => {
-    const errorMessage = getDrakonFindTargetImageUploadError(files, existingCount);
+    const errorMessage = getDrakonFindTargetImageUploadError(files, t, existingCount);
     if (errorMessage) {
       setToast({ message: errorMessage, type: "warning" });
       return false;
@@ -437,13 +499,15 @@ export default function DrakonFindPage() {
         fetch("/api/drakon-find/audit?limit=40", { cache: "no-store" }),
         fetch("/api/drakon-find/hits?limit=40", { cache: "no-store" }),
       ]);
-      if (!targetsRes.ok || !searchesRes.ok || !auditRes.ok || !hitsRes.ok) throw new Error("Falha ao carregar o painel");
       const [targetsData, searchesData, auditData, hitsData] = await Promise.all([
         targetsRes.json(),
         searchesRes.json(),
         auditRes.json(),
         hitsRes.json(),
       ]);
+      if (!targetsRes.ok || !searchesRes.ok || !auditRes.ok || !hitsRes.ok) {
+        throw new Error(t("drakonFind.toast.panelLoadFailed"));
+      }
       startTransition(() => {
         const nextTargets = Array.isArray(targetsData?.targets)
           ? targetsData.targets
@@ -469,7 +533,10 @@ export default function DrakonFindPage() {
       });
     } catch (error) {
       console.error("[DRAKON FIND] load failed", error);
-      setToast({ message: "Nao foi possivel carregar o Drakon Find.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.loadFailed"),
+        type: "error",
+      });
     } finally {
       if (showLoading) setLoading(false);
     }
@@ -477,12 +544,12 @@ export default function DrakonFindPage() {
 
   useEffect(() => {
     void loadCollections(true);
-  }, []);
+  }, [currentLanguage]);
 
   useEffect(() => {
     const interval = window.setInterval(() => void loadCollections(false), 5000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [currentLanguage]);
 
   useEffect(() => {
     if (!expandedHit) return;
@@ -513,7 +580,7 @@ export default function DrakonFindPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ selected_states: deferredSelectedStates, country_code: "BR" }),
         });
-        if (!response.ok) throw new Error("Falha ao resolver escopo");
+        if (!response.ok) throw new Error(t("drakonFind.toast.scopeResolveFailed"));
         const data = await response.json();
         if (!cancelled) startTransition(() => setScope(data?.scope || null));
       } catch (error) {
@@ -546,7 +613,7 @@ export default function DrakonFindPage() {
     const existingCount = target
       ? Math.max(Array.isArray(target.images) ? target.images.length : 0, Number(target.image_count || 0))
       : 0;
-    const validationError = getDrakonFindTargetImageUploadError(files, existingCount);
+    const validationError = getDrakonFindTargetImageUploadError(files, t, existingCount);
     if (validationError) throw new Error(validationError);
     setUploadingTargetId(targetId);
     try {
@@ -555,7 +622,7 @@ export default function DrakonFindPage() {
         formData.append("image", file);
         const response = await fetch(`/api/drakon-find/targets/${targetId}/images`, { method: "POST", body: formData });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data?.error || "Falha ao enviar imagem do target");
+        if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.imageUploadFailed"));
       }
       await loadCollections(false, targetId);
     } finally {
@@ -584,9 +651,9 @@ export default function DrakonFindPage() {
         }),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao cadastrar target");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.targetCreateFailed"));
       const createdTargetId = Number(data?.target?.id || 0);
-      if (createdTargetId <= 0) throw new Error("Falha ao cadastrar target");
+      if (createdTargetId <= 0) throw new Error(t("drakonFind.toast.targetCreateFailed"));
 
       await loadCollections(false, createdTargetId);
       setSelectedTargetNewFiles([]);
@@ -595,7 +662,7 @@ export default function DrakonFindPage() {
         try {
           await uploadImagesToTarget(createdTargetId, filesToUpload);
           setSelectedTargetId(createdTargetId);
-          setToast({ message: "Target cadastrado e imagens enviadas com sucesso.", type: "success" });
+          setToast({ message: t("drakonFind.toast.targetCreatedWithImages"), type: "success" });
         } catch (uploadError) {
           await loadCollections(false, createdTargetId);
           setSelectedTargetId(createdTargetId);
@@ -603,18 +670,21 @@ export default function DrakonFindPage() {
           setToast({
             message:
               uploadError instanceof Error
-                ? `Target criado, mas o upload das imagens falhou: ${uploadError.message}`
-                : "Target criado, mas o upload das imagens falhou.",
+                ? t("drakonFind.toast.targetCreatedUploadFailedWithError", { error: uploadError.message })
+                : t("drakonFind.toast.targetCreatedUploadFailed"),
             type: "warning",
           });
         }
       } else {
-        setToast({ message: "Target cadastrado com sucesso.", type: "success" });
+        setToast({ message: t("drakonFind.toast.targetCreated"), type: "success" });
       }
       setTargetForm({ entity_type: "object", name: "", description: "", traits: "" });
       setTargetFiles([]);
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao cadastrar target.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.targetCreateFailed"),
+        type: "error",
+      });
     } finally {
       setSavingTarget(false);
       restoreScrollPosition();
@@ -622,10 +692,10 @@ export default function DrakonFindPage() {
   };
 
   const handleCreateSearch = async () => {
-    if (!selectedTarget) return setToast({ message: "Selecione um target antes de iniciar.", type: "warning" });
-    if (!selectedStates.length) return setToast({ message: "Escolha ao menos um estado no mapa.", type: "warning" });
+    if (!selectedTarget) return setToast({ message: t("drakonFind.toast.selectTargetFirst"), type: "warning" });
+    if (!selectedStates.length) return setToast({ message: t("drakonFind.toast.selectStateFirst"), type: "warning" });
     if (effectiveEligibleCameraCount <= 0) {
-      return setToast({ message: "Reative ao menos uma camera no preview antes de iniciar.", type: "warning" });
+      return setToast({ message: t("drakonFind.toast.reactivateCameraFirst"), type: "warning" });
     }
     setCreatingSearch(true);
     try {
@@ -641,11 +711,14 @@ export default function DrakonFindPage() {
         }),
       });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao criar busca");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchCreateFailed"));
       await loadCollections(false);
-      setToast({ message: "Busca criada e enviada para o orquestrador distribuido.", type: "success" });
+      setToast({ message: t("drakonFind.toast.searchCreated"), type: "success" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao criar busca.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.searchCreateFailed"),
+        type: "error",
+      });
     } finally {
       setCreatingSearch(false);
     }
@@ -656,11 +729,14 @@ export default function DrakonFindPage() {
     try {
       const response = await fetch(`/api/drakon-find/searches/${searchId}/cancel`, { method: "POST" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao cancelar busca");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchCancelFailed"));
       await loadCollections(false);
-      setToast({ message: "Cancelamento enviado aos agentes.", type: "info" });
+      setToast({ message: t("drakonFind.toast.searchCancelled"), type: "info" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao cancelar busca.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.searchCancelFailed"),
+        type: "error",
+      });
     } finally {
       setActingSearchId(null);
     }
@@ -671,11 +747,14 @@ export default function DrakonFindPage() {
     try {
       const response = await fetch(`/api/drakon-find/searches/${searchId}/retry`, { method: "POST" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao repetir busca");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchRetryFailed"));
       await loadCollections(false);
-      setToast({ message: "Busca recolocada na fila com novo attempt.", type: "success" });
+      setToast({ message: t("drakonFind.toast.searchRetried"), type: "success" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao repetir busca.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.searchRetryFailed"),
+        type: "error",
+      });
     } finally {
       setActingSearchId(null);
     }
@@ -686,12 +765,15 @@ export default function DrakonFindPage() {
     try {
       const response = await fetch(`/api/drakon-find/searches/${searchId}`, { method: "DELETE" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao excluir operacao");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchDeleteFailed"));
       if (expandedHit?.search_id === searchId) setExpandedHit(null);
       await loadCollections(false);
-      setToast({ message: "Operacao removida do painel.", type: "info" });
+      setToast({ message: t("drakonFind.toast.searchDeleted"), type: "info" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao excluir operacao.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.searchDeleteFailed"),
+        type: "error",
+      });
     } finally {
       setActingSearchId(null);
     }
@@ -702,39 +784,43 @@ export default function DrakonFindPage() {
     try {
       const response = await fetch(`/api/drakon-find/targets/${targetId}/images/${imageId}`, { method: "DELETE" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao remover imagem");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.imageDeleteFailed"));
       await loadCollections(false);
-      setToast({ message: "Imagem removida do target.", type: "info" });
+      setToast({ message: t("drakonFind.toast.imageDeleted"), type: "info" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao remover imagem.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.imageDeleteFailed"),
+        type: "error",
+      });
     } finally {
       setDeletingImageId(null);
     }
   };
 
   const handleDeleteTarget = async (target: DrakonFindTarget) => {
-    const blockReason = getTargetDeletionBlockReason(target);
+    const blockReason = getTargetDeletionBlockReason(target, t);
     if (blockReason) {
       setToast({ message: blockReason, type: "warning" });
       return;
     }
-    const confirmed = window.confirm(
-      `Excluir o target "${target.name}" do catalogo? Essa acao remove tambem as imagens de referencia.`
-    );
+    const confirmed = window.confirm(t("drakonFind.confirm.deleteTarget", { name: target.name }));
     if (!confirmed) return;
 
     setDeletingTargetId(target.id);
     try {
       const response = await fetch(`/api/drakon-find/targets/${target.id}`, { method: "DELETE" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao excluir target");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.targetDeleteFailed"));
       if (selectedTargetId === target.id) {
         setSelectedTargetNewFiles([]);
       }
       await loadCollections(false);
-      setToast({ message: "Target removido do catalogo.", type: "info" });
+      setToast({ message: t("drakonFind.toast.targetDeleted"), type: "info" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao excluir target.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.targetDeleteFailed"),
+        type: "error",
+      });
     } finally {
       setDeletingTargetId(null);
     }
@@ -742,7 +828,7 @@ export default function DrakonFindPage() {
 
   const handleDeleteHit = async (hit: DrakonFindHit) => {
     const confirmed = window.confirm(
-      `Excluir o alerta da camera "${hit.camera_name || "Camera sem nome"}"? Essa acao remove a midia associada.`
+      t("drakonFind.confirm.deleteHit", { cameraName: hit.camera_name || t("drakonFind.generic.unnamedCamera") })
     );
     if (!confirmed) return;
 
@@ -750,16 +836,23 @@ export default function DrakonFindPage() {
     try {
       const response = await fetch(`/api/drakon-find/hits/${hit.id}`, { method: "DELETE" });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data?.error || "Falha ao excluir alerta");
+      if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.hitDeleteFailed"));
       if (expandedHit?.id === hit.id) setExpandedHit(null);
       await loadCollections(false);
-      setToast({ message: "Alerta removido dos resultados ao vivo.", type: "info" });
+      setToast({ message: t("drakonFind.toast.hitDeleted"), type: "info" });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "Falha ao excluir alerta.", type: "error" });
+      setToast({
+        message: error instanceof Error ? error.message : t("drakonFind.toast.hitDeleteFailed"),
+        type: "error",
+      });
     } finally {
       setDeletingHitId(null);
     }
   };
+
+  const selectedTargetDeletionBlockReason = selectedTarget
+    ? getTargetDeletionBlockReason(selectedTarget, t)
+    : null;
 
   return (
     <Layout>
@@ -769,23 +862,17 @@ export default function DrakonFindPage() {
             <div>
               <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.22em] text-blue-200">
                 <Radar className="h-3.5 w-3.5" />
-                Drakon Find
+                {t("drakonFind.hero.badge")}
               </div>
               <h1 className="text-3xl font-semibold tracking-tight text-gray-100 md:text-4xl">
-                Busca distribuida com target visual, geofence por UF e resultados ao vivo.
+                {t("drakonFind.hero.title")}
               </h1>
               <p className="mt-4 max-w-3xl text-sm leading-6 text-gray-300 md:text-base">
-                A operacao agora sobe imagens do target, distribui comandos por EXE elegivel e mostra
-                hits, progresso e auditoria em uma mesma superficie.
+                {t("drakonFind.hero.subtitle")}
               </p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              {[
-                { icon: ShieldCheck, title: "Dispatch", text: "Roteamento por EXE com limite de concorrencia." },
-                { icon: ImagePlus, title: "Visual", text: "Texto + imagens reais do alvo como referencia." },
-                { icon: Activity, title: "Runtime", text: "Hits, progresso e erros atualizados no polling." },
-                { icon: FileText, title: "Auditoria", text: "Cada tentativa registra create, retry, cancel e match." },
-              ].map(({ icon: Icon, title, text }) => (
+              {heroCards.map(({ icon: Icon, title, text }) => (
                 <div key={title} className="rounded-[24px] border border-blue-500/20 bg-gray-950/50 p-4">
                   <div className="mb-3 flex items-center gap-2 text-blue-200">
                     <Icon className="h-4 w-4" />
@@ -799,10 +886,10 @@ export default function DrakonFindPage() {
         </section>
 
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <MetricCard icon={Target} label="Targets" value={targets.length} subtext="Catalogo visual pronto para novas buscas." />
-          <MetricCard icon={Activity} label="Ativas" value={activeSearches.length} subtext="Buscas em fila, dispatch ou execucao." />
-          <MetricCard icon={Eye} label="Hits" value={hits.length} subtext="Matches recebidos do runtime distribuido." />
-          <MetricCard icon={Camera} label="Escopo" value={effectiveEligibleCameraCount} subtext="Cameras publicas ativas para a busca nas UFs marcadas." />
+          <MetricCard icon={Target} label={t("drakonFind.metrics.targetsLabel")} value={targets.length} subtext={t("drakonFind.metrics.targetsText")} />
+          <MetricCard icon={Activity} label={t("drakonFind.metrics.activeLabel")} value={activeSearches.length} subtext={t("drakonFind.metrics.activeText")} />
+          <MetricCard icon={Eye} label={t("drakonFind.metrics.hitsLabel")} value={hits.length} subtext={t("drakonFind.metrics.hitsText")} />
+          <MetricCard icon={Camera} label={t("drakonFind.metrics.scopeLabel")} value={effectiveEligibleCameraCount} subtext={t("drakonFind.metrics.scopeText")} />
         </section>
 
         <section className="space-y-6">
@@ -811,21 +898,21 @@ export default function DrakonFindPage() {
               <div className="mb-5 flex items-center gap-3">
                 <div className="rounded-2xl border border-blue-500/20 bg-blue-500/10 p-3 text-blue-300"><Target className="h-5 w-5" /></div>
                 <div>
-                  <p className="text-sm font-semibold text-gray-100">Cadastro do target</p>
-                  <p className="text-sm text-gray-400">Texto operacional mais referencias visuais.</p>
+                  <p className="text-sm font-semibold text-gray-100">{t("drakonFind.targetForm.title")}</p>
+                  <p className="text-sm text-gray-400">{t("drakonFind.targetForm.subtitle")}</p>
                 </div>
               </div>
               <form onSubmit={handleCreateTarget} className="space-y-4">
                 <select value={targetForm.entity_type} onChange={(event) => setTargetForm((current) => ({ ...current, entity_type: event.target.value }))} className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100">
-                  {ENTITY_TYPE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  {ENTITY_TYPE_OPTIONS.map((option) => <option key={option} value={option}>{getEntityTypeLabel(option, t)}</option>)}
                 </select>
-                <input value={targetForm.name} onChange={(event) => setTargetForm((current) => ({ ...current, name: event.target.value }))} placeholder="Ex.: moto com duas pessoas" className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
-                <textarea value={targetForm.description} onChange={(event) => setTargetForm((current) => ({ ...current, description: event.target.value }))} rows={5} placeholder="Descreva aparencia, sinais visuais, contexto e padroes do alvo." className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
-                <input value={targetForm.traits} onChange={(event) => setTargetForm((current) => ({ ...current, traits: event.target.value }))} placeholder="capacete branco, mochila preta, adesivo lateral..." className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
+                <input value={targetForm.name} onChange={(event) => setTargetForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("drakonFind.targetForm.namePlaceholder")} className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
+                <textarea value={targetForm.description} onChange={(event) => setTargetForm((current) => ({ ...current, description: event.target.value }))} rows={5} placeholder={t("drakonFind.targetForm.descriptionPlaceholder")} className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
+                <input value={targetForm.traits} onChange={(event) => setTargetForm((current) => ({ ...current, traits: event.target.value }))} placeholder={t("drakonFind.targetForm.traitsPlaceholder")} className="w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-4 py-3 text-sm text-gray-100" />
                 <label onPointerDown={(event) => captureScrollPosition(event.currentTarget)} className="block rounded-[22px] border border-dashed border-gray-700 bg-gray-950/70 px-4 py-4 text-sm text-gray-300">
                   <div className="flex items-center gap-3">
                     <ImagePlus className="h-4 w-4 text-cyan-300" />
-                    <span>Selecionar imagens de referencia</span>
+                    <span>{t("drakonFind.targetForm.selectImages")}</span>
                   </div>
                   <input
                     type="file"
@@ -851,7 +938,7 @@ export default function DrakonFindPage() {
                 </label>
                 <button type="submit" disabled={savingTarget} className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-blue-500 via-cyan-500 to-sky-400 px-4 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60">
                   {savingTarget ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-                  Registrar target
+                  {t("drakonFind.targetForm.submit")}
                 </button>
               </form>
             </div>
@@ -859,17 +946,17 @@ export default function DrakonFindPage() {
             <div className="rounded-[28px] border border-gray-800/80 bg-gradient-to-br from-gray-900 to-gray-950 p-6">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-gray-100">Catalogo</p>
-                  <p className="text-sm text-gray-400">Selecione o alvo usado na proxima busca.</p>
+                  <p className="text-sm font-semibold text-gray-100">{t("drakonFind.catalog.title")}</p>
+                  <p className="text-sm text-gray-400">{t("drakonFind.catalog.subtitle")}</p>
                 </div>
-                <div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{targets.length} alvo(s)</div>
+                <div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{t("drakonFind.catalog.count", { count: targets.length })}</div>
               </div>
               <div className="max-h-[34rem] space-y-3 overflow-y-auto overscroll-contain pr-1">
-                {loading && !targets.length ? <div className="rounded-2xl border border-gray-800 bg-gray-950/60 px-4 py-5 text-sm text-gray-400">Carregando targets...</div> : null}
-                {!loading && !targets.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Nenhum target cadastrado ainda.</div> : null}
+                {loading && !targets.length ? <div className="rounded-2xl border border-gray-800 bg-gray-950/60 px-4 py-5 text-sm text-gray-400">{t("drakonFind.catalog.loading")}</div> : null}
+                {!loading && !targets.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">{t("drakonFind.catalog.empty")}</div> : null}
                 {targets.map((target) => {
                   const selected = target.id === selectedTargetId;
-                  const deleteBlockedReason = getTargetDeletionBlockReason(target);
+                  const deleteBlockedReason = getTargetDeletionBlockReason(target, t);
                   const deletingTarget = deletingTargetId === target.id;
                   return (
                     <div
@@ -886,15 +973,15 @@ export default function DrakonFindPage() {
                           className="min-w-0 flex-1 text-left"
                         >
                           <div className="text-sm font-semibold text-gray-100">{target.name}</div>
-                          <div className="mt-1 text-xs uppercase tracking-[0.16em] text-gray-500">{target.entity_type}</div>
+                          <div className="mt-1 text-xs uppercase tracking-[0.16em] text-gray-500">{getEntityTypeLabel(target.entity_type, t)}</div>
                         </button>
                         <div className="flex items-center gap-2">
-                          {selected ? <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-200">Selecionado</span> : null}
+                          {selected ? <span className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-200">{t("drakonFind.catalog.selected")}</span> : null}
                           <button
                             type="button"
                             onClick={() => void handleDeleteTarget(target)}
                             disabled={Boolean(deleteBlockedReason) || deletingTarget}
-                            title={deleteBlockedReason || "Excluir target"}
+                            title={deleteBlockedReason || t("drakonFind.catalog.delete")}
                             className="inline-flex items-center justify-center rounded-xl border border-red-500/30 bg-red-500/10 p-2 text-red-100 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {deletingTarget ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
@@ -911,8 +998,8 @@ export default function DrakonFindPage() {
                       >
                         <p className="line-clamp-3 text-sm leading-6 text-gray-300">{target.description}</p>
                         <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-400">
-                          <span>{target.image_count} imagem(ns) de referencia</span>
-                          <span>{target.search_count || 0} busca(s) vinculada(s)</span>
+                          <span>{t("drakonFind.catalog.referenceImages", { count: target.image_count })}</span>
+                          <span>{t("drakonFind.catalog.linkedSearches", { count: target.search_count || 0 })}</span>
                         </div>
                         {deleteBlockedReason ? <div className="mt-2 text-xs text-amber-200">{deleteBlockedReason}</div> : null}
                       </button>
@@ -927,12 +1014,12 @@ export default function DrakonFindPage() {
             <div className="rounded-[28px] border border-gray-800/80 bg-gradient-to-br from-gray-900 to-gray-950 p-6">
               <div className="mb-5 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-gray-100">Composer da busca</p>
-                  <p className="text-sm text-gray-400">Target visual, geofence, video 60s e preview do escopo.</p>
+                  <p className="text-sm font-semibold text-gray-100">{t("drakonFind.searchComposer.title")}</p>
+                  <p className="text-sm text-gray-400">{t("drakonFind.searchComposer.subtitle")}</p>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
                   <div className="inline-flex items-center gap-2 rounded-full border border-gray-700 bg-gray-950/70 px-3 py-1.5 text-xs text-gray-300"><Search className="h-3.5 w-3.5 text-blue-300" />allowpublicaccess = 1</div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100"><Activity className="h-3.5 w-3.5 text-cyan-300" />video 60s</div>
+                  <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100"><Activity className="h-3.5 w-3.5 text-cyan-300" />{t("drakonFind.operations.videoWindow")}</div>
                 </div>
               </div>
               <div className="grid gap-6 2xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] 2xl:items-start">
@@ -941,23 +1028,23 @@ export default function DrakonFindPage() {
                     <div className="space-y-4">
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div>
-                          <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200"><Target className="h-3.5 w-3.5" />Target ativo</div>
+                          <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200"><Target className="h-3.5 w-3.5" />{t("drakonFind.searchComposer.activeTarget")}</div>
                           <h2 className="text-xl font-semibold text-gray-100">{selectedTarget.name}</h2>
                           <p className="mt-2 text-sm leading-6 text-gray-300">{selectedTarget.description}</p>
                         </div>
                         <button
                           type="button"
                           onClick={() => void handleDeleteTarget(selectedTarget)}
-                          disabled={Boolean(getTargetDeletionBlockReason(selectedTarget)) || deletingTargetId === selectedTarget.id}
-                          title={getTargetDeletionBlockReason(selectedTarget) || "Excluir target"}
+                          disabled={Boolean(selectedTargetDeletionBlockReason) || deletingTargetId === selectedTarget.id}
+                          title={selectedTargetDeletionBlockReason || t("drakonFind.catalog.delete")}
                           className="inline-flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-3.5 py-2.5 text-sm font-medium text-red-100 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {deletingTargetId === selectedTarget.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                          Excluir target
+                          {t("drakonFind.searchComposer.deleteTarget")}
                         </button>
                       </div>
                       <label onPointerDown={(event) => captureScrollPosition(event.currentTarget)} className="block rounded-[22px] border border-dashed border-gray-700 bg-gray-950/75 px-4 py-4 text-sm text-gray-300">
-                        <div className="flex items-center gap-3"><UploadCloud className="h-4 w-4 text-cyan-300" /><span>Adicionar novas imagens de referencia</span></div>
+                        <div className="flex items-center gap-3"><UploadCloud className="h-4 w-4 text-cyan-300" /><span>{t("drakonFind.searchComposer.addImages")}</span></div>
                         <input
                           type="file"
                           accept="image/*"
@@ -988,10 +1075,10 @@ export default function DrakonFindPage() {
                             try {
                               await uploadImagesToTarget(selectedTarget.id, selectedTargetNewFiles);
                               setSelectedTargetNewFiles([]);
-                              setToast({ message: "Imagens de referencia atualizadas.", type: "success" });
+                              setToast({ message: t("drakonFind.toast.referenceImagesUpdated"), type: "success" });
                             } catch (error) {
                               setToast({
-                                message: error instanceof Error ? error.message : "Falha ao enviar imagens do target.",
+                                message: error instanceof Error ? error.message : t("drakonFind.toast.referenceImagesUploadFailed"),
                                 type: "error",
                               });
                             }
@@ -999,49 +1086,49 @@ export default function DrakonFindPage() {
                           className="inline-flex items-center gap-2 rounded-2xl border border-cyan-500/30 bg-cyan-500/10 px-3.5 py-2.5 text-sm font-medium text-cyan-100 disabled:opacity-60"
                         >
                           {uploadingTargetId === selectedTarget.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-                          Subir referencias
+                          {t("drakonFind.searchComposer.uploadReferences")}
                         </button>
-                        <div className="text-xs text-gray-400">{selectedTarget.image_count} imagem(ns) ativas.</div>
-                        <div className="text-xs text-gray-500">{selectedTarget.search_count || 0} busca(s) vinculada(s).</div>
+                        <div className="text-xs text-gray-400">{t("drakonFind.searchComposer.activeImages", { count: selectedTarget.image_count })}</div>
+                        <div className="text-xs text-gray-500">{t("drakonFind.searchComposer.linkedSearches", { count: selectedTarget.search_count || 0 })}</div>
                       </div>
-                      {getTargetDeletionBlockReason(selectedTarget) ? <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">{getTargetDeletionBlockReason(selectedTarget)}</div> : null}
+                      {selectedTargetDeletionBlockReason ? <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">{selectedTargetDeletionBlockReason}</div> : null}
                       <ImageGrid images={selectedTarget.images || []} deletingImageId={deletingImageId} onDelete={(imageId) => handleDeleteTargetImage(selectedTarget.id, imageId)} />
                     </div>
-                  ) : <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Nenhum target selecionado.</div>}
+                  ) : <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">{t("drakonFind.searchComposer.noTarget")}</div>}
                 </div>
                 <BrazilStateTileMap selectedStates={selectedStates} onToggleState={(stateCode: string) => setSelectedStates((current) => current.includes(stateCode) ? current.filter((item) => item !== stateCode) : [...current, stateCode])} stateCounts={scopeStateCounts} />
               </div>
               <div className="mt-6 grid gap-4 xl:grid-cols-[minmax(280px,0.72fr)_minmax(0,1.28fr)]">
                 <div className="rounded-[24px] border border-gray-800 bg-gray-950/60 p-5">
-                  <div className="mb-4 flex items-center gap-2 text-gray-100"><MapPin className="h-4 w-4 text-cyan-300" /><span className="text-sm font-semibold">Resumo</span>{scopeLoading ? <Loader2 className="h-4 w-4 animate-spin text-blue-400" /> : null}</div>
+                  <div className="mb-4 flex items-center gap-2 text-gray-100"><MapPin className="h-4 w-4 text-cyan-300" /><span className="text-sm font-semibold">{t("drakonFind.searchComposer.summaryTitle")}</span>{scopeLoading ? <Loader2 className="h-4 w-4 animate-spin text-blue-400" /> : null}</div>
                   <div className="mb-4 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-3">
-                    <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">Janela operacional</div>
+                    <div className="text-[11px] uppercase tracking-[0.18em] text-cyan-200">{t("drakonFind.searchComposer.operationalWindow")}</div>
                     <div className="mt-2 grid gap-3 sm:grid-cols-2">
                       <div>
-                        <div className="text-xs text-gray-400">Duracao</div>
+                        <div className="text-xs text-gray-400">{t("drakonFind.searchComposer.durationLabel")}</div>
                         <select value={searchDurationSeconds} onChange={(event) => setSearchDurationSeconds(Number(event.target.value) || 1800)} className="mt-2 w-full rounded-2xl border border-gray-700 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100">
-                          {SEARCH_DURATION_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          {SEARCH_DURATION_OPTIONS.map((option) => <option key={option} value={option}>{getSearchDurationLabel(option, t)}</option>)}
                         </select>
                       </div>
                       <div className="rounded-2xl border border-gray-800 bg-gray-900/80 px-4 py-3">
-                        <div className="text-xs text-gray-400">Input type</div>
-                        <div className="mt-2 text-sm font-semibold text-gray-100">Video continuo de 60s</div>
-                        <div className="mt-1 text-xs text-gray-500">A cada janela nova finalizada.</div>
+                        <div className="text-xs text-gray-400">{t("drakonFind.searchComposer.inputType")}</div>
+                        <div className="mt-2 text-sm font-semibold text-gray-100">{t("drakonFind.searchComposer.inputTypeValue")}</div>
+                        <div className="mt-1 text-xs text-gray-500">{t("drakonFind.searchComposer.inputTypeHint")}</div>
                       </div>
                     </div>
                   </div>
                   <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">
-                    {[{ label: "Estados", value: selectedStates.length }, { label: "Cameras", value: effectiveEligibleCameraCount }, { label: "Owners", value: includedOwnerCount }].map((item) => <div key={item.label} className="rounded-2xl border border-gray-800 bg-gray-900/80 p-4"><div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">{item.label}</div><div className="mt-2 text-2xl font-semibold text-gray-100">{item.value}</div></div>)}
+                    {[{ label: t("drakonFind.searchComposer.statesLabel"), value: selectedStates.length }, { label: t("drakonFind.searchComposer.camerasLabel"), value: effectiveEligibleCameraCount }, { label: t("drakonFind.searchComposer.ownersLabel"), value: includedOwnerCount }].map((item) => <div key={item.label} className="rounded-2xl border border-gray-800 bg-gray-900/80 p-4"><div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">{item.label}</div><div className="mt-2 text-2xl font-semibold text-gray-100">{item.value}</div></div>)}
                   </div>
                 </div>
                 <div className="rounded-[24px] border border-gray-800 bg-gray-950/60 p-5">
                   <div className="mb-2 flex items-center justify-between gap-3 text-gray-100">
-                    <div className="flex items-center gap-2"><Camera className="h-4 w-4 text-blue-300" /><span className="text-sm font-semibold">Preview</span></div>
+                    <div className="flex items-center gap-2"><Camera className="h-4 w-4 text-blue-300" /><span className="text-sm font-semibold">{t("drakonFind.searchComposer.previewTitle")}</span></div>
                     <div className="rounded-full border border-gray-700 bg-gray-900/80 px-3 py-1 text-[11px] text-gray-300">
-                      {effectiveEligibleCameraCount} ativas / {scope?.eligible_camera_count ?? 0} elegiveis
+                      {t("drakonFind.searchComposer.previewCount", { active: effectiveEligibleCameraCount, eligible: scope?.eligible_camera_count ?? 0 })}
                     </div>
                   </div>
-                  <div className="mb-4 text-xs text-gray-400">Clique na camera para desmarcar da busca. Clique novamente para reativar.</div>
+                  <div className="mb-4 text-xs text-gray-400">{t("drakonFind.searchComposer.previewHint")}</div>
                   <div className="max-h-[26rem] overflow-y-auto overscroll-contain pr-1 grid gap-2 lg:grid-cols-2">
                     {scopePreviewCameras.map((camera) => {
                       const excluded = excludedScopeCameraIdSet.has(camera.id);
@@ -1061,31 +1148,31 @@ export default function DrakonFindPage() {
                           <div className="flex items-start justify-between gap-3">
                             <div>
                               <div className={`text-sm font-medium ${excluded ? "text-amber-50" : "text-gray-100"}`}>{camera.name}</div>
-                              <div className={`mt-1 text-xs ${excluded ? "text-amber-100/80" : "text-gray-400"}`}>{camera.city || "Cidade nao informada"} - {camera.state_code || camera.state || "--"}</div>
+                              <div className={`mt-1 text-xs ${excluded ? "text-amber-100/80" : "text-gray-400"}`}>{camera.city || t("drakonFind.searchComposer.cityUnknown")} - {camera.state_code || camera.state || "--"}</div>
                             </div>
                             <span className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${excluded ? "border-amber-400/30 bg-amber-500/10 text-amber-100" : "border-cyan-400/20 bg-cyan-500/10 text-cyan-100"}`}>
-                              {excluded ? "Desmarcada" : "Selecionada"}
+                              {excluded ? t("drakonFind.searchComposer.cameraDeselected") : t("drakonFind.searchComposer.cameraSelected")}
                             </span>
                           </div>
                         </button>
                       );
                     })}
-                    {!scopePreviewCameras.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-900/50 px-4 py-6 text-sm text-gray-400 lg:col-span-2">O preview aparece aqui assim que o escopo for resolvido.</div> : null}
+                    {!scopePreviewCameras.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-900/50 px-4 py-6 text-sm text-gray-400 lg:col-span-2">{t("drakonFind.searchComposer.previewEmpty")}</div> : null}
                   </div>
                 </div>
               </div>
               <div className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-[24px] border border-blue-500/20 bg-blue-500/10 px-4 py-4">
-                <div><div className="text-sm font-semibold text-gray-100">Pronto para iniciar a busca</div><div className="mt-1 text-sm text-gray-300">O runtime vai analisar janelas de video de 60 segundos por {formatDurationLabel(searchDurationSeconds).toLowerCase()} e acompanhar hits ao vivo. {excludedScopeCameraIds.length ? `${excludedScopeCameraIds.length} camera(s) foram desmarcadas manualmente.` : ""}</div></div>
+                <div><div className="text-sm font-semibold text-gray-100">{t("drakonFind.searchComposer.readyTitle")}</div><div className="mt-1 text-sm text-gray-300">{excludedScopeCameraIds.length ? t("drakonFind.searchComposer.readySummaryWithExcluded", { duration: getSearchDurationLabel(searchDurationSeconds, t), count: excludedScopeCameraIds.length }) : t("drakonFind.searchComposer.readySummary", { duration: getSearchDurationLabel(searchDurationSeconds, t) })}</div></div>
                 <button type="button" onClick={handleCreateSearch} disabled={!canCreateSearch || creatingSearch} className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-blue-500 via-cyan-500 to-sky-400 px-5 py-3 text-sm font-semibold text-slate-950 disabled:opacity-60">
                   {creatingSearch ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
-                  Iniciar busca
+                  {t("drakonFind.searchComposer.start")}
                 </button>
               </div>
             </div>
 
             <div className="grid gap-6 xl:grid-cols-2 xl:items-start">
               <div className="rounded-[28px] border border-gray-800/80 bg-gradient-to-br from-gray-900 to-gray-950 p-6">
-                <div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-gray-100">Operacoes em tempo real</p><p className="text-sm text-gray-400">Status, clientes e hits por busca.</p></div><div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{searches.length} busca(s)</div></div>
+                <div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-gray-100">{t("drakonFind.operations.title")}</p><p className="text-sm text-gray-400">{t("drakonFind.operations.subtitle")}</p></div><div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{t("drakonFind.operations.count", { count: searches.length })}</div></div>
                 <div className="max-h-[42rem] space-y-3 overflow-y-auto overscroll-contain pr-1">
                   {searches.map((search) => {
                     const isActing = actingSearchId === search.id;
@@ -1095,29 +1182,29 @@ export default function DrakonFindPage() {
                     return (
                       <div key={search.id} className="rounded-[24px] border border-gray-800 bg-gray-950/55 p-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
-                          <div><div className="mb-2 flex items-center gap-2"><StatusBadge status={search.status} /><span className="text-xs uppercase tracking-[0.16em] text-gray-500">#{search.id}</span></div><div className="text-lg font-semibold text-gray-100">{search.target_name}</div><div className="mt-1 text-sm text-gray-400">{search.eligible_camera_count} cameras - {formatAssignedClientLabel(search.active_client_count)} - {search.hit_count || searchHitCounts[search.id] || 0} hits</div></div>
-                          <div className="text-right text-xs text-gray-500">ultimo evento {formatRelative(search.last_event_at || search.updated_at)}</div>
+                          <div><div className="mb-2 flex items-center gap-2"><StatusBadge status={search.status} /><span className="text-xs uppercase tracking-[0.16em] text-gray-500">#{search.id}</span></div><div className="text-lg font-semibold text-gray-100">{search.target_name}</div><div className="mt-1 text-sm text-gray-400">{t("drakonFind.operations.meta", { cameraCount: search.eligible_camera_count, clientLabel: formatAssignedClientLabel(search.active_client_count, t), hitCount: search.hit_count || searchHitCounts[search.id] || 0 })}</div></div>
+                          <div className="text-right text-xs text-gray-500">{t("drakonFind.operations.lastEvent", { time: formatRelative(search.last_event_at || search.updated_at, localeTag) })}</div>
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-400">
-                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">video 60s</span>
-                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">duracao {formatDurationLabel(search.duration_seconds)}</span>
-                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">ate {formatDateTime(search.run_until)}</span>
+                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.operations.videoWindow")}</span>
+                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.operations.durationChip", { duration: getSearchDurationLabel(search.duration_seconds, t) })}</span>
+                          <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.operations.untilChip", { date: formatDateTime(search.run_until, localeTag) })}</span>
                         </div>
-                        {search.last_error ? <div className={`mt-4 rounded-2xl border px-3 py-3 text-sm ${isInformationalSearchMessage(search.last_error) ? "border-amber-500/20 bg-amber-500/10 text-amber-100" : "border-red-500/20 bg-red-500/10 text-red-100"}`}>{search.last_error}</div> : null}
-                        {!isActive && search.pending_camera_count > 0 ? <div className="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">Encerramento em propagacao: {search.pending_camera_count} camera(s) ainda estao finalizando o ciclo anterior.</div> : null}
+                        {search.last_error ? <div className={`mt-4 rounded-2xl border px-3 py-3 text-sm ${isInformationalSearchMessage(search.last_error) ? "border-amber-500/20 bg-amber-500/10 text-amber-100" : "border-red-500/20 bg-red-500/10 text-red-100"}`}>{translateSearchMessage(search.last_error, t)}</div> : null}
+                        {!isActive && search.pending_camera_count > 0 ? <div className="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">{t("drakonFind.operations.finishing", { count: search.pending_camera_count })}</div> : null}
                         <div className="mt-4 flex flex-wrap gap-2">
-                          {isActive ? <button type="button" disabled={isActing} onClick={() => handleCancelSearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}Cancelar</button> : <button type="button" disabled={isActing || !canRetry} onClick={() => handleRetrySearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{canRetry ? "Retry" : "Finalizando"}</button>}
-                          {!isActive ? <button type="button" disabled={isActing || !canDelete} onClick={() => handleDeleteSearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-gray-700 bg-gray-900/80 px-3 py-2 text-sm font-medium text-gray-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}{canDelete ? "Excluir" : "Finalizando"}</button> : null}
+                          {isActive ? <button type="button" disabled={isActing} onClick={() => handleCancelSearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Ban className="h-4 w-4" />}{t("drakonFind.operations.cancel")}</button> : <button type="button" disabled={isActing || !canRetry} onClick={() => handleRetrySearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}{canRetry ? t("drakonFind.operations.retry") : t("drakonFind.operations.finalizing")}</button>}
+                          {!isActive ? <button type="button" disabled={isActing || !canDelete} onClick={() => handleDeleteSearch(search.id)} className="inline-flex items-center gap-2 rounded-2xl border border-gray-700 bg-gray-900/80 px-3 py-2 text-sm font-medium text-gray-100 disabled:opacity-60">{isActing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}{canDelete ? t("drakonFind.operations.delete") : t("drakonFind.operations.finalizing")}</button> : null}
                         </div>
                       </div>
                     );
                   })}
-                  {!searches.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Nenhuma busca criada ainda.</div> : null}
+                  {!searches.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">{t("drakonFind.operations.empty")}</div> : null}
                 </div>
               </div>
 
               <div className="rounded-[28px] border border-gray-800/80 bg-gradient-to-br from-gray-900 to-gray-950 p-6">
-                <div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-gray-100">Resultados ao vivo</p><p className="text-sm text-gray-400">Matches recebidos do runtime mais recente.</p></div><div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{hits.length} hit(s)</div></div>
+                <div className="mb-4 flex items-center justify-between gap-3"><div><p className="text-sm font-semibold text-gray-100">{t("drakonFind.hits.title")}</p><p className="text-sm text-gray-400">{t("drakonFind.hits.subtitle")}</p></div><div className="rounded-full border border-gray-700 bg-gray-950/80 px-3 py-1 text-xs text-gray-300">{t("drakonFind.hits.count", { count: hits.length })}</div></div>
                 <div className="max-h-[42rem] space-y-3 overflow-y-auto overscroll-contain pr-1">
                   {hits.map((hit) => (
                     <div key={hit.id} className="overflow-hidden rounded-[22px] border border-gray-800 bg-gray-950/55">
@@ -1128,17 +1215,17 @@ export default function DrakonFindPage() {
                             <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-black/10 to-transparent opacity-0 transition duration-200 group-hover:opacity-100" />
                             <button type="button" onClick={() => setExpandedHit(hit)} className="absolute right-3 top-3 inline-flex items-center gap-2 rounded-2xl border border-cyan-400/20 bg-slate-950/78 px-3 py-2 text-xs font-semibold text-cyan-100 opacity-0 shadow-[0_16px_40px_rgba(2,12,27,0.55)] transition duration-200 group-hover:opacity-100 focus:opacity-100">
                               <Maximize2 className="h-3.5 w-3.5" />
-                              Expandir
+                              {t("drakonFind.hits.expand")}
                             </button>
                           </div>
                         ) : hit.image_url ? <img src={hit.image_url} alt={hit.summary} className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-gray-600"><Eye className="h-6 w-6" /></div>}</div>
                         <div className="p-4">
-                          <div className="text-sm font-semibold text-gray-100">{hit.camera_name || "Camera sem nome"}</div>
+                          <div className="text-sm font-semibold text-gray-100">{hit.camera_name || t("drakonFind.generic.unnamedCamera")}</div>
                           <p className="mt-2 text-sm leading-6 text-gray-300">{hit.summary}</p>
                           <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-400">
-                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">busca #{hit.search_id}</span>
-                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">confianca {formatConfidence(hit.confidence)}</span>
-                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{formatRelative(hit.matched_at)}</span>
+                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.hits.searchChip", { id: hit.search_id })}</span>
+                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.hits.confidenceChip", { value: formatConfidence(hit.confidence) })}</span>
+                            <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{formatRelative(hit.matched_at, localeTag)}</span>
                           </div>
                           <div className="mt-4 flex flex-wrap gap-2">
                             <button
@@ -1148,23 +1235,23 @@ export default function DrakonFindPage() {
                               className="inline-flex items-center gap-2 rounded-2xl border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-100 disabled:opacity-60"
                             >
                               {deletingHitId === hit.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                              Excluir alerta
+                              {t("drakonFind.hits.delete")}
                             </button>
-                            {hit.video_url ? <button type="button" onClick={() => setExpandedHit(hit)} className="inline-flex items-center gap-2 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-sm font-medium text-cyan-100"><Maximize2 className="h-4 w-4" />Expandir</button> : null}
+                            {hit.video_url ? <button type="button" onClick={() => setExpandedHit(hit)} className="inline-flex items-center gap-2 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-sm font-medium text-cyan-100"><Maximize2 className="h-4 w-4" />{t("drakonFind.hits.expand")}</button> : null}
                           </div>
                         </div>
                       </div>
                     </div>
                   ))}
-                  {!hits.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Assim que os primeiros matches chegarem, eles aparecem aqui.</div> : null}
+                  {!hits.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">{t("drakonFind.hits.empty")}</div> : null}
                 </div>
               </div>
 
               <div className="xl:col-span-2 rounded-[28px] border border-gray-800/80 bg-gradient-to-br from-gray-900 to-gray-950 p-6">
-                <div className="mb-4 flex items-center gap-3"><div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-3 text-cyan-300"><FileText className="h-5 w-5" /></div><div><p className="text-sm font-semibold text-gray-100">Trilha de auditoria</p><p className="text-sm text-gray-400">Criacao, dispatch, retry, cancelamento e hits.</p></div></div>
+                <div className="mb-4 flex items-center gap-3"><div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-3 text-cyan-300"><FileText className="h-5 w-5" /></div><div><p className="text-sm font-semibold text-gray-100">{t("drakonFind.audit.title")}</p><p className="text-sm text-gray-400">{t("drakonFind.audit.subtitle")}</p></div></div>
                 <div className="max-h-[34rem] space-y-3 overflow-y-auto overscroll-contain pr-1">
-                  {audit.map((entry) => <div key={entry.id} className="rounded-[22px] border border-gray-800 bg-gray-950/55 p-4"><div className="mb-2 flex items-center justify-between gap-3"><span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-300">{entry.action_type.replace(/_/g, " ")}</span><span className="text-xs text-gray-500">{formatDateTime(entry.created_at)}</span></div><p className="text-sm leading-6 text-gray-200">{entry.message}</p></div>)}
-                  {!audit.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">Assim que os primeiros eventos acontecerem, eles aparecem aqui.</div> : null}
+                  {audit.map((entry) => <div key={entry.id} className="rounded-[22px] border border-gray-800 bg-gray-950/55 p-4"><div className="mb-2 flex items-center justify-between gap-3"><span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-300">{entry.action_type.replace(/_/g, " ")}</span><span className="text-xs text-gray-500">{formatDateTime(entry.created_at, localeTag)}</span></div><p className="text-sm leading-6 text-gray-200">{entry.message}</p></div>)}
+                  {!audit.length ? <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/60 px-4 py-6 text-sm text-gray-400">{t("drakonFind.audit.empty")}</div> : null}
                 </div>
               </div>
             </div>

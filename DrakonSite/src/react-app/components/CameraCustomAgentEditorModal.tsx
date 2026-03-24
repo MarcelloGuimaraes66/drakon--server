@@ -12,6 +12,11 @@ import {
   isOpenAiKeyRequiredError,
   isZAiKeyRequiredError,
 } from "@/react-app/utils/openAiKeyGuard";
+import {
+  getCoreModelNoticeCopy,
+  shouldShowCoreModelNotice,
+} from "@/react-app/utils/coreModelNotice";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 
 export type ToastVariant = "default" | "destructive";
 
@@ -495,7 +500,7 @@ export default function CameraCustomAgentEditorModal({
   onSaved,
   showToast,
 }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [displayName, setDisplayName] = useState("");
   const [isEnabled, setIsEnabled] = useState(true);
   const [inputType, setInputType] = useState<"video" | "image">("video");
@@ -1442,7 +1447,12 @@ export default function CameraCustomAgentEditorModal({
               <select
                 value={inferenceModel}
                 onChange={(e) => {
+                  const previousModel = inferenceModel;
                   const nextModel = normalizeInferenceModel(e.target.value);
+                  if (shouldShowCoreModelNotice(nextModel, previousModel)) {
+                    const notice = getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language);
+                    showToast(notice.title, notice.message, "default");
+                  }
                   const constrained = applyExecutionConstraints(
                     inputType,
                     nextModel,
@@ -1463,6 +1473,7 @@ export default function CameraCustomAgentEditorModal({
                 <option value="core">{t("jobs.inferenceModelOption.core")}</option>
                 <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
               </select>
+              <ModelHostingBadge modelTier={inferenceModel} />
               <select
                 value={inputType}
                 onChange={(e) => {

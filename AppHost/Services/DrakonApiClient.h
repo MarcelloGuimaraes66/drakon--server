@@ -129,6 +129,15 @@ namespace winrt::DrakonDesktop::services
         int64_t totalSpent{ 0 };
     };
 
+    struct MonthlyTokenUsageSummarySnapshot
+    {
+        int64_t inputTokens{ 0 };
+        int64_t outputTokens{ 0 };
+        int64_t totalTokens{ 0 };
+        std::string localMonth;
+        std::string timezoneIana;
+    };
+
     struct PaymentRecord
     {
         int32_t id{ 0 };
@@ -471,6 +480,7 @@ namespace winrt::DrakonDesktop::services
         ServiceValueResponse<PairingStatusSnapshot> GetPairingStatus();
         ServiceResponse DisconnectPairing();
         ServiceValueResponse<TokenBalanceSnapshot> GetTokenBalance();
+        ServiceValueResponse<MonthlyTokenUsageSummarySnapshot> GetMonthlyTokenUsageSummary();
         ServiceValueResponse<std::vector<PaymentRecord>> GetPayments();
         ServiceValueResponse<SubscriptionSnapshot> GetActiveSubscription();
         ServiceValueResponse<std::vector<BillingCard>> GetBillingCards();

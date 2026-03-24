@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <iomanip>
 #include <initializer_list>
 #include <sstream>
@@ -127,7 +128,19 @@ namespace winrt::DrakonDesktop::implementation
         WireUpNavigation();
         SizeChanged({ this, &ShellPage::OnShellSizeChanged });
         UpdateResponsiveState(ActualWidth());
+        m_headerRefreshTimer = DispatcherTimer();
+        m_headerRefreshTimer.Interval(std::chrono::seconds(30));
+        m_headerRefreshTimer.Tick({ this, &ShellPage::OnHeaderRefreshTick });
+        m_headerRefreshTimer.Start();
         LoadShellChromeAsync();
+    }
+
+    ShellPage::~ShellPage()
+    {
+        if (m_headerRefreshTimer)
+        {
+            m_headerRefreshTimer.Stop();
+        }
     }
 
     void ShellPage::InitializeComponent()
@@ -369,11 +382,19 @@ namespace winrt::DrakonDesktop::implementation
     fire_and_forget ShellPage::LoadShellChromeAsync()
     {
         auto lifetime = get_strong();
+        if (m_shellChromeRefreshInFlight)
+        {
+            co_return;
+        }
+
+        m_shellChromeRefreshInFlight = true;
         apartment_context uiThread;
+        try
+        {
 
         co_await winrt::resume_background();
         auto auth = services::DrakonApiClient::Instance().GetAuthState();
-        auto tokens = services::DrakonApiClient::Instance().GetTokenBalance();
+        auto monthlyUsage = services::DrakonApiClient::Instance().GetMonthlyTokenUsageSummary();
         co_await uiThread;
 
         if (auth.success && auth.value.isAuthenticated)
@@ -397,11 +418,25 @@ namespace winrt::DrakonDesktop::implementation
             SetNamedText(L"CurrentUserInitialText", L"D");
         }
 
-        if (tokens.success)
+        if (monthlyUsage.success)
         {
-            SetNamedText(L"HeaderInputTokensText", to_hstring(FormatMillions(tokens.value.inputBalance)) + L"M");
-            SetNamedText(L"HeaderOutputTokensText", to_hstring(FormatMillions(tokens.value.outputBalance)) + L"M");
+            SetNamedText(L"HeaderInputTokensText", to_hstring(FormatMillions(monthlyUsage.value.inputTokens)) + L"M");
+            SetNamedText(L"HeaderOutputTokensText", to_hstring(FormatMillions(monthlyUsage.value.outputTokens)) + L"M");
         }
+        }
+        catch (...)
+        {
+            co_await uiThread;
+        }
+
+        m_shellChromeRefreshInFlight = false;
+    }
+
+    void ShellPage::OnHeaderRefreshTick(
+        Windows::Foundation::IInspectable const&,
+        Windows::Foundation::IInspectable const&)
+    {
+        LoadShellChromeAsync();
     }
 
     void ShellPage::OnNavigationButtonClick(

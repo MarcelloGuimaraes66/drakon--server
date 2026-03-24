@@ -2040,6 +2040,47 @@ inline void touchEntity(
     } else {
         e["last_seen_ts"] = previousLastSeen;
     }
+    e["present_now"] = true;
+    e.erase("absent_since_ts");
+}
+
+inline void markEntityAbsent(
+    json& st,
+    const std::string& entityId,
+    const std::string& tsUtc,
+    const std::string& zone = std::string())
+{
+    ensureState(st);
+    const std::string id = trim(entityId);
+    if (id.empty() ||
+        !st["entities"].contains(id) ||
+        !st["entities"][id].is_object())
+    {
+        return;
+    }
+
+    json& e = st["entities"][id];
+    const std::string normalizedTs = trim(tsUtc).empty() ? nowIso() : trim(tsUtc);
+    const bool hadExplicitPresentFlag =
+        e.contains("present_now") && e["present_now"].is_boolean();
+    const bool wasPresent = hadExplicitPresentFlag
+        ? e["present_now"].get<bool>()
+        : !trim(strField(e, "last_seen_ts")).empty();
+    const std::string previousAbsentSince = strField(e, "absent_since_ts");
+    const std::string previousLastAbsent = strField(e, "last_absent_ts");
+
+    e["present_now"] = false;
+    if (wasPresent || previousAbsentSince.empty()) {
+        e["absent_since_ts"] = normalizedTs;
+    } else {
+        e["absent_since_ts"] = previousAbsentSince;
+    }
+    if (previousLastAbsent.empty() || normalizedTs > previousLastAbsent) {
+        e["last_absent_ts"] = normalizedTs;
+    } else {
+        e["last_absent_ts"] = previousLastAbsent;
+    }
+    if (!trim(zone).empty()) e["last_absent_zone"] = trim(zone);
 }
 
 inline std::string sanitizeToken(const std::string& value, const std::string& fallback = "entity") {
@@ -2089,6 +2130,34 @@ inline bool isPresentEventName(const std::string& rawEvent) {
     return lower(trim(normalizeEventName(rawEvent))) == "present";
 }
 
+inline bool normalizedTokenEndsWith(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+inline bool isAbsenceEventName(const std::string& rawEvent) {
+    const std::string eventName = lower(trim(normalizeEventName(rawEvent)));
+    if (eventName.empty()) return false;
+    return eventName == "left_zone" ||
+           eventName == "occupant_exit" ||
+           eventName == "entity_absent" ||
+           eventName == "absent" ||
+           eventName == "lost" ||
+           eventName == "not_visible" ||
+           eventName == "not_currently_visible" ||
+           eventName == "not_visible_this_segment" ||
+           eventName == "not_visible_this_batch" ||
+           eventName == "not_visible_in_segment" ||
+           eventName == "not_visible_in_current_segment" ||
+           eventName == "not_visible_in_current_batch" ||
+           eventName == "no_longer_visible" ||
+           eventName.rfind("no_", 0) == 0 ||
+           normalizedTokenEndsWith(eventName, "_lost") ||
+           normalizedTokenEndsWith(eventName, "_left") ||
+           normalizedTokenEndsWith(eventName, "_exit") ||
+           normalizedTokenEndsWith(eventName, "_absent");
+}
+
 enum class TemporalEvidenceClass {
     positive_event_evidence,
     presence_evidence,
@@ -2115,7 +2184,8 @@ inline std::string normalizeEvidenceToken(const std::string& rawToken) {
 inline bool observationStatusSuggestsNegative(const std::string& rawStatus) {
     const std::string status = normalizeEvidenceToken(rawStatus);
     if (status.empty()) return false;
-    return status == "not_observed" ||
+    return isAbsenceEventName(status) ||
+           status == "not_observed" ||
            status == "not_detected" ||
            status == "not_seen" ||
            status == "not_visible" ||
@@ -2567,6 +2637,9 @@ inline bool currentBatchHasEntityEvidence(const json& identityPatch, const json&
         {
             return false;
         }
+        const std::string eventName =
+            trim(strField(node, "event", strField(node, "type", strField(node, "event_type"))));
+        if (isAbsenceEventName(eventName)) return false;
         const std::string decision = lower(trim(strField(node, "decision")));
         if (decision == "unknown" || decision == "not_visible_this_batch" || decision == "no_match") {
             return false;
@@ -2592,6 +2665,7 @@ inline bool currentBatchHasEntityEvidence(const json& identityPatch, const json&
                 trim(strField(item, "entity_id", strField(item, "entity_key", strField(item, "entity_type"))));
             const std::string eventName =
                 trim(strField(item, "event", strField(item, "type", strField(item, "event_type"))));
+            if (isAbsenceEventName(eventName)) continue;
             if (!entityToken.empty() || isPresentEventName(eventName) || tokenLooksLikeThreatEvidence(eventName)) {
                 return true;
             }
@@ -2714,6 +2788,17 @@ inline std::string entityStateLastSeenTs(
         return identityMemoryLastSeenTs(*identityMemoryRow);
     }
     return std::string();
+}
+
+inline bool entityStateHasExplicitPresentFlag(const json& entityState, bool& outPresentNow) {
+    if (!entityState.is_object() ||
+        !entityState.contains("present_now") ||
+        !entityState["present_now"].is_boolean())
+    {
+        return false;
+    }
+    outPresentNow = entityState["present_now"].get<bool>();
+    return true;
 }
 
 inline bool entityStateRepresentsSyntheticAbsence(const std::string& rawEntityId,
@@ -2857,6 +2942,8 @@ inline long long countPresentEntitiesInState(
         if (!it.value().is_object()) continue;
         const json* identityMemoryRow = findIdentityMemoryByEntityId(st, it.key());
         if (!entityMatchesFilter(it.key(), entityFilter, &it.value(), identityMemoryRow)) continue;
+        bool explicitPresentNow = false;
+        if (entityStateHasExplicitPresentFlag(it.value(), explicitPresentNow) && !explicitPresentNow) continue;
         const std::string lastSeen = strField(it.value(), "last_seen_ts");
         if (lastSeen.empty()) continue;
         if (!zoneMatchesFilter(strField(it.value(), "current_zone"), zoneFilter)) continue;
@@ -3127,6 +3214,8 @@ inline void applyRound(json& st,
                        const json& observations,
                        const std::vector<TemporalEvidenceCandidate>& canonicalEvidenceCandidates,
                        const std::string& nowIsoUtc,
+                       const std::string& answer = std::string(),
+                       const json& unknownReasons = json::array(),
                        const std::string& segmentStartTsRaw = std::string(),
                        const std::string& segmentEndTsRaw = std::string(),
                        const json& resolvedIdentityMatches = json::array()) {
@@ -3204,7 +3293,8 @@ inline void applyRound(json& st,
         {
             return TemporalEvidenceClass::meta_state_reference;
         }
-        if (nodeRepresentsSyntheticAbsence(node) ||
+        if (isAbsenceEventName(normalizedEvent) ||
+            nodeRepresentsSyntheticAbsence(node) ||
             observationStatusSuggestsNegative(statusToken) ||
             nodeSuggestsNoVisiblePerson(node) ||
             nodeSuggestsNoVisibleTarget(node) ||
@@ -3235,10 +3325,10 @@ inline void applyRound(json& st,
                st["entities"].contains(id) &&
                st["entities"][id].is_object();
     };
-    auto resolveEntityIdFromHint = [&](const std::string& hintRaw) -> std::string {
-        const std::string hint = sanitizeToken(hintRaw.empty() ? defaultEntityKey : hintRaw, "entity");
+    auto selectExistingEntityIdFromHint = [&](const std::string& hint) -> std::string {
+        if (hint.empty()) return std::string();
         auto itRound = roundEntityByHint.find(hint);
-        if (itRound != roundEntityByHint.end()) return itRound->second;
+        if (itRound != roundEntityByHint.end() && entityExists(itRound->second)) return itRound->second;
 
         std::string selected;
         std::string selectedLastSeen;
@@ -3271,17 +3361,28 @@ inline void applyRound(json& st,
                 }
             }
         }
-        if (selected.empty()) {
-            const auto pos = hint.find_last_of('_');
-            bool numericSuffix = pos != std::string::npos && pos + 1 < hint.size();
-            for (std::size_t i = pos + 1; numericSuffix && i < hint.size(); ++i) {
-                if (!std::isdigit(static_cast<unsigned char>(hint[i]))) numericSuffix = false;
-            }
-            if (numericSuffix) selected = hint;
+        const auto pos = hint.find_last_of('_');
+        bool numericSuffix = pos != std::string::npos && pos + 1 < hint.size();
+        for (std::size_t i = pos + 1; numericSuffix && i < hint.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(hint[i]))) numericSuffix = false;
         }
+        if (selected.empty() && numericSuffix && entityExists(hint)) {
+            selected = hint;
+        }
+        if (!selected.empty()) roundEntityByHint[hint] = selected;
+        return selected;
+    };
+    auto resolveEntityIdFromHint = [&](const std::string& hintRaw) -> std::string {
+        const std::string hint = sanitizeToken(hintRaw.empty() ? defaultEntityKey : hintRaw, "entity");
+        std::string selected = selectExistingEntityIdFromHint(hint);
         if (selected.empty()) selected = allocateEntityId(st, hint);
         roundEntityByHint[hint] = selected;
         return selected;
+    };
+    auto resolveExistingEntityIdFromHint = [&](const std::string& hintRaw) -> std::string {
+        const std::string rawHint = trim(hintRaw);
+        if (rawHint.empty()) return std::string();
+        return selectExistingEntityIdFromHint(sanitizeToken(rawHint, "entity"));
     };
 
     std::unordered_map<std::string, std::string> roundLastPresentTs;
@@ -3289,6 +3390,7 @@ inline void applyRound(json& st,
     std::unordered_set<std::string> roundHasEntered;
     std::unordered_set<std::string> roundAppendedEventKeys;
     std::unordered_set<std::string> roundTouchedEntityIds;
+    std::unordered_set<std::string> roundPositiveEntityIds;
 
     auto normalizeAcceptedEventTs = [&](const std::string& rawTs, const std::string& fallbackTs) -> std::string {
         const std::string candidate = normalizeFlexibleTs(trim(rawTs).empty() ? fallbackTs : rawTs);
@@ -3398,10 +3500,90 @@ inline void applyRound(json& st,
         return true;
     };
 
+    auto applyEntityStateMetadata = [&](const std::string& entityIdRaw,
+                                        const std::string& entityHintRaw,
+                                        const std::string& entityTypeRaw,
+                                        const json& evidenceRef,
+                                        const std::string& evidenceTs) {
+        const std::string entityId = trim(entityIdRaw);
+        if (entityId.empty() ||
+            !st.contains("entities") ||
+            !st["entities"].is_object() ||
+            !st["entities"].contains(entityId) ||
+            !st["entities"][entityId].is_object())
+        {
+            return;
+        }
+
+        json& entityState = st["entities"][entityId];
+        const std::string entityHint = trim(entityHintRaw);
+        if (!entityHint.empty()) entityState["entity_key"] = entityHint;
+        const std::string entityType = trim(entityTypeRaw);
+        if (!entityType.empty()) entityState["entity_type"] = entityType;
+        applyTemporalEvidenceRefToEntityState(entityState, evidenceRef, evidenceTs);
+        if (evidenceRef.is_object() &&
+            evidenceRef.contains("temporal_evidence_key") &&
+            evidenceRef["temporal_evidence_key"].is_string())
+        {
+            const std::string evidenceKey = trim(evidenceRef["temporal_evidence_key"].get<std::string>());
+            if (!evidenceKey.empty()) recordLastRoundEvidenceKey(st, evidenceKey);
+        }
+    };
+
+    auto resolveExistingEntityIdForAbsence = [&](const std::string& entityIdRaw,
+                                                 const std::string& entityHintRaw) -> std::string {
+        const std::string explicitEntityId = trim(entityIdRaw);
+        if (!explicitEntityId.empty() && entityExists(explicitEntityId)) return explicitEntityId;
+        const std::string explicitEntityHint = trim(entityHintRaw);
+        if (!explicitEntityHint.empty()) {
+            const std::string resolvedByHint = resolveExistingEntityIdFromHint(explicitEntityHint);
+            if (!resolvedByHint.empty()) return resolvedByHint;
+        }
+        if (!explicitEntityId.empty()) {
+            const std::string resolvedByIdHint = resolveExistingEntityIdFromHint(explicitEntityId);
+            if (!resolvedByIdHint.empty()) return resolvedByIdHint;
+        }
+        return std::string();
+    };
+
+    auto commitExplicitEntityAbsence = [&](const std::string& entityIdRaw,
+                                           const std::string& entityHintRaw,
+                                           const std::string& entityTypeRaw,
+                                           const std::string& eventRaw,
+                                           const std::string& tsRaw,
+                                           const std::string& zoneRaw,
+                                           const json& evidenceRef) -> std::string {
+        const std::string entityId = resolveExistingEntityIdForAbsence(entityIdRaw, entityHintRaw);
+        if (entityId.empty()) return std::string();
+
+        const std::string acceptedTs = normalizeAcceptedEventTs(tsRaw, defaultRoundEventTs);
+        if (acceptedTs.empty()) return std::string();
+
+        const std::string normalizedEvent = trim(normalizeEventName(eventRaw));
+        const std::string zone = trim(zoneRaw);
+        const std::string dedupeHint = trim(entityHintRaw).empty() ? entityId : trim(entityHintRaw);
+        if (!normalizedEvent.empty() && isAllowedStateEvent(normalizedEvent)) {
+            appendValidatedRoundEvent(
+                entityId,
+                dedupeHint,
+                normalizedEvent,
+                acceptedTs,
+                zone,
+                evidenceRef,
+                false);
+        }
+
+        applyEntityStateMetadata(entityId, entityHintRaw, entityTypeRaw, evidenceRef, acceptedTs);
+        markEntityAbsent(st, entityId, acceptedTs, zone);
+        roundTouchedEntityIds.insert(entityId);
+        return entityId;
+    };
+
     const bool preferCanonicalCandidateEvents = !canonicalEvidenceCandidates.empty();
     std::unordered_set<std::string> roundAcceptedCandidateEvidenceKeys;
     for (const auto& candidate : canonicalEvidenceCandidates) {
         const std::string eventName = trim(normalizeEventName(candidate.eventName));
+        const bool absenceEvent = isAbsenceEventName(eventName);
         if (eventName.empty() || isPresentEventName(eventName)) continue;
 
         if (!isAllowedStateEvent(eventName)) {
@@ -3416,7 +3598,10 @@ inline void applyRound(json& st,
         }
 
         const std::string resolvedEntityId =
-            entityExists(entityToken) ? entityToken : resolveEntityIdFromHint(entityToken);
+            entityExists(entityToken)
+                ? entityToken
+                : (absenceEvent ? resolveExistingEntityIdFromHint(entityToken)
+                                : resolveEntityIdFromHint(entityToken));
         if (trim(resolvedEntityId).empty()) {
             recordLastRoundCandidateDecision(st, candidate, "rejected_missing_entity");
             continue;
@@ -3476,17 +3661,20 @@ inline void applyRound(json& st,
         }
 
         if (!evidenceKey.empty()) roundAcceptedCandidateEvidenceKeys.insert(evidenceKey);
-        touchEntity(st, resolvedEntityId, acceptedTs, trim(candidate.zone), json::array(), forgetEntityMissingForSeconds);
-        if (st.contains("entities") && st["entities"].is_object() &&
-            st["entities"].contains(resolvedEntityId) && st["entities"][resolvedEntityId].is_object())
-        {
-            applyTemporalEvidenceRefToEntityState(st["entities"][resolvedEntityId], evidenceRef, acceptedTs);
+        if (absenceEvent) {
+            applyEntityStateMetadata(resolvedEntityId, entityToken, std::string(), evidenceRef, acceptedTs);
+            markEntityAbsent(st, resolvedEntityId, acceptedTs, trim(candidate.zone));
+            roundTouchedEntityIds.insert(resolvedEntityId);
+        } else {
+            touchEntity(st, resolvedEntityId, acceptedTs, trim(candidate.zone), json::array(), forgetEntityMissingForSeconds);
+            applyEntityStateMetadata(resolvedEntityId, entityToken, std::string(), evidenceRef, acceptedTs);
+            roundTouchedEntityIds.insert(resolvedEntityId);
+            roundPositiveEntityIds.insert(resolvedEntityId);
         }
-        roundTouchedEntityIds.insert(resolvedEntityId);
         recordLastRoundCandidateDecision(
             st,
             candidate,
-            "accepted_event",
+            absenceEvent ? "accepted_absence_event" : "accepted_event",
             resolvedEntityId,
             acceptedTs);
     }
@@ -3521,6 +3709,7 @@ inline void applyRound(json& st,
         }
         touchEntity(st, entityId, acceptedTs, zone, json::array(), forgetEntityMissingForSeconds);
         roundTouchedEntityIds.insert(entityId);
+        roundPositiveEntityIds.insert(entityId);
         json pseudoPatch = json::object();
         pseudoPatch["entity_id"] = entityId;
         if (!description.empty()) pseudoPatch["description"] = description;
@@ -3535,9 +3724,32 @@ inline void applyRound(json& st,
                 continue;
             }
             if (!p.is_object()) continue;
-            if (nodeRepresentsSyntheticAbsence(p)) continue;
             const double confidence = dblField(p, "confidence", -1.0);
             const std::string decisionRaw = lower(trim(strField(p, "decision")));
+            const std::string patchEntityId = trim(strField(p, "entity_id", strField(p, "id")));
+            const std::string patchEntityHintRaw =
+                trim(strField(p, "entity_key", strField(p, "entity_type")));
+            const std::string patchEntityHint =
+                patchEntityHintRaw.empty() ? inferEntityPrefix(p, plan) : patchEntityHintRaw;
+            const std::string patchEntityType = trim(strField(p, "entity_type"));
+            const std::string patchZone = extractObservedZoneField(p);
+            const std::string patchTs =
+                strField(p, "ts_utc", strField(p, "timestamp", strField(p, "time")));
+            const json patchEvidenceRef = extractTemporalEvidenceRef(p);
+            if (nodeRepresentsSyntheticAbsence(p) ||
+                isAbsenceEventName(extractStructuredEvidenceEventName(p)) ||
+                observationStatusSuggestsNegative(strField(p, "status", strField(p, "state"))))
+            {
+                commitExplicitEntityAbsence(
+                    patchEntityId,
+                    patchEntityHint,
+                    patchEntityType,
+                    extractStructuredEvidenceEventName(p),
+                    patchTs,
+                    patchZone,
+                    patchEvidenceRef);
+                continue;
+            }
             std::string decision;
             if (decisionRaw == "match_existing" ||
                 decisionRaw == "match" ||
@@ -3567,8 +3779,7 @@ inline void applyRound(json& st,
             if (decision == "unknown") continue;
 
             std::string entityId = trim(strField(p, "entity_id", strField(p, "id")));
-            const std::string entityHint =
-                trim(strField(p, "entity_key", strField(p, "entity_type")));
+            const std::string entityHint = patchEntityHint;
             if (decision == "new_entity") {
                 const std::string prefix = entityHint.empty() ? inferEntityPrefix(p, plan) : entityHint;
                 entityId = allocateEntityId(st, prefix);
@@ -3587,27 +3798,11 @@ inline void applyRound(json& st,
             if (entityId.empty()) continue;
 
             const json traits = extractTraitsFromNode(p);
-            const std::string zone = extractObservedZoneField(p);
-            const json patchEvidenceRef = extractTemporalEvidenceRef(p);
+            const std::string zone = patchZone;
             touchEntity(st, entityId, nowTs, zone, traits, forgetEntityMissingForSeconds);
-            if (st.contains("entities") && st["entities"].is_object() &&
-                st["entities"].contains(entityId) && st["entities"][entityId].is_object())
-            {
-                json& entityState = st["entities"][entityId];
-                if (!entityHint.empty()) entityState["entity_key"] = entityHint;
-                const std::string entityType = trim(strField(p, "entity_type"));
-                if (!entityType.empty()) entityState["entity_type"] = entityType;
-                applyTemporalEvidenceRefToEntityState(entityState, patchEvidenceRef, nowTs);
-                if (patchEvidenceRef.contains("temporal_evidence_key") &&
-                    patchEvidenceRef["temporal_evidence_key"].is_string())
-                {
-                    recordLastRoundEvidenceKey(
-                        st,
-                        patchEvidenceRef["temporal_evidence_key"].get<std::string>()
-                    );
-                }
-            }
+            applyEntityStateMetadata(entityId, entityHint, patchEntityType, patchEvidenceRef, nowTs);
             roundTouchedEntityIds.insert(entityId);
+            roundPositiveEntityIds.insert(entityId);
             upsertIdentityMemory(st, entityId, p, nowTs, zone);
 
             if (p.contains("events") && p["events"].is_array()) {
@@ -3615,10 +3810,23 @@ inline void applyRound(json& st,
                     const std::string dedupeHint =
                         entityHint.empty() ? inferEntityPrefix(p, plan) : entityHint;
                     if (ev.is_string()) {
+                        const std::string rawEventName = ev.get<std::string>();
+                        if (isAbsenceEventName(rawEventName)) {
+                            appendValidatedRoundEvent(
+                                entityId,
+                                dedupeHint,
+                                rawEventName,
+                                std::string(),
+                                zone,
+                                json::object(),
+                                true
+                            );
+                            continue;
+                        }
                         appendValidatedRoundEvent(
                             entityId,
                             dedupeHint,
-                            ev.get<std::string>(),
+                            rawEventName,
                             std::string(),
                             zone,
                             json::object(),
@@ -3629,6 +3837,18 @@ inline void applyRound(json& st,
                     if (!ev.is_object()) continue;
                     const std::string eventName = extractStructuredEvidenceEventName(ev);
                     const TemporalEvidenceClass evidenceClass = classifyStructuredEvidence(ev, eventName);
+                    if (isAbsenceEventName(eventName)) {
+                        appendValidatedRoundEvent(
+                            entityId,
+                            dedupeHint,
+                            eventName,
+                            strField(ev, "ts_utc", strField(ev, "timestamp", strField(ev, "time"))),
+                            extractZoneField(ev, zone),
+                            extractTemporalEvidenceRef(ev),
+                            trim(strField(ev, "ts_utc", strField(ev, "timestamp", strField(ev, "time")))).empty()
+                        );
+                        continue;
+                    }
                     if (evidenceClass != TemporalEvidenceClass::positive_event_evidence &&
                         evidenceClass != TemporalEvidenceClass::presence_evidence)
                     {
@@ -3673,10 +3893,23 @@ inline void applyRound(json& st,
             const std::string eventName = extractStructuredEvidenceEventName(o);
             const json observationEvidenceRef = extractTemporalEvidenceRef(o);
             const TemporalEvidenceClass evidenceClass = classifyStructuredEvidence(o, eventName);
+            const std::string observationEntityType = trim(strField(o, "entity_type"));
+            const std::string observationEntityHint =
+                entityHint.empty() ? inferEntityPrefix(o, plan) : entityHint;
             if (evidenceClass == TemporalEvidenceClass::meta_state_reference ||
-                evidenceClass == TemporalEvidenceClass::negative_observation ||
                 evidenceClass == TemporalEvidenceClass::scene_only_description)
             {
+                continue;
+            }
+            if (evidenceClass == TemporalEvidenceClass::negative_observation) {
+                commitExplicitEntityAbsence(
+                    entityId,
+                    observationEntityHint,
+                    observationEntityType,
+                    eventName,
+                    ts,
+                    zone,
+                    observationEvidenceRef);
                 continue;
             }
             if (preferCanonicalCandidateEvents &&
@@ -3687,14 +3920,14 @@ inline void applyRound(json& st,
             const std::string acceptedTs = normalizeAcceptedEventTs(ts, defaultRoundEventTs);
             if (acceptedTs.empty()) continue;
             if (entityId.empty()) {
-                entityId = resolveEntityIdFromHint(entityHint.empty() ? defaultEntityKey : entityHint);
+                entityId = resolveEntityIdFromHint(observationEntityHint.empty() ? defaultEntityKey : observationEntityHint);
             }
             const json observationTraits = extractTraitsFromNode(o);
             const bool commitObservationEvent = shouldCommitObservationEvent(o, eventName);
             if (!commitObservationEvent || eventName.empty() || entityId.empty()) {
                 continue;
             }
-            const std::string entityHintToken = entityHint.empty() ? entityId : entityHint;
+            const std::string entityHintToken = observationEntityHint.empty() ? entityId : observationEntityHint;
             if (!appendValidatedRoundEvent(
                     entityId,
                     entityHintToken,
@@ -3707,26 +3940,38 @@ inline void applyRound(json& st,
                 continue;
             }
             touchEntity(st, entityId, acceptedTs, zone, observationTraits, forgetEntityMissingForSeconds);
-            if (st.contains("entities") && st["entities"].is_object() &&
-                st["entities"].contains(entityId) && st["entities"][entityId].is_object())
-            {
-                json& entityState = st["entities"][entityId];
-                if (!entityHint.empty()) entityState["entity_key"] = entityHint;
-                const std::string entityType = trim(strField(o, "entity_type"));
-                if (!entityType.empty()) entityState["entity_type"] = entityType;
-                applyTemporalEvidenceRefToEntityState(entityState, observationEvidenceRef, acceptedTs);
-            }
+            applyEntityStateMetadata(entityId, observationEntityHint, observationEntityType, observationEvidenceRef, acceptedTs);
             roundTouchedEntityIds.insert(entityId);
+            roundPositiveEntityIds.insert(entityId);
             json pseudoPatch = json::object();
             pseudoPatch["entity_id"] = entityId;
-            if (!entityHint.empty()) pseudoPatch["entity_key"] = entityHint;
-            const std::string entityType = trim(strField(o, "entity_type"));
-            if (!entityType.empty()) pseudoPatch["entity_type"] = entityType;
+            if (!observationEntityHint.empty()) pseudoPatch["entity_key"] = observationEntityHint;
+            if (!observationEntityType.empty()) pseudoPatch["entity_type"] = observationEntityType;
             const std::string description =
                 trim(strField(o, "description", strField(o, "note", strField(o, "entity_description", strField(o, "person_description")))));
             if (!description.empty()) pseudoPatch["description"] = description;
             if (observationTraits.is_array() && !observationTraits.empty()) pseudoPatch["updated_traits"] = observationTraits;
             upsertIdentityMemory(st, entityId, pseudoPatch, acceptedTs, zone);
+        }
+    }
+
+    const bool explicitNoVisibleTargetThisBatch =
+        textSuggestsNoVisiblePerson(answer) ||
+        textSuggestsNoVisibleTarget(answer) ||
+        nodeSuggestsNoVisiblePerson(unknownReasons) ||
+        nodeSuggestsNoVisibleTarget(unknownReasons) ||
+        nodeSuggestsNoVisiblePerson(observations) ||
+        nodeSuggestsNoVisibleTarget(observations);
+    if (explicitNoVisibleTargetThisBatch &&
+        roundPositiveEntityIds.empty() &&
+        !currentBatchHasEntityEvidence(identityPatch, observations) &&
+        st.contains("entities") &&
+        st["entities"].is_object())
+    {
+        for (auto it = st["entities"].begin(); it != st["entities"].end(); ++it) {
+            if (!it.value().is_object()) continue;
+            markEntityAbsent(st, it.key(), defaultRoundEventTs);
+            roundTouchedEntityIds.insert(it.key());
         }
     }
 
@@ -3786,12 +4031,12 @@ inline void applyRound(json& st,
 
     if (resolvedIdentityMatches.is_array() &&
         resolvedIdentityMatches.size() == 1 &&
-        roundTouchedEntityIds.size() == 1 &&
+        roundPositiveEntityIds.size() == 1 &&
         resolvedIdentityMatches[0].is_object())
     {
         upsertResolvedIdentity(
             st,
-            *roundTouchedEntityIds.begin(),
+            *roundPositiveEntityIds.begin(),
             resolvedIdentityMatches[0],
             nowTs
         );
@@ -4175,7 +4420,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If identity_memory contains resolved_identity metadata for an entity, preserve that metadata for the same entity_id; do not replace entity_id with a human name.\n"
         << "- observations and identity_patch MUST describe only what is visible in the current batch or snapshot.\n"
         << "- answer may combine the current batch with state_slice when explaining cumulative counts or prior confirmed context.\n"
-        << "- alert_condition may reflect cumulative state_slice plus current-batch observations, but the TemporalEngine is the final alert authority.\n"
+        << "- alert_condition must reflect only whether the current batch itself satisfies the local alert condition; use state_slice only for explanation and identity continuity. The TemporalEngine is the final alert authority.\n"
         << "- Use time_context.now_utc as authoritative current time for temporal decisions.\n"
         << "- If an on-frame clock conflicts with provided temporal fields, prefer provided temporal fields.\n"
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"
@@ -4193,6 +4438,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
         << "- Keep traits concise (2-6 items): color/clothing/accessory/object_in_hand/pose when visible.\n"
         << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence and events.\n"
+        << "- If a tracked entity from state_slice or identity_memory is no longer visible in this batch, return identity_patch for that same entity_id with decision set to not_visible_this_segment or absent.\n"
         << "- If TEMPORAL_RUNTIME_INPUT_JSON includes cross_camera_watchlist, treat it as an authoritative watchlist from other cameras in the same Job Step, even if this camera has different local alert logic.\n"
         << "- Each cross_camera_watchlist entry may include target_entity, entities, and search_prompt. Use target_entity and search_prompt as the primary instructions for what to look for.\n"
         << "- target_entity.entity_id and source_entity_id in cross_camera_watchlist refer to the source-camera target that started the hunt, not to a local entity_id in the current camera.\n"
@@ -4417,6 +4663,10 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
         }
 
         const json& entityState = st["entities"][trimmedId];
+        bool explicitPresentNow = false;
+        if (entityStateHasExplicitPresentFlag(entityState, explicitPresentNow) && !explicitPresentNow) {
+            return false;
+        }
         const std::string lastSeen = strField(entityState, "last_seen_ts");
         if (lastSeen.empty()) return false;
         if (ageSeconds(lastSeen, nowIsoUtc) > presenceRecencySeconds) return false;

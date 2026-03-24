@@ -3,6 +3,8 @@ import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import Toast from "@/react-app/components/Toast";
+import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
@@ -15,6 +17,10 @@ import {
   extractChatProgressFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
+import {
+  getCoreModelNoticeCopy,
+  shouldShowCoreModelNotice,
+} from "@/react-app/utils/coreModelNotice";
 
 type ChatModelTier = "ultra" | "core";
 type ChatRunningResolution = 640 | 1024;
@@ -65,7 +71,7 @@ function normalizeChatModelFps(value: unknown, fallback = DEFAULT_ULTRA_VIDEO_MO
 }
 
 export default function Chat() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const billingEnabled = brand.features.billingEnabled;
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
@@ -92,8 +98,11 @@ export default function Chat() {
   const [runningResolution, setRunningResolution] = useState<ChatRunningResolution>(
     DEFAULT_CHAT_CORE_RUNNING_RESOLUTION
   );
+  const [toast, setToast] = useState<{
+    message: string;
+    type: "success" | "error" | "warning" | "info";
+  } | null>(null);
   const [openHeaderDropdown, setOpenHeaderDropdown] = useState<ChatHeaderDropdown>(null);
-  const [showTokenWarning, setShowTokenWarning] = useState(false);
   const [isHeaderGhostedWhileScrolling, setIsHeaderGhostedWhileScrolling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -101,7 +110,6 @@ export default function Chat() {
   const emptyCamerasRef = useRef<any[]>([]);
   const previousMessageCountRef = useRef(0);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
-  const chatTokensSectionTitle = `${brand.chatName} Tokens`;
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(
     emptyCamerasRef.current,
   );
@@ -360,22 +368,6 @@ export default function Chat() {
   const handleSend = async () => {
     if ((!input.trim() && !uploadedImage && !uploadedVideo) || !activeSessionId) return;
 
-    try {
-      const balanceResponse = await fetch("/api/token-balance");
-      const balance = await balanceResponse.json();
-
-      const inputBalance = balance.input_balance || 0;
-      const outputBalance = balance.output_balance || 0;
-      const minRequired = 1_000_000;
-
-      if (inputBalance < minRequired || outputBalance < minRequired) {
-        setShowTokenWarning(true);
-        return;
-      }
-    } catch (balanceError) {
-      console.error("Failed to check token balance:", balanceError);
-    }
-
     const userMessage = input;
     const imageBase64 = uploadedImage;
     const videoId = uploadedVideo?.id;
@@ -434,10 +426,17 @@ export default function Chat() {
   };
 
   const handleModelSelect = (tier: ChatModelTier) => {
+    const previousTier = modelTier;
     const normalizedTier = normalizeChatModelTier(tier);
     setModelTier(normalizedTier);
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
     setOpenHeaderDropdown(null);
+    if (shouldShowCoreModelNotice(normalizedTier, previousTier)) {
+      setToast({
+        message: getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language).message,
+        type: "info",
+      });
+    }
   };
 
   const handleModelFpsChange = (value: string) => {
@@ -817,29 +816,36 @@ export default function Chat() {
                   >
                     <span className="hidden text-gray-400 sm:inline">Model</span>
                     <span className="text-blue-300">{modelLabels[modelTier]}</span>
+                    <ModelHostingBadge modelTier={modelTier} compact />
                     <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                     </svg>
                   </button>
 
                   {canChangeModelTier && openHeaderDropdown === "model" && (
-                      <div className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
+                      <div className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
                         <button
                           onClick={() => handleModelSelect("ultra")}
                           className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
                         >
-                          <div className="flex items-center justify-between">
+                          <div className="flex items-center justify-between gap-3">
                             <span className="font-medium">{t("jobs.inferenceModelOption.ultra")}</span>
-                            {modelTier === "ultra" && <span className="text-blue-300">&#10003;</span>}
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="ultra" compact />
+                              {modelTier === "ultra" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
                           </div>
                         </button>
                         <button
                           onClick={() => handleModelSelect("core")}
                           className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
                         >
-                          <div className="flex items-center justify-between">
+                          <div className="flex items-center justify-between gap-3">
                             <span className="font-medium">{t("jobs.inferenceModelOption.core")}</span>
-                            {modelTier === "core" && <span className="text-blue-300">&#10003;</span>}
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="core" compact />
+                              {modelTier === "core" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
                           </div>
                         </button>
                       </div>
@@ -971,33 +977,6 @@ export default function Chat() {
         </div>
       </div>
 
-      {showTokenWarning && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
-            <h3 className="mb-3 text-lg font-semibold text-gray-100">Insufficient Token Balance</h3>
-            <p className="mb-6 text-sm text-gray-400">
-              {`You need at least 1M input tokens AND 1M output tokens to use ${brand.chatName}. Please purchase more tokens in the ${chatTokensSectionTitle} section.`}
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setShowTokenWarning(false)}
-                className="flex-1 rounded-lg bg-gray-800 px-4 py-2 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700"
-              >
-                Cancel
-              </button>
-              {billingEnabled ? (
-                <a
-                  href="/billing"
-                  className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-center text-sm font-medium text-white transition-colors hover:bg-blue-700"
-                >
-                  Buy Tokens
-                </a>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      )}
-
       {deletingSessionId !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
           <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
@@ -1023,6 +1002,7 @@ export default function Chat() {
         </div>
       )}
 
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
       <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />
     </Layout>
   );

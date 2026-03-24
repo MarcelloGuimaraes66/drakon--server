@@ -467,40 +467,14 @@ namespace winrt::DrakonDesktop::implementation
         auto lifetime = get_strong();
         winrt::apartment_context uiThread;
 
-        ShowStatus(L"Checking billing gate before opening the camera form...", InfoBarSeverity::Informational);
+        ShowStatus(L"Opening camera form...", InfoBarSeverity::Informational);
 
         co_await winrt::resume_background();
         auto auth = services::DrakonApiClient::Instance().GetAuthState();
-        decltype(services::DrakonApiClient::Instance().GetBillingStatus()) billing{};
-        if (auth.success && auth.value.isAuthenticated)
-        {
-            billing = services::DrakonApiClient::Instance().GetBillingStatus();
-        }
         co_await uiThread;
 
         if (auth.success && auth.value.isAuthenticated)
         {
-            if (billing.success && !billing.value.canAddCameras)
-            {
-                ShowStatus(
-                    L"Billing gate blocked this action. The current subscription or card state does not allow more cameras.",
-                    InfoBarSeverity::Error);
-                co_return;
-            }
-
-            if (!billing.success && billing.statusCode != 0)
-            {
-                ShowStatus(to_hstring(billing.error), InfoBarSeverity::Error);
-                co_return;
-            }
-
-            if (!billing.success && billing.statusCode == 0)
-            {
-                ShowStatus(
-                    L"Billing status could not be confirmed right now. Following DrakonSite behavior and allowing the add flow.",
-                    InfoBarSeverity::Warning);
-            }
-
             ShowEditorAsync(std::nullopt);
             co_return;
         }
