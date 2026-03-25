@@ -16,7 +16,8 @@ SetupIconFile=..\stage\runtime\branding\app.ico
 UninstallDisplayIcon={app}\runtime\branding\app.ico
 
 [Files]
-Source: "..\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "prereqs\*"
+Source: "..\stage\prereqs\WindowsAppRuntimeInstall-x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall ignoreversion
 Source: "download-llm-from-drive.ps1"; Flags: dontcopy
 
 [Icons]
@@ -28,6 +29,7 @@ Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: 
 
 [Code]
 const
+  WindowsAppRuntimeInstallerFileName = 'WindowsAppRuntimeInstall-x64.exe';
   LlmInstallStatusSection = 'progress';
   LlmInstallPollIntervalMs = 250;
   LlmInstallStartupTimeoutTicks = 120;
@@ -61,6 +63,29 @@ begin
     FileExists(ExpandConstant('{app}\llm\bin\llama-server.exe')) and
     FileExists(ExpandConstant('{app}\chatv2_llm_server_path.txt')) and
     FileExists(ExpandConstant('{app}\chatv2_llm_model_path.txt'));
+end;
+
+procedure InstallWindowsAppRuntime();
+var
+  InstallerPath: string;
+  Params: string;
+  ResultCode: Integer;
+begin
+  InstallerPath := ExpandConstant('{tmp}\' + WindowsAppRuntimeInstallerFileName);
+  if not FileExists(InstallerPath) then
+    RaiseException('The Windows App Runtime installer payload is missing from setup.');
+
+  WizardForm.StatusLabel.Caption := 'Installing Windows App Runtime...';
+  WizardForm.Update;
+
+  Params := '--quiet --force';
+  if not Exec(InstallerPath, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Unable to start the Windows App Runtime installer.');
+
+  if ResultCode <> 0 then
+    RaiseException(
+      'Failed to install the required Windows App Runtime. Exit code: ' + IntToStr(ResultCode) + '.'
+    );
 end;
 
 procedure LlmInstallDialogCloseQuery(Sender: TObject; var CanClose: Boolean);
@@ -255,5 +280,8 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
+    InstallWindowsAppRuntime();
     InstallMandatoryLlm();
+  end;
 end;

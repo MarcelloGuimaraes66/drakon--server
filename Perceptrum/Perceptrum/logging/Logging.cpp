@@ -434,8 +434,23 @@ static void maskJsonKeyValue(std::string& text, const std::string& key) {
     size_t pos = 0;
 
     while ((pos = text.find(quotedKey, pos)) != std::string::npos) {
-        size_t colon = text.find(':', pos + quotedKey.size());
-        if (colon == std::string::npos) break;
+        size_t prev = pos;
+        while (prev > 0 && std::isspace(static_cast<unsigned char>(text[prev - 1])) != 0) {
+            --prev;
+        }
+        if (prev == 0 || (text[prev - 1] != '{' && text[prev - 1] != ',')) {
+            pos += quotedKey.size();
+            continue;
+        }
+
+        size_t colon = pos + quotedKey.size();
+        while (colon < text.size() && std::isspace(static_cast<unsigned char>(text[colon])) != 0) {
+            ++colon;
+        }
+        if (colon >= text.size() || text[colon] != ':') {
+            pos += quotedKey.size();
+            continue;
+        }
 
         size_t valueStart = text.find_first_not_of(" \t\r\n", colon + 1);
         if (valueStart == std::string::npos) break;

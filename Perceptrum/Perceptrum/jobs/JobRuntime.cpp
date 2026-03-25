@@ -565,8 +565,26 @@ static std::vector<FaceReferenceImage> resolveFaceReferenceImagesForJob_(
     constexpr size_t kMaxReferenceImages = 12;
     out.reserve((std::min)(kMaxReferenceImages, faceTargets.size() * (size_t)2));
 
-    for (const auto& target : faceTargets) {
-        for (const auto& image : target.images) {
+    std::vector<JobFaceTarget> orderedTargets = faceTargets;
+    std::stable_sort(
+        orderedTargets.begin(),
+        orderedTargets.end(),
+        [](const JobFaceTarget& lhs, const JobFaceTarget& rhs) {
+            if (lhs.id != rhs.id) return lhs.id < rhs.id;
+            if (lhs.name != rhs.name) return lhs.name < rhs.name;
+            return lhs.description < rhs.description;
+        });
+
+    for (const auto& target : orderedTargets) {
+        std::vector<JobFaceTargetImage> orderedImages = target.images;
+        std::stable_sort(
+            orderedImages.begin(),
+            orderedImages.end(),
+            [](const JobFaceTargetImage& lhs, const JobFaceTargetImage& rhs) {
+                return lhs.image_url < rhs.image_url;
+            });
+
+        for (const auto& image : orderedImages) {
             if (out.size() >= kMaxReferenceImages) break;
             std::string imageUrl = image.image_url;
             auto isSpace = [](unsigned char ch) { return std::isspace(ch); };
@@ -633,7 +651,16 @@ static std::vector<NegativeReferenceImage> resolveNegativeReferenceImagesForJob_
     constexpr size_t kMaxReferenceImages = 8;
     out.reserve((std::min)(kMaxReferenceImages, negativeImages.size()));
 
-    for (const auto& image : negativeImages) {
+    std::vector<JobNegativeReferenceImage> orderedImages = negativeImages;
+    std::stable_sort(
+        orderedImages.begin(),
+        orderedImages.end(),
+        [](const JobNegativeReferenceImage& lhs, const JobNegativeReferenceImage& rhs) {
+            if (lhs.id != rhs.id) return lhs.id < rhs.id;
+            return lhs.image_url < rhs.image_url;
+        });
+
+    for (const auto& image : orderedImages) {
         if (out.size() >= kMaxReferenceImages) break;
 
         std::string imageUrl = image.image_url;
@@ -1453,8 +1480,6 @@ static std::string openAIModelNameForInferenceModel_(const std::string& inferenc
     return "gpt-5-mini"; // "pro"
 }
 
-static constexpr const char* kOpenAIAlertValidatorModelName_ = "gpt-5.1";
-
 struct AlertValidationMeta_ {
     bool executed = false;
     bool alertCondition = false;
@@ -1503,6 +1528,17 @@ static std::string trimCopyRuntime_(std::string s) {
     while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
     while (!s.empty() && isSpace((unsigned char)s.back())) s.pop_back();
     return s;
+}
+
+static std::string normalizeVideoPackagingMode_(std::string s) {
+    s = trimCopyRuntime_(std::move(s));
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (s == "frame_sequence" || s == "frame-sequence" || s == "full_frame" || s == "full-frame" || s == "frames") {
+        return "frame_sequence";
+    }
+    return "mosaic";
 }
 
 static bool hasUsableFaceTargets_(const std::vector<JobFaceTarget>& faceTargets) {
@@ -2979,6 +3015,7 @@ static JobAgentDef agentFromGroup_(const JobInferenceGroup& g) {
     a.alert_condition_text = g.alert_condition_text;
     a.negative_condition_text = g.negative_condition_text;
     a.input_type = g.input_type;
+    a.video_packaging_mode = normalizeVideoPackagingMode_(g.video_packaging_mode);
     a.priority_level = g.priority_level;
     a.inference_model = normalizeInferenceModel_(g.inference_model);
     a.api_key = g.api_key;
@@ -4120,6 +4157,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                     respondedCameraIds.size() == expectedCameraIds.size();
                                 const bool allTrue = allResponded &&
                                     alertCameraIds.size() == expectedCameraIds.size();
+                                const bool groupAlertReady =
+                                    allTrue && !expectedCameraIds.empty() && !llmExecutedCameraIds.empty();
                                 bool groupValidatorExecuted = false;
                                 bool groupValidatorAlertCondition = false;
                                 int groupValidatorPromptTokens = 0;
@@ -4134,99 +4173,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
                                 // Fire ONE alert for the group when all ONLINE cameras in the group are true.
                                 // Also require at least one fresh LLM response in this cycle to avoid stale alert replay.
-                                if (allTrue && !expectedCameraIds.empty() && !llmExecutedCameraIds.empty()) {
-                                    std::vector<GroupImageInput> validatorInputs;
-                                    validatorInputs.reserve(expectedCameraIds.size());
-
-                                    std::unordered_map<int, json> resultByCamera;
-                                    if (normResults.is_array()) {
-                                        for (const auto& resultNode : normResults) {
-                                            if (!resultNode.is_object()) continue;
-                                            if (!resultNode.contains("camera_id") || !resultNode["camera_id"].is_number_integer()) continue;
-                                            resultByCamera[resultNode["camera_id"].get<int>()] = resultNode;
-                                        }
-                                    }
-
-                                    bool validatorInputReady = true;
-                                    for (int camId : expectedCameraIds) {
-                                        std::string imageB64;
-                                        std::string snapshotTsUtcIso;
-
-                                        auto resultIt = resultByCamera.find(camId);
-                                        if (resultIt != resultByCamera.end()) {
-                                            const json& node = resultIt->second;
-                                            if (node.contains("image_jpeg_b64") && node["image_jpeg_b64"].is_string()) {
-                                                imageB64 = node["image_jpeg_b64"].get<std::string>();
-                                            }
-                                            if (node.contains("snapshot_ts_utc_iso") && node["snapshot_ts_utc_iso"].is_string()) {
-                                                snapshotTsUtcIso = node["snapshot_ts_utc_iso"].get<std::string>();
-                                            }
-                                        }
-
-                                        if (imageB64.empty()) {
-                                            auto imgIt = jpegByCam.find(camId);
-                                            if (imgIt != jpegByCam.end()) {
-                                                imageB64 = imgIt->second;
-                                            }
-                                        }
-
-                                        if (imageB64.empty()) {
-                                            validatorInputReady = false;
-                                            break;
-                                        }
-
-                                        GroupImageInput vi;
-                                        vi.cameraId = camId;
-                                        vi.cameraName = cameraNameById(camId);
-                                        vi.snapshotTsUtcIso = snapshotTsUtcIso;
-                                        vi.jpegBase64 = imageB64;
-                                        vi.injectedInput = resolvePipelineInputsForCamera_(job, step, camId, stepsById);
-                                        vi.sourceTag = "validator_reuse";
-                                        validatorInputs.push_back(std::move(vi));
-                                    }
-
-                                    if (validatorInputReady && owner_ && !modelApiKey.empty() && !validatorInputs.empty()) {
-                                        VideoHit validatorHit = owner_->callOpenAIVisionImageGroupJOB_(
-                                            validatorInputs,
-                                            /*groupPrompt*/ groupPromptForInference,
-                                            groupFaceReferences,
-                                            groupNegativeReferences,
-                                            /*alertConditionText*/ pg.g.alert_condition_text,
-                                            /*startConditionText*/ startConditionText,
-                                            /*openAiModelName*/ kOpenAIAlertValidatorModelName_,
-                                            /*openAiApiKey*/ modelApiKey,
-                                            groupValidatorPromptTokens,
-                                            groupValidatorOutputTokens,
-                                            groupValidatorTotalTokens
-                                        );
-
-                                        groupValidatorExecuted = true;
-                                        groupValidatorAlertCondition = allExpectedCameraIdsAlertTrueFromGroupResult_(
-                                            validatorHit.answer,
-                                            expectedCameraIds
-                                        );
-
-                                        enqueueJobTokenUsageAsync(
-                                            owner_,
-                                            jobId,
-                                            step.id,
-                                            -1,
-                                            groupValidatorPromptTokens,
-                                            groupValidatorOutputTokens,
-                                            groupValidatorTotalTokens,
-                                            /*inferenceModel*/ "validator",
-                                            pg.g.agent_key + ":validator_gpt-5.1"
-                                        );
-                                    }
-                                    else {
-                                        Logger::instance().logDebug(
-                                            "job",
-                                            "Group alert validator skipped group_id=" + pg.g.id +
-                                            " reason=missing_input_owner_or_api_key"
-                                        );
-                                    }
-
-                                    const bool validatedGroupAlert = groupValidatorExecuted && groupValidatorAlertCondition;
+                                if (groupAlertReady) {
+                                    const bool validatedGroupAlert = true;
                                     if (validatedGroupAlert) {
                                         const int primaryCameraId = expectedCameraIds.front();
 
@@ -4248,7 +4196,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                         groupAlert["alert_camera_ids"] = alertCameraIds;
                                         groupAlert["alert_condition_first_pass"] = allTrue;
                                         groupAlert["validator_executed"] = groupValidatorExecuted;
-                                        groupAlert["validator_model"] = kOpenAIAlertValidatorModelName_;
+                                        groupAlert["validator_model"] = "";
                                         groupAlert["validator_alert_condition"] = groupValidatorAlertCondition;
                                         groupAlert["validator_prompt_tokens"] = groupValidatorPromptTokens;
                                         groupAlert["validator_output_tokens"] = groupValidatorOutputTokens;
@@ -4332,12 +4280,10 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 summary["alert_target_ids"] = alertTargetIds;
                                 summary["all_cameras_responded"] = allResponded;
                                 summary["group_alert_condition_met"] = allTrue;
-                                summary["group_alert_condition_validated"] =
-                                    allTrue && groupValidatorExecuted && groupValidatorAlertCondition;
-                                summary["alert_condition"] =
-                                    allTrue && groupValidatorExecuted && groupValidatorAlertCondition;
+                                summary["group_alert_condition_validated"] = groupAlertReady;
+                                summary["alert_condition"] = groupAlertReady;
                                 summary["validator_executed"] = groupValidatorExecuted;
-                                summary["validator_model"] = kOpenAIAlertValidatorModelName_;
+                                summary["validator_model"] = "";
                                 summary["validator_alert_condition"] = groupValidatorAlertCondition;
                                 summary["validator_prompt_tokens"] = groupValidatorPromptTokens;
                                 summary["validator_output_tokens"] = groupValidatorOutputTokens;
@@ -5490,9 +5436,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     for (auto& ch : it) ch = (char)std::tolower((unsigned char)ch);
     const bool isImage = (it == "image");
     const std::string inferenceModel = normalizeInferenceModel_(agent.inference_model);
-    const bool useOpenAI = isOpenAIInferenceModel_(inferenceModel);
     const bool useCore = isCoreInferenceModel_(inferenceModel);
-    const bool useOpenAICompatible = useOpenAI || useCore;
+    const bool useOpenAICompatible = isOpenAIInferenceModel_(inferenceModel) || useCore;
     const std::string openAiModelName = openAIModelNameForInferenceModel_(inferenceModel);
     const std::string modelApiKey = agent.api_key;
     int modelInputFps = normalizeModelInputFps_(agent.model_fps, inferenceModel, it);
@@ -5672,6 +5617,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 if (!patch.is_object() || !patch.contains("events") || !patch["events"].is_array()) continue;
                 const std::string patchEntityId = temporal::trim(temporal::strField(patch, "entity_id"));
                 for (const auto& ev : patch["events"]) {
+                    if (ev.is_object() &&
+                        expected != "present" &&
+                        !temporal::nodeCountsAsNewEvent(ev))
+                    {
+                        continue;
+                    }
                     if (!matchesEvent(ev)) continue;
                     if (ev.is_object()) {
                         appendId(temporal::strField(ev, "entity_id", temporal::strField(ev, "id", patchEntityId)));
@@ -5684,6 +5635,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
         if (roundHit.observations.is_array()) {
             for (const auto& obs : roundHit.observations) {
+                if (obs.is_object() &&
+                    expected != "present" &&
+                    !temporal::nodeCountsAsNewEvent(obs))
+                {
+                    continue;
+                }
                 if (!matchesEvent(obs)) continue;
                 if (obs.is_object()) {
                     appendId(temporal::strField(obs, "entity_id", temporal::strField(obs, "id")));
@@ -5709,12 +5666,24 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             for (const auto& patch : roundHit.identityPatch) {
                 if (!patch.is_object() || !patch.contains("events") || !patch["events"].is_array()) continue;
                 for (const auto& ev : patch["events"]) {
+                    if (ev.is_object() &&
+                        expected != "present" &&
+                        !temporal::nodeCountsAsNewEvent(ev))
+                    {
+                        continue;
+                    }
                     if (matchesEvent(ev)) return true;
                 }
             }
         }
         if (roundHit.observations.is_array()) {
             for (const auto& obs : roundHit.observations) {
+                if (obs.is_object() &&
+                    expected != "present" &&
+                    !temporal::nodeCountsAsNewEvent(obs))
+                {
+                    continue;
+                }
                 if (matchesEvent(obs)) return true;
             }
         }
@@ -6926,66 +6895,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             sanitizeAlertRegionIds_(hit.alertRegionIds, allowedAlertRegionLabelById, nullptr);
         const bool firstPassPolygonAlertSignal =
             !polygonRegions.empty() && !preValidatedAlertRegionIds.empty();
-        const bool shouldRunSecondCheck =
-            (firstPassAlertCondition || firstPassPolygonAlertSignal) && !temporalPlanActive;
         AlertValidationMeta_ validatorMeta;
-        if (shouldRunSecondCheck) {
-            if (!firstPassAlertCondition && firstPassPolygonAlertSignal) {
-                Logger::instance().logDebug(
-                    "job",
-                    "runAgentInferenceOnCamera_: forcing validator due polygon alert_region_ids cameraId=" +
-                    std::to_string(cameraId) + " roi_count=" +
-                    std::to_string(preValidatedAlertRegionIds.size())
-                );
-            }
-            if (useOpenAI) {
-                if (owner_ && !modelApiKey.empty()) {
-                    VideoHit validatorHit = owner_->callOpenAIVisionImageJOB_(
-                        cameraId,
-                        annotatedJpegB64,
-                        inferencePrompt,
-                        faceReferences,
-                        negativeReferences,
-                        /*alertConditionText*/ alertConditionText,
-                        /*startConditionText*/ startConditionText,
-                        /*openAiModelName*/ kOpenAIAlertValidatorModelName_,
-                        /*openAiApiKey*/ modelApiKey,
-                        tsUtcIso,
-                        validatorMeta.promptTokens,
-                        validatorMeta.outputTokens,
-                        validatorMeta.totalTokens
-                    );
-                    validatorMeta.executed = true;
-                    validatorMeta.alertCondition = validatorHit.alertCondition;
-
-                    enqueueJobTokenUsageAsync(
-                        owner_,
-                        jobId,
-                        stepId,
-                        cameraId,
-                        validatorMeta.promptTokens,
-                        validatorMeta.outputTokens,
-                        validatorMeta.totalTokens,
-                        /*inferenceModel*/ "validator",
-                        agent.agent_key + ":validator_gpt-5.1"
-                    );
-                }
-                else {
-                    Logger::instance().logDebug(
-                        "job",
-                        "runAgentInferenceOnCamera_: alert validator skipped (image) cameraId=" +
-                        std::to_string(cameraId) + " reason=missing_owner_or_api_key"
-                    );
-                }
-
-                // Alert delivery is fail-closed: only fires when validator confirms alert=true.
-                hit.alertCondition = validatorMeta.executed && validatorMeta.alertCondition;
-                decisionSource = "validator";
-            }
-            else if (useCore) {
-                // Core model runs single-pass in image fallback paths.
-                hit.alertCondition = firstPassAlertCondition;
-            }
+        if (!firstPassAlertCondition && firstPassPolygonAlertSignal && !temporalPlanActive) {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: promoting first-pass alert due polygon alert_region_ids cameraId=" +
+                std::to_string(cameraId) + " roi_count=" +
+                std::to_string(preValidatedAlertRegionIds.size())
+            );
+            hit.alertCondition = true;
         }
 
         const LocalAlertNormalization_ normalizedLocalAlert =
@@ -7270,7 +7188,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         out["final_alert_condition"] = finalAlertAny;
         out["alert_condition_first_pass"] = firstPassAlertAny;
         out["validator_executed"] = validatorExecutedAny;
-        out["validator_model"] = kOpenAIAlertValidatorModelName_;
+        out["validator_model"] = "";
         out["validator_alert_condition"] = validatorAlertAny;
         out["validator_prompt_tokens"] = sumValidatorPromptTokens;
         out["validator_output_tokens"] = sumValidatorOutputTokens;
@@ -7672,6 +7590,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             /*modelInputFps*/ modelInputFps,
             /*expectedWindowSeconds*/ expectedWindowSecondsForOpenAI,
             /*runningResolution*/ runningResolution,
+            normalizeVideoPackagingMode_(agent.video_packaging_mode),
             promptTokens,
             outputTokens,
             totalTokens
@@ -7710,67 +7629,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         sanitizeAlertRegionIds_(hit.alertRegionIds, allowedAlertRegionLabelById, nullptr);
     const bool firstPassPolygonAlertSignal =
         !polygonRegions.empty() && !preValidatedAlertRegionIds.empty();
-    const bool shouldRunSecondCheck =
-        (firstPassAlertCondition || firstPassPolygonAlertSignal) && !temporalPlanActive;
     AlertValidationMeta_ validatorMeta;
-    if (shouldRunSecondCheck) {
-        if (!firstPassAlertCondition && firstPassPolygonAlertSignal) {
-            Logger::instance().logDebug(
-                "job",
-                "runAgentInferenceOnCamera_: forcing validator due polygon alert_region_ids (video) cameraId=" +
-                std::to_string(cameraId) + " roi_count=" +
-                std::to_string(preValidatedAlertRegionIds.size())
-            );
-        }
-        if (useOpenAI) {
-            if (owner_ && !modelApiKey.empty()) {
-                VideoHit validatorHit = owner_->callOpenAIVisionVideoSegmentJOB_(
-                    seg,
-                    inferencePrompt,
-                    faceReferences,
-                    negativeReferences,
-                    /*alertConditionText*/ alertConditionText,
-                    /*startConditionText*/ startConditionText,
-                    /*openAiModelName*/ kOpenAIAlertValidatorModelName_,
-                    /*openAiApiKey*/ modelApiKey,
-                    /*modelInputFps*/ modelInputFps,
-                    /*expectedWindowSeconds*/ expectedWindowSecondsForOpenAI,
-                    /*runningResolution*/ runningResolution,
-                    validatorMeta.promptTokens,
-                    validatorMeta.outputTokens,
-                    validatorMeta.totalTokens
-                );
-                validatorMeta.executed = true;
-                validatorMeta.alertCondition = validatorHit.alertCondition;
-
-                enqueueJobTokenUsageAsync(
-                    owner_,
-                    jobId,
-                    stepId,
-                    cameraId,
-                    validatorMeta.promptTokens,
-                    validatorMeta.outputTokens,
-                    validatorMeta.totalTokens,
-                    /*inferenceModel*/ "validator",
-                    agent.agent_key + ":validator_gpt-5.1"
-                );
-            }
-            else {
-                Logger::instance().logDebug(
-                    "job",
-                    "runAgentInferenceOnCamera_: alert validator skipped (video) cameraId=" +
-                    std::to_string(cameraId) + " reason=missing_owner_or_api_key"
-                );
-            }
-
-            // Alert delivery is fail-closed: only fires when validator confirms alert=true.
-            hit.alertCondition = validatorMeta.executed && validatorMeta.alertCondition;
-            decisionSource = "validator";
-        }
-        else if (useCore) {
-            // Core model runs single-pass in video mode.
-            hit.alertCondition = firstPassAlertCondition;
-        }
+    if (!firstPassAlertCondition && firstPassPolygonAlertSignal && !temporalPlanActive) {
+        Logger::instance().logDebug(
+            "job",
+            "runAgentInferenceOnCamera_: promoting first-pass alert due polygon alert_region_ids (video) cameraId=" +
+            std::to_string(cameraId) + " roi_count=" +
+            std::to_string(preValidatedAlertRegionIds.size())
+        );
+        hit.alertCondition = true;
     }
 
     const LocalAlertNormalization_ normalizedLocalAlert =
@@ -8042,6 +7909,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     out["model_fps"] = modelInputFps;
     out["camera_id"] = cameraId;
     out["input_type"] = "video";
+    out["video_packaging_mode"] = normalizeVideoPackagingMode_(agent.video_packaging_mode);
     out["result_source"] = "llm";
     out["decision_source"] = decisionSource;
     out["answer"] = representativeAnswer;
@@ -8050,7 +7918,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     out["final_alert_condition"] = finalAlertAny;
     out["alert_condition_first_pass"] = firstPassAlertAny;
     out["validator_executed"] = validatorExecutedAny;
-    out["validator_model"] = kOpenAIAlertValidatorModelName_;
+    out["validator_model"] = "";
     out["validator_alert_condition"] = validatorAlertAny;
     out["validator_prompt_tokens"] = sumValidatorPromptTokens;
     out["validator_output_tokens"] = sumValidatorOutputTokens;

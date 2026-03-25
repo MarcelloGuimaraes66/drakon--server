@@ -636,6 +636,9 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
     const onlyCaptureOnMotion = normalizeAgentOnlyCaptureOnMotion(
       row?.only_capture_on_motion ?? row?.onlyCaptureOnMotion
     );
+    const videoPackagingMode = normalizeAgentVideoPackagingMode(
+      row?.video_packaging_mode ?? row?.videoPackagingMode
+    );
     if (!id || !agentKey || targetIds.length === 0) continue;
     const sourceTargetIdRaw = row?.source_target_id ?? row?.sourceTargetId;
     const sourceTargetId = Number(sourceTargetIdRaw);
@@ -682,6 +685,7 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
       targetIds,
       agentKey,
       inputType: execution.inputType,
+      video_packaging_mode: videoPackagingMode,
       priority_level: priorityLevel,
       inference_model: execution.inferenceModel,
       model_fps: execution.modelFps,
@@ -791,11 +795,13 @@ type TargetInputType = "video" | "image";
 type AgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
 type AgentRunEverySeconds = 10 | 60;
 type AgentRunningResolution = 640 | 1024;
+type AgentVideoPackagingMode = "mosaic" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
+const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic";
 
 interface InferenceGroup {
   id: string;
@@ -803,6 +809,7 @@ interface InferenceGroup {
   targetIds: number[];
   agentKey: string;
   inputType: TargetInputType;
+  video_packaging_mode: AgentVideoPackagingMode;
   priority_level?: AgentPriority | null;
   inference_model?: AgentInferenceModel;
   model_fps?: number;
@@ -825,12 +832,14 @@ interface GroupAgentSourceOption {
   cameraLabel: string;
   agentKey: string;
   label: string;
+  inputType: TargetInputType;
   priorityLevel: AgentPriority;
   inferenceModel: AgentInferenceModel;
   modelFps: number;
   runEvery: AgentRunEverySeconds;
   runningResolution: AgentRunningResolution | null;
   onlyCaptureOnMotion: boolean;
+  videoPackagingMode: AgentVideoPackagingMode;
 }
 
 const AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<AgentRunEverySeconds> = [60, 10];
@@ -872,6 +881,28 @@ const normalizeAgentModelFps = (
     }
   }
   return normalizeAgentModelFps(fallback, DEFAULT_ULTRA_VIDEO_MODEL_FPS);
+};
+
+const normalizeAgentVideoPackagingMode = (
+  value: unknown,
+  fallback: AgentVideoPackagingMode = DEFAULT_AGENT_VIDEO_PACKAGING_MODE
+): AgentVideoPackagingMode => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "frame_sequence" ||
+      normalized === "frame-sequence" ||
+      normalized === "full_frame" ||
+      normalized === "full-frame" ||
+      normalized === "frames"
+    ) {
+      return "frame_sequence";
+    }
+    if (normalized === "mosaic") {
+      return "mosaic";
+    }
+  }
+  return fallback;
 };
 
 const applyAgentExecutionConstraints = (
@@ -1025,6 +1056,7 @@ interface Agent {
   model_fps?: number;
   run_every?: AgentRunEverySeconds;
   running_resolution?: AgentRunningResolution | null;
+  video_packaging_mode?: AgentVideoPackagingMode | string | null;
   only_capture_on_motion?: boolean;
   use_temporal_context?: boolean;
   face_target_ids?: number[];
@@ -1110,6 +1142,7 @@ interface AgentFormState {
   model_fps: number;
   run_every: AgentRunEverySeconds;
   running_resolution: AgentRunningResolution | null;
+  video_packaging_mode: AgentVideoPackagingMode;
   only_capture_on_motion: boolean;
   use_temporal_context: boolean;
   face_target_ids: number[];
@@ -1138,6 +1171,7 @@ const buildEmptyAgentForm = (): AgentFormState => ({
   model_fps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   run_every: FIXED_AGENT_RUN_EVERY_SECONDS,
   running_resolution: null,
+  video_packaging_mode: DEFAULT_AGENT_VIDEO_PACKAGING_MODE,
   only_capture_on_motion: false,
   use_temporal_context: DEFAULT_AGENT_USE_TEMPORAL_CONTEXT,
   face_target_ids: [],
@@ -3133,6 +3167,9 @@ function StepCard({
       selectedSource.modelFps
     );
     const lockedGroupInputType: TargetInputType = sourceExecution.inputType;
+    const videoPackagingMode = normalizeAgentVideoPackagingMode(
+      selectedSource.videoPackagingMode
+    );
 
     if (editingGroupId) {
       const nextGroups = inferenceGroups.map((group) =>
@@ -3147,6 +3184,7 @@ function StepCard({
               model_fps: sourceExecution.modelFps,
               run_every: sourceExecution.runEvery,
               running_resolution: sourceExecution.runningResolution,
+              video_packaging_mode: videoPackagingMode,
               only_capture_on_motion: selectedSource.onlyCaptureOnMotion,
               source_target_id: selectedSource.targetId,
             }
@@ -3180,6 +3218,7 @@ function StepCard({
         model_fps: sourceExecution.modelFps,
         run_every: sourceExecution.runEvery,
         running_resolution: sourceExecution.runningResolution,
+        video_packaging_mode: videoPackagingMode,
         only_capture_on_motion: selectedSource.onlyCaptureOnMotion,
         source_target_id: selectedSource.targetId,
       },
@@ -3964,6 +4003,9 @@ function StepCard({
     );
     return {
       ...agent,
+      video_packaging_mode: normalizeAgentVideoPackagingMode(
+        agent?.video_packaging_mode ?? agent?.videoPackagingMode
+      ),
       only_capture_on_motion: normalizeAgentOnlyCaptureOnMotion(
         agent?.only_capture_on_motion ?? agent?.onlyCaptureOnMotion
       ),
@@ -4479,6 +4521,7 @@ function StepCard({
       model_fps?: number;
       run_every?: AgentRunEverySeconds;
       running_resolution?: AgentRunningResolution | null;
+      video_packaging_mode?: AgentVideoPackagingMode | string | null;
       only_capture_on_motion?: boolean;
       use_temporal_context?: boolean;
     };
@@ -4504,6 +4547,7 @@ function StepCard({
         source.run_every,
         FIXED_AGENT_RUN_EVERY_SECONDS
       ),
+      video_packaging_mode: normalizeAgentVideoPackagingMode(source.video_packaging_mode),
       running_resolution:
         inferenceModel === "core"
           ? normalizeAgentRunningResolution(
@@ -6039,6 +6083,9 @@ function StepCard({
         model_fps: execution.modelFps,
         run_every: execution.runEvery,
         running_resolution: execution.runningResolution,
+        video_packaging_mode: normalizeAgentVideoPackagingMode(
+          targetAgent.video_packaging_mode
+        ),
         only_capture_on_motion: normalizeAgentOnlyCaptureOnMotion(
           targetAgent.only_capture_on_motion
         ),
@@ -6275,10 +6322,17 @@ function StepCard({
               DEFAULT_CORE_RUNNING_RESOLUTION
             )
           : null;
+      const inputType =
+        inferenceModel === "core"
+          ? "video"
+          : normalizeTargetInputType(targetInputTypes[target.id] ?? target.input_type);
       const onlyCaptureOnMotion = targetAgent
         ? (agentOnlyCaptureOnMotion[target.id] ??
             normalizeAgentOnlyCaptureOnMotion(targetAgent.only_capture_on_motion))
         : normalizeAgentOnlyCaptureOnMotion(defaultAgent?.only_capture_on_motion);
+      const videoPackagingMode = normalizeAgentVideoPackagingMode(
+        targetAgent?.video_packaging_mode ?? defaultAgent?.video_packaging_mode
+      );
 
       options.push({
         targetId: target.id,
@@ -6286,12 +6340,14 @@ function StepCard({
         cameraLabel,
         agentKey: effectiveAgent.agent_key,
         label: `${cameraLabel} - ${effectiveAgent.agent_key}${targetAgent ? "" : " (default)"}`,
+        inputType,
         priorityLevel,
         inferenceModel,
         modelFps,
         runEvery,
         runningResolution,
         onlyCaptureOnMotion,
+        videoPackagingMode,
       });
     });
     return options;
@@ -6303,6 +6359,7 @@ function StepCard({
     agentInferenceModels,
     agentRunEvery,
     agentOnlyCaptureOnMotion,
+    targetInputTypes,
   ]);
   const selectedGroupSourceOption =
     groupAgentSourceOptions.find((option) => option.targetId === groupAgentSourceTargetId) ||
@@ -7276,6 +7333,35 @@ function StepCard({
                                 ))}
                               </select>
                             </div>
+                            {promptEditorTargetInputType === "video" ? (
+                              <div className="space-y-2">
+                                <label className="block text-sm font-semibold text-gray-100">
+                                  Video packaging
+                                </label>
+                                <select
+                                  value={normalizeAgentVideoPackagingMode(
+                                    agentForm.video_packaging_mode
+                                  )}
+                                  onChange={(e) =>
+                                    setAgentForm((prev) => ({
+                                      ...prev,
+                                      video_packaging_mode: normalizeAgentVideoPackagingMode(
+                                        e.target.value
+                                      ),
+                                    }))
+                                  }
+                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                                >
+                                  <option value="mosaic">Mosaic (recommended)</option>
+                                  <option value="frame_sequence">Full frame</option>
+                                </select>
+                                <p className="text-xs text-gray-400">
+                                  Mosaic is much cheaper. Full frame sends frames individually and
+                                  is better for finer, more precise analysis such as facial
+                                  recognition.
+                                </p>
+                              </div>
+                            ) : null}
                             {normalizeAgentInferenceModel(agentForm.inference_model) === "ultra" &&
                             promptEditorTargetInputType === "video" ? (
                               <div className="space-y-2">
@@ -8562,6 +8648,16 @@ function StepCard({
                               : t("jobs.alwaysCapture")}
                           </div>
                         </div>
+                        {selectedGroupSourceOption.inputType === "video" ? (
+                          <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                            <div className="text-[10px] uppercase tracking-widest text-gray-400">Video packaging</div>
+                            <div className="text-gray-100">
+                              {selectedGroupSourceOption.videoPackagingMode === "frame_sequence"
+                                ? "Full frame"
+                                : "Mosaic"}
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
                     ) : (
                       <div className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-gray-400 text-sm">

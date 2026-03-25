@@ -29,8 +29,10 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <functional>
+#include <iomanip>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -116,6 +118,77 @@ static std::string lowerAsciiCopy_(std::string value)
         return static_cast<char>(std::tolower(c));
     });
     return value;
+}
+
+static std::string foldCommonUtf8LatinToAscii_(const std::string& input)
+{
+    std::string out;
+    out.reserve(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(input[i]);
+        if (ch < 0x80) {
+            out.push_back(static_cast<char>(ch));
+            continue;
+        }
+
+        if (ch == 0xC3 && i + 1 < input.size()) {
+            const unsigned char next = static_cast<unsigned char>(input[i + 1]);
+            char mapped = '\0';
+            switch (next) {
+            case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+            case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5:
+                mapped = 'a';
+                break;
+            case 0x87: case 0xA7:
+                mapped = 'c';
+                break;
+            case 0x88: case 0x89: case 0x8A: case 0x8B:
+            case 0xA8: case 0xA9: case 0xAA: case 0xAB:
+                mapped = 'e';
+                break;
+            case 0x8C: case 0x8D: case 0x8E: case 0x8F:
+            case 0xAC: case 0xAD: case 0xAE: case 0xAF:
+                mapped = 'i';
+                break;
+            case 0x91: case 0xB1:
+                mapped = 'n';
+                break;
+            case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x98:
+            case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6: case 0xB8:
+                mapped = 'o';
+                break;
+            case 0x99: case 0x9A: case 0x9B: case 0x9C:
+            case 0xB9: case 0xBA: case 0xBB: case 0xBC:
+                mapped = 'u';
+                break;
+            case 0x9D: case 0xBD: case 0xBF:
+                mapped = 'y';
+                break;
+            default:
+                break;
+            }
+            if (mapped != '\0') {
+                out.push_back(mapped);
+                ++i;
+                continue;
+            }
+        }
+
+        if (ch == 0xC2 && i + 1 < input.size()) {
+            const unsigned char next = static_cast<unsigned char>(input[i + 1]);
+            if (next == 0xAA) {
+                out.push_back('a');
+                ++i;
+                continue;
+            }
+            if (next == 0xBA) {
+                out.push_back('o');
+                ++i;
+                continue;
+            }
+        }
+    }
+    return out;
 }
 
 class CoreModelLeaseAborted : public std::runtime_error {
@@ -230,6 +303,22 @@ static int normalizeAlgorithmModelFps_(
         return 1;
     }
     return clampRequestedModelFps_(requestedFps);
+}
+
+static std::string trimAscii(const std::string& input);
+
+static std::string normalizeVideoPackagingMode_(const std::string& value)
+{
+    const std::string normalized = lowerAsciiCopy_(trimAscii(value));
+    if (normalized == "frame_sequence" ||
+        normalized == "frame-sequence" ||
+        normalized == "full_frame" ||
+        normalized == "full-frame" ||
+        normalized == "frames")
+    {
+        return "frame_sequence";
+    }
+    return "mosaic";
 }
 
 
@@ -4307,6 +4396,9 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         );
         ac.inputType = lowerLocal(jsonStringOr(a, "input_type", "video"));
         if (ac.inputType.empty()) ac.inputType = "video";
+        ac.videoPackagingMode = normalizeVideoPackagingMode_(
+            jsonStringOr(a, "video_packaging_mode", jsonStringOr(a, "videoPackagingMode", "mosaic"))
+        );
         ac.inferenceModel = lowerLocal(jsonStringOr(a, "inference_model", "ultra"));
         if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
         ac.runEverySeconds = jsonIntOr(a, "run_every", 60) <= 10 ? 10 : 60;
@@ -5495,10 +5587,17 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 ac.alertCondition,
                 ac.negativeCondition
             );
-            ac.inputType = lowerLocal(jsonStringOr(algo, "input_type", "video"));
-            if (ac.inputType.empty()) ac.inputType = "video";
-            ac.inferenceModel = lowerLocal(jsonStringOr(algo, "inference_model", "ultra"));
-            if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
+        ac.inputType = lowerLocal(jsonStringOr(algo, "input_type", "video"));
+        if (ac.inputType.empty()) ac.inputType = "video";
+        ac.videoPackagingMode = normalizeVideoPackagingMode_(
+            jsonStringOr(
+                algo,
+                "video_packaging_mode",
+                jsonStringOr(algo, "videoPackagingMode", "mosaic")
+            )
+        );
+        ac.inferenceModel = lowerLocal(jsonStringOr(algo, "inference_model", "ultra"));
+        if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
             ac.runEverySeconds = jsonIntOr(algo, "run_every", 60) <= 10 ? 10 : 60;
             ac.runningResolution = jsonIntOr(
                 algo,
@@ -8123,10 +8222,245 @@ static std::string buildPromptVideoFrameMetaText_(const PromptVideoFrame& frame)
         { "frame_index", frame.frameIndex },
         { "frame_timestamp_in_segment", frame.frameTimestampInSegment }
     };
-    if (!frame.timestampName.empty()) {
-        meta["timestamp_name"] = frame.timestampName;
-    }
     return std::string("FRAME_META_JSON: ") + meta.dump();
+}
+
+static constexpr int kPromptVideoMosaicWidth_ = 1920;
+static constexpr int kPromptVideoMosaicHeight_ = 1080;
+
+struct PromptVideoMosaicGridRule_ {
+    std::size_t maxFrames = 0;
+    int columns = 1;
+    int rows = 1;
+};
+
+// Central mosaic layout ladder.
+// To test other layouts later (for example restoring 4x3), update this table only.
+static constexpr PromptVideoMosaicGridRule_ kPromptVideoMosaicGridRules_[] = {
+    { 1u, 1, 1 },
+    { 2u, 2, 1 },
+    { 4u, 2, 2 },
+    { 6u, 3, 2 },
+    { 9u, 3, 3 }
+};
+
+static constexpr std::size_t kPromptVideoMosaicGridRuleCount_ =
+    sizeof(kPromptVideoMosaicGridRules_) / sizeof(kPromptVideoMosaicGridRules_[0]);
+static constexpr int kPromptVideoMosaicDefaultColumns_ =
+    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].columns;
+static constexpr int kPromptVideoMosaicDefaultRows_ =
+    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].rows;
+static constexpr int kPromptVideoMosaicDefaultCellWidth_ =
+    kPromptVideoMosaicWidth_ / kPromptVideoMosaicDefaultColumns_;
+static constexpr int kPromptVideoMosaicDefaultCellHeight_ =
+    kPromptVideoMosaicHeight_ / kPromptVideoMosaicDefaultRows_;
+static constexpr std::size_t kPromptVideoMosaicMaxFramesPerMosaic_ =
+    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].maxFrames;
+
+struct PromptVideoMosaicLayout_ {
+    int columns = kPromptVideoMosaicDefaultColumns_;
+    int rows = kPromptVideoMosaicDefaultRows_;
+    int cellWidth = kPromptVideoMosaicDefaultCellWidth_;
+    int cellHeight = kPromptVideoMosaicDefaultCellHeight_;
+};
+
+struct PromptVideoMosaic_ {
+    int mosaicIndex = 1;
+    int validCellCount = 0;
+    int gridColumns = kPromptVideoMosaicDefaultColumns_;
+    int gridRows = kPromptVideoMosaicDefaultRows_;
+    std::string jpegBase64;
+};
+
+struct PromptVideoMosaicBundle_ {
+    std::vector<PromptVideoMosaic_> mosaics;
+    std::vector<int> validCellsPerMosaic;
+    std::vector<int> gridColsPerMosaic;
+    std::vector<int> gridRowsPerMosaic;
+    int totalSampledFrames = 0;
+};
+
+static PromptVideoMosaicLayout_ makePromptVideoMosaicLayout_(int columns, int rows)
+{
+    columns = (std::max)(1, columns);
+    rows = (std::max)(1, rows);
+    return {
+        columns,
+        rows,
+        kPromptVideoMosaicWidth_ / columns,
+        kPromptVideoMosaicHeight_ / rows
+    };
+}
+
+static PromptVideoMosaicLayout_ getPromptVideoMosaicLayout_(std::size_t framesInMosaic)
+{
+    const std::size_t clampedFrames =
+        (std::max)(std::size_t{ 1 }, (std::min)(framesInMosaic, kPromptVideoMosaicMaxFramesPerMosaic_));
+
+    for (const auto& rule : kPromptVideoMosaicGridRules_) {
+        if (clampedFrames <= rule.maxFrames) {
+            return makePromptVideoMosaicLayout_(rule.columns, rule.rows);
+        }
+    }
+
+    return makePromptVideoMosaicLayout_(
+        kPromptVideoMosaicDefaultColumns_,
+        kPromptVideoMosaicDefaultRows_
+    );
+}
+
+static std::string buildPromptVideoMosaicGridRuleText_()
+{
+    std::ostringstream out;
+    for (std::size_t i = 0; i < kPromptVideoMosaicGridRuleCount_; ++i) {
+        const auto& rule = kPromptVideoMosaicGridRules_[i];
+        if (i > 0) out << ",";
+        out << "<=" << rule.maxFrames << ":" << rule.columns << "x" << rule.rows;
+    }
+    return out.str();
+}
+
+static std::vector<int> buildPromptVideoMosaicDistribution_(std::size_t totalFrames)
+{
+    std::vector<int> distribution;
+    if (totalFrames == 0) return distribution;
+
+    std::size_t mosaicCount =
+        (totalFrames + static_cast<std::size_t>(kPromptVideoMosaicMaxFramesPerMosaic_) - 1u) /
+        static_cast<std::size_t>(kPromptVideoMosaicMaxFramesPerMosaic_);
+    if (mosaicCount == 0) mosaicCount = 1;
+
+    const std::size_t baseFramesPerMosaic = totalFrames / mosaicCount;
+    const std::size_t remainder = totalFrames % mosaicCount;
+
+    distribution.reserve(mosaicCount);
+    for (std::size_t i = 0; i < mosaicCount; ++i) {
+        distribution.push_back(
+            static_cast<int>(baseFramesPerMosaic + (i < remainder ? 1u : 0u))
+        );
+    }
+    return distribution;
+}
+
+static bool decodePromptVideoFrameToMat_(
+    const std::string& bareJpegBase64,
+    cv::Mat& outFrame)
+{
+    outFrame.release();
+    if (trimAscii(bareJpegBase64).empty()) return false;
+
+    std::vector<unsigned char> jpegBytes;
+    std::string err;
+    if (!decodeBase64ToBytesForPromptEnhance_(bareJpegBase64, jpegBytes, &err) || jpegBytes.empty()) {
+        return false;
+    }
+
+    outFrame = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
+    return !outFrame.empty();
+}
+
+static bool encodePromptVideoMosaicToBase64_(
+    const cv::Mat& mosaic,
+    std::string& outBareJpegBase64)
+{
+    outBareJpegBase64.clear();
+    if (mosaic.empty()) return false;
+
+    std::vector<unsigned char> jpeg;
+    const std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 82 };
+    if (!cv::imencode(".jpg", mosaic, jpeg, params) || jpeg.empty()) {
+        return false;
+    }
+
+    const std::string bytesStr(
+        reinterpret_cast<const char*>(jpeg.data()),
+        reinterpret_cast<const char*>(jpeg.data()) + jpeg.size()
+    );
+    outBareJpegBase64 = base64Encode(bytesStr);
+    return !outBareJpegBase64.empty();
+}
+
+static PromptVideoMosaicBundle_ buildPromptVideoMosaicBundle_(
+    const std::vector<PromptVideoFrame>& frames)
+{
+    PromptVideoMosaicBundle_ bundle;
+    bundle.totalSampledFrames = static_cast<int>(frames.size());
+    if (frames.empty()) return bundle;
+
+    const std::vector<int> distribution = buildPromptVideoMosaicDistribution_(frames.size());
+    if (distribution.empty()) return bundle;
+
+    bundle.mosaics.reserve(distribution.size());
+    bundle.validCellsPerMosaic.reserve(distribution.size());
+    bundle.gridColsPerMosaic.reserve(distribution.size());
+    bundle.gridRowsPerMosaic.reserve(distribution.size());
+
+    std::size_t offset = 0;
+    for (std::size_t mosaicZero = 0; mosaicZero < distribution.size(); ++mosaicZero) {
+        const int framesInMosaic = distribution[mosaicZero];
+        if (framesInMosaic <= 0) continue;
+
+        const PromptVideoMosaicLayout_ layout =
+            getPromptVideoMosaicLayout_(static_cast<std::size_t>(framesInMosaic));
+        cv::Mat mosaic(
+            kPromptVideoMosaicHeight_,
+            kPromptVideoMosaicWidth_,
+            CV_8UC3,
+            cv::Scalar(0, 0, 0)
+        );
+
+        for (int cellZero = 0; cellZero < framesInMosaic; ++cellZero) {
+            const std::size_t frameIdx = offset + static_cast<std::size_t>(cellZero);
+            if (frameIdx >= frames.size()) break;
+
+            cv::Mat decoded;
+            if (!decodePromptVideoFrameToMat_(frames[frameIdx].jpegBase64, decoded) || decoded.empty()) {
+                continue;
+            }
+
+            cv::Mat resized;
+            cv::resize(
+                decoded,
+                resized,
+                cv::Size(layout.cellWidth, layout.cellHeight),
+                0.0,
+                0.0,
+                cv::INTER_AREA
+            );
+
+            const int x = (cellZero % layout.columns) * layout.cellWidth;
+            const int y = (cellZero / layout.columns) * layout.cellHeight;
+            if (x < 0 || y < 0 ||
+                x + layout.cellWidth > mosaic.cols ||
+                y + layout.cellHeight > mosaic.rows)
+            {
+                continue;
+            }
+
+            resized.copyTo(mosaic(cv::Rect(x, y, layout.cellWidth, layout.cellHeight)));
+        }
+
+        std::string mosaicBase64;
+        if (!encodePromptVideoMosaicToBase64_(mosaic, mosaicBase64)) {
+            return PromptVideoMosaicBundle_{};
+        }
+
+        PromptVideoMosaic_ promptMosaic;
+        promptMosaic.mosaicIndex = static_cast<int>(mosaicZero) + 1;
+        promptMosaic.validCellCount = framesInMosaic;
+        promptMosaic.gridColumns = layout.columns;
+        promptMosaic.gridRows = layout.rows;
+        promptMosaic.jpegBase64 = std::move(mosaicBase64);
+
+        bundle.validCellsPerMosaic.push_back(framesInMosaic);
+        bundle.gridColsPerMosaic.push_back(layout.columns);
+        bundle.gridRowsPerMosaic.push_back(layout.rows);
+        bundle.mosaics.push_back(std::move(promptMosaic));
+
+        offset += static_cast<std::size_t>(framesInMosaic);
+    }
+
+    return bundle;
 }
 
 struct ResolvedPromptFrameReference_ {
@@ -8240,6 +8574,63 @@ static bool tryReadFrameIndexField_(
     return false;
 }
 
+static bool tryReadPositiveIntegerLikeValue_(
+    const nlohmann::json& value,
+    int& outValue)
+{
+    outValue = -1;
+    try {
+        if (value.is_number_integer()) {
+            outValue = value.get<int>();
+            return outValue >= 1;
+        }
+        if (value.is_string()) {
+            const std::string raw = trimAscii(value.get<std::string>());
+            if (raw.empty()) return false;
+
+            std::size_t consumed = 0;
+            const int parsed = std::stoi(raw, &consumed);
+            if (consumed != raw.size()) return false;
+            outValue = parsed;
+            return outValue >= 1;
+        }
+    }
+    catch (...) {
+        outValue = -1;
+    }
+
+    return false;
+}
+
+static bool tryReadPromptVideoMosaicRef_(
+    const nlohmann::json& node,
+    int& outMosaicIndex,
+    int& outCellIndex)
+{
+    outMosaicIndex = -1;
+    outCellIndex = -1;
+    if (!node.is_object()) return false;
+
+    const auto tryReadFromObject = [&](const nlohmann::json& obj) -> bool {
+        if (!obj.is_object()) return false;
+        if (!obj.contains("mosaic_index") || !obj.contains("cell_index")) return false;
+
+        int mosaicIndex = -1;
+        int cellIndex = -1;
+        if (!tryReadPositiveIntegerLikeValue_(obj["mosaic_index"], mosaicIndex)) return false;
+        if (!tryReadPositiveIntegerLikeValue_(obj["cell_index"], cellIndex)) return false;
+
+        outMosaicIndex = mosaicIndex;
+        outCellIndex = cellIndex;
+        return true;
+    };
+
+    if (node.contains("frame_ref") && tryReadFromObject(node["frame_ref"])) {
+        return true;
+    }
+    return tryReadFromObject(node);
+}
+
 static bool deriveTimePointFromSegmentOffset_(
     const std::string& offsetText,
     const TemporalVideoSegmentContext_& ctx,
@@ -8305,6 +8696,51 @@ static const PromptVideoFrame* findPromptVideoFrameBySegmentOffset_(
     return nullptr;
 }
 
+static bool mapPromptVideoMosaicRefToFrameIndex_(
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    int mosaicIndex,
+    int cellIndex,
+    int& outFrameIndex)
+{
+    outFrameIndex = -1;
+    if (frameCatalog == nullptr || mosaicIndex < 1 || cellIndex < 1) return false;
+
+    const std::vector<int> distribution =
+        buildPromptVideoMosaicDistribution_(frameCatalog->size());
+    if (distribution.empty()) return false;
+    if (mosaicIndex > static_cast<int>(distribution.size())) return false;
+
+    const int cellsInMosaic = distribution[static_cast<std::size_t>(mosaicIndex - 1)];
+    if (cellIndex > cellsInMosaic) return false;
+
+    int prefixFrames = 0;
+    for (int i = 0; i < mosaicIndex - 1; ++i) {
+        prefixFrames += distribution[static_cast<std::size_t>(i)];
+    }
+
+    const int frameIndex = prefixFrames + (cellIndex - 1);
+    if (frameIndex < 0 ||
+        static_cast<std::size_t>(frameIndex) >= frameCatalog->size())
+    {
+        return false;
+    }
+
+    outFrameIndex = frameIndex;
+    return true;
+}
+
+static const PromptVideoFrame* findPromptVideoFrameByMosaicRef_(
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    int mosaicIndex,
+    int cellIndex)
+{
+    int frameIndex = -1;
+    if (!mapPromptVideoMosaicRefToFrameIndex_(frameCatalog, mosaicIndex, cellIndex, frameIndex)) {
+        return nullptr;
+    }
+    return findPromptVideoFrameByFrameIndex_(frameCatalog, frameIndex);
+}
+
 static void fillResolvedPromptFrameReferenceFromTimePoint_(
     const std::chrono::system_clock::time_point& tp,
     int frameIndex,
@@ -8344,11 +8780,20 @@ static bool resolvePromptFrameReferenceFromObject_(
                 ? trimAscii(node["time_in_video"].get<std::string>())
                 : std::string());
 
+    int mosaicIndex = -1;
+    int cellIndex = -1;
+    const bool hasMosaicRef = tryReadPromptVideoMosaicRef_(node, mosaicIndex, cellIndex);
     int frameIndex = -1;
     const bool hasFrameIndex = tryReadFrameIndexField_(node, frameIndex);
 
     const PromptVideoFrame* matchedFrame = nullptr;
-    if (hasFrameIndex) {
+    if (hasMosaicRef) {
+        matchedFrame = findPromptVideoFrameByMosaicRef_(frameCatalog, mosaicIndex, cellIndex);
+        if (matchedFrame != nullptr) {
+            frameIndex = matchedFrame->frameIndex;
+        }
+    }
+    if (matchedFrame == nullptr && hasFrameIndex) {
         matchedFrame = findPromptVideoFrameByFrameIndex_(frameCatalog, frameIndex);
     }
     if (matchedFrame == nullptr && !timestampName.empty()) {
@@ -8358,15 +8803,40 @@ static bool resolvePromptFrameReferenceFromObject_(
         matchedFrame = findPromptVideoFrameBySegmentOffset_(frameCatalog, frameTimestampInSegment);
     }
 
-    if (matchedFrame != nullptr && matchedFrame->hasAbsoluteTimestamp) {
-        fillResolvedPromptFrameReferenceFromTimePoint_(
-            matchedFrame->absoluteTimestamp,
-            matchedFrame->frameIndex,
-            matchedFrame->timestampName,
-            matchedFrame->frameTimestampInSegment,
-            out
-        );
-        return true;
+    if (matchedFrame != nullptr) {
+        out.matched = true;
+        out.frameIndex = matchedFrame->frameIndex;
+        out.timestampName = matchedFrame->timestampName;
+        out.frameTimestampInSegment = matchedFrame->frameTimestampInSegment;
+
+        if (matchedFrame->hasAbsoluteTimestamp) {
+            fillResolvedPromptFrameReferenceFromTimePoint_(
+                matchedFrame->absoluteTimestamp,
+                matchedFrame->frameIndex,
+                matchedFrame->timestampName,
+                matchedFrame->frameTimestampInSegment,
+                out
+            );
+            return true;
+        }
+
+        std::chrono::system_clock::time_point matchedTp;
+        if (!matchedFrame->frameTimestampInSegment.empty() &&
+            deriveTimePointFromSegmentOffset_(matchedFrame->frameTimestampInSegment, ctx, matchedTp))
+        {
+            fillResolvedPromptFrameReferenceFromTimePoint_(
+                matchedTp,
+                matchedFrame->frameIndex,
+                matchedFrame->timestampName,
+                matchedFrame->frameTimestampInSegment,
+                out
+            );
+            return true;
+        }
+
+        return out.frameIndex >= 0 ||
+            !out.timestampName.empty() ||
+            !out.frameTimestampInSegment.empty();
     }
 
     std::chrono::system_clock::time_point tp;
@@ -8495,7 +8965,11 @@ static std::string readTemporalEvidenceEntityId_(const nlohmann::json& node)
     };
 
     std::string entityId = readStringField("entity_id");
+    if (entityId.empty()) entityId = readStringField("matched_entity_id");
     if (entityId.empty()) entityId = readStringField("entity_key");
+    if (entityId.empty()) entityId = readStringField("entity_ref");
+    if (entityId.empty()) entityId = readStringField("entity");
+    if (entityId.empty()) entityId = readStringField("subject");
     if (entityId.empty()) entityId = readStringField("entity_type");
     return entityId;
 }
@@ -8523,21 +8997,757 @@ static std::string readTemporalEvidenceReason_(const nlohmann::json& node)
 {
     if (!node.is_object()) return std::string();
 
-    const std::array<const char*, 5> reasonFields = {
+    const std::array<const char*, 6> reasonFields = {
         "reason",
         "description",
         "note",
+        "reasoning",
         "entity_description",
         "person_description"
     };
 
-    for (const char* key : reasonFields) {
-        if (node.contains(key) && node[key].is_string()) {
-            const std::string value = trimAscii(node[key].get<std::string>());
+    const auto readReasonFromObject = [&](const nlohmann::json& source) -> std::string {
+        if (!source.is_object()) return std::string();
+        for (const char* key : reasonFields) {
+            if (source.contains(key) && source[key].is_string()) {
+                const std::string value = trimAscii(source[key].get<std::string>());
+                if (!value.empty()) return value;
+            }
+        }
+        return std::string();
+    };
+
+    const std::string direct = readReasonFromObject(node);
+    if (!direct.empty()) return direct;
+
+    if (node.contains("details")) {
+        if (node["details"].is_string()) {
+            const std::string value = trimAscii(node["details"].get<std::string>());
             if (!value.empty()) return value;
         }
+        const std::string nested = readReasonFromObject(node["details"]);
+        if (!nested.empty()) return nested;
     }
     return std::string();
+}
+
+struct TemporalNodeEntityContext_ {
+    std::string entityId;
+    std::string entityKey;
+    std::string entityType;
+    std::string referenceKey;
+};
+
+static std::string readTemporalNodeStringAlias_(
+    const nlohmann::json& node,
+    std::initializer_list<const char*> keys)
+{
+    if (!node.is_object()) return std::string();
+    for (const char* key : keys) {
+        if (key == nullptr || !node.contains(key) || !node[key].is_string()) continue;
+        const std::string value = trimAscii(node[key].get<std::string>());
+        if (!value.empty()) return value;
+    }
+    return std::string();
+}
+
+static bool tryParseTemporalBoolValue_(
+    const nlohmann::json& value,
+    bool& outValue)
+{
+    if (value.is_boolean()) {
+        outValue = value.get<bool>();
+        return true;
+    }
+    if (value.is_number_integer()) {
+        outValue = value.get<long long>() != 0;
+        return true;
+    }
+    if (value.is_number()) {
+        outValue = value.get<double>() != 0.0;
+        return true;
+    }
+    if (!value.is_string()) return false;
+
+    const std::string raw = lowerAsciiCopy_(trimAscii(value.get<std::string>()));
+    if (raw.empty()) return false;
+    if (raw == "true" || raw == "1" || raw == "yes" || raw == "y" || raw == "sim") {
+        outValue = true;
+        return true;
+    }
+    if (raw == "false" || raw == "0" || raw == "no" || raw == "n" || raw == "nao") {
+        outValue = false;
+        return true;
+    }
+    return false;
+}
+
+static bool tryReadTemporalBoolAlias_(
+    const nlohmann::json& node,
+    std::initializer_list<const char*> keys,
+    bool& outValue)
+{
+    if (!node.is_object()) return false;
+    for (const char* key : keys) {
+        if (key == nullptr || !node.contains(key)) continue;
+        if (tryParseTemporalBoolValue_(node[key], outValue)) return true;
+    }
+    return false;
+}
+
+static bool tryReadTemporalBoolAliasFromObjectOrDetails_(
+    const nlohmann::json& node,
+    std::initializer_list<const char*> keys,
+    bool& outValue)
+{
+    if (tryReadTemporalBoolAlias_(node, keys, outValue)) return true;
+    if (node.is_object() &&
+        node.contains("details") &&
+        node["details"].is_object() &&
+        tryReadTemporalBoolAlias_(node["details"], keys, outValue))
+    {
+        return true;
+    }
+    return false;
+}
+
+static std::string normalizeTemporalSemanticToken_(const std::string& rawValue)
+{
+    const std::string folded = foldCommonUtf8LatinToAscii_(trimAscii(rawValue));
+    std::string out;
+    out.reserve(folded.size());
+    bool pendingUnderscore = false;
+    for (unsigned char ch : folded) {
+        if (std::isalnum(ch)) {
+            if (pendingUnderscore && !out.empty()) out.push_back('_');
+            out.push_back(static_cast<char>(std::tolower(ch)));
+            pendingUnderscore = false;
+        }
+        else if (!out.empty()) {
+            pendingUnderscore = true;
+        }
+    }
+    return out;
+}
+
+static bool temporalObservationKindSuggestsContinuation_(const std::string& rawKind)
+{
+    const std::string kind = normalizeTemporalSemanticToken_(rawKind);
+    if (kind.empty()) return false;
+    return kind == "continuation" ||
+           kind == "continued" ||
+           kind == "same_episode_continuation" ||
+           kind == "episode_continuation" ||
+           kind == "same_action_continuation" ||
+           kind == "same_event_continuation" ||
+           kind == "ongoing_continuation" ||
+           kind == "same_episode" ||
+           kind == "same_action" ||
+           kind == "same_event" ||
+           kind.find("continu") != std::string::npos;
+}
+
+static bool tryReadTemporalObservationKindAlias_(
+    const nlohmann::json& node,
+    std::string& outKind)
+{
+    outKind = readTemporalNodeStringAlias_(
+        node,
+        { "observation_kind", "observation_type", "kind" });
+    if (!outKind.empty()) return true;
+
+    if (node.is_object() &&
+        node.contains("details") &&
+        node["details"].is_object())
+    {
+        outKind = readTemporalNodeStringAlias_(
+            node["details"],
+            { "observation_kind", "observation_type", "kind" });
+        if (!outKind.empty()) return true;
+    }
+    return false;
+}
+
+static bool temporalNodeReferencesExistingEpisode_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return false;
+
+    auto hasNonEmptyEpisodeRef = [&](const nlohmann::json& source) -> bool {
+        if (!source.is_object()) return false;
+        const std::string sameEpisodeAs =
+            readTemporalNodeStringAlias_(source, { "same_episode_as", "episode_ref", "episode_id" });
+        return !sameEpisodeAs.empty();
+    };
+
+    if (hasNonEmptyEpisodeRef(node)) return true;
+    if (node.contains("details") && node["details"].is_object() &&
+        hasNonEmptyEpisodeRef(node["details"]))
+    {
+        return true;
+    }
+    return false;
+}
+
+static bool temporalNodeMarksContinuation_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return false;
+
+    bool flag = false;
+    if (tryReadTemporalBoolAliasFromObjectOrDetails_(
+            node,
+            { "continuation", "is_continuation", "continued" },
+            flag) &&
+        flag)
+    {
+        return true;
+    }
+
+    if (temporalNodeReferencesExistingEpisode_(node)) return true;
+
+    std::string kind;
+    if (tryReadTemporalObservationKindAlias_(node, kind) &&
+        temporalObservationKindSuggestsContinuation_(kind))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+static bool temporalNodeCountsAsNewEvent_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return true;
+
+    bool countsAsNewEvent = true;
+    if (tryReadTemporalBoolAliasFromObjectOrDetails_(
+            node,
+            { "counts_as_new_event", "count_as_new_event", "is_new_event", "new_event" },
+            countsAsNewEvent) &&
+        !countsAsNewEvent)
+    {
+        return false;
+    }
+
+    if (temporalNodeMarksContinuation_(node)) return false;
+    return true;
+}
+
+static void copyTemporalStringAliasIfMissing_(
+    nlohmann::json& node,
+    const char* targetKey,
+    std::initializer_list<const char*> sourceKeys)
+{
+    if (!node.is_object() || targetKey == nullptr) return;
+    if (node.contains(targetKey) && node[targetKey].is_string()) {
+        const std::string existing = trimAscii(node[targetKey].get<std::string>());
+        if (!existing.empty()) return;
+    }
+
+    const std::string value = readTemporalNodeStringAlias_(node, sourceKeys);
+    if (!value.empty()) node[targetKey] = value;
+}
+
+static void copyTemporalNumericAliasIfMissing_(
+    nlohmann::json& node,
+    const char* targetKey,
+    std::initializer_list<const char*> sourceKeys)
+{
+    if (!node.is_object() || targetKey == nullptr) return;
+    if (node.contains(targetKey)) {
+        if (node[targetKey].is_number()) return;
+        if (node[targetKey].is_string()) {
+            const std::string existing = trimAscii(node[targetKey].get<std::string>());
+            if (!existing.empty()) return;
+        }
+    }
+
+    for (const char* key : sourceKeys) {
+        if (key == nullptr || !node.contains(key)) continue;
+        const auto& value = node[key];
+        if (value.is_number()) {
+            node[targetKey] = value;
+            return;
+        }
+        if (value.is_string()) {
+            const std::string raw = trimAscii(value.get<std::string>());
+            if (raw.empty()) continue;
+            try {
+                node[targetKey] = std::stod(raw);
+                return;
+            }
+            catch (...) {
+            }
+        }
+    }
+}
+
+static void setTemporalBoolFieldIfMissing_(
+    nlohmann::json& node,
+    const char* targetKey,
+    bool value)
+{
+    if (!node.is_object() || targetKey == nullptr) return;
+    if (node.contains(targetKey) && node[targetKey].is_boolean()) return;
+    node[targetKey] = value;
+}
+
+static std::string readTemporalDecision_(const nlohmann::json& node)
+{
+    return readTemporalNodeStringAlias_(node, { "decision", "identity_decision" });
+}
+
+static std::string buildTemporalNodeReferenceKey_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+
+    int mosaicIndex = -1;
+    int cellIndex = -1;
+    if (tryReadPromptVideoMosaicRef_(node, mosaicIndex, cellIndex)) {
+        return "mosaic:" + std::to_string(mosaicIndex) + ":" + std::to_string(cellIndex);
+    }
+
+    int frameIndex = -1;
+    if (tryReadFrameIndexField_(node, frameIndex) && frameIndex >= 0) {
+        return "frame:" + std::to_string(frameIndex);
+    }
+
+    const std::string timestampName =
+        readTemporalNodeStringAlias_(node, { "timestamp_name" });
+    if (!timestampName.empty()) return "timestamp_name:" + timestampName;
+
+    const std::string offset =
+        readTemporalNodeStringAlias_(node, { "frame_timestamp_in_segment", "time_in_video" });
+    if (!offset.empty()) return "segment_offset:" + offset;
+
+    return std::string();
+}
+
+static bool temporalDecisionSuggestsNegativeOrUnknown_(const std::string& rawDecision)
+{
+    const std::string decision = lowerAsciiCopy_(trimAscii(rawDecision));
+    if (decision.empty()) return false;
+    return decision == "unknown" ||
+           decision == "unmatched" ||
+           decision == "no_match" ||
+           temporal::decisionSuggestsSyntheticAbsence(decision);
+}
+
+static void canonicalizeTemporalNodeAliases_(
+    nlohmann::json& node,
+    const std::string& inheritedEntityId = std::string(),
+    const std::string& inheritedEntityKey = std::string(),
+    const std::string& inheritedEntityType = std::string())
+{
+    if (!node.is_object()) return;
+
+    copyTemporalStringAliasIfMissing_(node, "event", { "event_type" });
+    copyTemporalStringAliasIfMissing_(node, "entity_id", { "matched_entity_id" });
+    copyTemporalStringAliasIfMissing_(
+        node,
+        "entity_key",
+        { "entity_ref", "entity", "subject", "target_entity", "matched_entity" });
+    copyTemporalStringAliasIfMissing_(node, "decision", { "identity_decision" });
+    copyTemporalNumericAliasIfMissing_(
+        node,
+        "confidence",
+        { "identity_confidence", "match_confidence" });
+    copyTemporalStringAliasIfMissing_(node, "reason", { "reasoning" });
+    copyTemporalStringAliasIfMissing_(node, "description", { "reasoning" });
+    copyTemporalStringAliasIfMissing_(node, "observation_kind", { "observation_type", "kind" });
+
+    if (!node.contains("description") || !node["description"].is_string() ||
+        trimAscii(node["description"].get<std::string>()).empty())
+    {
+        if (node.contains("details") && node["details"].is_object()) {
+            const std::string nestedDescription = readTemporalNodeStringAlias_(
+                node["details"],
+                { "description", "reason", "note", "reasoning" });
+            if (!nestedDescription.empty()) node["description"] = nestedDescription;
+        }
+    }
+
+    const bool marksContinuation = temporalNodeMarksContinuation_(node);
+    bool countsAsNewEvent = true;
+    const bool hasExplicitCountPolicy =
+        tryReadTemporalBoolAliasFromObjectOrDetails_(
+            node,
+            { "counts_as_new_event", "count_as_new_event", "is_new_event", "new_event" },
+            countsAsNewEvent);
+    if (hasExplicitCountPolicy) {
+        setTemporalBoolFieldIfMissing_(node, "counts_as_new_event", countsAsNewEvent);
+    }
+    if (marksContinuation || (hasExplicitCountPolicy && !countsAsNewEvent))
+    {
+        node["counts_as_new_event"] = false;
+        setTemporalBoolFieldIfMissing_(node, "continuation", true);
+        if (!node.contains("observation_kind") || !node["observation_kind"].is_string() ||
+            trimAscii(node["observation_kind"].get<std::string>()).empty())
+        {
+            node["observation_kind"] = "continuation";
+        }
+    }
+
+    if ((!node.contains("entity_id") || !node["entity_id"].is_string() ||
+         trimAscii(node["entity_id"].get<std::string>()).empty()) &&
+        !trimAscii(inheritedEntityId).empty())
+    {
+        node["entity_id"] = trimAscii(inheritedEntityId);
+    }
+    if ((!node.contains("entity_key") || !node["entity_key"].is_string() ||
+         trimAscii(node["entity_key"].get<std::string>()).empty()) &&
+        !trimAscii(inheritedEntityKey).empty())
+    {
+        node["entity_key"] = trimAscii(inheritedEntityKey);
+    }
+    if ((!node.contains("entity_type") || !node["entity_type"].is_string() ||
+         trimAscii(node["entity_type"].get<std::string>()).empty()) &&
+        !trimAscii(inheritedEntityType).empty())
+    {
+        node["entity_type"] = trimAscii(inheritedEntityType);
+    }
+}
+
+static TemporalNodeEntityContext_ buildTemporalNodeEntityContext_(const nlohmann::json& node)
+{
+    TemporalNodeEntityContext_ context;
+    if (!node.is_object()) return context;
+
+    context.entityId = readTemporalNodeStringAlias_(node, { "entity_id", "matched_entity_id" });
+    context.entityKey = readTemporalNodeStringAlias_(
+        node,
+        { "entity_key", "entity_ref", "entity", "subject", "target_entity", "matched_entity" });
+    context.entityType = readTemporalNodeStringAlias_(node, { "entity_type" });
+    context.referenceKey = buildTemporalNodeReferenceKey_(node);
+    return context;
+}
+
+static bool temporalIdentityPatchCarriesPositiveEntity_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return false;
+    if (temporalDecisionSuggestsNegativeOrUnknown_(readTemporalDecision_(node))) return false;
+
+    const std::string eventName = trimAscii(readTemporalEvidenceEventName_(node));
+    if (!eventName.empty() && temporal::isAbsenceEventName(eventName)) return false;
+
+    const TemporalNodeEntityContext_ context = buildTemporalNodeEntityContext_(node);
+    return !context.entityId.empty() || !context.entityKey.empty();
+}
+
+static void applyTemporalEntityContext_(
+    nlohmann::json& node,
+    const TemporalNodeEntityContext_& context)
+{
+    if (!node.is_object()) return;
+    canonicalizeTemporalNodeAliases_(node, context.entityId, context.entityKey, context.entityType);
+}
+
+static void inheritTemporalEntityContextFromIdentityPatches_(
+    nlohmann::json& node,
+    const std::vector<TemporalNodeEntityContext_>& contexts)
+{
+    if (!node.is_object()) return;
+    canonicalizeTemporalNodeAliases_(node);
+    if (!readTemporalEvidenceEntityId_(node).empty()) return;
+
+    const std::string referenceKey = buildTemporalNodeReferenceKey_(node);
+    if (!referenceKey.empty()) {
+        const TemporalNodeEntityContext_* matched = nullptr;
+        for (const auto& context : contexts) {
+            if (context.referenceKey != referenceKey) continue;
+            if (matched != nullptr) {
+                matched = nullptr;
+                break;
+            }
+            matched = &context;
+        }
+        if (matched != nullptr) {
+            applyTemporalEntityContext_(node, *matched);
+            return;
+        }
+    }
+
+    const TemporalNodeEntityContext_* uniqueEntityContext = nullptr;
+    std::string uniqueEntityFingerprint;
+    bool ambiguous = false;
+    for (const auto& context : contexts) {
+        std::string fingerprint;
+        if (!context.entityId.empty()) {
+            fingerprint = "id:" + context.entityId;
+        }
+        else if (!context.entityKey.empty()) {
+            fingerprint = "key:" + context.entityKey + "|type:" + context.entityType;
+        }
+        else {
+            continue;
+        }
+
+        if (uniqueEntityFingerprint.empty()) {
+            uniqueEntityFingerprint = fingerprint;
+            uniqueEntityContext = &context;
+            continue;
+        }
+        if (fingerprint != uniqueEntityFingerprint) {
+            ambiguous = true;
+            break;
+        }
+    }
+
+    if (!ambiguous && uniqueEntityContext != nullptr) {
+        applyTemporalEntityContext_(node, *uniqueEntityContext);
+    }
+}
+
+static std::string normalizeTemporalCueText_(const std::string& rawText)
+{
+    const std::string folded = foldCommonUtf8LatinToAscii_(trimAscii(rawText));
+    std::string out;
+    out.reserve(folded.size());
+    bool pendingSpace = false;
+    for (unsigned char ch : folded) {
+        if (std::isalnum(ch)) {
+            if (pendingSpace && !out.empty()) out.push_back(' ');
+            out.push_back(static_cast<char>(std::tolower(ch)));
+            pendingSpace = false;
+        }
+        else if (!out.empty()) {
+            pendingSpace = true;
+        }
+    }
+    return out;
+}
+
+template <std::size_t N>
+static bool normalizedTextContainsAnyPhrase_(
+    const std::string& normalizedText,
+    const char* const (&phrases)[N])
+{
+    if (normalizedText.empty()) return false;
+    for (const char* phrase : phrases) {
+        if (phrase == nullptr || *phrase == '\0') continue;
+        if (normalizedText.find(phrase) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool textSuggestsSingleContinuousEpisode_(const std::string& rawText)
+{
+    const std::string text = normalizeTemporalCueText_(rawText);
+    if (text.empty()) return false;
+
+    static const char* const kContinuousPhrases[] = {
+        "same episode",
+        "single episode",
+        "continuous episode",
+        "continuous sequence",
+        "continuity of the same episode",
+        "same occurrence",
+        "single occurrence",
+        "same event",
+        "same continuous event",
+        "same action",
+        "same act",
+        "same ongoing action",
+        "still the same action",
+        "same episode of interaction",
+        "same continuous action",
+        "same interaction",
+        "single interaction episode",
+        "single continuous interaction",
+        "single continuous action",
+        "single ongoing action",
+        "single ongoing episode",
+        "single instance",
+        "one occurrence",
+        "one single occurrence",
+        "one single episode",
+        "one continuous episode",
+        "still holding",
+        "continues holding",
+        "still doing the same action",
+        "still in the same episode",
+        "still the same episode",
+        "continues the same action",
+        "continues the same episode",
+        "ongoing same episode",
+        "ongoing same action",
+        "mesmo episodio",
+        "episodio continuo",
+        "sequencia continua",
+        "continuidade do mesmo episodio",
+        "ainda o mesmo episodio",
+        "mesma ocorrencia",
+        "ocorrencia unica",
+        "mesmo evento",
+        "mesma acao",
+        "mesmo ato",
+        "mesma acao continua",
+        "mesmo evento continuo",
+        "continuidade da mesma acao",
+        "continuidade do mesmo ato",
+        "continuidade do mesmo evento",
+        "mesma interacao continua",
+        "um unico episodio",
+        "uma unica ocorrencia",
+        "uma unica acao",
+        "continua segurando",
+        "ainda segurando",
+        "mesma interacao",
+        "um episodio continuo",
+        "uma unica vez"
+    };
+    if (normalizedTextContainsAnyPhrase_(text, kContinuousPhrases)) return true;
+
+    const bool singleOccurrence =
+        text.find("uma vez") != std::string::npos ||
+        text.find("uma unica vez") != std::string::npos ||
+        text.find("uma unica ocorrencia") != std::string::npos ||
+        text.find("1 vez") != std::string::npos ||
+        text.find("one time") != std::string::npos ||
+        text.find("one occurrence") != std::string::npos ||
+        text.find("single occurrence") != std::string::npos ||
+        text.find("single time") != std::string::npos ||
+        text.find("once") != std::string::npos;
+    const bool continuityContext =
+        text.find("continu") != std::string::npos ||
+        text.find("mesm") != std::string::npos ||
+        text.find("same") != std::string::npos ||
+        text.find("still") != std::string::npos ||
+        text.find("ainda") != std::string::npos ||
+        text.find("ongoing") != std::string::npos;
+    return singleOccurrence && continuityContext;
+}
+
+static bool textSuggestsMultipleDistinctEpisodes_(const std::string& rawText)
+{
+    const std::string text = normalizeTemporalCueText_(rawText);
+    if (text.empty()) return false;
+
+    static const char* const kRepeatPhrases[] = {
+        "two times",
+        "three times",
+        "2 times",
+        "3 times",
+        "second time",
+        "third time",
+        "another time",
+        "picked up again",
+        "duas vezes",
+        "tres vezes",
+        "2 vezes",
+        "3 vezes",
+        "segunda vez",
+        "terceira vez",
+        "outra vez",
+        "pegou novamente",
+        "pegou de novo"
+    };
+    return normalizedTextContainsAnyPhrase_(text, kRepeatPhrases);
+}
+
+static bool temporalEventSupportsContinuousEpisodeCompaction_(const std::string& rawEventName)
+{
+    const std::string eventName =
+        lowerAsciiCopy_(trimAscii(temporal::normalizeEventName(rawEventName)));
+    if (eventName.empty()) return false;
+    if (temporal::isAbsenceEventName(eventName)) return false;
+    return true;
+}
+
+static bool temporalEvidenceCandidatesAreCloseInTime_(
+    const TemporalEvidenceCandidate& lhs,
+    const TemporalEvidenceCandidate& rhs,
+    int maxGapSeconds)
+{
+    if (maxGapSeconds <= 0) return false;
+
+    std::chrono::system_clock::time_point lhsTp;
+    std::chrono::system_clock::time_point rhsTp;
+    if (temporal::parseFlexibleTs(lhs.timestampUtcIso, lhsTp) &&
+        temporal::parseFlexibleTs(rhs.timestampUtcIso, rhsTp))
+    {
+        const auto diff = (lhsTp <= rhsTp) ? (rhsTp - lhsTp) : (lhsTp - rhsTp);
+        return std::chrono::duration_cast<std::chrono::seconds>(diff).count() <= maxGapSeconds;
+    }
+
+    if (lhs.frameIndex >= 0 && rhs.frameIndex >= 0) {
+        return std::abs(rhs.frameIndex - lhs.frameIndex) <= maxGapSeconds;
+    }
+
+    return false;
+}
+
+static void compactContinuousTemporalEvidenceCandidatesForVideo_(
+    VideoHit& hit,
+    const std::string& logStreamId,
+    const std::string& scopeTag)
+{
+    if (hit.temporalEvidenceCandidates.size() < 2) return;
+
+    const bool batchSuggestsSingleEpisode =
+        textSuggestsSingleContinuousEpisode_(hit.answer) &&
+        !textSuggestsMultipleDistinctEpisodes_(hit.answer);
+
+    std::unordered_map<std::string, std::size_t> lastKeptIndexByGroup;
+    std::vector<TemporalEvidenceCandidate> compacted;
+    compacted.reserve(hit.temporalEvidenceCandidates.size());
+
+    json suppressedKeys = json::array();
+    for (const auto& candidate : hit.temporalEvidenceCandidates) {
+        const std::string normalizedEvent = lowerAsciiCopy_(trimAscii(candidate.eventName));
+        if (!temporalEventSupportsContinuousEpisodeCompaction_(normalizedEvent)) {
+            compacted.push_back(candidate);
+            continue;
+        }
+
+        const std::string groupKey =
+            normalizedEvent + "|" +
+            lowerAsciiCopy_(trimAscii(candidate.entityId)) + "|" +
+            lowerAsciiCopy_(trimAscii(candidate.zone));
+
+        bool suppress = false;
+        auto itLastKept = lastKeptIndexByGroup.find(groupKey);
+        if (itLastKept != lastKeptIndexByGroup.end() && itLastKept->second < compacted.size()) {
+            const bool reasonSuggestsSingleEpisode =
+                textSuggestsSingleContinuousEpisode_(candidate.reason) &&
+                !textSuggestsMultipleDistinctEpisodes_(candidate.reason);
+            if (reasonSuggestsSingleEpisode) {
+                suppress = true;
+            }
+            else if (batchSuggestsSingleEpisode &&
+                     temporalEvidenceCandidatesAreCloseInTime_(
+                         compacted[itLastKept->second],
+                         candidate,
+                         20))
+            {
+                suppress = true;
+            }
+        }
+
+        if (suppress) {
+            if (!trimAscii(candidate.evidenceKey).empty()) {
+                suppressedKeys.push_back(candidate.evidenceKey);
+            }
+            continue;
+        }
+
+        compacted.push_back(candidate);
+        lastKeptIndexByGroup[groupKey] = compacted.size() - 1;
+    }
+
+    if (!suppressedKeys.empty()) {
+        const std::size_t rawCount = hit.temporalEvidenceCandidates.size();
+        hit.temporalEvidenceCandidates = std::move(compacted);
+        if (!logStreamId.empty() && !scopeTag.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag + ": compacted continuous temporal events raw_count=" +
+                    std::to_string(static_cast<unsigned long long>(rawCount)) +
+                    " kept_count=" +
+                    std::to_string(static_cast<unsigned long long>(hit.temporalEvidenceCandidates.size())) +
+                    " suppressed_evidence_keys=" + suppressedKeys.dump()
+            );
+        }
+    }
 }
 
 static std::string buildTemporalEvidenceKey_(
@@ -8576,6 +9786,16 @@ static const PromptVideoFrame* findPromptVideoFrameForNode_(
     const nlohmann::json& node,
     const std::vector<PromptVideoFrame>* frameCatalog)
 {
+    int mosaicIndex = -1;
+    int cellIndex = -1;
+    if (tryReadPromptVideoMosaicRef_(node, mosaicIndex, cellIndex)) {
+        if (const PromptVideoFrame* byMosaic =
+            findPromptVideoFrameByMosaicRef_(frameCatalog, mosaicIndex, cellIndex))
+        {
+            return byMosaic;
+        }
+    }
+
     int frameIndex = -1;
     if (tryReadFrameIndexField_(node, frameIndex)) {
         if (const PromptVideoFrame* byIndex =
@@ -8687,6 +9907,12 @@ static bool buildTemporalEvidenceCandidateFromNode_(
     }
 
     outCandidate.eventName = readTemporalEvidenceEventName_(node, fallbackEventName);
+    if (!outCandidate.eventName.empty() &&
+        !temporal::isPresentEventName(outCandidate.eventName) &&
+        !temporalNodeCountsAsNewEvent_(node))
+    {
+        return false;
+    }
     outCandidate.entityId = readTemporalEvidenceEntityId_(node);
     outCandidate.zone = readTemporalEvidenceZone_(node);
     outCandidate.reason = readTemporalEvidenceReason_(node);
@@ -8716,6 +9942,7 @@ static void normalizeTemporalPayloadForStill_(
     const std::string snapshotUtc = trimAscii(snapshotTsUtcIso);
     if (snapshotUtc.empty()) return;
     hit.temporalEvidenceCandidates.clear();
+    std::vector<TemporalNodeEntityContext_> positiveIdentityContexts;
 
     std::set<std::string> seenEvidenceKeys;
     auto appendStillEvidenceCandidate = [&](const nlohmann::json& node, const std::string& fallbackEventName) {
@@ -8723,6 +9950,12 @@ static void normalizeTemporalPayloadForStill_(
 
         TemporalEvidenceCandidate candidate;
         candidate.eventName = readTemporalEvidenceEventName_(node, fallbackEventName);
+        if (!candidate.eventName.empty() &&
+            !temporal::isPresentEventName(candidate.eventName) &&
+            !temporalNodeCountsAsNewEvent_(node))
+        {
+            return;
+        }
         candidate.entityId = readTemporalEvidenceEntityId_(node);
         candidate.zone = readTemporalEvidenceZone_(node);
         candidate.reason = readTemporalEvidenceReason_(node);
@@ -8779,6 +10012,7 @@ static void normalizeTemporalPayloadForStill_(
                 continue;
             }
             if (!ev.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(ev, parentEntityId, parentEntityKey, parentEntityType);
             ev["ts_utc"] = snapshotUtc;
             if ((!ev.contains("entity_id") || !ev["entity_id"].is_string()) && !parentEntityId.empty()) {
                 ev["entity_id"] = parentEntityId;
@@ -8797,6 +10031,10 @@ static void normalizeTemporalPayloadForStill_(
     if (hit.identityPatch.is_array()) {
         for (auto& item : hit.identityPatch) {
             if (!item.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(item);
+            if (temporalIdentityPatchCarriesPositiveEntity_(item)) {
+                positiveIdentityContexts.push_back(buildTemporalNodeEntityContext_(item));
+            }
             normalizeTimestampFieldsInObjectForVideo_(item, TemporalVideoSegmentContext_{});
             item["last_seen_ts_utc"] = snapshotUtc;
             if (item.contains("events")) {
@@ -8820,6 +10058,8 @@ static void normalizeTemporalPayloadForStill_(
     if (hit.observations.is_array()) {
         for (auto& item : hit.observations) {
             if (!item.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(item);
+            inheritTemporalEntityContextFromIdentityPatches_(item, positiveIdentityContexts);
             item["ts_utc"] = snapshotUtc;
             normalizeTimestampFieldsInObjectForVideo_(item, TemporalVideoSegmentContext_{});
             appendStillEvidenceCandidate(item, readTemporalEvidenceEventName_(item, "present"));
@@ -8984,6 +10224,7 @@ static void normalizeTemporalPayloadForVideo_(
                 continue;
             }
             if (!ev.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(ev, parentEntityId, parentEntityKey, parentEntityType);
             if ((!ev.contains("entity_id") || !ev["entity_id"].is_string()) && !parentEntityId.empty()) {
                 ev["entity_id"] = parentEntityId;
             }
@@ -9031,9 +10272,15 @@ static void normalizeTemporalPayloadForVideo_(
         }
     };
 
+    std::vector<TemporalNodeEntityContext_> positiveIdentityContexts;
+
     if (hit.identityPatch.is_array()) {
         for (auto& item : hit.identityPatch) {
             if (!item.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(item);
+            if (temporalIdentityPatchCarriesPositiveEntity_(item)) {
+                positiveIdentityContexts.push_back(buildTemporalNodeEntityContext_(item));
+            }
             applyResolvedReference(item);
             normalizeTimestampFieldsInObjectForVideo_(item, ctx);
             if (item.contains("events")) {
@@ -9064,6 +10311,8 @@ static void normalizeTemporalPayloadForVideo_(
     if (hit.observations.is_array()) {
         for (auto& item : hit.observations) {
             if (!item.is_object()) continue;
+            canonicalizeTemporalNodeAliases_(item);
+            inheritTemporalEntityContextFromIdentityPatches_(item, positiveIdentityContexts);
 
             std::string normalized = applyResolvedReference(item);
             const std::string offsetHint =
@@ -9141,6 +10390,8 @@ static void normalizeTemporalPayloadForVideo_(
                 (hit.eventTimestampName.empty() ? std::string("unknown") : hit.eventTimestampName)
         );
     }
+
+    compactContinuousTemporalEvidenceCandidatesForVideo_(hit, logStreamId, scopeTag);
 }
 
 } // namespace
@@ -11481,17 +12732,25 @@ static std::string sanitizeModelRawRespForLog_(const std::string& rawResp)
 {
     if (rawResp.empty()) return rawResp;
 
+    auto truncateRawRespForLog = [](const std::string& value) {
+        constexpr std::size_t kMaxRawRespCharsForLog = 4000;
+        if (value.size() <= kMaxRawRespCharsForLog) return value;
+        return value.substr(0, kMaxRawRespCharsForLog) +
+            "...(truncated " + std::to_string(value.size() - kMaxRawRespCharsForLog) + " chars)";
+    };
+
     nlohmann::json parsed = nlohmann::json::parse(rawResp, nullptr, false);
     if (parsed.is_discarded()) {
-        return rawResp;
+        return truncateRawRespForLog(rawResp);
     }
 
     stripJsonKeyRecursive_(parsed, "thoughtSignature");
+    stripJsonKeyRecursive_(parsed, "reasoning_content");
     try {
-        return parsed.dump();
+        return truncateRawRespForLog(parsed.dump());
     }
     catch (...) {
-        return rawResp;
+        return truncateRawRespForLog(rawResp);
     }
 }
 
@@ -11548,28 +12807,72 @@ static void logGroupCameraDebug_(
 
 
 
-static bool addOneSecondToMMSS(std::string& mmss)
+static constexpr std::size_t kStructuredVisionMaxAlertRegionIds_ = 16;
+static constexpr std::size_t kStructuredVisionMaxIdentityPatchItems_ = 32;
+static constexpr std::size_t kStructuredVisionMaxObservationItems_ = 48;
+static constexpr std::size_t kStructuredVisionMaxUnknownReasonItems_ = 16;
+static constexpr std::size_t kStructuredVisionMaxFaceIdTargetNames_ = 8;
+static constexpr std::size_t kStructuredVisionMaxCrossCameraMatches_ = 12;
+static constexpr std::size_t kStructuredVisionMaxDetectionTimesInVideo_ = 12;
+
+static bool tryParseStrictMmSs_(const std::string& rawValue, int& outTotalSeconds)
 {
-    int mm = 0, ss = 0;
+    outTotalSeconds = -1;
+    const std::string mmss = trimAscii(rawValue);
+    if (mmss.empty()) return false;
 
-    // Accept "MM:SS" (your contract). If it doesn't match, don't touch it.
-    if (sscanf_s(mmss.c_str(), "%d:%d", &mm, &ss) != 2) {
+    const std::size_t colonPos = mmss.find(':');
+    if (colonPos == std::string::npos || mmss.find(':', colonPos + 1) != std::string::npos) {
         return false;
     }
-    if (mm < 0 || ss < 0 || ss > 59) {
+
+    const std::string mmText = mmss.substr(0, colonPos);
+    const std::string ssText = mmss.substr(colonPos + 1);
+    if (mmText.empty() || ssText.size() != 2) {
         return false;
     }
 
-    int total = mm * 60 + ss;
-    total += 1; // add one second
+    if (!std::all_of(mmText.begin(), mmText.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; }) ||
+        !std::all_of(ssText.begin(), ssText.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; }))
+    {
+        return false;
+    }
 
-    mm = total / 60;
-    ss = total % 60;
+    int mm = 0;
+    int ss = 0;
+    try {
+        mm = std::stoi(mmText);
+        ss = std::stoi(ssText);
+    }
+    catch (...) {
+        return false;
+    }
+
+    if (mm < 0 || ss < 0 || ss > 59) return false;
+    outTotalSeconds = (mm * 60) + ss;
+    return true;
+}
+
+static std::string formatMmSs_(int totalSeconds)
+{
+    if (totalSeconds < 0) return std::string();
+    const int mm = totalSeconds / 60;
+    const int ss = totalSeconds % 60;
 
     char buf[16];
     sprintf_s(buf, "%02d:%02d", mm, ss);
-    mmss = buf;
-    return true;
+    return buf;
+}
+
+static bool addOneSecondToMMSS(std::string& mmss)
+{
+    int totalSeconds = -1;
+    if (!tryParseStrictMmSs_(mmss, totalSeconds)) {
+        return false;
+    }
+
+    mmss = formatMmSs_(totalSeconds + 1);
+    return !mmss.empty();
 }
 
 
@@ -12070,19 +13373,39 @@ namespace {
         throw std::runtime_error(lastErr.empty() ? "httpPostJsonOpenAI failed" : lastErr);
     }
 
+    struct OpenAIUsageStats_ {
+        int promptTokens = 0;
+        int outputTokens = 0;
+        int totalTokens = 0;
+        int cachedPromptTokens = 0;
+    };
+
+    static OpenAIUsageStats_ extractOpenAIUsageStats_(const nlohmann::json& respJson)
+    {
+        OpenAIUsageStats_ stats;
+        if (!respJson.contains("usage") || !respJson["usage"].is_object()) return stats;
+
+        const auto& u = respJson["usage"];
+        stats.promptTokens = u.value("prompt_tokens", 0);
+        stats.outputTokens = u.value("completion_tokens", 0);
+        stats.totalTokens = u.value("total_tokens", 0);
+        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object()) {
+            stats.cachedPromptTokens =
+                u["prompt_tokens_details"].value("cached_tokens", 0);
+        }
+        return stats;
+    }
+
     static void extractOpenAIUsageTokens(
         const nlohmann::json& respJson,
         int& outPromptTokens,
         int& outOutputTokens,
         int& outTotalTokens)
     {
-        outPromptTokens = outOutputTokens = outTotalTokens = 0;
-        if (!respJson.contains("usage") || !respJson["usage"].is_object()) return;
-
-        const auto& u = respJson["usage"];
-        outPromptTokens = u.value("prompt_tokens", 0);
-        outOutputTokens = u.value("completion_tokens", 0);
-        outTotalTokens = u.value("total_tokens", 0);
+        const OpenAIUsageStats_ stats = extractOpenAIUsageStats_(respJson);
+        outPromptTokens = stats.promptTokens;
+        outOutputTokens = stats.outputTokens;
+        outTotalTokens = stats.totalTokens;
     }
 
     static std::string extractOpenAIFinishReason(const nlohmann::json& respJson)
@@ -12145,6 +13468,53 @@ namespace {
         return text;
     }
 
+    static bool tryExtractJsonObjectSlice(const std::string& text, std::string& outJsonSlice);
+
+    struct OpenAITextObjectResponse_ {
+        nlohmann::json respJson = nlohmann::json::object();
+        nlohmann::json jsonObject = nlohmann::json::object();
+        OpenAIUsageStats_ usageStats;
+        std::string finishReason;
+        std::string text;
+        std::string jsonSlice;
+        bool hasValidResponseJson = false;
+        bool hasJsonObjectSlice = false;
+        bool hasValidJsonObject = false;
+    };
+
+    static OpenAITextObjectResponse_ extractOpenAITextObjectResponse_(
+        const std::string& rawResp)
+    {
+        OpenAITextObjectResponse_ out;
+        out.respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        if (out.respJson.is_discarded() || !out.respJson.is_object()) {
+            out.respJson = nlohmann::json::object();
+            return out;
+        }
+
+        out.hasValidResponseJson = true;
+        out.usageStats = extractOpenAIUsageStats_(out.respJson);
+        out.finishReason = extractOpenAIFinishReason(out.respJson);
+        out.text = extractOpenAITextFromResponse(out.respJson);
+        out.hasJsonObjectSlice = tryExtractJsonObjectSlice(out.text, out.jsonSlice);
+        if (!out.hasJsonObjectSlice) {
+            return out;
+        }
+
+        out.jsonObject = nlohmann::json::parse(out.jsonSlice, nullptr, false);
+        out.hasValidJsonObject = out.jsonObject.is_object();
+        if (!out.hasValidJsonObject) {
+            out.jsonObject = nlohmann::json::object();
+        }
+        return out;
+    }
+
+    static bool shouldRetryOpenAITextObjectResponseForLength_(
+        const OpenAITextObjectResponse_& response)
+    {
+        return response.finishReason == "length" && !response.hasValidJsonObject;
+    }
+
     static bool tryExtractJsonObjectSlice(const std::string& text, std::string& outJsonSlice)
     {
         const std::size_t firstBrace = text.find('{');
@@ -12160,13 +13530,22 @@ namespace {
         return true;
     }
 
-    static nlohmann::json makeOpenAIImageContentFromBareJpeg(const std::string& bareJpegBase64)
+    static std::string resolveOpenAIImageDetailForModel_(const std::string& modelName)
     {
+        (void)modelName;
+        return std::string("low");
+    }
+
+    static nlohmann::json makeOpenAIImageContentFromBareJpeg(
+        const std::string& bareJpegBase64,
+        const std::string& modelName = std::string())
+    {
+        const std::string detail = resolveOpenAIImageDetailForModel_(modelName);
         return nlohmann::json{
             { "type", "image_url" },
             { "image_url", {
                 { "url", "data:image/jpeg;base64," + bareJpegBase64 },
-                { "detail", "low" }
+                { "detail", detail }
             }}
         };
     }
@@ -12275,7 +13654,10 @@ namespace {
     {
         const std::string normalized =
             normalizeOpenAIFrameJpegBase64ForModel_(bareJpegBase64, modelName);
-        return makeOpenAIImageContentFromBareJpeg(normalized.empty() ? bareJpegBase64 : normalized);
+        return makeOpenAIImageContentFromBareJpeg(
+            normalized.empty() ? bareJpegBase64 : normalized,
+            modelName
+        );
     }
 
     static std::vector<FaceReferenceImage> buildEffectiveFaceReferences_(
@@ -12304,6 +13686,21 @@ namespace {
                 out.push_back(std::move(fallback));
             }
         }
+
+        std::stable_sort(
+            out.begin(),
+            out.end(),
+            [](const FaceReferenceImage& lhs, const FaceReferenceImage& rhs) {
+                if (lhs.targetId != rhs.targetId) return lhs.targetId < rhs.targetId;
+                if (lhs.targetName != rhs.targetName) return lhs.targetName < rhs.targetName;
+                if (lhs.targetDescription != rhs.targetDescription) {
+                    return lhs.targetDescription < rhs.targetDescription;
+                }
+                if (lhs.referenceImageUrl != rhs.referenceImageUrl) {
+                    return lhs.referenceImageUrl < rhs.referenceImageUrl;
+                }
+                return lhs.imageDataUrl < rhs.imageDataUrl;
+            });
 
         return out;
     }
@@ -12399,12 +13796,14 @@ namespace {
             if (!node.contains(key)) return;
             const auto& field = node[key];
             if (field.is_string()) {
+                if (names.size() >= kStructuredVisionMaxFaceIdTargetNames_) return;
                 appendUniqueTrimmedTargetName_(names, field.get<std::string>());
                 return;
             }
             if (field.is_array()) {
                 for (const auto& it : field) {
                     if (!it.is_string()) continue;
+                    if (names.size() >= kStructuredVisionMaxFaceIdTargetNames_) break;
                     appendUniqueTrimmedTargetName_(names, it.get<std::string>());
                 }
             }
@@ -12445,15 +13844,18 @@ namespace {
             if (!node.contains(key)) return;
             const auto& field = node[key];
             if (field.is_string()) {
+                if (regionIds.size() >= kStructuredVisionMaxAlertRegionIds_) return;
                 appendUniqueTrimmedText_(regionIds, field.get<std::string>());
                 return;
             }
             if (field.is_number_integer()) {
+                if (regionIds.size() >= kStructuredVisionMaxAlertRegionIds_) return;
                 appendUniqueTrimmedText_(regionIds, std::to_string(field.get<int>()));
                 return;
             }
             if (field.is_array()) {
                 for (const auto& it : field) {
+                    if (regionIds.size() >= kStructuredVisionMaxAlertRegionIds_) break;
                     if (it.is_string()) {
                         appendUniqueTrimmedText_(regionIds, it.get<std::string>());
                     }
@@ -12472,14 +13874,243 @@ namespace {
         return regionIds;
     }
 
+    struct VisionPromptSections_ {
+        std::string rawPrompt;
+        std::string basePrompt;
+        std::string pipelineInput;
+        std::string temporalStaticJson;
+        std::string temporalRuntimeJson;
+        bool hasTemporal = false;
+        bool hasCrossCameraWatchlist = false;
+    };
+
+    static std::size_t findMatchingJsonObjectEnd_(const std::string& text, std::size_t firstBrace)
+    {
+        if (firstBrace == std::string::npos || firstBrace >= text.size() || text[firstBrace] != '{') {
+            return std::string::npos;
+        }
+
+        bool inString = false;
+        bool escaped = false;
+        int depth = 0;
+        for (std::size_t i = firstBrace; i < text.size(); ++i) {
+            const char ch = text[i];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (inString) {
+                if (ch == '\\') {
+                    escaped = true;
+                }
+                else if (ch == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (ch == '"') {
+                inString = true;
+                continue;
+            }
+            if (ch == '{') {
+                ++depth;
+                continue;
+            }
+            if (ch == '}') {
+                --depth;
+                if (depth == 0) {
+                    return i + 1;
+                }
+            }
+        }
+        return std::string::npos;
+    }
+
+    static std::size_t findNextPromptSectionBoundary_(const std::string& prompt, std::size_t start)
+    {
+        const char* markers[] = {
+            "HIDDEN FACEID TASK (SYSTEM):",
+            "HIDDEN NEGATIVE VISUAL REFERENCES TASK (SYSTEM):",
+            "INPUT_FROM_PREVIOUS_STEP:",
+            temporal::kTemporalStaticPromptMarker,
+            temporal::kTemporalRuntimePromptMarker,
+            "TEMPORAL_RUNTIME_INPUT_JSON:",
+            "TEMPORAL_RUNTIME_INPUT_JSON_COMPAT_NOTE:",
+            "TEMPORAL OUTPUT RULES:"
+        };
+
+        std::size_t boundary = std::string::npos;
+        for (const char* marker : markers) {
+            const std::size_t pos = prompt.find(marker, start);
+            if (pos == std::string::npos) continue;
+            if (boundary == std::string::npos || pos < boundary) {
+                boundary = pos;
+            }
+        }
+        return boundary;
+    }
+
+    static void erasePromptSliceAndTrim_(std::string& prompt, std::size_t start, std::size_t endExclusive)
+    {
+        if (start == std::string::npos || endExclusive == std::string::npos || start >= endExclusive) {
+            return;
+        }
+        while (start > 0 && (prompt[start - 1] == '\r' || prompt[start - 1] == '\n')) {
+            --start;
+        }
+        while (endExclusive < prompt.size() &&
+               (prompt[endExclusive] == '\r' || prompt[endExclusive] == '\n'))
+        {
+            ++endExclusive;
+        }
+        prompt.erase(start, endExclusive - start);
+        prompt = trimAscii(prompt);
+    }
+
+    static bool erasePromptSectionFromMarkerToEnd_(std::string& prompt, const std::string& marker)
+    {
+        const std::size_t markerPos = prompt.find(marker);
+        if (markerPos == std::string::npos) return false;
+        erasePromptSliceAndTrim_(prompt, markerPos, prompt.size());
+        return true;
+    }
+
+    static bool extractTextSectionAfterMarker_(
+        std::string& prompt,
+        const std::string& marker,
+        std::string& outSection)
+    {
+        const std::size_t markerPos = prompt.find(marker);
+        if (markerPos == std::string::npos) return false;
+
+        std::size_t contentStart = markerPos + marker.size();
+        while (contentStart < prompt.size() &&
+               (prompt[contentStart] == '\r' || prompt[contentStart] == '\n'))
+        {
+            ++contentStart;
+        }
+
+        std::size_t boundary = findNextPromptSectionBoundary_(prompt, contentStart);
+        if (boundary == std::string::npos) {
+            boundary = prompt.size();
+        }
+
+        outSection = trimAscii(prompt.substr(contentStart, boundary - contentStart));
+        erasePromptSliceAndTrim_(prompt, markerPos, boundary);
+        return !outSection.empty();
+    }
+
+    static bool extractJsonObjectAfterMarker_(
+        std::string& prompt,
+        const std::string& marker,
+        std::string& outJson)
+    {
+        const std::size_t markerPos = prompt.find(marker);
+        if (markerPos == std::string::npos) return false;
+
+        const std::size_t firstBrace = prompt.find('{', markerPos + marker.size());
+        if (firstBrace == std::string::npos) return false;
+        const std::size_t endExclusive = findMatchingJsonObjectEnd_(prompt, firstBrace);
+        if (endExclusive == std::string::npos) return false;
+
+        outJson = prompt.substr(firstBrace, endExclusive - firstBrace);
+        erasePromptSliceAndTrim_(prompt, markerPos, endExclusive);
+        return !outJson.empty();
+    }
+
+    static VisionPromptSections_ parseVisionPromptSections_(const std::string& userQuestion)
+    {
+        VisionPromptSections_ sections;
+        sections.rawPrompt = trimAscii(userQuestion);
+        sections.basePrompt = sections.rawPrompt;
+        bool extractedAnySection = false;
+
+        extractedAnySection = extractTextSectionAfterMarker_(
+            sections.basePrompt,
+            "INPUT_FROM_PREVIOUS_STEP:",
+            sections.pipelineInput
+        ) || extractedAnySection;
+
+        std::string ignoredHiddenFacePrompt;
+        extractedAnySection = extractTextSectionAfterMarker_(
+            sections.basePrompt,
+            "HIDDEN FACEID TASK (SYSTEM):",
+            ignoredHiddenFacePrompt
+        ) || extractedAnySection;
+
+        std::string ignoredHiddenNegativeReferencePrompt;
+        extractedAnySection = extractTextSectionAfterMarker_(
+            sections.basePrompt,
+            "HIDDEN NEGATIVE VISUAL REFERENCES TASK (SYSTEM):",
+            ignoredHiddenNegativeReferencePrompt
+        ) || extractedAnySection;
+
+        extractedAnySection = extractJsonObjectAfterMarker_(
+            sections.basePrompt,
+            temporal::kTemporalStaticPromptMarker,
+            sections.temporalStaticJson
+        ) || extractedAnySection;
+        extractedAnySection = extractJsonObjectAfterMarker_(
+            sections.basePrompt,
+            temporal::kTemporalRuntimePromptMarker,
+            sections.temporalRuntimeJson
+        ) || extractedAnySection;
+
+        if (sections.temporalStaticJson.empty() && sections.temporalRuntimeJson.empty()) {
+            std::string legacyRuntimeJson;
+            if (extractJsonObjectAfterMarker_(
+                    sections.basePrompt,
+                    "TEMPORAL_RUNTIME_INPUT_JSON:",
+                    legacyRuntimeJson))
+            {
+                extractedAnySection = true;
+                const nlohmann::json runtimeObject =
+                    nlohmann::json::parse(legacyRuntimeJson, nullptr, false);
+                if (runtimeObject.is_object()) {
+                    nlohmann::json staticContext = nlohmann::json::object();
+                    nlohmann::json runtimeState = nlohmann::json::object();
+                    temporal::splitInferenceInputForPrompt(runtimeObject, staticContext, runtimeState);
+                    sections.temporalStaticJson = staticContext.dump();
+                    sections.temporalRuntimeJson = runtimeState.dump();
+                }
+            }
+        }
+
+        if (!erasePromptSectionFromMarkerToEnd_(
+                sections.basePrompt,
+                "TEMPORAL_RUNTIME_INPUT_JSON_COMPAT_NOTE:"))
+        {
+            erasePromptSectionFromMarkerToEnd_(sections.basePrompt, "TEMPORAL OUTPUT RULES:");
+        }
+
+        sections.basePrompt = trimAscii(sections.basePrompt);
+        if (sections.basePrompt.empty() && !extractedAnySection) {
+            sections.basePrompt = sections.rawPrompt;
+        }
+
+        sections.hasTemporal =
+            !sections.temporalStaticJson.empty() || !sections.temporalRuntimeJson.empty();
+        const std::string watchlistHaystack = temporal::lower(
+            trimAscii(sections.temporalRuntimeJson.empty()
+                ? sections.rawPrompt
+                : sections.temporalRuntimeJson));
+        sections.hasCrossCameraWatchlist =
+            watchlistHaystack.find("cross_camera_watchlist") != std::string::npos;
+        return sections;
+    }
+
     static bool promptHasTemporalRuntimeInput_(const std::string& userQuestion)
     {
         const std::string q = temporal::lower(trimAscii(userQuestion));
-        return q.find("temporal_runtime_input_json") != std::string::npos;
+        return q.find("temporal_runtime_input_json") != std::string::npos ||
+            q.find(temporal::lower(std::string(temporal::kTemporalStaticPromptMarker))) != std::string::npos ||
+            q.find(temporal::lower(std::string(temporal::kTemporalRuntimePromptMarker))) != std::string::npos;
     }
 
     static bool promptHasCrossCameraWatchlist_(const std::string& userQuestion)
     {
+        const VisionPromptSections_ sections = parseVisionPromptSections_(userQuestion);
+        if (sections.hasCrossCameraWatchlist) return true;
         const std::string q = temporal::lower(trimAscii(userQuestion));
         return q.find("\"cross_camera_watchlist\"") != std::string::npos ||
             q.find("cross_camera_watchlist") != std::string::npos;
@@ -12547,42 +14178,74 @@ namespace {
         const nlohmann::json& scid,
         int& outStepId);
 
-    static void parseDetectionTimeInVideoFromJson_(
-        const nlohmann::json& node,
-        VideoHit& hit)
+    static void trimJsonArrayToMaxItems_(
+        nlohmann::json& node,
+        std::size_t maxItems)
     {
-        hit.detectionTimeInVideo.clear();
+        if (!node.is_array() || node.size() <= maxItems) return;
+        node.erase(
+            node.begin() + static_cast<nlohmann::json::array_t::difference_type>(maxItems),
+            node.end());
+    }
 
-        auto trimInPlace = [](std::string& s) {
-            auto notSpace = [](int ch) { return !std::isspace(ch); };
-            s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
-            s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
-        };
+    template <typename T>
+    static void trimVectorToMaxItems_(
+        std::vector<T>& values,
+        std::size_t maxItems)
+    {
+        if (values.size() <= maxItems) return;
+        values.resize(maxItems);
+    }
 
-        auto pushTime = [&](std::string t) {
-            trimInPlace(t);
-            if (t.empty()) return;
-            addOneSecondToMMSS(t);
-            hit.detectionTimeInVideo.push_back(std::move(t));
+    static std::vector<std::string> collectSanitizedDetectionTimesInVideoFromJson_(
+        const nlohmann::json& node)
+    {
+        std::vector<std::string> out;
+        auto pushTime = [&](std::string value) {
+            value = trimAscii(value);
+            if (value.empty()) return;
+            if (!addOneSecondToMMSS(value)) return;
+            if (std::find(out.begin(), out.end(), value) != out.end()) return;
+            if (out.size() >= kStructuredVisionMaxDetectionTimesInVideo_) return;
+            out.push_back(std::move(value));
         };
 
         if (!node.contains("detection_time_in_video")) {
-            return;
+            return out;
         }
 
         const auto& dt = node["detection_time_in_video"];
         if (dt.is_string()) {
             pushTime(dt.get<std::string>());
-            return;
+            return out;
         }
         if (!dt.is_array()) {
-            return;
+            return out;
         }
 
         for (const auto& item : dt) {
             if (!item.is_string()) continue;
             pushTime(item.get<std::string>());
         }
+        return out;
+    }
+
+    static void applyStructuredVisionCompatCaps_(VideoHit& hit)
+    {
+        trimVectorToMaxItems_(hit.alertRegionIds, kStructuredVisionMaxAlertRegionIds_);
+        trimVectorToMaxItems_(hit.faceIdTargetNames, kStructuredVisionMaxFaceIdTargetNames_);
+        trimJsonArrayToMaxItems_(hit.identityPatch, kStructuredVisionMaxIdentityPatchItems_);
+        trimJsonArrayToMaxItems_(hit.observations, kStructuredVisionMaxObservationItems_);
+        trimJsonArrayToMaxItems_(hit.unknownReasons, kStructuredVisionMaxUnknownReasonItems_);
+        trimJsonArrayToMaxItems_(hit.crossCameraWatchlistMatches, kStructuredVisionMaxCrossCameraMatches_);
+        trimVectorToMaxItems_(hit.detectionTimeInVideo, kStructuredVisionMaxDetectionTimesInVideo_);
+    }
+
+    static void parseDetectionTimeInVideoFromJson_(
+        const nlohmann::json& node,
+        VideoHit& hit)
+    {
+        hit.detectionTimeInVideo = collectSanitizedDetectionTimesInVideoFromJson_(node);
     }
 
     static void parseStructuredVisionResponseIntoHit_(
@@ -12645,6 +14308,8 @@ namespace {
         else {
             hit.detectionTimeInVideo.clear();
         }
+
+        applyStructuredVisionCompatCaps_(hit);
     }
 
     static bool hitHasStructuredMatch_(const VideoHit& hit)
@@ -12688,7 +14353,8 @@ namespace {
 
     static void appendOpenAIFaceReferenceContent_(
         nlohmann::json& content,
-        const std::vector<FaceReferenceImage>& references)
+        const std::vector<FaceReferenceImage>& references,
+        const std::string& modelName)
     {
         for (const auto& ref : references) {
             const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
@@ -12704,7 +14370,7 @@ namespace {
             }
 
             content.push_back({ { "type", "text" }, { "text", label.str() } });
-            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare, modelName));
         }
     }
 
@@ -12720,6 +14386,13 @@ namespace {
             normalized.imageDataUrl = "data:image/jpeg;base64," + data;
             out.push_back(std::move(normalized));
         }
+        std::stable_sort(
+            out.begin(),
+            out.end(),
+            [](const NegativeReferenceImage& lhs, const NegativeReferenceImage& rhs) {
+                if (lhs.imageId != rhs.imageId) return lhs.imageId < rhs.imageId;
+                return lhs.imageDataUrl < rhs.imageDataUrl;
+            });
         return out;
     }
 
@@ -12749,7 +14422,8 @@ namespace {
 
     static void appendOpenAINegativeReferenceContent_(
         nlohmann::json& content,
-        const std::vector<NegativeReferenceImage>& references)
+        const std::vector<NegativeReferenceImage>& references,
+        const std::string& modelName)
     {
         for (const auto& ref : references) {
             const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
@@ -12762,8 +14436,51 @@ namespace {
             }
 
             content.push_back({ { "type", "text" }, { "text", label.str() } });
-            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare, modelName));
         }
+    }
+
+    static std::string buildOpenAIStaticReferenceLabelText_(
+        const std::vector<FaceReferenceImage>& faceReferences,
+        const std::vector<NegativeReferenceImage>& negativeReferences)
+    {
+        std::ostringstream out;
+        bool wroteAny = false;
+
+        auto appendLine = [&](const std::string& line) {
+            const std::string trimmed = trimAscii(line);
+            if (trimmed.empty()) return;
+            if (wroteAny) out << "\n";
+            out << trimmed;
+            wroteAny = true;
+        };
+
+        for (const auto& ref : faceReferences) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+            std::ostringstream label;
+            label << "USER_REFERENCE_IMAGE";
+            if (ref.targetId > 0) {
+                label << " TARGET_ID=" << ref.targetId;
+            }
+            if (!ref.targetName.empty()) {
+                label << " TARGET_NAME=" << ref.targetName;
+            }
+            appendLine(label.str());
+        }
+
+        for (const auto& ref : negativeReferences) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+            std::ostringstream label;
+            label << "NEGATIVE_REFERENCE_IMAGE";
+            if (ref.imageId > 0) {
+                label << " NEGATIVE_IMAGE_ID=" << ref.imageId;
+            }
+            appendLine(label.str());
+        }
+
+        return out.str();
     }
 
     static bool usesOpenAIMaxCompletionTokensField_(std::string modelName)
@@ -12828,13 +14545,6 @@ namespace {
         const std::string& modelName,
         int tokenLimit)
     {
-        if (isZAiCoreModelName_(modelName)) {
-            body.erase("max_tokens");
-            body.erase("max_completion_tokens");
-            body["max_tokens"] = 3000;
-            return;
-        }
-
         const int effectiveTokenLimit = resolveOpenAITokenLimitForModel_(modelName, tokenLimit);
         body.erase("max_tokens");
         body.erase("max_completion_tokens");
@@ -12867,14 +14577,1774 @@ namespace {
         const std::string& modelName,
         double fallbackTemperature)
     {
-        if (isZAiCoreModelName_(modelName)) {
-            body["temperature"] = 0.2;
-            return;
-        }
-
         body["temperature"] = usesOpenAIFixedDefaultTemperature_(modelName)
             ? 1.0
             : fallbackTemperature;
+    }
+
+    enum class OpenAIVisionModality_ {
+        Video,
+        Image
+    };
+
+    struct OpenAIVisionPromptOptions_ {
+        OpenAIVisionModality_ modality = OpenAIVisionModality_::Video;
+        bool jobMode = false;
+        bool directChatFlow = false;
+        bool hasTemporal = false;
+        bool useVideoMosaics = false;
+        bool hasFaceReferences = false;
+        bool hasLegacySingleFaceReference = false;
+        bool hasNegativeReferences = false;
+        bool hasCrossCameraWatchlist = false;
+        bool temporalAlertMayUsePriorState = false;
+        bool includeDetectionTimeInVideo = false;
+        bool requireDetectionTimeInVideo = false;
+    };
+
+    struct OpenAIVisionRequestBuild_ {
+        nlohmann::json body = nlohmann::json::object();
+        std::string cacheKey;
+        std::string cacheVariant;
+        std::string videoPackagingModeForLog;
+        std::string promptCacheRetention;
+        std::string temporalPlanHash;
+        std::string faceRefsHash;
+        std::string negativeRefsHash;
+        std::string promptTextForLog;
+        std::string staticTextForLog;
+        std::string staticResponseFormatForLog;
+        std::string staticImageManifestForLog;
+        std::string dynamicTextForLog;
+        std::string staticTextHash;
+        std::string responseFormatHash;
+        std::string staticImageManifestHash;
+        std::string fullCacheablePrefixHash;
+        std::string dynamicTextHash;
+        std::string dynamicImageManifestHash;
+        int staticPrefixTokenEstimate = 0;
+        std::size_t staticPromptBytes = 0;
+        std::size_t dynamicPromptBytes = 0;
+    };
+
+    static constexpr const char* kOpenAIVisionPromptRevision_ = "vision-cache-v3";
+
+    static std::string hashString64Hex_(const std::string& value)
+    {
+        constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
+        constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+        std::uint64_t hash = kFnvOffset;
+        for (unsigned char ch : value) {
+            hash ^= static_cast<std::uint64_t>(ch);
+            hash *= kFnvPrime;
+        }
+
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0') << std::setw(16) << hash;
+        return oss.str();
+    }
+
+    static std::string summarizeImageUrlForPromptLog_(const std::string& url)
+    {
+        if (url.empty()) return url;
+        if (url.rfind("data:", 0) != 0) return url;
+
+        const std::size_t commaPos = url.find(',');
+        const std::string header = (commaPos == std::string::npos) ? url : url.substr(0, commaPos);
+        const std::string payload =
+            (commaPos == std::string::npos) ? std::string() : url.substr(commaPos + 1);
+
+        std::string mime = "data";
+        if (header.size() > 5) {
+            const std::size_t semiPos = header.find(';', 5);
+            if (semiPos != std::string::npos) {
+                mime = header.substr(5, semiPos - 5);
+            }
+            else {
+                mime = header.substr(5);
+            }
+        }
+
+        std::ostringstream oss;
+        oss << "<" << mime
+            << " data_url omitted payload_chars=" << payload.size()
+            << " hash=" << hashString64Hex_(payload) << ">";
+        return oss.str();
+    }
+
+    static nlohmann::json sanitizeOpenAIVisionRequestBodyForLog_(const nlohmann::json& body)
+    {
+        nlohmann::json sanitized = body;
+        if (!sanitized.contains("messages") || !sanitized["messages"].is_array()) {
+            return sanitized;
+        }
+
+        for (auto& message : sanitized["messages"]) {
+            if (!message.is_object() || !message.contains("content")) continue;
+
+            auto& content = message["content"];
+            if (content.is_string()) continue;
+            if (!content.is_array()) continue;
+
+            for (auto& part : content) {
+                if (!part.is_object()) continue;
+
+                const std::string type = part.value("type", std::string());
+                if (type == "image_url" &&
+                    part.contains("image_url") &&
+                    part["image_url"].is_object())
+                {
+                    auto& imageUrl = part["image_url"];
+                    if (imageUrl.contains("url") && imageUrl["url"].is_string()) {
+                        imageUrl["url"] = summarizeImageUrlForPromptLog_(
+                            imageUrl["url"].get<std::string>()
+                        );
+                    }
+                }
+            }
+        }
+
+        return sanitized;
+    }
+
+    static void appendOpenAIPromptTextBlockForLog_(
+        std::ostringstream& out,
+        const std::string& role,
+        const std::string& rawText)
+    {
+        const std::string text = trimAscii(rawText);
+        if (text.empty()) return;
+
+        if (out.tellp() > 0) {
+            out << "\n\n";
+        }
+        out << "[" << (role.empty() ? "user" : role) << "]\n";
+        out << text;
+    }
+
+    static std::string buildOpenAITextBlocksForLog_(
+        const std::vector<std::pair<std::string, std::string>>& blocks)
+    {
+        std::ostringstream out;
+        for (const auto& block : blocks) {
+            appendOpenAIPromptTextBlockForLog_(out, block.first, block.second);
+        }
+        return out.str();
+    }
+
+    static std::string buildOpenAIPromptTextForLog_(const nlohmann::json& messages)
+    {
+        if (!messages.is_array()) return std::string();
+
+        std::ostringstream out;
+        for (const auto& message : messages) {
+            if (!message.is_object()) continue;
+
+            const std::string role = trimAscii(message.value("role", std::string("user")));
+            if (!message.contains("content")) continue;
+
+            const nlohmann::json& content = message["content"];
+            if (content.is_string()) {
+                appendOpenAIPromptTextBlockForLog_(out, role, content.get<std::string>());
+                continue;
+            }
+
+            if (!content.is_array()) continue;
+
+            std::ostringstream contentText;
+            bool wroteText = false;
+            for (const auto& part : content) {
+                if (!part.is_object()) continue;
+                if (part.value("type", std::string()) != "text") continue;
+                const std::string text = trimAscii(part.value("text", std::string()));
+                if (text.empty()) continue;
+                if (wroteText) {
+                    contentText << "\n";
+                }
+                contentText << text;
+                wroteText = true;
+            }
+
+            if (wroteText) {
+                appendOpenAIPromptTextBlockForLog_(out, role, contentText.str());
+            }
+        }
+
+        return out.str();
+    }
+
+    static std::string buildOpenAIPromptCacheRetentionForLog_(
+        const std::string& modelName,
+        const std::string& cacheKey)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        const bool supportsCaching =
+            !isZAiCoreModelName_(modelName) && normalized.rfind("gpt-", 0) == 0;
+        if (!supportsCaching || trimAscii(cacheKey).empty()) {
+            return "disabled";
+        }
+        if (normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0) {
+            return "24h";
+        }
+        return "in_memory";
+    }
+
+    static int estimateOpenAITextTokensHeuristic_(const std::string& text)
+    {
+        const std::string trimmed = trimAscii(text);
+        if (trimmed.empty()) return 0;
+        const double charCount = static_cast<double>(trimmed.size());
+        const int estimate = static_cast<int>((charCount / 4.5) + 0.5);
+        return (std::max)(1, estimate);
+    }
+
+    static nlohmann::json buildOpenAIStaticImageManifestJson_(
+        const std::vector<FaceReferenceImage>& faceReferences,
+        const std::vector<NegativeReferenceImage>& negativeReferences,
+        const std::string& modelName)
+    {
+        const std::string detail = resolveOpenAIImageDetailForModel_(modelName);
+        nlohmann::json items = nlohmann::json::array();
+        int order = 1;
+
+        for (const auto& ref : faceReferences) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+            nlohmann::json item = {
+                { "order", order++ },
+                { "kind", "USER_REFERENCE_IMAGE" },
+                { "detail", detail },
+                { "image_hash", hashString64Hex_(bare) }
+            };
+            item["target_id"] = (ref.targetId > 0) ? nlohmann::json(ref.targetId) : nlohmann::json(nullptr);
+            item["target_name"] = trimAscii(ref.targetName).empty()
+                ? nlohmann::json(nullptr)
+                : nlohmann::json(trimAscii(ref.targetName));
+            items.push_back(std::move(item));
+        }
+
+        for (const auto& ref : negativeReferences) {
+            const std::string bare = stripDataUrlPrefix(ref.imageDataUrl);
+            if (bare.empty()) continue;
+            nlohmann::json item = {
+                { "order", order++ },
+                { "kind", "NEGATIVE_REFERENCE_IMAGE" },
+                { "detail", detail },
+                { "image_hash", hashString64Hex_(bare) }
+            };
+            item["negative_image_id"] = (ref.imageId > 0) ? nlohmann::json(ref.imageId) : nlohmann::json(nullptr);
+            items.push_back(std::move(item));
+        }
+
+        return nlohmann::json{
+            { "items", items }
+        };
+    }
+
+    static std::string buildOpenAIStaticImageManifestForLog_(
+        const std::vector<FaceReferenceImage>& faceReferences,
+        const std::vector<NegativeReferenceImage>& negativeReferences,
+        const std::string& modelName)
+    {
+        const nlohmann::json manifest =
+            buildOpenAIStaticImageManifestJson_(faceReferences, negativeReferences, modelName);
+        if (!manifest.contains("items") || !manifest["items"].is_array() || manifest["items"].empty()) {
+            return std::string();
+        }
+        return std::string("STATIC_IMAGE_MANIFEST_JSON:\n") + manifest.dump();
+    }
+
+    static std::string buildOpenAIStaticImageManifestHash_(
+        const std::vector<FaceReferenceImage>& faceReferences,
+        const std::vector<NegativeReferenceImage>& negativeReferences,
+        const std::string& modelName)
+    {
+        const nlohmann::json manifest =
+            buildOpenAIStaticImageManifestJson_(faceReferences, negativeReferences, modelName);
+        if (!manifest.contains("items") || !manifest["items"].is_array() || manifest["items"].empty()) {
+            return "none";
+        }
+        return hashString64Hex_(manifest.dump());
+    }
+
+    static std::string hashJsonValueOrNone_(const nlohmann::json& value)
+    {
+        if (value.is_null()) return "none";
+        if (value.is_object() && value.empty()) return "none";
+        if (value.is_array() && value.empty()) return "none";
+        return hashString64Hex_(value.dump());
+    }
+
+    static bool supportsOpenAIPromptCaching_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return !isZAiCoreModelName_(modelName) && normalized.rfind("gpt-", 0) == 0;
+    }
+
+    static bool supportsOpenAIPromptCacheRetention24h_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0;
+    }
+
+    static bool supportsOpenAIJsonSchemaResponseFormat_(const std::string& modelName)
+    {
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return !isZAiCoreModelName_(modelName) && normalized.rfind("gpt-", 0) == 0;
+    }
+
+    static std::string buildFaceReferenceCacheHash_(const std::vector<FaceReferenceImage>& references)
+    {
+        if (references.empty()) return "none";
+        nlohmann::json digest = nlohmann::json::array();
+        for (const auto& ref : references) {
+            digest.push_back({
+                { "target_id", ref.targetId },
+                { "target_name", ref.targetName },
+                { "target_description", ref.targetDescription },
+                { "reference_image_url", ref.referenceImageUrl },
+                { "image_hash", hashString64Hex_(ref.imageDataUrl) }
+            });
+        }
+        return hashString64Hex_(digest.dump());
+    }
+
+    static std::string buildNegativeReferenceCacheHash_(const std::vector<NegativeReferenceImage>& references)
+    {
+        if (references.empty()) return "none";
+        nlohmann::json digest = nlohmann::json::array();
+        for (const auto& ref : references) {
+            digest.push_back({
+                { "image_id", ref.imageId },
+                { "image_hash", hashString64Hex_(ref.imageDataUrl) }
+            });
+        }
+        return hashString64Hex_(digest.dump());
+    }
+
+    static std::string extractTemporalPlanHashFromSections_(const VisionPromptSections_& sections)
+    {
+        if (sections.temporalStaticJson.empty()) return "none";
+        const nlohmann::json staticContext =
+            nlohmann::json::parse(sections.temporalStaticJson, nullptr, false);
+        if (!staticContext.is_object()) return "none";
+        if (!staticContext.contains("plan_ref") || !staticContext["plan_ref"].is_object()) {
+            return "none";
+        }
+        const nlohmann::json& planRef = staticContext["plan_ref"];
+        if (planRef.contains("plan_hash") && planRef["plan_hash"].is_string()) {
+            const std::string planHash = trimAscii(planRef["plan_hash"].get<std::string>());
+            return planHash.empty() ? "none" : hashString64Hex_(planHash);
+        }
+        return "none";
+    }
+
+    static std::string buildOpenAIVisionCacheVariant_(const OpenAIVisionPromptOptions_& options)
+    {
+        std::string variant =
+            (options.modality == OpenAIVisionModality_::Video) ? "video" : "image";
+        variant += options.jobMode ? "_job" : "_direct";
+        if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
+            variant += "_mosaic";
+        }
+        if (options.hasTemporal) variant += "_temporal";
+        if (options.hasFaceReferences) variant += "_face";
+        if (options.hasLegacySingleFaceReference) variant += "_legacy_face";
+        if (options.hasNegativeReferences) variant += "_negative";
+        if (options.hasCrossCameraWatchlist) variant += "_watchlist";
+        if (options.includeDetectionTimeInVideo) variant += "_time";
+        return variant;
+    }
+
+    static nlohmann::json makeNullableStringSchema_()
+    {
+        return nlohmann::json{ { "type", nlohmann::json::array({ "string", "null" }) } };
+    }
+
+    static nlohmann::json makeNullableIntegerSchema_()
+    {
+        return nlohmann::json{ { "type", nlohmann::json::array({ "integer", "null" }) } };
+    }
+
+    static nlohmann::json makeNullableStringArraySchema_(int maxItems)
+    {
+        nlohmann::json schema = {
+            { "type", nlohmann::json::array({ "array", "null" }) },
+            { "items", {
+                { "type", "string" }
+            }}
+        };
+        if (maxItems > 0) schema["maxItems"] = maxItems;
+        return schema;
+    }
+
+    static nlohmann::json makeNullableMmSsArraySchema_(int maxItems)
+    {
+        nlohmann::json schema = {
+            { "type", nlohmann::json::array({ "array", "null" }) },
+            { "items", {
+                { "type", "string" },
+                { "pattern", "^\\d{2}:\\d{2}$" }
+            }}
+        };
+        if (maxItems > 0) schema["maxItems"] = maxItems;
+        return schema;
+    }
+
+    static nlohmann::json makeNullableObjectArraySchema_(int maxItems)
+    {
+        nlohmann::json schema = {
+            { "type", nlohmann::json::array({ "array", "null" }) },
+            { "items", {
+                { "type", "object" }
+            }}
+        };
+        if (maxItems > 0) schema["maxItems"] = maxItems;
+        return schema;
+    }
+
+    static nlohmann::json buildOpenAIVisionResponseFormat_(
+        const OpenAIVisionPromptOptions_& options,
+        const std::string& cacheVariant)
+    {
+        nlohmann::json properties = {
+            { "answer", makeNullableStringSchema_() },
+            { "alert_condition", { { "type", "boolean" } } },
+            { "start_condition_step_id", makeNullableIntegerSchema_() },
+            { "alert_region_ids", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxAlertRegionIds_)) }
+        };
+        nlohmann::json required = nlohmann::json::array({
+            "answer",
+            "alert_condition",
+            "start_condition_step_id",
+            "alert_region_ids"
+        });
+
+        if (options.hasTemporal) {
+            properties["identity_patch"] =
+                makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityPatchItems_));
+            properties["observations"] =
+                makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxObservationItems_));
+            properties["unknown_reasons"] =
+                makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxUnknownReasonItems_));
+            required.push_back("identity_patch");
+            required.push_back("observations");
+            required.push_back("unknown_reasons");
+        }
+        if (options.hasFaceReferences) {
+            properties["faceid_match"] = { { "type", "boolean" } };
+            properties["faceid_target_names"] =
+                makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxFaceIdTargetNames_));
+            required.push_back("faceid_match");
+            required.push_back("faceid_target_names");
+        }
+        if (options.hasCrossCameraWatchlist) {
+            properties["cross_camera_watchlist_matches"] =
+                makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxCrossCameraMatches_));
+            required.push_back("cross_camera_watchlist_matches");
+        }
+        if (options.includeDetectionTimeInVideo) {
+            properties["detection_time_in_video"] =
+                makeNullableMmSsArraySchema_(static_cast<int>(kStructuredVisionMaxDetectionTimesInVideo_));
+            required.push_back("detection_time_in_video");
+        }
+
+        return nlohmann::json{
+            { "type", "json_schema" },
+            { "json_schema", {
+                { "name", std::string("vision_") + cacheVariant },
+                { "strict", false },
+                { "schema", {
+                    { "type", "object" },
+                    { "additionalProperties", false },
+                    { "properties", properties },
+                    { "required", required }
+                }}
+            }}
+        };
+    }
+
+    static nlohmann::json makeOpenAITextContentPart_(const std::string& text)
+    {
+        return nlohmann::json{
+            { "type", "text" },
+            { "text", text }
+        };
+    }
+
+    static void pushOpenAIUserTextMessageIfAny_(
+        nlohmann::json& messages,
+        const std::string& text)
+    {
+        if (trimAscii(text).empty()) return;
+        messages.push_back({
+            { "role", "user" },
+            { "content", text }
+        });
+    }
+
+    static void pushOpenAIUserContentMessageIfAny_(
+        nlohmann::json& messages,
+        const nlohmann::json& content)
+    {
+        if (!content.is_array() || content.empty()) return;
+        messages.push_back({
+            { "role", "user" },
+            { "content", content }
+        });
+    }
+
+    static std::string buildOpenAIVideoMosaicLayoutText_()
+    {
+        const nlohmann::json layout = {
+            { "layout_id", "openai_video_mosaic_v1" },
+            { "media_type", "mosaic_sequence" },
+            { "mosaic_index_base", 1 },
+            { "cell_index_base", 1 },
+            { "mosaics_are_in_temporal_order", true },
+            { "cell_reading_order", "left_to_right_top_to_bottom" },
+            { "distribution_rule", "balanced_sequential_partition" },
+            { "max_cells_per_mosaic", kPromptVideoMosaicMaxFramesPerMosaic_ },
+            { "grid_rule", buildPromptVideoMosaicGridRuleText_() },
+            { "reference_format", {
+                { "frame_ref", {
+                    { "mosaic_index", "1-based VIDEO_MOSAIC_IMAGE order" },
+                    { "cell_index", "1-based cell order within that mosaic" }
+                }}
+            }}
+        };
+        return std::string("MOSAIC_LAYOUT_JSON:\n") + layout.dump();
+    }
+
+    static std::string buildOpenAIVideoMosaicRuntimeText_(
+        const PromptVideoMosaicBundle_& bundle,
+        int modelInputFps)
+    {
+        const nlohmann::json runtime = {
+            { "mosaic_count", static_cast<int>(bundle.mosaics.size()) },
+            { "valid_cells_per_mosaic", bundle.validCellsPerMosaic },
+            { "grid_cols_per_mosaic", bundle.gridColsPerMosaic },
+            { "grid_rows_per_mosaic", bundle.gridRowsPerMosaic },
+            { "total_sampled_frames", bundle.totalSampledFrames },
+            { "sampled_fps_approx", modelInputFps }
+        };
+        return std::string("MOSAIC_RUNTIME_JSON:\n") + runtime.dump();
+    }
+
+    static std::string buildOpenAIVisionSystemText_(const OpenAIVisionPromptOptions_& options)
+    {
+        std::ostringstream prompt;
+        prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
+        prompt << "- Follow the provided response schema exactly.\n";
+        prompt << "- All JSON field names must remain in English.\n";
+        prompt << "- Write `answer` in the same language as the task text.\n";
+        prompt << "- Keep `answer` concise; prefer one short sentence unless the task explicitly needs more detail.\n";
+        prompt << "- Be conservative: when uncertain, prefer null/empty optional fields and keep booleans false.\n";
+        if (options.modality == OpenAIVisionModality_::Video) {
+            if (options.useVideoMosaics) {
+                prompt << "- Video evidence is provided as an ordered mosaic sequence.\n";
+                prompt << "- When citing temporal video evidence inside JSON objects, use frame_ref with 1-based mosaic_index and cell_index.\n";
+                prompt << "- Do not invent frame_index, timestamp_name, or absolute timestamps when they are not provided.\n";
+            }
+            else {
+                prompt << "- Use frame_index and frame_timestamp_in_segment as the canonical frame references for video evidence.\n";
+                prompt << "- Do not invent timestamp_name or absolute timestamps when they are not provided.\n";
+            }
+        }
+        else {
+            prompt << "- This is a single snapshot; do not invent motion, duration, or unseen frames.\n";
+        }
+        if (options.hasTemporal) {
+            prompt << "- TEMPORAL_STATIC_CONTEXT_JSON defines the stable temporal contract for this agent.\n";
+            prompt << "- TEMPORAL_RUNTIME_STATE_JSON contains authoritative prior confirmed state for the current round.\n";
+            if (options.temporalAlertMayUsePriorState) {
+                prompt << "- alert_condition may combine current evidence with authoritative prior temporal state when the task explicitly requires cumulative reasoning.\n";
+            }
+            else {
+                prompt << "- alert_condition must reflect only current-batch evidence; use temporal state for explanation, identity continuity, and structured temporal fields.\n";
+            }
+            prompt << "- Do not write temporal state directly; only return observations, identity patches, and watchlist matches when supported.\n";
+        }
+        if (options.hasFaceReferences || options.hasLegacySingleFaceReference) {
+            prompt << "- When a face reference is provided, compare conservatively and only mark a positive match when identity is clearly consistent.\n";
+        }
+        if (options.hasNegativeReferences) {
+            prompt << "- NEGATIVE_REFERENCE_IMAGE inputs are examples of scenes that should not trigger by themselves.\n";
+        }
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "- Evaluate shared cross_camera_watchlist targets independently from the local alert condition.\n";
+        }
+        if (options.requireDetectionTimeInVideo) {
+            prompt << "- When the answer states that a relevant event is visible, include supporting detection_time_in_video timestamps.\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIVideoStaticText_(
+        const OpenAIVisionPromptOptions_& options,
+        const VisionPromptSections_& sections,
+        const std::string& alertConditionText,
+        const std::string& startConditionText)
+    {
+        std::ostringstream prompt;
+        if (options.jobMode) {
+            prompt << "JOB STEP MODE (AUTOMATION):\n";
+            prompt << "- This inference is executed inside an automated Job Step.\n";
+            prompt << "- The output is consumed by a JobRunner state machine.\n\n";
+        }
+        else {
+            prompt << "DIRECT CAMERA/CHAT VIDEO MODE:\n";
+            prompt << "- This inference may run in direct camera monitoring or ad-hoc video analysis.\n\n";
+        }
+
+        prompt << "TASK TEXT:\n";
+        if (!sections.basePrompt.empty()) prompt << sections.basePrompt << "\n\n";
+        else prompt << "(No extra task text provided.)\n\n";
+
+        prompt << "IMPORTANT CONTEXT RULE:\n";
+        prompt << "- The analyzed segment is only PART of the full requested time window.\n";
+        prompt << "- Never imply that the answer covers the entire requested window.\n";
+        if (options.hasTemporal) {
+            prompt << "- Use current frames for new observations in this batch.\n";
+            prompt << "- Use temporal context for identity continuity and cumulative interpretation only when explicitly allowed.\n\n";
+        }
+        else {
+            prompt << "- Refer only to what is visible in this sampled video evidence.\n\n";
+        }
+
+        if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
+            prompt << "VIDEO MOSAIC INPUT RULES:\n";
+            prompt << "- You will receive an ordered sequence of VIDEO_MOSAIC_IMAGE inputs.\n";
+            prompt << "- mosaic_index is the 1-based order of VIDEO_MOSAIC_IMAGE inputs in the prompt.\n";
+            prompt << "- Within each mosaic, cell_index is 1-based in left-to-right, top-to-bottom order.\n";
+            prompt << "- Each cell is one sampled frame from the current segment.\n";
+            prompt << "- When citing evidence inside observations or identity_patch events, use frame_ref with mosaic_index and cell_index.\n";
+            prompt << "- Do not guess frame_index manually.\n";
+            prompt << buildOpenAIVideoMosaicLayoutText_() << "\n\n";
+        }
+
+        if (options.hasFaceReferences) {
+            prompt << "REFERENCE IMAGE LOGIC:\n";
+            prompt << "- Structured USER_REFERENCE_IMAGE inputs may include TARGET_ID and TARGET_NAME metadata.\n";
+            prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
+        }
+        else if (options.hasLegacySingleFaceReference) {
+            prompt << "REFERENCE IMAGE LOGIC:\n";
+            prompt << "- USER_REFERENCE_IMAGE is a close-up face of the person to search for in the CCTV frames.\n";
+            prompt << "- Compare visible faces conservatively and do not force a positive match under poor visibility.\n\n";
+        }
+
+        if (options.hasNegativeReferences) {
+            prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+            prompt << "- These references represent visual conditions that should reduce false positives.\n\n";
+        }
+
+        prompt << "CONDITIONS TO EVALUATE:\n";
+        if (options.hasTemporal) {
+            prompt << "- Evaluate the current sampled video evidence for new observations.\n";
+            prompt << "- Use temporal state only as allowed by the system rules.\n";
+            prompt << "- For a continuous action that stays in progress across several frames, emit one event observation for the first clearly supported transition and treat later frames as continuity of the same episode.\n";
+            prompt << "- When you include a later-frame continuity object, mark it with continuation=true and counts_as_new_event=false instead of creating a second event occurrence.\n";
+            prompt << "- If not confident about new observations, keep booleans false.\n\n";
+        }
+        else {
+            prompt << "- Evaluate the conditions below using only this sampled video evidence.\n";
+            prompt << "- If not confident, keep booleans false.\n\n";
+        }
+
+        prompt << "ALERT CONDITION:\n";
+        if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+        else prompt << "(No alert condition provided. Keep alert_condition false unless the task explicitly requires otherwise.)\n\n";
+
+        prompt << "START CONDITION:\n";
+        if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+        else prompt << "(No start condition provided. Keep start_condition_step_id null.)\n\n";
+
+        prompt << "FIELD RULES:\n";
+        prompt << "- alert_region_ids should list visible region ids only when alert evidence is clearly tied to them.\n";
+        if (options.hasTemporal) {
+            prompt << "- identity_patch and observations must contain JSON objects only.\n";
+            prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+            prompt << "- Do not repeat the same event in observations just because later frames still show the entity in the middle of that same action.\n";
+            prompt << "- If you need to mention that later frame, keep the same observation as continuity using continuation=true and counts_as_new_event=false.\n";
+            prompt << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch.\n";
+        }
+        if (options.hasFaceReferences) {
+            prompt << "- If faceid_match is true, include matched target names when known.\n";
+        }
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+        }
+        if (options.includeDetectionTimeInVideo) {
+            prompt << "- detection_time_in_video must contain only representative MM:SS timestamps from this segment.\n";
+            prompt << "- Use at most " << kStructuredVisionMaxDetectionTimesInVideo_ << " unique timestamps and never list every second.\n";
+            prompt << "- Do not use HH:MM:SS or any timestamp format other than MM:SS.\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIVideoDynamicText_(
+        const OpenAIVisionPromptOptions_& options,
+        const VisionPromptSections_& sections,
+        const std::string& segmentStartForPrompt,
+        const std::string& segmentEndForPrompt,
+        int modelInputFps,
+        const PromptVideoMosaicBundle_* mosaicBundle)
+    {
+        std::ostringstream prompt;
+        prompt << "CURRENT VIDEO SEGMENT:\n";
+        prompt << "- segment_start: " << segmentStartForPrompt << "\n";
+        prompt << "- segment_end: " << segmentEndForPrompt << "\n";
+        if (options.useVideoMosaics && mosaicBundle != nullptr && !mosaicBundle->mosaics.empty()) {
+            prompt << "- video_input_mode: ordered_mosaic_sequence\n";
+            prompt << "- evidence_reference_mode: frame_ref.mosaic_index + frame_ref.cell_index\n";
+            prompt << "\n" << buildOpenAIVideoMosaicRuntimeText_(*mosaicBundle, modelInputFps) << "\n";
+        }
+        else {
+            prompt << "- sampled_fps_approx: " << modelInputFps << "\n";
+            prompt << "- frame_meta_fields: frame_index, frame_timestamp_in_segment\n";
+        }
+
+        if (!sections.pipelineInput.empty()) {
+            prompt << "\nINPUT_FROM_PREVIOUS_STEP:\n" << sections.pipelineInput << "\n";
+        }
+        if (!sections.temporalRuntimeJson.empty()) {
+            prompt << "\n" << temporal::kTemporalRuntimePromptMarker << "\n"
+                   << sections.temporalRuntimeJson << "\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIImageStaticText_(
+        const OpenAIVisionPromptOptions_& options,
+        const VisionPromptSections_& sections,
+        const std::string& alertConditionText,
+        const std::string& startConditionText)
+    {
+        std::ostringstream prompt;
+        prompt << "JOB STEP MODE (AUTOMATION):\n";
+        prompt << "- This inference is executed inside an automated Job Step.\n";
+        prompt << "- The output is consumed by a JobRunner state machine.\n\n";
+
+        prompt << "TASK TEXT:\n";
+        if (!sections.basePrompt.empty()) prompt << sections.basePrompt << "\n\n";
+        else prompt << "(No extra task text provided.)\n\n";
+
+        prompt << "IMPORTANT CONTEXT RULE:\n";
+        prompt << "- This is a single snapshot.\n";
+        prompt << "- Never imply motion or duration unless it is explicitly supported by temporal state.\n";
+        if (options.hasTemporal) {
+            prompt << "- Use this snapshot only for new observations visible right now.\n\n";
+        }
+        else {
+            prompt << "- Refer only to what is visible in this image.\n\n";
+        }
+
+        if (options.hasFaceReferences) {
+            prompt << "REFERENCE IMAGE LOGIC:\n";
+            prompt << "- Structured USER_REFERENCE_IMAGE inputs may include TARGET_ID and TARGET_NAME metadata.\n";
+            prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
+        }
+        if (options.hasNegativeReferences) {
+            prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+            prompt << "- These references represent visual conditions that should reduce false positives.\n\n";
+        }
+
+        prompt << "CONDITIONS TO EVALUATE:\n";
+        if (options.hasTemporal) {
+            prompt << "- Evaluate this snapshot for current evidence.\n";
+            prompt << "- Use temporal state only as allowed by the system rules.\n";
+            prompt << "- If not confident about new observations, keep booleans false.\n\n";
+        }
+        else {
+            prompt << "- Evaluate the conditions below using only this snapshot.\n";
+            prompt << "- If not confident, keep booleans false.\n\n";
+        }
+
+        prompt << "ALERT CONDITION:\n";
+        if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+        else prompt << "(No alert condition provided. Keep alert_condition false.)\n\n";
+
+        prompt << "START CONDITION:\n";
+        if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+        else prompt << "(No start condition provided. Keep start_condition_step_id null.)\n\n";
+
+        prompt << "FIELD RULES:\n";
+        prompt << "- alert_region_ids should list visible region ids only when alert evidence is clearly tied to them.\n";
+        if (options.hasTemporal) {
+            prompt << "- identity_patch and observations must contain JSON objects only.\n";
+            prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+        }
+        if (options.hasFaceReferences) {
+            prompt << "- If faceid_match is true, include matched target names when known.\n";
+        }
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIImageDynamicText_(
+        const VisionPromptSections_& sections,
+        const std::string& snapshotTsUtcIso)
+    {
+        std::ostringstream prompt;
+        prompt << "CURRENT SNAPSHOT:\n";
+        prompt << "- snapshot_ts_utc: " << (snapshotTsUtcIso.empty() ? "unknown" : snapshotTsUtcIso) << "\n";
+        if (!sections.pipelineInput.empty()) {
+            prompt << "\nINPUT_FROM_PREVIOUS_STEP:\n" << sections.pipelineInput << "\n";
+        }
+        if (!sections.temporalRuntimeJson.empty()) {
+            prompt << "\n" << temporal::kTemporalRuntimePromptMarker << "\n"
+                   << sections.temporalRuntimeJson << "\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIVisionFallbackSchemaText_(
+        const OpenAIVisionPromptOptions_& options)
+    {
+        std::ostringstream prompt;
+        prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+        prompt << "- answer: string or null\n";
+        prompt << "- alert_condition: boolean\n";
+        prompt << "- start_condition_step_id: integer or null\n";
+        prompt << "- alert_region_ids: array of strings or null (max " <<
+            kStructuredVisionMaxAlertRegionIds_ << " items)\n";
+        if (options.hasTemporal) {
+            prompt << "- identity_patch: array or null (max " <<
+                kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
+            prompt << "- observations: array or null (max " <<
+                kStructuredVisionMaxObservationItems_ << " items)\n";
+            prompt << "- unknown_reasons: array or null (max " <<
+                kStructuredVisionMaxUnknownReasonItems_ << " items)\n";
+        }
+        if (options.hasFaceReferences) {
+            prompt << "- faceid_match: boolean\n";
+            prompt << "- faceid_target_names: array of strings or null (max " <<
+                kStructuredVisionMaxFaceIdTargetNames_ << " items)\n";
+        }
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "- cross_camera_watchlist_matches: array or null (max " <<
+                kStructuredVisionMaxCrossCameraMatches_ << " items)\n";
+        }
+        if (options.includeDetectionTimeInVideo) {
+            prompt << "- detection_time_in_video: array of unique MM:SS strings or null (max " <<
+                kStructuredVisionMaxDetectionTimesInVideo_ << " items)\n";
+            prompt << "- detection_time_in_video must contain representative timestamps only; never enumerate every second.\n";
+            prompt << "- detection_time_in_video must use MM:SS only; do not use HH:MM:SS.\n";
+        }
+        if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
+            prompt << "- Within temporal observation/event objects, prefer frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer}.\n";
+        }
+        prompt << "- Keep answer short and factual.\n";
+        prompt << "- No markdown, no code fences, no extra keys.\n";
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIVisionCacheKey_(
+        const std::string& modelName,
+        const std::string& cacheVariant,
+        const std::string& staticSystemText,
+        const std::string& staticUserText,
+        const std::string& temporalStaticText,
+        const std::string& faceRefsHash,
+        const std::string& negativeRefsHash,
+        const nlohmann::json& responseFormat)
+    {
+        const std::string prefixHash = hashString64Hex_(
+            std::string(kOpenAIVisionPromptRevision_) + "\n" +
+            staticSystemText + "\n" +
+            staticUserText + "\n" +
+            temporalStaticText + "\n" +
+            responseFormat.dump() + "\n" +
+            "face=" + faceRefsHash + "\n" +
+            "negative=" + negativeRefsHash
+        );
+
+        return "vision:" + normalizeOpenAIModelName_(modelName) +
+            ":" + trimAscii(cacheVariant) +
+            ":" + prefixHash;
+    }
+
+    static std::string buildOpenAIVisionCacheKey_(
+        const std::string& modelName,
+        const OpenAIVisionPromptOptions_& options,
+        const std::string& staticSystemText,
+        const std::string& staticUserText,
+        const std::string& temporalStaticText,
+        const std::string& faceRefsHash,
+        const std::string& negativeRefsHash,
+        const nlohmann::json& responseFormat)
+    {
+        return buildOpenAIVisionCacheKey_(
+            modelName,
+            buildOpenAIVisionCacheVariant_(options),
+            staticSystemText,
+            staticUserText,
+            temporalStaticText,
+            faceRefsHash,
+            negativeRefsHash,
+            responseFormat
+        );
+    }
+
+    static void applyOpenAIVisionCacheFields_(
+        nlohmann::json& body,
+        const std::string& modelName,
+        const std::string& cacheKey)
+    {
+        if (!supportsOpenAIPromptCaching_(modelName) || trimAscii(cacheKey).empty()) {
+            return;
+        }
+        body["prompt_cache_key"] = cacheKey;
+        if (supportsOpenAIPromptCacheRetention24h_(modelName)) {
+            body["prompt_cache_retention"] = "24h";
+        }
+    }
+
+    static std::vector<std::string> buildOpenAIVisionPromptLogMessages_(
+        const std::string& scope,
+        const std::string& modelName,
+        const OpenAIVisionRequestBuild_& build)
+    {
+        std::vector<std::string> messages;
+        messages.reserve(6);
+
+        messages.push_back(
+            scope +
+            ": prompt layout model=" + modelName +
+            " variant=" + build.cacheVariant +
+            " video_packaging_mode=" + build.videoPackagingModeForLog +
+            " static_prompt_bytes=" + std::to_string(static_cast<unsigned long long>(build.staticPromptBytes)) +
+            " dynamic_prompt_bytes=" + std::to_string(static_cast<unsigned long long>(build.dynamicPromptBytes)) +
+            " temporal_plan_hash=" + build.temporalPlanHash +
+            " face_refs_hash=" + build.faceRefsHash +
+            " negative_refs_hash=" + build.negativeRefsHash +
+            " cache_key=" + build.cacheKey
+        );
+
+        messages.push_back(
+            scope +
+            ": prompt cache diagnostics model=" + modelName +
+            " cache_key=" + build.cacheKey +
+            " prompt_cache_retention=" + build.promptCacheRetention +
+            " static_text_hash=" + build.staticTextHash +
+            " response_format_hash=" + build.responseFormatHash +
+            " static_image_manifest_hash=" + build.staticImageManifestHash +
+            " full_cacheable_prefix_hash=" + build.fullCacheablePrefixHash +
+            " dynamic_text_hash=" + build.dynamicTextHash +
+            " dynamic_image_manifest_hash=" + build.dynamicImageManifestHash +
+            " static_prefix_token_estimate=" + std::to_string(build.staticPrefixTokenEstimate)
+        );
+
+        messages.push_back(
+            scope +
+            ": prompt static text model=" + modelName +
+            "\n" + (build.staticTextForLog.empty() ? std::string("(no static text prompt parts)") : build.staticTextForLog)
+        );
+
+        messages.push_back(
+            scope +
+            ": prompt static response_format model=" + modelName +
+            "\n" + (build.staticResponseFormatForLog.empty() ? std::string("(none)") : build.staticResponseFormatForLog)
+        );
+
+        messages.push_back(
+            scope +
+            ": prompt static image manifest model=" + modelName +
+            "\n" + (build.staticImageManifestForLog.empty() ? std::string("(none)") : build.staticImageManifestForLog)
+        );
+
+        messages.push_back(
+            scope +
+            ": prompt dynamic text (images omitted) model=" + modelName +
+            "\n" + (build.dynamicTextForLog.empty() ? std::string("(no dynamic text prompt parts)") : build.dynamicTextForLog)
+        );
+
+        return messages;
+    }
+
+    static void logOpenAIVisionPromptBuild_(
+        const std::string& logStreamId,
+        const std::string& scope,
+        const std::string& modelName,
+        const OpenAIVisionRequestBuild_& build)
+    {
+        const std::string streamId = logStreamId.empty() ? std::string("agent") : logStreamId;
+        for (const std::string& message : buildOpenAIVisionPromptLogMessages_(scope, modelName, build)) {
+            Logger::instance().logDebug(streamId, message);
+        }
+    }
+
+    static OpenAIVisionRequestBuild_ buildOpenAIVideoRequest_(
+        const std::string& modelName,
+        const VisionPromptSections_& sections,
+        const std::string& alertConditionText,
+        const std::string& startConditionText,
+        const std::string& segmentStartForPrompt,
+        const std::string& segmentEndForPrompt,
+        int modelInputFps,
+        const std::vector<PromptVideoFrame>& frames,
+        const std::vector<FaceReferenceImage>& effectiveFaceReferences,
+        const std::vector<NegativeReferenceImage>& effectiveNegativeReferences,
+        const std::string& uploadedImageBase64,
+        const std::string& videoPackagingMode,
+        bool jobMode,
+        bool cameraStyleFlow)
+    {
+        OpenAIVisionRequestBuild_ build;
+        build.videoPackagingModeForLog = normalizeVideoPackagingMode_(videoPackagingMode);
+        const std::vector<FaceReferenceImage> canonicalFaceReferences =
+            buildEffectiveFaceReferences_(effectiveFaceReferences);
+        const std::vector<NegativeReferenceImage> canonicalNegativeReferences =
+            buildEffectiveNegativeReferences_(effectiveNegativeReferences);
+        const PromptVideoMosaicBundle_ mosaicBundle =
+            buildPromptVideoMosaicBundle_(frames);
+        const bool preferVideoMosaics = build.videoPackagingModeForLog != "frame_sequence";
+        const bool useVideoMosaics = preferVideoMosaics && !mosaicBundle.mosaics.empty();
+
+        OpenAIVisionPromptOptions_ options;
+        options.modality = OpenAIVisionModality_::Video;
+        options.jobMode = jobMode;
+        options.directChatFlow = !jobMode && !cameraStyleFlow;
+        options.hasTemporal = sections.hasTemporal;
+        options.useVideoMosaics = useVideoMosaics;
+        options.hasFaceReferences = !canonicalFaceReferences.empty();
+        options.hasLegacySingleFaceReference =
+            !trimAscii(uploadedImageBase64).empty() && canonicalFaceReferences.empty();
+        options.hasNegativeReferences = !canonicalNegativeReferences.empty();
+        options.hasCrossCameraWatchlist = sections.hasCrossCameraWatchlist;
+        options.temporalAlertMayUsePriorState = false;
+        options.includeDetectionTimeInVideo = true;
+        options.requireDetectionTimeInVideo = options.directChatFlow;
+
+        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticUserText = buildOpenAIVideoStaticText_(
+            options,
+            sections,
+            alertConditionText,
+            startConditionText
+        );
+        const std::string temporalStaticText =
+            sections.temporalStaticJson.empty()
+                ? std::string()
+                : (std::string(temporal::kTemporalStaticPromptMarker) + "\n" + sections.temporalStaticJson);
+        const std::string dynamicText = buildOpenAIVideoDynamicText_(
+            options,
+            sections,
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            modelInputFps,
+            useVideoMosaics ? &mosaicBundle : nullptr
+        );
+
+        const std::string faceRefsHash = buildFaceReferenceCacheHash_(canonicalFaceReferences);
+        const std::string negativeRefsHash = buildNegativeReferenceCacheHash_(canonicalNegativeReferences);
+        const std::string temporalPlanHash = extractTemporalPlanHashFromSections_(sections);
+        const nlohmann::json responseFormat = supportsOpenAIJsonSchemaResponseFormat_(modelName)
+            ? buildOpenAIVisionResponseFormat_(options, buildOpenAIVisionCacheVariant_(options))
+            : nlohmann::json();
+        const std::string fallbackSchemaText =
+            responseFormat.is_object() && !responseFormat.empty()
+                ? std::string()
+                : buildOpenAIVisionFallbackSchemaText_(options);
+        const std::string staticReferenceLabelText =
+            buildOpenAIStaticReferenceLabelText_(canonicalFaceReferences, canonicalNegativeReferences);
+
+        nlohmann::json messages = nlohmann::json::array();
+        messages.push_back({
+            { "role", "system" },
+            { "content", staticSystemText }
+        });
+        pushOpenAIUserTextMessageIfAny_(messages, staticUserText);
+        pushOpenAIUserTextMessageIfAny_(messages, fallbackSchemaText);
+        pushOpenAIUserTextMessageIfAny_(messages, temporalStaticText);
+
+        nlohmann::json staticReferenceContent = nlohmann::json::array();
+        if (options.hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(staticReferenceContent, canonicalFaceReferences, modelName);
+        }
+        if (options.hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(staticReferenceContent, canonicalNegativeReferences, modelName);
+        }
+        pushOpenAIUserContentMessageIfAny_(messages, staticReferenceContent);
+
+        nlohmann::json dynamicContent = nlohmann::json::array();
+        std::vector<std::string> dynamicTextPartsForLog;
+        nlohmann::json dynamicImageManifest = nlohmann::json::array();
+        int dynamicImageOrder = 1;
+        if (!trimAscii(dynamicText).empty()) {
+            dynamicContent.push_back(makeOpenAITextContentPart_(dynamicText));
+            build.dynamicPromptBytes += dynamicText.size();
+            dynamicTextPartsForLog.push_back(dynamicText);
+        }
+        if (options.hasLegacySingleFaceReference) {
+            const std::string legacyLabel =
+                "USER_REFERENCE_IMAGE: target FACE of the person to search in the CCTV video.";
+            const std::string legacyBare = stripDataUrlPrefix(uploadedImageBase64);
+            dynamicContent.push_back(makeOpenAITextContentPart_(legacyLabel));
+            dynamicContent.push_back(makeOpenAIImageContentFromBareJpeg(legacyBare, modelName));
+            dynamicTextPartsForLog.push_back(legacyLabel);
+            if (!legacyBare.empty()) {
+                dynamicImageManifest.push_back({
+                    { "order", dynamicImageOrder++ },
+                    { "kind", "USER_REFERENCE_IMAGE_LEGACY" },
+                    { "detail", resolveOpenAIImageDetailForModel_(modelName) },
+                    { "image_hash", hashString64Hex_(legacyBare) }
+                });
+            }
+        }
+        if (useVideoMosaics) {
+            for (const auto& mosaic : mosaicBundle.mosaics) {
+                const std::string mosaicLabel =
+                    "VIDEO_MOSAIC_IMAGE #" + std::to_string(mosaic.mosaicIndex);
+                dynamicContent.push_back(makeOpenAITextContentPart_(mosaicLabel));
+                dynamicContent.push_back(makeOpenAIImageContentFromBareJpeg(mosaic.jpegBase64, modelName));
+                build.dynamicPromptBytes += mosaicLabel.size();
+                dynamicTextPartsForLog.push_back(mosaicLabel);
+                dynamicImageManifest.push_back({
+                    { "order", dynamicImageOrder++ },
+                    { "kind", "VIDEO_MOSAIC_IMAGE" },
+                    { "mosaic_index", mosaic.mosaicIndex },
+                    { "detail", resolveOpenAIImageDetailForModel_(modelName) },
+                    { "grid_cols", mosaic.gridColumns },
+                    { "grid_rows", mosaic.gridRows },
+                    { "image_hash", hashString64Hex_(mosaic.jpegBase64) }
+                });
+            }
+        }
+        else {
+            for (const auto& frame : frames) {
+                const std::string frameMeta = buildPromptVideoFrameMetaText_(frame);
+                const std::string normalizedBare =
+                    normalizeOpenAIFrameJpegBase64ForModel_(frame.jpegBase64, modelName);
+                const std::string actualBare =
+                    normalizedBare.empty() ? frame.jpegBase64 : normalizedBare;
+                dynamicContent.push_back(makeOpenAITextContentPart_(frameMeta));
+                dynamicContent.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, modelName));
+                build.dynamicPromptBytes += frameMeta.size();
+                dynamicTextPartsForLog.push_back(frameMeta);
+                dynamicImageManifest.push_back({
+                    { "order", dynamicImageOrder++ },
+                    { "kind", "VIDEO_FRAME_IMAGE" },
+                    { "frame_index", frame.frameIndex },
+                    { "detail", resolveOpenAIImageDetailForModel_(modelName) },
+                    { "image_hash", hashString64Hex_(actualBare) }
+                });
+            }
+        }
+        pushOpenAIUserContentMessageIfAny_(messages, dynamicContent);
+
+        build.staticPromptBytes =
+            staticSystemText.size() +
+            staticUserText.size() +
+            fallbackSchemaText.size() +
+            temporalStaticText.size() +
+            staticReferenceLabelText.size() +
+            responseFormat.dump().size();
+        build.cacheVariant = buildOpenAIVisionCacheVariant_(options);
+        build.temporalPlanHash = temporalPlanHash;
+        build.faceRefsHash = faceRefsHash;
+        build.negativeRefsHash = negativeRefsHash;
+        build.cacheKey = buildOpenAIVisionCacheKey_(
+            modelName,
+            options,
+            staticSystemText,
+            staticUserText + "\n" + fallbackSchemaText,
+            temporalStaticText,
+            faceRefsHash,
+            negativeRefsHash,
+            responseFormat
+        );
+        build.promptCacheRetention = buildOpenAIPromptCacheRetentionForLog_(modelName, build.cacheKey);
+
+        build.body = {
+            { "model", modelName },
+            { "messages", messages }
+        };
+        if (responseFormat.is_object() && !responseFormat.empty()) {
+            build.body["response_format"] = responseFormat;
+        }
+        build.promptTextForLog = buildOpenAIPromptTextForLog_(messages);
+        build.staticTextForLog = buildOpenAITextBlocksForLog_({
+            { "system", staticSystemText },
+            { "user", staticUserText },
+            { "user", fallbackSchemaText },
+            { "user", temporalStaticText }
+        });
+        build.staticResponseFormatForLog =
+            (responseFormat.is_object() && !responseFormat.empty())
+                ? (std::string("RESPONSE_FORMAT_JSON:\n") + responseFormat.dump())
+                : std::string();
+        build.staticImageManifestForLog =
+            buildOpenAIStaticImageManifestForLog_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        {
+            std::ostringstream dynamicTextCombined;
+            bool wroteAny = false;
+            for (const auto& part : dynamicTextPartsForLog) {
+                const std::string trimmedPart = trimAscii(part);
+                if (trimmedPart.empty()) continue;
+                if (wroteAny) dynamicTextCombined << "\n";
+                dynamicTextCombined << trimmedPart;
+                wroteAny = true;
+            }
+            build.dynamicTextForLog = buildOpenAITextBlocksForLog_({
+                { "user", dynamicTextCombined.str() }
+            });
+        }
+        build.staticTextHash =
+            trimAscii(build.staticTextForLog).empty() ? "none" : hashString64Hex_(build.staticTextForLog);
+        build.responseFormatHash =
+            (responseFormat.is_object() && !responseFormat.empty()) ? hashString64Hex_(responseFormat.dump()) : "none";
+        build.staticImageManifestHash =
+            buildOpenAIStaticImageManifestHash_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        build.dynamicTextHash =
+            trimAscii(build.dynamicTextForLog).empty() ? "none" : hashString64Hex_(build.dynamicTextForLog);
+        build.dynamicImageManifestHash = hashJsonValueOrNone_(dynamicImageManifest);
+        build.fullCacheablePrefixHash = hashString64Hex_(
+            std::string(kOpenAIVisionPromptRevision_) + "\n" +
+            build.staticTextForLog + "\n" +
+            build.staticResponseFormatForLog + "\n" +
+            build.staticImageManifestForLog
+        );
+        build.staticPrefixTokenEstimate = estimateOpenAITextTokensHeuristic_(
+            staticSystemText + "\n" +
+            staticUserText + "\n" +
+            fallbackSchemaText + "\n" +
+            temporalStaticText + "\n" +
+            staticReferenceLabelText + "\n" +
+            responseFormat.dump()
+        );
+        applyOpenAIVisionCacheFields_(build.body, modelName, build.cacheKey);
+        return build;
+    }
+
+    static OpenAIVisionRequestBuild_ buildOpenAIImageRequest_(
+        const std::string& modelName,
+        const VisionPromptSections_& sections,
+        const std::string& alertConditionText,
+        const std::string& startConditionText,
+        const std::string& snapshotTsUtcIso,
+        const std::string& jpegBase64,
+        const std::vector<FaceReferenceImage>& effectiveFaceReferences,
+        const std::vector<NegativeReferenceImage>& effectiveNegativeReferences)
+    {
+        OpenAIVisionRequestBuild_ build;
+        const std::vector<FaceReferenceImage> canonicalFaceReferences =
+            buildEffectiveFaceReferences_(effectiveFaceReferences);
+        const std::vector<NegativeReferenceImage> canonicalNegativeReferences =
+            buildEffectiveNegativeReferences_(effectiveNegativeReferences);
+        OpenAIVisionPromptOptions_ options;
+        options.modality = OpenAIVisionModality_::Image;
+        options.jobMode = true;
+        options.hasTemporal = sections.hasTemporal;
+        options.hasFaceReferences = !canonicalFaceReferences.empty();
+        options.hasNegativeReferences = !canonicalNegativeReferences.empty();
+        options.hasCrossCameraWatchlist = sections.hasCrossCameraWatchlist;
+        options.temporalAlertMayUsePriorState = true;
+
+        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticUserText = buildOpenAIImageStaticText_(
+            options,
+            sections,
+            alertConditionText,
+            startConditionText
+        );
+        const std::string temporalStaticText =
+            sections.temporalStaticJson.empty()
+                ? std::string()
+                : (std::string(temporal::kTemporalStaticPromptMarker) + "\n" + sections.temporalStaticJson);
+        const std::string dynamicText = buildOpenAIImageDynamicText_(sections, snapshotTsUtcIso);
+
+        const std::string faceRefsHash = buildFaceReferenceCacheHash_(canonicalFaceReferences);
+        const std::string negativeRefsHash = buildNegativeReferenceCacheHash_(canonicalNegativeReferences);
+        const std::string temporalPlanHash = extractTemporalPlanHashFromSections_(sections);
+        const nlohmann::json responseFormat = supportsOpenAIJsonSchemaResponseFormat_(modelName)
+            ? buildOpenAIVisionResponseFormat_(options, buildOpenAIVisionCacheVariant_(options))
+            : nlohmann::json();
+        const std::string fallbackSchemaText =
+            responseFormat.is_object() && !responseFormat.empty()
+                ? std::string()
+                : buildOpenAIVisionFallbackSchemaText_(options);
+        const std::string staticReferenceLabelText =
+            buildOpenAIStaticReferenceLabelText_(canonicalFaceReferences, canonicalNegativeReferences);
+
+        nlohmann::json messages = nlohmann::json::array();
+        messages.push_back({
+            { "role", "system" },
+            { "content", staticSystemText }
+        });
+        pushOpenAIUserTextMessageIfAny_(messages, staticUserText);
+        pushOpenAIUserTextMessageIfAny_(messages, fallbackSchemaText);
+        pushOpenAIUserTextMessageIfAny_(messages, temporalStaticText);
+
+        nlohmann::json staticReferenceContent = nlohmann::json::array();
+        if (options.hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(staticReferenceContent, canonicalFaceReferences, modelName);
+        }
+        if (options.hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(staticReferenceContent, canonicalNegativeReferences, modelName);
+        }
+        pushOpenAIUserContentMessageIfAny_(messages, staticReferenceContent);
+
+        nlohmann::json dynamicContent = nlohmann::json::array();
+        std::vector<std::string> dynamicTextPartsForLog;
+        if (!trimAscii(dynamicText).empty()) {
+            dynamicContent.push_back(makeOpenAITextContentPart_(dynamicText));
+            build.dynamicPromptBytes += dynamicText.size();
+            dynamicTextPartsForLog.push_back(dynamicText);
+        }
+        const std::string snapshotBare =
+            normalizeOpenAIFrameJpegBase64ForModel_(stripDataUrlPrefix(jpegBase64), modelName);
+        dynamicContent.push_back(
+            makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(jpegBase64), modelName)
+        );
+        pushOpenAIUserContentMessageIfAny_(messages, dynamicContent);
+
+        build.staticPromptBytes =
+            staticSystemText.size() +
+            staticUserText.size() +
+            fallbackSchemaText.size() +
+            temporalStaticText.size() +
+            staticReferenceLabelText.size() +
+            responseFormat.dump().size();
+        build.cacheVariant = buildOpenAIVisionCacheVariant_(options);
+        build.temporalPlanHash = temporalPlanHash;
+        build.faceRefsHash = faceRefsHash;
+        build.negativeRefsHash = negativeRefsHash;
+        build.cacheKey = buildOpenAIVisionCacheKey_(
+            modelName,
+            options,
+            staticSystemText,
+            staticUserText + "\n" + fallbackSchemaText,
+            temporalStaticText,
+            faceRefsHash,
+            negativeRefsHash,
+            responseFormat
+        );
+        build.promptCacheRetention = buildOpenAIPromptCacheRetentionForLog_(modelName, build.cacheKey);
+
+        build.body = {
+            { "model", modelName },
+            { "messages", messages }
+        };
+        if (responseFormat.is_object() && !responseFormat.empty()) {
+            build.body["response_format"] = responseFormat;
+        }
+        build.promptTextForLog = buildOpenAIPromptTextForLog_(messages);
+        build.staticTextForLog = buildOpenAITextBlocksForLog_({
+            { "system", staticSystemText },
+            { "user", staticUserText },
+            { "user", fallbackSchemaText },
+            { "user", temporalStaticText }
+        });
+        build.staticResponseFormatForLog =
+            (responseFormat.is_object() && !responseFormat.empty())
+                ? (std::string("RESPONSE_FORMAT_JSON:\n") + responseFormat.dump())
+                : std::string();
+        build.staticImageManifestForLog =
+            buildOpenAIStaticImageManifestForLog_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        {
+            std::ostringstream dynamicTextCombined;
+            bool wroteAny = false;
+            for (const auto& part : dynamicTextPartsForLog) {
+                const std::string trimmedPart = trimAscii(part);
+                if (trimmedPart.empty()) continue;
+                if (wroteAny) dynamicTextCombined << "\n";
+                dynamicTextCombined << trimmedPart;
+                wroteAny = true;
+            }
+            build.dynamicTextForLog = buildOpenAITextBlocksForLog_({
+                { "user", dynamicTextCombined.str() }
+            });
+        }
+        build.staticTextHash =
+            trimAscii(build.staticTextForLog).empty() ? "none" : hashString64Hex_(build.staticTextForLog);
+        build.responseFormatHash =
+            (responseFormat.is_object() && !responseFormat.empty()) ? hashString64Hex_(responseFormat.dump()) : "none";
+        build.staticImageManifestHash =
+            buildOpenAIStaticImageManifestHash_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        build.dynamicTextHash =
+            trimAscii(build.dynamicTextForLog).empty() ? "none" : hashString64Hex_(build.dynamicTextForLog);
+        build.dynamicImageManifestHash = hashJsonValueOrNone_(nlohmann::json::array({
+            {
+                { "order", 1 },
+                { "kind", "SNAPSHOT_IMAGE" },
+                { "detail", resolveOpenAIImageDetailForModel_(modelName) },
+                { "image_hash", hashString64Hex_(snapshotBare.empty() ? stripDataUrlPrefix(jpegBase64) : snapshotBare) }
+            }
+        }));
+        build.fullCacheablePrefixHash = hashString64Hex_(
+            std::string(kOpenAIVisionPromptRevision_) + "\n" +
+            build.staticTextForLog + "\n" +
+            build.staticResponseFormatForLog + "\n" +
+            build.staticImageManifestForLog
+        );
+        build.staticPrefixTokenEstimate = estimateOpenAITextTokensHeuristic_(
+            staticSystemText + "\n" +
+            staticUserText + "\n" +
+            fallbackSchemaText + "\n" +
+            temporalStaticText + "\n" +
+            staticReferenceLabelText + "\n" +
+            responseFormat.dump()
+        );
+        applyOpenAIVisionCacheFields_(build.body, modelName, build.cacheKey);
+        return build;
+    }
+
+    static std::string buildOpenAIGroupImageCacheVariant_(
+        bool hasFaceReferences,
+        bool hasNegativeReferences)
+    {
+        std::string variant = "group_image_job";
+        if (hasFaceReferences) variant += "_face";
+        if (hasNegativeReferences) variant += "_negative";
+        return variant;
+    }
+
+    static nlohmann::json buildOpenAIGroupImageResponseFormat_(
+        bool hasFaceReferences,
+        int inputCount,
+        const std::string& cacheVariant)
+    {
+        nlohmann::json resultProperties = {
+            { "camera_id", { { "type", "integer" } } },
+            { "region_id", makeNullableStringSchema_() },
+            { "answer", makeNullableStringSchema_() },
+            { "alert_condition", { { "type", "boolean" } } },
+            { "start_condition_step_id", makeNullableIntegerSchema_() },
+            { "alert_region_ids", makeNullableStringArraySchema_(16) }
+        };
+        nlohmann::json resultRequired = nlohmann::json::array({
+            "camera_id",
+            "region_id",
+            "answer",
+            "alert_condition",
+            "start_condition_step_id",
+            "alert_region_ids"
+        });
+        if (hasFaceReferences) {
+            resultProperties["faceid_match"] = { { "type", "boolean" } };
+            resultProperties["faceid_target_names"] = makeNullableStringArraySchema_(8);
+            resultRequired.push_back("faceid_match");
+            resultRequired.push_back("faceid_target_names");
+        }
+
+        nlohmann::json resultsSchema = {
+            { "type", "array" },
+            { "items", {
+                { "type", "object" },
+                { "additionalProperties", false },
+                { "properties", resultProperties },
+                { "required", resultRequired }
+            }}
+        };
+        if (inputCount > 0) {
+            resultsSchema["minItems"] = inputCount;
+            resultsSchema["maxItems"] = inputCount;
+        }
+
+        nlohmann::json alertCameraIdsSchema = {
+            { "type", "array" },
+            { "items", {
+                { "type", "integer" }
+            }}
+        };
+        if (inputCount > 0) {
+            alertCameraIdsSchema["maxItems"] = inputCount;
+        }
+
+        return nlohmann::json{
+            { "type", "json_schema" },
+            { "json_schema", {
+                { "name", "vision_" + cacheVariant },
+                { "strict", false },
+                { "schema", {
+                    { "type", "object" },
+                    { "additionalProperties", false },
+                    { "properties", {
+                        { "results", resultsSchema },
+                        { "alert_camera_ids", alertCameraIdsSchema }
+                    }},
+                    { "required", nlohmann::json::array({
+                        "results",
+                        "alert_camera_ids"
+                    }) }
+                }}
+            }}
+        };
+    }
+
+    static std::string buildOpenAIGroupImageFallbackSchemaText_(bool hasFaceReferences)
+    {
+        std::ostringstream prompt;
+        prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
+        prompt << "- results: array with one object per GROUP_IMAGE_INPUT_JSON item, in the same order\n";
+        prompt << "- each result object fields: camera_id integer, region_id string or null, answer string or null, alert_condition boolean, start_condition_step_id integer or null, alert_region_ids array of strings or null\n";
+        if (hasFaceReferences) {
+            prompt << "- each result object also includes: faceid_match boolean, faceid_target_names array of strings or null\n";
+        }
+        prompt << "- alert_camera_ids: array of integers whose corresponding results[i].alert_condition is true\n";
+        prompt << "- No markdown, no code fences, no extra keys.\n";
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIGroupImageStaticText_(
+        const VisionPromptSections_& sections,
+        const std::string& alertConditionText,
+        const std::string& startConditionText,
+        bool hasFaceReferences,
+        bool hasNegativeReferences)
+    {
+        std::ostringstream prompt;
+        prompt << "GROUP JOB MODE (AUTOMATION):\n";
+        prompt << "- You will receive MULTIPLE CCTV IMAGE snapshots from different cameras.\n";
+        prompt << "- Evaluate each input independently using only the paired metadata and image for that item.\n";
+        prompt << "- Return exactly one result entry per input item, preserving input order.\n";
+        prompt << "- Never imply temporal continuity across snapshots.\n\n";
+
+        if (!sections.basePrompt.empty()) {
+            prompt << "USER QUESTION:\n" << sections.basePrompt << "\n\n";
+        }
+
+        if (hasFaceReferences) {
+            prompt << "REFERENCE IMAGE LOGIC:\n";
+            prompt << "- Structured USER_REFERENCE_IMAGE inputs may include TARGET_ID and TARGET_NAME metadata.\n";
+            prompt << "- If any target identity is confidently present in an input image, set that result.faceid_match=true and result.alert_condition=true.\n";
+            prompt << "- Only claim a match when identity is clearly consistent.\n\n";
+        }
+
+        if (hasNegativeReferences) {
+            prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
+            prompt << "- NEGATIVE_REFERENCE_IMAGE inputs are examples of visual conditions that should reduce false positives.\n";
+            prompt << "- If an input strongly matches those references and no explicit severe risk is visible, keep that result.alert_condition=false.\n\n";
+        }
+
+        prompt << "ALERT CONDITION (controls each results[i].alert_condition):\n";
+        if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
+        else prompt << "(No alert condition provided. Keep alert_condition as false.)\n\n";
+
+        prompt << "START CONDITION (controls each results[i].start_condition_step_id):\n";
+        if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
+        else prompt << "(No start condition provided. Keep start_condition_step_id as null.)\n\n";
+
+        prompt << "GROUP OUTPUT RULES:\n";
+        prompt << "- Each image is preceded by GROUP_IMAGE_INPUT_JSON metadata.\n";
+        prompt << "- camera_id and region_id in results must echo the metadata for that item.\n";
+        prompt << "- Use region_id=\"full-frame\" when the metadata indicates full-frame analysis and no specific region id is provided.\n";
+        prompt << "- If alert evidence is visible inside drawn regions, include matching region ids in alert_region_ids.\n";
+        prompt << "- Keep answer short and in the same language as the user question.\n";
+        if (hasFaceReferences) {
+            prompt << "- If faceid_match is true, include matched target names when known.\n";
+        }
+        prompt << "- alert_camera_ids must contain only the camera_id values whose final result has alert_condition=true.\n";
+        return prompt.str();
+    }
+
+    static OpenAIVisionRequestBuild_ buildOpenAIGroupImageRequest_(
+        const std::string& modelName,
+        const VisionPromptSections_& sections,
+        const std::vector<GroupImageInput>& inputs,
+        const std::vector<FaceReferenceImage>& effectiveFaceReferences,
+        const std::vector<NegativeReferenceImage>& effectiveNegativeReferences,
+        const std::string& alertConditionText,
+        const std::string& startConditionText)
+    {
+        OpenAIVisionRequestBuild_ build;
+        const std::vector<FaceReferenceImage> canonicalFaceReferences =
+            buildEffectiveFaceReferences_(effectiveFaceReferences);
+        const std::vector<NegativeReferenceImage> canonicalNegativeReferences =
+            buildEffectiveNegativeReferences_(effectiveNegativeReferences);
+        OpenAIVisionPromptOptions_ options;
+        options.modality = OpenAIVisionModality_::Image;
+        options.jobMode = true;
+        options.hasFaceReferences = !canonicalFaceReferences.empty();
+        options.hasNegativeReferences = !canonicalNegativeReferences.empty();
+
+        const std::string cacheVariant = buildOpenAIGroupImageCacheVariant_(
+            options.hasFaceReferences,
+            options.hasNegativeReferences
+        );
+        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticUserText = buildOpenAIGroupImageStaticText_(
+            sections,
+            alertConditionText,
+            startConditionText,
+            options.hasFaceReferences,
+            options.hasNegativeReferences
+        );
+        const nlohmann::json responseFormat = supportsOpenAIJsonSchemaResponseFormat_(modelName)
+            ? buildOpenAIGroupImageResponseFormat_(
+                options.hasFaceReferences,
+                static_cast<int>(inputs.size()),
+                cacheVariant)
+            : nlohmann::json();
+        const std::string fallbackSchemaText =
+            responseFormat.is_object() && !responseFormat.empty()
+                ? std::string()
+                : buildOpenAIGroupImageFallbackSchemaText_(options.hasFaceReferences);
+        const std::string staticReferenceLabelText =
+            buildOpenAIStaticReferenceLabelText_(canonicalFaceReferences, canonicalNegativeReferences);
+
+        const std::string faceRefsHash = buildFaceReferenceCacheHash_(canonicalFaceReferences);
+        const std::string negativeRefsHash = buildNegativeReferenceCacheHash_(canonicalNegativeReferences);
+
+        nlohmann::json messages = nlohmann::json::array();
+        messages.push_back({
+            { "role", "system" },
+            { "content", staticSystemText }
+        });
+        pushOpenAIUserTextMessageIfAny_(messages, staticUserText);
+        pushOpenAIUserTextMessageIfAny_(messages, fallbackSchemaText);
+
+        nlohmann::json staticReferenceContent = nlohmann::json::array();
+        if (options.hasFaceReferences) {
+            appendOpenAIFaceReferenceContent_(staticReferenceContent, canonicalFaceReferences, modelName);
+        }
+        if (options.hasNegativeReferences) {
+            appendOpenAINegativeReferenceContent_(staticReferenceContent, canonicalNegativeReferences, modelName);
+        }
+        pushOpenAIUserContentMessageIfAny_(messages, staticReferenceContent);
+
+        nlohmann::json dynamicContent = nlohmann::json::array();
+        std::vector<std::string> dynamicTextPartsForLog;
+        nlohmann::json dynamicImageManifest = nlohmann::json::array();
+        int dynamicImageOrder = 1;
+        const std::string inputOrderText =
+            "INPUT ITEM ORDER:\n"
+            "- Each image is paired with the immediately preceding GROUP_IMAGE_INPUT_JSON metadata.\n"
+            "- Return results in the same order as the incoming items.\n";
+        dynamicContent.push_back(makeOpenAITextContentPart_(inputOrderText));
+        build.dynamicPromptBytes += inputOrderText.size();
+        dynamicTextPartsForLog.push_back(inputOrderText);
+
+        for (const auto& in : inputs) {
+            if (trimAscii(in.jpegBase64).empty()) continue;
+
+            nlohmann::json inputMeta = {
+                { "camera_id", in.cameraId },
+                { "region_id", in.regionId.empty() ? "full-frame" : in.regionId },
+                { "full_frame", in.fullFrame }
+            };
+            if (in.snapshotTsUtcIso.empty()) {
+                inputMeta["snapshot_ts_utc"] = nullptr;
+            }
+            else {
+                inputMeta["snapshot_ts_utc"] = in.snapshotTsUtcIso;
+            }
+            if (!trimAscii(in.cameraName).empty()) {
+                inputMeta["camera_name"] = in.cameraName;
+            }
+            if (!trimAscii(in.regionLabel).empty()) {
+                inputMeta["region_label"] = in.regionLabel;
+            }
+            if (!trimAscii(in.injectedInput).empty() && in.injectedInput != "__MISSING_INPUT__") {
+                inputMeta["input_from_previous_step"] = in.injectedInput;
+            }
+
+            const std::string metaText = "GROUP_IMAGE_INPUT_JSON: " + inputMeta.dump();
+            const std::string bare = stripDataUrlPrefix(in.jpegBase64);
+            const std::string normalizedBare =
+                normalizeOpenAIFrameJpegBase64ForModel_(bare, modelName);
+            const std::string actualBare = normalizedBare.empty() ? bare : normalizedBare;
+            dynamicContent.push_back(makeOpenAITextContentPart_(metaText));
+            dynamicContent.push_back(
+                makeOpenAIFrameImageContentFromBareJpeg(bare, modelName)
+            );
+            build.dynamicPromptBytes += metaText.size();
+            dynamicTextPartsForLog.push_back(metaText);
+            dynamicImageManifest.push_back({
+                { "order", dynamicImageOrder++ },
+                { "kind", "GROUP_IMAGE_INPUT" },
+                { "detail", resolveOpenAIImageDetailForModel_(modelName) },
+                { "camera_id", in.cameraId },
+                { "region_id", in.regionId.empty() ? "full-frame" : in.regionId },
+                { "full_frame", in.fullFrame },
+                { "image_hash", hashString64Hex_(actualBare) }
+            });
+        }
+        pushOpenAIUserContentMessageIfAny_(messages, dynamicContent);
+
+        build.staticPromptBytes =
+            staticSystemText.size() +
+            staticUserText.size() +
+            fallbackSchemaText.size() +
+            staticReferenceLabelText.size() +
+            responseFormat.dump().size();
+        build.cacheVariant = cacheVariant;
+        build.temporalPlanHash = "none";
+        build.faceRefsHash = faceRefsHash;
+        build.negativeRefsHash = negativeRefsHash;
+        build.cacheKey = buildOpenAIVisionCacheKey_(
+            modelName,
+            cacheVariant,
+            staticSystemText,
+            staticUserText + "\n" + fallbackSchemaText,
+            std::string(),
+            faceRefsHash,
+            negativeRefsHash,
+            responseFormat
+        );
+        build.promptCacheRetention = buildOpenAIPromptCacheRetentionForLog_(modelName, build.cacheKey);
+
+        build.body = {
+            { "model", modelName },
+            { "messages", messages }
+        };
+        if (responseFormat.is_object() && !responseFormat.empty()) {
+            build.body["response_format"] = responseFormat;
+        }
+        build.promptTextForLog = buildOpenAIPromptTextForLog_(messages);
+        build.staticTextForLog = buildOpenAITextBlocksForLog_({
+            { "system", staticSystemText },
+            { "user", staticUserText },
+            { "user", fallbackSchemaText }
+        });
+        build.staticResponseFormatForLog =
+            (responseFormat.is_object() && !responseFormat.empty())
+                ? (std::string("RESPONSE_FORMAT_JSON:\n") + responseFormat.dump())
+                : std::string();
+        build.staticImageManifestForLog =
+            buildOpenAIStaticImageManifestForLog_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        {
+            std::ostringstream dynamicTextCombined;
+            bool wroteAny = false;
+            for (const auto& part : dynamicTextPartsForLog) {
+                const std::string trimmedPart = trimAscii(part);
+                if (trimmedPart.empty()) continue;
+                if (wroteAny) dynamicTextCombined << "\n";
+                dynamicTextCombined << trimmedPart;
+                wroteAny = true;
+            }
+            build.dynamicTextForLog = buildOpenAITextBlocksForLog_({
+                { "user", dynamicTextCombined.str() }
+            });
+        }
+        build.staticTextHash =
+            trimAscii(build.staticTextForLog).empty() ? "none" : hashString64Hex_(build.staticTextForLog);
+        build.responseFormatHash =
+            (responseFormat.is_object() && !responseFormat.empty()) ? hashString64Hex_(responseFormat.dump()) : "none";
+        build.staticImageManifestHash =
+            buildOpenAIStaticImageManifestHash_(canonicalFaceReferences, canonicalNegativeReferences, modelName);
+        build.dynamicTextHash =
+            trimAscii(build.dynamicTextForLog).empty() ? "none" : hashString64Hex_(build.dynamicTextForLog);
+        build.dynamicImageManifestHash = hashJsonValueOrNone_(dynamicImageManifest);
+        build.fullCacheablePrefixHash = hashString64Hex_(
+            std::string(kOpenAIVisionPromptRevision_) + "\n" +
+            build.staticTextForLog + "\n" +
+            build.staticResponseFormatForLog + "\n" +
+            build.staticImageManifestForLog
+        );
+        build.staticPrefixTokenEstimate = estimateOpenAITextTokensHeuristic_(
+            staticSystemText + "\n" +
+            staticUserText + "\n" +
+            fallbackSchemaText + "\n" +
+            staticReferenceLabelText + "\n" +
+            responseFormat.dump()
+        );
+        applyOpenAIVisionCacheFields_(build.body, modelName, build.cacheKey);
+        return build;
     }
 
     static bool parseStartConditionStepIdField(
@@ -14962,6 +18432,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     int modelInputFps,
     int expectedWindowSeconds,
     int runningResolution,
+    const std::string& videoPackagingMode,
     int& outPromptTokens,
     int& outOutputTokens,
     int& outTotalTokens,
@@ -15009,15 +18480,12 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     hit.segmentStartTs = segmentStartForPrompt;
     hit.segmentEndTs = segmentEndForPrompt;
 
-    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
+    const VisionPromptSections_ promptSections = parseVisionPromptSections_(userQuestion);
     const std::vector<FaceReferenceImage> effectiveFaceReferences =
         buildEffectiveFaceReferences_(faceReferences);
     const bool hasStructuredFaceReferences = !effectiveFaceReferences.empty();
-    const bool hasLegacySingleFaceReference =
-        !uploadedImageBase64.empty() && !hasStructuredFaceReferences;
     const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
         buildEffectiveNegativeReferences_(negativeReferences);
-    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
     const std::vector<std::string> fallbackFaceTargetNames =
         collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
     const bool cameraStyleFlow =
@@ -15080,274 +18548,184 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         hit.segmentStartTs = segmentStartForPrompt;
         hit.segmentEndTs = segmentEndForPrompt;
 
-        std::string promptStr;
-        {
-            std::ostringstream prompt;
-            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
-            prompt << "User question: \"" << userQuestion << "\".\n\n";
-            prompt << "You will receive ONE CCTV video segment as an ORDERED sequence of frames.\n";
-            prompt << "Each frame is preceded by FRAME_META_JSON with frame_index, timestamp_name, and frame_timestamp_in_segment.\n";
-            prompt << "- frame_index is the stable ordinal of the sampled frame in this batch.\n";
-            prompt << "- timestamp_name is the real local camera/EXE timestamp for that frame.\n";
-            prompt << "- frame_timestamp_in_segment is the elapsed time from the start of this segment.\n";
-            prompt << "This segment covers: " << segmentStartForPrompt << " to " << segmentEndForPrompt << ".\n";
-            prompt << "Treat this segment range as the authoritative absolute timeline for this batch.\n\n";
-            prompt << "Frames were sampled at approximately " << modelInputFps << " FPS for this model.\n\n";
-
-            prompt << "DIRECT CAMERA/CHAT VIDEO MODE:\n";
-            prompt << "- This inference can run in direct camera monitoring or ad-hoc video analysis.\n";
-            prompt << "- Follow RESPONSE FORMAT exactly.\n\n";
-
-            prompt << "LANGUAGE RULES:\n";
-            prompt << "- Detect the language of the user question.\n";
-            prompt << "- All JSON field names must remain in English exactly as specified.\n";
-            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
-            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
-
-            prompt << "IMPORTANT CONTEXT RULE:\n";
-            prompt << "- The analyzed segment is only PART of the full requested time window.\n";
-            prompt << "- NEVER imply your answer covers the entire requested window.\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this frame sequence for NEW observations in this batch.\n";
-                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
-                prompt << "- answer may mention authoritative prior state when needed, but alert_condition must reflect only what this batch itself shows.\n";
-                prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
-            }
-            else {
-                prompt << "- Refer ONLY to what is visible in these frames.\n\n";
-            }
-
-            if (hasStructuredFaceReferences) {
-                prompt << "REFERENCE IMAGE LOGIC:\n";
-                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
-                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
-                prompt << "- Search these identities in the CCTV frames conservatively.\n";
-                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
-                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
-            }
-            else if (hasLegacySingleFaceReference) {
-                prompt << "REFERENCE IMAGE LOGIC:\n";
-                prompt << "- Sometimes the user provides ONE reference image before the CCTV frames. ";
-                prompt << "This image is tagged as USER_REFERENCE_IMAGE.\n";
-                prompt << "- Whenever a reference image is present, it is ALWAYS a close-up selfie or a crop of a single HUMAN FACE.\n";
-                prompt << "- Treat this reference face as the target person.\n";
-                prompt << "- Your job is to check if a VERY SIMILAR FACE appears in the frame sequence.\n";
-                prompt << "INSTRUCTIONS FOR FACE MATCHING:\n";
-                prompt << "1. First, analyze the USER_REFERENCE_IMAGE and list distinct facial features.\n";
-                prompt << "2. For each CCTV frame, analyze every visible face.\n";
-                prompt << "3. Compare hair/baldness, hairstyle, hair color, ethnicity, gender, age, facial hair style/color.\n";
-                prompt << "4. If face is not clearly visible, do not classify.\n";
-                prompt << "5. If not very confident, do not classify positively.\n\n";
-            }
-            if (hasNegativeReferences) {
-                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
-                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
-                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
-                prompt << "- If current frames strongly match those references and no explicit severe risk is visible, keep alert_condition=false.\n";
-                prompt << "- Use this only to reduce false positives.\n\n";
-            }
-
-            prompt << "CONDITIONS TO EVALUATE:\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this frame sequence for current-batch evidence.\n";
-                prompt << "- For alert_condition, use ONLY current-batch evidence. Use TEMPORAL_RUNTIME_INPUT_JSON only for explanation, identity continuity, and structured temporal fields.\n";
-                prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
-                prompt << "- If not confident about new observations, keep booleans false.\n\n";
-            }
-            else {
-                prompt << "- Evaluate the two conditions below using ONLY this frame sequence.\n";
-                prompt << "- If not confident, keep booleans false.\n\n";
-            }
-
-            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
-            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
-            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false unless explicit strong evidence for user's request.)\n\n";
-
-            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
-            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
-            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
-
-            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
-            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
-            prompt << "1) \"answer\": string\n";
-            prompt << "2) \"alert_condition\": boolean\n";
-            prompt << "3) \"start_condition_step_id\": false OR integer\n";
-            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
-                prompt << "6) \"observations\": array (OPTIONAL)\n";
-                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
-            }
-            if (hasStructuredFaceReferences) {
-                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
-                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
-            }
-            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n";
-            if (!cameraStyleFlow) {
-                prompt << "For direct chat answers, if the answer describes visible content relevant to the question, include at least one supporting timestamp in \"detection_time_in_video\".\n";
-            }
-            prompt << "\n";
-
-            prompt << "RULES:\n";
-            if (hasNegativeReferences) {
-                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
-            }
-            prompt << "- If alert_condition=true and region overlays are visible, include matching region ids in \"alert_region_ids\".\n";
-            if (!cameraStyleFlow) {
-                prompt << "- In direct chat mode, whenever the answer mentions a relevant visible person/object/activity, \"detection_time_in_video\" is REQUIRED.\n";
-                prompt << "- Use the best one or more timestamps that support the main statement in the answer.\n";
-            }
-            if (hasTemporalRuntimeHint) {
-                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
-                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
-                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
-                prompt << "- For frame-specific video evidence, use frame_index as the primary reference and include frame_timestamp_in_segment whenever possible.\n";
-                prompt << "- If you include timestamp_name, copy it exactly from FRAME_META_JSON and never invent or reformat it.\n";
-                prompt << "- Do not invent ts_utc from frame metadata; the backend will resolve the absolute time.\n";
-                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
-            }
-            if (hasStructuredFaceReferences) {
-                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
-                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
-                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\", optional \"detection_time_in_video\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                prompt << ".\n";
-            }
-            else {
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", and optional \"detection_time_in_video\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                prompt << ".\n";
-            }
-            prompt << "- No Markdown.\n";
-            prompt << "- Output RAW JSON only.\n";
-
-            promptStr = prompt.str();
-        }
-
-        Logger::instance().logDebug(
+        OpenAIVisionRequestBuild_ requestBuild = buildOpenAIVideoRequest_(
+            modelName,
+            promptSections,
+            alertConditionText,
+            startConditionText,
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            modelInputFps,
+            frames,
+            effectiveFaceReferences,
+            effectiveNegativeReferences,
+            uploadedImageBase64,
+            videoPackagingMode,
+            /*jobMode*/ false,
+            cameraStyleFlow
+        );
+        logOpenAIVisionPromptBuild_(
             camLogId,
-            "callOpenAIVisionVideoSegment_: OPENAI PROMPT (model=" + modelName +
-            ", frames=" + std::to_string(frames.size()) +
-            ", expected_window_s=" + std::to_string(expectedWindowSeconds) + ")\n" + promptStr
+            "callOpenAIVisionVideoSegment_",
+            modelName,
+            requestBuild
         );
 
-        nlohmann::json content = nlohmann::json::array();
-        content.push_back({ { "type", "text" }, { "text", promptStr } });
-
-        if (hasStructuredFaceReferences) {
-            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
-        }
-        else if (hasLegacySingleFaceReference) {
-            content.push_back({
-                { "type", "text" },
-                { "text", "USER_REFERENCE_IMAGE: target FACE of the person to search in the CCTV video." }
-            });
-            content.push_back(makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(uploadedImageBase64)));
-        }
-        if (hasNegativeReferences) {
-            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
-        }
-
-        for (const auto& frame : frames) {
-            content.push_back({
-                { "type", "text" },
-                { "text", buildPromptVideoFrameMetaText_(frame) }
-            });
-            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, modelName));
-        }
-
-        nlohmann::json body = {
-            { "model", modelName },
-            { "messages", nlohmann::json::array({
-                {
-                    { "role", "user" },
-                    { "content", content }
-                }
-            })}
-        };
+        nlohmann::json body = requestBuild.body;
         applyOpenAITemperatureField_(body, modelName, 0.0);
-        applyOpenAITokenLimitField_(body, modelName, 4000);
+        const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, 4000);
+        const int secondEffectiveLimit = std::min(6000, firstEffectiveLimit + 1200);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
-        const auto coreRequestStart = std::chrono::steady_clock::now();
 
         std::string rawResp;
-        try {
-            rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                openAiApiKey,
-                body,
-                []() { MaybeNotifyFirstRetry(); },
-                requestCoreChatPriority,
-                shouldAbort,
-                requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
-                camLogId
-            );
-        }
-        catch (const std::exception& e) {
+        OpenAITextObjectResponse_ parsedResponse;
+        auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            nlohmann::json reqBody = body;
+            applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
+            const auto coreRequestStart = std::chrono::steady_clock::now();
+
+            try {
+                rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                    openAiApiKey,
+                    reqBody,
+                    []() { MaybeNotifyFirstRetry(); },
+                    requestCoreChatPriority,
+                    shouldAbort,
+                    requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
+                    camLogId
+                );
+            }
+            catch (const std::exception& e) {
+                if (useCoreModel) {
+                    const auto latencyMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - coreRequestStart).count();
+                    Logger::instance().logDebug(
+                        camLogId,
+                        "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=error model=" +
+                        modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                        " attempt=" + std::to_string(attemptNo) +
+                        " latency_ms=" + std::to_string(latencyMs)
+                    );
+                }
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionVideoSegment_: httpPostJsonOpenAI exception (attempt=" +
+                        std::to_string(attemptNo) + "): " + e.what()
+                );
+                emitAgentApiErrorEvent_(
+                    this,
+                    segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                    errorSource,
+                    "http_post",
+                    modelName,
+                    e.what(),
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "segment_start_ts", segmentStartForPrompt },
+                        { "segment_end_ts", segmentEndForPrompt },
+                        { "expected_window_seconds", expectedWindowSeconds }
+                    }
+                );
+                return false;
+            }
+
             if (useCoreModel) {
                 const auto latencyMs =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - coreRequestStart).count();
                 Logger::instance().logDebug(
                     camLogId,
-                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=error model=" +
+                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=success model=" +
                     modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                    " attempt=" + std::to_string(attemptNo) +
                     " latency_ms=" + std::to_string(latencyMs)
                 );
             }
-            Logger::instance().logDebug(camLogId,
-                std::string("callOpenAIVisionVideoSegment_: httpPostJsonOpenAI exception: ") + e.what());
+
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegment_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
+                    sanitizeModelRawRespForLog_(rawResp)
+            );
+
+            parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            if (!parsedResponse.hasValidResponseJson) {
+                Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON response");
+                emitAgentApiErrorEvent_(
+                    this,
+                    segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                    errorSource,
+                    "invalid_json_response",
+                    modelName,
+                    "OpenAI returned invalid JSON response",
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "segment_start_ts", segmentStartForPrompt },
+                        { "segment_end_ts", segmentEndForPrompt }
+                    }
+                );
+                return false;
+            }
+
+            outPromptTokens += parsedResponse.usageStats.promptTokens;
+            outOutputTokens += parsedResponse.usageStats.outputTokens;
+            outTotalTokens += parsedResponse.usageStats.totalTokens;
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegment_: prompt cache usage model=" + modelName +
+                " variant=" + requestBuild.cacheVariant +
+                " cache_key=" + requestBuild.cacheKey +
+                " attempt=" + std::to_string(attemptNo) +
+                " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_prompt_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
+                " output_tokens=" + std::to_string(parsedResponse.usageStats.outputTokens)
+            );
+            return true;
+        };
+
+        if (!postAndParse(firstEffectiveLimit, 1)) {
+            return hit;
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse) &&
+            secondEffectiveLimit > firstEffectiveLimit)
+        {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegment_: finish_reason=length with incomplete JSON; retrying once with higher token limit " +
+                    std::to_string(secondEffectiveLimit)
+            );
+            if (!postAndParse(secondEffectiveLimit, 2)) {
+                return hit;
+            }
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse)) {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegment_: finish_reason=length persisted after retry; giving up for this inference"
+            );
             emitAgentApiErrorEvent_(
                 this,
                 segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
                 errorSource,
-                "http_post",
+                "finish_reason_length",
                 modelName,
-                e.what(),
+                "OpenAI returned finish_reason=length before completing a valid JSON object",
                 nlohmann::json{
                     { "segment_start_ts", segmentStartForPrompt },
-                    { "segment_end_ts", segmentEndForPrompt },
-                    { "expected_window_seconds", expectedWindowSeconds }
+                    { "segment_end_ts", segmentEndForPrompt }
                 }
             );
             return hit;
         }
-        if (useCoreModel) {
-            const auto latencyMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - coreRequestStart).count();
-            Logger::instance().logDebug(
-                camLogId,
-                "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegment_ status=success model=" +
-                modelName + " camera_id=" + std::to_string(segment.cameraId) +
-                " latency_ms=" + std::to_string(latencyMs)
-            );
-        }
 
-        Logger::instance().logDebug(camLogId, "callOpenAIVisionVideoSegment_: rawResp = " + rawResp);
-
-        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
-        if (respJson.is_discarded() || !respJson.is_object()) {
-            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON response");
-            emitAgentApiErrorEvent_(
-                this,
-                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
-                errorSource,
-                "invalid_json_response",
-                modelName,
-                "OpenAI returned invalid JSON response"
-            );
-            return hit;
-        }
-
-        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
-
-        std::string text = extractOpenAITextFromResponse(respJson);
-        if (text.empty()) {
+        if (parsedResponse.text.empty()) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: empty text");
             emitAgentApiErrorEvent_(
                 this,
@@ -15360,8 +18738,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             return hit;
         }
 
-        std::string jsonSlice;
-        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+        if (!parsedResponse.hasJsonObjectSlice) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: no JSON braces");
             emitAgentApiErrorEvent_(
                 this,
@@ -15374,8 +18751,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             return hit;
         }
 
-        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
-        if (!res.is_object()) {
+        if (!parsedResponse.hasValidJsonObject) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON object");
             emitAgentApiErrorEvent_(
                 this,
@@ -15387,6 +18763,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             );
             return hit;
         }
+
+        const nlohmann::json& res = parsedResponse.jsonObject;
 
         parseStructuredVisionResponseIntoHit_(
             res,
@@ -15475,6 +18853,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
     int modelInputFps,
     int expectedWindowSeconds,
     int runningResolution,
+    const std::string& videoPackagingMode,
     int& outPromptTokens,
     int& outOutputTokens,
     int& outTotalTokens)
@@ -15523,9 +18902,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
     const bool hasFaceReferences = !effectiveFaceReferences.empty();
     const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
         buildEffectiveNegativeReferences_(negativeReferences);
-    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
-    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
-    const bool hasCrossCameraWatchlist = promptHasCrossCameraWatchlist_(userQuestion);
+    const VisionPromptSections_ promptSections = parseVisionPromptSections_(userQuestion);
     const std::vector<std::string> fallbackFaceTargetNames =
         collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
     if (faceReferences.empty()) {
@@ -15600,263 +18977,184 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
         hit.segmentStartTs = segmentStartForPrompt;
         hit.segmentEndTs = segmentEndForPrompt;
 
-        std::string promptStr;
-        {
-            std::ostringstream prompt;
-            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
-            prompt << "User question: \"" << userQuestion << "\".\n\n";
-            prompt << "You will receive ONE CCTV video segment as an ORDERED sequence of frames.\n";
-            prompt << "Each frame is preceded by FRAME_META_JSON with frame_index, timestamp_name, and frame_timestamp_in_segment.\n";
-            prompt << "- frame_index is the stable ordinal of the sampled frame in this batch.\n";
-            prompt << "- timestamp_name is the real local camera/EXE timestamp for that frame.\n";
-            prompt << "- frame_timestamp_in_segment is the elapsed time from the start of this segment.\n";
-            prompt << "This segment covers: " << segmentStartForPrompt << " to " << segmentEndForPrompt << ".\n";
-            prompt << "Treat this segment range as the authoritative absolute timeline for this batch.\n\n";
-            prompt << "Frames were sampled at approximately " << modelInputFps << " FPS for this model.\n\n";
-
-            prompt << "JOB STEP MODE (AUTOMATION):\n";
-            prompt << "- This inference is executed inside an automated Job Step.\n";
-            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
-            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
-
-            prompt << "LANGUAGE RULES:\n";
-            prompt << "- Detect the language of the user question.\n";
-            prompt << "- All JSON field names must remain in English exactly as specified.\n";
-            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
-            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
-
-            prompt << "IMPORTANT CONTEXT RULE:\n";
-            prompt << "- The analyzed segment is only PART of the full requested time window.\n";
-            prompt << "- NEVER imply your answer covers the entire requested window.\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this frame sequence for NEW observations in this batch.\n";
-                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
-                prompt << "- answer may mention authoritative prior state when needed, but alert_condition must reflect only what this batch itself shows.\n";
-                prompt << "- Do not claim anything outside this segment unless it is explicitly supported by TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
-            }
-            else {
-                prompt << "- Refer ONLY to what is visible in these frames.\n\n";
-            }
-
-            if (hasFaceReferences) {
-                prompt << "REFERENCE IMAGE LOGIC:\n";
-                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
-                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
-                prompt << "- Search these identities in the CCTV frames conservatively.\n";
-                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
-                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
-            }
-            if (hasNegativeReferences) {
-                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
-                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
-                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
-                prompt << "- If current frames strongly match those references and no explicit severe risk is visible, keep alert_condition=false.\n";
-                prompt << "- Use this only to reduce false positives.\n\n";
-            }
-
-            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this frame sequence for current-batch evidence.\n";
-                prompt << "- For alert_condition, use ONLY current-batch evidence. Use TEMPORAL_RUNTIME_INPUT_JSON only for explanation, identity continuity, and structured temporal fields.\n";
-                prompt << "- For start_condition_step_id, prefer evidence visible in this batch unless the condition explicitly depends on prior temporal state.\n";
-                prompt << "- If not confident about new observations, keep booleans false.\n\n";
-            }
-            else {
-                prompt << "- Evaluate the two conditions below using ONLY this frame sequence.\n";
-                prompt << "- If not confident, keep booleans false.\n\n";
-            }
-
-            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
-            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
-            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false.)\n\n";
-
-            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
-            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
-            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
-
-            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
-            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
-            prompt << "1) \"answer\": string\n";
-            prompt << "2) \"alert_condition\": boolean\n";
-            prompt << "3) \"start_condition_step_id\": false OR integer\n";
-            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
-                prompt << "6) \"observations\": array (OPTIONAL)\n";
-                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
-            }
-            if (hasFaceReferences) {
-                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
-                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
-            }
-            if (hasCrossCameraWatchlist) {
-                prompt << "10) \"cross_camera_watchlist_matches\": array (OPTIONAL; include when the current batch strongly matches a shared watchlist entry, even if local alert_condition remains false)\n";
-            }
-            prompt << "Optional: \"detection_time_in_video\": array of \"MM:SS\" timestamps.\n\n";
-
-            prompt << "RULES:\n";
-            if (hasNegativeReferences) {
-                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
-            }
-            prompt << "- If alert_condition=true and region overlays are visible, include matching region ids in \"alert_region_ids\".\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
-                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
-                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
-                prompt << "- For frame-specific video evidence, use frame_index as the primary reference and include frame_timestamp_in_segment whenever possible.\n";
-                prompt << "- If you include timestamp_name, copy it exactly from FRAME_META_JSON and never invent or reformat it.\n";
-                prompt << "- Do not invent ts_utc from frame metadata; the backend will resolve the absolute time.\n";
-                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
-            }
-            if (hasCrossCameraWatchlist) {
-                prompt << "- Evaluate TEMPORAL_RUNTIME_INPUT_JSON.cross_camera_watchlist independently from the local alert_condition and start condition.\n";
-                prompt << "- If a watchlist entry provides target_entity, entities, or search_prompt, use those fields as the authoritative description of what to look for.\n";
-                prompt << "- target_entity.entity_id and source_entity_id identify the source-camera target that triggered the hunt; they are not the local entity_id for this camera.\n";
-                prompt << "- If TEMPORAL_RUNTIME_INPUT_JSON contains cross_camera_watchlist and the current batch strongly matches one or more hunt entries, include cross_camera_watchlist_matches even when local alert_condition stays false.\n";
-                prompt << "- Allow for normal cross-camera differences in angle, lighting, background, scale, and pose when comparing the current batch with the shared target metadata.\n";
-                prompt << "- Each cross_camera_watchlist_matches item must be a JSON object with hunt_id, matched_entity_id, confidence, and optional reason.\n";
-                prompt << "- matched_entity_id must be the local entity_id from this camera when available; never copy target_entity.entity_id into matched_entity_id unless the same local ID is genuinely in use here.\n";
-            }
-            if (hasFaceReferences) {
-                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
-                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
-                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\", optional \"detection_time_in_video\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                if (hasCrossCameraWatchlist) {
-                    prompt << ", optional \"cross_camera_watchlist_matches\"";
-                }
-                prompt << ".\n";
-            }
-            else {
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", and optional \"detection_time_in_video\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                if (hasCrossCameraWatchlist) {
-                    prompt << ", optional \"cross_camera_watchlist_matches\"";
-                }
-                prompt << ".\n";
-            }
-            prompt << "- No Markdown.\n";
-            prompt << "- Output RAW JSON only.\n";
-
-            promptStr = prompt.str();
-        }
-
-        Logger::instance().logDebug(
+        OpenAIVisionRequestBuild_ requestBuild = buildOpenAIVideoRequest_(
+            modelName,
+            promptSections,
+            alertConditionText,
+            startConditionText,
+            segmentStartForPrompt,
+            segmentEndForPrompt,
+            modelInputFps,
+            frames,
+            effectiveFaceReferences,
+            effectiveNegativeReferences,
+            /*uploadedImageBase64*/ std::string(),
+            videoPackagingMode,
+            /*jobMode*/ true,
+            /*cameraStyleFlow*/ true
+        );
+        logOpenAIVisionPromptBuild_(
             camLogId,
-            "callOpenAIVisionVideoSegmentJOB_: OPENAI PROMPT (model=" + modelName +
-            ", frames=" + std::to_string(frames.size()) +
-            ", expected_window_s=" + std::to_string(expectedWindowSeconds) + ")\n" + promptStr
+            "callOpenAIVisionVideoSegmentJOB_",
+            modelName,
+            requestBuild
         );
 
-        nlohmann::json content = nlohmann::json::array();
-        content.push_back({ { "type", "text" }, { "text", promptStr } });
-        if (hasFaceReferences) {
-            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
-        }
-        if (hasNegativeReferences) {
-            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
-        }
-
-        for (const auto& frame : frames) {
-            content.push_back({
-                { "type", "text" },
-                { "text", buildPromptVideoFrameMetaText_(frame) }
-            });
-            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(frame.jpegBase64, modelName));
-        }
-
-        nlohmann::json body = {
-            { "model", modelName },
-            { "messages", nlohmann::json::array({
-                {
-                    { "role", "user" },
-                    { "content", content }
-                }
-            })}
-        };
+        nlohmann::json body = requestBuild.body;
         applyOpenAITemperatureField_(body, modelName, 0.0);
-        applyOpenAITokenLimitField_(body, modelName, 4000);
+        const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, 4000);
+        const int secondEffectiveLimit = std::min(6000, firstEffectiveLimit + 1200);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
-        const auto coreRequestStart = std::chrono::steady_clock::now();
 
         std::string rawResp;
-        try {
-            rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                openAiApiKey,
-                body,
-                []() { MaybeNotifyFirstRetry(); },
-                false,
-                {},
-                "background_video_segment_job",
-                camLogId
-            );
-        }
-        catch (const std::exception& e) {
+        OpenAITextObjectResponse_ parsedResponse;
+        auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            nlohmann::json reqBody = body;
+            applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
+            const auto coreRequestStart = std::chrono::steady_clock::now();
+
+            try {
+                rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                    openAiApiKey,
+                    reqBody,
+                    []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "background_video_segment_job",
+                    camLogId
+                );
+            }
+            catch (const std::exception& e) {
+                if (useCoreModel) {
+                    const auto latencyMs =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - coreRequestStart).count();
+                    Logger::instance().logDebug(
+                        camLogId,
+                        "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=error model=" +
+                        modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                        " attempt=" + std::to_string(attemptNo) +
+                        " latency_ms=" + std::to_string(latencyMs)
+                    );
+                }
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionVideoSegmentJOB_: httpPostJsonOpenAI exception (attempt=" +
+                        std::to_string(attemptNo) + "): " + e.what()
+                );
+                emitAgentApiErrorEvent_(
+                    this,
+                    segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                    "job_or_camera_video",
+                    "http_post",
+                    modelName,
+                    e.what(),
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "segment_start_ts", segmentStartForPrompt },
+                        { "segment_end_ts", segmentEndForPrompt },
+                        { "expected_window_seconds", expectedWindowSeconds }
+                    }
+                );
+                return false;
+            }
+
             if (useCoreModel) {
                 const auto latencyMs =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - coreRequestStart).count();
                 Logger::instance().logDebug(
                     camLogId,
-                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=error model=" +
+                    "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=success model=" +
                     modelName + " camera_id=" + std::to_string(segment.cameraId) +
+                    " attempt=" + std::to_string(attemptNo) +
                     " latency_ms=" + std::to_string(latencyMs)
                 );
             }
-            Logger::instance().logDebug(camLogId,
-                std::string("callOpenAIVisionVideoSegmentJOB_: httpPostJsonOpenAI exception: ") + e.what());
+
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegmentJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
+                    sanitizeModelRawRespForLog_(rawResp)
+            );
+
+            parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            if (!parsedResponse.hasValidResponseJson) {
+                Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON response");
+                emitAgentApiErrorEvent_(
+                    this,
+                    segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
+                    "job_or_camera_video",
+                    "invalid_json_response",
+                    modelName,
+                    "OpenAI returned invalid JSON response",
+                    nlohmann::json{
+                        { "attempt", attemptNo },
+                        { "segment_start_ts", segmentStartForPrompt },
+                        { "segment_end_ts", segmentEndForPrompt }
+                    }
+                );
+                return false;
+            }
+
+            outPromptTokens += parsedResponse.usageStats.promptTokens;
+            outOutputTokens += parsedResponse.usageStats.outputTokens;
+            outTotalTokens += parsedResponse.usageStats.totalTokens;
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegmentJOB_: prompt cache usage model=" + modelName +
+                " variant=" + requestBuild.cacheVariant +
+                " cache_key=" + requestBuild.cacheKey +
+                " attempt=" + std::to_string(attemptNo) +
+                " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_prompt_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
+                " output_tokens=" + std::to_string(parsedResponse.usageStats.outputTokens)
+            );
+            return true;
+        };
+
+        if (!postAndParse(firstEffectiveLimit, 1)) {
+            return hit;
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse) &&
+            secondEffectiveLimit > firstEffectiveLimit)
+        {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegmentJOB_: finish_reason=length with incomplete JSON; retrying once with higher token limit " +
+                    std::to_string(secondEffectiveLimit)
+            );
+            if (!postAndParse(secondEffectiveLimit, 2)) {
+                return hit;
+            }
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse)) {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionVideoSegmentJOB_: finish_reason=length persisted after retry; giving up for this inference"
+            );
             emitAgentApiErrorEvent_(
                 this,
                 segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
                 "job_or_camera_video",
-                "http_post",
+                "finish_reason_length",
                 modelName,
-                e.what(),
+                "OpenAI returned finish_reason=length before completing a valid JSON object",
                 nlohmann::json{
                     { "segment_start_ts", segmentStartForPrompt },
-                    { "segment_end_ts", segmentEndForPrompt },
-                    { "expected_window_seconds", expectedWindowSeconds }
+                    { "segment_end_ts", segmentEndForPrompt }
                 }
             );
             return hit;
         }
-        if (useCoreModel) {
-            const auto latencyMs =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - coreRequestStart).count();
-            Logger::instance().logDebug(
-                camLogId,
-                "core_inference_context_latency_ms scope=callOpenAIVisionVideoSegmentJOB_ status=success model=" +
-                modelName + " camera_id=" + std::to_string(segment.cameraId) +
-                " latency_ms=" + std::to_string(latencyMs)
-            );
-        }
 
-        Logger::instance().logDebug(camLogId, "callOpenAIVisionVideoSegmentJOB_: rawResp = " + rawResp);
-
-        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
-        if (respJson.is_discarded() || !respJson.is_object()) {
-            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON response");
-            emitAgentApiErrorEvent_(
-                this,
-                segment.cameraId > 0 ? std::optional<int>(segment.cameraId) : std::nullopt,
-                "job_or_camera_video",
-                "invalid_json_response",
-                modelName,
-                "OpenAI returned invalid JSON response"
-            );
-            return hit;
-        }
-
-        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
-
-        std::string text = extractOpenAITextFromResponse(respJson);
-        if (text.empty()) {
+        if (parsedResponse.text.empty()) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: empty text");
             emitAgentApiErrorEvent_(
                 this,
@@ -15869,8 +19167,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             return hit;
         }
 
-        std::string jsonSlice;
-        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+        if (!parsedResponse.hasJsonObjectSlice) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: no JSON braces");
             emitAgentApiErrorEvent_(
                 this,
@@ -15883,8 +19180,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             return hit;
         }
 
-        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
-        if (!res.is_object()) {
+        if (!parsedResponse.hasValidJsonObject) {
             Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON object");
             emitAgentApiErrorEvent_(
                 this,
@@ -15896,6 +19192,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             );
             return hit;
         }
+
+        const nlohmann::json& res = parsedResponse.jsonObject;
 
         parseStructuredVisionResponseIntoHit_(
             res,
@@ -15976,6 +19274,7 @@ VideoHit AgentCore::runCameraCustomVideoInference(
     const std::string& modelApiKey,
     int modelInputFps,
     int runningResolution,
+    const std::string& videoPackagingMode,
     int expectedWindowSeconds,
     int& outPromptTokens,
     int& outOutputTokens,
@@ -16033,6 +19332,7 @@ VideoHit AgentCore::runCameraCustomVideoInference(
             safeFps,
             safeWindow,
             safeRunningResolution,
+            videoPackagingMode,
             outPromptTokens,
             outOutputTokens,
             outTotalTokens
@@ -16252,7 +19552,7 @@ DrakonFindInferenceResult AgentCore::runDrakonFindImageInference_(
                 label << " (" << reference.imageUrl << ")";
             }
             content.push_back({ { "type", "text" }, { "text", label.str() } });
-            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare, safeModelName));
         }
 
         content.push_back({ { "type", "text" }, { "text", "LIVE_CAMERA_SNAPSHOT" } });
@@ -16529,7 +19829,7 @@ DrakonFindInferenceResult AgentCore::runDrakonFindVideoInference_(
                 label << " (" << reference.imageUrl << ")";
             }
             content.push_back({ { "type", "text" }, { "text", label.str() } });
-            content.push_back(makeOpenAIImageContentFromBareJpeg(bare));
+            content.push_back(makeOpenAIImageContentFromBareJpeg(bare, safeModelName));
         }
 
         for (const auto& frame : frames) {
@@ -16615,15 +19915,10 @@ DrakonFindInferenceResult AgentCore::runDrakonFindVideoInference_(
         if (parsed.contains("observed_traits") && parsed["observed_traits"].is_array()) {
             result.observedTraits = parsed["observed_traits"];
         }
-        if (parsed.contains("detection_time_in_video")) {
-            if (parsed["detection_time_in_video"].is_array()) {
-                result.detectionTimeInVideo = parsed["detection_time_in_video"];
-            }
-            else if (parsed["detection_time_in_video"].is_string()) {
-                result.detectionTimeInVideo = nlohmann::json::array(
-                    { parsed["detection_time_in_video"] }
-                );
-            }
+        const std::vector<std::string> sanitizedDetectionTimes =
+            collectSanitizedDetectionTimesInVideoFromJson_(parsed);
+        if (!sanitizedDetectionTimes.empty()) {
+            result.detectionTimeInVideo = sanitizedDetectionTimes;
         }
         result.raw = parsed;
     }
@@ -16694,178 +19989,31 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
     const bool hasFaceReferences = !effectiveFaceReferences.empty();
     const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
         buildEffectiveNegativeReferences_(negativeReferences);
-    const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
-    const bool hasTemporalRuntimeHint = promptHasTemporalRuntimeInput_(userQuestion);
-    const bool hasCrossCameraWatchlist = promptHasCrossCameraWatchlist_(userQuestion);
+    const VisionPromptSections_ promptSections = parseVisionPromptSections_(userQuestion);
     const std::vector<std::string> fallbackFaceTargetNames =
         collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
 
     try {
-        std::string promptStr;
-        {
-            std::ostringstream prompt;
-            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
-            prompt << "User question: \"" << userQuestion << "\".\n\n";
-            prompt << "You will receive ONE CCTV IMAGE snapshot.\n";
-            prompt << "This is a single moment in time.\n";
-            prompt << "Snapshot timestamp (UTC): "
-                << (snapshotTsUtcIso.empty() ? "unknown" : snapshotTsUtcIso) << "\n\n";
-
-            prompt << "JOB STEP MODE (AUTOMATION):\n";
-            prompt << "- This inference is executed inside an automated Job Step.\n";
-            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
-            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
-
-            prompt << "LANGUAGE RULES:\n";
-            prompt << "- Detect the language of the user question.\n";
-            prompt << "- All JSON field names must remain in English exactly as specified.\n";
-            prompt << "- The `answer` text MUST be written in the same language as the user question.\n";
-            prompt << "- If the user mixes languages, use the main language of the question for `answer`.\n\n";
-
-            prompt << "IMPORTANT CONTEXT RULE:\n";
-            prompt << "- This is a SINGLE SNAPSHOT.\n";
-            prompt << "- NEVER imply events over time.\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this snapshot only for NEW observations visible right now.\n";
-                prompt << "- TEMPORAL_RUNTIME_INPUT_JSON contains authoritative prior state from earlier rounds.\n";
-                prompt << "- answer and alert_condition may combine this snapshot with that prior state when needed.\n";
-                prompt << "- Do not invent motion or duration that is not supported by this snapshot plus TEMPORAL_RUNTIME_INPUT_JSON.\n\n";
-            }
-            else {
-                prompt << "- Refer only to what is visible in this image.\n\n";
-            }
-
-            if (hasFaceReferences) {
-                prompt << "REFERENCE IMAGE LOGIC:\n";
-                prompt << "- You will receive one or more USER_REFERENCE_IMAGE face photos.\n";
-                prompt << "- Each reference can include TARGET_ID and TARGET_NAME metadata.\n";
-                prompt << "- Search these identities in this snapshot conservatively.\n";
-                prompt << "- If any target identity is confidently present, set faceid_match=true and alert_condition=true.\n\n";
-                prompt << "- If faceid_match=true, include matched TARGET_NAME values in faceid_target_names.\n\n";
-            }
-            if (hasNegativeReferences) {
-                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
-                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
-                prompt << "- These represent visual conditions that SHOULD NOT trigger alerts by themselves.\n";
-                prompt << "- If this snapshot strongly matches those references and no explicit severe risk is visible, keep alert_condition=false.\n";
-                prompt << "- Use this to reduce false positives only.\n\n";
-            }
-
-            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- Use this snapshot for current-batch evidence only.\n";
-                prompt << "- For alert_condition, you MAY combine current snapshot evidence with authoritative prior state from TEMPORAL_RUNTIME_INPUT_JSON.\n";
-                prompt << "- For start_condition_step_id, prefer evidence visible in this snapshot unless the condition explicitly depends on prior temporal state.\n";
-                prompt << "- If not confident about new observations, keep booleans false.\n\n";
-            }
-            else {
-                prompt << "- Evaluate the two conditions below using only this snapshot.\n";
-                prompt << "- If not confident, keep booleans false.\n\n";
-            }
-
-            prompt << "ALERT CONDITION (controls \"alert_condition\"):\n";
-            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
-            else prompt << "(No alert condition provided. Keep \"alert_condition\" as false.)\n\n";
-
-            prompt << "START CONDITION (controls \"start_condition_step_id\"):\n";
-            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
-            else prompt << "(No start condition provided. Keep \"start_condition_step_id\" as false.)\n\n";
-
-            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
-            prompt << "Return ONLY one JSON object with EXACTLY these fields:\n";
-            prompt << "1) \"answer\": string\n";
-            prompt << "2) \"alert_condition\": boolean\n";
-            prompt << "3) \"start_condition_step_id\": false OR integer\n";
-            prompt << "4) \"alert_region_ids\": array of strings (OPTIONAL; region ids where alert evidence is visible)\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "5) \"identity_patch\": array (OPTIONAL)\n";
-                prompt << "6) \"observations\": array (OPTIONAL)\n";
-                prompt << "7) \"unknown_reasons\": array (OPTIONAL)\n";
-            }
-            if (hasFaceReferences) {
-                prompt << (hasTemporalRuntimeHint ? "8" : "5") << ") \"faceid_match\": boolean\n";
-                prompt << (hasTemporalRuntimeHint ? "9" : "6") << ") \"faceid_target_names\": array of strings (OPTIONAL; include when faceid_match=true)\n";
-            }
-            if (hasCrossCameraWatchlist) {
-                prompt << "10) \"cross_camera_watchlist_matches\": array (OPTIONAL; include when the current snapshot strongly matches a shared watchlist entry, even if local alert_condition remains false)\n";
-            }
-            prompt << "\n";
-
-            prompt << "RULES:\n";
-            if (hasNegativeReferences) {
-                prompt << "- If evidence strongly matches NEGATIVE_REFERENCE_IMAGE, prefer keeping alert_condition=false unless explicit severe risk is visible.\n";
-            }
-            prompt << "- If alert_condition=true and region overlays are visible, include the matching region ids in \"alert_region_ids\".\n";
-            if (hasTemporalRuntimeHint) {
-                prompt << "- TEMPORAL STRUCTURE: identity_patch and observations must contain JSON objects only (never plain text strings).\n";
-                prompt << "- Each identity_patch item should include decision, confidence, entity_id when known, plus entity_key and entity_type whenever they can be inferred, and events.\n";
-                prompt << "- Each observations item should include event/type and entity_id or entity_key.\n";
-                prompt << "- If any tracked entity is visible, do not return identity_patch as empty.\n";
-            }
-            if (hasCrossCameraWatchlist) {
-                prompt << "- Evaluate TEMPORAL_RUNTIME_INPUT_JSON.cross_camera_watchlist independently from the local alert_condition and start condition.\n";
-                prompt << "- If a watchlist entry provides target_entity, entities, or search_prompt, use those fields as the authoritative description of what to look for.\n";
-                prompt << "- target_entity.entity_id and source_entity_id identify the source-camera target that triggered the hunt; they are not the local entity_id for this camera.\n";
-                prompt << "- If TEMPORAL_RUNTIME_INPUT_JSON contains cross_camera_watchlist and the current snapshot strongly matches one or more hunt entries, include cross_camera_watchlist_matches even when local alert_condition stays false.\n";
-                prompt << "- Allow for normal cross-camera differences in angle, lighting, background, scale, and pose when comparing the current snapshot with the shared target metadata.\n";
-                prompt << "- Each cross_camera_watchlist_matches item must be a JSON object with hunt_id, matched_entity_id, confidence, and optional reason.\n";
-                prompt << "- matched_entity_id must be the local entity_id from this camera when available; never copy target_entity.entity_id into matched_entity_id unless the same local ID is genuinely in use here.\n";
-            }
-            if (hasFaceReferences) {
-                prompt << "- If faceid_match is true, alert_condition MUST be true.\n";
-                prompt << "- If faceid_match is true and TARGET_NAME metadata exists, include those names in faceid_target_names.\n";
-                prompt << "- If faceid_match is true, keep answer concise and mention matched target name(s).\n";
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", optional \"alert_region_ids\", \"faceid_match\", optional \"faceid_target_names\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                if (hasCrossCameraWatchlist) {
-                    prompt << ", optional \"cross_camera_watchlist_matches\"";
-                }
-                prompt << ".\n";
-            }
-            else {
-                prompt << "- Do not add fields other than \"answer\", \"alert_condition\", \"start_condition_step_id\", and optional \"alert_region_ids\"";
-                if (hasTemporalRuntimeHint) {
-                    prompt << ", optional \"identity_patch\", optional \"observations\", optional \"unknown_reasons\"";
-                }
-                if (hasCrossCameraWatchlist) {
-                    prompt << ", optional \"cross_camera_watchlist_matches\"";
-                }
-                prompt << ".\n";
-            }
-            prompt << "- No Markdown.\n";
-            prompt << "- Output RAW JSON only.\n";
-
-            promptStr = prompt.str();
-        }
-
         const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
         const std::string camLogId = std::to_string(cameraId);
-        Logger::instance().logDebug(
+        OpenAIVisionRequestBuild_ requestBuild = buildOpenAIImageRequest_(
+            modelName,
+            promptSections,
+            alertConditionText,
+            startConditionText,
+            snapshotTsUtcIso,
+            jpegBase64,
+            effectiveFaceReferences,
+            effectiveNegativeReferences
+        );
+        logOpenAIVisionPromptBuild_(
             camLogId,
-            "callOpenAIVisionImageJOB_: OPENAI PROMPT (model=" + modelName + ")\n" + promptStr
+            "callOpenAIVisionImageJOB_",
+            modelName,
+            requestBuild
         );
 
-        nlohmann::json content = nlohmann::json::array();
-        content.push_back({ { "type", "text" }, { "text", promptStr } });
-        if (hasFaceReferences) {
-            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
-        }
-        if (hasNegativeReferences) {
-            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
-        }
-        content.push_back(makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(jpegBase64), modelName));
-
-        nlohmann::json body = {
-            { "model", modelName },
-            { "messages", nlohmann::json::array({
-                {
-                    { "role", "user" },
-                    { "content", content }
-                }
-            })}
-        };
+        nlohmann::json body = requestBuild.body;
         applyOpenAITemperatureField_(body, modelName, 0.0);
         const int baseRequestedLimit = 1200;
         const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, baseRequestedLimit);
@@ -16873,7 +20021,7 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
         const bool useCoreModel = isZAiCoreModelName_(modelName);
 
         std::string rawResp;
-        nlohmann::json respJson;
+        OpenAITextObjectResponse_ parsedResponse;
 
         auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
             nlohmann::json reqBody = body;
@@ -16937,11 +20085,12 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
 
             Logger::instance().logDebug(
                 camLogId,
-                "callOpenAIVisionImageJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " + rawResp
+                "callOpenAIVisionImageJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
+                    sanitizeModelRawRespForLog_(rawResp)
             );
 
-            respJson = nlohmann::json::parse(rawResp, nullptr, false);
-            if (respJson.is_discarded() || !respJson.is_object()) {
+            parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            if (!parsedResponse.hasValidResponseJson) {
                 Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: invalid JSON response");
                 emitAgentApiErrorEvent_(
                     this,
@@ -16958,11 +20107,23 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                 return false;
             }
 
-            int p = 0, o = 0, t = 0;
-            extractOpenAIUsageTokens(respJson, p, o, t);
-            outPromptTokens += p;
-            outOutputTokens += o;
-            outTotalTokens += t;
+            outPromptTokens += parsedResponse.usageStats.promptTokens;
+            outOutputTokens += parsedResponse.usageStats.outputTokens;
+            outTotalTokens += parsedResponse.usageStats.totalTokens;
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionImageJOB_: prompt cache usage model=" + modelName +
+                " variant=" + requestBuild.cacheVariant +
+                " cache_key=" + requestBuild.cacheKey +
+                " attempt=" + std::to_string(attemptNo) +
+                " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_prompt_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
+                " output_tokens=" + std::to_string(parsedResponse.usageStats.outputTokens)
+            );
             return true;
             };
 
@@ -16970,40 +20131,38 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             return hit;
         }
 
-        std::string text = extractOpenAITextFromResponse(respJson);
-        std::string finishReason = extractOpenAIFinishReason(respJson);
-        if (text.empty() && finishReason == "length" && secondEffectiveLimit > firstEffectiveLimit) {
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse) &&
+            secondEffectiveLimit > firstEffectiveLimit)
+        {
             Logger::instance().logDebug(
                 camLogId,
-                "callOpenAIVisionImageJOB_: empty text with finish_reason=length; retrying once with higher token limit " +
+                "callOpenAIVisionImageJOB_: finish_reason=length with incomplete JSON; retrying once with higher token limit " +
                 std::to_string(secondEffectiveLimit));
 
             if (!postAndParse(secondEffectiveLimit, 2)) {
                 return hit;
             }
-
-            text = extractOpenAITextFromResponse(respJson);
-            finishReason = extractOpenAIFinishReason(respJson);
-            if (text.empty() && finishReason == "length") {
-                Logger::instance().logDebug(
-                    camLogId,
-                    "callOpenAIVisionImageJOB_: second attempt also returned finish_reason=length with empty text; giving up for this inference");
-                emitAgentApiErrorEvent_(
-                    this,
-                    cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
-                    "job_or_camera_image",
-                    "finish_reason_length",
-                    modelName,
-                    "OpenAI returned finish_reason=length with empty text after retry",
-                    nlohmann::json{
-                        { "snapshot_ts_utc_iso", snapshotTsUtcIso }
-                    }
-                );
-                return hit;
-            }
         }
 
-        if (text.empty()) {
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse)) {
+            Logger::instance().logDebug(
+                camLogId,
+                "callOpenAIVisionImageJOB_: finish_reason=length persisted after retry; giving up for this inference");
+            emitAgentApiErrorEvent_(
+                this,
+                cameraId > 0 ? std::optional<int>(cameraId) : std::nullopt,
+                "job_or_camera_image",
+                "finish_reason_length",
+                modelName,
+                "OpenAI returned finish_reason=length before completing a valid JSON object",
+                nlohmann::json{
+                    { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                }
+            );
+            return hit;
+        }
+
+        if (parsedResponse.text.empty()) {
             Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: empty text");
             emitAgentApiErrorEvent_(
                 this,
@@ -17019,8 +20178,7 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             return hit;
         }
 
-        std::string jsonSlice;
-        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+        if (!parsedResponse.hasJsonObjectSlice) {
             Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: no JSON braces");
             emitAgentApiErrorEvent_(
                 this,
@@ -17036,8 +20194,7 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             return hit;
         }
 
-        nlohmann::json res = nlohmann::json::parse(jsonSlice, nullptr, false);
-        if (!res.is_object()) {
+        if (!parsedResponse.hasValidJsonObject) {
             Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: invalid JSON object");
             emitAgentApiErrorEvent_(
                 this,
@@ -17053,6 +20210,7 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             return hit;
         }
 
+        const nlohmann::json& res = parsedResponse.jsonObject;
         parseStructuredVisionResponseIntoHit_(
             res,
             hit,
@@ -17152,43 +20310,14 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
     const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
     const std::vector<std::string> fallbackFaceTargetNames =
         collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+    const VisionPromptSections_ promptSections = parseVisionPromptSections_(groupPrompt);
 
     try {
         const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
-        nlohmann::json content = nlohmann::json::array();
         int validCount = 0;
-
-        if (hasFaceReferences) {
-            appendOpenAIFaceReferenceContent_(content, effectiveFaceReferences);
-        }
-        if (hasNegativeReferences) {
-            appendOpenAINegativeReferenceContent_(content, effectiveNegativeReferences);
-        }
 
         for (const auto& in : inputs) {
             if (in.jpegBase64.empty()) continue;
-
-            if (!in.injectedInput.empty() && in.injectedInput != "__MISSING_INPUT__") {
-                std::ostringstream pin;
-                pin << "PIPELINE_INPUT_FOR_CAMERA " << in.cameraId;
-                if (!in.regionId.empty()) pin << " REGION " << in.regionId;
-                pin << ":\n" << in.injectedInput << "\n";
-                content.push_back({ { "type", "text" }, { "text", pin.str() } });
-            }
-
-            std::ostringstream hdr;
-            hdr << "CAMERA " << in.cameraId;
-            if (!in.regionId.empty()) {
-                hdr << " | REGION_ID " << in.regionId;
-            }
-            if (!in.regionLabel.empty()) {
-                hdr << " | REGION_LABEL " << in.regionLabel;
-            }
-            if (!in.cameraName.empty()) hdr << " (" << in.cameraName << ")";
-            hdr << "\nFull frame: " << (in.fullFrame ? "true" : "false");
-            hdr << "\nSnapshot timestamp (UTC): " << (in.snapshotTsUtcIso.empty() ? "unknown" : in.snapshotTsUtcIso);
-            content.push_back({ { "type", "text" }, { "text", hdr.str() } });
-            content.push_back(makeOpenAIFrameImageContentFromBareJpeg(stripDataUrlPrefix(in.jpegBase64), modelName));
             validCount++;
         }
 
@@ -17197,103 +20326,37 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
             return hit;
         }
         const std::string inputSourceSummary = buildGroupInputSourceSummary_(inputs);
-
-        std::string promptStr;
+        OpenAIVisionRequestBuild_ requestBuild = buildOpenAIGroupImageRequest_(
+            modelName,
+            promptSections,
+            inputs,
+            effectiveFaceReferences,
+            effectiveNegativeReferences,
+            alertConditionText,
+            startConditionText
+        );
+        auto attachInputSourcesToPromptLog = [&](const std::string& message) {
+            const std::string suffix = " input_sources=" + inputSourceSummary;
+            const std::size_t newlinePos = message.find('\n');
+            if (newlinePos == std::string::npos) {
+                return message + suffix;
+            }
+            return message.substr(0, newlinePos) + suffix + message.substr(newlinePos);
+        };
+        for (const std::string& message :
+             buildOpenAIVisionPromptLogMessages_(
+                 "callOpenAIVisionImageGroupJOB_",
+                 modelName,
+                 requestBuild))
         {
-            std::ostringstream prompt;
-            prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
-            prompt << "User question: \"" << groupPrompt << "\".\n\n";
-            prompt << "You will receive MULTIPLE CCTV IMAGE snapshots from different cameras and optional analysis regions.\n";
-            prompt << "Each snapshot is a single moment in time.\n\n";
-
-            prompt << "JOB STEP MODE (AUTOMATION):\n";
-            prompt << "- This inference is executed inside an automated Job Step.\n";
-            prompt << "- Your output will be consumed by a JobRunner state machine.\n";
-            prompt << "- You MUST follow the RESPONSE FORMAT exactly.\n\n";
-
-            prompt << "LANGUAGE RULES:\n";
-            prompt << "- Detect the language of the user question.\n";
-            prompt << "- All JSON field names must remain in English exactly as specified.\n";
-            prompt << "- The `answer` text MUST be written in the same language as the user question.\n\n";
-
-            prompt << "IMPORTANT CONTEXT RULE:\n";
-            prompt << "- Each image is a single snapshot.\n";
-            prompt << "- NEVER imply temporal continuity.\n";
-            prompt << "- Refer only to what is visible in each snapshot.\n\n";
-
-            if (hasNegativeReferences) {
-                prompt << "NEGATIVE VISUAL REFERENCES LOGIC:\n";
-                prompt << "- You will receive one or more NEGATIVE_REFERENCE_IMAGE samples.\n";
-                prompt << "- These represent visual patterns that SHOULD NOT trigger alerts by themselves.\n";
-                prompt << "- If a camera snapshot strongly matches those references and no explicit severe risk is visible, keep that camera alert_condition=false.\n";
-                prompt << "- Use this only to reduce false positives.\n\n";
-            }
-
-            prompt << "CONDITIONS TO EVALUATE (JOB STEP):\n";
-            prompt << "- Evaluate alert + start conditions PER INPUT ITEM (camera + optional region) based only on that snapshot.\n";
-            prompt << "- If not confident, keep booleans false.\n\n";
-
-            prompt << "ALERT CONDITION (controls each results[i].alert_condition):\n";
-            if (!alertConditionText.empty()) prompt << alertConditionText << "\n\n";
-            else prompt << "(No alert condition provided. Keep alert_condition as false.)\n\n";
-
-            prompt << "START CONDITION (controls each results[i].start_condition_step_id):\n";
-            if (!startConditionText.empty()) prompt << startConditionText << "\n\n";
-            else prompt << "(No start condition provided. Keep start_condition_step_id as false.)\n\n";
-
-            prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
-            prompt << "Return ONLY a single JSON object with EXACTLY this structure:\n";
-            prompt << "{\n";
-            prompt << "  \"results\": [\n";
-            prompt << "    {\"camera_id\": 123, \"region_id\": \"region-1\", \"answer\": \"...\", \"alert_condition\": false, \"start_condition_step_id\": false, \"alert_region_ids\": []";
-            if (hasFaceReferences) {
-                prompt << ", \"faceid_match\": false, \"faceid_target_names\": []";
-            }
-            prompt << "}\n";
-            prompt << "  ],\n";
-            prompt << "  \"alert_camera_ids\": [123, 456]\n";
-            prompt << "}\n\n";
-            prompt << "RULES:\n";
-            prompt << "- You MUST output one results entry for every INPUT ITEM received.\n";
-            prompt << "- camera_id MUST match the corresponding input camera id.\n";
-            prompt << "- region_id MUST match the corresponding input region_id when present; use \"full-frame\" when no region_id is provided.\n";
-            prompt << "- start_condition_step_id MUST be false OR integer.\n";
-            prompt << "- If results[i].alert_condition is true and region overlays are visible, include matching region ids in results[i].alert_region_ids.\n";
-            if (hasNegativeReferences) {
-                prompt << "- If a snapshot strongly matches NEGATIVE_REFERENCE_IMAGE and no explicit severe risk is visible, keep that camera's alert_condition=false.\n";
-            }
-            if (hasFaceReferences) {
-                prompt << "- results[i].faceid_match MUST be boolean.\n";
-                prompt << "- If results[i].faceid_match is true, results[i].alert_condition MUST be true.\n";
-                prompt << "- If results[i].faceid_match is true and TARGET_NAME metadata exists, include results[i].faceid_target_names as an array of matched names.\n";
-                prompt << "- Do not add fields inside results[i] other than camera_id, region_id, answer, alert_condition, start_condition_step_id, optional alert_region_ids, faceid_match, and optional faceid_target_names.\n";
-            }
-            else {
-                prompt << "- Do not add fields inside results[i] other than camera_id, region_id, answer, alert_condition, start_condition_step_id, and optional alert_region_ids.\n";
-            }
-            prompt << "- No Markdown. RAW JSON only.\n";
-
-            promptStr = prompt.str();
+            logGroupCameraDebug_(
+                inputs,
+                attachInputSourcesToPromptLog(message),
+                /*forceCameraStream*/ true
+            );
         }
 
-        content.push_back({ { "type", "text" }, { "text", promptStr } });
-
-        logGroupCameraDebug_(
-            inputs,
-            "callOpenAIVisionImageGroupJOB_: OPENAI PROMPT (model=" + modelName +
-            ", input_sources=" + inputSourceSummary + ")\n" + promptStr,
-            /*forceCameraStream*/ true
-        );
-
-        nlohmann::json body = {
-            { "model", modelName },
-            { "messages", nlohmann::json::array({
-                {
-                    { "role", "user" },
-                    { "content", content }
-                }
-            })}
-        };
+        nlohmann::json body = requestBuild.body;
         applyOpenAITemperatureField_(body, modelName, 0.0);
         applyOpenAITokenLimitField_(body, modelName, 4000);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
@@ -17365,7 +20428,8 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
 
         logGroupCameraDebug_(
             inputs,
-            "callOpenAIVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ") = " + rawResp,
+            "callOpenAIVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ") = " +
+                sanitizeModelRawRespForLog_(rawResp),
             /*forceCameraStream*/ true
         );
 
@@ -17387,7 +20451,23 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
             return hit;
         }
 
-        extractOpenAIUsageTokens(respJson, outPromptTokens, outOutputTokens, outTotalTokens);
+        const OpenAIUsageStats_ usageStats = extractOpenAIUsageStats_(respJson);
+        outPromptTokens = usageStats.promptTokens;
+        outOutputTokens = usageStats.outputTokens;
+        outTotalTokens = usageStats.totalTokens;
+        logGroupCameraDebug_(
+            inputs,
+            "callOpenAIVisionImageGroupJOB_: prompt cache usage model=" + modelName +
+            " variant=" + requestBuild.cacheVariant +
+            " cache_key=" + requestBuild.cacheKey +
+            " prompt_tokens=" + std::to_string(usageStats.promptTokens) +
+            " cached_prompt_tokens=" + std::to_string(usageStats.cachedPromptTokens) +
+            " uncached_prompt_tokens=" +
+                std::to_string((std::max)(0, usageStats.promptTokens - usageStats.cachedPromptTokens)) +
+            " output_tokens=" + std::to_string(usageStats.outputTokens) +
+            " input_sources=" + inputSourceSummary,
+            /*forceCameraStream*/ true
+        );
 
         std::string text = extractOpenAITextFromResponse(respJson);
         if (text.empty()) {
@@ -19061,7 +22141,7 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
         nlohmann::json content = nlohmann::json::array();
         content.push_back({ { "type", "text" }, { "text", prompt.str() } });
         content.push_back(
-            makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(snapshotDataUrl))
+            makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(snapshotDataUrl), modelName)
         );
 
         nlohmann::json body = {
@@ -19807,6 +22887,7 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
                     modelInputFps,
                     /*expectedWindowSeconds*/ 0,
                     runningResolution,
+                    std::string("mosaic"),
                     batchPrompt,
                     batchOutput,
                     batchTotal,

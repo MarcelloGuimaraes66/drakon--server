@@ -209,6 +209,7 @@ public:
         const std::string& modelApiKey,
         int modelInputFps,
         int runningResolution,
+        const std::string& videoPackagingMode,
         int expectedWindowSeconds,
         int& outPromptTokens,
         int& outOutputTokens,
@@ -564,6 +565,7 @@ private:
         int modelInputFps,
         int expectedWindowSeconds,
         int runningResolution,
+        const std::string& videoPackagingMode,
         int& outPromptTokens,
         int& outOutputTokens,
         int& outTotalTokens,
@@ -630,6 +632,7 @@ private:
         int modelInputFps,
         int expectedWindowSeconds,
         int runningResolution,
+        const std::string& videoPackagingMode,
         int& outPromptTokens,
         int& outOutputTokens,
         int& outTotalTokens);

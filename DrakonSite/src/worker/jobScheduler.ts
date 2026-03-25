@@ -88,6 +88,7 @@ type InferenceGroupPayload = {
   targetIds: number[];
   agentKey: string;
   inputType: TargetInputType;
+  video_packaging_mode: "mosaic" | "frame_sequence";
   prompt_template: string;
   alert_condition: string | null;
   negative_condition: string | null;
@@ -174,6 +175,21 @@ function normalizeTargetInputType(value: unknown): TargetInputType {
   if (typeof value !== "string") return "video";
   const normalized = value.trim().toLowerCase();
   return normalized === "image" ? "image" : "video";
+}
+
+function normalizeVideoPackagingMode(value: unknown): "mosaic" | "frame_sequence" {
+  if (typeof value !== "string") return "mosaic";
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "frame_sequence" ||
+    normalized === "frame-sequence" ||
+    normalized === "full_frame" ||
+    normalized === "full-frame" ||
+    normalized === "frames"
+  ) {
+    return "frame_sequence";
+  }
+  return "mosaic";
 }
 
 function normalizePriorityLevel(value: unknown): string | null {
@@ -875,6 +891,9 @@ function parseInferenceGroupsForPayload(raw: unknown): InferenceGroupPayload[] {
       alertCondition,
       negativeCondition
     );
+    const videoPackagingMode = normalizeVideoPackagingMode(
+      row?.video_packaging_mode ?? row?.videoPackagingMode
+    );
     const priorityLevel = normalizePriorityLevel(
       typeof row?.priority_level === "string" ? row.priority_level : row?.priorityLevel
     );
@@ -951,6 +970,7 @@ function parseInferenceGroupsForPayload(raw: unknown): InferenceGroupPayload[] {
       targetIds,
       agentKey,
       inputType,
+      video_packaging_mode: videoPackagingMode,
       prompt_template: promptParts.prompt_template,
       alert_condition: promptParts.alert_condition,
       negative_condition: promptParts.negative_condition,
@@ -1995,6 +2015,11 @@ async function buildJobStartPayload(
           (resolvedAgent as any)?.run_every ?? group.run_every,
           10
         );
+        const videoPackagingMode = normalizeVideoPackagingMode(
+          (resolvedAgent as any)?.video_packaging_mode ??
+            (resolvedAgent as any)?.videoPackagingMode ??
+            group.video_packaging_mode
+        );
         const runningResolution = normalizeRunningResolution(
           (resolvedAgent as any)?.running_resolution ?? group.running_resolution,
           DEFAULT_CORE_RUNNING_RESOLUTION
@@ -2045,6 +2070,7 @@ async function buildJobStartPayload(
           api_key: apiKey,
           model_fps: modelFps,
           run_every: inferenceModel === "core" ? 60 : runEvery,
+          video_packaging_mode: videoPackagingMode,
           running_resolution: inferenceModel === "core" ? runningResolution : null,
           only_capture_on_motion: onlyCaptureOnMotion,
           analysis_regions: resolvedAnalysisRegions,

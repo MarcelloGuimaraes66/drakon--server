@@ -76,6 +76,7 @@ export interface CameraCustomAgentRow {
   algorithm_type: string;
   is_enabled: number | boolean;
   input_type?: string | null;
+  video_packaging_mode?: string | null;
   inference_model?: string | null;
   model_fps?: number | null;
   run_every?: number | null;
@@ -109,8 +110,10 @@ const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
 type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type CameraVideoPackagingMode = "mosaic" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
 const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
+const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic";
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
@@ -197,6 +200,28 @@ const normalizeModelFps = (
     }
   }
   return normalizeModelFps(fallback, DEFAULT_ULTRA_VIDEO_MODEL_FPS);
+};
+
+const normalizeVideoPackagingMode = (
+  value: unknown,
+  fallback: CameraVideoPackagingMode = DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+): CameraVideoPackagingMode => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "frame_sequence" ||
+      normalized === "frame-sequence" ||
+      normalized === "full_frame" ||
+      normalized === "full-frame" ||
+      normalized === "frames"
+    ) {
+      return "frame_sequence";
+    }
+    if (normalized === "mosaic") {
+      return "mosaic";
+    }
+  }
+  return fallback;
 };
 
 const applyExecutionConstraints = (
@@ -504,6 +529,9 @@ export default function CameraCustomAgentEditorModal({
   const [displayName, setDisplayName] = useState("");
   const [isEnabled, setIsEnabled] = useState(true);
   const [inputType, setInputType] = useState<"video" | "image">("video");
+  const [videoPackagingMode, setVideoPackagingMode] = useState<CameraVideoPackagingMode>(
+    DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+  );
   const [inferenceModel, setInferenceModel] = useState<CameraAgentInferenceModel>(
     DEFAULT_CAMERA_AGENT_INFERENCE_MODEL
   );
@@ -713,6 +741,7 @@ export default function CameraCustomAgentEditorModal({
     setDisplayName(getDisplayNameFromAgent(agent));
     setIsEnabled(normalizeBool(agent?.is_enabled, true));
     setInputType(execution.inputType);
+    setVideoPackagingMode(normalizeVideoPackagingMode(agent?.video_packaging_mode));
     setInferenceModel(execution.inferenceModel);
     setRunEvery(execution.runEvery);
     setRunningResolution(execution.runningResolution);
@@ -1370,6 +1399,7 @@ export default function CameraCustomAgentEditorModal({
       face_target_ids: faceIds,
       is_enabled: isEnabled ? 1 : 0,
       input_type: inputType,
+      video_packaging_mode: videoPackagingMode,
       inference_model: inferenceModel,
       model_fps:
         inferenceModel === "ultra" && inputType === "video"
@@ -1959,13 +1989,33 @@ export default function CameraCustomAgentEditorModal({
                     disabled={inferenceModel === "core"}
                     className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
                   >
-                    {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
-                      <option key={seconds} value={seconds}>
-                        {getRunEveryOptionLabel(seconds)}
-                      </option>
-                    ))}
+                {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
+                  <option key={seconds} value={seconds}>
+                    {getRunEveryOptionLabel(seconds)}
+                  </option>
+                ))}
                   </select>
                 </div>
+                {inputType === "video" ? (
+                  <div className="space-y-2">
+                    <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
+                    <select
+                      value={videoPackagingMode}
+                      onChange={(e) =>
+                        setVideoPackagingMode(
+                          normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
+                        )
+                      }
+                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                    >
+                      <option value="mosaic">Mosaic (recommended)</option>
+                      <option value="frame_sequence">Full frame</option>
+                    </select>
+                    <p className="text-xs text-gray-400">
+                      Mosaic is much cheaper. Full frame sends frames individually and is better for finer, more precise analysis such as facial recognition.
+                    </p>
+                  </div>
+                ) : null}
                 {inferenceModel === "ultra" && inputType === "video" ? (
                   <div className="space-y-2">
                     <label className="block text-sm font-semibold text-gray-100">Video FPS</label>

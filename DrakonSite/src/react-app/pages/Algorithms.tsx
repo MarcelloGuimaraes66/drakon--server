@@ -33,6 +33,7 @@ type CustomAlgorithm = {
   display_name: string;
   is_enabled: boolean;
   input_type: "video" | "image";
+  video_packaging_mode: "mosaic" | "frame_sequence";
   inference_model: "core" | "ultra" | "legacy" | "pro";
   model_fps: number;
   run_every: number;
@@ -222,6 +223,16 @@ export default function Algorithms() {
                 : Number(row?.is_enabled || 0) !== 0,
             input_type:
               String(row?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video",
+            video_packaging_mode: (() => {
+              const mode = String(row?.video_packaging_mode || "").trim().toLowerCase();
+              return mode === "frame_sequence" ||
+                mode === "frame-sequence" ||
+                mode === "full_frame" ||
+                mode === "full-frame" ||
+                mode === "frames"
+                ? "frame_sequence"
+                : "mosaic";
+            })(),
             inference_model: (() => {
               const model = String(row?.inference_model || "").trim().toLowerCase();
               return model === "core" || model === "legacy" || model === "pro" || model === "ultra"
@@ -325,6 +336,7 @@ export default function Algorithms() {
       algorithm_type: custom.algorithm_type,
       is_enabled: custom.is_enabled,
       input_type: custom.input_type,
+      video_packaging_mode: custom.video_packaging_mode,
       inference_model: custom.inference_model,
       model_fps: custom.model_fps,
       run_every: custom.run_every,

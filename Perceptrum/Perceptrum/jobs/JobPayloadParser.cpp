@@ -128,6 +128,17 @@ static std::string normalizeInputTypeValue(std::string v) {
     return (v == "image") ? "image" : "video";
 }
 
+static std::string normalizeVideoPackagingModeValue(std::string v) {
+    auto is_space = [](unsigned char c) { return std::isspace(c); };
+    while (!v.empty() && is_space((unsigned char)v.front())) v.erase(v.begin());
+    while (!v.empty() && is_space((unsigned char)v.back())) v.pop_back();
+    for (char& c : v) c = (char)std::tolower((unsigned char)c);
+    if (v == "frame_sequence" || v == "frame-sequence" || v == "full_frame" || v == "full-frame" || v == "frames") {
+        return "frame_sequence";
+    }
+    return "mosaic";
+}
+
 static int normalizeRunningResolutionValue(int raw, int fallback = 640) {
     if (raw == 1024) return 1024;
     if (raw == 640) return 640;
@@ -806,6 +817,13 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                     g.input_type = normalizeInputTypeValue(
                         safeString(ig, "inputType", safeString(ig, "input_type", "video"))
                     );
+                    g.video_packaging_mode = normalizeVideoPackagingModeValue(
+                        safeString(
+                            ig,
+                            "video_packaging_mode",
+                            safeString(ig, "videoPackagingMode", "mosaic")
+                        )
+                    );
 
                     const auto parsedPrompt = parsePromptTemplateFields_(
                         g.prompt_template,
@@ -962,6 +980,13 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                 ag.input_schema_json = a.value("input_schema", "{}");
                 ag.input_type = normalizeInputTypeValue(
                     safeString(a, "input_type", safeString(a, "inputType", "video"))
+                );
+                ag.video_packaging_mode = normalizeVideoPackagingModeValue(
+                    safeString(
+                        a,
+                        "video_packaging_mode",
+                        safeString(a, "videoPackagingMode", "mosaic")
+                    )
                 );
                 ag.inference_model = normalizeInferenceModelName(
                     safeString(a, "inference_model", safeString(a, "inferenceModel", "legacy"))

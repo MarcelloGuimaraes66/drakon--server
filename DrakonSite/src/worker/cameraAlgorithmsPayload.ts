@@ -57,6 +57,7 @@ type BuildEnabledAlgorithmsArgs = {
 type CameraCustomInferenceModel = "legacy" | "pro" | "ultra" | "core";
 type CameraCustomRunEvery = 10 | 60;
 type CameraCustomRunningResolution = 640 | 1024;
+type CameraVideoPackagingMode = "mosaic" | "frame_sequence";
 
 const FIXED_CAMERA_CUSTOM_INFERENCE_MODEL: CameraCustomInferenceModel = "ultra";
 const DEFAULT_CAMERA_CUSTOM_RUN_EVERY = 60;
@@ -105,6 +106,28 @@ const normalizeCameraAgentInputType = (value: unknown): "video" | "image" => {
   if (typeof value !== "string") return "video";
   const normalized = value.trim().toLowerCase();
   return normalized === "image" ? "image" : "video";
+};
+
+const normalizeCameraVideoPackagingMode = (
+  value: unknown,
+  fallback: CameraVideoPackagingMode = "mosaic"
+): CameraVideoPackagingMode => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "frame_sequence" ||
+      normalized === "frame-sequence" ||
+      normalized === "full_frame" ||
+      normalized === "full-frame" ||
+      normalized === "frames"
+    ) {
+      return "frame_sequence";
+    }
+    if (normalized === "mosaic") {
+      return "mosaic";
+    }
+  }
+  return fallback;
 };
 
 const normalizeCameraAgentRunEvery = (
@@ -406,9 +429,11 @@ const normalizeExecutionSettings = (
   rawInferenceModel: unknown,
   rawModelFps: unknown,
   rawRunEvery: unknown,
-  rawRunningResolution: unknown
+  rawRunningResolution: unknown,
+  rawVideoPackagingMode: unknown
 ): {
   inputType: "video" | "image";
+  videoPackagingMode: CameraVideoPackagingMode;
   inferenceModel: CameraCustomInferenceModel;
   runEvery: CameraCustomRunEvery;
   runningResolution: CameraCustomRunningResolution | null;
@@ -417,10 +442,12 @@ const normalizeExecutionSettings = (
   validatorModelName: string;
 } => {
   const inferenceModel = normalizeInferenceModel(rawInferenceModel);
+  const videoPackagingMode = normalizeCameraVideoPackagingMode(rawVideoPackagingMode);
   if (inferenceModel === "core") {
     const runningResolution = normalizeCameraAgentRunningResolution(rawRunningResolution);
     return {
       inputType: "video",
+      videoPackagingMode,
       inferenceModel,
       runEvery: 60,
       runningResolution,
@@ -435,6 +462,7 @@ const normalizeExecutionSettings = (
   const modelName = inferenceModel === "ultra" ? "gpt-5.1" : "gpt-5-mini";
   return {
     inputType,
+    videoPackagingMode,
     inferenceModel,
     runEvery,
     runningResolution: null,
@@ -714,7 +742,8 @@ export async function buildEnabledAlgorithmsForCamera(
       row.inference_model ?? FIXED_CAMERA_CUSTOM_INFERENCE_MODEL,
       row.model_fps,
       row.run_every,
-      row.running_resolution
+      row.running_resolution,
+      row.video_packaging_mode
     );
     const modelApiKey =
       executionSettings.inferenceModel === "core" ? zAiApiKey : openAiApiKey;
@@ -732,6 +761,7 @@ export async function buildEnabledAlgorithmsForCamera(
       negative_condition: negativeCondition,
       analysis_regions: analysisRegions,
       input_type: executionSettings.inputType,
+      video_packaging_mode: executionSettings.videoPackagingMode,
       inference_model: executionSettings.inferenceModel,
       run_every: executionSettings.runEvery,
       running_resolution: executionSettings.runningResolution,

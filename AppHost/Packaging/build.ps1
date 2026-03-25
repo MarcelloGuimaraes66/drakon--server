@@ -3,7 +3,9 @@ param(
     [string]$Brand = "perceptrum",
     [ValidateSet("Build", "Package", "All")]
     [string]$Step = "All",
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$AllowUnsignedPayload,
+    [string]$WindowsAppRuntimeInstallerPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,41 @@ function Resolve-IsccCommand {
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) {
             return [pscustomobject]@{ Source = $candidate }
+        }
+    }
+
+    return $null
+}
+
+function Resolve-WindowsAppRuntimeInstallerPath {
+    param(
+        [string]$ExplicitPath
+    )
+
+    $candidates = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        $candidates += $ExplicitPath
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_APP_RUNTIME_INSTALLER)) {
+        $candidates += $env:WINDOWS_APP_RUNTIME_INSTALLER
+    }
+
+    $candidates += @(
+        (Join-Path $packagingRoot "prereqs\WindowsAppRuntimeInstall-x64.exe"),
+        (Join-Path $env:USERPROFILE "Downloads\WindowsAppRuntimeInstall-x64.exe")
+    )
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        $resolvedPath = Resolve-Path -Path $candidate -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Path -First 1
+        if ($resolvedPath) {
+            return $resolvedPath
         }
     }
 
@@ -90,6 +127,29 @@ function Copy-DirectoryContents {
     }
 
     $items | Copy-Item -Destination $Destination -Recurse -Force
+}
+
+function Stage-WindowsAppRuntimeInstaller {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$BrandMetadata,
+        [string]$InstallerPath
+    )
+
+    $resolvedInstallerPath = Resolve-WindowsAppRuntimeInstallerPath -ExplicitPath $InstallerPath
+    if (-not $resolvedInstallerPath) {
+        throw (
+            "Windows App Runtime installer not found. Provide -WindowsAppRuntimeInstallerPath, set " +
+            "WINDOWS_APP_RUNTIME_INSTALLER, or place WindowsAppRuntimeInstall-x64.exe in " +
+            "$packagingRoot\prereqs or $env:USERPROFILE\Downloads."
+        )
+    }
+
+    $prereqRoot = Join-Path $BrandMetadata.ArtifactStageRoot "prereqs"
+    Ensure-Directory -Path $prereqRoot
+
+    $destinationPath = Join-Path $prereqRoot "WindowsAppRuntimeInstall-x64.exe"
+    Copy-Item -Path $resolvedInstallerPath -Destination $destinationPath -Force
 }
 
 function Invoke-BrandApply {
@@ -359,10 +419,11 @@ function Invoke-PackageStep {
     }
 
     Write-Host "Copying staged payload into AppHost\stage..."
+    Stage-WindowsAppRuntimeInstaller -BrandMetadata $BrandMetadata -InstallerPath $WindowsAppRuntimeInstallerPath
     Copy-DirectoryContents -Source $BrandMetadata.ArtifactStageRoot -Destination $sharedStageRoot
 
     if (-not $RequireSignedPayload -and -not (Test-HasEmbeddedAuthenticodeSignature -FilePath $BrandMetadata.PayloadExePath)) {
-        Write-Host "Packaging an unsigned payload because Step All does not pause for manual signing."
+        Write-Host "Packaging an unsigned payload because signature enforcement is disabled for this run."
     }
 
     Write-Host "Building installer..."
@@ -386,7 +447,7 @@ switch ($Step) {
         Invoke-BuildStep -BrandMetadata $brandMetadata
     }
     "Package" {
-        Invoke-PackageStep -BrandMetadata $brandMetadata -RequireSignedPayload $true
+        Invoke-PackageStep -BrandMetadata $brandMetadata -RequireSignedPayload (-not $AllowUnsignedPayload.IsPresent)
     }
     "All" {
         Invoke-BuildStep -BrandMetadata $brandMetadata

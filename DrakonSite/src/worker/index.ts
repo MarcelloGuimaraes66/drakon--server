@@ -4284,6 +4284,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE job_step_agents ADD COLUMN model_fps INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(
+          `ALTER TABLE job_step_agents ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic'`
+        );
+        await addColumnIfMissing(
           `ALTER TABLE job_step_agents ADD COLUMN use_temporal_context INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(
@@ -4377,6 +4380,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN input_type TEXT DEFAULT 'video'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE camera_algorithms ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic'`
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN inference_model TEXT DEFAULT 'ultra'`
@@ -11986,6 +11992,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       algorithm_type?: string;
       display_name?: string;
       input_type?: string;
+      video_packaging_mode?: string;
       inference_model?: string;
       model_fps?: unknown;
       running_resolution?: unknown;
@@ -12035,6 +12042,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     return c.json({ error: "Invalid input_type. Allowed values: video, image" }, 400);
   }
   const inputType = requestedInputType || "video";
+  const videoPackagingMode = normalizeVideoPackagingMode(body.video_packaging_mode);
   const requestedInferenceModel = body.inference_model === undefined
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
@@ -12165,10 +12173,10 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       `INSERT INTO camera_algorithms (
          camera_id, algorithm_type, is_enabled, llm_prompt, image_region, config_json,
          prompt_template, alert_condition, negative_condition, analysis_regions,
-         input_type, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
+         input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
          created_at, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       cameraId,
@@ -12186,6 +12194,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       negativeCondition,
       JSON.stringify(normalizedRegionsResult.regions),
       executionSettings.inputType,
+      videoPackagingMode,
       executionSettings.inferenceModel,
       executionSettings.modelFps,
       executionSettings.runEvery,
@@ -12251,6 +12260,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
     .json<{
       display_name?: string;
       input_type?: string;
+      video_packaging_mode?: string;
       inference_model?: string;
       model_fps?: unknown;
       running_resolution?: unknown;
@@ -12300,6 +12310,13 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
     return c.json({ error: "Invalid input_type. Allowed values: video, image" }, 400);
   }
   const inputType = requestedInputType || existingInputType;
+  const existingVideoPackagingMode = normalizeVideoPackagingMode(
+    (ownedAlgorithm as any).video_packaging_mode
+  );
+  const videoPackagingMode =
+    body.video_packaging_mode === undefined
+      ? existingVideoPackagingMode
+      : normalizeVideoPackagingMode(body.video_packaging_mode, existingVideoPackagingMode);
   const existingInferenceModel =
     normalizeJobStepInferenceModel((ownedAlgorithm as any).inference_model) ||
     FIXED_JOB_STEP_INFERENCE_MODEL;
@@ -12511,6 +12528,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
            negative_condition = ?,
            analysis_regions = ?,
            input_type = ?,
+           video_packaging_mode = ?,
            inference_model = ?,
            model_fps = ?,
            run_every = ?,
@@ -12532,6 +12550,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
       negativeCondition,
       JSON.stringify(normalizedRegionsResult.regions),
       executionSettings.inputType,
+      videoPackagingMode,
       executionSettings.inferenceModel,
       executionSettings.modelFps,
       executionSettings.runEvery,
@@ -13872,6 +13891,7 @@ const listCustomCameraAgents = async (
         );
         return {
           input_type: execution.inputType,
+          video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
           inference_model: execution.inferenceModel,
           model_fps: execution.modelFps,
           run_every: execution.runEvery,
@@ -24937,6 +24957,7 @@ app.delete("/api/jobs/:id", anyAuthMiddleware, async (c) => {
 
 type JobStepInputType = "video" | "image";
 type JobStepInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type VideoPackagingMode = "mosaic" | "frame_sequence";
 const FIXED_JOB_STEP_INFERENCE_MODEL: JobStepInferenceModel = "ultra";
 type JobStepRunEverySeconds = 10 | 60;
 const FIXED_JOB_STEP_RUN_EVERY_SECONDS: JobStepRunEverySeconds = 60;
@@ -24953,6 +24974,7 @@ type JobStepInferenceGroup = {
   targetIds: number[];
   agentKey: string;
   inputType: JobStepInputType;
+  video_packaging_mode: VideoPackagingMode;
   prompt_template: string;
   alert_condition: string | null;
   negative_condition: string | null;
@@ -24976,6 +24998,28 @@ const normalizeJobStepInputType = (value: unknown): JobStepInputType | null => {
     return normalized;
   }
   return null;
+};
+
+const normalizeVideoPackagingMode = (
+  value: unknown,
+  fallback: VideoPackagingMode = "mosaic"
+): VideoPackagingMode => {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "frame_sequence" ||
+      normalized === "frame-sequence" ||
+      normalized === "full_frame" ||
+      normalized === "full-frame" ||
+      normalized === "frames"
+    ) {
+      return "frame_sequence";
+    }
+    if (normalized === "mosaic") {
+      return "mosaic";
+    }
+  }
+  return fallback;
 };
 
 const normalizeJobStepInferenceModel = (value: unknown): JobStepInferenceModel | null => {
@@ -25698,6 +25742,9 @@ const parseStoredInferenceGroups = (raw: unknown): JobStepInferenceGroup[] => {
       inferenceModel,
       requestedInputType
     );
+    const videoPackagingMode = normalizeVideoPackagingMode(
+      group?.video_packaging_mode ?? group?.videoPackagingMode
+    );
     const executionSettings = applyInferenceExecutionConstraints(
       requestedInputType,
       inferenceModel,
@@ -25760,6 +25807,7 @@ const parseStoredInferenceGroups = (raw: unknown): JobStepInferenceGroup[] => {
       targetIds,
       agentKey,
       inputType: executionSettings.inputType,
+      video_packaging_mode: videoPackagingMode,
       prompt_template: promptParts.prompt_template,
       alert_condition: promptParts.alert_condition,
       negative_condition: promptParts.negative_condition,
@@ -25948,6 +25996,7 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
         targetIds: number[];
         agentKey: string;
         inputType: string;
+        video_packaging_mode?: string;
         prompt_template?: string;
         alert_condition?: string | null;
         negative_condition?: string | null;
@@ -26360,6 +26409,12 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
           requestedInferenceModel,
           inputType
         );
+        const videoPackagingMode = normalizeVideoPackagingMode(
+          row?.video_packaging_mode ??
+            row?.videoPackagingMode ??
+            (resolvedAgent as any)?.video_packaging_mode ??
+            (resolvedAgent as any)?.videoPackagingMode
+        );
         const executionSettings = applyInferenceExecutionConstraints(
           inputType,
           requestedInferenceModel,
@@ -26380,6 +26435,7 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
           targetIds,
           agentKey,
           inputType: executionSettings.inputType,
+          video_packaging_mode: videoPackagingMode,
           prompt_template: resolvedPromptParts.prompt_template,
           alert_condition: resolvedPromptParts.alert_condition,
           negative_condition: resolvedPromptParts.negative_condition,
@@ -27082,6 +27138,7 @@ app.get("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     return {
       ...agent,
       input_type: execution.inputType,
+      video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
       inference_model: execution.inferenceModel,
       model_fps: execution.modelFps,
       run_every: execution.runEvery,
@@ -27109,6 +27166,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     negative_condition?: string;
     priority_level?: string;
     input_type?: string;
+    video_packaging_mode?: string;
     inference_model?: string;
     model_fps?: unknown;
     run_every?: number;
@@ -27168,6 +27226,9 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   if (body.input_type !== undefined && !requestedInputType) {
     return c.json({ error: "Invalid input_type. Allowed values: video, image" }, 400);
   }
+  const requestedVideoPackagingMode = body.video_packaging_mode === undefined
+    ? null
+    : normalizeVideoPackagingMode(body.video_packaging_mode);
   const requestedInferenceModel = body.inference_model === undefined
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
@@ -27334,6 +27395,9 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       (existingAgent as any).use_temporal_context,
       true
     );
+    const existingVideoPackagingMode = normalizeVideoPackagingMode(
+      (existingAgent as any).video_packaging_mode
+    );
     const useTemporalContext =
       requestedUseTemporalContext ?? existingUseTemporalContext;
     const normalizedPromptParts = resolveNormalizedPromptParts(
@@ -27378,6 +27442,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     }
     const inputType = requestedInputType || existingInputType;
     const inferenceModel = requestedInferenceModel || existingInferenceModel;
+    const videoPackagingMode = requestedVideoPackagingMode || existingVideoPackagingMode;
     const runEvery = requestedRunEvery ?? existingRunEvery;
     const modelFps = requestedModelFps ?? existingModelFps;
     const runningResolution = requestedRunningResolution ?? existingRunningResolution;
@@ -27460,13 +27525,14 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
     await c.env.DB.prepare(
       `UPDATE job_step_agents
-       SET agent_key = ?, priority_level = ?, input_type = ?, inference_model = ?, model_fps = ?, run_every = ?, running_resolution = ?, only_capture_on_motion = ?, use_temporal_context = ?, prompt_template = ?, params = ?, input_schema = ?, alert_condition = ?, analysis_regions = ?, temporal_plan_json = ?, temporal_plan_hash = ?, temporal_plan_version = ?, temporal_compiled_at = ?, temporal_compile_model = ?, temporal_explain_json = ?, updated_at = ?
+       SET agent_key = ?, priority_level = ?, input_type = ?, video_packaging_mode = ?, inference_model = ?, model_fps = ?, run_every = ?, running_resolution = ?, only_capture_on_motion = ?, use_temporal_context = ?, prompt_template = ?, params = ?, input_schema = ?, alert_condition = ?, analysis_regions = ?, temporal_plan_json = ?, temporal_plan_hash = ?, temporal_plan_version = ?, temporal_compiled_at = ?, temporal_compile_model = ?, temporal_explain_json = ?, updated_at = ?
        WHERE id = ?`
     )
       .bind(
         body.agent_key,
         priorityLevel,
         executionSettings.inputType,
+        videoPackagingMode,
         executionSettings.inferenceModel,
         executionSettings.modelFps,
         executionSettings.runEvery,
@@ -27564,6 +27630,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
         );
         return {
           input_type: execution.inputType,
+          video_packaging_mode: normalizeVideoPackagingMode((agent as any)?.video_packaging_mode),
           inference_model: execution.inferenceModel,
           model_fps: execution.modelFps,
           run_every: execution.runEvery,
@@ -27590,6 +27657,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
   const inputType = requestedInputType || "video";
   const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
+  const videoPackagingMode = requestedVideoPackagingMode || "mosaic";
   const runEvery = requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
   const modelFps = requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
   const runningResolution = requestedRunningResolution ?? null;
@@ -27680,8 +27748,8 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   }
 
   const result = await c.env.DB.prepare(
-    `INSERT INTO job_step_agents (step_id, camera_id, agent_key, priority_level, input_type, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, use_temporal_context, prompt_template, params, input_schema, alert_condition, analysis_regions, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    `INSERT INTO job_step_agents (step_id, camera_id, agent_key, priority_level, input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, use_temporal_context, prompt_template, params, input_schema, alert_condition, analysis_regions, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   )
     .bind(
       stepId,
@@ -27689,6 +27757,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       body.agent_key,
       priorityLevel,
       executionSettings.inputType,
+      videoPackagingMode,
       executionSettings.inferenceModel,
       executionSettings.modelFps,
       executionSettings.runEvery,
@@ -27774,6 +27843,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       );
       return {
         input_type: execution.inputType,
+        video_packaging_mode: normalizeVideoPackagingMode((agent as any)?.video_packaging_mode),
         inference_model: execution.inferenceModel,
         model_fps: execution.modelFps,
         run_every: execution.runEvery,

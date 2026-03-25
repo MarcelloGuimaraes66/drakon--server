@@ -15,6 +15,7 @@ struct AlgorithmConfig {
     std::string alertCondition;
     std::string negativeCondition;
     std::string inputType{ "video" };
+    std::string videoPackagingMode{ "mosaic" };
     std::string inferenceModel{ "ultra" };
     int runEverySeconds{ 60 };
     int runningResolution{ 640 }; // core only: 640 or 1024

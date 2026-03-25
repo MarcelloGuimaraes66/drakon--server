@@ -5696,6 +5696,107 @@ void CameraSession::inferenceLoop_() {
         telemetryLastInferenceTickMs_.store(steadyNowMs_(), std::memory_order_relaxed);
     };
 
+    auto buildTemporalStateSummaryForLog = [](
+        const nlohmann::json& state,
+        const nlohmann::json& planEnvelope) -> std::string
+    {
+        const std::size_t eventsCount =
+            state.is_object() && state.contains("events") && state["events"].is_array()
+                ? state["events"].size()
+                : 0u;
+        const std::size_t entitiesCount =
+            state.is_object() && state.contains("entities") && state["entities"].is_object()
+                ? state["entities"].size()
+                : 0u;
+        const std::size_t identityMemoryCount =
+            state.is_object() && state.contains("identity_memory") && state["identity_memory"].is_array()
+                ? state["identity_memory"].size()
+                : 0u;
+        const std::size_t lastRoundEvidenceKeyCount =
+            state.is_object() &&
+            state.contains("meta") &&
+            state["meta"].is_object() &&
+            state["meta"].contains("last_round_evidence_keys") &&
+            state["meta"]["last_round_evidence_keys"].is_array()
+                ? state["meta"]["last_round_evidence_keys"].size()
+                : 0u;
+        const std::size_t candidateDecisionCount =
+            state.is_object() &&
+            state.contains("meta") &&
+            state["meta"].is_object() &&
+            state["meta"].contains("last_round_candidate_decisions") &&
+            state["meta"]["last_round_candidate_decisions"].is_array()
+                ? state["meta"]["last_round_candidate_decisions"].size()
+                : 0u;
+        const std::size_t identityMemoryFallbackCount =
+            state.is_object() &&
+            state.contains("meta") &&
+            state["meta"].is_object() &&
+            state["meta"].contains("last_round_identity_memory_fallbacks") &&
+            state["meta"]["last_round_identity_memory_fallbacks"].is_array()
+                ? state["meta"]["last_round_identity_memory_fallbacks"].size()
+                : 0u;
+        const std::size_t operatorStateCount =
+            state.is_object() &&
+            state.contains("meta") &&
+            state["meta"].is_object() &&
+            state["meta"].contains("operator_state") &&
+            state["meta"]["operator_state"].is_object()
+                ? state["meta"]["operator_state"].size()
+                : 0u;
+        const nlohmann::json stateSlice = temporal::buildStateSlice(state, planEnvelope);
+
+        return
+            "events_count=" + std::to_string(eventsCount) +
+            " entities_count=" + std::to_string(entitiesCount) +
+            " identity_memory_count=" + std::to_string(identityMemoryCount) +
+            " last_round_evidence_keys_count=" + std::to_string(lastRoundEvidenceKeyCount) +
+            " candidate_decisions_count=" + std::to_string(candidateDecisionCount) +
+            " identity_memory_fallback_count=" + std::to_string(identityMemoryFallbackCount) +
+            " operator_state_count=" + std::to_string(operatorStateCount) +
+            " state_slice=" + stateSlice.dump();
+    };
+
+    auto normalizeCustomVideoRunEverySeconds = [](const AlgorithmConfig& algo) {
+        std::string inputType = algo.inputType;
+        std::transform(inputType.begin(), inputType.end(), inputType.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (inputType.empty()) inputType = "video";
+
+        std::string inferenceModel = algo.inferenceModel;
+        std::transform(inferenceModel.begin(), inferenceModel.end(), inferenceModel.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (inferenceModel.empty()) inferenceModel = "ultra";
+
+        if (inputType != "video") {
+            return 10;
+        }
+        if (inferenceModel == "core") {
+            return 60;
+        }
+        return algo.runEverySeconds > 10 ? 60 : 10;
+    };
+
+    auto isCustomVideoAlgorithm = [&](const AlgorithmConfig& algo) {
+        if (!algo.isCustomV2) return false;
+        std::string inputType = algo.inputType;
+        std::transform(inputType.begin(), inputType.end(), inputType.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (inputType.empty()) inputType = "video";
+        return inputType == "video";
+    };
+
+    auto customVideoAlgorithmUsesSixtySecondWindow = [&](const AlgorithmConfig& algo) {
+        return isCustomVideoAlgorithm(algo) && normalizeCustomVideoRunEverySeconds(algo) > 10;
+    };
+
+    auto customVideoAlgorithmNeedsBaseWindow = [&](const AlgorithmConfig& algo) {
+        return isCustomVideoAlgorithm(algo) && normalizeCustomVideoRunEverySeconds(algo) <= 10;
+    };
+
 
 
     try {
@@ -5708,7 +5809,6 @@ void CameraSession::inferenceLoop_() {
             if (!batchOpt.has_value()) {
                 auto imageOpt = getOldestInferenceImageForCamera(config_.id);
                 if (!imageOpt.has_value()) {
-                    // No media ready yet: just drain one frame so the buffer doesn't block captureLoop_
                     std::optional<Frame> opt = buffer_.pop();
 
                     if (!opt.has_value()) {
@@ -5716,9 +5816,25 @@ void CameraSession::inferenceLoop_() {
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                         continue;
                     }
-                    continue;
-                }
 
+                    bool hasDirectSixtySecondCustomVideoAlgorithm = false;
+                    {
+                        std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                        for (const auto& ac : config_.algorithms) {
+                            if (customVideoAlgorithmUsesSixtySecondWindow(ac)) {
+                                hasDirectSixtySecondCustomVideoAlgorithm = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Keep draining one frame so captureLoop_ does not stall, but still
+                    // allow direct 60s custom video algorithms to run from finalized clips.
+                    if (!hasDirectSixtySecondCustomVideoAlgorithm) {
+                        continue;
+                    }
+                }
+                else {
                 const std::string imagePath = *imageOpt;
                 auto removeProcessedImage = [&]() {
                     std::error_code rmEc;
@@ -6086,52 +6202,6 @@ void CameraSession::inferenceLoop_() {
                     const bool llmAlertCondition = primaryHit.alertCondition;
                     std::string decisionSource = "llm";
                     std::string temporalDecisionSummary;
-                    std::string normalizedInferenceModel = customAlgo.inferenceModel;
-                    std::transform(
-                        normalizedInferenceModel.begin(),
-                        normalizedInferenceModel.end(),
-                        normalizedInferenceModel.begin(),
-                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
-                    );
-                    const bool useSecondPassValidator =
-                        normalizedInferenceModel != "core" && !temporalPlanActive;
-                    if (primaryHit.alertCondition && useSecondPassValidator) {
-                        int validatorPromptTokens = 0;
-                        int validatorOutputTokens = 0;
-                        int validatorTotalTokens = 0;
-                        VideoHit validatorHit = owner_->runCameraCustomImageInference(
-                            cameraIdNumeric,
-                            inferenceImageDataUrl,
-                            runtimePrompt,
-                            faceReferences,
-                            negativeReferences,
-                            customAlgo.alertCondition,
-                            customAlgo.validatorModelName,
-                            customAlgo.validatorModelApiKey.empty()
-                                ? customAlgo.modelApiKey
-                                : customAlgo.validatorModelApiKey,
-                            temporal::nowIso(),
-                            validatorPromptTokens,
-                            validatorOutputTokens,
-                            validatorTotalTokens
-                        );
-                        if (!clientId.empty() && !exeToken.empty() && !backendBaseUrl.empty()) {
-                            sendTokenUsageAsync(
-                                config_.id,
-                                validatorPromptTokens,
-                                validatorOutputTokens,
-                                validatorTotalTokens,
-                                "agent",
-                                customAlgo.type + ":validator_gpt-5.1",
-                                clientId,
-                                exeToken,
-                                backendBaseUrl
-                            );
-                        }
-                        finalAlert = validatorHit.alertCondition;
-                        primaryHit = validatorHit;
-                        decisionSource = "validator";
-                    }
 
                     const bool localAlertSignal = finalAlert;
                     const std::string localDecisionSource = decisionSource;
@@ -6143,6 +6213,8 @@ void CameraSession::inferenceLoop_() {
                             primaryHit.observations,
                             primaryHit.temporalEvidenceCandidates,
                             nowIsoForInference,
+                            primaryHit.answer,
+                            primaryHit.unknownReasons,
                             std::string(),
                             std::string(),
                             primaryHit.faceIdentityMatches
@@ -6157,6 +6229,14 @@ void CameraSession::inferenceLoop_() {
                                 " decisions=" + candidateDecisions.dump()
                             );
                         }
+                        Logger::instance().logDebug(
+                            config_.id,
+                            "inferenceLoop_: temporal state after applyRound (image) algo=" + customAlgo.type +
+                            " camera_id=" + config_.id + " " +
+                            buildTemporalStateSummaryForLog(
+                                temporalSlot.state,
+                                temporalSlot.planEnvelope)
+                        );
                         const temporal::EvalResult eval = temporal::evaluate(
                             temporalSlot.state,
                             temporalSlot.planEnvelope,
@@ -6270,7 +6350,7 @@ void CameraSession::inferenceLoop_() {
                             alertRegionNamesSet.begin(),
                             alertRegionNamesSet.end()
                         );
-                        extra["validator_model"] = customAlgo.validatorModelName;
+                        extra["validator_model"] = "";
                         extra["decision_source"] = decisionSource;
                         extra["llm_alert_condition"] = llmAlertCondition;
                         extra["final_alert_condition"] = finalAlert;
@@ -6296,16 +6376,23 @@ void CameraSession::inferenceLoop_() {
                 removeProcessedImage();
                 recordInferenceOutcome(true);
                 continue;
+                }
             }
 
-            std::string clipPath = batchOpt->clipPath;
-            const int adaptiveWindowSeconds = batchOpt->windowSeconds;
-            Logger::instance().logDebug(
-                config_.id,
-                "inferenceLoop_: selected video window for inference: " + clipPath +
-                " window_seconds=" + std::to_string(adaptiveWindowSeconds) +
-                " source_clip_count=" + std::to_string(batchOpt->sourceCount)
-            );
+            std::string clipPath;
+            int adaptiveWindowSeconds = 10;
+            size_t adaptiveSourceCount = 0;
+            if (batchOpt.has_value()) {
+                clipPath = batchOpt->clipPath;
+                adaptiveWindowSeconds = batchOpt->windowSeconds;
+                adaptiveSourceCount = batchOpt->sourceCount;
+                Logger::instance().logDebug(
+                    config_.id,
+                    "inferenceLoop_: selected video window for inference: " + clipPath +
+                    " window_seconds=" + std::to_string(adaptiveWindowSeconds) +
+                    " source_clip_count=" + std::to_string(adaptiveSourceCount)
+                );
+            }
 
             // 2) Build list of active algos & LLM prompts (same as before)
             std::vector<AlgorithmConfig> algosCopy;
@@ -6442,73 +6529,70 @@ void CameraSession::inferenceLoop_() {
                 continue;
             }
 
-            recordInferenceInput();
-
             try {
-                // 3) Read the 10s MP4 into memory
-                /*
-                std::vector<unsigned char> videoBytes;
-                {
-                    std::ifstream ifs(clipPath, std::ios::binary);
-                    if (!ifs) {
-                        Logger::instance().logDebug(
-                            config_.id,
-                            "inferenceLoop_: failed to open clip for reading: " + clipPath
-                        );
-                        // Remove broken clip so we don't get stuck on it
-                        std::error_code rmEc;
-                        fs::remove(clipPath, rmEc);
-                        continue;
+                bool hasCustomVideoBaseWindowDemand = false;
+                for (const auto& customAlgo : customV2Algos) {
+                    if (customVideoAlgorithmNeedsBaseWindow(customAlgo)) {
+                        hasCustomVideoBaseWindowDemand = true;
+                        break;
                     }
-                    videoBytes.assign(
-                        std::istreambuf_iterator<char>(ifs),
-                        std::istreambuf_iterator<char>()
-                    );
                 }
-                */
 
+                const bool hasBaseVideoWindow = !clipPath.empty();
+                const bool needBaseVideoWindow =
+                    hasBaseVideoWindow && (!activeAlgos.empty() || hasCustomVideoBaseWindowDemand);
+
+                bool inferenceInputRecorded = false;
+                auto ensureInferenceInputRecorded = [&]() {
+                    if (!inferenceInputRecorded) {
+                        recordInferenceInput();
+                        inferenceInputRecorded = true;
+                    }
+                };
 
                 std::vector<unsigned char> videoBytes;
                 std::string finalClipPath = clipPath;
                 std::string sampledPath;
 
-                if (analysisSpeed > 1) {
-                    if (buildSampledClipWithFfmpeg(clipPath, analysisSpeed, sampledPath, config_.id)) {
-                        finalClipPath = sampledPath;
+                if (needBaseVideoWindow) {
+                    if (analysisSpeed > 1) {
+                        if (buildSampledClipWithFfmpeg(clipPath, analysisSpeed, sampledPath, config_.id)) {
+                            finalClipPath = sampledPath;
+                        }
+                        else {
+                            Logger::instance().logDebug(
+                                config_.id,
+                                "inferenceLoop_: sampling failed, falling back to original clip"
+                            );
+                        }
                     }
-                    else {
-                        Logger::instance().logDebug(
-                            config_.id,
-                            "inferenceLoop_: sampling failed, falling back to original clip"
+
+                    {
+                        const auto diskReadStartedAt = std::chrono::steady_clock::now();
+                        std::ifstream ifs(finalClipPath, std::ios::binary);
+                        if (!ifs) {
+                            Logger::instance().logDebug(
+                                config_.id,
+                                "inferenceLoop_: failed to open clip for reading: " + finalClipPath
+                            );
+                            // Remove original broken clip so we don't get stuck on it
+                            std::error_code rmEc;
+                            fs::remove(clipPath, rmEc);
+                            continue;
+                        }
+                        videoBytes.assign(
+                            std::istreambuf_iterator<char>(ifs),
+                            std::istreambuf_iterator<char>()
+                        );
+                        recordDiskReadSample(
+                            videoBytes.size(),
+                            std::chrono::steady_clock::now() - diskReadStartedAt
                         );
                     }
                 }
 
-                {
-                    const auto diskReadStartedAt = std::chrono::steady_clock::now();
-                    std::ifstream ifs(finalClipPath, std::ios::binary);
-                    if (!ifs) {
-                        Logger::instance().logDebug(
-                            config_.id,
-                            "inferenceLoop_: failed to open clip for reading: " + finalClipPath
-                        );
-                        // Remove original broken clip so we don't get stuck on it
-                        std::error_code rmEc;
-                        fs::remove(clipPath, rmEc);
-                        continue;
-                    }
-                    videoBytes.assign(
-                        std::istreambuf_iterator<char>(ifs),
-                        std::istreambuf_iterator<char>()
-                    );
-                    recordDiskReadSample(
-                        videoBytes.size(),
-                        std::chrono::steady_clock::now() - diskReadStartedAt
-                    );
-                }
-
-
-                if (!activeAlgos.empty() && question != "empty") {
+                if (needBaseVideoWindow && !activeAlgos.empty() && question != "empty") {
+                    ensureInferenceInputRecorded();
                     Logger::instance().logDebug(
                         config_.id,
                         "inferenceLoop_: sending video window to API, size=" +
@@ -6797,40 +6881,6 @@ void CameraSession::inferenceLoop_() {
                             continue;
                         }
 
-                        const std::vector<AlgorithmConfig::AnalysisRegion> polygonRegions =
-                            collectPolygonRegionsForAlgo_(customAlgo);
-                        std::vector<std::string> motionTriggeredRegionIds;
-                        bool shouldInfer = true;
-
-                        if (!polygonRegions.empty()) {
-                            bool hasRegionMotion = false;
-                            std::string motionErr;
-                            if (!detectMotionInAnyRegionFromClipCamera_(
-                                clipPath,
-                                polygonRegions,
-                                hasRegionMotion,
-                                &motionTriggeredRegionIds,
-                                &motionErr))
-                            {
-                                Logger::instance().logDebug(
-                                    config_.id,
-                                    "inferenceLoop_: custom region motion detection failed algo=" +
-                                    customAlgo.type + " err=" + motionErr
-                                );
-                                shouldInfer = false;
-                            }
-                            else if (!hasRegionMotion) {
-                                shouldInfer = false;
-                                Logger::instance().logDebug(
-                                    config_.id,
-                                    "inferenceLoop_: custom region motion not detected, skipping algo=" +
-                                    customAlgo.type
-                                );
-                            }
-                        }
-                        if (!shouldInfer) {
-                            continue;
-                        }
                         std::string normalizedInferenceModel = customAlgo.inferenceModel;
                         std::transform(
                             normalizedInferenceModel.begin(),
@@ -6838,16 +6888,17 @@ void CameraSession::inferenceLoop_() {
                             normalizedInferenceModel.begin(),
                             [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
                         );
-                        const bool useSixtySecondWindow = (customAlgo.runEverySeconds > 10);
+                        const int normalizedRunEverySeconds =
+                            normalizeCustomVideoRunEverySeconds(customAlgo);
+                        const bool useSixtySecondWindow = normalizedRunEverySeconds > 10;
                         const int expectedVideoWindowSeconds = useSixtySecondWindow
                             ? 60
                             : adaptiveWindowSeconds;
 
-                        std::string segmentSourcePath = finalClipPath;
-                        std::vector<unsigned char> segmentSourceBytes = videoBytes;
-
+                        std::string segmentSourcePath;
+                        std::vector<unsigned char> segmentSourceBytes;
                         if (useSixtySecondWindow) {
-                            if (!isCustomAlgorithmDueNow_(customAlgo.type, customAlgo.runEverySeconds)) {
+                            if (!isCustomAlgorithmDueNow_(customAlgo.type, normalizedRunEverySeconds)) {
                                 continue;
                             }
 
@@ -6904,8 +6955,49 @@ void CameraSession::inferenceLoop_() {
                                 continue;
                             }
                         }
+                        else {
+                            if (finalClipPath.empty() || videoBytes.empty()) {
+                                continue;
+                            }
+                            segmentSourcePath = finalClipPath;
+                            segmentSourceBytes = videoBytes;
+                        }
 
-                        if (!shouldRunCustomAlgorithmNow_(customAlgo.type, customAlgo.runEverySeconds)) {
+                        const std::vector<AlgorithmConfig::AnalysisRegion> polygonRegions =
+                            collectPolygonRegionsForAlgo_(customAlgo);
+                        std::vector<std::string> motionTriggeredRegionIds;
+                        bool shouldInfer = true;
+                        if (!polygonRegions.empty()) {
+                            bool hasRegionMotion = false;
+                            std::string motionErr;
+                            if (!detectMotionInAnyRegionFromClipCamera_(
+                                segmentSourcePath,
+                                polygonRegions,
+                                hasRegionMotion,
+                                &motionTriggeredRegionIds,
+                                &motionErr))
+                            {
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: custom region motion detection failed algo=" +
+                                    customAlgo.type + " err=" + motionErr
+                                );
+                                shouldInfer = false;
+                            }
+                            else if (!hasRegionMotion) {
+                                shouldInfer = false;
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: custom region motion not detected, skipping algo=" +
+                                    customAlgo.type
+                                );
+                            }
+                        }
+                        if (!shouldInfer) {
+                            continue;
+                        }
+
+                        if (!shouldRunCustomAlgorithmNow_(customAlgo.type, normalizedRunEverySeconds)) {
                             continue;
                         }
 
@@ -6917,6 +7009,8 @@ void CameraSession::inferenceLoop_() {
                                 customAlgo.type + " clip=" + segmentSourcePath
                             );
                         }
+
+                        ensureInferenceInputRecorded();
 
                         EncodedVideoSegment primarySegment;
                         primarySegment.bytes = segmentSourceBytes;
@@ -7277,6 +7371,7 @@ void CameraSession::inferenceLoop_() {
                             customAlgo.modelApiKey,
                             customAlgo.modelFps,
                             customAlgo.runningResolution,
+                            customAlgo.videoPackagingMode,
                             expectedVideoWindowSeconds,
                             primaryPromptTokens,
                             primaryOutputTokens,
@@ -7301,46 +7396,6 @@ void CameraSession::inferenceLoop_() {
                         const bool llmAlertCondition = primaryHit.alertCondition;
                         std::string decisionSource = "llm";
                         std::string temporalDecisionSummary;
-                        const bool useSecondPassValidator =
-                            normalizedInferenceModel != "core" && !temporalPlanActive;
-                        if (primaryHit.alertCondition && useSecondPassValidator) {
-                            int validatorPromptTokens = 0;
-                            int validatorOutputTokens = 0;
-                            int validatorTotalTokens = 0;
-                            VideoHit validatorHit = owner_->runCameraCustomVideoInference(
-                                primarySegment,
-                                runtimePrompt,
-                                faceReferences,
-                                negativeReferences,
-                                customAlgo.alertCondition,
-                                customAlgo.validatorModelName,
-                                customAlgo.validatorModelApiKey.empty()
-                                    ? customAlgo.modelApiKey
-                                    : customAlgo.validatorModelApiKey,
-                                customAlgo.modelFps,
-                                customAlgo.runningResolution,
-                                expectedVideoWindowSeconds,
-                                validatorPromptTokens,
-                                validatorOutputTokens,
-                                validatorTotalTokens
-                            );
-                            if (!clientId.empty() && !exeToken.empty() && !backendBaseUrl.empty()) {
-                                sendTokenUsageAsync(
-                                    config_.id,
-                                    validatorPromptTokens,
-                                    validatorOutputTokens,
-                                    validatorTotalTokens,
-                                    "agent",
-                                    customAlgo.type + ":validator_gpt-5.1",
-                                    clientId,
-                                    exeToken,
-                                    backendBaseUrl
-                                );
-                            }
-                            finalAlert = validatorHit.alertCondition;
-                            primaryHit = validatorHit;
-                            decisionSource = "validator";
-                        }
 
                         const bool localAlertSignal = finalAlert;
                         const std::string localDecisionSource = decisionSource;
@@ -7354,6 +7409,8 @@ void CameraSession::inferenceLoop_() {
                                 primaryHit.observations,
                                 primaryHit.temporalEvidenceCandidates,
                                 temporalDecisionNowIso,
+                                primaryHit.answer,
+                                primaryHit.unknownReasons,
                                 primarySegment.startTs,
                                 primarySegment.endTs,
                                 primaryHit.faceIdentityMatches
@@ -7368,6 +7425,14 @@ void CameraSession::inferenceLoop_() {
                                     " decisions=" + candidateDecisions.dump()
                                 );
                             }
+                            Logger::instance().logDebug(
+                                config_.id,
+                                "inferenceLoop_: temporal state after applyRound (video) algo=" + customAlgo.type +
+                                " camera_id=" + std::to_string(primarySegment.cameraId) + " " +
+                                buildTemporalStateSummaryForLog(
+                                    temporalSlot.state,
+                                    temporalSlot.planEnvelope)
+                            );
                             const temporal::EvalResult eval = temporal::evaluate(
                                 temporalSlot.state,
                                 temporalSlot.planEnvelope,
@@ -7446,6 +7511,7 @@ void CameraSession::inferenceLoop_() {
                             reportDetails["camera_id"] = primarySegment.cameraId;
                             reportDetails["camera_name"] = primarySegment.cameraName;
                             reportDetails["algorithm_type"] = customAlgo.type;
+                            reportDetails["video_packaging_mode"] = customAlgo.videoPackagingMode;
                             reportDetails["operator_results"] = temporalOperatorResults;
                             reportDetails["answer"] = primaryHit.answer;
                             reportDetails["decision_source"] = decisionSource;
@@ -7488,12 +7554,13 @@ void CameraSession::inferenceLoop_() {
 
                             nlohmann::json extra = nlohmann::json::object();
                             extra["algorithm_type"] = customAlgo.type;
+                            extra["video_packaging_mode"] = customAlgo.videoPackagingMode;
                             extra["alert_region_ids"] = alertRegionIds;
                             extra["alert_region_names"] = std::vector<std::string>(
                                 alertRegionNamesSet.begin(),
                                 alertRegionNamesSet.end()
                             );
-                            extra["validator_model"] = customAlgo.validatorModelName;
+                            extra["validator_model"] = "";
                             extra["decision_source"] = decisionSource;
                             extra["llm_alert_condition"] = llmAlertCondition;
                             extra["final_alert_condition"] = finalAlert;
@@ -7562,14 +7629,16 @@ void CameraSession::inferenceLoop_() {
                 }
 
                 // 6) Done with this clip: delete it from temp
-                std::error_code rmEc;
-                fs::remove(clipPath, rmEc);
-                if (rmEc) {
-                    Logger::instance().logDebug(
-                        config_.id,
-                        "inferenceLoop_: failed to remove processed clip: " +
-                        rmEc.message()
-                    );
+                if (!clipPath.empty()) {
+                    std::error_code rmEc;
+                    fs::remove(clipPath, rmEc);
+                    if (rmEc) {
+                        Logger::instance().logDebug(
+                            config_.id,
+                            "inferenceLoop_: failed to remove processed clip: " +
+                            rmEc.message()
+                        );
+                    }
                 }
 
                 // If we created a sampled clip, clean it up too
@@ -7585,7 +7654,9 @@ void CameraSession::inferenceLoop_() {
                     }
                 }
 
-                recordInferenceOutcome(true);
+                if (inferenceInputRecorded) {
+                    recordInferenceOutcome(true);
+                }
 
             }
             catch (const std::exception& ex) {

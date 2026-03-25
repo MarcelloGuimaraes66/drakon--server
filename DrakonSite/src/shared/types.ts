@@ -59,6 +59,7 @@ export const CreateAlgorithmSchema = z.object({
   negative_condition: z.string().optional(),
   analysis_regions: z.array(z.unknown()).optional(),
   input_type: z.string().optional(),
+  video_packaging_mode: z.string().optional(),
   inference_model: z.string().optional(),
   model_fps: z.number().optional(),
   run_every: z.number().optional(),
@@ -318,6 +319,7 @@ export interface Algorithm {
   negative_condition?: string;
   analysis_regions?: any;
   input_type?: string;
+  video_packaging_mode?: string;
   inference_model?: string;
   run_every?: number;
   running_resolution?: number | null;

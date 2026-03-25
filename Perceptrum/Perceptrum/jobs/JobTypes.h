@@ -67,6 +67,7 @@ struct JobAgentDef {
     std::string negative_condition_text;
 
     std::string input_type = "video"; // "video" | "image"
+    std::string video_packaging_mode = "mosaic"; // "mosaic" | "frame_sequence"
     std::vector<JobFaceTarget> face_targets;
     std::vector<JobNegativeReferenceImage> negative_reference_images;
     std::vector<JobAnalysisRegion> analysis_regions;
@@ -110,6 +111,7 @@ struct JobInferenceGroup {
     std::string alert_condition_text;
     std::string negative_condition_text;
     std::string input_type = "video"; // "video" | "image" (payload field: inputType)
+    std::string video_packaging_mode = "mosaic"; // payload field: videoPackagingMode
     std::vector<int> target_ids;    // ids of JobTarget inside this step (payload field: targetIds)
     std::string priority_level;
     std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "core"

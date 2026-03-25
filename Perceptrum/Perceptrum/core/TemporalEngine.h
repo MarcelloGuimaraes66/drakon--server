@@ -287,6 +287,212 @@ inline double dblField(const json& n, const char* key, double fallback = 0.0) {
     return fallback;
 }
 
+inline std::string strFieldAny(
+    const json& n,
+    std::initializer_list<const char*> keys,
+    const std::string& fallback = std::string())
+{
+    if (!n.is_object()) return fallback;
+    for (const char* key : keys) {
+        if (key == nullptr || !n.contains(key) || !n[key].is_string()) continue;
+        const std::string value = n[key].get<std::string>();
+        if (!trim(value).empty()) return value;
+    }
+    return fallback;
+}
+
+inline double dblFieldAny(
+    const json& n,
+    std::initializer_list<const char*> keys,
+    double fallback = 0.0)
+{
+    if (!n.is_object()) return fallback;
+    for (const char* key : keys) {
+        if (key == nullptr || !n.contains(key)) continue;
+        const auto& v = n[key];
+        if (v.is_number()) return v.get<double>();
+        if (v.is_string()) {
+            try {
+                return std::stod(v.get<std::string>());
+            }
+            catch (...) {
+            }
+        }
+    }
+    return fallback;
+}
+
+inline bool tryParseBoolValue(const json& value, bool& outValue) {
+    if (value.is_boolean()) {
+        outValue = value.get<bool>();
+        return true;
+    }
+    if (value.is_number_integer()) {
+        outValue = value.get<long long>() != 0;
+        return true;
+    }
+    if (value.is_number()) {
+        outValue = value.get<double>() != 0.0;
+        return true;
+    }
+    if (!value.is_string()) return false;
+
+    const std::string raw = lower(trim(value.get<std::string>()));
+    if (raw.empty()) return false;
+    if (raw == "true" || raw == "1" || raw == "yes" || raw == "y" || raw == "sim") {
+        outValue = true;
+        return true;
+    }
+    if (raw == "false" || raw == "0" || raw == "no" || raw == "n" || raw == "nao") {
+        outValue = false;
+        return true;
+    }
+    return false;
+}
+
+inline bool boolFieldAny(
+    const json& n,
+    std::initializer_list<const char*> keys,
+    bool& outValue)
+{
+    if (!n.is_object()) return false;
+    for (const char* key : keys) {
+        if (key == nullptr || !n.contains(key)) continue;
+        if (tryParseBoolValue(n[key], outValue)) return true;
+    }
+    return false;
+}
+
+inline bool boolFieldAnyFromObjectOrDetails(
+    const json& n,
+    std::initializer_list<const char*> keys,
+    bool& outValue)
+{
+    if (boolFieldAny(n, keys, outValue)) return true;
+    if (n.is_object() && n.contains("details") && n["details"].is_object()) {
+        return boolFieldAny(n["details"], keys, outValue);
+    }
+    return false;
+}
+
+inline std::string normalizeStructuredSemanticToken(const std::string& rawToken) {
+    const std::string raw = trim(rawToken);
+    if (raw.empty()) return raw;
+
+    std::string key;
+    key.reserve(raw.size());
+    for (unsigned char ch : raw) {
+        if (std::isalnum(ch)) key.push_back(static_cast<char>(std::tolower(ch)));
+        else if ((ch == '_' || ch == '-' || ch == ' ') && !key.empty() && key.back() != '_') {
+            key.push_back('_');
+        }
+    }
+    while (!key.empty() && key.front() == '_') key.erase(key.begin());
+    while (!key.empty() && key.back() == '_') key.pop_back();
+    return key;
+}
+
+inline std::string structuredObservationKindField(const json& node) {
+    std::string kind = trim(strFieldAny(node, { "observation_kind", "observation_type", "kind" }));
+    if (!kind.empty()) return kind;
+    if (node.is_object() && node.contains("details") && node["details"].is_object()) {
+        kind = trim(strFieldAny(node["details"], { "observation_kind", "observation_type", "kind" }));
+    }
+    return kind;
+}
+
+inline bool structuredObservationKindSuggestsContinuation(const std::string& rawKind) {
+    const std::string kind = normalizeStructuredSemanticToken(rawKind);
+    if (kind.empty()) return false;
+    return kind == "continuation" ||
+           kind == "continued" ||
+           kind == "same_episode_continuation" ||
+           kind == "episode_continuation" ||
+           kind == "same_action_continuation" ||
+           kind == "same_event_continuation" ||
+           kind == "ongoing_continuation" ||
+           kind == "same_episode" ||
+           kind == "same_action" ||
+           kind == "same_event" ||
+           kind.find("continu") != std::string::npos;
+}
+
+inline bool nodeReferencesExistingEpisode(const json& node) {
+    if (!node.is_object()) return false;
+    const std::string episodeRef =
+        trim(strFieldAny(node, { "same_episode_as", "episode_ref", "episode_id" }));
+    if (!episodeRef.empty()) return true;
+    if (node.contains("details") && node["details"].is_object()) {
+        const std::string nestedEpisodeRef =
+            trim(strFieldAny(node["details"], { "same_episode_as", "episode_ref", "episode_id" }));
+        if (!nestedEpisodeRef.empty()) return true;
+    }
+    return false;
+}
+
+inline bool nodeMarksContinuation(const json& node) {
+    if (!node.is_object()) return false;
+
+    bool flag = false;
+    if (boolFieldAnyFromObjectOrDetails(
+            node,
+            { "continuation", "is_continuation", "continued" },
+            flag) &&
+        flag)
+    {
+        return true;
+    }
+    if (nodeReferencesExistingEpisode(node)) return true;
+    return structuredObservationKindSuggestsContinuation(structuredObservationKindField(node));
+}
+
+inline bool nodeCountsAsNewEvent(const json& node) {
+    if (!node.is_object()) return true;
+
+    bool countsAsNewEvent = true;
+    if (boolFieldAnyFromObjectOrDetails(
+            node,
+            { "counts_as_new_event", "count_as_new_event", "is_new_event", "new_event" },
+            countsAsNewEvent) &&
+        !countsAsNewEvent)
+    {
+        return false;
+    }
+
+    if (nodeMarksContinuation(node)) return false;
+    return true;
+}
+
+inline std::string structuredDecisionField(const json& node) {
+    return trim(strFieldAny(node, { "decision", "identity_decision" }));
+}
+
+inline double structuredConfidenceField(const json& node, double fallback = 0.0) {
+    return dblFieldAny(node, { "confidence", "identity_confidence", "match_confidence" }, fallback);
+}
+
+inline std::string structuredEntityIdField(const json& node) {
+    return trim(strFieldAny(node, { "entity_id", "id", "matched_entity_id" }));
+}
+
+inline std::string structuredEntityKeyField(const json& node) {
+    return trim(strFieldAny(
+        node,
+        { "entity_key", "entity_ref", "entity", "subject", "target_entity", "matched_entity" }));
+}
+
+inline std::string structuredEntityHintField(const json& node) {
+    const std::string entityKey = structuredEntityKeyField(node);
+    if (!entityKey.empty()) return entityKey;
+    return trim(strFieldAny(node, { "entity_type" }));
+}
+
+inline std::string structuredEntityTokenField(const json& node) {
+    const std::string entityId = structuredEntityIdField(node);
+    if (!entityId.empty()) return entityId;
+    return structuredEntityHintField(node);
+}
+
 inline json extractPlan(const json& envelope) {
     if (!envelope.is_object()) return json::object();
     if (envelope.contains("plan_json") && envelope["plan_json"].is_object()) return envelope["plan_json"];
@@ -2520,10 +2726,10 @@ inline bool decisionSuggestsSyntheticAbsence(const std::string& rawDecision) {
 inline bool nodeRepresentsSyntheticAbsence(const json& node) {
     if (!node.is_object()) return false;
 
-    const std::string decision = trim(strField(node, "decision"));
+    const std::string decision = structuredDecisionField(node);
     if (decisionSuggestsSyntheticAbsence(decision)) return true;
 
-    const std::string entityId = trim(strField(node, "entity_id", strField(node, "id")));
+    const std::string entityId = structuredEntityIdField(node);
     if (tokenSuggestsSyntheticAbsence(entityId)) return true;
 
     const std::string status = trim(strField(node, "status", strField(node, "state")));
@@ -2535,8 +2741,7 @@ inline bool nodeRepresentsSyntheticAbsence(const json& node) {
 
     if (!nodeSuggestsNoVisibleTarget(node)) return false;
 
-    const std::string entityToken =
-        trim(strField(node, "entity_id", strField(node, "entity_key", strField(node, "entity_type"))));
+    const std::string entityToken = structuredEntityTokenField(node);
     if (entityToken.empty() ||
         tokenSuggestsSyntheticAbsence(entityToken) ||
         decisionSuggestsSyntheticAbsence(decision))
@@ -2565,16 +2770,20 @@ inline bool shouldCommitObservationEvent(const json& observation, const std::str
     }
     const std::string eventName = lower(trim(normalizeEventName(rawEvent)));
     if (eventName.empty()) return true;
+    if (!isPresentEventName(eventName) && !nodeCountsAsNewEvent(observation)) {
+        return false;
+    }
     if (isPresentEventName(eventName)) {
         return !nodeSuggestsNoVisiblePerson(observation) &&
                !nodeSuggestsNoVisibleTarget(observation);
     }
 
     if (observation.is_object() &&
-        observation.contains("confidence") &&
-        observation["confidence"].is_number())
+        (observation.contains("confidence") ||
+         observation.contains("identity_confidence") ||
+         observation.contains("match_confidence")))
     {
-        const double confidence = dblField(observation, "confidence", 0.0);
+        const double confidence = structuredConfidenceField(observation, 0.0);
         if (confidence <= 0.0) return false;
     }
 
@@ -2640,11 +2849,11 @@ inline bool currentBatchHasEntityEvidence(const json& identityPatch, const json&
         const std::string eventName =
             trim(strField(node, "event", strField(node, "type", strField(node, "event_type"))));
         if (isAbsenceEventName(eventName)) return false;
-        const std::string decision = lower(trim(strField(node, "decision")));
+        const std::string decision = lower(structuredDecisionField(node));
         if (decision == "unknown" || decision == "not_visible_this_batch" || decision == "no_match") {
             return false;
         }
-        return !trim(strField(node, "entity_id", strField(node, "entity_key", strField(node, "entity_type")))).empty();
+        return !structuredEntityTokenField(node).empty();
     };
     if (identityPatch.is_array()) {
         for (const auto& item : identityPatch) {
@@ -2661,8 +2870,7 @@ inline bool currentBatchHasEntityEvidence(const json& identityPatch, const json&
             {
                 continue;
             }
-            const std::string entityToken =
-                trim(strField(item, "entity_id", strField(item, "entity_key", strField(item, "entity_type"))));
+            const std::string entityToken = structuredEntityTokenField(item);
             const std::string eventName =
                 trim(strField(item, "event", strField(item, "type", strField(item, "event_type"))));
             if (isAbsenceEventName(eventName)) continue;
@@ -2839,7 +3047,7 @@ inline bool entityMatchesFilter(const std::string& rawEntityId,
 
 inline std::string eventEntityToken(const json& item) {
     if (!item.is_object()) return std::string();
-    return trim(strField(item, "entity_id", strField(item, "entity_key", strField(item, "entity_type"))));
+    return structuredEntityTokenField(item);
 }
 
 inline bool eventRepresentsSyntheticAbsence(const json& st, const json& item) {
@@ -3000,9 +3208,9 @@ inline std::string latestPresentTimestampInState(
 }
 
 inline std::string inferEntityPrefix(const json& patch, const json& plan) {
-    std::string prefix = trim(strField(patch, "entity_key", strField(patch, "entity_type")));
+    std::string prefix = structuredEntityHintField(patch);
     if (prefix.empty()) {
-        const std::string entityId = trim(strField(patch, "entity_id"));
+        const std::string entityId = structuredEntityIdField(patch);
         if (!entityId.empty()) {
             const auto p = entityId.find_last_of("_#");
             if (p != std::string::npos && p + 1 < entityId.size()) {
@@ -3119,7 +3327,7 @@ inline void upsertIdentityMemory(
     if (patch.contains("reference_image_urls") && patch["reference_image_urls"].is_array()) {
         mem["reference_image_urls"] = patch["reference_image_urls"];
     }
-    const std::string entityKey = trim(strField(patch, "entity_key"));
+    const std::string entityKey = structuredEntityKeyField(patch);
     if (!entityKey.empty()) mem["entity_key"] = entityKey;
     const std::string entityType = trim(strField(patch, "entity_type"));
     if (!entityType.empty()) mem["entity_type"] = entityType;
@@ -3222,6 +3430,7 @@ inline void applyRound(json& st,
     ensureState(st);
     st["meta"]["last_round_evidence_keys"] = json::array();
     st["meta"]["last_round_candidate_decisions"] = json::array();
+    st["meta"]["last_round_identity_memory_fallbacks"] = json::array();
     std::string nowTs = decisionAnchorUtc(nowIsoUtc, segmentEndTsRaw);
     if (nowTs.empty()) nowTs = decisionAnchorUtc(nowIso());
     const std::string segmentStartTs = normalizeFlexibleTs(segmentStartTsRaw);
@@ -3391,6 +3600,23 @@ inline void applyRound(json& st,
     std::unordered_set<std::string> roundAppendedEventKeys;
     std::unordered_set<std::string> roundTouchedEntityIds;
     std::unordered_set<std::string> roundPositiveEntityIds;
+    std::unordered_set<std::string> roundIdentityMemoryFallbackEntityIds;
+
+    auto recordIdentityMemoryFallback = [&](const std::string& entityId,
+                                            const std::string& entityHint,
+                                            const std::string& source) {
+        const std::string normalizedEntityId = trim(entityId);
+        if (normalizedEntityId.empty()) return;
+        if (!roundIdentityMemoryFallbackEntityIds.insert(normalizedEntityId).second) return;
+
+        json entry = {
+            { "entity_id", normalizedEntityId },
+            { "source", trim(source) }
+        };
+        const std::string normalizedHint = trim(entityHint);
+        if (!normalizedHint.empty()) entry["entity_hint"] = normalizedHint;
+        st["meta"]["last_round_identity_memory_fallbacks"].push_back(std::move(entry));
+    };
 
     auto normalizeAcceptedEventTs = [&](const std::string& rawTs, const std::string& fallbackTs) -> std::string {
         const std::string candidate = normalizeFlexibleTs(trim(rawTs).empty() ? fallbackTs : rawTs);
@@ -3423,6 +3649,7 @@ inline void applyRound(json& st,
                 {
                     continue;
                 }
+                if (!shouldCommitObservationEvent(o, eventName)) continue;
                 tsRaw = strField(o, "ts_utc", strField(o, "timestamp", strField(o, "time")));
                 if (!isPresentEventName(eventName) && !nodeHasDirectTemporalAnchor(o)) continue;
             } else {
@@ -3528,6 +3755,98 @@ inline void applyRound(json& st,
             const std::string evidenceKey = trim(evidenceRef["temporal_evidence_key"].get<std::string>());
             if (!evidenceKey.empty()) recordLastRoundEvidenceKey(st, evidenceKey);
         }
+    };
+
+    auto patchSupportsIdentityMemoryFallback = [&](const json& patch) -> bool {
+        if (!patch.is_object()) return false;
+        if (nodeRepresentsSyntheticAbsence(patch) ||
+            nodeSuggestsNoVisiblePerson(patch) ||
+            nodeSuggestsNoVisibleTarget(patch) ||
+            nodeSuggestsInactionableVisibility(patch))
+        {
+            return false;
+        }
+        const std::string eventName = extractStructuredEvidenceEventName(patch);
+        if (isAbsenceEventName(eventName)) return false;
+
+        const std::string entityToken = structuredEntityTokenField(patch);
+        const json traits = extractTraitsFromNode(patch);
+        const std::string description = trim(strField(
+            patch,
+            "description",
+            strField(patch, "entity_description", strField(patch, "person_description"))));
+        return !entityToken.empty() ||
+               (traits.is_array() && !traits.empty()) ||
+               !description.empty();
+    };
+
+    auto tryUpsertIdentityMemoryFromWeakPatch = [&](const json& patch,
+                                                    const std::string& patchEntityId,
+                                                    const std::string& patchEntityHint,
+                                                    const std::string& patchEntityType,
+                                                    const std::string& patchZone,
+                                                    const std::string& patchTs) -> bool {
+        if (!patchSupportsIdentityMemoryFallback(patch)) return false;
+
+        std::string resolvedEntityId = trim(patchEntityId);
+        if (!resolvedEntityId.empty() && !entityExists(resolvedEntityId)) {
+            resolvedEntityId.clear();
+        }
+
+        auto resolvedEntityAllowed = [&](const std::string& candidateEntityId) -> bool {
+            const std::string normalized = trim(candidateEntityId);
+            if (normalized.empty()) return false;
+            return roundPositiveEntityIds.empty() ||
+                   roundPositiveEntityIds.find(normalized) != roundPositiveEntityIds.end();
+        };
+
+        if (resolvedEntityId.empty() && !patchEntityHint.empty()) {
+            if (entityExists(patchEntityHint)) {
+                resolvedEntityId = patchEntityHint;
+            }
+            else if (!roundPositiveEntityIds.empty()) {
+                const std::string candidate = resolveExistingEntityIdFromHint(patchEntityHint);
+                if (resolvedEntityAllowed(candidate)) resolvedEntityId = candidate;
+            }
+        }
+        if (resolvedEntityId.empty() && !patchEntityId.empty() && !roundPositiveEntityIds.empty()) {
+            const std::string candidate = resolveExistingEntityIdFromHint(patchEntityId);
+            if (resolvedEntityAllowed(candidate)) resolvedEntityId = candidate;
+        }
+        if (resolvedEntityId.empty() && roundPositiveEntityIds.size() == 1) {
+            resolvedEntityId = *roundPositiveEntityIds.begin();
+        }
+        if (resolvedEntityId.empty()) return false;
+
+        json pseudoPatch = patch;
+        pseudoPatch["entity_id"] = resolvedEntityId;
+        if (!patchEntityHint.empty() &&
+            (!pseudoPatch.contains("entity_key") ||
+             !pseudoPatch["entity_key"].is_string() ||
+             trim(pseudoPatch["entity_key"].get<std::string>()).empty()))
+        {
+            pseudoPatch["entity_key"] = patchEntityHint;
+        }
+        if (!patchEntityType.empty() &&
+            (!pseudoPatch.contains("entity_type") ||
+             !pseudoPatch["entity_type"].is_string() ||
+             trim(pseudoPatch["entity_type"].get<std::string>()).empty()))
+        {
+            pseudoPatch["entity_type"] = patchEntityType;
+        }
+
+        const std::string seenTs = normalizeAcceptedEventTs(patchTs, defaultRoundEventTs);
+        upsertIdentityMemory(
+            st,
+            resolvedEntityId,
+            pseudoPatch,
+            seenTs.empty() ? nowTs : seenTs,
+            patchZone);
+        recordIdentityMemoryFallback(
+            resolvedEntityId,
+            patchEntityHint.empty() ? patchEntityId : patchEntityHint,
+            "weak_identity_patch");
+        return true;
     };
 
     auto resolveExistingEntityIdForAbsence = [&](const std::string& entityIdRaw,
@@ -3724,11 +4043,10 @@ inline void applyRound(json& st,
                 continue;
             }
             if (!p.is_object()) continue;
-            const double confidence = dblField(p, "confidence", -1.0);
-            const std::string decisionRaw = lower(trim(strField(p, "decision")));
-            const std::string patchEntityId = trim(strField(p, "entity_id", strField(p, "id")));
-            const std::string patchEntityHintRaw =
-                trim(strField(p, "entity_key", strField(p, "entity_type")));
+            const double confidence = structuredConfidenceField(p, -1.0);
+            const std::string decisionRaw = lower(structuredDecisionField(p));
+            const std::string patchEntityId = structuredEntityIdField(p);
+            const std::string patchEntityHintRaw = structuredEntityHintField(p);
             const std::string patchEntityHint =
                 patchEntityHintRaw.empty() ? inferEntityPrefix(p, plan) : patchEntityHintRaw;
             const std::string patchEntityType = trim(strField(p, "entity_type"));
@@ -3776,7 +4094,16 @@ inline void applyRound(json& st,
                     ? "match_existing"
                     : ((confidence >= newThreshold) ? "new_entity" : "unknown");
             }
-            if (decision == "unknown") continue;
+            if (decision == "unknown") {
+                tryUpsertIdentityMemoryFromWeakPatch(
+                    p,
+                    patchEntityId,
+                    patchEntityHint,
+                    patchEntityType,
+                    patchZone,
+                    patchTs);
+                continue;
+            }
 
             std::string entityId = trim(strField(p, "entity_id", strField(p, "id")));
             const std::string entityHint = patchEntityHint;
@@ -4344,13 +4671,41 @@ inline json buildRuntimeVariableContract(const json& envelope) {
     return out;
 }
 
-inline json buildInferenceInput(const json& envelope,
-                                const json& st,
-                                int cameraId,
-                                const std::string& nowIsoUtc,
-                                const std::string& segmentStartTsRaw = std::string(),
-                                const std::string& segmentEndTsRaw = std::string()) {
+inline constexpr const char* kTemporalStaticPromptMarker = "TEMPORAL_STATIC_CONTEXT_JSON:";
+inline constexpr const char* kTemporalRuntimePromptMarker = "TEMPORAL_RUNTIME_STATE_JSON:";
+
+inline json buildInferenceStaticContext(const json& envelope) {
     const json plan = effectivePlan(envelope);
+    return json{
+        { "plan_ref", {
+            { "plan_id", strField(plan, "plan_id") },
+            { "plan_hash", strField(plan, "plan_hash") },
+            { "schema_version", strField(plan, "schema_version", "temporal-plan/1.0") }
+        }},
+        { "entities_contract", plan.value("entities", json::array()) },
+        { "event_catalog", plan.value("event_catalog", json::array()) },
+        { "identity_policy", plan.value("identity_policy", json::object()) },
+        { "runtime_variable_contract", buildRuntimeVariableContract(envelope) },
+        { "state_semantics", {
+            { "state_slice_authority", "authoritative_confirmed_state_from_prior_rounds" },
+            { "identity_memory_authority", "authoritative_identity_memory_from_prior_rounds" },
+            { "observations_scope", "current_batch_only" },
+            { "final_alert_authority", "temporal_engine" }
+        }},
+        { "expected_output_schema", {
+            { "identity_patch", json::array() },
+            { "observations", json::array() },
+            { "unknown_reasons", json::array() }
+        }}
+    };
+}
+
+inline json buildInferenceRuntimeState(const json& envelope,
+                                       const json& st,
+                                       int cameraId,
+                                       const std::string& nowIsoUtc,
+                                       const std::string& segmentStartTsRaw = std::string(),
+                                       const std::string& segmentEndTsRaw = std::string()) {
     json idMem = json::array();
     if (st.is_object() && st.contains("identity_memory") && st["identity_memory"].is_array()) {
         struct IdentityMemoryPromptRow {
@@ -4383,36 +4738,68 @@ inline json buildInferenceInput(const json& envelope,
     if (!segmentStartTs.empty()) timeContext["segment_start_utc"] = segmentStartTs;
     if (!segmentEndTs.empty()) timeContext["segment_end_utc"] = segmentEndTs;
     return json{
-        { "plan_ref", {
-            { "plan_id", strField(plan, "plan_id") },
-            { "plan_hash", strField(plan, "plan_hash") },
-            { "schema_version", strField(plan, "schema_version", "temporal-plan/1.0") }
-        }},
         { "camera_id", cameraId },
-        { "entities_contract", plan.value("entities", json::array()) },
-        { "event_catalog", plan.value("event_catalog", json::array()) },
-        { "identity_policy", plan.value("identity_policy", json::object()) },
         { "state_slice", buildStateSlice(st, envelope) },
-        { "runtime_variable_contract", buildRuntimeVariableContract(envelope) },
         { "identity_memory", idMem },
-        { "state_semantics", {
-            { "state_slice_authority", "authoritative_confirmed_state_from_prior_rounds" },
-            { "identity_memory_authority", "authoritative_identity_memory_from_prior_rounds" },
-            { "observations_scope", "current_batch_only" },
-            { "final_alert_authority", "temporal_engine" }
-        }},
-        { "time_context", timeContext },
-        { "expected_output_schema", {
-            { "identity_patch", json::array() },
-            { "observations", json::array() },
-            { "unknown_reasons", json::array() }
-        }}
+        { "time_context", timeContext }
     };
 }
 
+inline json buildInferenceInput(const json& envelope,
+                                const json& st,
+                                int cameraId,
+                                const std::string& nowIsoUtc,
+                                const std::string& segmentStartTsRaw = std::string(),
+                                const std::string& segmentEndTsRaw = std::string()) {
+    json combined = buildInferenceStaticContext(envelope);
+    const json runtimeState = buildInferenceRuntimeState(
+        envelope,
+        st,
+        cameraId,
+        nowIsoUtc,
+        segmentStartTsRaw,
+        segmentEndTsRaw
+    );
+    for (auto it = runtimeState.begin(); it != runtimeState.end(); ++it) {
+        combined[it.key()] = it.value();
+    }
+    return combined;
+}
+
+inline void splitInferenceInputForPrompt(const json& runtimeInput, json& staticContext, json& runtimeState) {
+    staticContext = json::object();
+    runtimeState = json::object();
+    if (!runtimeInput.is_object()) return;
+
+    const std::unordered_set<std::string> staticKeys = {
+        "plan_ref",
+        "entities_contract",
+        "event_catalog",
+        "identity_policy",
+        "runtime_variable_contract",
+        "state_semantics",
+        "expected_output_schema"
+    };
+
+    for (auto it = runtimeInput.begin(); it != runtimeInput.end(); ++it) {
+        if (staticKeys.find(it.key()) != staticKeys.end()) {
+            staticContext[it.key()] = it.value();
+        }
+        else {
+            runtimeState[it.key()] = it.value();
+        }
+    }
+}
+
 inline std::string runtimePromptAppendix(const json& runtimeInput) {
+    json staticContext = json::object();
+    json runtimeState = json::object();
+    splitInferenceInputForPrompt(runtimeInput, staticContext, runtimeState);
     std::ostringstream oss;
-    oss << "\n\nTEMPORAL_RUNTIME_INPUT_JSON:\n" << runtimeInput.dump(2)
+    oss << "\n\n" << kTemporalStaticPromptMarker << "\n" << staticContext.dump()
+        << "\n\n" << kTemporalRuntimePromptMarker << "\n" << runtimeState.dump()
+        << "\n\nTEMPORAL_RUNTIME_INPUT_JSON_COMPAT_NOTE:\n"
+        << "- Legacy TEMPORAL_RUNTIME_INPUT_JSON is now split between TEMPORAL_STATIC_CONTEXT_JSON and TEMPORAL_RUNTIME_STATE_JSON.\n"
         << "\n\nTEMPORAL OUTPUT RULES:\n"
         << "- Keep original output fields requested by this prompt.\n"
         << "- Also return identity_patch (array), observations (array), unknown_reasons (array).\n"
@@ -4426,6 +4813,8 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"
         << "- identity_patch and observations MUST be arrays of JSON objects (never plain strings).\n"
         << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description and updated_traits/key_traits.\n"
+        << "- If the same continuous action stays visible across multiple frames, emit one event observation for the first clearly supported transition and use later frames only as continuity for that same episode.\n"
+        << "- When you include a continuity object for a later frame of the same episode, mark it with continuation=true and counts_as_new_event=false.\n"
         << "- Reuse stable entity_id/entity_key across rounds for the same real-world entity; create a new ID only when it is clearly a different entity.\n"
         << "- Use canonical event object fields whenever possible.\n"
         << "- For video batches where each frame has FRAME_META_JSON, prefer event, frame_index, frame_timestamp_in_segment, and zone.\n"
@@ -4438,6 +4827,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
         << "- Keep traits concise (2-6 items): color/clothing/accessory/object_in_hand/pose when visible.\n"
         << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence and events.\n"
+        << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch even when entity_id is inferred from that context.\n"
         << "- If a tracked entity from state_slice or identity_memory is no longer visible in this batch, return identity_patch for that same entity_id with decision set to not_visible_this_segment or absent.\n"
         << "- If TEMPORAL_RUNTIME_INPUT_JSON includes cross_camera_watchlist, treat it as an authoritative watchlist from other cameras in the same Job Step, even if this camera has different local alert logic.\n"
         << "- Each cross_camera_watchlist entry may include target_entity, entities, and search_prompt. Use target_entity and search_prompt as the primary instructions for what to look for.\n"
