@@ -795,13 +795,13 @@ type TargetInputType = "video" | "image";
 type AgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
 type AgentRunEverySeconds = 10 | 60;
 type AgentRunningResolution = 640 | 1024;
-type AgentVideoPackagingMode = "mosaic" | "frame_sequence";
+type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
-const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic";
+const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_3x3";
 
 interface InferenceGroup {
   id: string;
@@ -894,15 +894,42 @@ const normalizeAgentVideoPackagingMode = (
       normalized === "frame-sequence" ||
       normalized === "full_frame" ||
       normalized === "full-frame" ||
-      normalized === "frames"
+      normalized === "frames" ||
+      normalized === "high_resolution" ||
+      normalized === "high-resolution" ||
+      normalized === "high resolution"
     ) {
       return "frame_sequence";
     }
-    if (normalized === "mosaic") {
-      return "mosaic";
+    if (
+      normalized === "mosaic_2x2" ||
+      normalized === "mosaic-2x2" ||
+      normalized === "2x2" ||
+      normalized === "standard_resolution" ||
+      normalized === "standard-resolution" ||
+      normalized === "standard resolution"
+    ) {
+      return "mosaic_2x2";
+    }
+    if (
+      normalized === "mosaic" ||
+      normalized === "mosaic_3x3" ||
+      normalized === "mosaic-3x3" ||
+      normalized === "3x3" ||
+      normalized === "compact_resolution" ||
+      normalized === "compact-resolution" ||
+      normalized === "compact resolution"
+    ) {
+      return "mosaic_3x3";
     }
   }
   return fallback;
+};
+
+const getAgentVideoPackagingModeLabel = (mode: AgentVideoPackagingMode): string => {
+  if (mode === "frame_sequence") return "High Resolution";
+  if (mode === "mosaic_2x2") return "Standard Resolution";
+  return "Compact Resolution";
 };
 
 const applyAgentExecutionConstraints = (
@@ -7352,13 +7379,19 @@ function StepCard({
                                   }
                                   className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
                                 >
-                                  <option value="mosaic">Mosaic (recommended)</option>
-                                  <option value="frame_sequence">Full frame</option>
+                                  <option value="frame_sequence">
+                                    {getAgentVideoPackagingModeLabel("frame_sequence")}
+                                  </option>
+                                  <option value="mosaic_2x2">
+                                    {getAgentVideoPackagingModeLabel("mosaic_2x2")}
+                                  </option>
+                                  <option value="mosaic_3x3">
+                                    {getAgentVideoPackagingModeLabel("mosaic_3x3")}
+                                  </option>
                                 </select>
                                 <p className="text-xs text-gray-400">
-                                  Mosaic is much cheaper. Full frame sends frames individually and
-                                  is better for finer, more precise analysis such as facial
-                                  recognition.
+                                  Standard Resolution uses a 2x2 mosaic. Compact Resolution uses a
+                                  3x3 mosaic and sends fewer image inputs than High Resolution.
                                 </p>
                               </div>
                             ) : null}
@@ -8652,9 +8685,9 @@ function StepCard({
                           <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                             <div className="text-[10px] uppercase tracking-widest text-gray-400">Video packaging</div>
                             <div className="text-gray-100">
-                              {selectedGroupSourceOption.videoPackagingMode === "frame_sequence"
-                                ? "Full frame"
-                                : "Mosaic"}
+                              {getAgentVideoPackagingModeLabel(
+                                selectedGroupSourceOption.videoPackagingMode
+                              )}
                             </div>
                           </div>
                         ) : null}

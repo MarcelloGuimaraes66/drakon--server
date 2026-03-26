@@ -110,10 +110,10 @@ const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
 type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
-type CameraVideoPackagingMode = "mosaic" | "frame_sequence";
+type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
 const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
-const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic";
+const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_3x3";
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
@@ -213,12 +213,33 @@ const normalizeVideoPackagingMode = (
       normalized === "frame-sequence" ||
       normalized === "full_frame" ||
       normalized === "full-frame" ||
-      normalized === "frames"
+      normalized === "frames" ||
+      normalized === "high_resolution" ||
+      normalized === "high-resolution" ||
+      normalized === "high resolution"
     ) {
       return "frame_sequence";
     }
-    if (normalized === "mosaic") {
-      return "mosaic";
+    if (
+      normalized === "mosaic_2x2" ||
+      normalized === "mosaic-2x2" ||
+      normalized === "2x2" ||
+      normalized === "standard_resolution" ||
+      normalized === "standard-resolution" ||
+      normalized === "standard resolution"
+    ) {
+      return "mosaic_2x2";
+    }
+    if (
+      normalized === "mosaic" ||
+      normalized === "mosaic_3x3" ||
+      normalized === "mosaic-3x3" ||
+      normalized === "3x3" ||
+      normalized === "compact_resolution" ||
+      normalized === "compact-resolution" ||
+      normalized === "compact resolution"
+    ) {
+      return "mosaic_3x3";
     }
   }
   return fallback;
@@ -2008,11 +2029,12 @@ export default function CameraCustomAgentEditorModal({
                       }
                       className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
                     >
-                      <option value="mosaic">Mosaic (recommended)</option>
-                      <option value="frame_sequence">Full frame</option>
+                      <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
+                      <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
+                      <option value="mosaic_3x3">{getVideoPackagingModeLabel("mosaic_3x3")}</option>
                     </select>
                     <p className="text-xs text-gray-400">
-                      Mosaic is much cheaper. Full frame sends frames individually and is better for finer, more precise analysis such as facial recognition.
+                      Standard Resolution uses a 2x2 mosaic. Compact Resolution uses a 3x3 mosaic and sends fewer image inputs than High Resolution.
                     </p>
                   </div>
                 ) : null}
@@ -2172,3 +2194,8 @@ export default function CameraCustomAgentEditorModal({
     </>
   );
 }
+const getVideoPackagingModeLabel = (mode: CameraVideoPackagingMode): string => {
+  if (mode === "frame_sequence") return "High Resolution";
+  if (mode === "mosaic_2x2") return "Standard Resolution";
+  return "Compact Resolution";
+};

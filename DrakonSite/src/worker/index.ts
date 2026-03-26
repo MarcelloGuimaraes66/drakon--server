@@ -27,12 +27,20 @@ import {
 } from "./jobScheduler";
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
 import { brand } from "@/shared/brand";
+import type {
+  CameraImportApplyResult,
+  CameraImportPreview,
+} from "@/shared/cameraImport";
 import {
   BRAZIL_STATE_NAME_BY_CODE,
   normalizeBrazilStateCode,
   normalizeBrazilStateSelection,
   normalizeCountryCode,
 } from "@/shared/brazilStates";
+import {
+  normalizeImportedPreview,
+  parseCameraImportFile,
+} from "./cameraImport";
 
 // AI agent descriptions mapping
 const ALGORITHM_DESCRIPTIONS: Record<string, string> = {
@@ -58,6 +66,168 @@ const ALGORITHM_DISPLAY_NAMES: Record<string, string> = {
   abandoned: "Abandoned Object/Bag",
   reid: "ReID (Person Identification)",
 };
+
+function normalizeCameraStartSummaryText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function humanizeAlgorithmTypeLabel(algorithmType: string): string {
+  const normalized = algorithmType
+    .replace(/^custom_/i, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return "";
+  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function summarizeRunningAnalytics(enabledAlgorithms: any[]): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+
+  for (const algorithm of enabledAlgorithms || []) {
+    const configJson =
+      algorithm?.config_json && typeof algorithm.config_json === "object"
+        ? (algorithm.config_json as Record<string, unknown>)
+        : null;
+    const configDisplayName = normalizeCameraStartSummaryText(configJson?.display_name);
+    const algorithmType = normalizeCameraStartSummaryText(algorithm?.algorithm_type).toLowerCase();
+    const name =
+      configDisplayName ||
+      ALGORITHM_DISPLAY_NAMES[algorithmType] ||
+      humanizeAlgorithmTypeLabel(algorithmType);
+
+    if (!name) continue;
+
+    const dedupeKey = name.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    names.push(name);
+  }
+
+  return names;
+}
+
+function maskDelimitedRtspParamValue(text: string, needle: string): string {
+  let output = text;
+  let cursor = 0;
+
+  while (cursor < output.length) {
+    const position = output.indexOf(needle, cursor);
+    if (position === -1) break;
+
+    const valueStart = position + needle.length;
+    let valueEnd = valueStart;
+    while (
+      valueEnd < output.length &&
+      !" \t\r\n,|&;)]}\"'".includes(output[valueEnd] || "")
+    ) {
+      valueEnd += 1;
+    }
+
+    if (valueEnd > valueStart) {
+      output = `${output.slice(0, valueStart)}****${output.slice(valueEnd)}`;
+      cursor = valueStart + 4;
+    } else {
+      cursor = valueStart;
+    }
+  }
+
+  return output;
+}
+
+function maskRtspSensitiveInfo(value: unknown): string {
+  if (typeof value !== "string") return "";
+
+  let output = value;
+  let cursor = 0;
+
+  while (cursor < output.length) {
+    const lowerIndex = output.indexOf("rtsp://", cursor);
+    const upperIndex = output.indexOf("RTSP://", cursor);
+    let start = -1;
+
+    if (lowerIndex === -1) {
+      start = upperIndex;
+    } else if (upperIndex === -1) {
+      start = lowerIndex;
+    } else {
+      start = Math.min(lowerIndex, upperIndex);
+    }
+
+    if (start === -1) break;
+
+    let end = start;
+    while (end < output.length && !" \t\r\n\"'<>|,)]}".includes(output[end] || "")) {
+      end += 1;
+    }
+
+    const rawUrl = output.slice(start, end);
+    const maskedUrl = rawUrl.replace(
+      /(rtsp:\/\/)([^/?#\s@]+)@/i,
+      (_match, scheme: string, auth: string) =>
+        `${scheme}${auth.includes(":") ? "***:***" : "***"}@`,
+    );
+
+    output = `${output.slice(0, start)}${maskedUrl}${output.slice(end)}`;
+    cursor = start + maskedUrl.length;
+  }
+
+  for (const needle of [
+    "user=",
+    "USER=",
+    "username=",
+    "USERNAME=",
+    "usuario=",
+    "USUARIO=",
+    "password=",
+    "PASSWORD=",
+    "passwd=",
+    "PASSWD=",
+    "pwd=",
+    "PWD=",
+    "senha=",
+    "SENHA=",
+  ]) {
+    output = maskDelimitedRtspParamValue(output, needle);
+  }
+
+  return output;
+}
+
+function sanitizeCameraConnectionFailureDetails(details: unknown): Record<string, unknown> | null {
+  if (!details || typeof details !== "object" || Array.isArray(details)) {
+    return null;
+  }
+
+  const sanitized: Record<string, unknown> = { ...(details as Record<string, unknown>) };
+
+  for (const key of ["rtsp_url", "rtsp_url_masked", "active_rtsp_url"]) {
+    if (typeof sanitized[key] === "string") {
+      sanitized[key] = maskRtspSensitiveInfo(sanitized[key]);
+    }
+  }
+
+  if (typeof sanitized.error === "string") {
+    sanitized.error = maskRtspSensitiveInfo(sanitized.error);
+  }
+
+  if (sanitized.failure && typeof sanitized.failure === "object" && !Array.isArray(sanitized.failure)) {
+    const failure = { ...(sanitized.failure as Record<string, unknown>) };
+
+    if (typeof failure.technical_detail === "string") {
+      failure.technical_detail = maskRtspSensitiveInfo(failure.technical_detail);
+    }
+    if (typeof failure.technicalDetail === "string") {
+      failure.technicalDetail = maskRtspSensitiveInfo(failure.technicalDetail);
+    }
+
+    sanitized.failure = failure;
+  }
+
+  return sanitized;
+}
 
 async function buildEnabledAlgorithmsPayloadForCamera(
   db: D1Database,
@@ -4284,7 +4454,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE job_step_agents ADD COLUMN model_fps INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(
-          `ALTER TABLE job_step_agents ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic'`
+          `ALTER TABLE job_step_agents ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_3x3'`
         );
         await addColumnIfMissing(
           `ALTER TABLE job_step_agents ADD COLUMN use_temporal_context INTEGER NOT NULL DEFAULT 1`
@@ -4382,7 +4552,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE camera_algorithms ADD COLUMN input_type TEXT DEFAULT 'video'`
         );
         await addColumnIfMissing(
-          `ALTER TABLE camera_algorithms ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic'`
+          `ALTER TABLE camera_algorithms ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_3x3'`
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN inference_model TEXT DEFAULT 'ultra'`
@@ -6648,6 +6818,164 @@ function validateRequiredRtspCameraFields(data: any): string[] {
   if (!normalizeOptionalCameraField(data?.username)) missing.push("username");
   if (!normalizeOptionalCameraField(data?.password)) missing.push("password");
   return missing;
+}
+
+type CameraInsertPayload = {
+  name: string;
+  ip_address?: string | null;
+  rtsp_port?: string | null;
+  manufacturer?: string | null;
+  username?: string | null;
+  password?: string | null;
+  channel?: string | null;
+  subtype?: string | null;
+  connection_method?: "RTSP" | "WEBCAM" | "HTTP" | "ONVIF" | string | null;
+  description?: string | null;
+  street?: string | null;
+  number?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zip_code?: string | null;
+  country?: string | null;
+  retention_days?: number | null;
+  webcam_index?: number | null;
+  allowpublicaccess?: boolean | number | null;
+};
+
+function normalizeCameraNameForConnectionMethod(name: string, connectionMethod: string) {
+  let normalizedName = name.trim();
+  if (connectionMethod === "WEBCAM") {
+    const prefix = "Webcam ";
+    if (!normalizedName.toLowerCase().startsWith(prefix.toLowerCase())) {
+      normalizedName = prefix + normalizedName;
+    }
+  }
+  return normalizedName;
+}
+
+function parseCommandJsonColumn(value: unknown) {
+  if (!value) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value === "object") {
+    return value;
+  }
+  return null;
+}
+
+async function createCameraForUser(
+  db: D1Database,
+  userId: string,
+  input: CameraInsertPayload
+) {
+  const retentionDays = input.retention_days || 1;
+  const validRetentionDays = [1, 3, 7, 15, 30, 90, 180];
+  const normalizedRetention = validRetentionDays.includes(retentionDays)
+    ? retentionDays
+    : 1;
+  const connectionMethod = input.connection_method || "RTSP";
+
+  if (connectionMethod !== "WEBCAM") {
+    const missingRtspFields = validateRequiredRtspCameraFields({
+      ...input,
+      connection_method: connectionMethod,
+    });
+    if (missingRtspFields.length > 0) {
+      throw new Error(`Missing required RTSP fields: ${missingRtspFields.join(", ")}`);
+    }
+  }
+
+  const cameraName = normalizeCameraNameForConnectionMethod(
+    input.name,
+    connectionMethod
+  );
+  const allowPublicAccess = input.allowpublicaccess ? 1 : 0;
+  const normalizedGeo = normalizeCameraGeography(input.state, input.country);
+  const normalizedStructuredDescription = normalizeStructuredCameraDescription(
+    input.description
+  );
+  const rawDescription =
+    typeof input.description === "string" ? input.description.trim() : "";
+  const persistedDescription = normalizedStructuredDescription ?? rawDescription;
+  const descriptionFirstCheckSuccessful = normalizedStructuredDescription ? 1 : 0;
+  const descriptionFirstCheckSuccessAt = normalizedStructuredDescription
+    ? new Date().toISOString()
+    : null;
+
+  const insertResult = await db
+    .prepare(
+      `INSERT INTO cameras (
+        user_id, name, ip_address, rtsp_port, manufacturer, username, password,
+        channel, subtype,
+        connection_method, store_frames, retention_days, description,
+        description_first_check_successful, description_first_check_success_at,
+        street, number, city, state, state_code, zip_code, country, country_code,
+        webcam_index, allowpublicaccess, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+    )
+    .bind(
+      userId,
+      cameraName,
+      connectionMethod === "WEBCAM"
+        ? ""
+        : normalizeCameraTransportField(input.ip_address) ?? "",
+      connectionMethod === "WEBCAM"
+        ? null
+        : normalizeOptionalCameraField(input.rtsp_port),
+      connectionMethod === "WEBCAM"
+        ? "Webcam"
+        : normalizeOptionalCameraField(input.manufacturer),
+      connectionMethod === "WEBCAM"
+        ? null
+        : normalizeOptionalCameraField(input.username),
+      connectionMethod === "WEBCAM"
+        ? null
+        : normalizeOptionalCameraField(input.password),
+      connectionMethod === "WEBCAM"
+        ? null
+        : normalizeOptionalCameraField(input.channel),
+      connectionMethod === "WEBCAM"
+        ? null
+        : normalizeOptionalCameraField(input.subtype),
+      connectionMethod,
+      1,
+      normalizedRetention,
+      persistedDescription,
+      descriptionFirstCheckSuccessful,
+      descriptionFirstCheckSuccessAt,
+      input.street || "",
+      input.number || "",
+      input.city || "",
+      normalizedGeo.stateText,
+      normalizedGeo.stateCode,
+      input.zip_code || "",
+      normalizedGeo.countryText,
+      normalizedGeo.countryCode,
+      connectionMethod === "WEBCAM" ? input.webcam_index ?? null : null,
+      allowPublicAccess
+    )
+    .run();
+
+  const camera = await db
+    .prepare("SELECT * FROM cameras WHERE id = ?")
+    .bind(insertResult.meta.last_row_id)
+    .first();
+
+  await db
+    .prepare(
+      `INSERT INTO commands (user_id, camera_id, command_type, payload)
+       VALUES (?, ?, 'add_camera', ?)`
+    )
+    .bind(userId, insertResult.meta.last_row_id, JSON.stringify(camera))
+    .run();
+
+  return camera;
 }
 
 // Helper to clear local session
@@ -10664,104 +10992,284 @@ app.post("/api/cameras", anyAuthMiddleware, zValidator("json", CreateCameraSchem
   const data = c.req.valid("json");
   
   console.log("[POST /api/cameras] Received payload:", JSON.stringify(data, null, 2));
-
-  // Ensure store_frames is always true and retention_days is valid
-  const retentionDays = data.retention_days || 1;
-  const validRetentionDays = [1, 3, 7, 15, 30, 90, 180];
-  const normalizedRetention = validRetentionDays.includes(retentionDays) ? retentionDays : 1;
-
-  // Determine connection method
-  const connectionMethod = data.connection_method || "RTSP";
-
-  if (connectionMethod !== "WEBCAM") {
-    const missingRtspFields = validateRequiredRtspCameraFields({
-      ...data,
-      connection_method: connectionMethod,
-    });
-    if (missingRtspFields.length > 0) {
+  try {
+    const camera = await createCameraForUser(c.env.DB, user.id, data);
+    return c.json(camera, 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to create camera";
+    if (message.startsWith("Missing required RTSP fields:")) {
+      const missingFields = message
+        .replace("Missing required RTSP fields:", "")
+        .split(",")
+        .map((field) => field.trim())
+        .filter(Boolean);
       return c.json(
         {
-          error: `Missing required RTSP fields: ${missingRtspFields.join(", ")}`,
-          missing_fields: missingRtspFields,
+          error: message,
+          missing_fields: missingFields,
         },
         400
       );
     }
+
+    console.error("[POST /api/cameras] Failed to create camera:", error);
+    return c.json({ error: message }, 500);
+  }
+});
+
+app.post("/api/camera-imports/preview", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const formData = await c.req.formData().catch(() => null);
+  if (!formData) {
+    return c.json({ error: "Invalid form data" }, 400);
   }
 
-  // Normalize name for webcam cameras: ensure "Webcam " prefix
-  let cameraName = data.name.trim();
-  if (connectionMethod === "WEBCAM") {
-    const prefix = "Webcam ";
-    if (!cameraName.toLowerCase().startsWith(prefix.toLowerCase())) {
-      cameraName = prefix + cameraName;
+  const fileValue = formData.get("file");
+  if (!(fileValue instanceof File)) {
+    return c.json({ error: "A file is required for import preview" }, 400);
+  }
+
+  const pairing = await c.env.DB
+    .prepare(
+      `SELECT id
+       FROM exe_pairings
+       WHERE user_id = ? AND status = 'connected'
+       ORDER BY last_seen_at DESC
+       LIMIT 1`
+    )
+    .bind(user.id)
+    .first();
+  if (!pairing) {
+    return c.json(
+      {
+        error:
+          "No EXE connected. Camera import preview requires the desktop agent online so Qwen can normalize the file.",
+      },
+      409
+    );
+  }
+
+  try {
+    const parsedFile = await parseCameraImportFile(fileValue);
+    const userCountryCode =
+      normalizeCountryCode((user as any)?.country_code, null) || "BR";
+    const now = new Date().toISOString();
+    const payload = {
+      ...parsedFile,
+      user_country_code: userCountryCode,
+    };
+
+    const insertResult = await c.env.DB
+      .prepare(
+        `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
+         VALUES (?, NULL, 'camera_import_preview', ?, 'pending', ?, ?)`
+      )
+      .bind(user.id, JSON.stringify(payload), now, now)
+      .run();
+
+    const commandId = Number(insertResult.meta.last_row_id || 0);
+    if (!Number.isInteger(commandId) || commandId <= 0) {
+      return c.json({ error: "Failed to create camera import preview command" }, 500);
+    }
+
+    return c.json(
+      {
+        command_id: commandId,
+        status: "pending",
+        file_name: parsedFile.file_name,
+        source_format: parsedFile.source_format,
+        total_rows_detected: parsedFile.total_rows_detected,
+        rows_sent_to_llm: parsedFile.rows.length,
+        global_warnings: parsedFile.global_warnings,
+      },
+      202
+    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to parse import file";
+    return c.json({ error: message }, 400);
+  }
+});
+
+app.get("/api/camera-imports/:commandId", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const commandId = Number(c.req.param("commandId"));
+
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return c.json({ error: "Invalid command id" }, 400);
+  }
+
+  const command = await c.env.DB
+    .prepare(
+      `SELECT id, status, payload, result, created_at, updated_at
+       FROM commands
+       WHERE id = ? AND user_id = ? AND command_type = 'camera_import_preview'
+       LIMIT 1`
+    )
+    .bind(commandId, user.id)
+    .first();
+  if (!command) {
+    return c.json({ error: "Camera import preview not found" }, 404);
+  }
+
+  const payload = parseCommandJsonColumn((command as any).payload) || {};
+  const result = parseCommandJsonColumn((command as any).result) || {};
+  const userCountryCode =
+    normalizeCountryCode((user as any)?.country_code, null) || "BR";
+  const rawPreview =
+    result && typeof result === "object" && result.preview
+      ? (result.preview as CameraImportPreview)
+      : null;
+  const preview = rawPreview
+    ? normalizeImportedPreview(
+        rawPreview,
+        userCountryCode,
+        Array.isArray(payload.global_warnings)
+          ? payload.global_warnings.filter(
+              (warning: unknown): warning is string => typeof warning === "string"
+            )
+          : []
+      )
+    : null;
+
+  return c.json({
+    command_id: Number((command as any).id || 0),
+    status: String((command as any).status || "pending"),
+    created_at: (command as any).created_at || null,
+    updated_at: (command as any).updated_at || null,
+    file_name: typeof payload.file_name === "string" ? payload.file_name : null,
+    source_format: typeof payload.source_format === "string" ? payload.source_format : null,
+    total_rows_detected:
+      typeof payload.total_rows_detected === "number" ? payload.total_rows_detected : null,
+    rows_sent_to_llm: Array.isArray(payload.rows) ? payload.rows.length : null,
+    preview,
+    apply: result.apply || null,
+    error: typeof result.error === "string" ? result.error : null,
+  });
+});
+
+app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const commandId = Number(c.req.param("commandId"));
+
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return c.json({ error: "Invalid command id" }, 400);
+  }
+
+  const command = await c.env.DB
+    .prepare(
+      `SELECT id, status, result
+       FROM commands
+       WHERE id = ? AND user_id = ? AND command_type = 'camera_import_preview'
+       LIMIT 1`
+    )
+    .bind(commandId, user.id)
+    .first();
+  if (!command) {
+    return c.json({ error: "Camera import preview not found" }, 404);
+  }
+
+  const status = String((command as any).status || "pending").trim().toLowerCase();
+  if (status !== "completed") {
+    return c.json(
+      { error: "Camera import preview is not ready yet" },
+      409
+    );
+  }
+
+  const result = parseCommandJsonColumn((command as any).result);
+  const preview = (result as { preview?: CameraImportPreview } | null)?.preview;
+  if (!preview || !Array.isArray(preview.candidates)) {
+    return c.json({ error: "Camera import preview result is missing candidates" }, 409);
+  }
+
+  if (result && typeof result === "object" && "apply" in result && result.apply) {
+    return c.json(result.apply);
+  }
+
+  const userCountryCode =
+    normalizeCountryCode((user as any)?.country_code, null) || "BR";
+  const normalizedPreview = normalizeImportedPreview(preview, userCountryCode);
+  const readyCandidates = normalizedPreview.candidates.filter(
+    (candidate) => candidate.can_create
+  );
+
+  const createdCameraIds: number[] = [];
+  const failedCandidates: Array<{
+    source_index: number;
+    source_reference: string;
+    reason: string;
+  }> = [];
+
+  for (const candidate of readyCandidates) {
+    try {
+      const created = await createCameraForUser(c.env.DB, user.id, {
+        name: candidate.name,
+        ip_address: candidate.ip_address,
+        rtsp_port: candidate.rtsp_port,
+        manufacturer: candidate.manufacturer,
+        username: candidate.username,
+        password: candidate.password,
+        channel: candidate.channel || null,
+        subtype: candidate.subtype || null,
+        connection_method: candidate.connection_method,
+        description: candidate.description || null,
+        street: candidate.street,
+        number: candidate.number,
+        city: candidate.city,
+        state: candidate.state,
+        zip_code: candidate.zip_code,
+        country: candidate.country,
+        retention_days: 1,
+        allowpublicaccess: false,
+      });
+      const createdId = Number((created as any)?.id || 0);
+      if (Number.isInteger(createdId) && createdId > 0) {
+        createdCameraIds.push(createdId);
+      }
+    } catch (error) {
+      failedCandidates.push({
+        source_index: candidate.source_index,
+        source_reference: candidate.source_reference,
+        reason: error instanceof Error ? error.message : "Failed to create camera",
+      });
     }
   }
 
-  const allowPublicAccess = data.allowpublicaccess ? 1 : 0;
-  const normalizedGeo = normalizeCameraGeography(data.state, data.country);
-  const normalizedStructuredDescription = normalizeStructuredCameraDescription(data.description);
-  const rawDescription =
-    typeof data.description === "string" ? data.description.trim() : "";
-  const persistedDescription = normalizedStructuredDescription ?? rawDescription;
-  const descriptionFirstCheckSuccessful = normalizedStructuredDescription ? 1 : 0;
-  const descriptionFirstCheckSuccessAt = normalizedStructuredDescription
-    ? new Date().toISOString()
-    : null;
+  const applyResult: CameraImportApplyResult & {
+    failed_candidates: Array<{
+      source_index: number;
+      source_reference: string;
+      reason: string;
+    }>;
+  } = {
+    command_id: commandId,
+    applied_at: new Date().toISOString(),
+    created_count: createdCameraIds.length,
+    skipped_count: normalizedPreview.candidates.length - createdCameraIds.length,
+    created_camera_ids: createdCameraIds,
+    duplicate_source_indexes: [],
+    failed_candidates: failedCandidates,
+  };
 
-  const result = await c.env.DB.prepare(
-    `INSERT INTO cameras (
-      user_id, name, ip_address, rtsp_port, manufacturer, username, password,
-      channel, subtype,
-      connection_method, store_frames, retention_days, description,
-      description_first_check_successful, description_first_check_success_at,
-      street, number, city, state, state_code, zip_code, country, country_code,
-      webcam_index, allowpublicaccess, updated_at
+  await c.env.DB
+    .prepare(
+      `UPDATE commands
+       SET result = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
-  )
     .bind(
-      user.id,
-      cameraName,
-      connectionMethod === "WEBCAM" ? "" : (normalizeCameraTransportField(data.ip_address) ?? ""),
-      connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.rtsp_port),
-      connectionMethod === "WEBCAM" ? "Webcam" : normalizeOptionalCameraField(data.manufacturer),
-      connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.username),
-      connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.password),
-      connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.channel),
-      connectionMethod === "WEBCAM" ? null : normalizeOptionalCameraField(data.subtype),
-      connectionMethod,
-      1, // Always enable frame storage
-      normalizedRetention,
-      persistedDescription,
-      descriptionFirstCheckSuccessful,
-      descriptionFirstCheckSuccessAt,
-      data.street,
-      data.number,
-      data.city,
-      normalizedGeo.stateText,
-      normalizedGeo.stateCode,
-      data.zip_code,
-      normalizedGeo.countryText,
-      normalizedGeo.countryCode,
-      connectionMethod === "WEBCAM" ? (data.webcam_index ?? null) : null,
-      allowPublicAccess
+      JSON.stringify({
+        ...(result && typeof result === "object" ? result : {}),
+        preview: normalizedPreview,
+        apply: applyResult,
+      }),
+      commandId,
+      user.id
     )
     .run();
 
-  const camera = await c.env.DB.prepare("SELECT * FROM cameras WHERE id = ?")
-    .bind(result.meta.last_row_id)
-    .first();
-
-  // Create command for EXE
-  await c.env.DB.prepare(
-    `INSERT INTO commands (user_id, camera_id, command_type, payload)
-     VALUES (?, ?, 'add_camera', ?)`
-  )
-    .bind(user.id, result.meta.last_row_id, JSON.stringify(camera))
-    .run();
-
-  return c.json(camera, 201);
+  return c.json(applyResult);
 });
 
 app.get("/api/cameras/:id", anyAuthMiddleware, async (c) => {
@@ -11100,6 +11608,8 @@ async function enqueueStartCameraCommand(
 ): Promise<{
   success: boolean;
   agents_disabled_no_subscription?: boolean;
+  camera_name?: string;
+  running_analytics?: string[];
   error?: string;
   error_code?: string;
 }> {
@@ -11262,9 +11772,10 @@ async function enqueueStartCameraCommand(
 
     const now = new Date().toISOString();
 
-    // Update is_service_running and is_online to 1 BEFORE sending command
+    // Mark the service as running immediately, but keep camera offline until the agent
+    // confirms the stream is actually online via camera_started/camera_online.
     await env.DB.prepare(
-      "UPDATE cameras SET is_service_running = 1, is_online = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
+      "UPDATE cameras SET is_service_running = 1, is_online = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
     )
       .bind(cameraId, userId)
       .run();
@@ -11292,6 +11803,9 @@ async function enqueueStartCameraCommand(
     return { 
       success: true,
       agents_disabled_no_subscription: agentsDisabledDueToNoSubscription,
+      camera_name:
+        normalizeCameraStartSummaryText(cam.name) || `Camera #${cameraId}`,
+      running_analytics: summarizeRunningAnalytics(enabledAlgorithms),
     };
   } catch (error) {
     console.error(`[START CAMERA] Error for camera ${cameraId}:`, error);
@@ -11382,6 +11896,8 @@ app.post("/api/cameras/:cameraId/start", anyAuthMiddleware, async (c) => {
   return c.json({ 
     success: true,
     agents_disabled_no_subscription: result.agents_disabled_no_subscription,
+    camera_name: result.camera_name ?? null,
+    running_analytics: Array.isArray(result.running_analytics) ? result.running_analytics : [],
   });
 });
 
@@ -21349,6 +21865,12 @@ app.post("/api/agent/events", async (c) => {
   let message = body.message ?? "";
   let details = body.details || null;
   const now = new Date().toISOString();
+  if (eventType === "camera_connection_failed") {
+    if (typeof message === "string") {
+      message = maskRtspSensitiveInfo(message);
+    }
+    details = sanitizeCameraConnectionFailureDetails(details);
+  }
   const detailsObject =
     details && typeof details === "object" && !Array.isArray(details)
       ? (details as Record<string, unknown>)
@@ -21362,9 +21884,8 @@ app.post("/api/agent/events", async (c) => {
     detailsObject.temporary_session === 1 ||
     detailsObject.temporary_session === "1" ||
     detailsObject.temporary_session === "true";
-  const isDrakonFindTemporaryConnectionFailure =
+  const isDrakonFindTemporarySessionEvent =
     !!cameraId &&
-    eventType === "camera_connection_failed" &&
     eventStartOrigin === "drakon_find" &&
     isTemporarySession;
 
@@ -22536,13 +23057,30 @@ app.post("/api/agent/events", async (c) => {
 
   eventId = eventResult.meta.last_row_id;
 
-  // Insert notification for AI detections
-  if (eventType === "ai_detection" && cameraId) {
-    const algoType = details?.algo_type || "Detection";
-    const cameraName = details?.camera_name || `Camera #${cameraId}`;
-    const notificationMessage = message || `${algoType} on ${cameraName}`;
-    const detectedAt = details?.timestamp_iso || now;
+  const readTrimmedString = (...values: unknown[]): string => {
+    for (const value of values) {
+      if (typeof value !== "string") continue;
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    return "";
+  };
 
+  const insertBellNotification = async ({
+    type,
+    title,
+    message,
+    imageKey = null,
+    videoKey = null,
+    mediaType = null,
+  }: {
+    type: string;
+    title: string;
+    message: string | null;
+    imageKey?: string | null;
+    videoKey?: string | null;
+    mediaType?: string | null;
+  }) => {
     await c.env.DB.prepare(
       `INSERT INTO notifications (user_id, camera_id, type, title, message, image_key, video_key, media_type, event_id, created_at, is_read)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
@@ -22550,9 +23088,9 @@ app.post("/api/agent/events", async (c) => {
       .bind(
         userId,
         cameraId,
-        "ai_detection",
-        "AI Detection",
-        notificationMessage,
+        type,
+        title,
+        message,
         imageKey,
         videoKey,
         mediaType,
@@ -22560,6 +23098,39 @@ app.post("/api/agent/events", async (c) => {
         now
       )
       .run();
+  };
+
+  const readJobNotificationContext = () => {
+    const jobDetails =
+      detailsObject.job && typeof detailsObject.job === "object" && !Array.isArray(detailsObject.job)
+        ? (detailsObject.job as Record<string, unknown>)
+        : null;
+    const parsedJobId = Number(detailsObject.job_id ?? jobDetails?.id ?? detailsObject.jobId);
+    const jobId =
+      Number.isInteger(parsedJobId) && parsedJobId > 0 ? parsedJobId : null;
+    const jobName = readTrimmedString(detailsObject.job_name, jobDetails?.name);
+    return {
+      jobId,
+      jobName,
+      hasJobId: jobId !== null,
+    };
+  };
+
+  // Insert notification for AI detections
+  if (eventType === "ai_detection" && cameraId) {
+    const algoType = details?.algo_type || "Detection";
+    const cameraName = details?.camera_name || `Camera #${cameraId}`;
+    const notificationMessage = message || `${algoType} on ${cameraName}`;
+    const detectedAt = details?.timestamp_iso || now;
+
+    await insertBellNotification({
+      type: "ai_detection",
+      title: "AI Detection",
+      message: notificationMessage,
+      imageKey,
+      videoKey,
+      mediaType,
+    });
 
     // Insert detection record
     if (imageKey || videoKey) {
@@ -22583,45 +23154,122 @@ app.post("/api/agent/events", async (c) => {
     }
   }
 
-  // Insert notification for stalled jobs so it appears in the bell dropdown.
+  if (eventType === "camera_connection_failed" && cameraId) {
+    const failureDetails =
+      detailsObject.failure &&
+      typeof detailsObject.failure === "object" &&
+      !Array.isArray(detailsObject.failure)
+        ? (detailsObject.failure as Record<string, unknown>)
+        : null;
+    const failurePhase = readTrimmedString(
+      failureDetails?.phase,
+      detailsObject.failure_phase
+    ).toLowerCase();
+    const notificationKind = readTrimmedString(
+      detailsObject.notification_kind
+    ).toLowerCase();
+    const title =
+      notificationKind === "reminder" && failurePhase === "startup"
+        ? "Still Connecting to Camera"
+        : notificationKind === "reminder" && failurePhase === "runtime"
+        ? "Still Reconnecting to Camera"
+        : failurePhase === "startup"
+        ? "Camera Start Failed"
+        : failurePhase === "runtime"
+        ? "Camera Connection Lost"
+        : "Camera Offline";
+    const notificationMessage =
+      readTrimmedString(message) ||
+      "Failed to connect to camera. Please check the RTSP settings and credentials.";
+
+    await insertBellNotification({
+      type: "camera_connection_failed",
+      title,
+      message: notificationMessage,
+    });
+  }
+
   if (eventType === "job_staled") {
-    const detailsObj = details && typeof details === "object" ? details : {};
-    const parsedJobId = Number(
-      (detailsObj as any).job_id ??
-        (detailsObj as any).job?.id ??
-        (detailsObj as any).jobId
-    );
-    const jobNameRaw =
-      typeof (detailsObj as any).job_name === "string"
-        ? (detailsObj as any).job_name
-        : typeof (detailsObj as any).job?.name === "string"
-        ? (detailsObj as any).job?.name
-        : "";
-    const jobName = jobNameRaw.trim();
-    const hasJobId = Number.isInteger(parsedJobId) && parsedJobId > 0;
+    const { jobId, jobName, hasJobId } = readJobNotificationContext();
     const title = jobName ? `Job Stalled: ${jobName}` : "Job Stalled";
     const fallbackMessage = jobName
       ? `Job ${jobName} stalled and was stopped automatically.`
       : hasJobId
-      ? `Job #${parsedJobId} stalled and was stopped automatically.`
+      ? `Job #${jobId} stalled and was stopped automatically.`
       : "A job stalled and was stopped automatically.";
     const notificationMessage =
-      typeof message === "string" && message.trim() ? message.trim() : fallbackMessage;
+      readTrimmedString(message) || fallbackMessage;
 
-    await c.env.DB.prepare(
-      `INSERT INTO notifications (user_id, camera_id, type, title, message, event_id, created_at, is_read)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
-    )
-      .bind(
-        userId,
-        cameraId,
-        "job_staled",
-        title,
-        notificationMessage,
-        eventId,
-        now
-      )
-      .run();
+    await insertBellNotification({
+      type: "job_staled",
+      title,
+      message: notificationMessage,
+    });
+  }
+
+  if (eventType === "job_start_blocked") {
+    const { jobId, jobName, hasJobId } = readJobNotificationContext();
+    const title = jobName ? `Job Start Blocked: ${jobName}` : "Job Start Blocked";
+    const fallbackMessage = jobName
+      ? `Job "${jobName}" could not start because OpenAI API key is not configured.`
+      : hasJobId
+      ? `Job #${jobId} could not start because OpenAI API key is not configured.`
+      : "A job could not start because OpenAI API key is not configured.";
+    const notificationMessage =
+      readTrimmedString(message) || fallbackMessage;
+
+    await insertBellNotification({
+      type: "job_start_blocked",
+      title,
+      message: notificationMessage,
+    });
+  }
+
+  if (eventType === "job_started") {
+    const { jobId, jobName, hasJobId } = readJobNotificationContext();
+    const title = jobName ? `Job Started: ${jobName}` : "Job Started";
+    const fallbackMessage = jobName
+      ? `Job "${jobName}" started successfully.`
+      : hasJobId
+      ? `Job #${jobId} started successfully.`
+      : "A job started successfully.";
+    const notificationMessage =
+      readTrimmedString(message) || fallbackMessage;
+
+    await insertBellNotification({
+      type: "job_started",
+      title,
+      message: notificationMessage,
+    });
+  }
+
+  if (eventType === "agent_api_error") {
+    const source = readTrimmedString(detailsObject.source).toLowerCase();
+    const model = readTrimmedString(detailsObject.model);
+    const apiErrorMessage = readTrimmedString(detailsObject.api_error_message);
+    const rawError = readTrimmedString(detailsObject.raw_error);
+    const sourceLabel = source.includes("chat")
+      ? "Chat"
+      : source.includes("job_or_camera")
+      ? "Jobs / AI Agents"
+      : source.includes("group") || source.includes("job")
+      ? "Jobs"
+      : source.includes("camera")
+      ? "AI Agents"
+      : "Inference";
+    const title = model
+      ? `AI API Error (${sourceLabel} - ${model})`
+      : `AI API Error (${sourceLabel})`;
+    const fallbackMessage =
+      apiErrorMessage || rawError || "OpenAI API request failed during inference.";
+    const notificationMessage =
+      readTrimmedString(message) || fallbackMessage;
+
+    await insertBellNotification({
+      type: "agent_api_error",
+      title,
+      message: notificationMessage,
+    });
   }
 
   // Handle job runtime state updates based on event type
@@ -22712,24 +23360,30 @@ app.post("/api/agent/events", async (c) => {
 
   // Set camera online when it starts successfully
   if (cameraId && (eventType === "camera_started" || eventType === "camera_online")) {
-    await c.env.DB.prepare(
-      `UPDATE cameras
-       SET is_online = 1, is_service_running = 1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ?`
-    )
-      .bind(cameraId, userId)
-      .run();
+    if (isDrakonFindTemporarySessionEvent) {
+      console.log(
+        `[CAMERA STATE] Skipped online state mutation for temporary Drakon Find session on camera ${cameraId}`
+      );
+    } else {
+      await c.env.DB.prepare(
+        `UPDATE cameras
+         SET is_online = 1, is_service_running = 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`
+      )
+        .bind(cameraId, userId)
+        .run();
+    }
   }
 
-  // Auto-stop camera if connection failed.
+  // Mark camera offline, but keep the service running so the agent can reconnect forever.
   if (cameraId && eventType === "camera_connection_failed") {
-    if (isDrakonFindTemporaryConnectionFailure) {
+    if (isDrakonFindTemporarySessionEvent) {
       console.log(
-        `[COMMAND] Skipped stop_camera and camera state mutation for temporary Drakon Find session on camera ${cameraId}`
+        `[CAMERA STATE] Skipped offline state mutation for temporary Drakon Find session on camera ${cameraId}`
       );
       return c.json({
         success: true,
-        skipped_stop_camera: true,
+        skipped_offline_mutation: true,
         temporary_session: true,
         start_origin: eventStartOrigin,
       });
@@ -22744,10 +23398,10 @@ app.post("/api/agent/events", async (c) => {
 
     const currentThumbnailUrl = camera ? (camera as any).thumbnail_url : null;
 
-    // Update camera status: set offline, stop service, and clear thumbnail
+    // Update camera status: set offline and clear stale thumbnail, but do not stop the service.
     await c.env.DB.prepare(
       `UPDATE cameras
-       SET is_online = 0, is_service_running = 0, thumbnail_url = NULL, updated_at = CURRENT_TIMESTAMP
+       SET is_online = 0, thumbnail_url = NULL, last_thumbnail_update = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND user_id = ?`
     )
       .bind(cameraId, userId)
@@ -22763,35 +23417,9 @@ app.post("/api/agent/events", async (c) => {
       }
     }
 
-    // Check if we already have a pending stop_camera command to avoid duplicates
-    const pendingStopCommand = await c.env.DB.prepare(
-      `SELECT id FROM commands
-       WHERE user_id = ? AND camera_id = ? AND command_type = 'stop_camera' AND status = 'pending'
-       ORDER BY created_at DESC
-       LIMIT 1`
-    )
-      .bind(userId, cameraId)
-      .first();
-
-    if (!pendingStopCommand) {
-      // Send stop_camera command to EXE (only if no pending stop exists)
-      await c.env.DB.prepare(
-        `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-         VALUES (?, ?, 'stop_camera', ?, 'pending', ?, ?)`
-      )
-        .bind(
-          userId,
-          cameraId,
-          JSON.stringify({ camera_id: cameraId }),
-          now,
-          now
-        )
-        .run();
-      
-      console.log(`[COMMAND] Enqueued stop_camera for camera ${cameraId}`);
-    } else {
-      console.log(`[COMMAND] Skipped duplicate stop_camera command for camera ${cameraId}`);
-    }
+    console.log(
+      `[CAMERA STATE] Camera ${cameraId} marked offline; service remains running for automatic reconnection`
+    );
   }
 
   return c.json({ success: true });
@@ -24957,7 +25585,7 @@ app.delete("/api/jobs/:id", anyAuthMiddleware, async (c) => {
 
 type JobStepInputType = "video" | "image";
 type JobStepInferenceModel = "legacy" | "pro" | "ultra" | "core";
-type VideoPackagingMode = "mosaic" | "frame_sequence";
+type VideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_JOB_STEP_INFERENCE_MODEL: JobStepInferenceModel = "ultra";
 type JobStepRunEverySeconds = 10 | 60;
 const FIXED_JOB_STEP_RUN_EVERY_SECONDS: JobStepRunEverySeconds = 60;
@@ -25002,7 +25630,7 @@ const normalizeJobStepInputType = (value: unknown): JobStepInputType | null => {
 
 const normalizeVideoPackagingMode = (
   value: unknown,
-  fallback: VideoPackagingMode = "mosaic"
+  fallback: VideoPackagingMode = "mosaic_3x3"
 ): VideoPackagingMode => {
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
@@ -25011,12 +25639,33 @@ const normalizeVideoPackagingMode = (
       normalized === "frame-sequence" ||
       normalized === "full_frame" ||
       normalized === "full-frame" ||
-      normalized === "frames"
+      normalized === "frames" ||
+      normalized === "high_resolution" ||
+      normalized === "high-resolution" ||
+      normalized === "high resolution"
     ) {
       return "frame_sequence";
     }
-    if (normalized === "mosaic") {
-      return "mosaic";
+    if (
+      normalized === "mosaic_2x2" ||
+      normalized === "mosaic-2x2" ||
+      normalized === "2x2" ||
+      normalized === "standard_resolution" ||
+      normalized === "standard-resolution" ||
+      normalized === "standard resolution"
+    ) {
+      return "mosaic_2x2";
+    }
+    if (
+      normalized === "mosaic" ||
+      normalized === "mosaic_3x3" ||
+      normalized === "mosaic-3x3" ||
+      normalized === "3x3" ||
+      normalized === "compact_resolution" ||
+      normalized === "compact-resolution" ||
+      normalized === "compact resolution"
+    ) {
+      return "mosaic_3x3";
     }
   }
   return fallback;
@@ -27657,7 +28306,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
   const inputType = requestedInputType || "video";
   const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
-  const videoPackagingMode = requestedVideoPackagingMode || "mosaic";
+  const videoPackagingMode = requestedVideoPackagingMode || "mosaic_3x3";
   const runEvery = requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
   const modelFps = requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
   const runningResolution = requestedRunningResolution ?? null;

@@ -1,6 +1,15 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { Camera, X, AlertCircle, ShieldAlert, AlertTriangle } from "lucide-react";
+import {
+  X,
+  AlertCircle,
+  ShieldAlert,
+  AlertTriangle,
+  WifiOff,
+  CirclePlay,
+  Cpu,
+  Clock3,
+} from "lucide-react";
 
 interface Notification {
   id: number;
@@ -67,10 +76,88 @@ export default function NotificationsDropdown({
     if (type === "ai_detection") {
       return <ShieldAlert className="w-5 h-5 text-red-400" />;
     }
+    if (type === "camera_connection_failed") {
+      return <WifiOff className="w-5 h-5 text-orange-300" />;
+    }
     if (type === "job_staled") {
       return <AlertTriangle className="w-5 h-5 text-amber-400" />;
     }
+    if (type === "job_start_blocked") {
+      return <AlertCircle className="w-5 h-5 text-amber-300" />;
+    }
+    if (type === "job_started") {
+      return <CirclePlay className="w-5 h-5 text-emerald-400" />;
+    }
+    if (type === "agent_api_error") {
+      return <Cpu className="w-5 h-5 text-rose-400" />;
+    }
     return <AlertCircle className="w-5 h-5 text-blue-400" />;
+  };
+
+  const getNotificationRowClass = (type: string) => {
+    if (type === "ai_detection") return "bg-red-500/5";
+    if (type === "camera_connection_failed") return "bg-orange-500/5";
+    if (type === "job_staled" || type === "job_start_blocked") return "bg-amber-500/5";
+    if (type === "job_started") return "bg-emerald-500/5";
+    if (type === "agent_api_error") return "bg-rose-500/5";
+    return "";
+  };
+
+  const getNotificationBadge = (
+    type: string,
+  ): { label: string; className: string } | null => {
+    if (type === "ai_detection") {
+      return {
+        label: "Alert",
+        className: "bg-red-500/20 text-red-400",
+      };
+    }
+    if (type === "camera_connection_failed") {
+      return {
+        label: "Camera",
+        className: "bg-orange-500/20 text-orange-300",
+      };
+    }
+    if (
+      type === "job_staled" ||
+      type === "job_start_blocked" ||
+      type === "job_started"
+    ) {
+      return {
+        label: "Job",
+        className:
+          type === "job_started"
+            ? "bg-emerald-500/20 text-emerald-300"
+            : "bg-amber-500/20 text-amber-300",
+      };
+    }
+    if (type === "agent_api_error") {
+      return {
+        label: "AI",
+        className: "bg-rose-500/20 text-rose-300",
+      };
+    }
+    return null;
+  };
+
+  const getNotificationTarget = (notification: Notification) => {
+    if (notification.type === "ai_detection" && notification.event_id) {
+      return `/events?type=detection&eventId=${notification.event_id}`;
+    }
+    if (notification.type === "camera_connection_failed") {
+      return "/cameras";
+    }
+    if (
+      notification.type === "job_staled" ||
+      notification.type === "job_start_blocked" ||
+      notification.type === "job_started"
+    ) {
+      return "/jobs";
+    }
+    if (notification.type === "agent_api_error") {
+      return notification.camera_id ? "/ai-agents" : "/jobs";
+    }
+    return null;
   };
 
   const formatTimestamp = (isoString: string) => {
@@ -102,16 +189,10 @@ export default function NotificationsDropdown({
       console.error("Failed to mark notification as read:", error);
     }
 
-    // Navigate to Logs & Events if it's a detection notification
-    if (notification.type === "ai_detection" && notification.event_id) {
+    const target = getNotificationTarget(notification);
+    if (target) {
       onClose();
-      navigate(`/events?type=detection&eventId=${notification.event_id}`);
-      return;
-    }
-
-    if (notification.type === "job_staled") {
-      onClose();
-      navigate("/jobs");
+      navigate(target);
     }
   };
 
@@ -151,17 +232,20 @@ export default function NotificationsDropdown({
             </div>
           ) : (
             <div className="divide-y divide-gray-800">
-              {notifications.map((notification) => (
+              {notifications.map((notification) => {
+                const badge = getNotificationBadge(notification.type);
+                const target = getNotificationTarget(notification);
+                const isClickable = !!target;
+
+                return (
                 <div
                   key={notification.id}
-                  onClick={() => handleNotificationClick(notification)}
-                  className={`p-4 hover:bg-gray-800/50 transition-colors cursor-pointer ${
-                    notification.type === "ai_detection"
-                      ? "bg-red-500/5"
-                      : notification.type === "job_staled"
-                      ? "bg-amber-500/5"
-                      : ""
-                  }`}
+                  onClick={() => isClickable && handleNotificationClick(notification)}
+                  className={`p-4 transition-colors ${
+                    isClickable
+                      ? "cursor-pointer hover:bg-gray-800/50"
+                      : "cursor-default"
+                  } ${getNotificationRowClass(notification.type)}`}
                 >
                   <div className="flex gap-3">
                     {/* Icon, thumbnail, or video preview */}
@@ -218,24 +302,23 @@ export default function NotificationsDropdown({
                         <h4 className="text-sm font-semibold text-gray-100">
                           {notification.title}
                         </h4>
-                        {notification.type === "ai_detection" && (
-                          <span className="px-2 py-0.5 bg-red-500/20 text-red-400 text-xs rounded-full whitespace-nowrap">
-                            Alert
-                          </span>
-                        )}
-                        {notification.type === "job_staled" && (
-                          <span className="px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded-full whitespace-nowrap">
-                            Job
+                        {badge && (
+                          <span
+                            className={`px-2 py-0.5 text-xs rounded-full whitespace-nowrap ${badge.className}`}
+                          >
+                            {badge.label}
                           </span>
                         )}
                       </div>
 
-                      <p className="text-sm text-gray-300 mb-1">
-                        {notification.message}
-                      </p>
+                      {notification.message ? (
+                        <p className="text-sm text-gray-300 mb-1">
+                          {notification.message}
+                        </p>
+                      ) : null}
 
                       <div className="flex items-center gap-2 text-xs text-gray-500">
-                        <Camera className="w-3 h-3" />
+                        <Clock3 className="w-3 h-3" />
                         <span>
                           {formatTimestamp(notification.created_at)}
                         </span>
@@ -243,7 +326,7 @@ export default function NotificationsDropdown({
                     </div>
                   </div>
                 </div>
-              ))}
+              )})}
             </div>
           )}
         </div>

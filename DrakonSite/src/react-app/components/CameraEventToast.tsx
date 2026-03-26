@@ -5,10 +5,18 @@ interface Toast {
   cameraId?: number | null;
   cameraName?: string;
   message: string;
+  analytics?: string[];
+  failureCode?: string | null;
+  failureSummary?: string;
+  failureAction?: string;
+  technicalDetail?: string;
+  failurePhase?: "startup" | "runtime" | null;
+  failureConfidence?: number | null;
   title?: string;
   type?:
     | "offline"
     | "online"
+    | "camera_started"
     | "job_staled"
     | "job_start_blocked"
     | "job_started"
@@ -30,38 +38,37 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
         const isJobStaledToast = toastType === "job_staled";
         const isJobStartBlockedToast = toastType === "job_start_blocked";
         const isJobStartedToast = toastType === "job_started";
+        const isCameraStartedToast = toastType === "camera_started";
         const isAgentApiErrorToast = toastType === "agent_api_error";
         const isOnlineToast = toast.type === "online";
         const isAmberJobToast = isJobStaledToast || isJobStartBlockedToast;
+        const isSuccessToast = isJobStartedToast || isOnlineToast || isCameraStartedToast;
+        const hasStructuredOfflineFailure =
+          toastType === "offline" &&
+          (!!toast.failureSummary || !!toast.failureAction || !!toast.technicalDetail);
+        const isLowConfidenceFailure =
+          typeof toast.failureConfidence === "number" && toast.failureConfidence < 0.7;
         const cameraLabel = toast.cameraName || "Camera";
         const cardClass = isAmberJobToast
           ? "bg-gradient-to-br from-amber-900/95 to-amber-950/95 border-amber-700/50 shadow-amber-500/20"
-          : isJobStartedToast
-          ? "bg-gradient-to-br from-emerald-900/95 to-emerald-950/95 border-emerald-700/50 shadow-emerald-500/20"
-          : isOnlineToast
+          : isSuccessToast
           ? "bg-gradient-to-br from-emerald-900/95 to-emerald-950/95 border-emerald-700/50 shadow-emerald-500/20"
           : isAgentApiErrorToast
           ? "bg-gradient-to-br from-red-900/95 to-red-950/95 border-red-700/50 shadow-red-500/20"
           : "bg-gradient-to-br from-red-900/95 to-red-950/95 border-red-700/50 shadow-red-500/20";
         const iconWrapClass = isAmberJobToast
           ? "bg-amber-500/20"
-          : isJobStartedToast
-          ? "bg-emerald-500/20"
-          : isOnlineToast
+          : isSuccessToast
           ? "bg-emerald-500/20"
           : "bg-red-500/20";
         const iconClass = isAmberJobToast
           ? "text-amber-400"
-          : isJobStartedToast
-          ? "text-emerald-400"
-          : isOnlineToast
+          : isSuccessToast
           ? "text-emerald-400"
           : "text-red-400";
         const dismissHoverClass = isAmberJobToast
           ? "hover:bg-amber-800/30"
-          : isJobStartedToast
-          ? "hover:bg-emerald-800/30"
-          : isOnlineToast
+          : isSuccessToast
           ? "hover:bg-emerald-800/30"
           : "hover:bg-red-800/30";
         const toastTitle = isJobStaledToast
@@ -70,10 +77,16 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
           ? toast.title || "Job Start Blocked"
           : isJobStartedToast
           ? toast.title || "Job Started"
+          : isCameraStartedToast
+          ? toast.title || "Camera Started"
           : isAgentApiErrorToast
           ? toast.title || "AI API Error"
           : isOnlineToast
           ? "Camera Online"
+          : hasStructuredOfflineFailure && toast.failurePhase === "startup"
+          ? toast.title || "Camera Start Failed"
+          : hasStructuredOfflineFailure && toast.failurePhase === "runtime"
+          ? toast.title || "Camera Connection Lost"
           : "Camera Offline";
 
         return (
@@ -83,7 +96,7 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
           >
             <div className="flex items-start gap-3">
               <div className={`w-10 h-10 ${iconWrapClass} rounded-lg flex items-center justify-center flex-shrink-0`}>
-                {isOnlineToast || isJobStartedToast ? (
+                {isSuccessToast ? (
                   <CheckCircle2 className={`w-5 h-5 ${iconClass}`} />
                 ) : (
                   <AlertCircle className={`w-5 h-5 ${iconClass}`} />
@@ -101,6 +114,16 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
                     <>
                       <span className="font-medium text-white">{cameraLabel}</span> is back online.
                     </>
+                  ) : isCameraStartedToast ? (
+                    <>
+                      <span className="font-medium text-white">{cameraLabel}</span> started successfully.
+                    </>
+                  ) : hasStructuredOfflineFailure ? (
+                    <>
+                      <span className="font-medium text-white">{cameraLabel}</span>{" "}
+                      {isLowConfidenceFailure ? "possible cause: " : ""}
+                      {toast.failureSummary || "connection failed."}
+                    </>
                   ) : (
                     <>
                       <span className="font-medium text-white">{cameraLabel}</span> is out of range.
@@ -108,11 +131,56 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
                     </>
                   )}
                 </p>
-                {!isJobStaledToast && !isJobStartBlockedToast && !isJobStartedToast && !isAgentApiErrorToast && (
+
+                {isCameraStartedToast ? (
+                  toast.analytics && toast.analytics.length > 0 ? (
+                    <div className="mb-2">
+                      <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-200/80">
+                        Running analytics
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {toast.analytics.map((analyticsName, index) => (
+                          <span
+                            key={`${toast.id}-analytics-${index}`}
+                            className="rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-100"
+                          >
+                            {analyticsName}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mb-2 text-xs text-gray-400">
+                      No analytics are enabled for this camera yet.
+                    </p>
+                  )
+                ) : null}
+
+                {hasStructuredOfflineFailure && toast.failureAction ? (
+                  <p className="mb-2 text-xs text-gray-300">
+                    {toast.failureAction}
+                  </p>
+                ) : null}
+
+                {!isJobStaledToast && !isJobStartBlockedToast && !isJobStartedToast && !isAgentApiErrorToast && !isCameraStartedToast && (
+                  hasStructuredOfflineFailure ? (
+                    toast.technicalDetail ? (
+                      <p className="text-xs text-gray-400">
+                        Technical detail: {toast.technicalDetail}
+                      </p>
+                    ) : null
+                  ) : (
+                    <p className="text-xs text-gray-400">
+                      {toast.message}
+                    </p>
+                  )
+                )}
+
+                {isCameraStartedToast && toast.message ? (
                   <p className="text-xs text-gray-400">
                     {toast.message}
                   </p>
-                )}
+                ) : null}
               </div>
 
               <button

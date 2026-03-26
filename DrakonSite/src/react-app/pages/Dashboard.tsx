@@ -1,5 +1,9 @@
 import Layout from "@/react-app/components/Layout";
 import { useDashboardSummary } from "@/react-app/lib/DashboardSummaryStore";
+import {
+  getCameraConnectionState,
+  isCameraServiceRunning,
+} from "@/react-app/lib/cameraStatus";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardAlertRefresh } from "@/react-app/hooks/useDashboardAlertRefresh";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
@@ -1912,8 +1916,10 @@ function DashboardContent() {
             <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
               {cameras.map((camera: any) => {
                 const cameraStats = perCamera[camera.id] || {};
-                const isRunning = camera.is_service_running === 1;
-                const isOnline = isRunning;
+                const connectionState = getCameraConnectionState(camera);
+                const isRunning = isCameraServiceRunning(camera);
+                const isOnline = connectionState === "online";
+                const isReconnecting = connectionState === "reconnecting";
 
                 return (
                   <div
@@ -1929,10 +1935,16 @@ function DashboardContent() {
                               className={`px-2 py-0.5 text-xs rounded-full ${
                                 isOnline
                                   ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                                  : isReconnecting
+                                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                                   : "bg-red-500/20 text-red-400 border border-red-500/30"
                               }`}
                             >
-                              {isOnline ? t("dashboard.online") : t("dashboard.offline")}
+                              {isOnline
+                                ? t("dashboard.online")
+                                : isReconnecting
+                                ? "Reconnecting"
+                                : t("dashboard.offline")}
                             </span>
                             <span
                               className={`px-2 py-0.5 text-xs rounded-full ${

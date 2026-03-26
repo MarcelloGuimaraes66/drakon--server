@@ -146,6 +146,7 @@ function normalizeRunningResolution(
 }
 
 interface SendMessageOptions {
+  sessionIdOverride?: number | null;
   content: string;
   camera_id?: number;
   uploadedImageBase64?: string | null;
@@ -494,6 +495,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
 
   const sendMessage = useCallback(
     async ({
+      sessionIdOverride,
       content,
       camera_id,
       uploadedImageBase64,
@@ -502,7 +504,8 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
       modelFps,
       runningResolution,
     }: SendMessageOptions) => {
-      if (!sessionId || (!content.trim() && !uploadedImageBase64 && !uploadedVideoId)) return;
+      const targetSessionId = sessionIdOverride ?? sessionId;
+      if (!targetSessionId || (!content.trim() && !uploadedImageBase64 && !uploadedVideoId)) return;
 
       setIsLoading(true);
       setError(null);
@@ -519,7 +522,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
             ? normalizeRunningResolution(runningResolution)
             : null;
 
-        const response = await fetch(`/api/chat/sessions/${sessionId}/messages`, {
+        const response = await fetch(`/api/chat/sessions/${targetSessionId}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 

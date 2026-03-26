@@ -1,6 +1,7 @@
 ﻿import { useEffect, useState, useRef } from "react";
 import { pollingManager } from "@/react-app/lib/PollingManager";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
+import { normalizeCameraConnectionFailedEvent, type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
 import { emitOpenAiKeyRequiredPrompt } from "@/react-app/utils/openAiKeyGuard";
 
 interface CameraEvent {
@@ -9,6 +10,7 @@ interface CameraEvent {
   camera_id: number | null;
   event_type: string;
   message: string | null;
+  details?: unknown | null;
   details_json: string | null;
   created_at: string;
   updated_at: string;
@@ -19,6 +21,12 @@ interface Toast {
   cameraId?: number | null;
   cameraName?: string;
   message: string;
+  failureCode?: string | null;
+  failureSummary?: string;
+  failureAction?: string;
+  technicalDetail?: string;
+  failurePhase?: CameraFailurePhase | null;
+  failureConfidence?: number | null;
   title?: string;
   type?:
     | "offline"
@@ -116,11 +124,10 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
           const camera = camerasRef.current.find((row) => row.id === event.camera_id);
           if (!camera) return;
 
-          const message =
-            event.message ||
-            "Failed to connect to camera. Please check the RTSP URL and credentials.";
+          const failureToast = normalizeCameraConnectionFailedEvent(event);
           shownToastIdsRef.current.add(event.id);
           offlineCameraIdsRef.current.add(event.camera_id);
+          previousOnlineStateRef.current.set(event.camera_id, false);
 
           setToasts((prev) => [
             ...prev,
@@ -128,7 +135,14 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
               id: event.id,
               cameraId: event.camera_id,
               cameraName: camera.name,
-              message,
+              message: failureToast.message,
+              title: failureToast.title,
+              failureCode: failureToast.failureCode,
+              failureSummary: failureToast.failureSummary,
+              failureAction: failureToast.failureAction,
+              technicalDetail: failureToast.technicalDetail,
+              failurePhase: failureToast.failurePhase,
+              failureConfidence: failureToast.failureConfidence,
               type: "offline",
             },
           ]);
@@ -137,6 +151,8 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
           }, AUTO_DISMISS_MS);
         });
+
+        dashboardSummaryStore.refresh();
       },
       onError: (error) => {
         console.error("[useCameraEvents] Polling error:", error);
@@ -488,6 +504,7 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
         camerasRef.current = cameraRows;
 
         const activeCameraIds = new Set<number>();
+        let didRecoverCamera = false;
 
         for (const camera of cameraRows) {
           const cameraId = Number(camera?.id);
@@ -524,6 +541,7 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             }, AUTO_DISMISS_MS);
 
             offlineCameraIdsRef.current.delete(cameraId);
+            didRecoverCamera = true;
           }
 
           previousOnlineStateRef.current.set(cameraId, isOnline);
@@ -534,6 +552,10 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             previousOnlineStateRef.current.delete(trackedId);
             offlineCameraIdsRef.current.delete(trackedId);
           }
+        }
+
+        if (didRecoverCamera) {
+          dashboardSummaryStore.refresh();
         }
       },
       onError: (error) => {

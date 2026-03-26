@@ -3784,6 +3784,9 @@ for (const lang of Object.keys(resources)) {
 }
 
 const languageSafetyOverrides: Record<string, Record<string, string>> = {
+  en: {
+    "common.registerCamera": "Register Camera",
+  },
   es: {
     "nav.jobs": "Tareas",
     "jobs.title": "Tareas",
@@ -3793,6 +3796,7 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.yearly": "Anual",
     "jobs.scheduleBuilder.selectWeekDays": "Selecciona que dias de la semana debe ejecutarse esta tarea:",
     "jobs.scheduleBuilder.selectMonthDays": "Selecciona que dias del mes debe ejecutarse esta tarea:",
+    "common.registerCamera": "Registrar c\u00e1mara",
   },
   pt: {
     "nav.cameras": "C\u00e2meras",
@@ -3806,6 +3810,7 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.yearly": "Anual",
     "jobs.scheduleBuilder.selectWeekDays": "Selecione os dias da semana em que esta tarefa deve executar:",
     "jobs.scheduleBuilder.selectMonthDays": "Selecione os dias do mes em que esta tarefa deve executar:",
+    "common.registerCamera": "Registrar c\u00e2mera",
   },
   fr: {
     "nav.jobs": "T\u00e2ches",
@@ -3814,6 +3819,7 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.weekly": "Hebdomadaire",
     "jobs.monthly": "Mensuel",
     "jobs.yearly": "Annuel",
+    "common.registerCamera": "Enregistrer une cam\u00e9ra",
   },
   zh: {
     "nav.aiAgents": "AI \u4ee3\u7406",
@@ -3826,6 +3832,7 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.scheduleBuilder.activeDateRange": "\u751f\u6548\u65e5\u671f\u8303\u56f4",
     "jobs.scheduleBuilder.addWindow": "\u6dfb\u52a0\u7a97\u53e3",
     "jobs.scheduleBuilder.summaryTitle": "\u8ba1\u5212\u6458\u8981",
+    "common.registerCamera": "\u6ce8\u518c\u6444\u50cf\u5934",
   },
   ar: {
     "nav.aiAssistant": "\u062f\u0631\u062f\u0634\u0629 Drakon",
@@ -3837,6 +3844,7 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "jobs.scheduleBuilder.activeDateRange": "\u0646\u0637\u0627\u0642 \u0627\u0644\u062a\u0627\u0631\u064a\u062e \u0627\u0644\u0646\u0634\u0637",
     "jobs.scheduleBuilder.addWindow": "\u0625\u0636\u0627\u0641\u0629 \u0646\u0627\u0641\u0630\u0629",
     "jobs.scheduleBuilder.summaryTitle": "\u0645\u0644\u062e\u0635 \u0627\u0644\u062c\u062f\u0648\u0644",
+    "common.registerCamera": "\u062a\u0633\u062c\u064a\u0644 \u0643\u0627\u0645\u064a\u0631\u0627",
   },
 };
 

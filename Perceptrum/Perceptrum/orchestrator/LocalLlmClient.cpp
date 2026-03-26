@@ -845,4 +845,72 @@ std::string LocalLlmClient::answerDirectly(
     return trimCopy(outcome.content);
 }
 
+LocalLlmClient::CompletionOutcome LocalLlmClient::completeText(
+    const std::string& operation,
+    const std::string& systemPrompt,
+    const std::string& userPrompt,
+    double temperature,
+    int maxTokens,
+    long timeoutMs,
+    int retries,
+    bool responseJsonObject,
+    const std::string& modelName) const
+{
+    CompletionOutcome outcome;
+    if (trimCopy(userPrompt).empty()) {
+        outcome.error = "empty_user_prompt";
+        return outcome;
+    }
+
+    Config configSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        configSnapshot = config_;
+    }
+
+    const std::string effectiveModel = trimCopy(modelName).empty()
+        ? configSnapshot.model
+        : trimCopy(modelName);
+    const long effectiveTimeout = timeoutMs > 0 ? timeoutMs : configSnapshot.answerTimeoutMs;
+    const int effectiveRetries = retries >= 0 ? retries : configSnapshot.answerRetries;
+
+    nlohmann::json body = {
+        { "model", effectiveModel },
+        { "messages", nlohmann::json::array({
+            {
+                { "role", "system" },
+                { "content", systemPrompt },
+            },
+            {
+                { "role", "user" },
+                { "content", userPrompt },
+            },
+        }) },
+        { "temperature", temperature },
+        { "max_tokens", maxTokens },
+    };
+
+    if (responseJsonObject) {
+        body["response_format"] = {
+            { "type", "json_object" }
+        };
+    }
+
+    outcome = requestCompletion_(
+        operation,
+        body,
+        effectiveTimeout,
+        effectiveRetries);
+    if (!outcome.ok && responseJsonObject) {
+        const std::string fallbackContent = structuredJsonFromOutcome_(outcome, operation);
+        if (!fallbackContent.empty()) {
+            outcome.ok = true;
+            outcome.content = fallbackContent;
+            outcome.error.clear();
+        }
+    }
+
+    return outcome;
+}
+
 } // namespace chatv2

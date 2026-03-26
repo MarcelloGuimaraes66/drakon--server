@@ -1535,10 +1535,15 @@ static std::string normalizeVideoPackagingMode_(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    if (s == "frame_sequence" || s == "frame-sequence" || s == "full_frame" || s == "full-frame" || s == "frames") {
+    if (s == "frame_sequence" || s == "frame-sequence" || s == "full_frame" || s == "full-frame" ||
+        s == "frames" || s == "high_resolution" || s == "high-resolution" || s == "high resolution") {
         return "frame_sequence";
     }
-    return "mosaic";
+    if (s == "mosaic_2x2" || s == "mosaic-2x2" || s == "2x2" ||
+        s == "standard_resolution" || s == "standard-resolution" || s == "standard resolution") {
+        return "mosaic_2x2";
+    }
+    return "mosaic_3x3";
 }
 
 static bool hasUsableFaceTargets_(const std::vector<JobFaceTarget>& faceTargets) {

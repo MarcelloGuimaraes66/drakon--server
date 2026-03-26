@@ -1,6 +1,7 @@
 ﻿import { createContext, useContext, useEffect, useState, useRef, ReactNode } from "react";
 import { pollingManager } from "@/react-app/lib/PollingManager";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
+import { normalizeCameraConnectionFailedEvent, type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
 import { emitOpenAiKeyRequiredPrompt } from "@/react-app/utils/openAiKeyGuard";
 
 interface CameraEvent {
@@ -9,6 +10,7 @@ interface CameraEvent {
   camera_id: number | null;
   event_type: string;
   message: string | null;
+  details?: unknown | null;
   details_json: string | null;
   created_at: string;
   updated_at: string;
@@ -19,10 +21,18 @@ interface Toast {
   cameraId?: number | null;
   cameraName?: string;
   message: string;
+  analytics?: string[];
+  failureCode?: string | null;
+  failureSummary?: string;
+  failureAction?: string;
+  technicalDetail?: string;
+  failurePhase?: CameraFailurePhase | null;
+  failureConfidence?: number | null;
   title?: string;
   type?:
     | "offline"
     | "online"
+    | "camera_started"
     | "job_staled"
     | "job_start_blocked"
     | "job_started"
@@ -32,6 +42,7 @@ interface Toast {
 interface EventsContextType {
   toasts: Toast[];
   dismissToast: (id: number) => void;
+  pushToast: (toast: Omit<Toast, "id"> & { id?: number }) => number;
   lastEventId: number;
   refreshCameras: () => void;
 }
@@ -125,11 +136,10 @@ export function EventsProvider({
           const camera = camerasRef.current.find((row) => row.id === event.camera_id);
           if (!camera) return;
 
-          const message =
-            event.message ||
-            "Failed to connect to camera. Please check the RTSP URL and credentials.";
+          const failureToast = normalizeCameraConnectionFailedEvent(event);
           shownToastIdsRef.current.add(event.id);
           offlineCameraIdsRef.current.add(event.camera_id);
+          previousOnlineStateRef.current.set(event.camera_id, false);
 
           setToasts((prev) => [
             ...prev,
@@ -137,7 +147,14 @@ export function EventsProvider({
               id: event.id,
               cameraId: event.camera_id,
               cameraName: camera.name,
-              message,
+              message: failureToast.message,
+              title: failureToast.title,
+              failureCode: failureToast.failureCode,
+              failureSummary: failureToast.failureSummary,
+              failureAction: failureToast.failureAction,
+              technicalDetail: failureToast.technicalDetail,
+              failurePhase: failureToast.failurePhase,
+              failureConfidence: failureToast.failureConfidence,
               type: "offline",
             },
           ]);
@@ -146,6 +163,8 @@ export function EventsProvider({
             setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
           }, AUTO_DISMISS_MS);
         });
+
+        dashboardSummaryStore.refresh();
 
         const eventIds = events.map((event) => event.id);
         fetch("/api/events/mark-read", {
@@ -542,6 +561,7 @@ export function EventsProvider({
         camerasRef.current = cameraRows;
 
         const activeCameraIds = new Set<number>();
+        let didRecoverCamera = false;
 
         for (const camera of cameraRows) {
           const cameraId = Number(camera?.id);
@@ -578,6 +598,7 @@ export function EventsProvider({
             }, AUTO_DISMISS_MS);
 
             offlineCameraIdsRef.current.delete(cameraId);
+            didRecoverCamera = true;
           }
 
           previousOnlineStateRef.current.set(cameraId, isOnline);
@@ -588,6 +609,10 @@ export function EventsProvider({
             previousOnlineStateRef.current.delete(trackedId);
             offlineCameraIdsRef.current.delete(trackedId);
           }
+        }
+
+        if (didRecoverCamera) {
+          dashboardSummaryStore.refresh();
         }
       },
       onError: (error) => {
@@ -604,12 +629,29 @@ export function EventsProvider({
     setToasts((prev) => prev.filter((toast) => toast.id !== id));
   };
 
+  const pushToast = (toast: Omit<Toast, "id"> & { id?: number }) => {
+    const toastId =
+      Number.isInteger(toast.id) && Number(toast.id) !== 0
+        ? Number(toast.id)
+        : syntheticToastIdRef.current--;
+
+    setToasts((prev) => [...prev, { ...toast, id: toastId }]);
+
+    if (typeof window !== "undefined") {
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((entry) => entry.id !== toastId));
+      }, AUTO_DISMISS_MS);
+    }
+
+    return toastId;
+  };
+
   const refreshCameras = () => {
     refreshCallbacksRef.current.forEach((cb) => cb());
   };
 
   return (
-    <EventsContext.Provider value={{ toasts, dismissToast, lastEventId, refreshCameras }}>
+    <EventsContext.Provider value={{ toasts, dismissToast, pushToast, lastEventId, refreshCameras }}>
       {children}
     </EventsContext.Provider>
   );

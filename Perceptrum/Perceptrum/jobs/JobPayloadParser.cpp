@@ -133,10 +133,15 @@ static std::string normalizeVideoPackagingModeValue(std::string v) {
     while (!v.empty() && is_space((unsigned char)v.front())) v.erase(v.begin());
     while (!v.empty() && is_space((unsigned char)v.back())) v.pop_back();
     for (char& c : v) c = (char)std::tolower((unsigned char)c);
-    if (v == "frame_sequence" || v == "frame-sequence" || v == "full_frame" || v == "full-frame" || v == "frames") {
+    if (v == "frame_sequence" || v == "frame-sequence" || v == "full_frame" || v == "full-frame" ||
+        v == "frames" || v == "high_resolution" || v == "high-resolution" || v == "high resolution") {
         return "frame_sequence";
     }
-    return "mosaic";
+    if (v == "mosaic_2x2" || v == "mosaic-2x2" || v == "2x2" ||
+        v == "standard_resolution" || v == "standard-resolution" || v == "standard resolution") {
+        return "mosaic_2x2";
+    }
+    return "mosaic_3x3";
 }
 
 static int normalizeRunningResolutionValue(int raw, int fallback = 640) {

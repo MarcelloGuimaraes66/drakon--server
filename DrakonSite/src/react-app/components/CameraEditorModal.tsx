@@ -101,9 +101,12 @@ export type CameraEditorCamera = {
   allowpublicaccess?: number | boolean | null;
 };
 
+export type CameraEditorDraft = Partial<Omit<CameraEditorCamera, "id">>;
+
 type CameraEditorModalProps = {
   isOpen: boolean;
   camera: CameraEditorCamera | null;
+  draftCamera?: CameraEditorDraft | null;
   onClose: () => void;
   onSaved?: () => Promise<void> | void;
 };
@@ -226,6 +229,49 @@ function buildEditForm(camera: CameraEditorCamera): EditFormData {
   };
 }
 
+function buildDraftWebcamForm(camera: CameraEditorDraft): WebcamFormData {
+  return {
+    ...createEmptyWebcamForm(),
+    name: camera.name || "",
+    webcam_index:
+      typeof camera.webcam_index === "number" ? camera.webcam_index : null,
+    street: camera.street || "",
+    number: camera.number || "",
+    city: camera.city || "",
+    state: camera.state || "",
+    zip_code: camera.zip_code || "",
+    country: camera.country || "",
+    retention_days: normalizeRetentionDays(camera.retention_days),
+    allowpublicaccess: Boolean(camera.allowpublicaccess),
+  };
+}
+
+function buildDraftRtspForm(camera: CameraEditorDraft): RtspFormData {
+  return {
+    ...createEmptyRtspForm(),
+    name: camera.name || "",
+    ip_address: camera.ip_address || "",
+    rtsp_port: camera.rtsp_port || "",
+    manufacturer: camera.manufacturer || "",
+    username: camera.username || "",
+    password: camera.password || "",
+    channel: camera.channel || "",
+    subtype: camera.subtype || "",
+    connection_method:
+      camera.connection_method === "HTTP" || camera.connection_method === "ONVIF"
+        ? camera.connection_method
+        : "RTSP",
+    street: camera.street || "",
+    number: camera.number || "",
+    city: camera.city || "",
+    state: camera.state || "",
+    zip_code: camera.zip_code || "",
+    country: camera.country || "",
+    retention_days: normalizeRetentionDays(camera.retention_days),
+    allowpublicaccess: Boolean(camera.allowpublicaccess),
+  };
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -287,6 +333,7 @@ async function parseApiError(response: Response, fallback: string): Promise<stri
 export default function CameraEditorModal({
   isOpen,
   camera,
+  draftCamera = null,
   onClose,
   onSaved,
 }: CameraEditorModalProps) {
@@ -327,13 +374,27 @@ export default function CameraEditorModal({
       return;
     }
 
+    if (draftCamera) {
+      const isWebcam =
+        draftCamera.connection_method === "WEBCAM" || draftCamera.webcam_index != null;
+
+      setActiveTab(isWebcam ? "WEBCAM" : "IP_RTSP");
+      setWebcamForm(buildDraftWebcamForm(draftCamera));
+      setRtspForm(buildDraftRtspForm(draftCamera));
+      setEditForm(null);
+      setDescriptionLabel("other_indoor");
+      setDescriptionText("");
+      setIsAddressExpanded(true);
+      return;
+    }
+
     setActiveTab("IP_RTSP");
     setWebcamForm(createEmptyWebcamForm());
     setRtspForm(createEmptyRtspForm());
     setEditForm(null);
     setDescriptionLabel("other_indoor");
     setDescriptionText("");
-  }, [camera, isOpen]);
+  }, [camera, draftCamera, isOpen]);
 
   if (!isOpen) {
     return null;

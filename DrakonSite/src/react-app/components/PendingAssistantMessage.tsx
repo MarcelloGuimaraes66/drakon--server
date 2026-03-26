@@ -1,6 +1,7 @@
 import { AlertCircle, Bot } from "lucide-react";
 
 import { ChatProgressInfo } from "@/react-app/utils/chatUtils";
+import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 interface PendingAssistantMessageProps {
   content?: string;
@@ -34,8 +35,8 @@ export default function PendingAssistantMessage({
       <div
         className={
           compact
-            ? "flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_18px_34px_-20px_rgba(52,211,153,0.95)]"
-            : "flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_18px_34px_-18px_rgba(45,212,191,0.75)]"
+            ? `flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl ${CHAT_ASSISTANT_BADGE_CLASS}`
+            : `flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-2xl ${CHAT_ASSISTANT_BADGE_CLASS}`
         }
       >
         <Bot className={compact ? "h-4 w-4 text-white" : "h-4 w-4 text-white md:h-5 md:w-5"} />

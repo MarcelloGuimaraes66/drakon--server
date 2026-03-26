@@ -2495,17 +2495,72 @@ void CameraSession::captureLoop_() {
             return false;
             };
 
-        // --- Initial connect: retry forever (until stop) ---
+        // --- Initial connect / reconnect notifications ---
         int backoffSec = 1;
         int initialReconnectAttempt = 0;
         int runtimeReconnectAttempt = 0;
-        auto notifyReconnectAttempt = [&](int attemptNo,
-            const std::string& phase,
+        constexpr auto kReconnectReminderInterval = std::chrono::minutes(2);
+        auto startupLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
+        auto runtimeLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
+        auto offlineSince = std::chrono::steady_clock::time_point{};
+
+        auto buildReconnectNotificationMessage = [&](const std::string& phase,
+            bool isReminder,
+            int attemptNo,
+            int nextRetryDelaySec)
+        {
+            std::string message;
+            if (phase == "startup") {
+                message = isReminder
+                    ? "Camera is still offline. Automatic reconnection is still trying to connect."
+                    : "Camera could not be started. Automatic reconnection is trying to connect.";
+            }
+            else {
+                message = isReminder
+                    ? "Camera is still offline. Automatic reconnection is still trying to reconnect."
+                    : "Camera connection was lost. Automatic reconnection is trying to restore the stream.";
+            }
+
+            if (attemptNo > 0) {
+                message += " Attempt #" + std::to_string(attemptNo) + ".";
+            }
+            if (nextRetryDelaySec > 0) {
+                message += " Next retry in about " + std::to_string(nextRetryDelaySec) + "s.";
+            }
+
+            return message;
+        };
+
+        auto notifyReconnectStatus = [&](const std::string& phase,
+            bool isReminder,
+            int attemptNo,
+            int nextRetryDelaySec,
             const std::string& reason)
         {
             if (!owner_) return;
 
             nlohmann::json extraDetails = nlohmann::json::object();
+            extraDetails["failure_phase"] = phase;
+            extraDetails["candidate_count"] = static_cast<int>(candidates.size());
+            extraDetails["reconnecting"] = true;
+            extraDetails["notification_kind"] = isReminder ? "reminder" : "initial";
+            if (attemptNo > 0) {
+                extraDetails["attempt_number"] = attemptNo;
+            }
+            if (nextRetryDelaySec > 0) {
+                extraDetails["next_retry_delay_seconds"] = nextRetryDelaySec;
+            }
+            if (!reason.empty()) {
+                extraDetails["failure_reason_raw"] = reason;
+            }
+            if (offlineSince.time_since_epoch().count() > 0) {
+                const auto offlineSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - offlineSince
+                ).count();
+                if (offlineSeconds >= 0) {
+                    extraDetails["offline_seconds"] = offlineSeconds;
+                }
+            }
             if (!config_.startOrigin.empty()) {
                 extraDetails["start_origin"] = config_.startOrigin;
             }
@@ -2513,14 +2568,73 @@ void CameraSession::captureLoop_() {
                 extraDetails["temporary_session"] = true;
             }
 
-            std::string message =
-                phase + " reconnect attempt #" + std::to_string(attemptNo) +
-                " failed. Camera still offline.";
-            if (!reason.empty()) {
-                message += " reason: " + reason;
+            owner_->notifyCameraConnectionError(
+                config_.id,
+                config_.rtspUrl,
+                buildReconnectNotificationMessage(phase, isReminder, attemptNo, nextRetryDelaySec),
+                extraDetails
+            );
+        };
+
+        auto maybeNotifyReconnectStatus = [&](const std::string& phase,
+            bool forceNow,
+            int attemptNo,
+            int nextRetryDelaySec,
+            const std::string& reason)
+        {
+            auto& lastNotificationAt =
+                phase == "startup"
+                ? startupLastReconnectNotificationAt
+                : runtimeLastReconnectNotificationAt;
+            const auto now = std::chrono::steady_clock::now();
+            const bool hasPreviousNotification = lastNotificationAt.time_since_epoch().count() != 0;
+            if (!forceNow && hasPreviousNotification &&
+                (now - lastNotificationAt) < kReconnectReminderInterval) {
+                return;
             }
 
-            owner_->notifyCameraConnectionError(config_.id, config_.rtspUrl, message, extraDetails);
+            lastNotificationAt = now;
+            notifyReconnectStatus(
+                phase,
+                hasPreviousNotification,
+                attemptNo,
+                nextRetryDelaySec,
+                reason
+            );
+        };
+
+        auto notifyCameraOnline = [&](const std::string& onlinePhase,
+            int reconnectAttempts)
+        {
+            if (!owner_ || config_.isDrakonFindTemporarySession) return;
+
+            try {
+                nlohmann::json details = nlohmann::json::object();
+                details["online_phase"] = onlinePhase;
+                details["recovered"] = reconnectAttempts > 0;
+                if (reconnectAttempts > 0) {
+                    details["reconnect_attempts"] = reconnectAttempts;
+                }
+                if (!config_.startOrigin.empty()) {
+                    details["start_origin"] = config_.startOrigin;
+                }
+                if (!activeUrl.empty()) {
+                    details["active_rtsp_url"] = activeUrl;
+                }
+
+                const int cameraIdValue = std::stoi(config_.id);
+                owner_->postAgentEvent(
+                    "camera_online",
+                    cameraIdValue,
+                    "",
+                    reconnectAttempts > 0
+                        ? "Camera connection restored. Stream is back online."
+                        : "Camera connected successfully and is online.",
+                    details
+                );
+            }
+            catch (...) {
+            }
         };
 
         while (running_ && activeUrl.empty()) {
@@ -2542,11 +2656,18 @@ void CameraSession::captureLoop_() {
                 break;
             }
 
+            if (offlineSince.time_since_epoch().count() == 0) {
+                offlineSince = std::chrono::steady_clock::now();
+                startupLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
+            }
+
             ++initialReconnectAttempt;
             telemetryReconnectCount_.fetch_add(1, std::memory_order_relaxed);
-            notifyReconnectAttempt(
+            maybeNotifyReconnectStatus(
+                "startup",
+                initialReconnectAttempt == 1,
                 initialReconnectAttempt,
-                "Startup",
+                backoffSec,
                 lastErr.empty() ? "failed to open any RTSP candidate" : lastErr
             );
 
@@ -2568,6 +2689,12 @@ void CameraSession::captureLoop_() {
         // connected now
         backoffSec = 1;
         runtimeReconnectAttempt = 0;
+        startupLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
+        offlineSince = std::chrono::steady_clock::time_point{};
+        notifyCameraOnline(
+            initialReconnectAttempt > 0 ? "startup_reconnected" : "startup_connected",
+            initialReconnectAttempt
+        );
 
 
 
@@ -2609,17 +2736,12 @@ void CameraSession::captureLoop_() {
         auto onOffline = [&](const std::string& reason) {
             if (!offline) {
                 offline = true;
+                offlineSince = std::chrono::steady_clock::now();
+                runtimeLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
                 Logger::instance().logDebug(config_.id, "RTSP OFFLINE: " + reason);
                 streamOnline_.store(false, std::memory_order_relaxed);
                 if (owner_) {
-                    nlohmann::json extraDetails = nlohmann::json::object();
-                    if (!config_.startOrigin.empty()) {
-                        extraDetails["start_origin"] = config_.startOrigin;
-                    }
-                    if (config_.isDrakonFindTemporarySession) {
-                        extraDetails["temporary_session"] = true;
-                    }
-                    owner_->notifyCameraConnectionError(config_.id, config_.rtspUrl, reason, extraDetails);
+                    maybeNotifyReconnectStatus("runtime", true, 0, 1, reason);
                 }
                 // Important: do NOT requestStop here (that’s for shutdown).
                 buffer_.clearBuffer(); // flush stale frames while offline
@@ -2628,8 +2750,12 @@ void CameraSession::captureLoop_() {
 
         auto onOnline = [&]() {
             if (offline) {
+                const int reconnectAttempts = runtimeReconnectAttempt;
                 offline = false;
                 streamOnline_.store(true, std::memory_order_relaxed);
+                runtimeLastReconnectNotificationAt = std::chrono::steady_clock::time_point{};
+                offlineSince = std::chrono::steady_clock::time_point{};
+                notifyCameraOnline("runtime_reconnected", reconnectAttempts);
                 runtimeReconnectAttempt = 0;
                 Logger::instance().logDebug(config_.id, "RTSP ONLINE again: " + activeUrl);
             }
@@ -2687,9 +2813,11 @@ void CameraSession::captureLoop_() {
                         while (running_ && !openAnyCandidate()) {
                             ++runtimeReconnectAttempt;
                             telemetryReconnectCount_.fetch_add(1, std::memory_order_relaxed);
-                            notifyReconnectAttempt(
+                            maybeNotifyReconnectStatus(
+                                "runtime",
+                                false,
                                 runtimeReconnectAttempt,
-                                "Runtime",
+                                reconnectBackoff,
                                 lastErr.empty() ? "failed to reconnect to any RTSP candidate" : lastErr
                             );
                             std::this_thread::sleep_for(std::chrono::seconds(reconnectBackoff));
@@ -2745,9 +2873,11 @@ void CameraSession::captureLoop_() {
                         while (running_ && !openAnyCandidate()) {
                             ++runtimeReconnectAttempt;
                             telemetryReconnectCount_.fetch_add(1, std::memory_order_relaxed);
-                            notifyReconnectAttempt(
+                            maybeNotifyReconnectStatus(
+                                "runtime",
+                                false,
                                 runtimeReconnectAttempt,
-                                "Runtime",
+                                reconnectBackoff,
                                 lastErr.empty() ? "failed to reconnect to any RTSP candidate" : lastErr
                             );
                             std::this_thread::sleep_for(std::chrono::seconds(reconnectBackoff));

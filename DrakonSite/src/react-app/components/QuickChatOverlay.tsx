@@ -14,6 +14,7 @@ import {
   extractHitMediaFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
+import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 type ChatModelTier = "ultra" | "core";
 type ChatRunningResolution = 640 | 1024;
@@ -313,7 +314,7 @@ export default function QuickChatOverlay() {
         <div className="relative border-b border-white/[0.06] px-5 pb-4 pt-5 md:px-6 md:pb-5 md:pt-6">
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-12 w-12 items-center justify-center rounded-[22px] bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_24px_50px_-24px_rgba(45,212,191,0.92)]">
+              <div className={`flex h-12 w-12 items-center justify-center rounded-[22px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
                 <Bot className="h-6 w-6 text-white" />
               </div>
               <div>
@@ -418,7 +419,7 @@ export default function QuickChatOverlay() {
 
           {!isCreatingSession && messages.length === 0 && (
             <div className="mx-auto flex max-w-xl flex-col items-center justify-center px-4 py-10 text-center">
-              <div className="flex h-20 w-20 items-center justify-center rounded-[26px] bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_28px_80px_-34px_rgba(45,212,191,0.95)]">
+              <div className={`flex h-20 w-20 items-center justify-center rounded-[26px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
                 <Bot className="h-10 w-10 text-white" />
               </div>
               <h4 className="mt-6 text-3xl font-semibold tracking-tight text-white">

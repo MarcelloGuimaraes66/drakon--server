@@ -34,6 +34,7 @@ Perceptrum/.git/
 _temporal_regression_check.obj
 temporal_engine_smoke.obj
 tmp-dbs/
+tmp_nvidia_frames/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

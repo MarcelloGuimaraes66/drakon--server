@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
-import { Camera, Play, Plus, Square, Wifi } from "lucide-react";
+import { Camera, FileUp, Play, Plus, Square, Wifi } from "lucide-react";
 import CameraStartAttentionToast from "@/react-app/components/CameraStartAttentionToast";
+import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
+import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
+  type CameraEditorDraft,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { getCameraConnectionState, isCameraServiceRunning } from "@/react-app/lib/cameraStatus";
+import { buildDraftCameraFromDiscovery } from "@/react-app/utils/cameraDiscovery";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
+import type { DiscoveredCameraDevice } from "@/shared/cameraDiscovery";
 import { Camera as CameraType } from "@/shared/types";
 
 type CamerasContentProps = {
@@ -25,11 +31,14 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const billingEnabled = brand.features.billingEnabled;
   const [searchParams, setSearchParams] = useSearchParams();
   const [isEditorOpen, setIsEditorOpen] = useState(false);
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
   const [editorCamera, setEditorCamera] = useState<CameraEditorCamera | null>(null);
+  const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
-  const { toasts, dismissToast } = useEvents();
+  const { toasts, dismissToast, pushToast } = useEvents();
 
   const sortedCameras = useMemo(
     () =>
@@ -78,11 +87,40 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     }
 
     clearEditSearchParam();
+    setIsImportOpen(false);
+    setIsDiscoveryOpen(false);
     setEditorCamera(null);
+    setEditorDraft(null);
     setIsEditorOpen(true);
   };
 
+  const openImportModal = async () => {
+    const canAdd = await checkBillingForCameraCreation();
+    if (!canAdd) {
+      return;
+    }
+
+    clearEditSearchParam();
+    setIsDiscoveryOpen(false);
+    setIsEditorOpen(false);
+    setEditorDraft(null);
+    setEditorCamera(null);
+    setIsImportOpen(true);
+  };
+
+  const openDiscoveryModal = () => {
+    clearEditSearchParam();
+    setIsImportOpen(false);
+    setEditorCamera(null);
+    setEditorDraft(null);
+    setIsEditorOpen(false);
+    setIsDiscoveryOpen(true);
+  };
+
   const openEditModal = (camera: CameraType, syncSearchParam = true) => {
+    setIsImportOpen(false);
+    setIsDiscoveryOpen(false);
+    setEditorDraft(null);
     setEditorCamera(camera);
     setIsEditorOpen(true);
 
@@ -102,10 +140,29 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const closeEditor = () => {
     setIsEditorOpen(false);
     setEditorCamera(null);
+    setEditorDraft(null);
     clearEditSearchParam();
   };
 
+  const handleDiscoveryImport = async (device: DiscoveredCameraDevice) => {
+    const canAdd = await checkBillingForCameraCreation();
+    if (!canAdd) {
+      return;
+    }
+
+    clearEditSearchParam();
+    setEditorCamera(null);
+    setEditorDraft(buildDraftCameraFromDiscovery(device));
+    setIsImportOpen(false);
+    setIsDiscoveryOpen(false);
+    setIsEditorOpen(true);
+  };
+
   const handleEditorSaved = async () => {
+    await refreshCameras();
+  };
+
+  const handleImportSaved = async () => {
     await refreshCameras();
   };
 
@@ -156,6 +213,23 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
         setSubscriptionToastCameraId(camera.id);
       }
 
+      if (result.nextRunning === 1) {
+        pushToast({
+          cameraId: camera.id,
+          cameraName:
+            result.cameraName ||
+            (typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${camera.id}`),
+          message:
+            result.runningAnalytics.length > 0
+              ? "The analytics below are active for this camera."
+              : "Enable analytics in the Algorithms page to start detections.",
+          analytics: result.runningAnalytics,
+          type: "camera_started",
+        });
+      }
+
       patchCamera(camera.id, {
         is_service_running: result.nextRunning,
       });
@@ -177,13 +251,29 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
               <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">Cameras</h1>
               <p className="text-sm md:text-base text-gray-400">Manage your security cameras</p>
             </div>
-            <button
-              onClick={openAddModal}
-              className="w-full md:w-auto flex items-center justify-center gap-2 px-5 py-3 md:py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 min-h-[44px] md:min-h-0"
-            >
-              <Plus className="w-5 h-5" />
-              Add Camera
-            </button>
+            <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
+              <button
+                onClick={openDiscoveryModal}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
+              >
+                <Wifi className="h-4 w-4" />
+                Scan Network
+              </button>
+              <button
+                onClick={openImportModal}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
+              >
+                <FileUp className="h-4 w-4" />
+                Import Cameras
+              </button>
+              <button
+                onClick={openAddModal}
+                className="w-full md:w-auto flex items-center justify-center gap-2 px-5 py-3 md:py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 min-h-[44px] md:min-h-0"
+              >
+                <Plus className="w-5 h-5" />
+                {t("common.registerCamera")}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -201,7 +291,13 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800">
-                {sortedCameras.map((camera) => (
+                {sortedCameras.map((camera) => {
+                  const connectionState = getCameraConnectionState(camera);
+                  const isRunning = isCameraServiceRunning(camera);
+                  const isReconnecting = connectionState === "reconnecting";
+                  const isOnline = connectionState === "online";
+
+                  return (
                   <tr key={camera.id} className="hover:bg-gray-800/30 transition-colors">
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-3">
@@ -225,13 +321,15 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                     <td className="px-6 py-4">
                       <span
                         className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-                          camera.is_service_running === 1
+                          isOnline
                             ? "bg-green-500/10 text-green-400"
+                            : isReconnecting
+                            ? "bg-amber-500/10 text-amber-300"
                             : "bg-red-500/10 text-red-400"
                         }`}
                       >
                         <Wifi className="w-3 h-3" />
-                        {camera.is_service_running === 1 ? "Online" : "Offline"}
+                        {isOnline ? "Online" : isReconnecting ? "Reconnecting" : "Offline"}
                       </span>
                     </td>
                     <td className="px-6 py-4 text-right">
@@ -241,14 +339,14 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                           disabled={pendingCameraIds.has(camera.id)}
                           aria-busy={pendingCameraIds.has(camera.id)}
                           className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
-                            camera.is_service_running === 1
+                            isRunning
                               ? "text-red-400 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                               : "text-green-400 hover:bg-green-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                           }`}
                         >
                           {pendingCameraIds.has(camera.id) ? (
                             t("common.loading")
-                          ) : camera.is_service_running === 1 ? (
+                          ) : isRunning ? (
                             <>
                               <Square className="w-4 h-4" />
                               {t("dashboard.stop")}
@@ -275,7 +373,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                       </div>
                     </td>
                   </tr>
-                ))}
+                )})}
               </tbody>
             </table>
           </div>
@@ -292,8 +390,21 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
       <CameraEditorModal
         isOpen={isEditorOpen}
         camera={editorCamera}
+        draftCamera={!editorCamera ? editorDraft : null}
         onClose={closeEditor}
         onSaved={handleEditorSaved}
+      />
+
+      <CameraDiscoveryModal
+        isOpen={isDiscoveryOpen}
+        onClose={() => setIsDiscoveryOpen(false)}
+        onImport={handleDiscoveryImport}
+      />
+
+      <CameraBulkImportModal
+        isOpen={isImportOpen}
+        onClose={() => setIsImportOpen(false)}
+        onImported={handleImportSaved}
       />
 
       <CameraEventToast toasts={toasts} onDismiss={dismissToast} />

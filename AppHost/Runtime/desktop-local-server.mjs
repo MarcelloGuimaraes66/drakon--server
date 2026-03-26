@@ -5,6 +5,7 @@ import path from "path";
 import { webcrypto } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Pool } from "../../DrakonSite/node_modules/pg/esm/index.mjs";
+import { discoverCameraDevices } from "./camera-discovery.mjs";
 
 import {
   resolveActiveBrandRuntime,
@@ -57,6 +58,7 @@ const sqliteCriticalTables = [
 ];
 
 let cachedExeId = String(process.env.APP_PROVISIONED_EXE_ID || "").trim();
+let activeCameraDiscoveryPromise = null;
 
 fs.mkdirSync(serviceSessionDir, { recursive: true });
 
@@ -448,6 +450,11 @@ async function startServer() {
       return;
     }
 
+    if (url.pathname === "/api/runtime/camera-discovery" && req.method === "POST") {
+      await handleCameraDiscovery(req, res);
+      return;
+    }
+
     if (url.pathname.startsWith("/media/")) {
       await serveMedia(res, url.pathname);
       return;
@@ -538,6 +545,37 @@ async function handleRuntimeLocalSession(req, res, env) {
           error instanceof Error ? error.message : "Unable to provision local session.",
       })
     );
+  }
+}
+
+async function handleCameraDiscovery(req, res) {
+  let body = {};
+
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    writeJson(res, 400, {
+      error:
+        error instanceof Error ? error.message : "Invalid JSON body for camera discovery.",
+    });
+    return;
+  }
+
+  try {
+    if (!activeCameraDiscoveryPromise) {
+      activeCameraDiscoveryPromise = discoverCameraDevices(body).finally(() => {
+        activeCameraDiscoveryPromise = null;
+      });
+    }
+
+    const payload = await activeCameraDiscoveryPromise;
+    writeJson(res, 200, payload);
+  } catch (error) {
+    console.error("[desktop-server] camera discovery failed", error);
+    writeJson(res, 500, {
+      error:
+        error instanceof Error ? error.message : "Failed to scan the local network for cameras.",
+    });
   }
 }
 

@@ -378,6 +378,7 @@ private:
     void processCommand_(const nlohmann::json& cmd);
     void handlePromptEnhanceCommand_(int commandId, const nlohmann::json& payload);
     void handleRefreshThumbnailCommand_(int commandId, const nlohmann::json& payload);
+    void handleCameraImportPreviewCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindStartCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindCancelCommand_(int commandId, const nlohmann::json& payload);
     void handleChatCancelCommand_(int commandId, const nlohmann::json& payload);

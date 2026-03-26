@@ -66,6 +66,16 @@ public:
         const std::string& knowledgeLanguage,
         const std::string& appLanguage,
         const std::string& selectedSkill) const;
+    CompletionOutcome completeText(
+        const std::string& operation,
+        const std::string& systemPrompt,
+        const std::string& userPrompt,
+        double temperature = 0.1,
+        int maxTokens = 1024,
+        long timeoutMs = 0,
+        int retries = -1,
+        bool responseJsonObject = false,
+        const std::string& modelName = std::string()) const;
 
 private:
     std::string effectiveBaseUrl_() const;

@@ -3,6 +3,8 @@
 #include "TemporalEngine.h"
 #include "../orchestrator/ChatV2Orchestrator.h"
 #include "../orchestrator/ConfigUtils.h"
+#include "../orchestrator/LocalLlmClient.h"
+#include "../orchestrator/LocalLlmRuntimeManager.h"
 #include "../orchestrator/ProgressUtils.h"
 
 #include "../camera/CameraConfig.h"
@@ -191,6 +193,504 @@ static std::string foldCommonUtf8LatinToAscii_(const std::string& input)
     return out;
 }
 
+static std::string trimAsciiCopyCameraFailure_(std::string value)
+{
+    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+static void maskCameraFailureParamValue_(std::string& text, const std::string& needle)
+{
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        const size_t valueStart = pos + needle.size();
+        size_t valueEnd = text.find_first_of(" \t\r\n,|&;)]}\"'", valueStart);
+        if (valueEnd == std::string::npos) {
+            valueEnd = text.size();
+        }
+
+        if (valueEnd > valueStart) {
+            text.replace(valueStart, valueEnd - valueStart, "****");
+            pos = valueStart + 4;
+        }
+        else {
+            pos = valueStart;
+        }
+    }
+}
+
+static std::string maskCameraFailureRtspUrl_(std::string url)
+{
+    size_t schemePos = url.find("rtsp://");
+    if (schemePos == std::string::npos) {
+        schemePos = url.find("RTSP://");
+    }
+    if (schemePos != std::string::npos) {
+        const size_t authStart = schemePos + 7;
+        size_t authEnd = url.find_first_of("/?#", authStart);
+        if (authEnd == std::string::npos) {
+            authEnd = url.size();
+        }
+
+        const size_t atPos = url.find('@', authStart);
+        if (atPos != std::string::npos && atPos < authEnd) {
+            const size_t colonPos = url.find(':', authStart);
+            const std::string replacement =
+                (colonPos != std::string::npos && colonPos < atPos) ? "***:***" : "***";
+            url.replace(authStart, atPos - authStart, replacement);
+        }
+    }
+
+    maskCameraFailureParamValue_(url, "user=");
+    maskCameraFailureParamValue_(url, "USER=");
+    maskCameraFailureParamValue_(url, "username=");
+    maskCameraFailureParamValue_(url, "USERNAME=");
+    maskCameraFailureParamValue_(url, "usuario=");
+    maskCameraFailureParamValue_(url, "USUARIO=");
+    maskCameraFailureParamValue_(url, "password=");
+    maskCameraFailureParamValue_(url, "PASSWORD=");
+    maskCameraFailureParamValue_(url, "passwd=");
+    maskCameraFailureParamValue_(url, "PASSWD=");
+    maskCameraFailureParamValue_(url, "pwd=");
+    maskCameraFailureParamValue_(url, "PWD=");
+    maskCameraFailureParamValue_(url, "senha=");
+    maskCameraFailureParamValue_(url, "SENHA=");
+
+    return url;
+}
+
+static std::string maskCameraFailureSensitiveText_(const std::string& message)
+{
+    std::string out = message;
+    size_t searchPos = 0;
+
+    while (searchPos < out.size()) {
+        const size_t lowerPos = out.find("rtsp://", searchPos);
+        const size_t upperPos = out.find("RTSP://", searchPos);
+        size_t pos = std::string::npos;
+
+        if (lowerPos == std::string::npos) {
+            pos = upperPos;
+        }
+        else if (upperPos == std::string::npos) {
+            pos = lowerPos;
+        }
+        else {
+            pos = (lowerPos < upperPos) ? lowerPos : upperPos;
+        }
+
+        if (pos == std::string::npos) {
+            break;
+        }
+
+        size_t end = out.find_first_of(" \t\r\n\"'<>|,)]}", pos);
+        if (end == std::string::npos) {
+            end = out.size();
+        }
+
+        const std::string rawUrl = out.substr(pos, end - pos);
+        const std::string maskedUrl = maskCameraFailureRtspUrl_(rawUrl);
+        out.replace(pos, rawUrl.size(), maskedUrl);
+        searchPos = pos + maskedUrl.size();
+    }
+
+    maskCameraFailureParamValue_(out, "user=");
+    maskCameraFailureParamValue_(out, "USER=");
+    maskCameraFailureParamValue_(out, "username=");
+    maskCameraFailureParamValue_(out, "USERNAME=");
+    maskCameraFailureParamValue_(out, "usuario=");
+    maskCameraFailureParamValue_(out, "USUARIO=");
+    maskCameraFailureParamValue_(out, "password=");
+    maskCameraFailureParamValue_(out, "PASSWORD=");
+    maskCameraFailureParamValue_(out, "passwd=");
+    maskCameraFailureParamValue_(out, "PASSWD=");
+    maskCameraFailureParamValue_(out, "pwd=");
+    maskCameraFailureParamValue_(out, "PWD=");
+    maskCameraFailureParamValue_(out, "senha=");
+    maskCameraFailureParamValue_(out, "SENHA=");
+
+    return out;
+}
+
+static std::vector<std::string> splitCameraFailureRtspCandidates_(const std::string& value)
+{
+    std::vector<std::string> candidates;
+    std::stringstream stream(value);
+    std::string item;
+
+    while (std::getline(stream, item, '|')) {
+        item = trimAsciiCopyCameraFailure_(item);
+        if (!item.empty()) {
+            candidates.push_back(item);
+        }
+    }
+
+    return candidates;
+}
+
+static bool extractCameraFailureRtspEndpoint_(
+    const std::string& rtspUrl,
+    std::string& host,
+    int& port,
+    std::string& maskedPath)
+{
+    host.clear();
+    port = 0;
+    maskedPath.clear();
+
+    const size_t schemePos = rtspUrl.find("://");
+    const size_t authorityStart = (schemePos == std::string::npos) ? 0 : schemePos + 3;
+    if (authorityStart >= rtspUrl.size()) {
+        return false;
+    }
+
+    size_t authorityEnd = rtspUrl.find_first_of("/?#", authorityStart);
+    if (authorityEnd == std::string::npos) {
+        authorityEnd = rtspUrl.size();
+    }
+
+    size_t hostStart = authorityStart;
+    const size_t atPos = rtspUrl.find('@', authorityStart);
+    if (atPos != std::string::npos && atPos < authorityEnd) {
+        hostStart = atPos + 1;
+    }
+    if (hostStart >= authorityEnd) {
+        return false;
+    }
+
+    const std::string authority = rtspUrl.substr(hostStart, authorityEnd - hostStart);
+    if (authority.empty()) {
+        return false;
+    }
+
+    host = authority;
+    port = 554;
+
+    if (!authority.empty() && authority.front() == '[') {
+        const size_t closingBracket = authority.find(']');
+        if (closingBracket != std::string::npos) {
+            host = authority.substr(0, closingBracket + 1);
+            if (closingBracket + 2 < authority.size() && authority[closingBracket + 1] == ':') {
+                try {
+                    port = std::stoi(authority.substr(closingBracket + 2));
+                }
+                catch (...) {
+                    port = 554;
+                }
+            }
+        }
+    }
+    else {
+        const size_t colonPos = authority.rfind(':');
+        if (colonPos != std::string::npos &&
+            authority.find(':') == colonPos &&
+            colonPos + 1 < authority.size()) {
+            host = authority.substr(0, colonPos);
+            try {
+                port = std::stoi(authority.substr(colonPos + 1));
+            }
+            catch (...) {
+                port = 554;
+            }
+        }
+    }
+
+    if (authorityEnd < rtspUrl.size()) {
+        size_t pathEnd = rtspUrl.find_first_of("?#", authorityEnd);
+        if (pathEnd == std::string::npos) {
+            pathEnd = rtspUrl.size();
+        }
+        maskedPath = rtspUrl.substr(authorityEnd, pathEnd - authorityEnd);
+    }
+
+    host = trimAsciiCopyCameraFailure_(host);
+    maskedPath = trimAsciiCopyCameraFailure_(maskedPath);
+    return !host.empty();
+}
+
+static bool containsAnyCameraFailureToken_(
+    const std::string& haystackLower,
+    const std::vector<const char*>& needles)
+{
+    for (const char* needle : needles) {
+        if (needle == nullptr) continue;
+        if (haystackLower.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string detectCameraConnectionFailurePhase_(
+    const nlohmann::json& extraDetails,
+    const std::string& fallbackMessage)
+{
+    if (extraDetails.is_object()) {
+        const auto it = extraDetails.find("failure_phase");
+        if (it != extraDetails.end() && it->is_string()) {
+            const std::string phase =
+                lowerAsciiCopy_(trimAsciiCopyCameraFailure_(it->get<std::string>()));
+            if (phase == "startup" || phase == "runtime") {
+                return phase;
+            }
+        }
+    }
+
+    const std::string normalizedMessage =
+        lowerAsciiCopy_(foldCommonUtf8LatinToAscii_(fallbackMessage));
+    if (normalizedMessage.find("startup reconnect attempt") != std::string::npos) {
+        return "startup";
+    }
+
+    return std::string();
+}
+
+static nlohmann::json buildCameraConnectionFailureSummary_(
+    const std::string& rtspUrl,
+    const std::string& rawReason,
+    const nlohmann::json& extraDetails,
+    const std::string& fallbackMessage)
+{
+    nlohmann::json failure = nlohmann::json::object();
+    const std::string phase = detectCameraConnectionFailurePhase_(extraDetails, fallbackMessage);
+    bool reconnecting = false;
+    bool reminderNotification = false;
+    int attemptNumber = 0;
+    int nextRetryDelaySeconds = 0;
+    long long offlineSeconds = 0;
+    if (!phase.empty()) {
+        failure["phase"] = phase;
+    }
+
+    if (extraDetails.is_object()) {
+        const auto candidateCountIt = extraDetails.find("candidate_count");
+        if (candidateCountIt != extraDetails.end() && candidateCountIt->is_number_integer()) {
+            failure["candidate_count"] = candidateCountIt->get<int>();
+        }
+
+        const auto reconnectingIt = extraDetails.find("reconnecting");
+        if (reconnectingIt != extraDetails.end() && reconnectingIt->is_boolean()) {
+            reconnecting = reconnectingIt->get<bool>();
+            failure["reconnecting"] = reconnecting;
+        }
+
+        const auto notificationKindIt = extraDetails.find("notification_kind");
+        if (notificationKindIt != extraDetails.end() && notificationKindIt->is_string()) {
+            const std::string notificationKind =
+                lowerAsciiCopy_(notificationKindIt->get<std::string>());
+            failure["notification_kind"] = notificationKind;
+            reminderNotification = notificationKind == "reminder";
+        }
+
+        const auto attemptNumberIt = extraDetails.find("attempt_number");
+        if (attemptNumberIt != extraDetails.end() && attemptNumberIt->is_number_integer()) {
+            attemptNumber = attemptNumberIt->get<int>();
+            if (attemptNumber > 0) {
+                failure["attempt_number"] = attemptNumber;
+            }
+        }
+
+        const auto nextRetryDelayIt = extraDetails.find("next_retry_delay_seconds");
+        if (nextRetryDelayIt != extraDetails.end() && nextRetryDelayIt->is_number_integer()) {
+            nextRetryDelaySeconds = nextRetryDelayIt->get<int>();
+            if (nextRetryDelaySeconds > 0) {
+                failure["next_retry_delay_seconds"] = nextRetryDelaySeconds;
+            }
+        }
+
+        const auto offlineSecondsIt = extraDetails.find("offline_seconds");
+        if (offlineSecondsIt != extraDetails.end() && offlineSecondsIt->is_number_integer()) {
+            offlineSeconds = offlineSecondsIt->get<long long>();
+            if (offlineSeconds > 0) {
+                failure["offline_seconds"] = offlineSeconds;
+            }
+        }
+    }
+
+    const std::vector<std::string> candidates = splitCameraFailureRtspCandidates_(rtspUrl);
+    const bool fallbackCandidateOnly =
+        candidates.size() == 1 &&
+        lowerAsciiCopy_(candidates.front()) == "rtsp://qw:554/streaming/channels/101";
+
+    if (fallbackCandidateOnly) {
+        failure["candidate_source"] = "fallback";
+    }
+
+    std::string endpointUrl = rtspUrl;
+    if (extraDetails.is_object()) {
+        const auto activeRtspIt = extraDetails.find("active_rtsp_url");
+        if (activeRtspIt != extraDetails.end() && activeRtspIt->is_string()) {
+            endpointUrl = activeRtspIt->get<std::string>();
+        }
+    }
+
+    const std::vector<std::string> endpointCandidates = splitCameraFailureRtspCandidates_(endpointUrl);
+    if (!endpointCandidates.empty() &&
+        lowerAsciiCopy_(endpointCandidates.front()) != "rtsp://qw:554/streaming/channels/101") {
+        const std::string maskedEndpointUrl = maskCameraFailureRtspUrl_(endpointCandidates.front());
+        std::string host;
+        int port = 0;
+        std::string pathMasked;
+        if (extractCameraFailureRtspEndpoint_(maskedEndpointUrl, host, port, pathMasked)) {
+            failure["host"] = host;
+            failure["port"] = port;
+            if (!pathMasked.empty()) {
+                failure["path_masked"] = pathMasked;
+            }
+        }
+    }
+
+    const std::string reason = trimAsciiCopyCameraFailure_(rawReason);
+    const std::string normalizedReason =
+        lowerAsciiCopy_(foldCommonUtf8LatinToAscii_(reason));
+    const std::string technicalDetail = maskCameraFailureSensitiveText_(reason);
+
+    if (!technicalDetail.empty()) {
+        failure["technical_detail"] = technicalDetail;
+    }
+
+    std::string code = "unknown";
+    std::string category = "configuration";
+    double confidence = 0.45;
+    std::string summary = "The camera could not be started.";
+    std::string action = "Review the RTSP settings and try again.";
+
+    if (containsAnyCameraFailureToken_(normalizedReason, {
+        "401",
+        "unauthorized",
+        "authorization failed",
+        "authentication failed",
+        "auth failed"
+        })) {
+        code = "auth_failed";
+        category = "credentials";
+        confidence = 0.98;
+        summary = "RTSP credentials were rejected.";
+        action = "Check the camera username and password.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "connection refused",
+        "actively refused",
+        "10061"
+        })) {
+        code = "port_refused";
+        category = "connectivity";
+        confidence = 0.92;
+        summary = "The camera refused the RTSP connection.";
+        action = "Confirm the IP address, RTSP port, and whether RTSP is enabled.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "no route to host",
+        "network is unreachable",
+        "host unreachable",
+        "could not resolve",
+        "name or service not known",
+        "temporary failure in name resolution"
+        })) {
+        code = "network_unreachable";
+        category = "connectivity";
+        confidence = 0.9;
+        summary = "The camera could not be reached over the network.";
+        action = "Check the IP address, network route, and connectivity.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "timed out",
+        "i/o timeout",
+        "immediate exit requested"
+        })) {
+        code = "open_timeout";
+        category = "connectivity";
+        confidence = 0.82;
+        summary = "The camera did not respond in time.";
+        action = "Check the IP address, network latency, and RTSP port.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "read timeout",
+        "capture stalled",
+        "av_read_frame"
+        })) {
+        code = "stream_stalled";
+        category = "stream";
+        confidence = 0.78;
+        summary = "The camera connected, but the stream stopped delivering frames.";
+        action = "Check stream stability, network quality, and camera load.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "no video stream",
+        "invalid data found",
+        "eof",
+        "404 not found",
+        "not found",
+        "unsupported codec"
+        })) {
+        code = "stream_invalid";
+        category = "stream";
+        confidence = 0.74;
+        summary = "The RTSP stream did not return valid video.";
+        action = "Review the RTSP path, manufacturer profile, channel, and subtype.";
+    }
+    else if (containsAnyCameraFailureToken_(normalizedReason, {
+        "failed to open any rtsp candidate"
+        })) {
+        code = "unknown";
+        category = "configuration";
+        confidence = 0.5;
+        summary = "No RTSP candidate could be opened.";
+        action = "Review the camera IP address, manufacturer profile, and RTSP settings.";
+    }
+    else if (fallbackCandidateOnly) {
+        code = "unknown";
+        category = "configuration";
+        confidence = 0.45;
+        summary = "The camera connection settings look incomplete.";
+        action = "Review the camera IP address, manufacturer profile, and RTSP settings.";
+    }
+
+    if (reconnecting) {
+        auto formatOfflineDuration = [](long long totalSeconds) {
+            if (totalSeconds >= 3600) {
+                return std::to_string(totalSeconds / 3600) + "h";
+            }
+            if (totalSeconds >= 60) {
+                return std::to_string(totalSeconds / 60) + "m";
+            }
+            return std::to_string((std::max)(0LL, totalSeconds)) + "s";
+        };
+
+        std::string reconnectAction =
+            reminderNotification
+            ? "Automatic reconnection is still retrying."
+            : "Automatic reconnection is active.";
+        if (attemptNumber > 0) {
+            reconnectAction += " Attempt #" + std::to_string(attemptNumber) + ".";
+        }
+        if (nextRetryDelaySeconds > 0) {
+            reconnectAction +=
+                " Next retry in about " + std::to_string(nextRetryDelaySeconds) + "s.";
+        }
+        if (offlineSeconds > 0) {
+            reconnectAction +=
+                " Offline for " + formatOfflineDuration(offlineSeconds) + ".";
+        }
+
+        action += " " + reconnectAction;
+    }
+
+    failure["code"] = code;
+    failure["category"] = category;
+    failure["confidence"] = confidence;
+    failure["summary"] = summary;
+    failure["action"] = action;
+
+    return failure;
+}
+
 class CoreModelLeaseAborted : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -314,11 +814,33 @@ static std::string normalizeVideoPackagingMode_(const std::string& value)
         normalized == "frame-sequence" ||
         normalized == "full_frame" ||
         normalized == "full-frame" ||
-        normalized == "frames")
+        normalized == "frames" ||
+        normalized == "high_resolution" ||
+        normalized == "high-resolution" ||
+        normalized == "high resolution")
     {
         return "frame_sequence";
     }
-    return "mosaic";
+    if (normalized == "mosaic_2x2" ||
+        normalized == "mosaic-2x2" ||
+        normalized == "2x2" ||
+        normalized == "standard_resolution" ||
+        normalized == "standard-resolution" ||
+        normalized == "standard resolution")
+    {
+        return "mosaic_2x2";
+    }
+    if (normalized == "mosaic" ||
+        normalized == "mosaic_3x3" ||
+        normalized == "mosaic-3x3" ||
+        normalized == "3x3" ||
+        normalized == "compact_resolution" ||
+        normalized == "compact-resolution" ||
+        normalized == "compact resolution")
+    {
+        return "mosaic_3x3";
+    }
+    return "mosaic_3x3";
 }
 
 
@@ -5262,6 +5784,46 @@ void AgentCore::processCommand_(const json& cmd) {
                 }
             }).detach();
         }
+        else if (type == "camera_import_preview") {
+            std::thread([this, commandId, payload]() {
+                try {
+                    handleCameraImportPreviewCommand_(commandId, payload);
+                }
+                catch (const std::exception& e) {
+                    logAgentException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::cameraImportPreviewThread",
+                        "camera_import_preview",
+                        {
+                            { "command_id", commandId }
+                        },
+                        e
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = std::string("camera_import_preview exception: ") + e.what();
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+                catch (...) {
+                    logAgentUnknownException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::cameraImportPreviewThread",
+                        "camera_import_preview",
+                        {
+                            { "command_id", commandId }
+                        }
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = "camera_import_preview unknown exception";
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+            }).detach();
+        }
         else if (type == "drakon_find_start") {
             handleDrakonFindStartCommand_(commandId, payload);
         }
@@ -6467,16 +7029,42 @@ void AgentCore::notifyCameraConnectionError(const std::string& cameraId,
             eventMessage = errorMessage;
         }
 
+        std::string rawReason = errorMessage;
+        if (extraDetails.is_object()) {
+            const auto rawReasonIt = extraDetails.find("failure_reason_raw");
+            if (rawReasonIt != extraDetails.end() && rawReasonIt->is_string()) {
+                rawReason = rawReasonIt->get<std::string>();
+            }
+        }
+
+        const std::string maskedRtspUrl = maskCameraFailureSensitiveText_(rtspUrl);
+        const std::string maskedEventMessage = maskCameraFailureSensitiveText_(eventMessage);
+        const std::string maskedRawReason = maskCameraFailureSensitiveText_(rawReason);
+        const nlohmann::json failureSummary =
+            buildCameraConnectionFailureSummary_(rtspUrl, rawReason, extraDetails, eventMessage);
+
         json payload;
         payload["camera_id"] = std::stoi(cameraId);  // your DB uses int
         payload["event_type"] = "camera_connection_failed";
-        payload["message"] = eventMessage;
+        payload["message"] = maskedEventMessage;
         payload["details"] = {
-            { "rtsp_url", rtspUrl },
-            { "error",    errorMessage }
+            { "rtsp_url", maskedRtspUrl },
+            { "rtsp_url_masked", maskedRtspUrl },
+            { "error", maskedRawReason }
         };
+        if (failureSummary.is_object() && !failureSummary.empty()) {
+            payload["details"]["failure"] = failureSummary;
+        }
         if (extraDetails.is_object()) {
             for (auto it = extraDetails.begin(); it != extraDetails.end(); ++it) {
+                if (it.key() == "failure_reason_raw" || it.key() == "active_rtsp_url") {
+                    continue;
+                }
+                if (it.value().is_string() && it.key().find("rtsp_url") != std::string::npos) {
+                    payload["details"][it.key()] =
+                        maskCameraFailureSensitiveText_(it.value().get<std::string>());
+                    continue;
+                }
                 payload["details"][it.key()] = it.value();
             }
         }
@@ -8228,47 +8816,52 @@ static std::string buildPromptVideoFrameMetaText_(const PromptVideoFrame& frame)
 static constexpr int kPromptVideoMosaicWidth_ = 1920;
 static constexpr int kPromptVideoMosaicHeight_ = 1080;
 
-struct PromptVideoMosaicGridRule_ {
-    std::size_t maxFrames = 0;
-    int columns = 1;
-    int rows = 1;
+struct PromptVideoMosaicProfile_ {
+    const char* videoPackagingMode = "mosaic_3x3";
+    const char* layoutId = "openai_video_mosaic_3x3_v1";
+    int columns = 3;
+    int rows = 3;
+    int maxFramesPerMosaic = 9;
 };
 
-// Central mosaic layout ladder.
-// To test other layouts later (for example restoring 4x3), update this table only.
-static constexpr PromptVideoMosaicGridRule_ kPromptVideoMosaicGridRules_[] = {
-    { 1u, 1, 1 },
-    { 2u, 2, 1 },
-    { 4u, 2, 2 },
-    { 6u, 3, 2 },
-    { 9u, 3, 3 }
+static constexpr PromptVideoMosaicProfile_ kPromptVideoMosaicProfile2x2_ = {
+    "mosaic_2x2",
+    "openai_video_mosaic_2x2_v1",
+    2,
+    2,
+    4
 };
 
-static constexpr std::size_t kPromptVideoMosaicGridRuleCount_ =
-    sizeof(kPromptVideoMosaicGridRules_) / sizeof(kPromptVideoMosaicGridRules_[0]);
-static constexpr int kPromptVideoMosaicDefaultColumns_ =
-    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].columns;
-static constexpr int kPromptVideoMosaicDefaultRows_ =
-    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].rows;
-static constexpr int kPromptVideoMosaicDefaultCellWidth_ =
-    kPromptVideoMosaicWidth_ / kPromptVideoMosaicDefaultColumns_;
-static constexpr int kPromptVideoMosaicDefaultCellHeight_ =
-    kPromptVideoMosaicHeight_ / kPromptVideoMosaicDefaultRows_;
-static constexpr std::size_t kPromptVideoMosaicMaxFramesPerMosaic_ =
-    kPromptVideoMosaicGridRules_[kPromptVideoMosaicGridRuleCount_ - 1].maxFrames;
+static constexpr PromptVideoMosaicProfile_ kPromptVideoMosaicProfile3x3_ = {
+    "mosaic_3x3",
+    "openai_video_mosaic_3x3_v1",
+    3,
+    3,
+    9
+};
+
+static const PromptVideoMosaicProfile_& getPromptVideoMosaicProfile_(
+    const std::string& videoPackagingMode)
+{
+    const std::string normalized = normalizeVideoPackagingMode_(videoPackagingMode);
+    if (normalized == "mosaic_2x2") {
+        return kPromptVideoMosaicProfile2x2_;
+    }
+    return kPromptVideoMosaicProfile3x3_;
+}
 
 struct PromptVideoMosaicLayout_ {
-    int columns = kPromptVideoMosaicDefaultColumns_;
-    int rows = kPromptVideoMosaicDefaultRows_;
-    int cellWidth = kPromptVideoMosaicDefaultCellWidth_;
-    int cellHeight = kPromptVideoMosaicDefaultCellHeight_;
+    int columns = 3;
+    int rows = 3;
+    int cellWidth = kPromptVideoMosaicWidth_ / 3;
+    int cellHeight = kPromptVideoMosaicHeight_ / 3;
 };
 
 struct PromptVideoMosaic_ {
     int mosaicIndex = 1;
     int validCellCount = 0;
-    int gridColumns = kPromptVideoMosaicDefaultColumns_;
-    int gridRows = kPromptVideoMosaicDefaultRows_;
+    int gridColumns = 3;
+    int gridRows = 3;
     std::string jpegBase64;
 };
 
@@ -8278,12 +8871,20 @@ struct PromptVideoMosaicBundle_ {
     std::vector<int> gridColsPerMosaic;
     std::vector<int> gridRowsPerMosaic;
     int totalSampledFrames = 0;
+    int maxCellsPerMosaic = 0;
+    int fixedGridColumns = 0;
+    int fixedGridRows = 0;
+    int cellWidth = 0;
+    int cellHeight = 0;
+    std::string videoPackagingMode;
+    std::string layoutId;
 };
 
-static PromptVideoMosaicLayout_ makePromptVideoMosaicLayout_(int columns, int rows)
+static PromptVideoMosaicLayout_ makePromptVideoMosaicLayout_(
+    const PromptVideoMosaicProfile_& profile)
 {
-    columns = (std::max)(1, columns);
-    rows = (std::max)(1, rows);
+    const int columns = (std::max)(1, profile.columns);
+    const int rows = (std::max)(1, profile.rows);
     return {
         columns,
         rows,
@@ -8292,42 +8893,76 @@ static PromptVideoMosaicLayout_ makePromptVideoMosaicLayout_(int columns, int ro
     };
 }
 
-static PromptVideoMosaicLayout_ getPromptVideoMosaicLayout_(std::size_t framesInMosaic)
+static bool fitPromptVideoFrameIntoCell_(
+    const cv::Mat& source,
+    int cellWidth,
+    int cellHeight,
+    cv::Mat& outCell)
 {
-    const std::size_t clampedFrames =
-        (std::max)(std::size_t{ 1 }, (std::min)(framesInMosaic, kPromptVideoMosaicMaxFramesPerMosaic_));
+    outCell.release();
+    if (source.empty() || cellWidth <= 0 || cellHeight <= 0) return false;
 
-    for (const auto& rule : kPromptVideoMosaicGridRules_) {
-        if (clampedFrames <= rule.maxFrames) {
-            return makePromptVideoMosaicLayout_(rule.columns, rule.rows);
-        }
+    const int sourceWidth = source.cols;
+    const int sourceHeight = source.rows;
+    if (sourceWidth <= 0 || sourceHeight <= 0) return false;
+
+    outCell = cv::Mat(cellHeight, cellWidth, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    const double scale =
+        (std::min)(
+            static_cast<double>(cellWidth) / static_cast<double>(sourceWidth),
+            static_cast<double>(cellHeight) / static_cast<double>(sourceHeight));
+    const int resizedWidth =
+        (std::max)(1, static_cast<int>(std::round(static_cast<double>(sourceWidth) * scale)));
+    const int resizedHeight =
+        (std::max)(1, static_cast<int>(std::round(static_cast<double>(sourceHeight) * scale)));
+
+    cv::Mat resized;
+    cv::resize(
+        source,
+        resized,
+        cv::Size(resizedWidth, resizedHeight),
+        0.0,
+        0.0,
+        scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR
+    );
+
+    const int offsetX = (std::max)(0, (cellWidth - resizedWidth) / 2);
+    const int offsetY = (std::max)(0, (cellHeight - resizedHeight) / 2);
+    if (offsetX + resizedWidth > outCell.cols || offsetY + resizedHeight > outCell.rows) {
+        return false;
     }
 
-    return makePromptVideoMosaicLayout_(
-        kPromptVideoMosaicDefaultColumns_,
-        kPromptVideoMosaicDefaultRows_
-    );
+    resized.copyTo(outCell(cv::Rect(offsetX, offsetY, resizedWidth, resizedHeight)));
+    return true;
 }
 
-static std::string buildPromptVideoMosaicGridRuleText_()
+static PromptVideoMosaicLayout_ getPromptVideoMosaicLayout_(
+    const PromptVideoMosaicProfile_& profile)
+{
+    return makePromptVideoMosaicLayout_(profile);
+}
+
+static std::string buildPromptVideoMosaicGridRuleText_(
+    const PromptVideoMosaicProfile_& profile)
 {
     std::ostringstream out;
-    for (std::size_t i = 0; i < kPromptVideoMosaicGridRuleCount_; ++i) {
-        const auto& rule = kPromptVideoMosaicGridRules_[i];
-        if (i > 0) out << ",";
-        out << "<=" << rule.maxFrames << ":" << rule.columns << "x" << rule.rows;
-    }
+    out << "fixed:" << profile.columns << "x" << profile.rows;
     return out.str();
 }
 
-static std::vector<int> buildPromptVideoMosaicDistribution_(std::size_t totalFrames)
+static std::vector<int> buildPromptVideoMosaicDistribution_(
+    std::size_t totalFrames,
+    int maxFramesPerMosaic)
 {
     std::vector<int> distribution;
+    const std::size_t safeMaxFramesPerMosaic =
+        (std::max)(std::size_t{ 1 }, static_cast<std::size_t>(maxFramesPerMosaic));
     if (totalFrames == 0) return distribution;
 
     std::size_t mosaicCount =
-        (totalFrames + static_cast<std::size_t>(kPromptVideoMosaicMaxFramesPerMosaic_) - 1u) /
-        static_cast<std::size_t>(kPromptVideoMosaicMaxFramesPerMosaic_);
+        (totalFrames + safeMaxFramesPerMosaic - 1u) /
+        safeMaxFramesPerMosaic;
     if (mosaicCount == 0) mosaicCount = 1;
 
     const std::size_t baseFramesPerMosaic = totalFrames / mosaicCount;
@@ -8381,13 +9016,28 @@ static bool encodePromptVideoMosaicToBase64_(
 }
 
 static PromptVideoMosaicBundle_ buildPromptVideoMosaicBundle_(
-    const std::vector<PromptVideoFrame>& frames)
+    const std::vector<PromptVideoFrame>& frames,
+    const std::string& videoPackagingMode)
 {
     PromptVideoMosaicBundle_ bundle;
     bundle.totalSampledFrames = static_cast<int>(frames.size());
     if (frames.empty()) return bundle;
 
-    const std::vector<int> distribution = buildPromptVideoMosaicDistribution_(frames.size());
+    const PromptVideoMosaicProfile_& profile =
+        getPromptVideoMosaicProfile_(videoPackagingMode);
+    const PromptVideoMosaicLayout_ layout = getPromptVideoMosaicLayout_(profile);
+    bundle.maxCellsPerMosaic = profile.maxFramesPerMosaic;
+    bundle.fixedGridColumns = layout.columns;
+    bundle.fixedGridRows = layout.rows;
+    bundle.cellWidth = layout.cellWidth;
+    bundle.cellHeight = layout.cellHeight;
+    bundle.videoPackagingMode = profile.videoPackagingMode;
+    bundle.layoutId = profile.layoutId;
+
+    const std::vector<int> distribution = buildPromptVideoMosaicDistribution_(
+        frames.size(),
+        profile.maxFramesPerMosaic
+    );
     if (distribution.empty()) return bundle;
 
     bundle.mosaics.reserve(distribution.size());
@@ -8400,8 +9050,6 @@ static PromptVideoMosaicBundle_ buildPromptVideoMosaicBundle_(
         const int framesInMosaic = distribution[mosaicZero];
         if (framesInMosaic <= 0) continue;
 
-        const PromptVideoMosaicLayout_ layout =
-            getPromptVideoMosaicLayout_(static_cast<std::size_t>(framesInMosaic));
         cv::Mat mosaic(
             kPromptVideoMosaicHeight_,
             kPromptVideoMosaicWidth_,
@@ -8418,15 +9066,16 @@ static PromptVideoMosaicBundle_ buildPromptVideoMosaicBundle_(
                 continue;
             }
 
-            cv::Mat resized;
-            cv::resize(
+            cv::Mat fittedCell;
+            if (!fitPromptVideoFrameIntoCell_(
                 decoded,
-                resized,
-                cv::Size(layout.cellWidth, layout.cellHeight),
-                0.0,
-                0.0,
-                cv::INTER_AREA
-            );
+                layout.cellWidth,
+                layout.cellHeight,
+                fittedCell) ||
+                fittedCell.empty())
+            {
+                continue;
+            }
 
             const int x = (cellZero % layout.columns) * layout.cellWidth;
             const int y = (cellZero / layout.columns) * layout.cellHeight;
@@ -8437,7 +9086,7 @@ static PromptVideoMosaicBundle_ buildPromptVideoMosaicBundle_(
                 continue;
             }
 
-            resized.copyTo(mosaic(cv::Rect(x, y, layout.cellWidth, layout.cellHeight)));
+            fittedCell.copyTo(mosaic(cv::Rect(x, y, layout.cellWidth, layout.cellHeight)));
         }
 
         std::string mosaicBase64;
@@ -8698,6 +9347,7 @@ static const PromptVideoFrame* findPromptVideoFrameBySegmentOffset_(
 
 static bool mapPromptVideoMosaicRefToFrameIndex_(
     const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& videoPackagingMode,
     int mosaicIndex,
     int cellIndex,
     int& outFrameIndex)
@@ -8705,8 +9355,13 @@ static bool mapPromptVideoMosaicRefToFrameIndex_(
     outFrameIndex = -1;
     if (frameCatalog == nullptr || mosaicIndex < 1 || cellIndex < 1) return false;
 
+    const PromptVideoMosaicProfile_& profile =
+        getPromptVideoMosaicProfile_(videoPackagingMode);
     const std::vector<int> distribution =
-        buildPromptVideoMosaicDistribution_(frameCatalog->size());
+        buildPromptVideoMosaicDistribution_(
+            frameCatalog->size(),
+            profile.maxFramesPerMosaic
+        );
     if (distribution.empty()) return false;
     if (mosaicIndex > static_cast<int>(distribution.size())) return false;
 
@@ -8731,11 +9386,18 @@ static bool mapPromptVideoMosaicRefToFrameIndex_(
 
 static const PromptVideoFrame* findPromptVideoFrameByMosaicRef_(
     const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& videoPackagingMode,
     int mosaicIndex,
     int cellIndex)
 {
     int frameIndex = -1;
-    if (!mapPromptVideoMosaicRefToFrameIndex_(frameCatalog, mosaicIndex, cellIndex, frameIndex)) {
+    if (!mapPromptVideoMosaicRefToFrameIndex_(
+        frameCatalog,
+        videoPackagingMode,
+        mosaicIndex,
+        cellIndex,
+        frameIndex))
+    {
         return nullptr;
     }
     return findPromptVideoFrameByFrameIndex_(frameCatalog, frameIndex);
@@ -8764,7 +9426,8 @@ static bool resolvePromptFrameReferenceFromObject_(
     const nlohmann::json& node,
     const std::vector<PromptVideoFrame>* frameCatalog,
     const TemporalVideoSegmentContext_& ctx,
-    ResolvedPromptFrameReference_& out)
+    ResolvedPromptFrameReference_& out,
+    const std::string& videoPackagingMode = std::string())
 {
     out = ResolvedPromptFrameReference_{};
     if (!node.is_object()) return false;
@@ -8788,7 +9451,12 @@ static bool resolvePromptFrameReferenceFromObject_(
 
     const PromptVideoFrame* matchedFrame = nullptr;
     if (hasMosaicRef) {
-        matchedFrame = findPromptVideoFrameByMosaicRef_(frameCatalog, mosaicIndex, cellIndex);
+        matchedFrame = findPromptVideoFrameByMosaicRef_(
+            frameCatalog,
+            videoPackagingMode,
+            mosaicIndex,
+            cellIndex
+        );
         if (matchedFrame != nullptr) {
             frameIndex = matchedFrame->frameIndex;
         }
@@ -9352,7 +10020,7 @@ static void canonicalizeTemporalNodeAliases_(
         "confidence",
         { "identity_confidence", "match_confidence" });
     copyTemporalStringAliasIfMissing_(node, "reason", { "reasoning" });
-    copyTemporalStringAliasIfMissing_(node, "description", { "reasoning" });
+    copyTemporalStringAliasIfMissing_(node, "description", { "reasoning", "short_description" });
     copyTemporalStringAliasIfMissing_(node, "observation_kind", { "observation_type", "kind" });
 
     if (!node.contains("description") || !node["description"].is_string() ||
@@ -9784,13 +10452,18 @@ static std::string buildTemporalEvidenceKey_(
 
 static const PromptVideoFrame* findPromptVideoFrameForNode_(
     const nlohmann::json& node,
-    const std::vector<PromptVideoFrame>* frameCatalog)
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& videoPackagingMode = std::string())
 {
     int mosaicIndex = -1;
     int cellIndex = -1;
     if (tryReadPromptVideoMosaicRef_(node, mosaicIndex, cellIndex)) {
         if (const PromptVideoFrame* byMosaic =
-            findPromptVideoFrameByMosaicRef_(frameCatalog, mosaicIndex, cellIndex))
+            findPromptVideoFrameByMosaicRef_(
+                frameCatalog,
+                videoPackagingMode,
+                mosaicIndex,
+                cellIndex))
         {
             return byMosaic;
         }
@@ -9838,20 +10511,28 @@ static bool buildTemporalEvidenceCandidateFromNode_(
     const nlohmann::json& node,
     const std::vector<PromptVideoFrame>* frameCatalog,
     const TemporalVideoSegmentContext_& ctx,
+    const std::string& videoPackagingMode,
     const std::string& fallbackEventName,
     TemporalEvidenceCandidate& outCandidate)
 {
     outCandidate = TemporalEvidenceCandidate{};
     if (!node.is_object() || frameCatalog == nullptr) return false;
 
-    const PromptVideoFrame* matchedFrame = findPromptVideoFrameForNode_(node, frameCatalog);
+    const PromptVideoFrame* matchedFrame =
+        findPromptVideoFrameForNode_(node, frameCatalog, videoPackagingMode);
     if (matchedFrame == nullptr || matchedFrame->jpegBase64.empty()) {
         return false;
     }
 
     ResolvedPromptFrameReference_ resolved;
     const bool hasResolvedRef =
-        resolvePromptFrameReferenceFromObject_(node, frameCatalog, ctx, resolved);
+        resolvePromptFrameReferenceFromObject_(
+            node,
+            frameCatalog,
+            ctx,
+            resolved,
+            videoPackagingMode
+        );
 
     outCandidate.frameIndex = matchedFrame->frameIndex;
     outCandidate.frameTimestampInSegment = !matchedFrame->frameTimestampInSegment.empty()
@@ -10073,9 +10754,12 @@ static void normalizeTemporalPayloadForVideo_(
     const std::string& fallbackUtcIso,
     const std::string& logStreamId,
     const std::string& scopeTag,
-    const std::vector<PromptVideoFrame>* frameCatalog = nullptr)
+    const std::vector<PromptVideoFrame>* frameCatalog = nullptr,
+    const std::string& videoPackagingMode = std::string())
 {
     hit.temporalEvidenceCandidates.clear();
+    const std::string normalizedVideoPackagingMode =
+        normalizeVideoPackagingMode_(videoPackagingMode);
 
     TemporalVideoSegmentContext_ ctx;
     deriveTemporalVideoSegmentContext_(
@@ -10168,7 +10852,13 @@ static void normalizeTemporalPayloadForVideo_(
         if (!node.is_object()) return std::string();
 
         ResolvedPromptFrameReference_ resolved;
-        if (!resolvePromptFrameReferenceFromObject_(node, frameCatalog, ctx, resolved)) {
+        if (!resolvePromptFrameReferenceFromObject_(
+            node,
+            frameCatalog,
+            ctx,
+            resolved,
+            normalizedVideoPackagingMode))
+        {
             return std::string();
         }
 
@@ -10193,7 +10883,14 @@ static void normalizeTemporalPayloadForVideo_(
         if (!node.is_object()) return;
 
         TemporalEvidenceCandidate candidate;
-        if (!buildTemporalEvidenceCandidateFromNode_(node, frameCatalog, ctx, fallbackEventName, candidate)) {
+        if (!buildTemporalEvidenceCandidateFromNode_(
+            node,
+            frameCatalog,
+            ctx,
+            normalizedVideoPackagingMode,
+            fallbackEventName,
+            candidate))
+        {
             return;
         }
 
@@ -12728,12 +13425,43 @@ static void stripJsonKeyRecursive_(nlohmann::json& node, const char* key)
     }
 }
 
+static void expandNestedJsonStringsForLogRecursive_(nlohmann::json& node)
+{
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            expandNestedJsonStringsForLogRecursive_(it.value());
+        }
+        return;
+    }
+
+    if (node.is_array()) {
+        for (auto& item : node) {
+            expandNestedJsonStringsForLogRecursive_(item);
+        }
+        return;
+    }
+
+    if (!node.is_string()) return;
+
+    const std::string raw = trimAscii(node.get<std::string>());
+    if (raw.empty()) return;
+
+    const char first = raw.front();
+    if (first != '{' && first != '[') return;
+
+    nlohmann::json nested = nlohmann::json::parse(raw, nullptr, false);
+    if (nested.is_discarded()) return;
+
+    expandNestedJsonStringsForLogRecursive_(nested);
+    node = std::move(nested);
+}
+
 static std::string sanitizeModelRawRespForLog_(const std::string& rawResp)
 {
     if (rawResp.empty()) return rawResp;
 
     auto truncateRawRespForLog = [](const std::string& value) {
-        constexpr std::size_t kMaxRawRespCharsForLog = 4000;
+        constexpr std::size_t kMaxRawRespCharsForLog = 12000;
         if (value.size() <= kMaxRawRespCharsForLog) return value;
         return value.substr(0, kMaxRawRespCharsForLog) +
             "...(truncated " + std::to_string(value.size() - kMaxRawRespCharsForLog) + " chars)";
@@ -12746,8 +13474,9 @@ static std::string sanitizeModelRawRespForLog_(const std::string& rawResp)
 
     stripJsonKeyRecursive_(parsed, "thoughtSignature");
     stripJsonKeyRecursive_(parsed, "reasoning_content");
+    expandNestedJsonStringsForLogRecursive_(parsed);
     try {
-        return truncateRawRespForLog(parsed.dump());
+        return truncateRawRespForLog(parsed.dump(2));
     }
     catch (...) {
         return truncateRawRespForLog(rawResp);
@@ -14116,17 +14845,336 @@ namespace {
             q.find("cross_camera_watchlist") != std::string::npos;
     }
 
+    static bool parseStartConditionStepIdField(
+        const nlohmann::json& scid,
+        int& outStepId);
+
+    static bool structuredVisionNodeUsesTemporalDeltaContract_(const nlohmann::json& node)
+    {
+        if (!node.is_object()) return false;
+        return node.contains("local_alert_update") ||
+            node.contains("start_condition_update") ||
+            node.contains("identity_updates") ||
+            node.contains("visibility_updates") ||
+            node.contains("event_updates") ||
+            node.contains("watchlist_updates");
+    }
+
+    static bool temporalDeltaVisibilityStateSuggestsPositive_(const std::string& rawState)
+    {
+        const std::string state = temporal::normalizeEvidenceToken(rawState);
+        return state.empty() ||
+            state == "visible" ||
+            state == "present" ||
+            state == "currently_visible" ||
+            state == "visible_this_batch" ||
+            state == "visible_this_segment" ||
+            state == "visible_in_segment" ||
+            state == "entity_visible" ||
+            state == "target_visible" ||
+            state == "person_visible" ||
+            state == "in_view" ||
+            state == "on_screen";
+    }
+
+    static bool temporalDeltaVisibilityStateSuggestsUncertain_(const std::string& rawState)
+    {
+        const std::string state = temporal::normalizeEvidenceToken(rawState);
+        return state == "uncertain" ||
+            state == "uncertain_visibility" ||
+            state == "ambiguous" ||
+            state == "ambiguous_visibility" ||
+            state == "unclear" ||
+            state == "occluded" ||
+            state == "partially_occluded" ||
+            state == "partial_occlusion" ||
+            state == "blocked" ||
+            state == "low_confidence";
+    }
+
+    static nlohmann::json buildStructuredVisionCompatNodeFromTemporalDelta_(
+        const nlohmann::json& node)
+    {
+        if (!node.is_object() || !structuredVisionNodeUsesTemporalDeltaContract_(node)) {
+            return node;
+        }
+
+        nlohmann::json normalized = node;
+        nlohmann::json identityPatch =
+            node.contains("identity_patch") && node["identity_patch"].is_array()
+                ? node["identity_patch"]
+                : nlohmann::json::array();
+        nlohmann::json observations =
+            node.contains("observations") && node["observations"].is_array()
+                ? node["observations"]
+                : nlohmann::json::array();
+        nlohmann::json unknownReasons = nlohmann::json::array();
+        nlohmann::json watchlistMatches =
+            node.contains("cross_camera_watchlist_matches") &&
+            node["cross_camera_watchlist_matches"].is_array()
+                ? node["cross_camera_watchlist_matches"]
+                : nlohmann::json::array();
+
+        auto appendObject = [](nlohmann::json& target, nlohmann::json item) {
+            if (!target.is_array()) target = nlohmann::json::array();
+            if (!item.is_object() || item.empty()) return;
+            target.push_back(std::move(item));
+        };
+
+        auto mergeAlertRegionIds = [&](const nlohmann::json& source) {
+            const std::vector<std::string> parsed = parseAlertRegionIdsFromJson_(source);
+            if (parsed.empty()) return;
+
+            std::vector<std::string> merged;
+            std::unordered_set<std::string> seen;
+            for (const auto& value : parseAlertRegionIdsFromJson_(normalized)) {
+                const std::string trimmed = trimAscii(value);
+                if (trimmed.empty() || !seen.insert(trimmed).second) continue;
+                merged.push_back(trimmed);
+            }
+
+            for (const auto& value : parsed) {
+                const std::string trimmed = trimAscii(value);
+                if (trimmed.empty() || !seen.insert(trimmed).second) continue;
+                merged.push_back(trimmed);
+            }
+
+            if (merged.empty()) {
+                normalized.erase("alert_region_ids");
+                return;
+            }
+
+            normalized["alert_region_ids"] = nlohmann::json::array();
+            for (const auto& value : merged) {
+                normalized["alert_region_ids"].push_back(value);
+            }
+        };
+
+        auto copyCommonTemporalFields = [&](const nlohmann::json& source, nlohmann::json& target) {
+            if (!source.is_object()) return;
+
+            const std::string entityId =
+                readTemporalNodeStringAlias_(source, { "entity_id", "matched_entity_id" });
+            if (!entityId.empty()) target["entity_id"] = entityId;
+
+            const std::string entityKey =
+                readTemporalNodeStringAlias_(
+                    source,
+                    { "entity_key", "entity_ref", "entity", "subject", "target_entity", "matched_entity" });
+            if (!entityKey.empty()) target["entity_key"] = entityKey;
+
+            const std::string entityType =
+                readTemporalNodeStringAlias_(source, { "entity_type", "matched_entity_type" });
+            if (!entityType.empty()) target["entity_type"] = entityType;
+
+            const std::string reason =
+                readTemporalNodeStringAlias_(
+                    source,
+                    { "reason", "description", "short_description", "note", "reasoning" });
+            if (!reason.empty()) {
+                if (!target.contains("reason")) target["reason"] = reason;
+                if (!target.contains("description")) target["description"] = reason;
+            }
+
+            const std::string zone = readTemporalEvidenceZone_(source);
+            if (!zone.empty() && !target.contains("zone")) target["zone"] = zone;
+
+            if (source.contains("confidence") && source["confidence"].is_number()) {
+                target["confidence"] = source["confidence"];
+            }
+
+            if (source.contains("updated_traits")) {
+                target["updated_traits"] = source["updated_traits"];
+            }
+            else if (source.contains("key_traits")) {
+                target["updated_traits"] = source["key_traits"];
+            }
+
+            if (source.contains("frame_ref") && source["frame_ref"].is_object()) {
+                target["frame_ref"] = source["frame_ref"];
+            }
+            else {
+                if (source.contains("frame_index")) target["frame_index"] = source["frame_index"];
+                if (source.contains("frame_timestamp_in_segment")) {
+                    target["frame_timestamp_in_segment"] = source["frame_timestamp_in_segment"];
+                }
+                if (source.contains("timestamp_name")) target["timestamp_name"] = source["timestamp_name"];
+                if (source.contains("time_in_video")) target["time_in_video"] = source["time_in_video"];
+            }
+        };
+
+        if (node.contains("local_alert_update") && node["local_alert_update"].is_object()) {
+            const auto& alertUpdate = node["local_alert_update"];
+            if (alertUpdate.contains("alert_condition") && alertUpdate["alert_condition"].is_boolean()) {
+                normalized["alert_condition"] = alertUpdate["alert_condition"];
+            }
+            mergeAlertRegionIds(alertUpdate);
+
+            const std::string alertReason =
+                readTemporalNodeStringAlias_(alertUpdate, { "reason", "description", "short_description" });
+            const bool alertIsTrue =
+                normalized.contains("alert_condition") &&
+                normalized["alert_condition"].is_boolean() &&
+                normalized["alert_condition"].get<bool>();
+            if (alertIsTrue &&
+                !alertReason.empty() &&
+                (!normalized.contains("answer") ||
+                 !normalized["answer"].is_string() ||
+                 trimAscii(normalized["answer"].get<std::string>()).empty()))
+            {
+                normalized["answer"] = alertReason;
+            }
+        }
+
+        if (node.contains("start_condition_update") && node["start_condition_update"].is_object()) {
+            const auto& startUpdate = node["start_condition_update"];
+            if (startUpdate.contains("step_id")) {
+                int stepId = -1;
+                if (parseStartConditionStepIdField(startUpdate["step_id"], stepId)) {
+                    normalized["start_condition_step_id"] = stepId;
+                }
+            }
+        }
+
+        if (node.contains("identity_updates") && node["identity_updates"].is_array()) {
+            for (const auto& item : node["identity_updates"]) {
+                if (!item.is_object()) continue;
+                nlohmann::json patch = item;
+                copyCommonTemporalFields(item, patch);
+                appendObject(identityPatch, std::move(patch));
+            }
+        }
+
+        if (node.contains("visibility_updates") && node["visibility_updates"].is_array()) {
+            for (const auto& item : node["visibility_updates"]) {
+                if (item.is_string()) {
+                    const std::string reason = trimAscii(item.get<std::string>());
+                    if (!reason.empty()) {
+                        appendObject(unknownReasons, nlohmann::json{ { "reason", reason } });
+                    }
+                    continue;
+                }
+                if (!item.is_object()) continue;
+
+                const std::string rawState =
+                    readTemporalNodeStringAlias_(item, { "state", "status", "visibility_state", "visibility" });
+                const std::string normalizedState =
+                    temporal::normalizeEvidenceToken(rawState.empty() ? "present" : rawState);
+
+                nlohmann::json out = nlohmann::json::object();
+                copyCommonTemporalFields(item, out);
+
+                if (temporalDeltaVisibilityStateSuggestsUncertain_(normalizedState)) {
+                    if (!normalizedState.empty()) out["state"] = normalizedState;
+                    if ((!out.contains("reason") || !out["reason"].is_string()) && !rawState.empty()) {
+                        out["reason"] = rawState;
+                    }
+                    appendObject(unknownReasons, std::move(out));
+                    continue;
+                }
+
+                if (temporalDeltaVisibilityStateSuggestsPositive_(normalizedState)) {
+                    out["type"] = "entity_presence";
+                    out["event"] = "present";
+                    out["state"] = "visible";
+                }
+                else {
+                    const std::string absenceState =
+                        normalizedState.empty() ? std::string("not_visible_this_segment") : normalizedState;
+                    out["type"] = "entity_visibility";
+                    out["event"] = absenceState;
+                    out["state"] = absenceState;
+                }
+                appendObject(observations, std::move(out));
+            }
+        }
+
+        if (node.contains("event_updates") && node["event_updates"].is_array()) {
+            for (const auto& item : node["event_updates"]) {
+                if (item.is_string()) {
+                    const std::string eventName = trimAscii(item.get<std::string>());
+                    if (!eventName.empty()) {
+                        appendObject(observations, nlohmann::json{ { "event", eventName } });
+                    }
+                    continue;
+                }
+                if (!item.is_object()) continue;
+
+                nlohmann::json observation = item;
+                copyCommonTemporalFields(item, observation);
+                const std::string eventName =
+                    readTemporalNodeStringAlias_(item, { "event", "event_type", "type" });
+                if (!eventName.empty() && !observation.contains("event")) {
+                    observation["event"] = eventName;
+                }
+                appendObject(observations, std::move(observation));
+            }
+        }
+
+        if (node.contains("unknown_reasons") && node["unknown_reasons"].is_array()) {
+            for (const auto& item : node["unknown_reasons"]) {
+                if (item.is_string()) {
+                    const std::string reason = trimAscii(item.get<std::string>());
+                    if (!reason.empty()) {
+                        appendObject(unknownReasons, nlohmann::json{ { "reason", reason } });
+                    }
+                    continue;
+                }
+                if (!item.is_object()) continue;
+                nlohmann::json unknown = item;
+                copyCommonTemporalFields(item, unknown);
+                appendObject(unknownReasons, std::move(unknown));
+            }
+        }
+
+        if (node.contains("watchlist_updates") && node["watchlist_updates"].is_array()) {
+            for (const auto& item : node["watchlist_updates"]) {
+                if (!item.is_object()) continue;
+                watchlistMatches.push_back(item);
+            }
+        }
+
+        if (identityPatch.is_array() && !identityPatch.empty()) normalized["identity_patch"] = identityPatch;
+        else normalized.erase("identity_patch");
+
+        if (observations.is_array() && !observations.empty()) normalized["observations"] = observations;
+        else normalized.erase("observations");
+
+        if (unknownReasons.is_array() && !unknownReasons.empty()) normalized["unknown_reasons"] = unknownReasons;
+        else normalized.erase("unknown_reasons");
+
+        if (watchlistMatches.is_array() && !watchlistMatches.empty()) {
+            normalized["cross_camera_watchlist_matches"] = watchlistMatches;
+        }
+        else {
+            normalized.erase("cross_camera_watchlist_matches");
+        }
+
+        return normalized;
+    }
+
     static nlohmann::json parseCrossCameraWatchlistMatchesFromJson_(const nlohmann::json& node)
     {
-        if (!node.is_object() ||
-            !node.contains("cross_camera_watchlist_matches") ||
-            !node["cross_camera_watchlist_matches"].is_array())
+        if (!node.is_object())
         {
             return nlohmann::json::array();
         }
 
+        const nlohmann::json* matchesNode = nullptr;
+        if (node.contains("cross_camera_watchlist_matches") &&
+            node["cross_camera_watchlist_matches"].is_array())
+        {
+            matchesNode = &node["cross_camera_watchlist_matches"];
+        }
+        else if (node.contains("watchlist_updates") && node["watchlist_updates"].is_array()) {
+            matchesNode = &node["watchlist_updates"];
+        }
+        if (matchesNode == nullptr) {
+            return nlohmann::json::array();
+        }
+
         nlohmann::json out = nlohmann::json::array();
-        for (const auto& item : node["cross_camera_watchlist_matches"]) {
+        for (const auto& item : *matchesNode) {
             if (!item.is_object()) continue;
             nlohmann::json normalized = nlohmann::json::object();
             const std::string huntId =
@@ -14153,8 +15201,14 @@ namespace {
             if (item.contains("matched_target_name") && item["matched_target_name"].is_string()) {
                 normalized["matched_target_name"] = item["matched_target_name"];
             }
+            else if (item.contains("target_name") && item["target_name"].is_string()) {
+                normalized["matched_target_name"] = item["target_name"];
+            }
             if (item.contains("matched_entity_type") && item["matched_entity_type"].is_string()) {
                 normalized["matched_entity_type"] = item["matched_entity_type"];
+            }
+            else if (item.contains("entity_type") && item["entity_type"].is_string()) {
+                normalized["matched_entity_type"] = item["entity_type"];
             }
             if (!normalized.empty()) out.push_back(std::move(normalized));
         }
@@ -14173,10 +15227,6 @@ namespace {
             hit.temporalPayloadPresent
         );
     }
-
-    static bool parseStartConditionStepIdField(
-        const nlohmann::json& scid,
-        int& outStepId);
 
     static void trimJsonArrayToMaxItems_(
         nlohmann::json& node,
@@ -14257,21 +15307,24 @@ namespace {
     {
         if (!node.is_object()) return;
 
-        if (node.contains("answer") && node["answer"].is_string()) {
-            hit.answer = node["answer"].get<std::string>();
+        const nlohmann::json compatNode =
+            buildStructuredVisionCompatNodeFromTemporalDelta_(node);
+
+        if (compatNode.contains("answer") && compatNode["answer"].is_string()) {
+            hit.answer = compatNode["answer"].get<std::string>();
         }
-        if (node.contains("alert_condition") && node["alert_condition"].is_boolean()) {
-            hit.alertCondition = node["alert_condition"].get<bool>();
+        if (compatNode.contains("alert_condition") && compatNode["alert_condition"].is_boolean()) {
+            hit.alertCondition = compatNode["alert_condition"].get<bool>();
         }
 
-        hit.alertRegionIds = parseAlertRegionIdsFromJson_(node);
-        parseTemporalFieldsFromJson_(node, hit);
-        hit.crossCameraWatchlistMatches = parseCrossCameraWatchlistMatchesFromJson_(node);
+        hit.alertRegionIds = parseAlertRegionIdsFromJson_(compatNode);
+        parseTemporalFieldsFromJson_(compatNode, hit);
+        hit.crossCameraWatchlistMatches = parseCrossCameraWatchlistMatchesFromJson_(compatNode);
 
         const std::size_t rawCrossCameraMatchCount =
-            node.contains("cross_camera_watchlist_matches") &&
-            node["cross_camera_watchlist_matches"].is_array()
-                ? node["cross_camera_watchlist_matches"].size()
+            compatNode.contains("cross_camera_watchlist_matches") &&
+            compatNode["cross_camera_watchlist_matches"].is_array()
+                ? compatNode["cross_camera_watchlist_matches"].size()
                 : 0;
         const std::size_t parsedCrossCameraMatchCount =
             hit.crossCameraWatchlistMatches.is_array()
@@ -14290,20 +15343,20 @@ namespace {
             );
         }
 
-        if (node.contains("start_condition_step_id")) {
+        if (compatNode.contains("start_condition_step_id")) {
             int stepId = -1;
-            if (parseStartConditionStepIdField(node["start_condition_step_id"], stepId)) {
+            if (parseStartConditionStepIdField(compatNode["start_condition_step_id"], stepId)) {
                 hit.startConditionStepId = stepId;
             }
-            else if (node["start_condition_step_id"].is_boolean() &&
-                     !node["start_condition_step_id"].get<bool>())
+            else if (compatNode["start_condition_step_id"].is_boolean() &&
+                     !compatNode["start_condition_step_id"].get<bool>())
             {
                 hit.startConditionStepId = -1;
             }
         }
 
         if (includeDetectionTimeInVideo) {
-            parseDetectionTimeInVideoFromJson_(node, hit);
+            parseDetectionTimeInVideoFromJson_(compatNode, hit);
         }
         else {
             hit.detectionTimeInVideo.clear();
@@ -14592,6 +15645,7 @@ namespace {
         bool jobMode = false;
         bool directChatFlow = false;
         bool hasTemporal = false;
+        bool useTemporalDeltaContract = false;
         bool useVideoMosaics = false;
         bool hasFaceReferences = false;
         bool hasLegacySingleFaceReference = false;
@@ -14627,7 +15681,7 @@ namespace {
         std::size_t dynamicPromptBytes = 0;
     };
 
-    static constexpr const char* kOpenAIVisionPromptRevision_ = "vision-cache-v3";
+    static constexpr const char* kOpenAIVisionPromptRevision_ = "vision-cache-v4";
 
     static std::string hashString64Hex_(const std::string& value)
     {
@@ -14948,6 +16002,7 @@ namespace {
             variant += "_mosaic";
         }
         if (options.hasTemporal) variant += "_temporal";
+        if (options.useTemporalDeltaContract) variant += "_delta";
         if (options.hasFaceReferences) variant += "_face";
         if (options.hasLegacySingleFaceReference) variant += "_legacy_face";
         if (options.hasNegativeReferences) variant += "_negative";
@@ -14964,6 +16019,16 @@ namespace {
     static nlohmann::json makeNullableIntegerSchema_()
     {
         return nlohmann::json{ { "type", nlohmann::json::array({ "integer", "null" }) } };
+    }
+
+    static nlohmann::json makeNullableBooleanSchema_()
+    {
+        return nlohmann::json{ { "type", nlohmann::json::array({ "boolean", "null" }) } };
+    }
+
+    static nlohmann::json makeNullableNumberSchema_()
+    {
+        return nlohmann::json{ { "type", nlohmann::json::array({ "number", "null" }) } };
     }
 
     static nlohmann::json makeNullableStringArraySchema_(int maxItems)
@@ -15003,10 +16068,136 @@ namespace {
         return schema;
     }
 
+    static nlohmann::json makeNullableObjectSchema_(nlohmann::json properties)
+    {
+        return nlohmann::json{
+            { "type", nlohmann::json::array({ "object", "null" }) },
+            { "additionalProperties", false },
+            { "properties", std::move(properties) }
+        };
+    }
+
+    static nlohmann::json makeFrameRefSchema_()
+    {
+        return makeNullableObjectSchema_(nlohmann::json{
+            { "mosaic_index", makeNullableIntegerSchema_() },
+            { "cell_index", makeNullableIntegerSchema_() },
+            { "frame_index", makeNullableIntegerSchema_() },
+            { "frame_timestamp_in_segment", makeNullableStringSchema_() }
+        });
+    }
+
+    static nlohmann::json makeNullableObjectArraySchemaWithItemProperties_(
+        nlohmann::json itemProperties,
+        int maxItems)
+    {
+        nlohmann::json schema = {
+            { "type", nlohmann::json::array({ "array", "null" }) },
+            { "items", {
+                { "type", "object" },
+                { "additionalProperties", false },
+                { "properties", std::move(itemProperties) }
+            }}
+        };
+        if (maxItems > 0) schema["maxItems"] = maxItems;
+        return schema;
+    }
+
     static nlohmann::json buildOpenAIVisionResponseFormat_(
         const OpenAIVisionPromptOptions_& options,
         const std::string& cacheVariant)
     {
+        if (options.useTemporalDeltaContract) {
+            nlohmann::json properties = {
+                { "answer", makeNullableStringSchema_() },
+                { "local_alert_update", makeNullableObjectSchema_(nlohmann::json{
+                    { "alert_condition", { { "type", "boolean" } } },
+                    { "alert_region_ids", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxAlertRegionIds_)) },
+                    { "reason", makeNullableStringSchema_() }
+                }) },
+                { "start_condition_update", makeNullableObjectSchema_(nlohmann::json{
+                    { "step_id", { { "type", "integer" } } }
+                }) },
+                { "identity_updates", makeNullableObjectArraySchemaWithItemProperties_(
+                    nlohmann::json{
+                        { "entity_id", makeNullableStringSchema_() },
+                        { "entity_key", makeNullableStringSchema_() },
+                        { "entity_type", makeNullableStringSchema_() },
+                        { "decision", makeNullableStringSchema_() },
+                        { "confidence", makeNullableNumberSchema_() },
+                        { "short_description", makeNullableStringSchema_() },
+                        { "updated_traits", makeNullableStringArraySchema_(8) },
+                        { "frame_ref", makeFrameRefSchema_() }
+                    },
+                    static_cast<int>(kStructuredVisionMaxIdentityPatchItems_)) },
+                { "visibility_updates", makeNullableObjectArraySchemaWithItemProperties_(
+                    nlohmann::json{
+                        { "entity_id", makeNullableStringSchema_() },
+                        { "entity_key", makeNullableStringSchema_() },
+                        { "entity_type", makeNullableStringSchema_() },
+                        { "state", makeNullableStringSchema_() },
+                        { "frame_ref", makeFrameRefSchema_() },
+                        { "reason", makeNullableStringSchema_() }
+                    },
+                    static_cast<int>(kStructuredVisionMaxObservationItems_)) },
+                { "event_updates", makeNullableObjectArraySchemaWithItemProperties_(
+                    nlohmann::json{
+                        { "entity_id", makeNullableStringSchema_() },
+                        { "entity_key", makeNullableStringSchema_() },
+                        { "entity_type", makeNullableStringSchema_() },
+                        { "event", makeNullableStringSchema_() },
+                        { "frame_ref", makeFrameRefSchema_() },
+                        { "zone", makeNullableStringSchema_() },
+                        { "reason", makeNullableStringSchema_() },
+                        { "continuation", makeNullableBooleanSchema_() },
+                        { "counts_as_new_event", makeNullableBooleanSchema_() }
+                    },
+                    static_cast<int>(kStructuredVisionMaxObservationItems_)) },
+                { "unknown_reasons", makeNullableObjectArraySchemaWithItemProperties_(
+                    nlohmann::json{
+                        { "entity_id", makeNullableStringSchema_() },
+                        { "entity_key", makeNullableStringSchema_() },
+                        { "entity_type", makeNullableStringSchema_() },
+                        { "reason", makeNullableStringSchema_() },
+                        { "description", makeNullableStringSchema_() },
+                        { "frame_ref", makeFrameRefSchema_() }
+                    },
+                    static_cast<int>(kStructuredVisionMaxUnknownReasonItems_)) }
+            };
+
+            if (options.hasFaceReferences) {
+                properties["faceid_match"] = { { "type", "boolean" } };
+                properties["faceid_target_names"] =
+                    makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxFaceIdTargetNames_));
+            }
+            if (options.hasCrossCameraWatchlist) {
+                properties["watchlist_updates"] =
+                    makeNullableObjectArraySchemaWithItemProperties_(
+                        nlohmann::json{
+                            { "hunt_id", makeNullableStringSchema_() },
+                            { "matched_entity_id", makeNullableStringSchema_() },
+                            { "matched_target_name", makeNullableStringSchema_() },
+                            { "matched_entity_type", makeNullableStringSchema_() },
+                            { "confidence", makeNullableNumberSchema_() },
+                            { "reason", makeNullableStringSchema_() }
+                        },
+                        static_cast<int>(kStructuredVisionMaxCrossCameraMatches_));
+            }
+
+            return nlohmann::json{
+                { "type", "json_schema" },
+                { "json_schema", {
+                    { "name", std::string("vision_") + cacheVariant },
+                    { "strict", false },
+                    { "schema", {
+                        { "type", "object" },
+                        { "additionalProperties", false },
+                        { "properties", properties }
+                    }}
+                }}
+            };
+        }
+
         nlohmann::json properties = {
             { "answer", makeNullableStringSchema_() },
             { "alert_condition", { { "type", "boolean" } } },
@@ -15094,18 +16285,26 @@ namespace {
         });
     }
 
-    static std::string buildOpenAIVideoMosaicLayoutText_()
+    static std::string buildOpenAIVideoMosaicLayoutText_(
+        const PromptVideoMosaicBundle_& bundle)
     {
         const nlohmann::json layout = {
-            { "layout_id", "openai_video_mosaic_v1" },
+            { "layout_id", bundle.layoutId },
+            { "video_packaging_mode", bundle.videoPackagingMode },
             { "media_type", "mosaic_sequence" },
             { "mosaic_index_base", 1 },
             { "cell_index_base", 1 },
             { "mosaics_are_in_temporal_order", true },
             { "cell_reading_order", "left_to_right_top_to_bottom" },
             { "distribution_rule", "balanced_sequential_partition" },
-            { "max_cells_per_mosaic", kPromptVideoMosaicMaxFramesPerMosaic_ },
-            { "grid_rule", buildPromptVideoMosaicGridRuleText_() },
+            { "grid_rule", buildPromptVideoMosaicGridRuleText_(
+                getPromptVideoMosaicProfile_(bundle.videoPackagingMode)) },
+            { "grid_mode", "fixed" },
+            { "grid_cols", bundle.fixedGridColumns },
+            { "grid_rows", bundle.fixedGridRows },
+            { "cell_width", bundle.cellWidth },
+            { "cell_height", bundle.cellHeight },
+            { "max_cells_per_mosaic", bundle.maxCellsPerMosaic },
             { "reference_format", {
                 { "frame_ref", {
                     { "mosaic_index", "1-based VIDEO_MOSAIC_IMAGE order" },
@@ -15121,7 +16320,14 @@ namespace {
         int modelInputFps)
     {
         const nlohmann::json runtime = {
+            { "layout_id", bundle.layoutId },
+            { "video_packaging_mode", bundle.videoPackagingMode },
             { "mosaic_count", static_cast<int>(bundle.mosaics.size()) },
+            { "max_cells_per_mosaic", bundle.maxCellsPerMosaic },
+            { "fixed_grid_cols", bundle.fixedGridColumns },
+            { "fixed_grid_rows", bundle.fixedGridRows },
+            { "cell_width", bundle.cellWidth },
+            { "cell_height", bundle.cellHeight },
             { "valid_cells_per_mosaic", bundle.validCellsPerMosaic },
             { "grid_cols_per_mosaic", bundle.gridColsPerMosaic },
             { "grid_rows_per_mosaic", bundle.gridRowsPerMosaic },
@@ -15131,14 +16337,53 @@ namespace {
         return std::string("MOSAIC_RUNTIME_JSON:\n") + runtime.dump();
     }
 
-    static std::string buildOpenAIVisionSystemText_(const OpenAIVisionPromptOptions_& options)
+    static std::string buildOpenAITemporalDeltaContractText_(
+        const OpenAIVisionPromptOptions_& options)
+    {
+        if (!options.useTemporalDeltaContract) return std::string();
+
+        std::ostringstream prompt;
+        prompt << "TEMPORAL DELTA OUTPUT CONTRACT:\n";
+        prompt << "- Return only updates discovered in the current batch.\n";
+        prompt << "- Omit any field that has no update for this round.\n";
+        prompt << "- Do not repeat persisted state, prior counts, unchanged traits, or unchanged events from TEMPORAL_RUNTIME_STATE_JSON.\n";
+        prompt << "- answer is optional. Omit it unless a short user-facing explanation is needed because of alert, start condition, face match, or a meaningful ambiguity explanation.\n";
+        prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
+        prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
+        prompt << "- identity_updates are optional. Emit them only for durable identity changes: new_entity, match_existing, merged identity, new confirmed traits, or another identity correction.\n";
+        prompt << "- visibility_updates are optional. Emit at most one per relevant entity when asserting a current-round visibility state.\n";
+        prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
+        prompt << "- Use visibility state not_visible_this_segment or absent when a tracked entity from temporal state is clearly not visible in the current batch.\n";
+        prompt << "- event_updates are optional. Emit only atomic current-batch events such as picked_up_cup. Never emit cumulative counts like 'third time'.\n";
+        prompt << "- unknown_reasons are optional. Emit them only when occlusion, ambiguity, or conflict explains why no stronger update was produced.\n";
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "- watchlist_updates are optional. Emit them only for strong positive watchlist matches or meaningful watchlist changes.\n";
+        }
+        if (options.hasFaceReferences) {
+            prompt << "- faceid_match and faceid_target_names are optional in this contract. Emit them only for positive face matches.\n";
+        }
+        if (options.modality == OpenAIVisionModality_::Video) {
+            prompt << "- When a visibility or event update cites video evidence, use frame_ref.\n";
+        }
+        return prompt.str();
+    }
+
+    static std::string buildOpenAIVisionSystemText_(
+        const OpenAIVisionPromptOptions_& options,
+        const PromptVideoMosaicBundle_* mosaicBundle = nullptr)
     {
         std::ostringstream prompt;
         prompt << "You are " << AppBrand::kAssistantName << ", a CCTV assistant.\n";
         prompt << "- Follow the provided response schema exactly.\n";
         prompt << "- All JSON field names must remain in English.\n";
-        prompt << "- Write `answer` in the same language as the task text.\n";
-        prompt << "- Keep `answer` concise; prefer one short sentence unless the task explicitly needs more detail.\n";
+        if (options.useTemporalDeltaContract) {
+            prompt << "- `answer` is optional in this automated temporal delta contract.\n";
+            prompt << "- When you do emit `answer`, write it in the same language as the task text and keep it to one short sentence.\n";
+        }
+        else {
+            prompt << "- Write `answer` in the same language as the task text.\n";
+            prompt << "- Keep `answer` concise; prefer one short sentence unless the task explicitly needs more detail.\n";
+        }
         prompt << "- Be conservative: when uncertain, prefer null/empty optional fields and keep booleans false.\n";
         if (options.modality == OpenAIVisionModality_::Video) {
             if (options.useVideoMosaics) {
@@ -15163,7 +16408,13 @@ namespace {
             else {
                 prompt << "- alert_condition must reflect only current-batch evidence; use temporal state for explanation, identity continuity, and structured temporal fields.\n";
             }
-            prompt << "- Do not write temporal state directly; only return observations, identity patches, and watchlist matches when supported.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- Do not write temporal state directly. Return only current-round updates.\n";
+                prompt << "- Omitted delta fields mean no update for that field in this round.\n";
+            }
+            else {
+                prompt << "- Do not write temporal state directly; only return observations, identity patches, and watchlist matches when supported.\n";
+            }
         }
         if (options.hasFaceReferences || options.hasLegacySingleFaceReference) {
             prompt << "- When a face reference is provided, compare conservatively and only mark a positive match when identity is clearly consistent.\n";
@@ -15184,7 +16435,8 @@ namespace {
         const OpenAIVisionPromptOptions_& options,
         const VisionPromptSections_& sections,
         const std::string& alertConditionText,
-        const std::string& startConditionText)
+        const std::string& startConditionText,
+        const PromptVideoMosaicBundle_* mosaicBundle = nullptr)
     {
         std::ostringstream prompt;
         if (options.jobMode) {
@@ -15212,15 +16464,21 @@ namespace {
             prompt << "- Refer only to what is visible in this sampled video evidence.\n\n";
         }
 
+        if (options.useTemporalDeltaContract) {
+            prompt << buildOpenAITemporalDeltaContractText_(options) << "\n";
+        }
+
         if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
             prompt << "VIDEO MOSAIC INPUT RULES:\n";
             prompt << "- You will receive an ordered sequence of VIDEO_MOSAIC_IMAGE inputs.\n";
             prompt << "- mosaic_index is the 1-based order of VIDEO_MOSAIC_IMAGE inputs in the prompt.\n";
             prompt << "- Within each mosaic, cell_index is 1-based in left-to-right, top-to-bottom order.\n";
             prompt << "- Each cell is one sampled frame from the current segment.\n";
-            prompt << "- When citing evidence inside observations or identity_patch events, use frame_ref with mosaic_index and cell_index.\n";
+            prompt << "- When citing evidence inside temporal update objects, use frame_ref with mosaic_index and cell_index.\n";
             prompt << "- Do not guess frame_index manually.\n";
-            prompt << buildOpenAIVideoMosaicLayoutText_() << "\n\n";
+            if (mosaicBundle != nullptr) {
+                prompt << buildOpenAIVideoMosaicLayoutText_(*mosaicBundle) << "\n\n";
+            }
         }
 
         if (options.hasFaceReferences) {
@@ -15263,17 +16521,37 @@ namespace {
         prompt << "FIELD RULES:\n";
         prompt << "- alert_region_ids should list visible region ids only when alert evidence is clearly tied to them.\n";
         if (options.hasTemporal) {
-            prompt << "- identity_patch and observations must contain JSON objects only.\n";
-            prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
-            prompt << "- Do not repeat the same event in observations just because later frames still show the entity in the middle of that same action.\n";
-            prompt << "- If you need to mention that later frame, keep the same observation as continuity using continuation=true and counts_as_new_event=false.\n";
-            prompt << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
+                prompt << "- If an entity is visible but nothing durable changed, prefer a short visibility_updates item instead of repeating a full identity update.\n";
+                prompt << "- Do not repeat the same event just because later frames still show continuity of the same action.\n";
+                prompt << "- When later frames only confirm continuity, use continuation=true and counts_as_new_event=false inside that event update.\n";
+                prompt << "- When temporal context lets you match a visible entity to prior state, emit an identity update only if there is new durable identity information worth saving.\n";
+            }
+            else {
+                prompt << "- identity_patch and observations must contain JSON objects only.\n";
+                prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+                prompt << "- Do not repeat the same event in observations just because later frames still show the entity in the middle of that same action.\n";
+                prompt << "- If you need to mention that later frame, keep the same observation as continuity using continuation=true and counts_as_new_event=false.\n";
+                prompt << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch.\n";
+            }
         }
         if (options.hasFaceReferences) {
-            prompt << "- If faceid_match is true, include matched target names when known.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- If there is no positive face match update, omit faceid_match entirely.\n";
+                prompt << "- If faceid_match is true, include matched target names when known.\n";
+            }
+            else {
+                prompt << "- If faceid_match is true, include matched target names when known.\n";
+            }
         }
         if (options.hasCrossCameraWatchlist) {
-            prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- watchlist_updates should report strong shared-target matches even if the local alert stays false.\n";
+            }
+            else {
+                prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+            }
         }
         if (options.includeDetectionTimeInVideo) {
             prompt << "- detection_time_in_video must contain only representative MM:SS timestamps from this segment.\n";
@@ -15340,6 +16618,10 @@ namespace {
             prompt << "- Refer only to what is visible in this image.\n\n";
         }
 
+        if (options.useTemporalDeltaContract) {
+            prompt << buildOpenAITemporalDeltaContractText_(options) << "\n";
+        }
+
         if (options.hasFaceReferences) {
             prompt << "REFERENCE IMAGE LOGIC:\n";
             prompt << "- Structured USER_REFERENCE_IMAGE inputs may include TARGET_ID and TARGET_NAME metadata.\n";
@@ -15372,14 +16654,31 @@ namespace {
         prompt << "FIELD RULES:\n";
         prompt << "- alert_region_ids should list visible region ids only when alert evidence is clearly tied to them.\n";
         if (options.hasTemporal) {
-            prompt << "- identity_patch and observations must contain JSON objects only.\n";
-            prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
+                prompt << "- If an entity is visible but nothing durable changed, prefer a short visibility_updates item instead of repeating a full identity update.\n";
+            }
+            else {
+                prompt << "- identity_patch and observations must contain JSON objects only.\n";
+                prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+            }
         }
         if (options.hasFaceReferences) {
-            prompt << "- If faceid_match is true, include matched target names when known.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- If there is no positive face match update, omit faceid_match entirely.\n";
+                prompt << "- If faceid_match is true, include matched target names when known.\n";
+            }
+            else {
+                prompt << "- If faceid_match is true, include matched target names when known.\n";
+            }
         }
         if (options.hasCrossCameraWatchlist) {
-            prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+            if (options.useTemporalDeltaContract) {
+                prompt << "- watchlist_updates should report strong shared-target matches even if the local alert stays false.\n";
+            }
+            else {
+                prompt << "- cross_camera_watchlist_matches should report strong shared-target matches even if the local alert stays false.\n";
+            }
         }
         return prompt.str();
     }
@@ -15405,6 +16704,37 @@ namespace {
         const OpenAIVisionPromptOptions_& options)
     {
         std::ostringstream prompt;
+        if (options.useTemporalDeltaContract) {
+            prompt << "RESPONSE FORMAT (RAW JSON ONLY, TEMPORAL DELTA CONTRACT):\n";
+            prompt << "- Omit any field that has no update in this round.\n";
+            prompt << "- answer: optional string or null\n";
+            prompt << "- local_alert_update: optional object with alert_condition boolean, optional alert_region_ids array of strings or null, optional reason string or null\n";
+            prompt << "- start_condition_update: optional object with step_id integer\n";
+            prompt << "- identity_updates: optional array or null (max " <<
+                kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
+            prompt << "- visibility_updates: optional array or null (max " <<
+                kStructuredVisionMaxObservationItems_ << " items)\n";
+            prompt << "- event_updates: optional array or null (max " <<
+                kStructuredVisionMaxObservationItems_ << " items)\n";
+            prompt << "- unknown_reasons: optional array or null (max " <<
+                kStructuredVisionMaxUnknownReasonItems_ << " items)\n";
+            if (options.hasFaceReferences) {
+                prompt << "- faceid_match: optional boolean (emit only for positive match)\n";
+                prompt << "- faceid_target_names: optional array of strings or null (max " <<
+                    kStructuredVisionMaxFaceIdTargetNames_ << " items)\n";
+            }
+            if (options.hasCrossCameraWatchlist) {
+                prompt << "- watchlist_updates: optional array or null (max " <<
+                    kStructuredVisionMaxCrossCameraMatches_ << " items)\n";
+            }
+            if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
+                prompt << "- visibility_updates and event_updates should use frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer} when citing evidence.\n";
+            }
+            prompt << "- Do not repeat unchanged temporal state, unchanged traits, or prior counts.\n";
+            prompt << "- No markdown, no code fences, no extra keys.\n";
+            return prompt.str();
+        }
+
         prompt << "RESPONSE FORMAT (RAW JSON ONLY):\n";
         prompt << "- answer: string or null\n";
         prompt << "- alert_condition: boolean\n";
@@ -15595,13 +16925,15 @@ namespace {
     {
         OpenAIVisionRequestBuild_ build;
         build.videoPackagingModeForLog = normalizeVideoPackagingMode_(videoPackagingMode);
+        const bool preferVideoMosaics = build.videoPackagingModeForLog != "frame_sequence";
         const std::vector<FaceReferenceImage> canonicalFaceReferences =
             buildEffectiveFaceReferences_(effectiveFaceReferences);
         const std::vector<NegativeReferenceImage> canonicalNegativeReferences =
             buildEffectiveNegativeReferences_(effectiveNegativeReferences);
         const PromptVideoMosaicBundle_ mosaicBundle =
-            buildPromptVideoMosaicBundle_(frames);
-        const bool preferVideoMosaics = build.videoPackagingModeForLog != "frame_sequence";
+            preferVideoMosaics
+                ? buildPromptVideoMosaicBundle_(frames, build.videoPackagingModeForLog)
+                : PromptVideoMosaicBundle_{};
         const bool useVideoMosaics = preferVideoMosaics && !mosaicBundle.mosaics.empty();
 
         OpenAIVisionPromptOptions_ options;
@@ -15609,6 +16941,7 @@ namespace {
         options.jobMode = jobMode;
         options.directChatFlow = !jobMode && !cameraStyleFlow;
         options.hasTemporal = sections.hasTemporal;
+        options.useTemporalDeltaContract = options.hasTemporal && !options.directChatFlow;
         options.useVideoMosaics = useVideoMosaics;
         options.hasFaceReferences = !canonicalFaceReferences.empty();
         options.hasLegacySingleFaceReference =
@@ -15616,15 +16949,20 @@ namespace {
         options.hasNegativeReferences = !canonicalNegativeReferences.empty();
         options.hasCrossCameraWatchlist = sections.hasCrossCameraWatchlist;
         options.temporalAlertMayUsePriorState = false;
-        options.includeDetectionTimeInVideo = true;
-        options.requireDetectionTimeInVideo = options.directChatFlow;
+        options.includeDetectionTimeInVideo = !options.useTemporalDeltaContract;
+        options.requireDetectionTimeInVideo =
+            options.includeDetectionTimeInVideo && options.directChatFlow;
 
-        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticSystemText = buildOpenAIVisionSystemText_(
+            options,
+            useVideoMosaics ? &mosaicBundle : nullptr
+        );
         const std::string staticUserText = buildOpenAIVideoStaticText_(
             options,
             sections,
             alertConditionText,
-            startConditionText
+            startConditionText,
+            useVideoMosaics ? &mosaicBundle : nullptr
         );
         const std::string temporalStaticText =
             sections.temporalStaticJson.empty()
@@ -15839,6 +17177,7 @@ namespace {
         options.modality = OpenAIVisionModality_::Image;
         options.jobMode = true;
         options.hasTemporal = sections.hasTemporal;
+        options.useTemporalDeltaContract = options.hasTemporal;
         options.hasFaceReferences = !canonicalFaceReferences.empty();
         options.hasNegativeReferences = !canonicalNegativeReferences.empty();
         options.hasCrossCameraWatchlist = sections.hasCrossCameraWatchlist;
@@ -18779,7 +20118,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             temporal::nowIso(),
             camLogId,
             "callOpenAIVisionVideoSegment_",
-            &frames
+            &frames,
+            videoPackagingMode
         );
         if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
             hit.faceIdMatch = res["faceid_match"].get<bool>();
@@ -19208,7 +20548,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             temporal::nowIso(),
             camLogId,
             "callOpenAIVisionVideoSegmentJOB_",
-            &frames
+            &frames,
+            videoPackagingMode
         );
         if (res.contains("faceid_match") && res["faceid_match"].is_boolean()) {
             hit.faceIdMatch = res["faceid_match"].get<bool>();
@@ -21709,6 +23050,466 @@ void AgentCore::handleDrakonFindStartCommand_(int commandId, const nlohmann::jso
     {
         std::lock_guard<std::mutex> lk(drakonFindMu_);
         drakonFindTasks_[searchId] = std::move(task);
+    }
+}
+
+void AgentCore::handleCameraImportPreviewCommand_(
+    int commandId,
+    const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        Logger::instance().logDebug("agent", "handleCameraImportPreviewCommand_: missing command id");
+        return;
+    }
+
+    auto fail = [&](const std::string& reason) {
+        nlohmann::json err;
+        err["error"] = reason;
+        postCommandResult_(commandId, "failed", err);
+    };
+
+    try {
+        if (!payload.contains("rows") || !payload["rows"].is_array()) {
+            fail("rows is required");
+            return;
+        }
+
+        const nlohmann::json& rowsJson = payload["rows"];
+        if (rowsJson.empty()) {
+            fail("rows is empty");
+            return;
+        }
+
+        auto trimImport = [](const std::string& value) -> std::string {
+            return trimAscii(value);
+        };
+
+        auto jsonStringOrImport = [&](const nlohmann::json& node, const char* key) -> std::string {
+            if (!node.is_object() || !node.contains(key) || !node[key].is_string()) {
+                return std::string();
+            }
+            return trimImport(node[key].get<std::string>());
+        };
+
+        auto jsonStringArrayOrImport = [&](const nlohmann::json& node, const char* key) {
+            std::vector<std::string> values;
+            if (!node.is_object() || !node.contains(key) || !node[key].is_array()) {
+                return values;
+            }
+            for (const auto& item : node[key]) {
+                if (!item.is_string()) continue;
+                const std::string text = trimImport(item.get<std::string>());
+                if (!text.empty()) {
+                    values.push_back(text);
+                }
+            }
+            return values;
+        };
+
+        auto toUpperImport = [](std::string value) -> std::string {
+            for (auto& ch : value) {
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            }
+            return value;
+        };
+
+        auto normalizeConnectionMethod = [&](const std::string& value, bool& outDefaulted) {
+            const std::string upper = toUpperImport(trimImport(value));
+            if (upper == "HTTP" || upper == "ONVIF" || upper == "WEBCAM") {
+                outDefaulted = false;
+                return upper;
+            }
+            if (upper == "RTSP") {
+                outDefaulted = false;
+                return upper;
+            }
+            outDefaulted = true;
+            return std::string("RTSP");
+        };
+
+        auto countryNameFromCode = [&](const std::string& code) {
+            const std::string upper = toUpperImport(trimImport(code));
+            static const std::unordered_map<std::string, std::string> kNames = {
+                { "BR", "Brazil" },
+                { "US", "United States" },
+                { "CA", "Canada" },
+                { "MX", "Mexico" },
+                { "AR", "Argentina" },
+                { "CL", "Chile" },
+                { "CO", "Colombia" },
+                { "PE", "Peru" },
+                { "UY", "Uruguay" },
+                { "PY", "Paraguay" },
+                { "BO", "Bolivia" },
+                { "PT", "Portugal" },
+                { "ES", "Spain" },
+                { "FR", "France" },
+                { "DE", "Germany" },
+                { "IT", "Italy" },
+                { "GB", "United Kingdom" },
+                { "IE", "Ireland" },
+                { "AU", "Australia" },
+                { "NZ", "New Zealand" },
+                { "JP", "Japan" }
+            };
+            auto it = kNames.find(upper);
+            if (it != kNames.end()) {
+                return it->second;
+            }
+            return upper.empty() ? std::string("Imported placeholder country") : upper;
+        };
+
+        const std::string userCountryCode =
+            toUpperImport(trimImport(payload.value("user_country_code", std::string("BR"))));
+
+        std::map<int, nlohmann::json> sourceRowsByIndex;
+        for (const auto& row : rowsJson) {
+            if (!row.is_object()) continue;
+            const int sourceIndex = row.value("source_index", -1);
+            if (sourceIndex < 0) continue;
+            sourceRowsByIndex[sourceIndex] = row;
+        }
+        if (sourceRowsByIndex.empty()) {
+            fail("rows did not contain valid source_index values");
+            return;
+        }
+
+        chatv2::LocalLlmRuntimeManager runtimeManager;
+        if (!runtimeManager.ensureReady()) {
+            fail("Local Qwen runtime unavailable: " + runtimeManager.lastError());
+            return;
+        }
+
+        chatv2::LocalLlmClient llmClient;
+        llmClient.setEndpointOverride(runtimeManager.baseUrl());
+
+        auto buildCandidateFromModel = [&](const nlohmann::json& modelItem, const nlohmann::json& sourceRow) {
+            const int sourceIndex = sourceRow.value("source_index", -1);
+            const std::string sourceReference = sourceRow.value("source_reference", std::string());
+            nlohmann::json candidate = nlohmann::json::object();
+            candidate["source_index"] = sourceIndex;
+            candidate["source_reference"] = sourceReference;
+            candidate["source_sheet_name"] =
+                sourceRow.contains("source_sheet_name") ? sourceRow["source_sheet_name"] : nlohmann::json();
+            candidate["source_row_number"] =
+                sourceRow.contains("source_row_number") ? sourceRow["source_row_number"] : nlohmann::json();
+            candidate["source_values"] =
+                sourceRow.contains("values") && sourceRow["values"].is_object()
+                    ? sourceRow["values"]
+                    : nlohmann::json::object();
+
+            candidate["name"] = jsonStringOrImport(modelItem, "name");
+            candidate["ip_address"] = jsonStringOrImport(modelItem, "ip_address");
+            candidate["rtsp_port"] = jsonStringOrImport(modelItem, "rtsp_port");
+            candidate["manufacturer"] = jsonStringOrImport(modelItem, "manufacturer");
+            candidate["username"] = jsonStringOrImport(modelItem, "username");
+            candidate["password"] = jsonStringOrImport(modelItem, "password");
+            candidate["channel"] = jsonStringOrImport(modelItem, "channel");
+            candidate["subtype"] = jsonStringOrImport(modelItem, "subtype");
+            candidate["description"] = jsonStringOrImport(modelItem, "description");
+            candidate["street"] = jsonStringOrImport(modelItem, "street");
+            candidate["number"] = jsonStringOrImport(modelItem, "number");
+            candidate["city"] = jsonStringOrImport(modelItem, "city");
+            candidate["state"] = jsonStringOrImport(modelItem, "state");
+            candidate["zip_code"] = jsonStringOrImport(modelItem, "zip_code");
+            candidate["country"] = jsonStringOrImport(modelItem, "country");
+
+            std::vector<std::string> defaultedFields = jsonStringArrayOrImport(modelItem, "defaulted_fields");
+            std::vector<std::string> warnings = jsonStringArrayOrImport(modelItem, "warnings");
+
+            bool connectionDefaulted = false;
+            const std::string normalizedConnectionMethod = normalizeConnectionMethod(
+                jsonStringOrImport(modelItem, "connection_method"),
+                connectionDefaulted);
+            candidate["connection_method"] = normalizedConnectionMethod;
+            if (connectionDefaulted) {
+                defaultedFields.push_back("connection_method");
+            }
+
+            if (candidate["rtsp_port"].get<std::string>().empty()) {
+                candidate["rtsp_port"] = "554";
+                defaultedFields.push_back("rtsp_port");
+            }
+
+            if (candidate["name"].get<std::string>().empty()) {
+                const std::string ipValue = candidate["ip_address"].get<std::string>();
+                if (!ipValue.empty()) {
+                    candidate["name"] = "Imported camera " + ipValue;
+                }
+                else {
+                    candidate["name"] = "Imported camera " + std::to_string(sourceIndex + 1);
+                }
+                defaultedFields.push_back("name");
+            }
+
+            bool addressDefaulted = false;
+            auto ensureAddressField = [&](const char* key, const std::string& value) {
+                if (!candidate[key].is_string() || candidate[key].get<std::string>().empty()) {
+                    candidate[key] = value;
+                    defaultedFields.push_back(key);
+                    addressDefaulted = true;
+                }
+            };
+            ensureAddressField("street", "Imported placeholder street");
+            ensureAddressField("number", std::to_string(1000 + sourceIndex + 1));
+            ensureAddressField("city", "Imported placeholder city " + std::to_string(sourceIndex + 1));
+            ensureAddressField("state", "Imported placeholder state");
+            ensureAddressField("zip_code", "00000-" + std::to_string(100 + sourceIndex + 1));
+            ensureAddressField("country", countryNameFromCode(userCountryCode));
+            candidate["address_was_defaulted"] = addressDefaulted;
+            if (addressDefaulted) {
+                warnings.push_back(
+                    "Address was missing or incomplete, so a placeholder address was generated."
+                );
+            }
+
+            nlohmann::json missingFields = nlohmann::json::array();
+            if (candidate["ip_address"].get<std::string>().empty()) {
+                missingFields.push_back("ip_address");
+            }
+            if (candidate["username"].get<std::string>().empty()) {
+                missingFields.push_back("username");
+            }
+            if (candidate["password"].get<std::string>().empty()) {
+                missingFields.push_back("password");
+            }
+            if (candidate["manufacturer"].get<std::string>().empty()) {
+                missingFields.push_back("manufacturer");
+            }
+
+            std::sort(defaultedFields.begin(), defaultedFields.end());
+            defaultedFields.erase(
+                std::unique(defaultedFields.begin(), defaultedFields.end()),
+                defaultedFields.end());
+            std::sort(warnings.begin(), warnings.end());
+            warnings.erase(
+                std::unique(warnings.begin(), warnings.end()),
+                warnings.end());
+
+            candidate["missing_fields"] = missingFields;
+            candidate["defaulted_fields"] = defaultedFields;
+            candidate["warnings"] = warnings;
+            candidate["can_create"] = missingFields.empty();
+            return candidate;
+        };
+
+        auto buildFallbackCandidate = [&](const nlohmann::json& sourceRow, const std::string& warning) {
+            nlohmann::json item = nlohmann::json::object();
+            item["warnings"] = nlohmann::json::array({ warning });
+            return buildCandidateFromModel(item, sourceRow);
+        };
+
+        std::map<int, nlohmann::json> candidatesByIndex;
+        const std::size_t chunkSize = 12;
+        std::vector<int> sourceIndices;
+        sourceIndices.reserve(sourceRowsByIndex.size());
+        for (const auto& entry : sourceRowsByIndex) {
+            sourceIndices.push_back(entry.first);
+        }
+
+        nlohmann::json globalWarnings = nlohmann::json::array();
+        if (payload.contains("global_warnings") && payload["global_warnings"].is_array()) {
+            for (const auto& warning : payload["global_warnings"]) {
+                if (!warning.is_string()) continue;
+                const std::string text = trimImport(warning.get<std::string>());
+                if (!text.empty()) {
+                    globalWarnings.push_back(text);
+                }
+            }
+        }
+
+        for (std::size_t offset = 0; offset < sourceIndices.size(); offset += chunkSize) {
+            const std::size_t limit = (std::min)(sourceIndices.size(), offset + chunkSize);
+            nlohmann::json chunkRows = nlohmann::json::array();
+            for (std::size_t index = offset; index < limit; ++index) {
+                chunkRows.push_back(sourceRowsByIndex[sourceIndices[index]]);
+            }
+
+            std::ostringstream systemPrompt;
+            systemPrompt
+                << "You normalize heterogeneous camera import rows into canonical CCTV camera records.\n"
+                << "Return valid JSON only.\n"
+                << "Never invent ip_address, username, password, or manufacturer if they are not present.\n"
+                << "You may infer name from context and default rtsp_port to 554 when an IP camera row exists.\n"
+                << "Default connection_method to RTSP unless the row explicitly indicates HTTP or ONVIF.\n"
+                << "If an RTSP/HTTP URL is present, extract ip_address, port, username, and password when visible.\n"
+                << "Address fields are optional. If the row does not contain an address, leave the address fields empty.\n"
+                << "Output schema:\n"
+                << "{\n"
+                << "  \"candidates\": [\n"
+                << "    {\n"
+                << "      \"source_index\": 0,\n"
+                << "      \"name\": \"\",\n"
+                << "      \"ip_address\": \"\",\n"
+                << "      \"rtsp_port\": \"\",\n"
+                << "      \"manufacturer\": \"\",\n"
+                << "      \"username\": \"\",\n"
+                << "      \"password\": \"\",\n"
+                << "      \"channel\": \"\",\n"
+                << "      \"subtype\": \"\",\n"
+                << "      \"connection_method\": \"RTSP\",\n"
+                << "      \"description\": \"\",\n"
+                << "      \"street\": \"\",\n"
+                << "      \"number\": \"\",\n"
+                << "      \"city\": \"\",\n"
+                << "      \"state\": \"\",\n"
+                << "      \"zip_code\": \"\",\n"
+                << "      \"country\": \"\",\n"
+                << "      \"defaulted_fields\": [],\n"
+                << "      \"warnings\": []\n"
+                << "    }\n"
+                << "  ]\n"
+                << "}\n";
+
+            std::ostringstream userPrompt;
+            userPrompt
+                << "Normalize the following camera import rows.\n"
+                << "Rows may come from Excel, Google Sheets exports, CSV, JSON, or free text.\n"
+                << "Keep one candidate per input row and preserve source_index.\n"
+                << "If a row is not a camera, return empty fields and add a warning.\n"
+                << "Rows JSON:\n"
+                << chunkRows.dump(2);
+
+            const auto outcome = llmClient.completeText(
+                "camera_import_preview",
+                systemPrompt.str(),
+                userPrompt.str(),
+                0.1,
+                2200,
+                60000,
+                1,
+                true
+            );
+
+            if (!outcome.ok || trimImport(outcome.content).empty()) {
+                globalWarnings.push_back(
+                    "One or more row groups could not be normalized by the local model. Empty preview rows were returned for those items."
+                );
+                for (std::size_t index = offset; index < limit; ++index) {
+                    const int sourceIndex = sourceIndices[index];
+                    candidatesByIndex[sourceIndex] = buildFallbackCandidate(
+                        sourceRowsByIndex[sourceIndex],
+                        "Local AI extraction failed for this row group."
+                    );
+                }
+                continue;
+            }
+
+            std::string jsonSlice = outcome.content;
+            if (!tryExtractJsonObjectSlice(jsonSlice, jsonSlice)) {
+                globalWarnings.push_back(
+                    "The local model returned malformed JSON for one row group. Empty preview rows were returned for those items."
+                );
+                for (std::size_t index = offset; index < limit; ++index) {
+                    const int sourceIndex = sourceIndices[index];
+                    candidatesByIndex[sourceIndex] = buildFallbackCandidate(
+                        sourceRowsByIndex[sourceIndex],
+                        "Local AI returned malformed JSON for this row group."
+                    );
+                }
+                continue;
+            }
+
+            const nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
+            if (!parsed.is_object() || !parsed.contains("candidates") || !parsed["candidates"].is_array()) {
+                globalWarnings.push_back(
+                    "The local model returned an unexpected object for one row group. Empty preview rows were returned for those items."
+                );
+                for (std::size_t index = offset; index < limit; ++index) {
+                    const int sourceIndex = sourceIndices[index];
+                    candidatesByIndex[sourceIndex] = buildFallbackCandidate(
+                        sourceRowsByIndex[sourceIndex],
+                        "Local AI returned an unexpected schema for this row group."
+                    );
+                }
+                continue;
+            }
+
+            std::unordered_set<int> seenInChunk;
+            for (const auto& modelItem : parsed["candidates"]) {
+                if (!modelItem.is_object()) continue;
+                const int sourceIndex = modelItem.value("source_index", -1);
+                auto sourceIt = sourceRowsByIndex.find(sourceIndex);
+                if (sourceIndex < 0 || sourceIt == sourceRowsByIndex.end()) {
+                    continue;
+                }
+                candidatesByIndex[sourceIndex] = buildCandidateFromModel(modelItem, sourceIt->second);
+                seenInChunk.insert(sourceIndex);
+            }
+
+            for (std::size_t index = offset; index < limit; ++index) {
+                const int sourceIndex = sourceIndices[index];
+                if (seenInChunk.count(sourceIndex)) continue;
+                candidatesByIndex[sourceIndex] = buildFallbackCandidate(
+                    sourceRowsByIndex[sourceIndex],
+                    "The local AI did not return a candidate for this row."
+                );
+            }
+        }
+
+        nlohmann::json candidates = nlohmann::json::array();
+        nlohmann::json missingFieldSummary = nlohmann::json::object();
+        int readyCount = 0;
+        int incompleteCount = 0;
+        int defaultedAddressCount = 0;
+
+        for (const auto& entry : sourceRowsByIndex) {
+            const int sourceIndex = entry.first;
+            auto candidateIt = candidatesByIndex.find(sourceIndex);
+            if (candidateIt == candidatesByIndex.end()) {
+                candidateIt = candidatesByIndex.emplace(
+                    sourceIndex,
+                    buildFallbackCandidate(entry.second, "No preview candidate was generated for this row.")
+                ).first;
+            }
+
+            const nlohmann::json& candidate = candidateIt->second;
+            candidates.push_back(candidate);
+            if (candidate.value("can_create", false)) {
+                readyCount += 1;
+            }
+            else {
+                incompleteCount += 1;
+            }
+            if (candidate.value("address_was_defaulted", false)) {
+                defaultedAddressCount += 1;
+            }
+            if (candidate.contains("missing_fields") && candidate["missing_fields"].is_array()) {
+                for (const auto& missing : candidate["missing_fields"]) {
+                    if (!missing.is_string()) continue;
+                    const std::string key = missing.get<std::string>();
+                    if (key.empty()) continue;
+                    if (!missingFieldSummary.contains(key) || !missingFieldSummary[key].is_number_integer()) {
+                        missingFieldSummary[key] = 0;
+                    }
+                    missingFieldSummary[key] = missingFieldSummary[key].get<int>() + 1;
+                }
+            }
+        }
+
+        nlohmann::json preview = nlohmann::json::object();
+        preview["file_name"] = payload.value("file_name", std::string());
+        preview["file_extension"] = payload.value("file_extension", std::string());
+        preview["source_format"] = payload.value("source_format", std::string("unknown"));
+        preview["total_rows_detected"] = payload.value("total_rows_detected", static_cast<int>(sourceRowsByIndex.size()));
+        preview["rows_sent_to_llm"] = static_cast<int>(sourceRowsByIndex.size());
+        preview["ready_count"] = readyCount;
+        preview["incomplete_count"] = incompleteCount;
+        preview["defaulted_address_count"] = defaultedAddressCount;
+        preview["skipped_count"] = 0;
+        preview["global_warnings"] = globalWarnings;
+        preview["missing_field_summary"] = missingFieldSummary;
+        preview["candidates"] = candidates;
+
+        nlohmann::json result = nlohmann::json::object();
+        result["preview"] = preview;
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        fail(std::string("camera_import_preview failed: ") + e.what());
+    }
+    catch (...) {
+        fail("camera_import_preview failed with unknown error");
     }
 }
 

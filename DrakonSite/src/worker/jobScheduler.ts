@@ -88,7 +88,7 @@ type InferenceGroupPayload = {
   targetIds: number[];
   agentKey: string;
   inputType: TargetInputType;
-  video_packaging_mode: "mosaic" | "frame_sequence";
+  video_packaging_mode: "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
   prompt_template: string;
   alert_condition: string | null;
   negative_condition: string | null;
@@ -177,19 +177,34 @@ function normalizeTargetInputType(value: unknown): TargetInputType {
   return normalized === "image" ? "image" : "video";
 }
 
-function normalizeVideoPackagingMode(value: unknown): "mosaic" | "frame_sequence" {
-  if (typeof value !== "string") return "mosaic";
+function normalizeVideoPackagingMode(
+  value: unknown
+): "mosaic_2x2" | "mosaic_3x3" | "frame_sequence" {
+  if (typeof value !== "string") return "mosaic_3x3";
   const normalized = value.trim().toLowerCase();
   if (
     normalized === "frame_sequence" ||
     normalized === "frame-sequence" ||
     normalized === "full_frame" ||
     normalized === "full-frame" ||
-    normalized === "frames"
+    normalized === "frames" ||
+    normalized === "high_resolution" ||
+    normalized === "high-resolution" ||
+    normalized === "high resolution"
   ) {
     return "frame_sequence";
   }
-  return "mosaic";
+  if (
+    normalized === "mosaic_2x2" ||
+    normalized === "mosaic-2x2" ||
+    normalized === "2x2" ||
+    normalized === "standard_resolution" ||
+    normalized === "standard-resolution" ||
+    normalized === "standard resolution"
+  ) {
+    return "mosaic_2x2";
+  }
+  return "mosaic_3x3";
 }
 
 function normalizePriorityLevel(value: unknown): string | null {
@@ -1621,6 +1636,9 @@ async function buildJobStartPayload(
           a.run_every,
           FIXED_AGENT_RUN_EVERY_SECONDS
         );
+        const videoPackagingMode = normalizeVideoPackagingMode(
+          a.video_packaging_mode ?? a.videoPackagingMode
+        );
         const runningResolution = normalizeRunningResolution(
           a.running_resolution,
           DEFAULT_CORE_RUNNING_RESOLUTION
@@ -1670,6 +1688,7 @@ async function buildJobStartPayload(
             DEFAULT_ULTRA_VIDEO_MODEL_FPS
           ),
           run_every: inferenceModel === "core" ? 60 : runEvery,
+          video_packaging_mode: videoPackagingMode,
           running_resolution: inferenceModel === "core" ? runningResolution : null,
           only_capture_on_motion: normalizeOnlyCaptureOnMotion(a.only_capture_on_motion, true),
           use_temporal_context: useTemporalContext,

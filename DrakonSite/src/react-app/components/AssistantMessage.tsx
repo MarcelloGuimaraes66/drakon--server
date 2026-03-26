@@ -7,6 +7,7 @@ import {
   formatAssistantMessageContent,
   shouldSuppressAssistantCameraFooter,
 } from "@/react-app/utils/chatUtils";
+import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 interface AssistantMessageProps {
   content: string;
@@ -165,7 +166,7 @@ export default function AssistantMessage({
       <div
         className={`flex-shrink-0 rounded-xl flex items-center justify-center ${
           isChatPageVariant
-            ? "bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_18px_34px_-20px_rgba(52,211,153,0.95)]"
+            ? CHAT_ASSISTANT_BADGE_CLASS
             : "bg-gradient-to-br from-gray-700 to-gray-800"
         } ${
           compact ? "w-8 h-8" : "w-8 h-8 md:w-10 md:h-10"

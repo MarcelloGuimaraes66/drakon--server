@@ -57,7 +57,7 @@ type BuildEnabledAlgorithmsArgs = {
 type CameraCustomInferenceModel = "legacy" | "pro" | "ultra" | "core";
 type CameraCustomRunEvery = 10 | 60;
 type CameraCustomRunningResolution = 640 | 1024;
-type CameraVideoPackagingMode = "mosaic" | "frame_sequence";
+type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 
 const FIXED_CAMERA_CUSTOM_INFERENCE_MODEL: CameraCustomInferenceModel = "ultra";
 const DEFAULT_CAMERA_CUSTOM_RUN_EVERY = 60;
@@ -110,7 +110,7 @@ const normalizeCameraAgentInputType = (value: unknown): "video" | "image" => {
 
 const normalizeCameraVideoPackagingMode = (
   value: unknown,
-  fallback: CameraVideoPackagingMode = "mosaic"
+  fallback: CameraVideoPackagingMode = "mosaic_3x3"
 ): CameraVideoPackagingMode => {
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
@@ -119,12 +119,33 @@ const normalizeCameraVideoPackagingMode = (
       normalized === "frame-sequence" ||
       normalized === "full_frame" ||
       normalized === "full-frame" ||
-      normalized === "frames"
+      normalized === "frames" ||
+      normalized === "high_resolution" ||
+      normalized === "high-resolution" ||
+      normalized === "high resolution"
     ) {
       return "frame_sequence";
     }
-    if (normalized === "mosaic") {
-      return "mosaic";
+    if (
+      normalized === "mosaic_2x2" ||
+      normalized === "mosaic-2x2" ||
+      normalized === "2x2" ||
+      normalized === "standard_resolution" ||
+      normalized === "standard-resolution" ||
+      normalized === "standard resolution"
+    ) {
+      return "mosaic_2x2";
+    }
+    if (
+      normalized === "mosaic" ||
+      normalized === "mosaic_3x3" ||
+      normalized === "mosaic-3x3" ||
+      normalized === "3x3" ||
+      normalized === "compact_resolution" ||
+      normalized === "compact-resolution" ||
+      normalized === "compact resolution"
+    ) {
+      return "mosaic_3x3";
     }
   }
   return fallback;

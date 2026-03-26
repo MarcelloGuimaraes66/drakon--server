@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from "react";
+import { useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import ChatInput from "@/react-app/components/ChatInput";
+import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
@@ -21,6 +23,7 @@ import {
   getCoreModelNoticeCopy,
   shouldShowCoreModelNotice,
 } from "@/react-app/utils/coreModelNotice";
+import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 type ChatModelTier = "ultra" | "core";
 type ChatRunningResolution = 640 | 1024;
@@ -29,6 +32,7 @@ const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
@@ -72,15 +76,17 @@ function normalizeChatModelFps(value: unknown, fallback = DEFAULT_ULTRA_VIDEO_MO
 
 export default function Chat() {
   const { t, i18n } = useTranslation();
+  const location = useLocation();
+  const navigate = useNavigate();
   const billingEnabled = brand.features.billingEnabled;
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [initialSessionId, setInitialSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [editingSessionId, setEditingSessionId] = useState<number | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null);
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [uploadedVideo, setUploadedVideo] = useState<{
     id: number;
@@ -146,30 +152,6 @@ export default function Chat() {
         : null;
 
   useEffect(() => {
-    const initializeChat = async () => {
-      const params = new URLSearchParams(window.location.search);
-      const sessionParam = params.get("session");
-      let parsedInitialSessionId: number | null = null;
-      if (sessionParam) {
-        const sessionId = parseInt(sessionParam, 10);
-        if (!isNaN(sessionId)) {
-          parsedInitialSessionId = sessionId;
-          setInitialSessionId(sessionId);
-        }
-      }
-
-      if (parsedInitialSessionId) {
-        await fetchSessions(parsedInitialSessionId);
-        return;
-      }
-
-      await createNewSession();
-    };
-
-    void initializeChat();
-  }, []);
-
-  useEffect(() => {
     return () => {
       if (headerGhostTimeoutRef.current) {
         clearTimeout(headerGhostTimeoutRef.current);
@@ -183,7 +165,12 @@ export default function Chat() {
       previousMessageCountRef.current = 0;
       setShouldAutoScroll(true);
       fetchMessages(activeSessionId);
+      return;
     }
+
+    previousMessageCountRef.current = 0;
+    setShouldAutoScroll(true);
+    setMessages([]);
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -195,42 +182,64 @@ export default function Chat() {
     }
   }, [messages, shouldAutoScroll]);
 
-  const fetchSessions = async (explicitInitialSessionId?: number | null) => {
+  const fetchSessions = async ({
+    preferredSessionId = null,
+    preserveDraftSelection = false,
+  }: {
+    preferredSessionId?: number | null;
+    preserveDraftSelection?: boolean;
+  } = {}) => {
     try {
       const response = await fetch("/api/chat/sessions");
       const data = await response.json();
       setSessions(data);
 
-      const desiredInitialSessionId = explicitInitialSessionId ?? initialSessionId;
       if (
-        desiredInitialSessionId &&
-        data.some((s: ChatSession) => s.id === desiredInitialSessionId)
+        preferredSessionId &&
+        data.some((s: ChatSession) => s.id === preferredSessionId)
       ) {
-        setActiveSessionId(desiredInitialSessionId);
-        setInitialSessionId(null);
+        setActiveSessionId(preferredSessionId);
         return data as ChatSession[];
       }
 
-      if (data.length > 0) {
-        setActiveSessionId((currentActiveSessionId) => {
-          if (
-            currentActiveSessionId &&
-            data.some((s: ChatSession) => s.id === currentActiveSessionId)
-          ) {
-            return currentActiveSessionId;
-          }
-          return data[0].id;
-        });
-        return data as ChatSession[];
+      if (preferredSessionId && !preserveDraftSelection) {
+        navigate("/chat", { replace: true });
       }
 
-      setActiveSessionId(null);
+      setActiveSessionId((currentActiveSessionId) => {
+        if (preserveDraftSelection) {
+          return null;
+        }
+        if (
+          currentActiveSessionId &&
+          data.some((s: ChatSession) => s.id === currentActiveSessionId)
+        ) {
+          return currentActiveSessionId;
+        }
+        return data.length > 0 ? data[0].id : null;
+      });
       return data as ChatSession[];
     } catch (fetchError) {
       console.error("Failed to fetch sessions:", fetchError);
       return [];
     }
   };
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const sessionParam = params.get("session");
+    const parsedSessionId = sessionParam ? parseInt(sessionParam, 10) : Number.NaN;
+
+    if (!Number.isNaN(parsedSessionId) && parsedSessionId > 0) {
+      setMessages([]);
+      void fetchSessions({ preferredSessionId: parsedSessionId, preserveDraftSelection: true });
+      return;
+    }
+
+    setActiveSessionId(null);
+    setMessages([]);
+    void fetchSessions({ preserveDraftSelection: true });
+  }, [location.search]);
 
   const fetchMessages = async (sessionId: number) => {
     try {
@@ -273,8 +282,10 @@ export default function Chat() {
   };
 
   const createNewSession = async (): Promise<number | null> => {
+    if (isCreatingSession) return null;
+
     try {
-      setMessages([]);
+      setIsCreatingSession(true);
 
       const response = await fetch("/api/chat/sessions", {
         method: "POST",
@@ -282,25 +293,46 @@ export default function Chat() {
         body: JSON.stringify({}),
       });
 
-      const newSession = await response.json();
-      const refreshedSessions = await fetch("/api/chat/sessions");
-      const refreshedData = await refreshedSessions.json();
-      setSessions(refreshedData);
+      if (!response.ok) {
+        throw new Error("Failed to create new chat");
+      }
+
+      const newSession = await response.json() as ChatSession;
+      setSessions((currentSessions) => [
+        newSession,
+        ...currentSessions.filter((session) => session.id !== newSession.id),
+      ]);
       setActiveSessionId(newSession.id);
       return newSession.id as number;
     } catch (createError) {
       console.error("Failed to create new chat:", createError);
       return null;
+    } finally {
+      setIsCreatingSession(false);
     }
   };
 
-  const handleNewChat = async () => {
-    await createNewSession();
+  const handleNewChat = () => {
+    setInput("");
+    setUploadedImage(null);
+    setUploadedVideo(null);
+    setMessages([]);
+    setActiveSessionId(null);
+    setShouldAutoScroll(true);
+    previousMessageCountRef.current = 0;
+
+    if (location.search) {
+      navigate("/chat");
+      return;
+    }
+
+    void fetchSessions({ preserveDraftSelection: true });
   };
 
   const handleSelectSession = (sessionId: number) => {
     setMessages([]);
     setActiveSessionId(sessionId);
+    navigate(`/chat?session=${sessionId}`);
   };
 
   const handleStartEdit = (session: ChatSession) => {
@@ -353,8 +385,10 @@ export default function Chat() {
         setMessages([]);
         if (newSessions.length > 0) {
           setActiveSessionId(newSessions[0].id);
+          navigate(`/chat?session=${newSessions[0].id}`, { replace: true });
         } else {
           setActiveSessionId(null);
+          navigate("/chat", { replace: true });
         }
       }
     } catch (deleteError) {
@@ -366,7 +400,15 @@ export default function Chat() {
   };
 
   const handleSend = async () => {
-    if ((!input.trim() && !uploadedImage && !uploadedVideo) || !activeSessionId) return;
+    if ((!input.trim() && !uploadedImage && !uploadedVideo) || isCreatingSession) return;
+
+    let targetSessionId = activeSessionId;
+    if (!targetSessionId) {
+      const createdSessionId = await createNewSession();
+      if (!createdSessionId) return;
+      targetSessionId = createdSessionId;
+      navigate(`/chat?session=${createdSessionId}`, { replace: true });
+    }
 
     const userMessage = input;
     const imageBase64 = uploadedImage;
@@ -390,6 +432,7 @@ export default function Chat() {
     setShouldAutoScroll(true);
 
     await sendMessage({
+      sessionIdOverride: targetSessionId,
       content: userMessage,
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
@@ -398,7 +441,7 @@ export default function Chat() {
       runningResolution: modelTier === "core" ? runningResolution : null,
     });
 
-    await fetchSessions();
+    await fetchSessions({ preferredSessionId: targetSessionId });
   };
 
   const formatTime = (dateString: string) => {
@@ -587,7 +630,11 @@ export default function Chat() {
           <div className="border-b border-white/[0.06] p-4">
             <button
               onClick={handleNewChat}
-              className="w-full rounded-[18px] border border-white/[0.08] bg-white/[0.03] px-4 py-4 text-left text-sm font-medium text-gray-100 transition-all hover:border-blue-400/30 hover:bg-white/[0.06] hover:text-white"
+              className={`w-full rounded-[18px] border px-4 py-4 text-left text-sm font-medium transition-all ${
+                activeSessionId === null
+                  ? "border-blue-400/25 bg-blue-500/10 text-white shadow-[0_18px_44px_-32px_rgba(74,149,255,0.95)]"
+                  : "border-white/[0.08] bg-white/[0.03] text-gray-100 hover:border-blue-400/30 hover:bg-white/[0.06] hover:text-white"
+              }`}
             >
               <span className="flex items-center gap-3">
                 <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-white/[0.05] text-blue-300">
@@ -695,6 +742,7 @@ export default function Chat() {
         </div>
 
         <div className="relative flex-1 min-w-0 overflow-hidden rounded-[30px] border border-white/[0.06] bg-[radial-gradient(circle_at_top,rgba(84,90,130,0.34),rgba(29,31,44,0.96)_42%,rgba(15,16,20,1)_100%)] shadow-[0_40px_140px_-60px_rgba(0,0,0,0.98)]">
+          {CHAT_PLEXUS_BACKGROUND_ENABLED ? <ChatPlexusBackground /> : null}
           <div
             className={`pointer-events-none absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-white/[0.05] to-transparent transition-opacity duration-200 ${
               isHeaderGhostedWhileScrolling ? "opacity-[0.04]" : "opacity-100"
@@ -710,7 +758,7 @@ export default function Chat() {
             >
               <div className="flex items-start justify-between gap-4">
                 <div className="flex items-center gap-3">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-[22px] bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_24px_50px_-24px_rgba(45,212,191,0.92)]">
+                  <div className={`flex h-12 w-12 items-center justify-center rounded-[22px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
                     <Bot className="h-6 w-6 text-white" />
                   </div>
                   <div>
@@ -867,23 +915,9 @@ export default function Chat() {
               className="flex-1 overflow-y-auto px-4 pb-6 pt-[7.5rem] md:px-8 md:pb-8 md:pt-[8.5rem] scrollbar-thin touch-pan-y"
             >
               <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-6">
-                {!activeSessionId && (
-                  <div className="mx-auto flex max-w-2xl flex-col items-center justify-center px-6 py-16 text-center md:py-24">
-                    <div className="flex h-24 w-24 items-center justify-center rounded-[30px] bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_30px_80px_-34px_rgba(45,212,191,0.95)]">
-                      <Bot className="h-11 w-11 text-white" />
-                    </div>
-                    <h3 className="mt-8 text-3xl font-semibold tracking-tight text-white md:text-5xl">
-                      No chats yet
-                    </h3>
-                    <p className="mt-4 max-w-xl text-base leading-8 text-gray-400 md:text-lg">
-                      {`Start a fresh conversation with ${brand.displayName} and explore your cameras in natural language.`}
-                    </p>
-                  </div>
-                )}
-
-                {activeSessionId && messages.length === 0 && (
+                {messages.length === 0 && (
                   <div className="mx-auto flex max-w-4xl flex-col items-center justify-center px-4 py-10 text-center md:py-16">
-                    <div className="flex h-24 w-24 items-center justify-center rounded-[30px] bg-gradient-to-br from-emerald-400 to-teal-500 shadow-[0_32px_90px_-36px_rgba(45,212,191,0.95)]">
+                    <div className={`flex h-24 w-24 items-center justify-center rounded-[30px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
                       <Bot className="h-11 w-11 text-white" />
                     </div>
                     <h3 className="mt-8 text-3xl font-semibold tracking-tight text-white md:text-5xl">
@@ -949,7 +983,7 @@ export default function Chat() {
                   onSend={handleSend}
                   onCancel={cancelMessage}
                   isRunning={isLoading}
-                  disabled={!activeSessionId}
+                  disabled={isCreatingSession}
                   placeholder="Ask about your cameras..."
                   variant="chat-page"
                   uploadedImage={uploadedImage}

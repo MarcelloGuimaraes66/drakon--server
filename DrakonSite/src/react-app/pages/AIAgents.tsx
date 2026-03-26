@@ -1,27 +1,39 @@
 import { useState, useRef, useMemo } from "react";
 import { Link, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
+import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
+import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
+  type CameraEditorDraft,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import {
+  getCameraConnectionState,
+  isCameraOnline,
+  isCameraServiceRunning,
+} from "@/react-app/lib/cameraStatus";
 import { Camera as CameraType, dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
+import { buildDraftCameraFromDiscovery } from "@/react-app/utils/cameraDiscovery";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
+import type { DiscoveredCameraDevice } from "@/shared/cameraDiscovery";
 import {
   Camera,
   Plus,
   Play,
   Square,
   WifiOff,
+  Wifi,
   Pencil,
   Cpu,
   AlertCircle,
+  FileUp,
   X,
 } from "lucide-react";
 
@@ -31,13 +43,17 @@ function AIAgentsContent() {
   const billingEnabled = brand.features.billingEnabled;
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
-  const { toasts, dismissToast } = useEvents();
+  const { toasts, dismissToast, pushToast } = useEvents();
   
   // Use unified dashboard summary hook - gets cameras from centralized polling
   const { cameras } = useDashboardSummary();
   const isLoading = cameras.length === 0;
   const [searchTerm, setSearchTerm] = useState("");
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editingCamera, setEditingCamera] = useState<CameraEditorCamera | null>(null);
+  const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const editRequestCameraId = useRef<number | null>(null);
@@ -74,7 +90,10 @@ function AIAgentsContent() {
     });
   };
 
-  const toggleService = async (cameraId: number, isRunning: boolean) => {
+  const toggleService = async (camera: CameraType) => {
+    const cameraId = camera.id;
+    const isRunning = camera.is_service_running === 1;
+
     if (pendingCameraIds.has(cameraId)) {
       return;
     }
@@ -89,6 +108,23 @@ function AIAgentsContent() {
       }
 
       // ✅ instant UI update (button flips immediately)
+      if (result.nextRunning === 1) {
+        pushToast({
+          cameraId,
+          cameraName:
+            result.cameraName ||
+            (typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${cameraId}`),
+          message:
+            result.runningAnalytics.length > 0
+              ? "The analytics below are active for this camera."
+              : "Enable analytics in the Algorithms page to start detections.",
+          analytics: result.runningAnalytics,
+          type: "camera_started",
+        });
+      }
+
       dashboardSummaryStore.patchCameraLocal(cameraId, {
         is_service_running: result.nextRunning,
         ...(result.nextRunning === 0
@@ -130,6 +166,11 @@ function AIAgentsContent() {
   const openEditCamera = async (camera: CameraType) => {
     editRequestCameraId.current = camera.id;
     setLoadingEditCameraId(camera.id);
+    setIsImportOpen(false);
+    setIsDiscoveryOpen(false);
+    setIsEditorOpen(false);
+    setEditorDraft(null);
+    setEditingCamera(null);
 
     try {
       const response = await fetch(`/api/cameras/${camera.id}`, {
@@ -143,11 +184,14 @@ function AIAgentsContent() {
       const fullCamera = await response.json();
       if (editRequestCameraId.current === camera.id) {
         setEditingCamera(fullCamera);
+        setIsEditorOpen(true);
       }
     } catch (error) {
       console.error("Failed to load camera editor payload:", error);
       if (editRequestCameraId.current === camera.id) {
+        setEditorDraft(null);
         setEditingCamera(camera as CameraEditorCamera);
+        setIsEditorOpen(true);
       }
     } finally {
       if (editRequestCameraId.current === camera.id) {
@@ -160,9 +204,45 @@ function AIAgentsContent() {
     editRequestCameraId.current = null;
     setLoadingEditCameraId(null);
     setEditingCamera(null);
+    setEditorDraft(null);
+    setIsEditorOpen(false);
   };
 
   const handleCameraSaved = async () => {
+    dashboardSummaryStore.refresh();
+  };
+
+  const openImportModal = async () => {
+    const canAdd = await checkBillingForCameraCreation();
+    if (!canAdd) {
+      return;
+    }
+
+    setIsDiscoveryOpen(false);
+    closeEditCamera();
+    setIsImportOpen(true);
+  };
+
+  const openDiscoveryModal = () => {
+    setIsImportOpen(false);
+    closeEditCamera();
+    setIsDiscoveryOpen(true);
+  };
+
+  const handleDiscoveryImport = async (device: DiscoveredCameraDevice) => {
+    const canAdd = await checkBillingForCameraCreation();
+    if (!canAdd) {
+      return;
+    }
+
+    setIsImportOpen(false);
+    closeEditCamera();
+    setEditorDraft(buildDraftCameraFromDiscovery(device));
+    setIsDiscoveryOpen(false);
+    setIsEditorOpen(true);
+  };
+
+  const handleImportSaved = async () => {
     dashboardSummaryStore.refresh();
   };
 
@@ -171,7 +251,7 @@ function AIAgentsContent() {
     mode: "default" | "overlay" = "default"
   ) => {
     const isOverlay = mode === "overlay";
-    const isRunning = camera.is_service_running === 1;
+    const isRunning = isCameraServiceRunning(camera);
     const isTogglePending = pendingCameraIds.has(camera.id);
 
     return (
@@ -196,7 +276,7 @@ function AIAgentsContent() {
         </button>
 
         <button
-          onClick={() => toggleService(camera.id, camera.is_service_running === 1)}
+          onClick={() => toggleService(camera)}
           disabled={isTogglePending}
           aria-busy={isTogglePending}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
@@ -254,18 +334,35 @@ function AIAgentsContent() {
               {t("aiAgents.subtitle")}
             </p>
           </div>
-          <div className="w-full md:w-72">
-            <label className="sr-only" htmlFor="ai-agents-search">
-              Search cameras
-            </label>
-            <input
-              id="ai-agents-search"
-              type="text"
-              value={searchTerm}
-              onChange={(event) => setSearchTerm(event.target.value)}
-              placeholder="Search cameras..."
-              className="w-full bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
-            />
+          <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
+            <button
+              onClick={openDiscoveryModal}
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
+            >
+              <Wifi className="h-4 w-4" />
+              Scan Network
+            </button>
+            <button
+              onClick={openImportModal}
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
+            >
+              <FileUp className="h-4 w-4" />
+              Import Cameras
+            </button>
+
+            <div className="w-full md:w-72">
+              <label className="sr-only" htmlFor="ai-agents-search">
+                Search cameras
+              </label>
+              <input
+                id="ai-agents-search"
+                type="text"
+                value={searchTerm}
+                onChange={(event) => setSearchTerm(event.target.value)}
+                placeholder="Search cameras..."
+                className="w-full bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
+              />
+            </div>
           </div>
         </div>
 
@@ -285,19 +382,25 @@ function AIAgentsContent() {
               <Plus className="w-6 md:w-8 h-6 md:h-8 text-gray-500 group-hover:text-blue-400 transition-colors" />
             </div>
             <p className="text-sm md:text-base text-gray-400 group-hover:text-gray-200 font-medium transition-colors">
-              {t("dashboard.addCamera")}
+              {t("common.registerCamera")}
             </p>
           </button>
 
           {/* Camera cards */}
-          {sortedFilteredCameras.map((camera) => (
+          {sortedFilteredCameras.map((camera) => {
+            const connectionState = getCameraConnectionState(camera);
+            const isRunning = isCameraServiceRunning(camera);
+            const isOnline = isCameraOnline(camera);
+            const isReconnecting = connectionState === "reconnecting";
+
+            return (
             <div
               key={camera.id}
               className="group relative bg-gradient-to-br from-gray-800/50 to-gray-900/50 backdrop-blur-sm border border-gray-700/50 rounded-2xl overflow-hidden shadow-xl hover:shadow-2xl transition-all duration-300 md:hover:scale-[1.02]"
             >
               {/* Thumbnail */}
               <div className="relative aspect-video bg-gradient-to-br from-gray-900 via-gray-950 to-gray-900 overflow-hidden">
-                {camera.is_service_running === 1 && getThumbnailUrl(camera) ? (
+                {isRunning && getThumbnailUrl(camera) ? (
                   <>
                     <img
                       key={`${camera.id}-${camera.last_thumbnail_update}`}
@@ -329,18 +432,29 @@ function AIAgentsContent() {
                 )}
 
                 {/* Status badge */}
-                {camera.is_service_running !== 1 && (
+                {isReconnecting ? (
+                  <div className="absolute top-3 right-3 z-20 flex items-center gap-2 bg-gray-900/90 backdrop-blur-sm px-3 py-1.5 rounded-full">
+                    <AlertCircle className="w-4 h-4 text-amber-300" />
+                    <span className="text-xs font-medium text-amber-300">
+                      Reconnecting
+                    </span>
+                  </div>
+                ) : !isRunning ? (
                   <div className="absolute top-3 right-3 z-20 flex items-center gap-2 bg-gray-900/90 backdrop-blur-sm px-3 py-1.5 rounded-full">
                     <WifiOff className="w-4 h-4 text-red-400" />
                     <span className="text-xs font-medium text-red-400">
                       {t("dashboard.offline")}
                     </span>
                   </div>
-                )}
+                ) : null}
 
                 {/* Service status */}
-                {camera.is_service_running ? (
-                  <div className="absolute top-3 left-3 z-20 bg-blue-500/90 backdrop-blur-sm p-2 rounded-full">
+                {isRunning ? (
+                  <div
+                    className={`absolute top-3 left-3 z-20 backdrop-blur-sm p-2 rounded-full ${
+                      isOnline ? "bg-blue-500/90" : "bg-amber-500/90"
+                    }`}
+                  >
                     <Play className="w-4 h-4 text-white fill-white" />
                   </div>
                 ) : null}
@@ -356,12 +470,23 @@ function AIAgentsContent() {
                   {camera.name}
                 </h3>
                 <p className="text-xs md:text-sm text-gray-500 mb-3 md:mb-4">{camera.ip_address}</p>
+                <p
+                  className={`text-xs font-medium mb-3 ${
+                    isOnline
+                      ? "text-green-400"
+                      : isReconnecting
+                      ? "text-amber-300"
+                      : "text-red-400"
+                  }`}
+                >
+                  {isOnline ? "Online" : isReconnecting ? "Reconnecting" : "Offline"}
+                </p>
 
                 {/* Actions */}
                 <div className="md:hidden">{renderCameraActions(camera)}</div>
               </div>
             </div>
-          ))}
+          )})}
         </div>
 
         {/* Empty state */}
@@ -384,7 +509,7 @@ function AIAgentsContent() {
               className="inline-flex items-center gap-2 px-6 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors min-h-[44px]"
             >
               <Plus className="w-5 h-5" />
-              {t("dashboard.addCamera")}
+              {t("common.registerCamera")}
             </button>
           </div>
         )}
@@ -426,10 +551,23 @@ function AIAgentsContent() {
       )}
 
       <CameraEditorModal
-        isOpen={!!editingCamera}
+        isOpen={isEditorOpen}
         camera={editingCamera}
+        draftCamera={!editingCamera ? editorDraft : null}
         onClose={closeEditCamera}
         onSaved={handleCameraSaved}
+      />
+
+      <CameraDiscoveryModal
+        isOpen={isDiscoveryOpen}
+        onClose={() => setIsDiscoveryOpen(false)}
+        onImport={handleDiscoveryImport}
+      />
+
+      <CameraBulkImportModal
+        isOpen={isImportOpen}
+        onClose={() => setIsImportOpen(false)}
+        onImported={handleImportSaved}
       />
 
       {/* Camera event toasts */}
