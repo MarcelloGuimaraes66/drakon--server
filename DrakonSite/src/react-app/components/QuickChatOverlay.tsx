@@ -4,6 +4,7 @@ import { useQuickChat } from "@/react-app/hooks/useQuickChat";
 import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import { ChatMessage } from "@/shared/types";
@@ -22,6 +23,7 @@ const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
@@ -96,7 +98,7 @@ export default function QuickChatOverlay() {
     core: "Core",
   };
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, cancelMessage, clearError } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
     sessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -109,12 +111,6 @@ export default function QuickChatOverlay() {
       : pendingExecutionState.kind === "stale"
         ? "Desktop agent connection looks stale. Check whether the EXE is still connected."
         : null;
-
-  useEffect(() => {
-    if (isOpen && !sessionId && !isCreatingSession) {
-      createQuickChatSession();
-    }
-  }, [isOpen, sessionId]);
 
   useEffect(() => {
     if (sessionId) {
@@ -138,15 +134,30 @@ export default function QuickChatOverlay() {
   }, [isOpen]);
 
   useEffect(() => {
+    if (!isOpen || sessionId) return;
+
+    setMessages([]);
+    setInput("");
+    setUploadedImage(null);
+    setUploadedVideo(null);
+    setShouldAutoScroll(true);
+    clearError();
+    clearWarning();
+  }, [clearError, clearWarning, isOpen, sessionId]);
+
+  useEffect(() => {
     // Only auto-scroll if user is near the bottom
     if (shouldAutoScroll) {
       scrollToBottom();
     }
   }, [messages, shouldAutoScroll]);
 
-  const createQuickChatSession = async () => {
+  const createQuickChatSession = async (): Promise<number | null> => {
+    if (isCreatingSession) return null;
+
     setIsCreatingSession(true);
     clearError();
+    clearWarning();
     try {
       const now = new Date().toLocaleString("en-US", {
         month: "short",
@@ -166,12 +177,13 @@ export default function QuickChatOverlay() {
         throw new Error("Failed to create chat session");
       }
 
-      const newSession = await response.json();
-      // Clear messages before setting new session
+      const newSession = await response.json() as { id: number };
       setMessages([]);
       setSessionId(newSession.id);
+      return newSession.id;
     } catch (error) {
       console.error("Failed to create quick chat session:", error);
+      return null;
     } finally {
       setIsCreatingSession(false);
     }
@@ -203,7 +215,13 @@ export default function QuickChatOverlay() {
   };
 
   const handleSend = async () => {
-    if ((!input.trim() && !uploadedImage && !uploadedVideo) || !sessionId) return;
+    if ((!input.trim() && !uploadedImage && !uploadedVideo) || isCreatingSession) return;
+
+    let targetSessionId = sessionId;
+    if (!targetSessionId) {
+      targetSessionId = await createQuickChatSession();
+      if (!targetSessionId) return;
+    }
 
     const userMessage = input;
     const imageBase64 = uploadedImage;
@@ -219,8 +237,9 @@ export default function QuickChatOverlay() {
     const savedResolution = localStorage.getItem(getBrandStorageKey("globalRunningResolution"));
     const runningResolution = normalizeChatRunningResolution(savedResolution);
 
-    await sendMessage({ 
-      content: userMessage, 
+    await sendMessage({
+      sessionIdOverride: targetSessionId,
+      content: userMessage,
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
       modelTier: modelTier,
@@ -309,6 +328,7 @@ export default function QuickChatOverlay() {
 
       {/* Overlay */}
       <div className="fixed inset-x-3 bottom-3 top-20 z-50 flex flex-col overflow-hidden rounded-[30px] border border-white/[0.08] bg-[radial-gradient(circle_at_top,rgba(84,90,130,0.26),rgba(24,27,38,0.95)_42%,rgba(11,12,18,0.98)_100%)] shadow-[0_40px_140px_-60px_rgba(0,0,0,0.98)] animate-slide-up md:inset-x-auto md:bottom-6 md:right-24 md:top-auto md:h-[76vh] md:max-h-[820px] md:w-[620px] lg:w-[700px]">
+        {QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED ? <ChatPlexusBackground className="opacity-[0.7]" /> : null}
         <div className="pointer-events-none absolute inset-x-0 top-0 h-36 bg-gradient-to-b from-white/[0.05] to-transparent" />
         {/* Header */}
         <div className="relative border-b border-white/[0.06] px-5 pb-4 pt-5 md:px-6 md:pb-5 md:pt-6">
@@ -445,7 +465,7 @@ export default function QuickChatOverlay() {
             onSend={handleSend}
             onCancel={cancelMessage}
             isRunning={isLoading}
-            disabled={!sessionId || isCreatingSession}
+            disabled={isCreatingSession}
             placeholder="Ask about your cameras..."
             variant="chat-page"
             uploadedImage={uploadedImage}

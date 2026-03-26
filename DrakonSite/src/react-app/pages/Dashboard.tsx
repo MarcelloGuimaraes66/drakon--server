@@ -52,6 +52,142 @@ function readAlertLabelString(...values: any[]): string | null {
   return null;
 }
 
+type AlertDisplayMetaOptions = {
+  huntBadgeLabel: string;
+  originPrefix: string;
+  cameraLabel: string;
+  targetLabel: string;
+  crossCameraSummaryPrefix: string;
+  crossCameraMediaLabel: string;
+  fallbackOriginLabel: string;
+};
+
+function getAlertDisplayMeta(
+  alert: any,
+  cameras: Array<{ id: number; name: string }>,
+  options: AlertDisplayMetaOptions,
+) {
+  const details = alert?.details || {};
+  const regionResults = Array.isArray(details?.region_results) ? details.region_results : [];
+  const representativeRegion =
+    regionResults.find((region: any) => region?.final_alert_condition) || regionResults[0] || null;
+
+  const decisionSource = readAlertLabelString(
+    details?.decision_source,
+    details?.decisionSource,
+    representativeRegion?.decision_source,
+    representativeRegion?.decisionSource,
+  ) || "";
+
+  const operatorResults = Array.isArray(details?.temporal_operator_results)
+    ? details.temporal_operator_results
+    : Array.isArray(details?.temporalOperatorResults)
+    ? details.temporalOperatorResults
+    : Array.isArray(representativeRegion?.temporal_operator_results)
+    ? representativeRegion.temporal_operator_results
+    : Array.isArray(representativeRegion?.temporalOperatorResults)
+    ? representativeRegion.temporalOperatorResults
+    : [];
+
+  const huntResult = operatorResults.find(
+    (item: any) =>
+      item &&
+      typeof item === "object" &&
+      (item?.operator_id === "cross_camera_watchlist_match" ||
+        item?.operatorId === "cross_camera_watchlist_match" ||
+        item?.type === "cross_camera_track_after_trigger"),
+  );
+
+  const firstMatch = Array.isArray(huntResult?.matches) ? huntResult.matches[0] : null;
+  const rawSummary =
+    readAlertLabelString(
+      details?.answer,
+      alert?.message,
+      details?.summary,
+      details?.reason,
+    ) || "-";
+  const rawBadge = String(
+    readAlertLabelString(
+      details?.agent_key,
+      details?.agentKey,
+      alert?.algo_type,
+      details?.algo_type,
+      details?.algoType,
+    ) || "Alert",
+  ).toUpperCase();
+  const isCrossCamera =
+    decisionSource === "temporal_engine_cross_camera" &&
+    firstMatch &&
+    typeof firstMatch === "object";
+
+  if (!isCrossCamera) {
+    return {
+      isCrossCamera: false,
+      badgeLabel: rawBadge,
+      originLine: null,
+      summaryText: rawSummary,
+      mediaLabel: String(
+        readAlertLabelString(details?.camera_name, details?.cameraName, alert?.camera_name) ||
+          rawBadge,
+      ),
+    };
+  }
+
+  const sourceCameraId = Number(firstMatch?.source_camera_id ?? firstMatch?.sourceCameraId);
+  const sourceCameraName =
+    readAlertLabelString(
+      firstMatch?.display_source_camera_name,
+      firstMatch?.displaySourceCameraName,
+      details?.display_source_camera_name,
+      details?.displaySourceCameraName,
+    ) ||
+    cameras.find((camera) => camera.id === sourceCameraId)?.name ||
+    (Number.isInteger(sourceCameraId) && sourceCameraId > 0 ? `#${sourceCameraId}` : null);
+
+  const sourceAgentKey = readAlertLabelString(
+    firstMatch?.display_source_agent_key,
+    firstMatch?.displaySourceAgentKey,
+    details?.display_source_agent_key,
+    details?.displaySourceAgentKey,
+    firstMatch?.source_agent_key,
+    firstMatch?.sourceAgentKey,
+  );
+  const targetName = readAlertLabelString(
+    firstMatch?.matched_target_name,
+    firstMatch?.matchedTargetName,
+    firstMatch?.target_name,
+    firstMatch?.targetName,
+  );
+
+  const originParts = [
+    sourceAgentKey ? String(sourceAgentKey).toUpperCase() : null,
+    sourceCameraName ? `${options.cameraLabel} ${sourceCameraName}` : null,
+    !sourceAgentKey && targetName ? `${options.targetLabel} ${String(targetName).toUpperCase()}` : null,
+  ].filter(Boolean);
+
+  const rawSummaryLower = rawSummary.toLowerCase();
+  const alreadyMentionsHunt =
+    rawSummaryLower.includes("cross-camera") ||
+    rawSummaryLower.includes("cross camera") ||
+    rawSummaryLower.includes("hunt");
+  const hasUserSummary = rawSummary !== "-";
+  const summaryText = alreadyMentionsHunt
+    ? rawSummary
+    : hasUserSummary
+    ? `${options.crossCameraSummaryPrefix} ${rawSummary}`
+    : options.crossCameraSummaryPrefix;
+
+  return {
+    isCrossCamera: true,
+    badgeLabel: options.huntBadgeLabel,
+    originLine: `${options.originPrefix}: ${
+      originParts.length ? originParts.join(" • ") : options.fallbackOriginLabel
+    }`,
+    summaryText,
+    mediaLabel: options.crossCameraMediaLabel,
+  };
+}
+
 function buildAlertGroupKey(alert: any): string {
   const details = alert?.details || {};
   const eventType = String(alert?.event_type || "").trim().toLowerCase() || "unknown";
@@ -163,6 +299,18 @@ function DashboardContent() {
   const { cameras, dashboard, refresh } = useDashboardSummary();
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useEvents();
   useDashboardAlertRefresh(refresh);
+  const isPortuguese = i18n.language?.startsWith("pt");
+  const alertDisplayOptions: AlertDisplayMetaOptions = {
+    huntBadgeLabel: "CROSS-CAMERA HUNT",
+    originPrefix: isPortuguese ? "Origem" : "Origin",
+    cameraLabel: isPortuguese ? "câmera" : "camera",
+    targetLabel: isPortuguese ? "alvo" : "target",
+    crossCameraSummaryPrefix: isPortuguese
+      ? "Alerta disparado por hunt entre câmeras."
+      : "Alert triggered by cross-camera hunt.",
+    crossCameraMediaLabel: "Cross-camera hunt",
+    fallbackOriginLabel: isPortuguese ? "hunt entre câmeras" : "cross-camera hunt",
+  };
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
   const [stoppingJobs, setStoppingJobs] = useState<Set<number>>(new Set());
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(new Set());
@@ -651,8 +799,10 @@ function DashboardContent() {
     const { mediaUrl, isVideo } = getAlertMedia(alert);
     if (!mediaUrl) return;
 
+    const displayMeta = getAlertDisplayMeta(alert, cameras, alertDisplayOptions);
     const details = alert?.details || {};
     const label =
+      displayMeta.mediaLabel ||
       details.camera_name ||
       alert?.camera_name ||
       details.agent_key ||
@@ -831,13 +981,8 @@ function DashboardContent() {
     };
   }, [activeAlertHistory.length, alertPanelFocusTarget, isAlertPanelOpen]);
   const activeAlertTime = activeAlert?.detected_at || activeAlert?.created_at || null;
-  const activeAlertSummary =
-    readAlertLabelString(
-      activeAlert?.details?.answer,
-      activeAlert?.message,
-      activeAlert?.details?.summary,
-      activeAlert?.details?.reason,
-    ) || "";
+  const activeAlertDisplayMeta = getAlertDisplayMeta(activeAlert, cameras, alertDisplayOptions);
+  const activeAlertSummary = activeAlertDisplayMeta.summaryText || "";
   const formatAlertTimestamp = (iso: string | null | undefined) => {
     if (!iso) return "--";
     const parsed = new Date(iso);
@@ -1390,9 +1535,8 @@ function DashboardContent() {
               const groupNameLabel = groupName
                 ? `${t("dashboard.groupPrefix")}: ${groupName.replace(/^group\s*:\s*/i, "")}`
                 : "";
-              const agentLabel = (alertDetails.agent_key || alert.algo_type || "Alert")
-                .toString()
-                .toUpperCase();
+              const displayMeta = getAlertDisplayMeta(alert, cameras, alertDisplayOptions);
+              const agentLabel = displayMeta.badgeLabel;
               const stepIdValue =
                 alertDetails.step_id ??
                 alertDetails.stepId ??
@@ -1642,6 +1786,11 @@ function DashboardContent() {
                         >
                           {groupNameLabel}
                         </span>
+                      </div>
+                    )}
+                    {displayMeta.originLine && (
+                      <div className="mb-1 truncate text-[11px] text-gray-400" title={displayMeta.originLine}>
+                        {displayMeta.originLine}
                       </div>
                     )}
                     <div className="flex items-center justify-between gap-2 text-xs text-gray-200">
@@ -2109,9 +2258,14 @@ function DashboardContent() {
                 }`}
               />
               <span className="px-2 py-0.5 rounded-full bg-gray-900/60 text-gray-200 border border-gray-700">
-                {(activeAlert?.details?.agent_key || activeAlert?.algo_type || "Alert").toString().toUpperCase()}
+                {activeAlertDisplayMeta.badgeLabel}
               </span>
             </div>
+            {activeAlertDisplayMeta.originLine && (
+              <div className="mb-2 text-xs text-gray-400">
+                {activeAlertDisplayMeta.originLine}
+              </div>
+            )}
             <div className="text-sm text-gray-200">
               {activeAlertSummary || "-"}
             </div>
@@ -2324,6 +2478,11 @@ function DashboardContent() {
                       groupAlertDetails?.summary,
                       groupAlertDetails?.reason,
                     ) || "-";
+                  const groupAlertDisplayMeta = getAlertDisplayMeta(
+                    groupAlert,
+                    cameras,
+                    alertDisplayOptions,
+                  );
                   const groupAlertTimestamp = formatAlertTimestamp(
                     groupAlert?.detected_at || groupAlert?.created_at || null,
                   );
@@ -2337,6 +2496,7 @@ function DashboardContent() {
                     groupAlertDetails?.camera_name || groupAlert?.camera_name
                       ? `${t("dashboard.camera")}: ${groupAlertDetails?.camera_name || groupAlert?.camera_name}`
                       : null,
+                    groupAlertDisplayMeta.originLine,
                   ].filter(Boolean);
 
                   return (

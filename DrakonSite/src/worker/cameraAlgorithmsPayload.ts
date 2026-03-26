@@ -110,7 +110,7 @@ const normalizeCameraAgentInputType = (value: unknown): "video" | "image" => {
 
 const normalizeCameraVideoPackagingMode = (
   value: unknown,
-  fallback: CameraVideoPackagingMode = "mosaic_3x3"
+  fallback: CameraVideoPackagingMode = "mosaic_2x2"
 ): CameraVideoPackagingMode => {
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();

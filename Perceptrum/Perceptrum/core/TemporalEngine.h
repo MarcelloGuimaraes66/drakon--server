@@ -27,6 +27,8 @@ inline std::string extractZoneField(const json& node, const std::string& fallbac
 inline std::string extractObservedZoneField(const json& node, const std::string& fallback = std::string());
 inline json effectivePlan(const json& envelope);
 inline bool validateCompilerDecisionConsistency(const json& envelope, std::string* outReason = nullptr);
+inline json parseTraitsValue(const json& value);
+inline void appendUniqueStringsToArray(json& target, const json& value);
 
 inline std::string trim(const std::string& s) {
     const auto a = s.find_first_not_of(" \t\r\n");
@@ -68,6 +70,283 @@ inline std::vector<std::string> extractWordTokens(const std::string& raw) {
         tokens.push_back(current);
     }
     return tokens;
+}
+
+inline bool tokenListContainsAny(
+    const std::vector<std::string>& tokens,
+    std::initializer_list<const char*> needles)
+{
+    for (const std::string& token : tokens) {
+        for (const char* needle : needles) {
+            if (needle != nullptr && token == needle) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline bool entityTypeSuggestsVehicleIdentity(const std::string& rawEntityType) {
+    const std::string s = lower(trim(rawEntityType));
+    return containsAnySubstring(
+        s,
+        {
+            "vehicle", "car", "sedan", "suv", "truck", "pickup", "van", "bus",
+            "taxi", "motorcycle", "motorbike", "bike", "bicycle", "plate",
+            "placa", "trailer", "boat"
+        });
+}
+
+inline bool entityTypeSuggestsPersonIdentity(const std::string& rawEntityType) {
+    const std::string s = lower(trim(rawEntityType));
+    return containsAnySubstring(
+        s,
+        {
+            "person", "people", "man", "woman", "male", "female", "human",
+            "pedestrian", "suspect", "intruder", "worker", "customer",
+            "passenger", "driver", "rider", "face", "armed"
+        });
+}
+
+inline bool traitLooksLikeSceneOrBackgroundContext(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "background", "scene", "room", "office", "bedroom", "kitchen",
+                "bathroom", "garage", "hallway", "corridor", "warehouse",
+                "store", "shop", "street", "road", "parking", "sidewalk",
+                "yard", "garden", "door", "window", "wall", "floor",
+                "ceiling", "desk", "table", "chair", "sofa", "bed",
+                "cabinet", "wardrobe", "closet", "shelf", "indoor",
+                "outdoor", "indoors", "outdoors", "lighting", "shadow",
+                "sunlight", "backdrop", "background blur", "camera angle"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "background", "scene", "room", "office", "bedroom", "kitchen",
+            "bathroom", "garage", "hallway", "corridor", "warehouse",
+            "store", "shop", "street", "road", "parking", "sidewalk",
+            "yard", "garden", "door", "window", "wall", "floor",
+            "ceiling", "desk", "table", "chair", "sofa", "bed",
+            "cabinet", "wardrobe", "closet", "shelf", "indoor",
+            "outdoor", "lighting", "shadow"
+        });
+}
+
+inline bool traitLooksLikeTransientIdentityContext(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "occluded", "partial", "partially", "blur", "blurry",
+                "motion blur", "cropped", "cut off", "far away", "distant",
+                "profile view", "side view", "rear view", "back view",
+                "front view", "angle", "low light", "dim light", "glare"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "occluded", "partial", "blurry", "cropped", "distant",
+            "profile", "rear", "front", "side", "angle", "glare"
+        });
+}
+
+inline bool traitLooksLikePersonIdentityCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "holding ", "carrying ", "wearing ", "black shirt", "white shirt",
+                "t-shirt", "tshirt", "shirt", "camiseta", "camisa", "blouse",
+                "jacket", "hoodie", "coat", "pants", "jeans", "shorts",
+                "bermuda", "dress", "skirt", "shoe", "sneaker", "boot",
+                "hat", "cap", "beanie", "helmet", "glasses", "goggles",
+                "beard", "mustache", "hair", "ponytail", "braid", "tattoo",
+                "scar", "bracelet", "watch", "necklace", "ring", "earring",
+                "backpack", "shoulder bag", "purse", "skin tone", "light skin",
+                "dark skin", "weapon", "gun", "pistol", "rifle", "knife",
+                "machete", "firearm", "mask"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "person", "man", "woman", "male", "female", "shirt", "tee",
+            "camiseta", "camisa", "blouse", "jacket", "hoodie", "coat",
+            "pants", "jeans", "shorts", "bermuda", "dress", "skirt",
+            "shoe", "shoes", "sneaker", "sneakers", "boot", "boots",
+            "hat", "cap", "beanie", "helmet", "glasses", "goggles",
+            "beard", "mustache", "hair", "curly", "straight", "braid",
+            "ponytail", "tattoo", "scar", "bracelet", "watch",
+            "necklace", "ring", "earring", "skin", "backpack", "bag",
+            "purse", "mask", "weapon", "gun", "pistol", "rifle", "knife",
+            "machete", "firearm", "build", "tall", "short", "slim",
+            "heavyset"
+        });
+}
+
+inline bool traitLooksLikeVehicleIdentityCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "license plate", "plate ", "plate:", "placa", "roof rack",
+                "spare tire", "spare wheel", "broken headlight",
+                "broken taillight", "tail light", "headlight", "sticker",
+                "decal", "scratch", "scrape", "dent", "bumper", "grille",
+                "sedan", "suv", "pickup", "truck", "van", "bus",
+                "motorcycle", "motorbike", "hatchback", "coupe", "wagon"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "vehicle", "car", "sedan", "suv", "truck", "pickup", "van",
+            "bus", "taxi", "motorcycle", "motorbike", "bike", "bicycle",
+            "plate", "placa", "sticker", "decal", "scratch", "scrape",
+            "dent", "bumper", "grille", "rack", "tire", "wheel",
+            "headlight", "taillight", "ford", "toyota", "honda",
+            "chevrolet", "chevy", "volkswagen", "vw", "nissan", "hyundai",
+            "kia", "bmw", "mercedes", "audi", "jeep", "ram", "fiat",
+            "renault", "peugeot"
+        });
+}
+
+inline bool traitLooksLikeIdentityCueForEntityType(
+    const std::string& rawEntityType,
+    const std::string& rawTrait)
+{
+    const bool vehicleLike = entityTypeSuggestsVehicleIdentity(rawEntityType);
+    const bool personLike = entityTypeSuggestsPersonIdentity(rawEntityType);
+    if (vehicleLike) return traitLooksLikeVehicleIdentityCue(rawTrait);
+    if (personLike) return traitLooksLikePersonIdentityCue(rawTrait);
+    return traitLooksLikePersonIdentityCue(rawTrait) ||
+           traitLooksLikeVehicleIdentityCue(rawTrait);
+}
+
+inline json curateIdentitySignatureTraits(
+    const std::string& rawEntityType,
+    const json& stableTraits,
+    const json& contextTraits,
+    const json& existingTraits = json::array())
+{
+    json curated = json::array();
+    appendUniqueStringsToArray(curated, existingTraits);
+
+    auto appendMatchingTraits = [&](const json& source, bool fallbackNonScene) {
+        const json parsed = parseTraitsValue(source);
+        if (!parsed.is_array()) return;
+        for (const auto& item : parsed) {
+            if (!item.is_string()) continue;
+            const std::string trait = trim(item.get<std::string>());
+            if (trait.empty()) continue;
+            const bool sceneLike = traitLooksLikeSceneOrBackgroundContext(trait);
+            const bool cueLike = traitLooksLikeIdentityCueForEntityType(rawEntityType, trait);
+            if (cueLike && !sceneLike) {
+                appendUniqueStringsToArray(curated, trait);
+            }
+            else if (fallbackNonScene && !sceneLike && !traitLooksLikeTransientIdentityContext(trait)) {
+                appendUniqueStringsToArray(curated, trait);
+            }
+        }
+    };
+
+    appendMatchingTraits(stableTraits, false);
+    appendMatchingTraits(contextTraits, false);
+    if (curated.empty()) {
+        appendMatchingTraits(stableTraits, true);
+    }
+    if (curated.empty()) {
+        appendMatchingTraits(contextTraits, true);
+    }
+    if (curated.size() > 8) {
+        curated.erase(curated.begin() + 8, curated.end());
+    }
+    return curated;
+}
+
+inline json curateIdentityContextTraits(
+    const std::string& rawEntityType,
+    const json& stableTraits,
+    const json& contextTraits,
+    const json& existingTraits = json::array())
+{
+    json curated = json::array();
+    appendUniqueStringsToArray(curated, existingTraits);
+
+    auto appendContextTraits = [&](const json& source, bool includeNonIdentityFallback) {
+        const json parsed = parseTraitsValue(source);
+        if (!parsed.is_array()) return;
+        for (const auto& item : parsed) {
+            if (!item.is_string()) continue;
+            const std::string trait = trim(item.get<std::string>());
+            if (trait.empty()) continue;
+            const bool sceneLike = traitLooksLikeSceneOrBackgroundContext(trait);
+            const bool transientLike = traitLooksLikeTransientIdentityContext(trait);
+            const bool identityCue = traitLooksLikeIdentityCueForEntityType(rawEntityType, trait);
+            if (sceneLike || transientLike || (includeNonIdentityFallback && !identityCue)) {
+                appendUniqueStringsToArray(curated, trait);
+            }
+        }
+    };
+
+    appendContextTraits(stableTraits, false);
+    appendContextTraits(contextTraits, true);
+    if (curated.size() > 8) {
+        curated.erase(curated.begin() + 8, curated.end());
+    }
+    return curated;
+}
+
+inline std::string buildIdentitySignatureSummary(
+    const std::string& rawEntityType,
+    const json& signatureTraits)
+{
+    const json traits = parseTraitsValue(signatureTraits);
+    if (!traits.is_array() || traits.empty()) return std::string();
+    std::ostringstream oss;
+    if (entityTypeSuggestsVehicleIdentity(rawEntityType)) {
+        oss << "Vehicle signature: ";
+    }
+    else if (entityTypeSuggestsPersonIdentity(rawEntityType)) {
+        oss << "Person signature: ";
+    }
+    else {
+        oss << "Target signature: ";
+    }
+    bool first = true;
+    std::size_t emitted = 0;
+    for (const auto& item : traits) {
+        if (!item.is_string()) continue;
+        const std::string trait = trim(item.get<std::string>());
+        if (trait.empty()) continue;
+        if (!first) oss << "; ";
+        oss << trait;
+        first = false;
+        ++emitted;
+        if (emitted >= 5) break;
+    }
+    return emitted == 0 ? std::string() : oss.str();
 }
 
 inline bool isAllowedOperatorType(const std::string& opType) {
@@ -1351,20 +1630,66 @@ inline json parseTraitsValue(const json& value) {
     return out;
 }
 
-inline json extractTraitsFromNode(const json& node) {
+inline void appendUniqueStringsToArray(json& target, const json& value) {
+    if (!target.is_array()) target = json::array();
+    std::unordered_set<std::string> seen;
+    for (const auto& item : target) {
+        if (!item.is_string()) continue;
+        const std::string existing = trim(item.get<std::string>());
+        if (!existing.empty()) seen.insert(existing);
+    }
+    std::function<void(const json&)> collect = [&](const json& node) {
+        if (node.is_array()) {
+            for (const auto& item : node) collect(item);
+            return;
+        }
+        if (!node.is_string()) return;
+        const std::string s = trim(node.get<std::string>());
+        if (s.empty() || !seen.insert(s).second) return;
+        target.push_back(s);
+    };
+    collect(value);
+}
+
+inline void appendUniqueTraitsToArray(json& target, const json& value) {
+    appendUniqueStringsToArray(target, parseTraitsValue(value));
+}
+
+inline json extractStableTraitsFromNode(const json& node) {
     if (!node.is_object()) return json::array();
-    if (node.contains("updated_traits")) {
-        const json parsed = parseTraitsValue(node["updated_traits"]);
-        if (parsed.is_array() && !parsed.empty()) return parsed;
+    json out = json::array();
+    if (node.contains("identity_signature_traits")) {
+        appendUniqueTraitsToArray(out, node["identity_signature_traits"]);
+    }
+    if (node.contains("stable_attributes")) {
+        appendUniqueTraitsToArray(out, node["stable_attributes"]);
     }
     if (node.contains("key_traits")) {
-        const json parsed = parseTraitsValue(node["key_traits"]);
-        if (parsed.is_array() && !parsed.empty()) return parsed;
+        appendUniqueTraitsToArray(out, node["key_traits"]);
     }
     if (node.contains("traits")) {
-        const json parsed = parseTraitsValue(node["traits"]);
-        if (parsed.is_array() && !parsed.empty()) return parsed;
+        appendUniqueTraitsToArray(out, node["traits"]);
     }
+    return out;
+}
+
+inline json extractContextTraitsFromNode(const json& node) {
+    if (!node.is_object()) return json::array();
+    if (node.contains("identity_context_traits")) {
+        return parseTraitsValue(node["identity_context_traits"]);
+    }
+    if (node.contains("updated_traits")) {
+        return parseTraitsValue(node["updated_traits"]);
+    }
+    return json::array();
+}
+
+inline json extractTraitsFromNode(const json& node) {
+    if (!node.is_object()) return json::array();
+    const json stableTraits = extractStableTraitsFromNode(node);
+    if (stableTraits.is_array() && !stableTraits.empty()) return stableTraits;
+    const json contextTraits = extractContextTraitsFromNode(node);
+    if (contextTraits.is_array() && !contextTraits.empty()) return contextTraits;
     return json::array();
 }
 
@@ -2242,7 +2567,12 @@ inline void touchEntity(
     if (previousLastSeen.empty() || normalizedTs > previousLastSeen) {
         e["last_seen_ts"] = normalizedTs;
         if (!trim(zone).empty()) e["current_zone"] = trim(zone);
-        if (traits.is_array() && !traits.empty()) e["key_traits"] = traits;
+        if (traits.is_array() && !traits.empty()) {
+            json mergedTraits = json::array();
+            if (e.contains("key_traits")) appendUniqueTraitsToArray(mergedTraits, e["key_traits"]);
+            appendUniqueTraitsToArray(mergedTraits, traits);
+            if (!mergedTraits.empty()) e["key_traits"] = mergedTraits;
+        }
     } else {
         e["last_seen_ts"] = previousLastSeen;
     }
@@ -3297,56 +3627,185 @@ inline void upsertIdentityMemory(
     }
 
     mem["entity_id"] = id;
+    json* entityState = nullptr;
+    if (st.contains("entities") && st["entities"].is_object() &&
+        st["entities"].contains(id) && st["entities"][id].is_object())
+    {
+        entityState = &st["entities"][id];
+    }
+
     const std::string description = trim(
         strField(
             patch,
             "description",
             strField(
                 patch,
-                "entity_description",
-                strField(patch, "person_description", strField(patch, "object_description"))
+                "short_description",
+                strField(
+                    patch,
+                    "appearance_summary",
+                    strField(
+                        patch,
+                        "entity_description",
+                        strField(patch, "person_description", strField(patch, "object_description"))
+                    )
+                )
             )
         )
     );
-    if (!description.empty()) mem["description"] = description;
-    if (st.contains("entities") && st["entities"].is_object() &&
-        st["entities"].contains(id) && st["entities"][id].is_object())
+    const std::string appearanceSummary = trim(strField(patch, "appearance_summary"));
+    std::string entityTypeHint = trim(
+        strField(patch, "entity_type", strField(patch, "entity_key")));
+    if (entityTypeHint.empty() &&
+        entityState &&
+        entityState->is_object())
     {
-        json& entityState = st["entities"][id];
-        if (!description.empty()) entityState["description"] = description;
-        if (!entityState.contains("description") && mem.contains("description") && mem["description"].is_string()) {
-            entityState["description"] = mem["description"];
+        entityTypeHint = trim(
+            strField(*entityState, "entity_type", strField(*entityState, "entity_key")));
+    }
+    if (entityTypeHint.empty()) {
+        entityTypeHint = trim(strField(mem, "entity_type", strField(mem, "entity_key")));
+    }
+    if (!description.empty()) mem["description"] = description;
+    if (!appearanceSummary.empty()) {
+        mem["appearance_summary"] = appearanceSummary;
+    }
+    else if ((!mem.contains("appearance_summary") || !mem["appearance_summary"].is_string() ||
+              trim(mem["appearance_summary"].get<std::string>()).empty()) &&
+             !description.empty())
+    {
+        mem["appearance_summary"] = description;
+    }
+    if (entityState) {
+        if (!description.empty()) {
+            (*entityState)["description"] = description;
+        }
+        else if (!entityState->contains("description") && mem.contains("description") && mem["description"].is_string()) {
+            (*entityState)["description"] = mem["description"];
+        }
+        if (mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
+            (*entityState)["appearance_summary"] = mem["appearance_summary"];
         }
     }
     mem["last_seen_ts_utc"] = seenTsUtc;
     if (!trim(zone).empty()) mem["last_seen_zone"] = trim(zone);
-    const json parsedTraits = extractTraitsFromNode(patch);
-    if (parsedTraits.is_array() && !parsedTraits.empty()) {
-        mem["key_traits"] = parsedTraits;
+
+    const json stableTraits = extractStableTraitsFromNode(patch);
+    const json contextTraits = extractContextTraitsFromNode(patch);
+
+    json mergedStableAttributes = json::array();
+    if (mem.contains("stable_attributes")) appendUniqueStringsToArray(mergedStableAttributes, mem["stable_attributes"]);
+    if (entityState && entityState->contains("stable_attributes")) {
+        appendUniqueStringsToArray(mergedStableAttributes, (*entityState)["stable_attributes"]);
     }
-    if (patch.contains("reference_image_urls") && patch["reference_image_urls"].is_array()) {
-        mem["reference_image_urls"] = patch["reference_image_urls"];
+    appendUniqueTraitsToArray(mergedStableAttributes, stableTraits);
+    if (mergedStableAttributes.empty()) {
+        appendUniqueTraitsToArray(mergedStableAttributes, contextTraits);
+    }
+    if (!mergedStableAttributes.empty()) {
+        mem["stable_attributes"] = mergedStableAttributes;
+        if (entityState) (*entityState)["stable_attributes"] = mergedStableAttributes;
+    }
+
+    json mergedKeyTraits = json::array();
+    if (mem.contains("key_traits")) appendUniqueTraitsToArray(mergedKeyTraits, mem["key_traits"]);
+    if (entityState && entityState->contains("key_traits")) {
+        appendUniqueTraitsToArray(mergedKeyTraits, (*entityState)["key_traits"]);
+    }
+    appendUniqueTraitsToArray(mergedKeyTraits, stableTraits);
+    if (mergedKeyTraits.empty()) {
+        appendUniqueTraitsToArray(mergedKeyTraits, contextTraits);
+    }
+    if (!mergedKeyTraits.empty()) {
+        mem["key_traits"] = mergedKeyTraits;
+        if (entityState) (*entityState)["key_traits"] = mergedKeyTraits;
+    }
+
+    if (contextTraits.is_array() && !contextTraits.empty()) {
+        mem["latest_context_traits"] = contextTraits;
+        if (entityState) (*entityState)["latest_context_traits"] = contextTraits;
+    }
+
+    json mergedIdentitySignatureTraits = json::array();
+    if (mem.contains("identity_signature_traits")) {
+        appendUniqueStringsToArray(mergedIdentitySignatureTraits, mem["identity_signature_traits"]);
+    }
+    if (entityState && entityState->contains("identity_signature_traits")) {
+        appendUniqueStringsToArray(mergedIdentitySignatureTraits, (*entityState)["identity_signature_traits"]);
+    }
+    mergedIdentitySignatureTraits = curateIdentitySignatureTraits(
+        entityTypeHint,
+        mergedStableAttributes,
+        contextTraits,
+        mergedIdentitySignatureTraits);
+    if (!mergedIdentitySignatureTraits.empty()) {
+        mem["identity_signature_traits"] = mergedIdentitySignatureTraits;
+        if (entityState) (*entityState)["identity_signature_traits"] = mergedIdentitySignatureTraits;
+        const std::string curatedSummary =
+            buildIdentitySignatureSummary(entityTypeHint, mergedIdentitySignatureTraits);
+        if (!curatedSummary.empty()) {
+            mem["identity_signature_summary"] = curatedSummary;
+            if (entityState) (*entityState)["identity_signature_summary"] = curatedSummary;
+        }
+    }
+
+    json mergedIdentityContextTraits = json::array();
+    if (mem.contains("identity_context_traits")) {
+        appendUniqueStringsToArray(mergedIdentityContextTraits, mem["identity_context_traits"]);
+    }
+    if (entityState && entityState->contains("identity_context_traits")) {
+        appendUniqueStringsToArray(mergedIdentityContextTraits, (*entityState)["identity_context_traits"]);
+    }
+    mergedIdentityContextTraits = curateIdentityContextTraits(
+        entityTypeHint,
+        mergedStableAttributes,
+        contextTraits,
+        mergedIdentityContextTraits);
+    if (!mergedIdentityContextTraits.empty()) {
+        mem["identity_context_traits"] = mergedIdentityContextTraits;
+        if (entityState) (*entityState)["identity_context_traits"] = mergedIdentityContextTraits;
+    }
+
+    json mergedReferenceImageUrls = json::array();
+    if (mem.contains("reference_image_urls")) {
+        appendUniqueStringsToArray(mergedReferenceImageUrls, mem["reference_image_urls"]);
+    }
+    if (entityState && entityState->contains("reference_image_urls")) {
+        appendUniqueStringsToArray(mergedReferenceImageUrls, (*entityState)["reference_image_urls"]);
+    }
+    if (patch.contains("reference_image_urls")) {
+        appendUniqueStringsToArray(mergedReferenceImageUrls, patch["reference_image_urls"]);
+    }
+    if (!mergedReferenceImageUrls.empty()) {
+        mem["reference_image_urls"] = mergedReferenceImageUrls;
+        if (entityState) (*entityState)["reference_image_urls"] = mergedReferenceImageUrls;
     }
     const std::string entityKey = structuredEntityKeyField(patch);
     if (!entityKey.empty()) mem["entity_key"] = entityKey;
     const std::string entityType = trim(strField(patch, "entity_type"));
     if (!entityType.empty()) mem["entity_type"] = entityType;
     if ((!mem.contains("key_traits") || !mem["key_traits"].is_array() || mem["key_traits"].empty()) &&
-        st.contains("entities") && st["entities"].is_object() &&
-        st["entities"].contains(id) && st["entities"][id].is_object() &&
-        st["entities"][id].contains("key_traits") &&
-        st["entities"][id]["key_traits"].is_array() &&
-        !st["entities"][id]["key_traits"].empty())
+        entityState &&
+        entityState->contains("key_traits") &&
+        (*entityState)["key_traits"].is_array() &&
+        !(*entityState)["key_traits"].empty())
     {
-        mem["key_traits"] = st["entities"][id]["key_traits"];
+        mem["key_traits"] = (*entityState)["key_traits"];
     }
     if ((!mem.contains("description") || !mem["description"].is_string() || trim(mem["description"].get<std::string>()).empty()) &&
-        st.contains("entities") && st["entities"].is_object() &&
-        st["entities"].contains(id) && st["entities"][id].is_object() &&
-        st["entities"][id].contains("description") &&
-        st["entities"][id]["description"].is_string())
+        entityState &&
+        entityState->contains("description") &&
+        (*entityState)["description"].is_string())
     {
-        mem["description"] = st["entities"][id]["description"];
+        mem["description"] = (*entityState)["description"];
+    }
+    if ((!mem.contains("appearance_summary") || !mem["appearance_summary"].is_string() ||
+         trim(mem["appearance_summary"].get<std::string>()).empty()) &&
+        entityState &&
+        entityState->contains("appearance_summary") &&
+        (*entityState)["appearance_summary"].is_string())
+    {
+        mem["appearance_summary"] = (*entityState)["appearance_summary"];
     }
 
     if (idx == static_cast<std::size_t>(-1)) st["identity_memory"].push_back(std::move(mem));
@@ -4795,6 +5254,15 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
     json staticContext = json::object();
     json runtimeState = json::object();
     splitInferenceInputForPrompt(runtimeInput, staticContext, runtimeState);
+    const json expectedOutputSchema =
+        staticContext.contains("expected_output_schema") &&
+        staticContext["expected_output_schema"].is_object()
+            ? staticContext["expected_output_schema"]
+            : json::object();
+    const std::string watchlistMatchField =
+        expectedOutputSchema.contains("watchlist_updates")
+            ? std::string("watchlist_updates")
+            : std::string("cross_camera_watchlist_matches");
     std::ostringstream oss;
     oss << "\n\n" << kTemporalStaticPromptMarker << "\n" << staticContext.dump()
         << "\n\n" << kTemporalRuntimePromptMarker << "\n" << runtimeState.dump()
@@ -4812,7 +5280,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If an on-frame clock conflicts with provided temporal fields, prefer provided temporal fields.\n"
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"
         << "- identity_patch and observations MUST be arrays of JSON objects (never plain strings).\n"
-        << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description and updated_traits/key_traits.\n"
+        << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, appearance_summary, stable_attributes, and updated_traits/key_traits.\n"
         << "- If the same continuous action stays visible across multiple frames, emit one event observation for the first clearly supported transition and use later frames only as continuity for that same episode.\n"
         << "- When you include a continuity object for a later frame of the same episode, mark it with continuation=true and counts_as_new_event=false.\n"
         << "- Reuse stable entity_id/entity_key across rounds for the same real-world entity; create a new ID only when it is clearly a different entity.\n"
@@ -4825,17 +5293,21 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- When the scenario is about entering/leaving places, use entered_zone and left_zone from event_catalog instead of only generic present.\n"
         << "- Do not infer entered_zone just because the entity is already visible in the first frame of the batch; only use entered_zone when the entry is actually visible.\n"
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
-        << "- Keep traits concise (2-6 items): color/clothing/accessory/object_in_hand/pose when visible.\n"
-        << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence and events.\n"
+        << "- Keep stable_attributes concise (2-8 items) and focused on durable target-centric identity cues: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, build, markings, or vehicle make/model/color/plate fragments when visible.\n"
+        << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n"
+        << "- updated_traits may capture transient cues or scene context for continuity, but they must not replace the stable appearance signature.\n"
+        << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence, and an appearance snapshot for continuity.\n"
         << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch even when entity_id is inferred from that context.\n"
         << "- If a tracked entity from state_slice or identity_memory is no longer visible in this batch, return identity_patch for that same entity_id with decision set to not_visible_this_segment or absent.\n"
         << "- If TEMPORAL_RUNTIME_INPUT_JSON includes cross_camera_watchlist, treat it as an authoritative watchlist from other cameras in the same Job Step, even if this camera has different local alert logic.\n"
         << "- Each cross_camera_watchlist entry may include target_entity, entities, and search_prompt. Use target_entity and search_prompt as the primary instructions for what to look for.\n"
         << "- target_entity.entity_id and source_entity_id in cross_camera_watchlist refer to the source-camera target that started the hunt, not to a local entity_id in the current camera.\n"
+        << "- Treat cross_camera_watchlist as a high-priority shared hunt for this round, even when the local task text is about another class or activity.\n"
         << "- Evaluate cross_camera_watchlist independently from the local alert_condition. A strong watchlist match should still be reported even when the local alert_condition remains false.\n"
-        << "- Compare watchlist targets using appearance traits such as clothing, colors, accessories, object type, group composition, and resolved_identity metadata when present. Allow for normal cross-camera differences in angle, lighting, scale, and background.\n"
-        << "- If the current batch strongly matches one or more watchlist entries, return cross_camera_watchlist_matches as an array of JSON objects with hunt_id, matched_entity_id, confidence, and optional reason.\n"
-        << "- matched_entity_id inside cross_camera_watchlist_matches must be the local entity_id from the current camera when available. Do not copy target_entity.entity_id as matched_entity_id unless that exact same local ID is already being used in this camera.\n"
+        << "- Do not let an unrelated local answer suppress a strong cross_camera_watchlist match.\n"
+        << "- Compare watchlist targets using target-centric appearance traits such as clothing, colors, accessories, carried objects, body markings, vehicle details, and resolved_identity metadata when present. Treat room/background details as low-value unless physically attached to the target. Allow for normal cross-camera differences in angle, lighting, scale, and background.\n"
+        << "- If the current batch strongly matches one or more watchlist entries, return " << watchlistMatchField << " as an array of JSON objects with hunt_id, matched_entity_id, confidence, and optional reason.\n"
+        << "- matched_entity_id inside " << watchlistMatchField << " must be the local entity_id from the current camera when available. Do not copy target_entity.entity_id as matched_entity_id unless that exact same local ID is already being used in this camera.\n"
         << "- Do not write temporal state directly.\n";
     return oss.str();
 }

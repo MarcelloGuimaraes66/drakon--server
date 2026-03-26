@@ -200,8 +200,8 @@ namespace winrt::DrakonDesktop::implementation
 
         if (connected)
         {
-            SetText(L"PairingClientIdTextBox", to_hstring(m_pairingStatus.clientId));
-            SetText(L"PairingExeIdTextBox", to_hstring(m_pairingStatus.exeId));
+            SetText(L"PairingClientIdTextBlock", to_hstring(m_pairingStatus.clientId));
+            SetText(L"PairingExeIdTextBlock", to_hstring(m_pairingStatus.exeId));
             SetText(L"PairingTimezoneTextBox", to_hstring(m_pairingStatus.timezoneIana.empty() ? std::string("-") : m_pairingStatus.timezoneIana));
 
             auto heartbeat = m_pairingStatus.lastSeenAgeSeconds <= 0

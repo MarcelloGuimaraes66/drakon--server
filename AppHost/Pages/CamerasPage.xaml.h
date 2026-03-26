@@ -50,5 +50,6 @@ namespace winrt::DrakonDesktop::implementation
         std::vector<winrt::DrakonDesktop::CameraRecord> m_cameras;
         bool m_loadedRemoteData{ false };
         bool m_usingLocalFallback{ true };
+        bool m_isEditorDialogOpen{ false };
     };
 }

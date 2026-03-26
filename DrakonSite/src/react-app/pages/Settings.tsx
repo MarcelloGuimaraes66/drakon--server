@@ -508,10 +508,13 @@ export default function Settings() {
           <div className="space-y-6">
             {pairingStatus.status === "connected" && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="rounded-xl border border-gray-700/50 bg-gray-800/50 p-4">
+                <div className="min-w-0 rounded-xl border border-gray-700/50 bg-gray-800/50 p-4">
                   <p className="text-xs text-gray-400 mb-2">Client ID</p>
-                  <div className="flex items-center gap-2">
-                    <p className="text-base md:text-lg font-mono tracking-tight text-gray-100">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <p
+                      className="min-w-0 flex-1 truncate text-base md:text-lg font-mono tracking-tight text-gray-100"
+                      title={pairingStatus.client_id || "-"}
+                    >
                       {pairingStatus.client_id || "-"}
                     </p>
                     <button
@@ -530,10 +533,13 @@ export default function Settings() {
                   </div>
                 </div>
 
-                <div className="rounded-xl border border-gray-700/50 bg-gray-800/50 p-4">
+                <div className="min-w-0 rounded-xl border border-gray-700/50 bg-gray-800/50 p-4">
                   <p className="text-xs text-gray-400 mb-2">EXE ID</p>
-                  <div className="flex items-center gap-2">
-                    <p className="text-base md:text-lg font-mono tracking-tight text-gray-100">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <p
+                      className="min-w-0 flex-1 truncate text-base md:text-lg font-mono tracking-tight text-gray-100"
+                      title={pairingStatus.exe_id || "-"}
+                    >
                       {pairingStatus.exe_id || "-"}
                     </p>
                     <button

@@ -801,7 +801,7 @@ const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
-const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_3x3";
+const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_2x2";
 
 interface InferenceGroup {
   id: string;

@@ -180,7 +180,7 @@ function normalizeTargetInputType(value: unknown): TargetInputType {
 function normalizeVideoPackagingMode(
   value: unknown
 ): "mosaic_2x2" | "mosaic_3x3" | "frame_sequence" {
-  if (typeof value !== "string") return "mosaic_3x3";
+  if (typeof value !== "string") return "mosaic_2x2";
   const normalized = value.trim().toLowerCase();
   if (
     normalized === "frame_sequence" ||

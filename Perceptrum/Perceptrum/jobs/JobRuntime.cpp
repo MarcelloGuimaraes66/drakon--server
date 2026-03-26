@@ -5810,12 +5810,30 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (mem.contains("description") && mem["description"].is_string()) {
                 doc["description"] = mem["description"];
             }
+            if (mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
+                doc["appearance_summary"] = mem["appearance_summary"];
+            }
+            if (mem.contains("identity_signature_summary") && mem["identity_signature_summary"].is_string()) {
+                doc["identity_signature_summary"] = mem["identity_signature_summary"];
+            }
             if (mem.contains("key_traits") && mem["key_traits"].is_array() && !mem["key_traits"].empty()) {
                 doc["key_traits"] = mem["key_traits"];
             }
             else if (mem.contains("updated_traits")) {
                 const json traits = temporal::parseTraitsValue(mem["updated_traits"]);
                 if (traits.is_array() && !traits.empty()) doc["key_traits"] = traits;
+            }
+            if (mem.contains("stable_attributes") && mem["stable_attributes"].is_array() && !mem["stable_attributes"].empty()) {
+                doc["stable_attributes"] = mem["stable_attributes"];
+            }
+            if (mem.contains("identity_signature_traits") && mem["identity_signature_traits"].is_array() && !mem["identity_signature_traits"].empty()) {
+                doc["identity_signature_traits"] = mem["identity_signature_traits"];
+            }
+            if (mem.contains("latest_context_traits") && mem["latest_context_traits"].is_array() && !mem["latest_context_traits"].empty()) {
+                doc["updated_traits"] = mem["latest_context_traits"];
+            }
+            if (mem.contains("identity_context_traits") && mem["identity_context_traits"].is_array() && !mem["identity_context_traits"].empty()) {
+                doc["identity_context_traits"] = mem["identity_context_traits"];
             }
             if (mem.contains("entity_key") && mem["entity_key"].is_string()) {
                 doc["entity_key"] = mem["entity_key"];
@@ -5849,10 +5867,40 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             {
                 doc["description"] = entityState["description"];
             }
+            if ((!doc.contains("appearance_summary") || !doc["appearance_summary"].is_string()) &&
+                entityState.contains("appearance_summary") && entityState["appearance_summary"].is_string())
+            {
+                doc["appearance_summary"] = entityState["appearance_summary"];
+            }
+            if ((!doc.contains("identity_signature_summary") || !doc["identity_signature_summary"].is_string()) &&
+                entityState.contains("identity_signature_summary") && entityState["identity_signature_summary"].is_string())
+            {
+                doc["identity_signature_summary"] = entityState["identity_signature_summary"];
+            }
             if ((!doc.contains("key_traits") || !doc["key_traits"].is_array() || doc["key_traits"].empty()) &&
                 entityState.contains("key_traits") && entityState["key_traits"].is_array() && !entityState["key_traits"].empty())
             {
                 doc["key_traits"] = entityState["key_traits"];
+            }
+            if ((!doc.contains("stable_attributes") || !doc["stable_attributes"].is_array() || doc["stable_attributes"].empty()) &&
+                entityState.contains("stable_attributes") && entityState["stable_attributes"].is_array() && !entityState["stable_attributes"].empty())
+            {
+                doc["stable_attributes"] = entityState["stable_attributes"];
+            }
+            if ((!doc.contains("identity_signature_traits") || !doc["identity_signature_traits"].is_array() || doc["identity_signature_traits"].empty()) &&
+                entityState.contains("identity_signature_traits") && entityState["identity_signature_traits"].is_array() && !entityState["identity_signature_traits"].empty())
+            {
+                doc["identity_signature_traits"] = entityState["identity_signature_traits"];
+            }
+            if ((!doc.contains("updated_traits") || !doc["updated_traits"].is_array() || doc["updated_traits"].empty()) &&
+                entityState.contains("latest_context_traits") && entityState["latest_context_traits"].is_array() && !entityState["latest_context_traits"].empty())
+            {
+                doc["updated_traits"] = entityState["latest_context_traits"];
+            }
+            if ((!doc.contains("identity_context_traits") || !doc["identity_context_traits"].is_array() || doc["identity_context_traits"].empty()) &&
+                entityState.contains("identity_context_traits") && entityState["identity_context_traits"].is_array() && !entityState["identity_context_traits"].empty())
+            {
+                doc["identity_context_traits"] = entityState["identity_context_traits"];
             }
             if (entityState.contains("last_seen_ts") && entityState["last_seen_ts"].is_string()) {
                 doc["last_seen_ts_utc"] = entityState["last_seen_ts"];
@@ -6020,15 +6068,52 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (patchNode && patchNode->is_object()) {
                 const std::string description = temporal::trim(
                     temporal::strField(*patchNode, "description",
-                        temporal::strField(*patchNode, "entity_description",
-                            temporal::strField(*patchNode, "person_description"))));
+                        temporal::strField(*patchNode, "short_description",
+                            temporal::strField(*patchNode, "appearance_summary",
+                                temporal::strField(*patchNode, "entity_description",
+                                    temporal::strField(*patchNode, "person_description"))))));
                 if (!description.empty()) doc["description"] = description;
+                const std::string appearanceSummary =
+                    temporal::trim(temporal::strField(*patchNode, "appearance_summary"));
+                if (!appearanceSummary.empty()) doc["appearance_summary"] = appearanceSummary;
+                const std::string identitySignatureSummary =
+                    temporal::trim(temporal::strField(*patchNode, "identity_signature_summary"));
+                if (!identitySignatureSummary.empty()) doc["identity_signature_summary"] = identitySignatureSummary;
                 const std::string entityKey = temporal::trim(temporal::strField(*patchNode, "entity_key"));
                 if (!entityKey.empty()) doc["entity_key"] = entityKey;
                 const std::string entityType = temporal::trim(temporal::strField(*patchNode, "entity_type"));
                 if (!entityType.empty()) doc["entity_type"] = entityType;
                 const json traits = temporal::extractTraitsFromNode(*patchNode);
                 if (traits.is_array() && !traits.empty()) doc["key_traits"] = traits;
+                if (patchNode->contains("stable_attributes")) {
+                    const json stableAttributes = temporal::parseTraitsValue((*patchNode)["stable_attributes"]);
+                    if (stableAttributes.is_array() && !stableAttributes.empty()) {
+                        doc["stable_attributes"] = stableAttributes;
+                    }
+                }
+                if (patchNode->contains("identity_signature_traits")) {
+                    const json identitySignatureTraits =
+                        temporal::parseTraitsValue((*patchNode)["identity_signature_traits"]);
+                    if (identitySignatureTraits.is_array() && !identitySignatureTraits.empty()) {
+                        doc["identity_signature_traits"] = identitySignatureTraits;
+                    }
+                }
+                if (patchNode->contains("updated_traits")) {
+                    const json updatedTraits = temporal::parseTraitsValue((*patchNode)["updated_traits"]);
+                    if (updatedTraits.is_array() && !updatedTraits.empty()) {
+                        doc["updated_traits"] = updatedTraits;
+                    }
+                }
+                if (patchNode->contains("identity_context_traits")) {
+                    const json identityContextTraits =
+                        temporal::parseTraitsValue((*patchNode)["identity_context_traits"]);
+                    if (identityContextTraits.is_array() && !identityContextTraits.empty()) {
+                        doc["identity_context_traits"] = identityContextTraits;
+                    }
+                }
+                if (patchNode->contains("reference_image_urls") && (*patchNode)["reference_image_urls"].is_array()) {
+                    doc["reference_image_urls"] = (*patchNode)["reference_image_urls"];
+                }
             }
 
             if (!entityId.empty()) {
@@ -6038,10 +6123,36 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                     if (!doc.contains("description") && mem.contains("description") && mem["description"].is_string()) {
                         doc["description"] = mem["description"];
                     }
+                    if (!doc.contains("appearance_summary") && mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
+                        doc["appearance_summary"] = mem["appearance_summary"];
+                    }
+                    if (!doc.contains("identity_signature_summary") && mem.contains("identity_signature_summary") && mem["identity_signature_summary"].is_string()) {
+                        doc["identity_signature_summary"] = mem["identity_signature_summary"];
+                    }
                     if ((!doc.contains("key_traits") || !doc["key_traits"].is_array() || doc["key_traits"].empty()) &&
                         mem.contains("key_traits") && mem["key_traits"].is_array() && !mem["key_traits"].empty())
                     {
                         doc["key_traits"] = mem["key_traits"];
+                    }
+                    if ((!doc.contains("stable_attributes") || !doc["stable_attributes"].is_array() || doc["stable_attributes"].empty()) &&
+                        mem.contains("stable_attributes") && mem["stable_attributes"].is_array() && !mem["stable_attributes"].empty())
+                    {
+                        doc["stable_attributes"] = mem["stable_attributes"];
+                    }
+                    if ((!doc.contains("identity_signature_traits") || !doc["identity_signature_traits"].is_array() || doc["identity_signature_traits"].empty()) &&
+                        mem.contains("identity_signature_traits") && mem["identity_signature_traits"].is_array() && !mem["identity_signature_traits"].empty())
+                    {
+                        doc["identity_signature_traits"] = mem["identity_signature_traits"];
+                    }
+                    if ((!doc.contains("updated_traits") || !doc["updated_traits"].is_array() || doc["updated_traits"].empty()) &&
+                        mem.contains("latest_context_traits") && mem["latest_context_traits"].is_array() && !mem["latest_context_traits"].empty())
+                    {
+                        doc["updated_traits"] = mem["latest_context_traits"];
+                    }
+                    if ((!doc.contains("identity_context_traits") || !doc["identity_context_traits"].is_array() || doc["identity_context_traits"].empty()) &&
+                        mem.contains("identity_context_traits") && mem["identity_context_traits"].is_array() && !mem["identity_context_traits"].empty())
+                    {
+                        doc["identity_context_traits"] = mem["identity_context_traits"];
                     }
                     if (!doc.contains("entity_key") && mem.contains("entity_key") && mem["entity_key"].is_string()) {
                         doc["entity_key"] = mem["entity_key"];
@@ -6072,10 +6183,36 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                     if (!doc.contains("description") && entityState.contains("description") && entityState["description"].is_string()) {
                         doc["description"] = entityState["description"];
                     }
+                    if (!doc.contains("appearance_summary") && entityState.contains("appearance_summary") && entityState["appearance_summary"].is_string()) {
+                        doc["appearance_summary"] = entityState["appearance_summary"];
+                    }
+                    if (!doc.contains("identity_signature_summary") && entityState.contains("identity_signature_summary") && entityState["identity_signature_summary"].is_string()) {
+                        doc["identity_signature_summary"] = entityState["identity_signature_summary"];
+                    }
                     if ((!doc.contains("key_traits") || !doc["key_traits"].is_array() || doc["key_traits"].empty()) &&
                         entityState.contains("key_traits") && entityState["key_traits"].is_array() && !entityState["key_traits"].empty())
                     {
                         doc["key_traits"] = entityState["key_traits"];
+                    }
+                    if ((!doc.contains("stable_attributes") || !doc["stable_attributes"].is_array() || doc["stable_attributes"].empty()) &&
+                        entityState.contains("stable_attributes") && entityState["stable_attributes"].is_array() && !entityState["stable_attributes"].empty())
+                    {
+                        doc["stable_attributes"] = entityState["stable_attributes"];
+                    }
+                    if ((!doc.contains("identity_signature_traits") || !doc["identity_signature_traits"].is_array() || doc["identity_signature_traits"].empty()) &&
+                        entityState.contains("identity_signature_traits") && entityState["identity_signature_traits"].is_array() && !entityState["identity_signature_traits"].empty())
+                    {
+                        doc["identity_signature_traits"] = entityState["identity_signature_traits"];
+                    }
+                    if ((!doc.contains("updated_traits") || !doc["updated_traits"].is_array() || doc["updated_traits"].empty()) &&
+                        entityState.contains("latest_context_traits") && entityState["latest_context_traits"].is_array() && !entityState["latest_context_traits"].empty())
+                    {
+                        doc["updated_traits"] = entityState["latest_context_traits"];
+                    }
+                    if ((!doc.contains("identity_context_traits") || !doc["identity_context_traits"].is_array() || doc["identity_context_traits"].empty()) &&
+                        entityState.contains("identity_context_traits") && entityState["identity_context_traits"].is_array() && !entityState["identity_context_traits"].empty())
+                    {
+                        doc["identity_context_traits"] = entityState["identity_context_traits"];
                     }
                     if (entityState.contains("last_seen_ts") && entityState["last_seen_ts"].is_string()) {
                         doc["last_seen_ts_utc"] = entityState["last_seen_ts"];
@@ -6157,8 +6294,70 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (doc.contains("key_traits") && !doc["key_traits"].is_array()) {
             doc["key_traits"] = temporal::parseTraitsValue(doc["key_traits"]);
         }
-        if (!doc.contains("key_traits") || !doc["key_traits"].is_array()) {
-            doc["key_traits"] = json::array();
+        if (doc.contains("stable_attributes") && !doc["stable_attributes"].is_array()) {
+            doc["stable_attributes"] = temporal::parseTraitsValue(doc["stable_attributes"]);
+        }
+        if (doc.contains("updated_traits") && !doc["updated_traits"].is_array()) {
+            doc["updated_traits"] = temporal::parseTraitsValue(doc["updated_traits"]);
+        }
+        if (doc.contains("identity_signature_traits") && !doc["identity_signature_traits"].is_array()) {
+            doc["identity_signature_traits"] = temporal::parseTraitsValue(doc["identity_signature_traits"]);
+        }
+        if (doc.contains("identity_context_traits") && !doc["identity_context_traits"].is_array()) {
+            doc["identity_context_traits"] = temporal::parseTraitsValue(doc["identity_context_traits"]);
+        }
+        json stableAttributes = json::array();
+        if (doc.contains("stable_attributes")) {
+            temporal::appendUniqueTraitsToArray(stableAttributes, doc["stable_attributes"]);
+        }
+        if (stableAttributes.empty() && doc.contains("key_traits")) {
+            temporal::appendUniqueTraitsToArray(stableAttributes, doc["key_traits"]);
+        }
+        doc["stable_attributes"] = stableAttributes;
+
+        json mergedKeyTraits = json::array();
+        if (!stableAttributes.empty()) {
+            temporal::appendUniqueTraitsToArray(mergedKeyTraits, stableAttributes);
+        }
+        if (doc.contains("key_traits")) {
+            temporal::appendUniqueTraitsToArray(mergedKeyTraits, doc["key_traits"]);
+        }
+        doc["key_traits"] = mergedKeyTraits;
+
+        if (!doc.contains("updated_traits") || !doc["updated_traits"].is_array()) {
+            doc["updated_traits"] = json::array();
+        }
+        const std::string identityTypeHint = !entityType.empty() ? entityType : entityKey;
+        json identitySignatureTraits = json::array();
+        if (doc.contains("identity_signature_traits")) {
+            temporal::appendUniqueTraitsToArray(identitySignatureTraits, doc["identity_signature_traits"]);
+        }
+        identitySignatureTraits = temporal::curateIdentitySignatureTraits(
+            identityTypeHint,
+            stableAttributes,
+            doc["updated_traits"],
+            identitySignatureTraits);
+        doc["identity_signature_traits"] = identitySignatureTraits;
+
+        json identityContextTraits = json::array();
+        if (doc.contains("identity_context_traits")) {
+            temporal::appendUniqueTraitsToArray(identityContextTraits, doc["identity_context_traits"]);
+        }
+        identityContextTraits = temporal::curateIdentityContextTraits(
+            identityTypeHint,
+            stableAttributes,
+            doc["updated_traits"],
+            identityContextTraits);
+        doc["identity_context_traits"] = identityContextTraits;
+
+        std::string identitySignatureSummary =
+            temporal::trim(temporal::strField(doc, "identity_signature_summary"));
+        if (identitySignatureSummary.empty()) {
+            identitySignatureSummary =
+                temporal::buildIdentitySignatureSummary(identityTypeHint, identitySignatureTraits);
+        }
+        if (!identitySignatureSummary.empty()) {
+            doc["identity_signature_summary"] = identitySignatureSummary;
         }
         return doc;
     };
@@ -6169,32 +6368,68 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             temporal::strField(normalized, "entity_type", temporal::strField(normalized, "entity_key", "object")));
         const std::string knownName = temporal::trim(temporal::strField(normalized, "known_name"));
         const std::string description = temporal::trim(temporal::strField(normalized, "description"));
+        const std::string appearanceSummary = temporal::trim(temporal::strField(normalized, "appearance_summary"));
+        const std::string identitySignatureSummary =
+            temporal::trim(temporal::strField(normalized, "identity_signature_summary"));
         const std::string lastSeenTs = temporal::trim(temporal::strField(normalized, "last_seen_ts_utc"));
         const std::string lastSeenZone = temporal::trim(temporal::strField(normalized, "last_seen_zone"));
         std::ostringstream prompt;
-        prompt << "Look for the same " << (entityType.empty() ? "object" : entityType)
-               << " from another camera in this job step.";
-        if (!knownName.empty()) {
-            prompt << " Known identity hint: " << knownName << ".";
-        }
-        if (!description.empty()) {
-            prompt << " Primary description: " << description << ".";
-        }
-        if (normalized.contains("key_traits") && normalized["key_traits"].is_array() && !normalized["key_traits"].empty()) {
-            prompt << " Key traits: ";
+        auto appendTraitSentence = [&](const char* fieldName, const char* label, std::size_t maxItems) {
+            if (!normalized.contains(fieldName) || !normalized[fieldName].is_array() || normalized[fieldName].empty()) {
+                return;
+            }
+            std::ostringstream clause;
             bool firstTrait = true;
             std::size_t emittedTraits = 0;
-            for (const auto& trait : normalized["key_traits"]) {
+            for (const auto& trait : normalized[fieldName]) {
                 if (!trait.is_string()) continue;
                 const std::string value = temporal::trim(trait.get<std::string>());
                 if (value.empty()) continue;
-                if (!firstTrait) prompt << "; ";
-                prompt << value;
+                if (!firstTrait) clause << "; ";
+                clause << value;
                 firstTrait = false;
                 ++emittedTraits;
-                if (emittedTraits >= 6) break;
+                if (emittedTraits >= maxItems) break;
             }
-            prompt << ".";
+            if (emittedTraits == 0) return;
+            prompt << " " << label << ": " << clause.str() << ".";
+        };
+        const bool hasCuratedSignature =
+            !identitySignatureSummary.empty() ||
+            (normalized.contains("identity_signature_traits") &&
+             normalized["identity_signature_traits"].is_array() &&
+             !normalized["identity_signature_traits"].empty());
+        prompt << "Look for the same " << (entityType.empty() ? "object" : entityType)
+               << " from another camera in this job step.";
+        prompt << " Treat this shared hunt as a priority task for the receiving camera even if its local task text is unrelated.";
+        prompt << " Prioritize the target's intrinsic appearance, clothing, accessories, carried objects, markings, and vehicle details.";
+        prompt << " Treat room layout, furniture, doors, walls, and surrounding background as low-value unless physically attached to the target.";
+        if (!knownName.empty()) {
+            prompt << " Known identity hint: " << knownName << ".";
+        }
+        if (hasCuratedSignature) {
+            if (!identitySignatureSummary.empty()) {
+                prompt << " Curated identity signature: " << identitySignatureSummary << ".";
+            }
+            appendTraitSentence("identity_signature_traits", "Identity signature traits", 8);
+        }
+        else {
+            if (!description.empty()) {
+                prompt << " Primary description: " << description << ".";
+            }
+            if (!appearanceSummary.empty() && appearanceSummary != description) {
+                prompt << " Stable appearance summary: " << appearanceSummary << ".";
+            }
+            appendTraitSentence("stable_attributes", "Stable appearance attributes", 8);
+            appendTraitSentence("updated_traits", "Current contextual cues", 6);
+        }
+        if (normalized.contains("resolved_identity") && normalized["resolved_identity"].is_object()) {
+            prompt << " Resolved identity metadata is available and should be treated as strong supporting evidence when the appearance is compatible.";
+        }
+        if (normalized.contains("reference_image_urls") && normalized["reference_image_urls"].is_array() &&
+            !normalized["reference_image_urls"].empty())
+        {
+            prompt << " Reference image metadata is available for this target.";
         }
         if (!lastSeenTs.empty()) {
             prompt << " Last seen at " << lastSeenTs << " UTC.";
@@ -6202,7 +6437,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (!lastSeenZone.empty()) {
             prompt << " Last seen zone/context: " << lastSeenZone << ".";
         }
-        prompt << " If this batch strongly matches the shared target despite normal cross-camera changes in angle, lighting, scale, or background, return cross_camera_watchlist_matches for this hunt even if the local alert_condition would otherwise stay false.";
+        prompt << " If this batch strongly matches the shared target despite normal cross-camera changes in angle, lighting, scale, or background, emit a positive watchlist match update for this hunt using the watchlist field from the active response schema, even if the local alert_condition would otherwise stay false or the receiving camera has a different local task.";
         return prompt.str();
     };
 
@@ -6447,6 +6682,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                     std::to_string(cameraId) + "_" + std::to_string(huntTick) },
                 { "source_camera_id", cameraId },
                 { "source_agent_id", agent.id },
+                { "source_agent_key", agent.agent_key },
                 { "created_at_utc", nowIsoUtc },
                 { "watch_ttl_seconds", ttlSeconds },
                 { "operator_id", operatorId },
@@ -6517,6 +6753,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             match["operator_id"] = temporal::strField(huntIt->second, "operator_id");
             match["alert_on_match"] = huntIt->second.value("alert_on_match", json(true));
             match["matched_camera_id"] = cameraId;
+            const int sourceAgentId = temporal::intField(huntIt->second, "source_agent_id", -1);
+            if (sourceAgentId >= 0) {
+                match["source_agent_id"] = sourceAgentId;
+            }
+            const std::string sourceAgentKey =
+                temporal::trim(temporal::strField(huntIt->second, "source_agent_key"));
+            if (!sourceAgentKey.empty()) {
+                match["source_agent_key"] = sourceAgentKey;
+            }
             if (!matchedEntityId.empty()) {
                 match["matched_local_entity_id"] = matchedEntityId;
             }
@@ -6559,7 +6804,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 { "identity_patch", json::array() },
                 { "observations", json::array() },
                 { "unknown_reasons", json::array() },
-                { "cross_camera_watchlist_matches", json::array() }
+                { "watchlist_updates", json::array() }
             } },
             { "time_context", {
                 { "now_utc", nowIsoUtc }
@@ -6814,7 +7059,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 if (!temporalInput.contains("expected_output_schema") || !temporalInput["expected_output_schema"].is_object()) {
                     temporalInput["expected_output_schema"] = json::object();
                 }
-                temporalInput["expected_output_schema"]["cross_camera_watchlist_matches"] = json::array();
+                temporalInput["expected_output_schema"]["watchlist_updates"] = json::array();
             }
             Logger::instance().logDebug(
                 "job",
@@ -7546,7 +7791,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (!temporalInput.contains("expected_output_schema") || !temporalInput["expected_output_schema"].is_object()) {
                 temporalInput["expected_output_schema"] = json::object();
             }
-            temporalInput["expected_output_schema"]["cross_camera_watchlist_matches"] = json::array();
+            temporalInput["expected_output_schema"]["watchlist_updates"] = json::array();
         }
         Logger::instance().logDebug(
             "job",

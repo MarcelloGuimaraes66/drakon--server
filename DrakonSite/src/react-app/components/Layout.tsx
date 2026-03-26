@@ -65,6 +65,7 @@ export default function Layout({ children }: LayoutProps) {
   const [isChatAutoCollapsedDesktop, setIsChatAutoCollapsedDesktop] = useState(false);
   const [showSidebarCollapseCue, setShowSidebarCollapseCue] = useState(false);
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
+  const [isNotificationsBadgeDismissed, setIsNotificationsBadgeDismissed] = useState(false);
   const [isSystemActivityOpen, setIsSystemActivityOpen] = useState(false);
   const [showOpenAiKeyPrompt, setShowOpenAiKeyPrompt] = useState(false);
   const [showZAiKeyPrompt, setShowZAiKeyPrompt] = useState(false);
@@ -72,6 +73,7 @@ export default function Layout({ children }: LayoutProps) {
   const collapseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearCueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expandTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previousUnreadCountRef = useRef(0);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
   const isSidebarCollapsed = isDesktop && (isSidebarCollapsedDesktop || isChatAutoCollapsedDesktop);
   const billingEnabled = brand.features.billingEnabled;
@@ -83,7 +85,7 @@ export default function Layout({ children }: LayoutProps) {
   
   // Use unified dashboard summary hook
   const { cameras, dashboard, unreadCount, tokenUsageMonth } = useDashboardSummary();
-  const hasUnreadNotifications = unreadCount > 0;
+  const hasUnreadNotifications = unreadCount > 0 && !isNotificationsBadgeDismissed;
 
   // Auto-close drawer on route change
   useEffect(() => {
@@ -164,6 +166,16 @@ export default function Layout({ children }: LayoutProps) {
       }
     };
   }, [location.pathname, isDesktop, isSidebarCollapsedDesktop, isChatAutoCollapsedDesktop]);
+
+  useEffect(() => {
+    const previousUnreadCount = previousUnreadCountRef.current;
+    if (unreadCount <= 0) {
+      setIsNotificationsBadgeDismissed(false);
+    } else if (unreadCount > previousUnreadCount) {
+      setIsNotificationsBadgeDismissed(false);
+    }
+    previousUnreadCountRef.current = unreadCount;
+  }, [unreadCount]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -249,7 +261,18 @@ export default function Layout({ children }: LayoutProps) {
   }, [isSettingsRoute]);
 
   const handleNotificationClick = () => {
-    setIsNotificationsOpen(!isNotificationsOpen);
+    setIsNotificationsOpen((prev) => {
+      const next = !prev;
+      if (next) {
+        setIsNotificationsBadgeDismissed(true);
+      }
+      return next;
+    });
+  };
+
+  const handleNotificationsClose = () => {
+    setIsNotificationsBadgeDismissed(true);
+    setIsNotificationsOpen(false);
   };
 
   const handleSidebarToggle = () => {
@@ -649,7 +672,7 @@ export default function Layout({ children }: LayoutProps) {
 
               <NotificationsDropdown
                 isOpen={isNotificationsOpen}
-                onClose={() => setIsNotificationsOpen(false)}
+                onClose={handleNotificationsClose}
               />
             </div>
           </div>

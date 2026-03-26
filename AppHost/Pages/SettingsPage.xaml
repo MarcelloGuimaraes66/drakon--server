@@ -135,7 +135,19 @@
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="Auto" />
                                                 </Grid.ColumnDefinitions>
-                                                <TextBox x:Name="PairingClientIdTextBox" IsReadOnly="True" />
+                                                <Border
+                                                    MinWidth="0"
+                                                    Padding="12,10"
+                                                    Background="{StaticResource DrakonPanelAltBrush}"
+                                                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="12">
+                                                    <TextBlock
+                                                        x:Name="PairingClientIdTextBlock"
+                                                        FontFamily="Cascadia Mono"
+                                                        IsTextSelectionEnabled="True"
+                                                        TextWrapping="Wrap" />
+                                                </Border>
                                                 <Button
                                                     x:Name="CopyClientIdButton"
                                                     Grid.Column="1"
@@ -152,7 +164,19 @@
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="Auto" />
                                                 </Grid.ColumnDefinitions>
-                                                <TextBox x:Name="PairingExeIdTextBox" IsReadOnly="True" />
+                                                <Border
+                                                    MinWidth="0"
+                                                    Padding="12,10"
+                                                    Background="{StaticResource DrakonPanelAltBrush}"
+                                                    BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="12">
+                                                    <TextBlock
+                                                        x:Name="PairingExeIdTextBlock"
+                                                        FontFamily="Cascadia Mono"
+                                                        IsTextSelectionEnabled="True"
+                                                        TextWrapping="Wrap" />
+                                                </Border>
                                                 <Button
                                                     x:Name="CopyExeIdButton"
                                                     Grid.Column="1"

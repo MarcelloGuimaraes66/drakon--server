@@ -18,6 +18,24 @@ namespace
     constexpr long HttpUnauthorized = 401;
     constexpr long HttpForbidden = 403;
 
+    struct ScopedBoolFlag
+    {
+        explicit ScopedBoolFlag(bool& target) noexcept : value(target)
+        {
+            value = true;
+        }
+
+        ScopedBoolFlag(ScopedBoolFlag const&) = delete;
+        ScopedBoolFlag& operator=(ScopedBoolFlag const&) = delete;
+
+        ~ScopedBoolFlag()
+        {
+            value = false;
+        }
+
+        bool& value;
+    };
+
     Brush LookupBrush(winrt::hstring const& key)
     {
         return Application::Current().Resources().Lookup(box_value(key)).as<Brush>();
@@ -515,6 +533,12 @@ namespace winrt::DrakonDesktop::implementation
 
     fire_and_forget CamerasPage::ShowEditorAsync(std::optional<int32_t> cameraId)
     {
+        if (m_isEditorDialogOpen)
+        {
+            co_return;
+        }
+
+        ScopedBoolFlag dialogOpenGuard{ m_isEditorDialogOpen };
         auto lifetime = get_strong();
         winrt::apartment_context uiThread;
 

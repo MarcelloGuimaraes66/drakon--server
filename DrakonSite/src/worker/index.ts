@@ -4454,7 +4454,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE job_step_agents ADD COLUMN model_fps INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(
-          `ALTER TABLE job_step_agents ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_3x3'`
+          `ALTER TABLE job_step_agents ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_2x2'`
         );
         await addColumnIfMissing(
           `ALTER TABLE job_step_agents ADD COLUMN use_temporal_context INTEGER NOT NULL DEFAULT 1`
@@ -4552,7 +4552,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE camera_algorithms ADD COLUMN input_type TEXT DEFAULT 'video'`
         );
         await addColumnIfMissing(
-          `ALTER TABLE camera_algorithms ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_3x3'`
+          `ALTER TABLE camera_algorithms ADD COLUMN video_packaging_mode TEXT DEFAULT 'mosaic_2x2'`
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN inference_model TEXT DEFAULT 'ultra'`
@@ -25630,7 +25630,7 @@ const normalizeJobStepInputType = (value: unknown): JobStepInputType | null => {
 
 const normalizeVideoPackagingMode = (
   value: unknown,
-  fallback: VideoPackagingMode = "mosaic_3x3"
+  fallback: VideoPackagingMode = "mosaic_2x2"
 ): VideoPackagingMode => {
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
@@ -28306,7 +28306,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
   const inputType = requestedInputType || "video";
   const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
-  const videoPackagingMode = requestedVideoPackagingMode || "mosaic_3x3";
+  const videoPackagingMode = requestedVideoPackagingMode || "mosaic_2x2";
   const runEvery = requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
   const modelFps = requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
   const runningResolution = requestedRunningResolution ?? null;

@@ -13538,11 +13538,13 @@ static void logGroupCameraDebug_(
 
 static constexpr std::size_t kStructuredVisionMaxAlertRegionIds_ = 16;
 static constexpr std::size_t kStructuredVisionMaxIdentityPatchItems_ = 32;
+static constexpr std::size_t kStructuredVisionMaxIdentityTraitItems_ = 16;
 static constexpr std::size_t kStructuredVisionMaxObservationItems_ = 48;
 static constexpr std::size_t kStructuredVisionMaxUnknownReasonItems_ = 16;
 static constexpr std::size_t kStructuredVisionMaxFaceIdTargetNames_ = 8;
 static constexpr std::size_t kStructuredVisionMaxCrossCameraMatches_ = 12;
 static constexpr std::size_t kStructuredVisionMaxDetectionTimesInVideo_ = 12;
+static constexpr std::size_t kStructuredVisionMaxReferenceImageUrls_ = 8;
 
 static bool tryParseStrictMmSs_(const std::string& rawValue, int& outTotalSeconds)
 {
@@ -14970,10 +14972,16 @@ namespace {
             const std::string reason =
                 readTemporalNodeStringAlias_(
                     source,
-                    { "reason", "description", "short_description", "note", "reasoning" });
+                    { "reason", "description", "short_description", "appearance_summary", "note", "reasoning" });
             if (!reason.empty()) {
                 if (!target.contains("reason")) target["reason"] = reason;
                 if (!target.contains("description")) target["description"] = reason;
+            }
+            if (source.contains("appearance_summary") && source["appearance_summary"].is_string()) {
+                target["appearance_summary"] = source["appearance_summary"];
+            }
+            if (source.contains("stable_attributes")) {
+                target["stable_attributes"] = source["stable_attributes"];
             }
 
             const std::string zone = readTemporalEvidenceZone_(source);
@@ -14988,6 +14996,9 @@ namespace {
             }
             else if (source.contains("key_traits")) {
                 target["updated_traits"] = source["key_traits"];
+            }
+            if (source.contains("reference_image_urls") && source["reference_image_urls"].is_array()) {
+                target["reference_image_urls"] = source["reference_image_urls"];
             }
 
             if (source.contains("frame_ref") && source["frame_ref"].is_object()) {
@@ -16126,7 +16137,10 @@ namespace {
                         { "decision", makeNullableStringSchema_() },
                         { "confidence", makeNullableNumberSchema_() },
                         { "short_description", makeNullableStringSchema_() },
-                        { "updated_traits", makeNullableStringArraySchema_(8) },
+                        { "appearance_summary", makeNullableStringSchema_() },
+                        { "stable_attributes", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "reference_image_urls", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxReferenceImageUrls_)) },
                         { "frame_ref", makeFrameRefSchema_() }
                     },
                     static_cast<int>(kStructuredVisionMaxIdentityPatchItems_)) },
@@ -16345,19 +16359,23 @@ namespace {
         std::ostringstream prompt;
         prompt << "TEMPORAL DELTA OUTPUT CONTRACT:\n";
         prompt << "- Return only updates discovered in the current batch.\n";
-        prompt << "- Omit any field that has no update for this round.\n";
-        prompt << "- Do not repeat persisted state, prior counts, unchanged traits, or unchanged events from TEMPORAL_RUNTIME_STATE_JSON.\n";
-        prompt << "- answer is optional. Omit it unless a short user-facing explanation is needed because of alert, start condition, face match, or a meaningful ambiguity explanation.\n";
+        prompt << "- Omit any field that has no update for this round, except that visible tracked entities still need a compact identity snapshot for continuity.\n";
+        prompt << "- Do not repeat persisted state, prior counts, or unchanged events from TEMPORAL_RUNTIME_STATE_JSON. Reuse prior identity only as context for the current-round snapshot.\n";
+        prompt << "- answer is optional. Omit it unless a short user-facing explanation is needed because of alert, start condition, watchlist match, face match, or a meaningful ambiguity explanation.\n";
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
-        prompt << "- identity_updates are optional. Emit them only for durable identity changes: new_entity, match_existing, merged identity, new confirmed traits, or another identity correction.\n";
+        prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, appearance_summary, stable_attributes, and any updated_traits/context cues needed for continuity.\n";
+        prompt << "- stable_attributes should capture durable target-centric identity cues that survive time and cross-camera changes: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, body build, markings, or vehicle make/model/color/plate fragments when visible.\n";
+        prompt << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n";
+        prompt << "- updated_traits may add transient current-round cues or scene context for continuity, but do not use them as a substitute for stable_attributes.\n";
         prompt << "- visibility_updates are optional. Emit at most one per relevant entity when asserting a current-round visibility state.\n";
         prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
         prompt << "- Use visibility state not_visible_this_segment or absent when a tracked entity from temporal state is clearly not visible in the current batch.\n";
         prompt << "- event_updates are optional. Emit only atomic current-batch events such as picked_up_cup. Never emit cumulative counts like 'third time'.\n";
         prompt << "- unknown_reasons are optional. Emit them only when occlusion, ambiguity, or conflict explains why no stronger update was produced.\n";
         if (options.hasCrossCameraWatchlist) {
-            prompt << "- watchlist_updates are optional. Emit them only for strong positive watchlist matches or meaningful watchlist changes.\n";
+            prompt << "- watchlist_updates are optional overall, but if the current batch strongly matches a shared target, emit watchlist_updates even when local_alert_update stays false or the local task text is about something else.\n";
+            prompt << "- In this temporal delta contract, use watchlist_updates as the watchlist match field name. Do not use cross_camera_watchlist_matches here.\n";
         }
         if (options.hasFaceReferences) {
             prompt << "- faceid_match and faceid_target_names are optional in this contract. Emit them only for positive face matches.\n";
@@ -16424,6 +16442,7 @@ namespace {
         }
         if (options.hasCrossCameraWatchlist) {
             prompt << "- Evaluate shared cross_camera_watchlist targets independently from the local alert condition.\n";
+            prompt << "- Treat cross_camera_watchlist as a co-primary shared-hunt task for this round; do not let unrelated local task text suppress a strong watchlist match.\n";
         }
         if (options.requireDetectionTimeInVideo) {
             prompt << "- When the answer states that a relevant event is visible, include supporting detection_time_in_video timestamps.\n";
@@ -16452,6 +16471,14 @@ namespace {
         prompt << "TASK TEXT:\n";
         if (!sections.basePrompt.empty()) prompt << sections.basePrompt << "\n\n";
         else prompt << "(No extra task text provided.)\n\n";
+
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "CROSS-CAMERA HUNT PRIORITY:\n";
+            prompt << "- cross_camera_watchlist is a co-primary task for this round, even if TASK TEXT is about another object class.\n";
+            prompt << "- Evaluate the shared hunt before defaulting to a negative local-only answer.\n";
+            prompt << "- If the current batch strongly matches the shared target, emit watchlist_updates even when the local alert condition remains false.\n";
+            prompt << "- Do not let an unrelated local answer such as 'no dog visible' suppress a positive watchlist match.\n\n";
+        }
 
         prompt << "IMPORTANT CONTEXT RULE:\n";
         prompt << "- The analyzed segment is only PART of the full requested time window.\n";
@@ -16523,10 +16550,10 @@ namespace {
         if (options.hasTemporal) {
             if (options.useTemporalDeltaContract) {
                 prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
-                prompt << "- If an entity is visible but nothing durable changed, prefer a short visibility_updates item instead of repeating a full identity update.\n";
+                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself matters.\n";
                 prompt << "- Do not repeat the same event just because later frames still show continuity of the same action.\n";
                 prompt << "- When later frames only confirm continuity, use continuation=true and counts_as_new_event=false inside that event update.\n";
-                prompt << "- When temporal context lets you match a visible entity to prior state, emit an identity update only if there is new durable identity information worth saving.\n";
+                prompt << "- When temporal context lets you match a visible entity to prior state, still emit an identity update with the current appearance snapshot even when the identity decision itself did not change.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
@@ -16608,6 +16635,14 @@ namespace {
         if (!sections.basePrompt.empty()) prompt << sections.basePrompt << "\n\n";
         else prompt << "(No extra task text provided.)\n\n";
 
+        if (options.hasCrossCameraWatchlist) {
+            prompt << "CROSS-CAMERA HUNT PRIORITY:\n";
+            prompt << "- cross_camera_watchlist is a co-primary task for this round, even if TASK TEXT is about another object class.\n";
+            prompt << "- Evaluate the shared hunt before defaulting to a negative local-only answer.\n";
+            prompt << "- If the current snapshot strongly matches the shared target, emit watchlist_updates even when the local alert condition remains false.\n";
+            prompt << "- Do not let an unrelated local answer suppress a positive watchlist match.\n\n";
+        }
+
         prompt << "IMPORTANT CONTEXT RULE:\n";
         prompt << "- This is a single snapshot.\n";
         prompt << "- Never imply motion or duration unless it is explicitly supported by temporal state.\n";
@@ -16656,7 +16691,7 @@ namespace {
         if (options.hasTemporal) {
             if (options.useTemporalDeltaContract) {
                 prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
-                prompt << "- If an entity is visible but nothing durable changed, prefer a short visibility_updates item instead of repeating a full identity update.\n";
+                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself matters.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
@@ -16726,6 +16761,7 @@ namespace {
             if (options.hasCrossCameraWatchlist) {
                 prompt << "- watchlist_updates: optional array or null (max " <<
                     kStructuredVisionMaxCrossCameraMatches_ << " items)\n";
+                prompt << "- When cross_camera_watchlist is present in this temporal delta contract, use watchlist_updates as the only watchlist match field name.\n";
             }
             if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
                 prompt << "- visibility_updates and event_updates should use frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer} when citing evidence.\n";
