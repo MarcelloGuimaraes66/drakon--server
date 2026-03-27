@@ -13540,6 +13540,7 @@ static constexpr std::size_t kStructuredVisionMaxAlertRegionIds_ = 16;
 static constexpr std::size_t kStructuredVisionMaxIdentityPatchItems_ = 32;
 static constexpr std::size_t kStructuredVisionMaxIdentityTraitItems_ = 16;
 static constexpr std::size_t kStructuredVisionMaxIdentityContextTraitItems_ = 4;
+static constexpr std::size_t kStructuredVisionMaxIdentityFeatureCandidates_ = 16;
 static constexpr std::size_t kStructuredVisionMaxObservationItems_ = 48;
 static constexpr std::size_t kStructuredVisionMaxUnknownReasonItems_ = 16;
 static constexpr std::size_t kStructuredVisionMaxFaceIdTargetNames_ = 8;
@@ -14984,6 +14985,9 @@ namespace {
             if (source.contains("stable_attributes")) {
                 target["stable_attributes"] = source["stable_attributes"];
             }
+            if (source.contains("identity_feature_candidates")) {
+                target["identity_feature_candidates"] = source["identity_feature_candidates"];
+            }
             if (source.contains("identity_signature_traits")) {
                 target["identity_signature_traits"] = source["identity_signature_traits"];
             }
@@ -16173,6 +16177,18 @@ namespace {
         return schema;
     }
 
+    static nlohmann::json makeIdentityFeatureCandidateArraySchema_()
+    {
+        return makeNullableObjectArraySchemaWithItemProperties_(
+            nlohmann::json{
+                { "text", makeNullableStringSchema_() },
+                { "category", makeNullableStringSchema_() },
+                { "relation_to_target", makeNullableStringSchema_() },
+                { "confidence", makeNullableNumberSchema_() }
+            },
+            static_cast<int>(kStructuredVisionMaxIdentityFeatureCandidates_));
+    }
+
     static nlohmann::json buildOpenAIVisionResponseFormat_(
         const OpenAIVisionPromptOptions_& options,
         const std::string& cacheVariant)
@@ -16198,6 +16214,7 @@ namespace {
                         { "short_description", makeNullableStringSchema_() },
                         { "appearance_summary", makeNullableStringSchema_() },
                         { "stable_attributes", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "identity_feature_candidates", makeIdentityFeatureCandidateArraySchema_() },
                         { "identity_signature_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "identity_context_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityContextTraitItems_)) },
@@ -16427,7 +16444,14 @@ namespace {
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
         prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, appearance_summary, stable_attributes, and any updated_traits/context cues needed for continuity.\n";
+        prompt << "- identity_feature_candidates is the authoritative structured identity field when enough detail is visible for reidentification.\n";
+        prompt << "- Each identity_feature_candidates item must include text, category, and relation_to_target.\n";
+        prompt << "- Use category values such as physical_trait, clothing, accessory, body_marking, carried_object, vehicle_detail, plate_fragment, pose_or_activity, visibility_condition, continuity_context, nearby_object, or scene.\n";
+        prompt << "- Use relation_to_target values such as intrinsic_body, worn_on_target, attached_to_target, carried_by_target, vehicle_body, attached_to_vehicle, plate_on_target, detached_near_target, pose_or_activity, visibility_condition, continuity_context, or background_scene.\n";
+        prompt << "- If an object is merely near the target and not worn, carried, or physically attached, mark it detached_near_target instead of treating it as identity.\n";
+        prompt << "- Only target-attached relations belong in identity_signature_traits and stable_attributes. Nearby detached objects, background, scene layout, pose, and activity must stay out of the identity signature.\n";
         prompt << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification. Fill it with strong target-centric physical identity cues only.\n";
+        prompt << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n";
         prompt << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n";
         prompt << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n";
         prompt << "- identity_context_traits is optional and should contain only a few brief non-identity cues for current-round continuity. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
@@ -16817,6 +16841,8 @@ namespace {
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
             prompt << "- identity_updates[*].identity_signature_traits: optional array of strong physical identity cues or null (max " <<
                 kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
+            prompt << "- identity_updates[*].identity_feature_candidates: optional array or null (max " <<
+                kStructuredVisionMaxIdentityFeatureCandidates_ << " items); each item should include text, category, and relation_to_target.\n";
             prompt << "- identity_updates[*].identity_context_traits: optional array of brief continuity/context cues or null (max " <<
                 kStructuredVisionMaxIdentityContextTraitItems_ << " items)\n";
             prompt << "- identity_updates[*].scene_brief: optional very short scene hint string or null\n";

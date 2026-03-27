@@ -28,10 +28,22 @@ private:
     SkillSelection chooseSkill_(
         const nlohmann::json& payload,
         const std::string& userMessage,
-        bool allowHeuristicFallback) const;
+        bool allowHeuristicFallback,
+        const nlohmann::json& conversationContext) const;
     SkillSelection chooseHeuristicSkill_(
         const nlohmann::json& payload,
         const std::string& userMessage) const;
+    nlohmann::json loadConversationContext_(
+        AgentCore& agent,
+        const nlohmann::json& payload) const;
+    nlohmann::json compactConversationContextIfNeeded_(
+        AgentCore& agent,
+        const nlohmann::json& payload,
+        nlohmann::json conversationContext) const;
+    bool persistConversationContext_(
+        AgentCore& agent,
+        const nlohmann::json& payload,
+        const nlohmann::json& conversationContext) const;
     bool finalizeAsChatMessage_(
         AgentCore& agent,
         const nlohmann::json& payload,
@@ -50,11 +62,13 @@ private:
     std::string buildGeneralAnswer_(
         const nlohmann::json& payload,
         const SkillSelection& selection,
-        const std::string& userMessage) const;
+        const std::string& userMessage,
+        const nlohmann::json& conversationContext) const;
     std::string polishAndSanitizeAnswer_(
         const nlohmann::json& payload,
         const SkillSelection& selection,
-        const std::string& draftAnswer) const;
+        const std::string& draftAnswer,
+        const nlohmann::json& conversationContext) const;
     std::string sanitizeUserFacingAnswer_(const std::string& answer) const;
     std::string buildLlmUnavailableAnswer_() const;
 

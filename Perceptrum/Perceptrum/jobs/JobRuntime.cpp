@@ -6114,6 +6114,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 if (patchNode->contains("reference_image_urls") && (*patchNode)["reference_image_urls"].is_array()) {
                     doc["reference_image_urls"] = (*patchNode)["reference_image_urls"];
                 }
+                if (patchNode->contains("identity_feature_candidates")) {
+                    const json identityFeatureCandidates =
+                        temporal::extractIdentityFeatureCandidatesFromNode(*patchNode);
+                    if (identityFeatureCandidates.is_array() && !identityFeatureCandidates.empty()) {
+                        doc["identity_feature_candidates"] = identityFeatureCandidates;
+                    }
+                }
             }
 
             if (!entityId.empty()) {
@@ -6306,8 +6313,25 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (doc.contains("identity_context_traits") && !doc["identity_context_traits"].is_array()) {
             doc["identity_context_traits"] = temporal::parseTraitsValue(doc["identity_context_traits"]);
         }
+        const json identityFeatureCandidates =
+            temporal::extractIdentityFeatureCandidatesFromNode(doc);
+        const bool hasStructuredIdentityCandidates =
+            identityFeatureCandidates.is_array() && !identityFeatureCandidates.empty();
+        const json structuredIdentitySignatureTraits =
+            temporal::deriveIdentitySignatureTraitsFromFeatureCandidates(identityFeatureCandidates);
+        const json structuredIdentityContextTraits =
+            temporal::deriveIdentityContextTraitsFromFeatureCandidates(identityFeatureCandidates);
+        if (hasStructuredIdentityCandidates) {
+            doc["identity_feature_candidates"] = identityFeatureCandidates;
+        }
         json stableAttributes = json::array();
-        if (doc.contains("stable_attributes")) {
+        if (hasStructuredIdentityCandidates &&
+            structuredIdentitySignatureTraits.is_array() &&
+            !structuredIdentitySignatureTraits.empty())
+        {
+            temporal::appendUniqueTraitsToArray(stableAttributes, structuredIdentitySignatureTraits);
+        }
+        else if (doc.contains("stable_attributes")) {
             temporal::appendUniqueTraitsToArray(stableAttributes, doc["stable_attributes"]);
         }
         if (stableAttributes.empty() && doc.contains("key_traits")) {
@@ -6316,10 +6340,20 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         doc["stable_attributes"] = stableAttributes;
 
         json mergedKeyTraits = json::array();
-        if (!stableAttributes.empty()) {
+        if (hasStructuredIdentityCandidates &&
+            structuredIdentitySignatureTraits.is_array() &&
+            !structuredIdentitySignatureTraits.empty())
+        {
+            temporal::appendUniqueTraitsToArray(mergedKeyTraits, structuredIdentitySignatureTraits);
+        }
+        else if (!stableAttributes.empty()) {
             temporal::appendUniqueTraitsToArray(mergedKeyTraits, stableAttributes);
         }
-        if (doc.contains("key_traits")) {
+        if (!(hasStructuredIdentityCandidates &&
+              structuredIdentitySignatureTraits.is_array() &&
+              !structuredIdentitySignatureTraits.empty()) &&
+            doc.contains("key_traits"))
+        {
             temporal::appendUniqueTraitsToArray(mergedKeyTraits, doc["key_traits"]);
         }
         doc["key_traits"] = mergedKeyTraits;
@@ -6329,33 +6363,37 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
         const std::string identityTypeHint = !entityType.empty() ? entityType : entityKey;
         json identitySignatureTraits = json::array();
-        if (doc.contains("identity_signature_traits")) {
-            temporal::appendUniqueTraitsToArray(identitySignatureTraits, doc["identity_signature_traits"]);
+        if (hasStructuredIdentityCandidates &&
+            structuredIdentitySignatureTraits.is_array() &&
+            !structuredIdentitySignatureTraits.empty())
+        {
+            temporal::appendUniqueTraitsToArray(identitySignatureTraits, structuredIdentitySignatureTraits);
         }
-        if (identitySignatureTraits.empty()) {
-            identitySignatureTraits = temporal::curateIdentitySignatureTraits(
-                identityTypeHint,
-                stableAttributes,
-                doc["updated_traits"],
-                identitySignatureTraits);
+        else if (doc.contains("identity_signature_traits")) {
+            temporal::appendUniqueTraitsToArray(identitySignatureTraits, doc["identity_signature_traits"]);
         }
         doc["identity_signature_traits"] = identitySignatureTraits;
 
         json identityContextTraits = json::array();
-        if (doc.contains("identity_context_traits")) {
-            temporal::appendUniqueTraitsToArray(identityContextTraits, doc["identity_context_traits"]);
+        if (hasStructuredIdentityCandidates &&
+            structuredIdentityContextTraits.is_array() &&
+            !structuredIdentityContextTraits.empty())
+        {
+            temporal::appendUniqueTraitsToArray(identityContextTraits, structuredIdentityContextTraits);
         }
-        if (identityContextTraits.empty()) {
-            identityContextTraits = temporal::curateIdentityContextTraits(
-                identityTypeHint,
-                stableAttributes,
-                doc["updated_traits"],
-                identityContextTraits);
+        else if (doc.contains("identity_context_traits")) {
+            temporal::appendUniqueTraitsToArray(identityContextTraits, doc["identity_context_traits"]);
         }
         doc["identity_context_traits"] = identityContextTraits;
 
-        std::string identitySignatureSummary =
-            temporal::trim(temporal::strField(doc, "identity_signature_summary"));
+        std::string identitySignatureSummary;
+        if (!(hasStructuredIdentityCandidates &&
+              identitySignatureTraits.is_array() &&
+              !identitySignatureTraits.empty()))
+        {
+            identitySignatureSummary =
+                temporal::trim(temporal::strField(doc, "identity_signature_summary"));
+        }
         if (identitySignatureSummary.empty()) {
             identitySignatureSummary =
                 temporal::buildIdentitySignatureSummary(identityTypeHint, identitySignatureTraits);
@@ -6385,12 +6423,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (normalized.contains("identity_signature_traits")) {
             temporal::appendUniqueTraitsToArray(identityTraits, normalized["identity_signature_traits"]);
         }
-        if (identityTraits.empty() && normalized.contains("stable_attributes")) {
-            temporal::appendUniqueTraitsToArray(identityTraits, normalized["stable_attributes"]);
-        }
-        if (identityTraits.empty() && normalized.contains("key_traits")) {
-            temporal::appendUniqueTraitsToArray(identityTraits, normalized["key_traits"]);
-        }
         if (identityTraits.size() > 8) {
             identityTraits.erase(identityTraits.begin() + 8, identityTraits.end());
         }
@@ -6419,6 +6451,18 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             !normalized["resolved_identity"].empty())
         {
             projected["resolved_identity"] = normalized["resolved_identity"];
+        }
+        const bool hasIdentityEvidence =
+            (!identityTraits.empty()) ||
+            !identitySignatureSummary.empty() ||
+            (projected.contains("reference_image_urls") && projected["reference_image_urls"].is_array() &&
+             !projected["reference_image_urls"].empty()) ||
+            (projected.contains("resolved_identity") && projected["resolved_identity"].is_object() &&
+             !projected["resolved_identity"].empty()) ||
+            (projected.contains("known_name") && projected["known_name"].is_string() &&
+             !temporal::trim(projected["known_name"].get<std::string>()).empty());
+        if (!hasIdentityEvidence) {
+            return json::object();
         }
         return projected;
     };
@@ -6469,10 +6513,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 prompt << " Curated identity signature: " << identitySignatureSummary << ".";
             }
             appendTraitSentence("identity_signature_traits", "Identity signature traits", 8);
-        }
-        else {
-            appendTraitSentence("stable_attributes", "Stable identity traits", 8);
-            appendTraitSentence("key_traits", "Identity cues", 8);
         }
         if (normalized.contains("resolved_identity") && normalized["resolved_identity"].is_object()) {
             prompt << " Resolved identity metadata is available and should be treated as strong supporting evidence when the appearance is compatible.";

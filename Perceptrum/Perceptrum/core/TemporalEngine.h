@@ -313,18 +313,11 @@ inline std::string buildIdentitySignatureSummary(
     const std::string& rawEntityType,
     const json& signatureTraits)
 {
+    (void)rawEntityType;
     const json traits = parseTraitsValue(signatureTraits);
     if (!traits.is_array() || traits.empty()) return std::string();
     std::ostringstream oss;
-    if (entityTypeSuggestsVehicleIdentity(rawEntityType)) {
-        oss << "Vehicle signature: ";
-    }
-    else if (entityTypeSuggestsPersonIdentity(rawEntityType)) {
-        oss << "Person signature: ";
-    }
-    else {
-        oss << "Target signature: ";
-    }
+    oss << "Identity signature: ";
     bool first = true;
     std::size_t emitted = 0;
     for (const auto& item : traits) {
@@ -1646,8 +1639,175 @@ inline void appendUniqueTraitsToArray(json& target, const json& value) {
     appendUniqueStringsToArray(target, parseTraitsValue(value));
 }
 
+inline std::string normalizeIdentityFeatureEnumToken(const std::string& raw) {
+    const std::string s = lower(trim(raw));
+    if (s.empty()) return std::string();
+    std::string out;
+    out.reserve(s.size());
+    bool pendingSeparator = false;
+    for (unsigned char ch : s) {
+        if (std::isalnum(ch)) {
+            if (pendingSeparator && !out.empty()) out.push_back('_');
+            out.push_back(static_cast<char>(ch));
+            pendingSeparator = false;
+        } else {
+            pendingSeparator = !out.empty();
+        }
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    return out;
+}
+
+inline json parseIdentityFeatureCandidatesValue(const json& value) {
+    json out = json::array();
+    std::unordered_set<std::string> seen;
+    std::function<void(const json&)> collect = [&](const json& node) {
+        if (node.is_array()) {
+            for (const auto& item : node) collect(item);
+            return;
+        }
+        if (!node.is_object()) return;
+
+        const std::string text = trim(
+            strField(
+                node,
+                "text",
+                strField(
+                    node,
+                    "trait",
+                    strField(
+                        node,
+                        "value",
+                        strField(node, "description")))));
+        if (text.empty()) return;
+
+        const std::string category = normalizeIdentityFeatureEnumToken(
+            strField(node, "category", strField(node, "bucket", strField(node, "type"))));
+        const std::string relation = normalizeIdentityFeatureEnumToken(
+            strField(node, "relation_to_target", strField(node, "relation", strField(node, "target_relation"))));
+
+        const std::string dedupeKey = lower(text) + "|" + category + "|" + relation;
+        if (!seen.insert(dedupeKey).second) return;
+
+        json normalized = json::object();
+        normalized["text"] = text;
+        if (!category.empty()) normalized["category"] = category;
+        if (!relation.empty()) normalized["relation_to_target"] = relation;
+        if (node.contains("confidence") && node["confidence"].is_number()) {
+            normalized["confidence"] = node["confidence"];
+        }
+        out.push_back(std::move(normalized));
+    };
+
+    collect(value);
+    return out;
+}
+
+inline json extractIdentityFeatureCandidatesFromNode(const json& node) {
+    if (!node.is_object() || !node.contains("identity_feature_candidates")) {
+        return json::array();
+    }
+    return parseIdentityFeatureCandidatesValue(node["identity_feature_candidates"]);
+}
+
+inline bool identityFeatureCategoryEligibleForSignature(const std::string& rawCategory) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "physical_trait",
+        "clothing",
+        "accessory",
+        "body_marking",
+        "carried_object",
+        "vehicle_detail",
+        "plate_fragment"
+    };
+    return kAllowed.find(normalizeIdentityFeatureEnumToken(rawCategory)) != kAllowed.end();
+}
+
+inline bool identityFeatureRelationEligibleForSignature(const std::string& rawRelation) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "intrinsic_body",
+        "worn_on_target",
+        "attached_to_target",
+        "carried_by_target",
+        "vehicle_body",
+        "attached_to_vehicle",
+        "plate_on_target"
+    };
+    return kAllowed.find(normalizeIdentityFeatureEnumToken(rawRelation)) != kAllowed.end();
+}
+
+inline bool identityFeatureCategoryEligibleForContext(const std::string& rawCategory) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "pose_or_activity",
+        "visibility_condition",
+        "continuity_context"
+    };
+    return kAllowed.find(normalizeIdentityFeatureEnumToken(rawCategory)) != kAllowed.end();
+}
+
+inline bool identityFeatureRelationEligibleForContext(const std::string& rawRelation) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "pose_or_activity",
+        "visibility_condition",
+        "continuity_context"
+    };
+    return kAllowed.find(normalizeIdentityFeatureEnumToken(rawRelation)) != kAllowed.end();
+}
+
+inline json deriveIdentitySignatureTraitsFromFeatureCandidates(
+    const json& value,
+    std::size_t maxItems = 16)
+{
+    const json candidates = parseIdentityFeatureCandidatesValue(value);
+    json out = json::array();
+    for (const auto& item : candidates) {
+        if (!item.is_object()) continue;
+        const std::string text = trim(strField(item, "text"));
+        const std::string category = normalizeIdentityFeatureEnumToken(strField(item, "category"));
+        const std::string relation = normalizeIdentityFeatureEnumToken(strField(item, "relation_to_target"));
+        if (text.empty()) continue;
+        if (!identityFeatureCategoryEligibleForSignature(category) ||
+            !identityFeatureRelationEligibleForSignature(relation))
+        {
+            continue;
+        }
+        appendUniqueStringsToArray(out, text);
+        if (out.size() >= maxItems) break;
+    }
+    return out;
+}
+
+inline json deriveIdentityContextTraitsFromFeatureCandidates(
+    const json& value,
+    std::size_t maxItems = 4)
+{
+    const json candidates = parseIdentityFeatureCandidatesValue(value);
+    json out = json::array();
+    for (const auto& item : candidates) {
+        if (!item.is_object()) continue;
+        const std::string text = trim(strField(item, "text"));
+        const std::string category = normalizeIdentityFeatureEnumToken(strField(item, "category"));
+        const std::string relation = normalizeIdentityFeatureEnumToken(strField(item, "relation_to_target"));
+        if (text.empty()) continue;
+        if (!identityFeatureCategoryEligibleForContext(category) ||
+            !identityFeatureRelationEligibleForContext(relation))
+        {
+            continue;
+        }
+        appendUniqueStringsToArray(out, text);
+        if (out.size() >= maxItems) break;
+    }
+    return out;
+}
+
 inline json extractStableTraitsFromNode(const json& node) {
     if (!node.is_object()) return json::array();
+    const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
+    const json structuredIdentityTraits =
+        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredCandidates);
+    if (structuredIdentityTraits.is_array() && !structuredIdentityTraits.empty()) {
+        return structuredIdentityTraits;
+    }
     json out = json::array();
     if (node.contains("identity_signature_traits")) {
         appendUniqueTraitsToArray(out, node["identity_signature_traits"]);
@@ -1666,6 +1826,12 @@ inline json extractStableTraitsFromNode(const json& node) {
 
 inline json extractContextTraitsFromNode(const json& node) {
     if (!node.is_object()) return json::array();
+    const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
+    const json structuredContextTraits =
+        deriveIdentityContextTraitsFromFeatureCandidates(structuredCandidates);
+    if (structuredContextTraits.is_array() && !structuredContextTraits.empty()) {
+        return structuredContextTraits;
+    }
     if (node.contains("identity_context_traits")) {
         return parseTraitsValue(node["identity_context_traits"]);
     }
@@ -3688,35 +3854,88 @@ inline void upsertIdentityMemory(
     mem["last_seen_ts_utc"] = seenTsUtc;
     if (!trim(zone).empty()) mem["last_seen_zone"] = trim(zone);
 
+    const json structuredIdentityFeatureCandidates =
+        extractIdentityFeatureCandidatesFromNode(patch);
+    const json derivedIdentitySignatureTraits =
+        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredIdentityFeatureCandidates);
+    const json derivedIdentityContextTraits =
+        deriveIdentityContextTraitsFromFeatureCandidates(structuredIdentityFeatureCandidates);
     const json stableTraits = extractStableTraitsFromNode(patch);
     const json contextTraits = extractContextTraitsFromNode(patch);
-    const json explicitIdentitySignatureTraits =
+    const json explicitIdentitySignatureTraitsRaw =
         patch.contains("identity_signature_traits")
             ? parseTraitsValue(patch["identity_signature_traits"])
             : json::array();
-    const json explicitIdentityContextTraits =
+    const json explicitIdentityContextTraitsRaw =
         patch.contains("identity_context_traits")
             ? parseTraitsValue(patch["identity_context_traits"])
             : json::array();
+    const json explicitIdentitySignatureTraits =
+        (derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty())
+            ? derivedIdentitySignatureTraits
+            : explicitIdentitySignatureTraitsRaw;
+    const json explicitIdentityContextTraits =
+        (derivedIdentityContextTraits.is_array() && !derivedIdentityContextTraits.empty())
+            ? derivedIdentityContextTraits
+            : explicitIdentityContextTraitsRaw;
     const std::string sceneBrief = extractSceneBriefFromNode(patch);
+    const bool hasStructuredIdentitySignature =
+        derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty();
+    auto signatureSourceIsStructured = [&](const json& node) -> bool {
+        if (!node.is_object()) return false;
+        return normalizeIdentityFeatureEnumToken(strField(node, "identity_signature_source")) ==
+               "structured_candidates";
+    };
+    const bool trustExistingMemoryIdentity = signatureSourceIsStructured(mem);
+    const bool trustExistingEntityIdentity =
+        entityState != nullptr && signatureSourceIsStructured(*entityState);
+    auto updateIdentitySignatureSource = [&](json& node) {
+        if (!node.is_object()) return;
+        if (hasStructuredIdentitySignature) {
+            node["identity_signature_source"] = "structured_candidates";
+        }
+        else if (explicitIdentitySignatureTraitsRaw.is_array() && !explicitIdentitySignatureTraitsRaw.empty()) {
+            node["identity_signature_source"] = "explicit_traits";
+        }
+    };
 
     json mergedStableAttributes = json::array();
-    if (mem.contains("stable_attributes")) appendUniqueStringsToArray(mergedStableAttributes, mem["stable_attributes"]);
-    if (entityState && entityState->contains("stable_attributes")) {
+    if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
+        mem.contains("stable_attributes"))
+    {
+        appendUniqueStringsToArray(mergedStableAttributes, mem["stable_attributes"]);
+    }
+    if (entityState &&
+        (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
+        entityState->contains("stable_attributes"))
+    {
         appendUniqueStringsToArray(mergedStableAttributes, (*entityState)["stable_attributes"]);
     }
     appendUniqueTraitsToArray(mergedStableAttributes, stableTraits);
+    if (mergedStableAttributes.size() > 16) {
+        mergedStableAttributes.erase(mergedStableAttributes.begin() + 16, mergedStableAttributes.end());
+    }
     if (!mergedStableAttributes.empty()) {
         mem["stable_attributes"] = mergedStableAttributes;
         if (entityState) (*entityState)["stable_attributes"] = mergedStableAttributes;
     }
 
     json mergedKeyTraits = json::array();
-    if (mem.contains("key_traits")) appendUniqueTraitsToArray(mergedKeyTraits, mem["key_traits"]);
-    if (entityState && entityState->contains("key_traits")) {
+    if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
+        mem.contains("key_traits"))
+    {
+        appendUniqueTraitsToArray(mergedKeyTraits, mem["key_traits"]);
+    }
+    if (entityState &&
+        (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
+        entityState->contains("key_traits"))
+    {
         appendUniqueTraitsToArray(mergedKeyTraits, (*entityState)["key_traits"]);
     }
     appendUniqueTraitsToArray(mergedKeyTraits, stableTraits);
+    if (mergedKeyTraits.size() > 16) {
+        mergedKeyTraits.erase(mergedKeyTraits.begin() + 16, mergedKeyTraits.end());
+    }
     if (!mergedKeyTraits.empty()) {
         mem["key_traits"] = mergedKeyTraits;
         if (entityState) (*entityState)["key_traits"] = mergedKeyTraits;
@@ -3732,25 +3951,32 @@ inline void upsertIdentityMemory(
     }
 
     json mergedIdentitySignatureTraits = json::array();
-    if (mem.contains("identity_signature_traits")) {
+    if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
+        mem.contains("identity_signature_traits"))
+    {
         appendUniqueStringsToArray(mergedIdentitySignatureTraits, mem["identity_signature_traits"]);
     }
-    if (entityState && entityState->contains("identity_signature_traits")) {
+    if (entityState &&
+        (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
+        entityState->contains("identity_signature_traits"))
+    {
         appendUniqueStringsToArray(mergedIdentitySignatureTraits, (*entityState)["identity_signature_traits"]);
     }
     if (explicitIdentitySignatureTraits.is_array() && !explicitIdentitySignatureTraits.empty()) {
         appendUniqueStringsToArray(mergedIdentitySignatureTraits, explicitIdentitySignatureTraits);
     }
-    else {
-        mergedIdentitySignatureTraits = curateIdentitySignatureTraits(
-            entityTypeHint,
-            mergedStableAttributes,
-            contextTraits,
-            mergedIdentitySignatureTraits);
+    if (mergedIdentitySignatureTraits.size() > 16) {
+        mergedIdentitySignatureTraits.erase(
+            mergedIdentitySignatureTraits.begin() + 16,
+            mergedIdentitySignatureTraits.end());
     }
     if (!mergedIdentitySignatureTraits.empty()) {
         mem["identity_signature_traits"] = mergedIdentitySignatureTraits;
-        if (entityState) (*entityState)["identity_signature_traits"] = mergedIdentitySignatureTraits;
+        updateIdentitySignatureSource(mem);
+        if (entityState) {
+            (*entityState)["identity_signature_traits"] = mergedIdentitySignatureTraits;
+            updateIdentitySignatureSource(*entityState);
+        }
         const std::string curatedSummary =
             buildIdentitySignatureSummary(entityTypeHint, mergedIdentitySignatureTraits);
         if (!curatedSummary.empty()) {
@@ -3760,21 +3986,20 @@ inline void upsertIdentityMemory(
     }
 
     json mergedIdentityContextTraits = json::array();
-    if (mem.contains("identity_context_traits")) {
-        appendUniqueStringsToArray(mergedIdentityContextTraits, mem["identity_context_traits"]);
-    }
-    if (entityState && entityState->contains("identity_context_traits")) {
-        appendUniqueStringsToArray(mergedIdentityContextTraits, (*entityState)["identity_context_traits"]);
-    }
     if (explicitIdentityContextTraits.is_array() && !explicitIdentityContextTraits.empty()) {
         appendUniqueStringsToArray(mergedIdentityContextTraits, explicitIdentityContextTraits);
+    } else {
+        if (mem.contains("identity_context_traits")) {
+            appendUniqueStringsToArray(mergedIdentityContextTraits, mem["identity_context_traits"]);
+        }
+        if (entityState && entityState->contains("identity_context_traits")) {
+            appendUniqueStringsToArray(mergedIdentityContextTraits, (*entityState)["identity_context_traits"]);
+        }
     }
-    else {
-        mergedIdentityContextTraits = curateIdentityContextTraits(
-            entityTypeHint,
-            mergedStableAttributes,
-            contextTraits,
-            mergedIdentityContextTraits);
+    if (mergedIdentityContextTraits.size() > 4) {
+        mergedIdentityContextTraits.erase(
+            mergedIdentityContextTraits.begin() + 4,
+            mergedIdentityContextTraits.end());
     }
     if (!mergedIdentityContextTraits.empty()) {
         mem["identity_context_traits"] = mergedIdentityContextTraits;
@@ -5297,6 +5522,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- identity_patch and observations MUST be arrays of JSON objects (never plain strings).\n"
         << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, appearance_summary, stable_attributes, and updated_traits/key_traits.\n"
         << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification, focused on strong physical identity cues only.\n"
+        << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n"
         << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n"
         << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n"
         << "- identity_context_traits is optional and should contain only a few brief non-identity continuity cues.\n"

@@ -36,6 +36,7 @@ temporal_engine_smoke.obj
 tmp-dbs/
 tmp_nvidia_frames/
 tmp_video_review/
+tmp-video-frames/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

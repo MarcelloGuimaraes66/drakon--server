@@ -76,6 +76,9 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Select exactly one skill for the user request and return JSON only.\n"
         << "Do not output reasoning, markdown, or code fences.\n"
         << "Requests may arrive in any language.\n"
+        << "requestContext may include conversation_compact_context and recent_turns from the same chat session.\n"
+        << "Use that prior context only to resolve short follow-up requests or references to earlier turns.\n"
+        << "If the current user_message clearly states a new intent, prioritize the current user_message.\n"
         << "Infer intent and reply_language from user_message first.\n"
         << "Treat app_language and ui_languages as fallback context only when user_message is ambiguous or language-free.\n"
         << "reply_language must always be one of the ui_languages.\n"
@@ -208,6 +211,9 @@ std::string buildUserFacingAnswerSystemPrompt()
         << "/no_think\n"
         << "You are the final user-facing assistant for the Drakon app.\n"
         << "Rewrite the draft into a polished response for the end user.\n"
+        << "The request payload may include conversation_compact_context and recent_turns from the current chat session.\n"
+        << "Use that context only to resolve follow-ups, references, and continuity.\n"
+        << "If current user_message conflicts with prior context, the current user_message wins.\n"
         << "reply_language was decided by a prior routing step and is authoritative when it is present.\n"
         << "If reply_language is empty or null, infer the reply language from user_message itself.\n"
         << "reply_language is always one of the app UI languages and falls back to English when the original user language is unsupported.\n"
@@ -226,6 +232,7 @@ std::string buildUserFacingAnswerSystemPrompt()
 std::string buildUserFacingAnswerUserPrompt(
     const std::string& userMessage,
     const std::string& draftAnswer,
+    const nlohmann::json& conversationContext,
     const std::string& replyLanguage,
     const std::string& knowledgeLanguage,
     const std::string& appLanguage,
@@ -236,6 +243,8 @@ std::string buildUserFacingAnswerUserPrompt(
         { "knowledge_language", normalizeAssistantLanguageTag(knowledgeLanguage) },
         { "app_language", normalizeAssistantLanguageTag(appLanguage) },
         { "selected_skill", selectedSkill },
+        { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
         { "user_message", userMessage },
         { "draft_answer", draftAnswer },
     };
@@ -250,6 +259,10 @@ std::string buildDirectAnswerSystemPrompt()
         << "You are the final user-facing assistant for the Drakon app.\n"
         << "Answer the user directly when no specialized skill is the right fit.\n"
         << "You may use general knowledge and broad product knowledge to be helpful.\n"
+        << "The request payload may include conversation_compact_context and recent_turns from the same chat session.\n"
+        << "Use recent_turns first for immediate continuity, and use conversation_compact_context for older durable context.\n"
+        << "Use prior context to resolve pronouns and follow-up requests such as 'and now', 'that one', or 'do the same'.\n"
+        << "If the current user message clearly overrides older context, follow the current user message.\n"
         << "reply_language was decided by a prior routing step and is authoritative when it is present.\n"
         << "If reply_language is empty or null, infer the reply language from user_message itself.\n"
         << "reply_language is always one of the app UI languages and falls back to English when the original user language is unsupported.\n"
@@ -265,6 +278,7 @@ std::string buildDirectAnswerSystemPrompt()
 
 std::string buildDirectAnswerUserPrompt(
     const std::string& userMessage,
+    const nlohmann::json& conversationContext,
     const std::string& replyLanguage,
     const std::string& knowledgeLanguage,
     const std::string& appLanguage,
@@ -275,7 +289,48 @@ std::string buildDirectAnswerUserPrompt(
         { "knowledge_language", normalizeAssistantLanguageTag(knowledgeLanguage) },
         { "app_language", normalizeAssistantLanguageTag(appLanguage) },
         { "selected_skill", selectedSkill },
+        { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
         { "user_message", userMessage },
+    };
+    return payload.dump(2);
+}
+
+std::string buildConversationCompactionSystemPrompt()
+{
+    std::ostringstream out;
+    out
+        << "/no_think\n"
+        << "You maintain compact conversation context for a local chat assistant.\n"
+        << "Return JSON only.\n"
+        << "Merge the existing compact context with the provided prior chat turns.\n"
+        << "Preserve only durable, user-relevant context that helps future turns stay coherent.\n"
+        << "Do not include chain-of-thought, internal implementation details, or verbatim transcript fragments unless they are essential facts.\n"
+        << "Never store secrets such as passwords, API keys, tokens, RTSP URLs, or private credentials.\n"
+        << "If a fact is uncertain, omit it.\n"
+        << "Keep arrays short and concise. Prefer short noun phrases or short factual sentences.\n"
+        << "Return this JSON schema:\n"
+        << "{"
+        << "\"summary\":\"\","
+        << "\"user_goals\":[],"
+        << "\"constraints\":[],"
+        << "\"preferences\":[],"
+        << "\"selected_entities\":[],"
+        << "\"decisions\":[],"
+        << "\"open_loops\":[]"
+        << "}\n";
+    return out.str();
+}
+
+std::string buildConversationCompactionUserPrompt(
+    const nlohmann::json& existingCompactContext,
+    const nlohmann::json& messagesToCompact,
+    const std::string& appLanguage)
+{
+    nlohmann::json payload = {
+        { "app_language", normalizeAssistantLanguageTag(appLanguage) },
+        { "existing_compact_context", existingCompactContext.is_object() ? existingCompactContext : nlohmann::json::object() },
+        { "turns_to_compact", messagesToCompact.is_array() ? messagesToCompact : nlohmann::json::array() },
     };
     return payload.dump(2);
 }

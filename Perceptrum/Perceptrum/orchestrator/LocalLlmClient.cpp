@@ -746,6 +746,7 @@ SkillSelection LocalLlmClient::chooseSkill(
 std::string LocalLlmClient::polishAnswer(
     const std::string& userMessage,
     const std::string& draftAnswer,
+    const nlohmann::json& conversationContext,
     const std::string& replyLanguage,
     const std::string& knowledgeLanguage,
     const std::string& appLanguage,
@@ -773,6 +774,7 @@ std::string LocalLlmClient::polishAnswer(
                 { "content", buildUserFacingAnswerUserPrompt(
                     userMessage,
                     draftAnswer,
+                    conversationContext,
                     replyLanguage,
                     knowledgeLanguage,
                     appLanguage,
@@ -797,6 +799,7 @@ std::string LocalLlmClient::polishAnswer(
 
 std::string LocalLlmClient::answerDirectly(
     const std::string& userMessage,
+    const nlohmann::json& conversationContext,
     const std::string& replyLanguage,
     const std::string& knowledgeLanguage,
     const std::string& appLanguage,
@@ -823,6 +826,7 @@ std::string LocalLlmClient::answerDirectly(
                 { "role", "user" },
                 { "content", buildDirectAnswerUserPrompt(
                     userMessage,
+                    conversationContext,
                     replyLanguage,
                     knowledgeLanguage,
                     appLanguage,
@@ -843,6 +847,48 @@ std::string LocalLlmClient::answerDirectly(
     }
 
     return trimCopy(outcome.content);
+}
+
+nlohmann::json LocalLlmClient::compactConversationContext(
+    const nlohmann::json& existingCompactContext,
+    const nlohmann::json& messagesToCompact,
+    const std::string& appLanguage) const
+{
+    if (!messagesToCompact.is_array() || messagesToCompact.empty()) {
+        return nlohmann::json::object();
+    }
+
+    CompletionOutcome outcome = completeText(
+        "compactConversationContext",
+        buildConversationCompactionSystemPrompt(),
+        buildConversationCompactionUserPrompt(
+            existingCompactContext,
+            messagesToCompact,
+            appLanguage),
+        0.1,
+        700,
+        0,
+        -1,
+        true);
+
+    if (!outcome.ok) {
+        const std::string fallbackContent = structuredJsonFromOutcome_(
+            outcome,
+            "compactConversationContext");
+        if (fallbackContent.empty()) {
+            return nlohmann::json::object();
+        }
+        const nlohmann::json parsed = nlohmann::json::parse(fallbackContent, nullptr, false);
+        return parsed.is_object() ? parsed : nlohmann::json::object();
+    }
+
+    const std::string jsonObject = extractJsonObject_(outcome.content);
+    if (jsonObject.empty()) {
+        return nlohmann::json::object();
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(jsonObject, nullptr, false);
+    return parsed.is_object() ? parsed : nlohmann::json::object();
 }
 
 LocalLlmClient::CompletionOutcome LocalLlmClient::completeText(

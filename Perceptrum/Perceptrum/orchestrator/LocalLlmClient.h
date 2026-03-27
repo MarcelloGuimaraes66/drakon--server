@@ -56,16 +56,22 @@ public:
     std::string polishAnswer(
         const std::string& userMessage,
         const std::string& draftAnswer,
+        const nlohmann::json& conversationContext,
         const std::string& replyLanguage,
         const std::string& knowledgeLanguage,
         const std::string& appLanguage,
         const std::string& selectedSkill) const;
     std::string answerDirectly(
         const std::string& userMessage,
+        const nlohmann::json& conversationContext,
         const std::string& replyLanguage,
         const std::string& knowledgeLanguage,
         const std::string& appLanguage,
         const std::string& selectedSkill) const;
+    nlohmann::json compactConversationContext(
+        const nlohmann::json& existingCompactContext,
+        const nlohmann::json& messagesToCompact,
+        const std::string& appLanguage) const;
     CompletionOutcome completeText(
         const std::string& operation,
         const std::string& systemPrompt,

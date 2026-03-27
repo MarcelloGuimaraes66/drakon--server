@@ -3082,41 +3082,6 @@ function StepCard({
     });
   };
 
-  const handleTargetInputTypeChange = async (targetId: number, value: TargetInputType) => {
-    const previousValue = targetInputTypes[targetId] || "video";
-    if (previousValue === value) return;
-
-    setTargetInputTypes((prev) => ({ ...prev, [targetId]: value }));
-    try {
-      const response = await fetch(`/api/job-steps/${step.id}/targets/${targetId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input_type: value }),
-      });
-
-      if (!response.ok) {
-        let errorMessage = "Failed to update input type";
-        try {
-          const error = await response.json();
-          errorMessage = error?.message || error?.error || errorMessage;
-        } catch {
-          // Ignore non-JSON error body
-        }
-        throw new Error(errorMessage);
-      }
-
-      setTargets((prev) =>
-        prev.map((target) =>
-          target.id === targetId ? { ...target, input_type: value } : target
-        )
-      );
-    } catch (error) {
-      console.error("Failed to update input type:", error);
-      setTargetInputTypes((prev) => ({ ...prev, [targetId]: previousValue }));
-      onShowToast("Failed to update input type", "error");
-    }
-  };
-
   const persistInferenceGroups = async (nextGroups: InferenceGroup[]): Promise<boolean> => {
     if (savingInferenceGroups) return false;
     setSavingInferenceGroups(true);
@@ -3267,6 +3232,8 @@ function StepCard({
   
   const [agentForm, setAgentForm] = useState<AgentFormState>(buildEmptyAgentForm);
   const [showPromptEditor, setShowPromptEditor] = useState(false);
+  const [promptEditorInputTypeDraft, setPromptEditorInputTypeDraft] =
+    useState<TargetInputType>("video");
   const [promptEditorDraft, setPromptEditorDraft] = useState<PromptEditorFields>({
     prompt_template: "",
     alert_condition: "",
@@ -4538,6 +4505,7 @@ function StepCard({
     cameraId,
     promptPayload,
     analysisRegions,
+    inputType,
   }: {
     source: {
       agent_key: string;
@@ -4558,6 +4526,7 @@ function StepCard({
       alert_condition: string;
     };
     analysisRegions: AnalysisRegion[];
+    inputType?: TargetInputType | null;
   }) => {
     const inferenceModel = normalizeAgentInferenceModel(source.inference_model);
     const body: Record<string, unknown> = {
@@ -4588,6 +4557,11 @@ function StepCard({
       face_target_ids: collectFaceTargetIdsFromRegions(analysisRegions),
       analysis_regions: analysisRegions,
     };
+    const normalizedInputType =
+      inputType == null ? null : normalizeTargetInputType(inputType);
+    if (normalizedInputType) {
+      body.input_type = normalizedInputType;
+    }
 
     if (JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED) {
       body.use_temporal_context = normalizeAgentUseTemporalContext(
@@ -4685,6 +4659,15 @@ function StepCard({
     }
 
     try {
+      const targetForCamera =
+        targets.find((target) => target.camera_id === agentFormCameraId) || null;
+      const inputTypeForSave = showPromptEditor
+        ? promptEditorInputTypeDraft
+        : normalizeTargetInputType(
+            targetForCamera
+              ? targetInputTypes[targetForCamera.id] ?? targetForCamera.input_type
+              : "video"
+          );
       const promptPayload = buildPromptPayload({
         prompt_template: primaryRegion.prompt_core,
         alert_condition: primaryRegion.alert_condition,
@@ -4699,6 +4682,7 @@ function StepCard({
             cameraId: agentFormCameraId,
             promptPayload,
             analysisRegions: syncedRegions,
+            inputType: inputTypeForSave,
           })
         ),
       });
@@ -5304,6 +5288,7 @@ function StepCard({
   const closePromptEditor = () => {
     if (enhancingPrompt) return;
     setShowPromptEditor(false);
+    setPromptEditorInputTypeDraft("video");
     setPromptEnhanceSuggestion(null);
     setPolygonDrawEnabled(false);
     setAnalysisRegionsPanelOpen(false);
@@ -5359,6 +5344,15 @@ function StepCard({
       Number.isInteger(selectedCameraIdRaw) && Number(selectedCameraIdRaw) > 0
         ? Number(selectedCameraIdRaw)
         : null;
+    const selectedPromptTarget =
+      selectedCameraId === null
+        ? null
+        : targets.find((target) => target.camera_id === selectedCameraId) || null;
+    const initialPromptEditorInputType = selectedPromptTarget
+      ? normalizeTargetInputType(
+          targetInputTypes[selectedPromptTarget.id] ?? selectedPromptTarget.input_type
+        )
+      : "video";
     const sourceForm = options?.formState ?? agentForm;
     let targetAgent =
       options?.targetAgent === undefined ? getEditingCameraAgent() : options.targetAgent;
@@ -5427,6 +5421,7 @@ function StepCard({
       alert_condition: fallbackPromptFields.alert_condition,
       negative_condition: fallbackPromptFields.negative_condition,
     });
+    setPromptEditorInputTypeDraft(initialPromptEditorInputType);
     setPolygonDrawEnabled(false);
     cancelEditingFaceTarget();
     setDeletingFaceTargetId(null);
@@ -6238,7 +6233,9 @@ function StepCard({
     }
     return targets.find((target) => target.camera_id === agentFormCameraId) || null;
   }, [agentFormCameraId, targets]);
-  const promptEditorTargetInputType = promptEditorTarget
+  const promptEditorTargetInputType = showPromptEditor
+    ? promptEditorInputTypeDraft
+    : promptEditorTarget
     ? normalizeTargetInputType(
         targetInputTypes[promptEditorTarget.id] ?? promptEditorTarget.input_type
       )
@@ -6277,12 +6274,8 @@ function StepCard({
         model_fps: constrained.modelFps,
       }));
     }
-    if (
-      showPromptEditor &&
-      promptEditorTarget &&
-      promptEditorTargetInputType !== "video"
-    ) {
-      void handleTargetInputTypeChange(promptEditorTarget.id, "video");
+    if (showPromptEditor && promptEditorTargetInputType !== "video") {
+      setPromptEditorInputTypeDraft("video");
     }
   }, [
     agentForm.inference_model,
@@ -7257,10 +7250,9 @@ function StepCard({
                               });
                               if (
                                 nextModel === "core" &&
-                                promptEditorTarget &&
                                 promptEditorTargetInputType !== "video"
                               ) {
-                                void handleTargetInputTypeChange(promptEditorTarget.id, "video");
+                                setPromptEditorInputTypeDraft("video");
                               }
                             }}
                             disabled={enhancingPrompt}
@@ -7277,9 +7269,8 @@ function StepCard({
                             value={promptEditorTargetInputType}
                             onChange={(e) => {
                               if (!promptEditorTarget) return;
-                              void handleTargetInputTypeChange(
-                                promptEditorTarget.id,
-                                e.target.value as TargetInputType
+                              setPromptEditorInputTypeDraft(
+                                normalizeTargetInputType(e.target.value)
                               );
                             }}
                             disabled={

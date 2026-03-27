@@ -301,6 +301,143 @@ bool skipPolishForResult_(const SkillRunResult& result)
         result.metadata["skip_polish"].get<bool>();
 }
 
+constexpr int kConversationContextSoftTokenLimit_ = 1400;
+constexpr std::size_t kConversationContextKeepTailMessages_ = 6;
+constexpr std::size_t kConversationContextMaxRecentTurnsForPrompt_ = 8;
+constexpr std::size_t kConversationContextMaxMessageChars_ = 700;
+
+nlohmann::json defaultCompactConversationContext_()
+{
+    return nlohmann::json::object({
+        { "summary", "" },
+        { "user_goals", nlohmann::json::array() },
+        { "constraints", nlohmann::json::array() },
+        { "preferences", nlohmann::json::array() },
+        { "selected_entities", nlohmann::json::array() },
+        { "decisions", nlohmann::json::array() },
+        { "open_loops", nlohmann::json::array() },
+    });
+}
+
+std::string truncateForContext_(std::string value, std::size_t maxChars)
+{
+    value = trimCopy_(std::move(value));
+    if (value.size() <= maxChars) {
+        return value;
+    }
+    if (maxChars <= 3) {
+        return value.substr(0, maxChars);
+    }
+    return value.substr(0, maxChars - 3) + "...";
+}
+
+nlohmann::json normalizeCompactConversationContext_(nlohmann::json compactContext)
+{
+    if (!compactContext.is_object()) {
+        compactContext = nlohmann::json::object();
+    }
+
+    const nlohmann::json defaults = defaultCompactConversationContext_();
+    for (auto it = defaults.begin(); it != defaults.end(); ++it) {
+        if (!compactContext.contains(it.key())) {
+            compactContext[it.key()] = it.value();
+        }
+    }
+
+    if (!compactContext["summary"].is_string()) {
+        compactContext["summary"] = "";
+    }
+
+    for (const auto& key : {
+             "user_goals",
+             "constraints",
+             "preferences",
+             "selected_entities",
+             "decisions",
+             "open_loops",
+         }) {
+        if (!compactContext[key].is_array()) {
+            compactContext[key] = nlohmann::json::array();
+        }
+        if (compactContext[key].size() > 8) {
+            compactContext[key].erase(compactContext[key].begin() + 8, compactContext[key].end());
+        }
+    }
+
+    compactContext["summary"] = truncateForContext_(
+        compactContext["summary"].get<std::string>(),
+        900);
+    return compactContext;
+}
+
+int estimateTextTokens_(const std::string& text)
+{
+    const std::string trimmed = trimCopy_(text);
+    if (trimmed.empty()) {
+        return 0;
+    }
+    return static_cast<int>((trimmed.size() + 3) / 4) + 8;
+}
+
+int estimateConversationTokens_(
+    const nlohmann::json& compactContext,
+    const nlohmann::json& recentTurns)
+{
+    int total = estimateTextTokens_(compactContext.dump());
+    if (recentTurns.is_array()) {
+        for (const auto& turn : recentTurns) {
+            if (!turn.is_object()) continue;
+            total += 12;
+            if (turn.contains("content") && turn["content"].is_string()) {
+                total += estimateTextTokens_(turn["content"].get<std::string>());
+            }
+        }
+    }
+    return total;
+}
+
+nlohmann::json normalizeRecentTurnsForPrompt_(nlohmann::json recentTurns)
+{
+    nlohmann::json normalized = nlohmann::json::array();
+    if (!recentTurns.is_array()) {
+        return normalized;
+    }
+
+    std::size_t startIndex = 0;
+    if (recentTurns.size() > kConversationContextMaxRecentTurnsForPrompt_) {
+        startIndex = recentTurns.size() - kConversationContextMaxRecentTurnsForPrompt_;
+    }
+
+    for (std::size_t i = startIndex; i < recentTurns.size(); ++i) {
+        const auto& turn = recentTurns[i];
+        if (!turn.is_object()) continue;
+        nlohmann::json item = {
+            { "role", turn.value("role", std::string()) },
+            { "content", truncateForContext_(turn.value("content", std::string()), kConversationContextMaxMessageChars_) },
+        };
+        const std::string messageType = turn.value("message_type", std::string());
+        if (!messageType.empty()) {
+            item["message_type"] = messageType;
+        }
+        normalized.push_back(std::move(item));
+    }
+
+    return normalized;
+}
+
+nlohmann::json normalizeConversationContextForPrompt_(nlohmann::json conversationContext)
+{
+    if (!conversationContext.is_object()) {
+        conversationContext = nlohmann::json::object();
+    }
+
+    conversationContext["compact_context"] = normalizeCompactConversationContext_(
+        conversationContext.value("compact_context", nlohmann::json::object()));
+    conversationContext["recent_turns"] = normalizeRecentTurnsForPrompt_(
+        conversationContext.value("recent_turns", nlohmann::json::array()));
+    return conversationContext;
+}
+
 } // namespace
 
 ChatV2Orchestrator::ChatV2Orchestrator()
@@ -361,11 +498,15 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         llm_.clearEndpointOverride();
     }
 
+    nlohmann::json conversationContext = loadConversationContext_(agent, payload);
+    conversationContext = compactConversationContextIfNeeded_(agent, payload, std::move(conversationContext));
+
     const bool allowHeuristicFallback = !runtimeManager_.requiresLlm();
     const SkillSelection selection = chooseSkill_(
         payload,
         userMessage,
-        allowHeuristicFallback);
+        allowHeuristicFallback,
+        conversationContext);
 
     if (selection.selectedSkill.empty()) {
         SkillSelection unavailableSelection;
@@ -422,7 +563,7 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         SkillRunResult result;
         result.status = SkillExecutionStatus::Completed;
         result.skillName = "general_answer";
-        result.answer = buildGeneralAnswer_(payload, selection, userMessage);
+        result.answer = buildGeneralAnswer_(payload, selection, userMessage, conversationContext);
         if (result.answer.empty()) {
             result.answer = buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
         }
@@ -488,7 +629,7 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         result.answer = sanitizeUserFacingAnswer_(result.answer);
     }
     else {
-        result.answer = polishAndSanitizeAnswer_(payload, selection, result.answer);
+        result.answer = polishAndSanitizeAnswer_(payload, selection, result.answer, conversationContext);
     }
     finalizeAsChatMessage_(agent, payload, selection, result);
 }
@@ -519,7 +660,11 @@ void ChatV2Orchestrator::handleShadowQuery(
     }
 
     const bool allowHeuristicFallback = !runtimeManager_.requiresLlm();
-    SkillSelection selection = chooseSkill_(payload, userMessage, allowHeuristicFallback);
+    SkillSelection selection = chooseSkill_(
+        payload,
+        userMessage,
+        allowHeuristicFallback,
+        nlohmann::json::object());
     if (selection.selectedSkill.empty()) {
         selection.selectedSkill = "unavailable";
         selection.confidence = 0.0;
@@ -540,14 +685,199 @@ void ChatV2Orchestrator::handleShadowQuery(
     recordRoutingTelemetry_(agent, payload, selection, "shadow", actualCommandType);
 }
 
+nlohmann::json ChatV2Orchestrator::loadConversationContext_(
+    AgentCore& agent,
+    const nlohmann::json& payload) const
+{
+    nlohmann::json fallback = {
+        { "compact_context", defaultCompactConversationContext_() },
+        { "recent_turns", nlohmann::json::array() },
+        { "last_compacted_message_id", 0 },
+        { "recent_token_estimate", 0 },
+    };
+
+    if (!payload.is_object()) {
+        return fallback;
+    }
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        return fallback;
+    }
+
+    const int beforeMessageId = payload.value("context_before_message_id", 0);
+    std::ostringstream url;
+    url
+        << agent.getBackendBaseUrl()
+        << "/api/agent/chat-context?client_id=" << agent.getClientId()
+        << "&chat_session_id=" << chatSessionId;
+    if (beforeMessageId > 0) {
+        url << "&before_message_id=" << beforeMessageId;
+    }
+
+    const HttpResponse response = getUrl(
+        url.str(),
+        agent.getExeToken(),
+        {},
+        3500);
+
+    if (!response.ok()) {
+        Logger::instance().logDebug(
+            "agent",
+            "ChatV2Orchestrator::loadConversationContext_: http=" +
+            std::to_string(response.statusCode) +
+            (response.error.empty() ? std::string() : " error=" + response.error));
+        return fallback;
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        return fallback;
+    }
+
+    fallback["compact_context"] = normalizeCompactConversationContext_(
+        parsed.value("compact_context", nlohmann::json::object()));
+    fallback["recent_turns"] = parsed.value("recent_turns", nlohmann::json::array());
+    fallback["last_compacted_message_id"] = parsed.value("last_compacted_message_id", 0);
+    fallback["recent_token_estimate"] = parsed.value("recent_token_estimate", 0);
+    return fallback;
+}
+
+nlohmann::json ChatV2Orchestrator::compactConversationContextIfNeeded_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    nlohmann::json conversationContext) const
+{
+    if (!conversationContext.is_object()) {
+        conversationContext = nlohmann::json::object();
+    }
+    conversationContext["compact_context"] = normalizeCompactConversationContext_(
+        conversationContext.value("compact_context", nlohmann::json::object()));
+    if (!conversationContext.contains("recent_turns") || !conversationContext["recent_turns"].is_array()) {
+        conversationContext["recent_turns"] = nlohmann::json::array();
+    }
+
+    const nlohmann::json recentTurns = conversationContext["recent_turns"];
+    const nlohmann::json compactContext = conversationContext["compact_context"];
+    if (!recentTurns.is_array() || recentTurns.size() <= kConversationContextKeepTailMessages_) {
+        conversationContext["recent_token_estimate"] =
+            estimateConversationTokens_(compactContext, recentTurns);
+        return conversationContext;
+    }
+
+    const int estimatedTokens =
+        estimateConversationTokens_(compactContext, recentTurns);
+    conversationContext["recent_token_estimate"] = estimatedTokens;
+    if (estimatedTokens <= kConversationContextSoftTokenLimit_) {
+        return conversationContext;
+    }
+
+    if (!llm_.isConfigured()) {
+        return conversationContext;
+    }
+
+    nlohmann::json turnsToCompact = nlohmann::json::array();
+    nlohmann::json turnsToKeep = nlohmann::json::array();
+    const std::size_t splitIndex = recentTurns.size() > kConversationContextKeepTailMessages_
+        ? recentTurns.size() - kConversationContextKeepTailMessages_
+        : 0;
+
+    for (std::size_t i = 0; i < recentTurns.size(); ++i) {
+        if (i < splitIndex) {
+            turnsToCompact.push_back(recentTurns[i]);
+        }
+        else {
+            turnsToKeep.push_back(recentTurns[i]);
+        }
+    }
+
+    if (turnsToCompact.empty()) {
+        return conversationContext;
+    }
+
+    const std::string appLanguage = appLanguageFromPayload_(payload);
+    nlohmann::json compactedContext = llm_.compactConversationContext(
+        compactContext,
+        turnsToCompact,
+        appLanguage);
+    compactedContext = normalizeCompactConversationContext_(std::move(compactedContext));
+    if (compactedContext == defaultCompactConversationContext_() &&
+        compactContext.is_object() &&
+        !compactContext.empty()) {
+        compactedContext = normalizeCompactConversationContext_(compactContext);
+    }
+
+    int lastCompactedMessageId = 0;
+    for (const auto& turn : turnsToCompact) {
+        const int messageId = turn.is_object() ? turn.value("message_id", 0) : 0;
+        if (messageId > lastCompactedMessageId) {
+            lastCompactedMessageId = messageId;
+        }
+    }
+    if (lastCompactedMessageId <= 0) {
+        return conversationContext;
+    }
+
+    conversationContext["compact_context"] = compactedContext;
+    conversationContext["recent_turns"] = normalizeRecentTurnsForPrompt_(turnsToKeep);
+    conversationContext["last_compacted_message_id"] = lastCompactedMessageId;
+    conversationContext["recent_token_estimate"] =
+        estimateConversationTokens_(compactedContext, conversationContext["recent_turns"]);
+
+    const bool persisted = persistConversationContext_(agent, payload, conversationContext);
+    Logger::instance().logDebug(
+        "agent",
+        "ChatV2Orchestrator::compactConversationContextIfNeeded_: compacted_messages=" +
+        std::to_string(turnsToCompact.size()) +
+        " kept_messages=" + std::to_string(turnsToKeep.size()) +
+        " persisted=" + std::string(persisted ? "true" : "false"));
+    return conversationContext;
+}
+
+bool ChatV2Orchestrator::persistConversationContext_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const nlohmann::json& conversationContext) const
+{
+    if (!payload.is_object()) {
+        return false;
+    }
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        return false;
+    }
+
+    nlohmann::json body = {
+        { "chat_session_id", chatSessionId },
+        { "compact_context", normalizeCompactConversationContext_(
+            conversationContext.value("compact_context", nlohmann::json::object())) },
+        { "last_compacted_message_id", conversationContext.value("last_compacted_message_id", 0) },
+        { "token_estimate", conversationContext.value("recent_token_estimate", 0) },
+    };
+
+    const std::string url =
+        agent.getBackendBaseUrl() + "/api/agent/chat-context?client_id=" + agent.getClientId();
+    const HttpResponse response = postJson(
+        url,
+        body.dump(),
+        agent.getExeToken(),
+        {},
+        3500);
+    return response.ok();
+}
+
 SkillSelection ChatV2Orchestrator::chooseSkill_(
     const nlohmann::json& payload,
     const std::string& userMessage,
-    bool allowHeuristicFallback) const
+    bool allowHeuristicFallback,
+    const nlohmann::json& conversationContext) const
 {
     const bool hasPayloadObject = payload.is_object();
     const std::string appLanguage = appLanguageFromPayload_(payload);
     const SkillSelection heuristic = chooseHeuristicSkill_(payload, userMessage);
+    const nlohmann::json promptConversationContext =
+        normalizeConversationContextForPrompt_(conversationContext);
 
     if (llm_.isConfigured()) {
         nlohmann::json requestContext = {
@@ -571,6 +901,8 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             },
             { "model_tier", hasPayloadObject ? payload.value("model_tier", std::string()) : std::string() },
             { "video_search_allowed", hasPayloadObject ? payload.value("video_search_allowed", true) : true },
+            { "conversation_compact_context", promptConversationContext.value("compact_context", nlohmann::json::object()) },
+            { "recent_turns", promptConversationContext.value("recent_turns", nlohmann::json::array()) },
         };
 
         SkillSelection selection = llm_.chooseSkill(
@@ -829,7 +1161,8 @@ std::string ChatV2Orchestrator::buildComingSoonAnswer_(
 std::string ChatV2Orchestrator::buildGeneralAnswer_(
     const nlohmann::json& payload,
     const SkillSelection& selection,
-    const std::string& userMessage) const
+    const std::string& userMessage,
+    const nlohmann::json& conversationContext) const
 {
     const std::string appLanguage = appLanguageFromPayload_(payload);
     const std::string fallbackLanguage =
@@ -841,6 +1174,7 @@ std::string ChatV2Orchestrator::buildGeneralAnswer_(
 
     const std::string answer = llm_.answerDirectly(
         userMessage,
+        normalizeConversationContextForPrompt_(conversationContext),
         selection.replyLanguage,
         selection.knowledgeLanguage,
         appLanguage,
@@ -855,7 +1189,8 @@ std::string ChatV2Orchestrator::buildGeneralAnswer_(
 std::string ChatV2Orchestrator::polishAndSanitizeAnswer_(
     const nlohmann::json& payload,
     const SkillSelection& selection,
-    const std::string& draftAnswer) const
+    const std::string& draftAnswer,
+    const nlohmann::json& conversationContext) const
 {
     const std::string appLanguage = appLanguageFromPayload_(payload);
     const std::string fallbackLanguage =
@@ -868,6 +1203,7 @@ std::string ChatV2Orchestrator::polishAndSanitizeAnswer_(
         const std::string polished = llm_.polishAnswer(
             userMessage,
             draftAnswer,
+            normalizeConversationContextForPrompt_(conversationContext),
             selection.replyLanguage,
             selection.knowledgeLanguage,
             appLanguage,
