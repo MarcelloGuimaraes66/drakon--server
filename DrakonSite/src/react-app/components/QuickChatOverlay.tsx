@@ -333,14 +333,9 @@ export default function QuickChatOverlay() {
         {/* Header */}
         <div className="relative border-b border-white/[0.06] px-5 pb-4 pt-5 md:px-6 md:pb-5 md:pt-6">
           <div className="flex items-start justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className={`flex h-12 w-12 items-center justify-center rounded-[22px] ${CHAT_ASSISTANT_BADGE_CLASS}`}>
-                <Bot className="h-6 w-6 text-white" />
-              </div>
-              <div>
-                <h3 className="text-xl font-semibold tracking-tight text-white">{brand.quickChatName}</h3>
-                <p className="mt-1 text-sm text-gray-400">Ask about live cameras, footage, and app help.</p>
-              </div>
+            <div className="min-w-0">
+              <h3 className="text-xl font-semibold tracking-tight text-white">{brand.quickChatName}</h3>
+              <p className="mt-1 text-sm text-gray-400">Ask about live cameras, footage, and app help.</p>
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2">

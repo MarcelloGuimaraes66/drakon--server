@@ -5810,8 +5810,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (mem.contains("description") && mem["description"].is_string()) {
                 doc["description"] = mem["description"];
             }
-            if (mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
-                doc["appearance_summary"] = mem["appearance_summary"];
+            else if (mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
+                doc["description"] = mem["appearance_summary"];
             }
             if (mem.contains("identity_signature_summary") && mem["identity_signature_summary"].is_string()) {
                 doc["identity_signature_summary"] = mem["identity_signature_summary"];
@@ -5867,10 +5867,10 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             {
                 doc["description"] = entityState["description"];
             }
-            if ((!doc.contains("appearance_summary") || !doc["appearance_summary"].is_string()) &&
+            if ((!doc.contains("description") || !doc["description"].is_string()) &&
                 entityState.contains("appearance_summary") && entityState["appearance_summary"].is_string())
             {
-                doc["appearance_summary"] = entityState["appearance_summary"];
+                doc["description"] = entityState["appearance_summary"];
             }
             if ((!doc.contains("identity_signature_summary") || !doc["identity_signature_summary"].is_string()) &&
                 entityState.contains("identity_signature_summary") && entityState["identity_signature_summary"].is_string())
@@ -6073,9 +6073,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                                 temporal::strField(*patchNode, "entity_description",
                                     temporal::strField(*patchNode, "person_description"))))));
                 if (!description.empty()) doc["description"] = description;
-                const std::string appearanceSummary =
-                    temporal::trim(temporal::strField(*patchNode, "appearance_summary"));
-                if (!appearanceSummary.empty()) doc["appearance_summary"] = appearanceSummary;
                 const std::string identitySignatureSummary =
                     temporal::trim(temporal::strField(*patchNode, "identity_signature_summary"));
                 if (!identitySignatureSummary.empty()) doc["identity_signature_summary"] = identitySignatureSummary;
@@ -6130,8 +6127,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                     if (!doc.contains("description") && mem.contains("description") && mem["description"].is_string()) {
                         doc["description"] = mem["description"];
                     }
-                    if (!doc.contains("appearance_summary") && mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
-                        doc["appearance_summary"] = mem["appearance_summary"];
+                    if (!doc.contains("description") && mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
+                        doc["description"] = mem["appearance_summary"];
                     }
                     if (!doc.contains("identity_signature_summary") && mem.contains("identity_signature_summary") && mem["identity_signature_summary"].is_string()) {
                         doc["identity_signature_summary"] = mem["identity_signature_summary"];
@@ -6190,8 +6187,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                     if (!doc.contains("description") && entityState.contains("description") && entityState["description"].is_string()) {
                         doc["description"] = entityState["description"];
                     }
-                    if (!doc.contains("appearance_summary") && entityState.contains("appearance_summary") && entityState["appearance_summary"].is_string()) {
-                        doc["appearance_summary"] = entityState["appearance_summary"];
+                    if (!doc.contains("description") && entityState.contains("appearance_summary") && entityState["appearance_summary"].is_string()) {
+                        doc["description"] = entityState["appearance_summary"];
                     }
                     if (!doc.contains("identity_signature_summary") && entityState.contains("identity_signature_summary") && entityState["identity_signature_summary"].is_string()) {
                         doc["identity_signature_summary"] = entityState["identity_signature_summary"];
@@ -6472,8 +6469,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         const std::string entityType = temporal::trim(
             temporal::strField(normalized, "entity_type", temporal::strField(normalized, "entity_key", "object")));
         const std::string knownName = temporal::trim(temporal::strField(normalized, "known_name"));
-        const std::string identitySignatureSummary =
-            temporal::trim(temporal::strField(normalized, "identity_signature_summary"));
         std::ostringstream prompt;
         auto appendTraitSentence = [&](const char* fieldName, const char* label, std::size_t maxItems) {
             if (!normalized.contains(fieldName) || !normalized[fieldName].is_array() || normalized[fieldName].empty()) {
@@ -6495,11 +6490,10 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (emittedTraits == 0) return;
             prompt << " " << label << ": " << clause.str() << ".";
         };
-        const bool hasCuratedSignature =
-            !identitySignatureSummary.empty() ||
-            (normalized.contains("identity_signature_traits") &&
-             normalized["identity_signature_traits"].is_array() &&
-             !normalized["identity_signature_traits"].empty());
+        const bool hasIdentitySignatureTraits =
+            normalized.contains("identity_signature_traits") &&
+            normalized["identity_signature_traits"].is_array() &&
+            !normalized["identity_signature_traits"].empty();
         prompt << "Look for the same " << (entityType.empty() ? "object" : entityType)
                << " from another camera in this job step.";
         prompt << " Treat this shared hunt as a priority task for the receiving camera even if its local task text is unrelated.";
@@ -6508,10 +6502,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (!knownName.empty()) {
             prompt << " Known identity hint: " << knownName << ".";
         }
-        if (hasCuratedSignature) {
-            if (!identitySignatureSummary.empty()) {
-                prompt << " Curated identity signature: " << identitySignatureSummary << ".";
-            }
+        if (hasIdentitySignatureTraits) {
             appendTraitSentence("identity_signature_traits", "Identity signature traits", 8);
         }
         if (normalized.contains("resolved_identity") && normalized["resolved_identity"].is_object()) {
@@ -7140,6 +7131,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         nlohmann::json temporalOperatorResults = nlohmann::json::array();
         TemporalRuntimeSlot temporalSlot = preparedTemporalSlot;
         const json activeCrossCameraWatchlist = loadActiveCrossCameraWatchlist(nowIsoForInference);
+        const json promptCrossCameraWatchlist =
+            temporal::sanitizePromptIdentityPayload(activeCrossCameraWatchlist);
         if (temporalPlanPrepared && temporal::planUsable(temporalSlot.planEnvelope)) {
             nlohmann::json temporalInput = temporal::buildInferenceInput(
                 temporalSlot.planEnvelope,
@@ -7147,8 +7140,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 cameraId,
                 nowIsoForInference
             );
-            if (activeCrossCameraWatchlist.is_array() && !activeCrossCameraWatchlist.empty()) {
-                temporalInput["cross_camera_watchlist"] = activeCrossCameraWatchlist;
+            if (promptCrossCameraWatchlist.is_array() && !promptCrossCameraWatchlist.empty()) {
+                temporalInput["cross_camera_watchlist"] = promptCrossCameraWatchlist;
                 if (!temporalInput.contains("expected_output_schema") || !temporalInput["expected_output_schema"].is_object()) {
                     temporalInput["expected_output_schema"] = json::object();
                 }
@@ -7166,9 +7159,9 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             inferencePrompt += temporal::runtimePromptAppendix(temporalInput);
             temporalPlanActive = true;
         }
-        else if (activeCrossCameraWatchlist.is_array() && !activeCrossCameraWatchlist.empty()) {
+        else if (promptCrossCameraWatchlist.is_array() && !promptCrossCameraWatchlist.empty()) {
             nlohmann::json temporalInput = buildCrossCameraRuntimeInput(nowIsoForInference, std::string(), std::string());
-            temporalInput["cross_camera_watchlist"] = activeCrossCameraWatchlist;
+            temporalInput["cross_camera_watchlist"] = promptCrossCameraWatchlist;
             Logger::instance().logDebug(
                 "job",
                 "runAgentInferenceOnCamera_: cross-camera watchlist injected without local temporal plan (image) job_id=" +
@@ -7870,6 +7863,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     nlohmann::json temporalOperatorResults = nlohmann::json::array();
     TemporalRuntimeSlot temporalSlot = preparedTemporalSlot;
     const json activeCrossCameraWatchlist = loadActiveCrossCameraWatchlist(nowIsoForInference);
+    const json promptCrossCameraWatchlist =
+        temporal::sanitizePromptIdentityPayload(activeCrossCameraWatchlist);
     if (temporalPlanPrepared && temporal::planUsable(temporalSlot.planEnvelope)) {
         nlohmann::json temporalInput = temporal::buildInferenceInput(
             temporalSlot.planEnvelope,
@@ -7879,8 +7874,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             seg.startTs,
             seg.endTs
         );
-        if (activeCrossCameraWatchlist.is_array() && !activeCrossCameraWatchlist.empty()) {
-            temporalInput["cross_camera_watchlist"] = activeCrossCameraWatchlist;
+        if (promptCrossCameraWatchlist.is_array() && !promptCrossCameraWatchlist.empty()) {
+            temporalInput["cross_camera_watchlist"] = promptCrossCameraWatchlist;
             if (!temporalInput.contains("expected_output_schema") || !temporalInput["expected_output_schema"].is_object()) {
                 temporalInput["expected_output_schema"] = json::object();
             }
@@ -7899,9 +7894,9 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         inferencePrompt += temporal::runtimePromptAppendix(temporalInput);
         temporalPlanActive = true;
     }
-    else if (activeCrossCameraWatchlist.is_array() && !activeCrossCameraWatchlist.empty()) {
+    else if (promptCrossCameraWatchlist.is_array() && !promptCrossCameraWatchlist.empty()) {
         nlohmann::json temporalInput = buildCrossCameraRuntimeInput(nowIsoForInference, seg.startTs, seg.endTs);
-        temporalInput["cross_camera_watchlist"] = activeCrossCameraWatchlist;
+        temporalInput["cross_camera_watchlist"] = promptCrossCameraWatchlist;
         Logger::instance().logDebug(
             "job",
             "runAgentInferenceOnCamera_: cross-camera watchlist injected without local temporal plan (video) job_id=" +

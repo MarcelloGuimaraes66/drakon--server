@@ -283,6 +283,37 @@ SkillSelection finalizeSelectionLanguages_(SkillSelection selection)
     return selection;
 }
 
+constexpr double kRouterReplyLanguageConfidenceFloor_ = 0.35;
+
+bool isSupportedReplyLanguage_(const std::string& replyLanguage)
+{
+    const std::string normalized = normalizeReplyLanguageTag(replyLanguage);
+    return normalized == "en" ||
+        normalized == "es" ||
+        normalized == "pt" ||
+        normalized == "fr" ||
+        normalized == "zh" ||
+        normalized == "ar";
+}
+
+bool shouldDetectReplyLanguageForSelection_(const SkillSelection& selection)
+{
+    if (!selection.fromModel) {
+        return true;
+    }
+
+    const std::string normalized = normalizeReplyLanguageTag(selection.replyLanguage);
+    if (normalized.empty()) {
+        return true;
+    }
+
+    if (!isSupportedReplyLanguage_(normalized)) {
+        return true;
+    }
+
+    return selection.replyLanguageConfidence < kRouterReplyLanguageConfidenceFloor_;
+}
+
 std::string progressLanguageFromSelection_(
     const SkillSelection& selection,
     const nlohmann::json& payload)
@@ -910,11 +941,13 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             requestContext,
             registry_.definitions());
         selection = rewriteInstructionalSelection_(selection, userMessage);
-        const std::string detectedReplyLanguage = llm_.detectReplyLanguage(
-            userMessage,
-            appLanguage);
-        if (!detectedReplyLanguage.empty()) {
-            selection.replyLanguage = detectedReplyLanguage;
+        if (shouldDetectReplyLanguageForSelection_(selection)) {
+            const std::string detectedReplyLanguage = llm_.detectReplyLanguage(
+                userMessage,
+                appLanguage);
+            if (!detectedReplyLanguage.empty()) {
+                selection.replyLanguage = detectedReplyLanguage;
+            }
         }
         selection = finalizeSelectionLanguages_(std::move(selection));
         if (selection.selectedSkill == "general_answer") {
@@ -931,7 +964,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
 
     if (!heuristic.selectedSkill.empty()) {
         SkillSelection rewritten = rewriteInstructionalSelection_(heuristic, userMessage);
-        if (llm_.isConfigured()) {
+        if (llm_.isConfigured() && shouldDetectReplyLanguageForSelection_(rewritten)) {
             const std::string detectedReplyLanguage = llm_.detectReplyLanguage(
                 userMessage,
                 appLanguage);
@@ -949,7 +982,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
     fallback.replyPreview = llm_.isConfigured()
         ? "Vou responder diretamente."
         : "Vou responder usando a skill de ajuda do aplicativo.";
-    if (llm_.isConfigured()) {
+    if (llm_.isConfigured() && shouldDetectReplyLanguageForSelection_(fallback)) {
         fallback.replyLanguage = llm_.detectReplyLanguage(
             userMessage,
             appLanguage);

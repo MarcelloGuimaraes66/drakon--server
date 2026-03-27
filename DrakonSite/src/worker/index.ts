@@ -378,7 +378,7 @@ async function hashToken(token: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// The desktop EXE polls /api/agent/commands every 15 seconds.
+// The desktop EXE polls /api/agent/commands every 1 second.
 // Production adds network + D1 visibility lag, so chat freshness needs a
 // wider window than local dev to avoid false "stale" states.
 const EXE_HEARTBEAT_STALE_AFTER_MS = 35_000;

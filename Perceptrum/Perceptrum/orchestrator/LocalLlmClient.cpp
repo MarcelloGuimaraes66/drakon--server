@@ -637,7 +637,7 @@ SkillSelection LocalLlmClient::chooseSkill(
         }
         if (structured.contains("reply_language") && structured["reply_language"].is_string()) {
             selection.replyLanguage =
-                normalizeAssistantLanguageTag(structured["reply_language"].get<std::string>());
+                normalizeReplyLanguageTag(structured["reply_language"].get<std::string>());
         }
         if (structured.contains("reply_language_confidence")) {
             try {
@@ -713,7 +713,7 @@ SkillSelection LocalLlmClient::chooseSkill(
     }
     if (structured.contains("reply_language") && structured["reply_language"].is_string()) {
         selection.replyLanguage =
-            normalizeAssistantLanguageTag(structured["reply_language"].get<std::string>());
+            normalizeReplyLanguageTag(structured["reply_language"].get<std::string>());
     }
     if (structured.contains("reply_language_confidence")) {
         try {

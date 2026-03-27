@@ -38,7 +38,7 @@ const DEFAULT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const CHAT_DESKTOP_AGENT_CHECK_AFTER_MS = 3500;
-// The EXE heartbeat is driven by the command poll loop, which runs every 15s.
+// The EXE heartbeat is driven by the command poll loop, which runs every 1s.
 // Keep this aligned with the backend's chat freshness window to avoid false
 // stale/offline states in production.
 const CHAT_DESKTOP_AGENT_MAX_AGE_SECONDS = 25;

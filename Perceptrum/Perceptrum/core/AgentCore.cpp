@@ -4797,7 +4797,7 @@ void AgentCore::workerLoop_() {
         }
         
 
-        std::this_thread::sleep_for(std::chrono::seconds(15));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -9201,26 +9201,64 @@ static bool tryReadFrameIndexField_(
     int& outFrameIndex)
 {
     outFrameIndex = -1;
-    if (!node.is_object() || !node.contains("frame_index")) return false;
+    if (!node.is_object()) return false;
 
-    const nlohmann::json& value = node["frame_index"];
-    try {
-        if (value.is_number_integer()) {
-            outFrameIndex = value.get<int>();
-            return outFrameIndex >= 0;
+    const auto tryReadValue = [&](const nlohmann::json& value) -> bool {
+        try {
+            if (value.is_number_integer()) {
+                outFrameIndex = value.get<int>();
+                return outFrameIndex >= 0;
+            }
+            if (value.is_string()) {
+                const std::string raw = trimAscii(value.get<std::string>());
+                if (raw.empty()) return false;
+                outFrameIndex = std::stoi(raw);
+                return outFrameIndex >= 0;
+            }
         }
-        if (value.is_string()) {
-            const std::string raw = trimAscii(value.get<std::string>());
-            if (raw.empty()) return false;
-            outFrameIndex = std::stoi(raw);
-            return outFrameIndex >= 0;
+        catch (...) {
+            outFrameIndex = -1;
         }
+        return false;
+    };
+
+    if (node.contains("frame_index") && tryReadValue(node["frame_index"])) {
+        return true;
     }
-    catch (...) {
-        outFrameIndex = -1;
+    if (node.contains("frame_ref") &&
+        node["frame_ref"].is_object() &&
+        node["frame_ref"].contains("frame_index") &&
+        tryReadValue(node["frame_ref"]["frame_index"]))
+    {
+        return true;
     }
 
     return false;
+}
+
+static std::string readPromptFrameOffsetField_(
+    const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+
+    const auto tryReadOffset = [](const nlohmann::json& obj) -> std::string {
+        if (!obj.is_object()) return std::string();
+        if (obj.contains("frame_timestamp_in_segment") && obj["frame_timestamp_in_segment"].is_string()) {
+            return trimAscii(obj["frame_timestamp_in_segment"].get<std::string>());
+        }
+        if (obj.contains("time_in_video") && obj["time_in_video"].is_string()) {
+            return trimAscii(obj["time_in_video"].get<std::string>());
+        }
+        return std::string();
+    };
+
+    const std::string topLevel = tryReadOffset(node);
+    if (!topLevel.empty()) return topLevel;
+    if (node.contains("frame_ref")) {
+        const std::string nested = tryReadOffset(node["frame_ref"]);
+        if (!nested.empty()) return nested;
+    }
+    return std::string();
 }
 
 static bool tryReadPositiveIntegerLikeValue_(
@@ -9436,12 +9474,7 @@ static bool resolvePromptFrameReferenceFromObject_(
         node.contains("timestamp_name") && node["timestamp_name"].is_string()
             ? trimAscii(node["timestamp_name"].get<std::string>())
             : std::string();
-    const std::string frameTimestampInSegment =
-        node.contains("frame_timestamp_in_segment") && node["frame_timestamp_in_segment"].is_string()
-            ? trimAscii(node["frame_timestamp_in_segment"].get<std::string>())
-            : (node.contains("time_in_video") && node["time_in_video"].is_string()
-                ? trimAscii(node["time_in_video"].get<std::string>())
-                : std::string());
+    const std::string frameTimestampInSegment = readPromptFrameOffsetField_(node);
 
     int mosaicIndex = -1;
     int cellIndex = -1;
@@ -10491,14 +10524,12 @@ static const PromptVideoFrame* findPromptVideoFrameForNode_(
         }
     }
 
-    if (node.is_object() &&
-        node.contains("frame_timestamp_in_segment") &&
-        node["frame_timestamp_in_segment"].is_string())
-    {
+    const std::string frameTimestampInSegment = readPromptFrameOffsetField_(node);
+    if (!frameTimestampInSegment.empty()) {
         if (const PromptVideoFrame* byOffset =
             findPromptVideoFrameBySegmentOffset_(
                 frameCatalog,
-                trimAscii(node["frame_timestamp_in_segment"].get<std::string>())))
+                frameTimestampInSegment))
         {
             return byOffset;
         }
@@ -14979,9 +15010,6 @@ namespace {
                 if (!target.contains("reason")) target["reason"] = reason;
                 if (!target.contains("description")) target["description"] = reason;
             }
-            if (source.contains("appearance_summary") && source["appearance_summary"].is_string()) {
-                target["appearance_summary"] = source["appearance_summary"];
-            }
             if (source.contains("stable_attributes")) {
                 target["stable_attributes"] = source["stable_attributes"];
             }
@@ -16212,8 +16240,6 @@ namespace {
                         { "decision", makeNullableStringSchema_() },
                         { "confidence", makeNullableNumberSchema_() },
                         { "short_description", makeNullableStringSchema_() },
-                        { "appearance_summary", makeNullableStringSchema_() },
-                        { "stable_attributes", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "identity_feature_candidates", makeIdentityFeatureCandidateArraySchema_() },
                         { "identity_signature_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
@@ -16443,23 +16469,23 @@ namespace {
         prompt << "- answer is optional. Omit it unless a short user-facing explanation is needed because of alert, start condition, watchlist match, face match, or a meaningful ambiguity explanation.\n";
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
-        prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, appearance_summary, stable_attributes, and any updated_traits/context cues needed for continuity.\n";
+        prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, identity_signature_traits, and any updated_traits/context cues needed for continuity.\n";
         prompt << "- identity_feature_candidates is the authoritative structured identity field when enough detail is visible for reidentification.\n";
         prompt << "- Each identity_feature_candidates item must include text, category, and relation_to_target.\n";
         prompt << "- Use category values such as physical_trait, clothing, accessory, body_marking, carried_object, vehicle_detail, plate_fragment, pose_or_activity, visibility_condition, continuity_context, nearby_object, or scene.\n";
         prompt << "- Use relation_to_target values such as intrinsic_body, worn_on_target, attached_to_target, carried_by_target, vehicle_body, attached_to_vehicle, plate_on_target, detached_near_target, pose_or_activity, visibility_condition, continuity_context, or background_scene.\n";
         prompt << "- If an object is merely near the target and not worn, carried, or physically attached, mark it detached_near_target instead of treating it as identity.\n";
-        prompt << "- Only target-attached relations belong in identity_signature_traits and stable_attributes. Nearby detached objects, background, scene layout, pose, and activity must stay out of the identity signature.\n";
+        prompt << "- Only target-attached relations belong in identity_signature_traits. Nearby detached objects, background, scene layout, pose, and activity must stay out of the identity signature.\n";
         prompt << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification. Fill it with strong target-centric physical identity cues only.\n";
         prompt << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n";
         prompt << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n";
         prompt << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n";
         prompt << "- identity_context_traits is optional and should contain only a few brief non-identity cues for current-round continuity. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
         prompt << "- scene_brief is optional and should be a very short scene hint only when useful for continuity. Keep it to a few words.\n";
-        prompt << "- stable_attributes should capture durable target-centric identity cues that survive time and cross-camera changes: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, body build, markings, or vehicle make/model/color/plate fragments when visible.\n";
-        prompt << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n";
-        prompt << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits or stable_attributes.\n";
-        prompt << "- updated_traits may add transient current-round cues or scene context for continuity, but do not use them as a substitute for stable_attributes.\n";
+        prompt << "- Keep identity_signature_traits concise (2-8 items) and focused on durable target-centric identity cues that survive time and cross-camera changes: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, body build, markings, or vehicle make/model/color/plate fragments when visible.\n";
+        prompt << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside identity_signature_traits unless they are physically attached to the target.\n";
+        prompt << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits.\n";
+        prompt << "- updated_traits may add transient current-round cues or scene context for continuity, but do not use them as a substitute for identity_signature_traits.\n";
         prompt << "- visibility_updates are optional. Emit at most one per relevant entity when asserting a current-round visibility state.\n";
         prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
         prompt << "- Use visibility state not_visible_this_segment or absent when a tracked entity from temporal state is clearly not visible in the current batch.\n";

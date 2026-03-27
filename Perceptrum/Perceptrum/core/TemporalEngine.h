@@ -3817,7 +3817,6 @@ inline void upsertIdentityMemory(
             )
         )
     );
-    const std::string appearanceSummary = trim(strField(patch, "appearance_summary"));
     std::string entityTypeHint = trim(
         strField(patch, "entity_type", strField(patch, "entity_key")));
     if (entityTypeHint.empty() &&
@@ -3831,25 +3830,41 @@ inline void upsertIdentityMemory(
         entityTypeHint = trim(strField(mem, "entity_type", strField(mem, "entity_key")));
     }
     if (!description.empty()) mem["description"] = description;
-    if (!appearanceSummary.empty()) {
-        mem["appearance_summary"] = appearanceSummary;
-    }
-    else if ((!mem.contains("appearance_summary") || !mem["appearance_summary"].is_string() ||
-              trim(mem["appearance_summary"].get<std::string>()).empty()) &&
-             !description.empty())
+    else if ((!mem.contains("description") || !mem["description"].is_string() ||
+              trim(mem["description"].get<std::string>()).empty()) &&
+             mem.contains("appearance_summary") &&
+             mem["appearance_summary"].is_string())
     {
-        mem["appearance_summary"] = description;
+        const std::string legacyAppearanceSummary = trim(mem["appearance_summary"].get<std::string>());
+        if (!legacyAppearanceSummary.empty()) {
+            mem["description"] = legacyAppearanceSummary;
+        }
     }
+    if ((!mem.contains("description") || !mem["description"].is_string() ||
+         trim(mem["description"].get<std::string>()).empty()) &&
+        entityState &&
+        entityState->contains("appearance_summary") &&
+        (*entityState)["appearance_summary"].is_string())
+    {
+        const std::string legacyAppearanceSummary = trim((*entityState)["appearance_summary"].get<std::string>());
+        if (!legacyAppearanceSummary.empty()) {
+            mem["description"] = legacyAppearanceSummary;
+        }
+    }
+    if (mem.contains("appearance_summary")) mem.erase("appearance_summary");
     if (entityState) {
         if (!description.empty()) {
             (*entityState)["description"] = description;
         }
-        else if (!entityState->contains("description") && mem.contains("description") && mem["description"].is_string()) {
+        else if ((!entityState->contains("description") ||
+                  !(*entityState)["description"].is_string() ||
+                  trim((*entityState)["description"].get<std::string>()).empty()) &&
+                 mem.contains("description") &&
+                 mem["description"].is_string())
+        {
             (*entityState)["description"] = mem["description"];
         }
-        if (mem.contains("appearance_summary") && mem["appearance_summary"].is_string()) {
-            (*entityState)["appearance_summary"] = mem["appearance_summary"];
-        }
+        if (entityState->contains("appearance_summary")) entityState->erase("appearance_summary");
     }
     mem["last_seen_ts_utc"] = seenTsUtc;
     if (!trim(zone).empty()) mem["last_seen_zone"] = trim(zone);
@@ -4039,14 +4054,19 @@ inline void upsertIdentityMemory(
     {
         mem["description"] = (*entityState)["description"];
     }
-    if ((!mem.contains("appearance_summary") || !mem["appearance_summary"].is_string() ||
-         trim(mem["appearance_summary"].get<std::string>()).empty()) &&
+    if ((!mem.contains("description") || !mem["description"].is_string() ||
+         trim(mem["description"].get<std::string>()).empty()) &&
         entityState &&
         entityState->contains("appearance_summary") &&
         (*entityState)["appearance_summary"].is_string())
     {
-        mem["appearance_summary"] = (*entityState)["appearance_summary"];
+        const std::string legacyAppearanceSummary = trim((*entityState)["appearance_summary"].get<std::string>());
+        if (!legacyAppearanceSummary.empty()) {
+            mem["description"] = legacyAppearanceSummary;
+        }
     }
+    if (mem.contains("appearance_summary")) mem.erase("appearance_summary");
+    if (entityState && entityState->contains("appearance_summary")) entityState->erase("appearance_summary");
 
     if (idx == static_cast<std::size_t>(-1)) st["identity_memory"].push_back(std::move(mem));
     else st["identity_memory"][idx] = std::move(mem);
@@ -5399,6 +5419,35 @@ inline json buildInferenceStaticContext(const json& envelope) {
     };
 }
 
+inline json sanitizePromptIdentityPayload(const json& value) {
+    if (value.is_array()) {
+        json out = json::array();
+        for (const auto& item : value) {
+            out.push_back(sanitizePromptIdentityPayload(item));
+        }
+        return out;
+    }
+    if (!value.is_object()) return value;
+
+    json out = json::object();
+    for (auto it = value.begin(); it != value.end(); ++it) {
+        const std::string key = it.key();
+        if (key == "stable_attributes" || key == "identity_signature_summary" || key == "appearance_summary") continue;
+        out[key] = sanitizePromptIdentityPayload(it.value());
+    }
+    if ((!out.contains("description") || !out["description"].is_string() ||
+         trim(out["description"].get<std::string>()).empty()) &&
+        value.contains("appearance_summary") &&
+        value["appearance_summary"].is_string())
+    {
+        const std::string legacyAppearanceSummary = trim(value["appearance_summary"].get<std::string>());
+        if (!legacyAppearanceSummary.empty()) {
+            out["description"] = legacyAppearanceSummary;
+        }
+    }
+    return out;
+}
+
 inline json buildInferenceRuntimeState(const json& envelope,
                                        const json& st,
                                        int cameraId,
@@ -5415,9 +5464,10 @@ inline json buildInferenceRuntimeState(const json& envelope,
         orderedRows.reserve(st["identity_memory"].size());
         for (const auto& row : st["identity_memory"]) {
             if (!row.is_object()) continue;
+            const json promptRow = sanitizePromptIdentityPayload(row);
             orderedRows.push_back(IdentityMemoryPromptRow{
                 identityMemoryLastSeenTs(row),
-                row
+                promptRow
             });
         }
         std::sort(
@@ -5520,7 +5570,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If an on-frame clock conflicts with provided temporal fields, prefer provided temporal fields.\n"
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"
         << "- identity_patch and observations MUST be arrays of JSON objects (never plain strings).\n"
-        << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, appearance_summary, stable_attributes, and updated_traits/key_traits.\n"
+        << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, identity_signature_traits, and updated_traits/key_traits.\n"
         << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification, focused on strong physical identity cues only.\n"
         << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n"
         << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n"
@@ -5539,9 +5589,9 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- When the scenario is about entering/leaving places, use entered_zone and left_zone from event_catalog instead of only generic present.\n"
         << "- Do not infer entered_zone just because the entity is already visible in the first frame of the batch; only use entered_zone when the entry is actually visible.\n"
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
-        << "- Keep stable_attributes concise (2-8 items) and focused on durable target-centric identity cues: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, build, markings, or vehicle make/model/color/plate fragments when visible.\n"
-        << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n"
-        << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits or stable_attributes.\n"
+        << "- Keep identity_signature_traits concise (2-8 items) and focused on durable target-centric identity cues: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, build, markings, or vehicle make/model/color/plate fragments when visible.\n"
+        << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside identity_signature_traits unless they are physically attached to the target.\n"
+        << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits.\n"
         << "- updated_traits may capture transient cues or scene context for continuity, but they must not replace the stable appearance signature.\n"
         << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence, and an appearance snapshot for continuity.\n"
         << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch even when entity_id is inferred from that context.\n"
