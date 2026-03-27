@@ -357,10 +357,18 @@ function Invoke-BuildStep {
 
     $binItems | Copy-Item -Destination $BrandMetadata.ArtifactStageRoot -Recurse -Force
 
+    $nativeKnowledgeRoot = Join-Path $workspaceRoot "Perceptrum\x64\$Configuration\orchestrator\knowledge"
+    $artifactKnowledgeRoot = Join-Path $BrandMetadata.ArtifactStageRoot "orchestrator\knowledge"
+    $binKnowledgeRoot = Join-Path $binOutputRoot "orchestrator\knowledge"
+
+    Copy-DirectoryContents -Source $nativeKnowledgeRoot -Destination $artifactKnowledgeRoot
+
     $artifactRuntimePath = Join-Path $BrandMetadata.ArtifactStageRoot "runtime"
     if (Test-Path $artifactRuntimePath) {
         Copy-Item -Path $artifactRuntimePath -Destination $binOutputRoot -Recurse -Force
     }
+
+    Copy-DirectoryContents -Source $nativeKnowledgeRoot -Destination $binKnowledgeRoot
 
     foreach ($name in @("brand.config.json", "brand.txt")) {
         $sourcePath = Join-Path $BrandMetadata.ArtifactStageRoot $name

@@ -264,6 +264,16 @@
     <Exec Command='node "$(ProjectDir)..\..\branding\apply-brand.mjs" --brand "$(SelectedBrand)"' />
     <Delete Files="$(OutDir)$(StaleTargetName).exe;$(OutDir)$(StaleTargetName).pdb;$(OutDir)$(StaleTargetName).lib;$(OutDir)$(StaleTargetName).exp;$(OutDir)$(StaleTargetName).iobj;$(OutDir)$(StaleTargetName).ipdb" ContinueOnError="WarnAndContinue" />
   </Target>
+  <Target Name="CopyKnowledgeFiles" AfterTargets="Build">
+    <ItemGroup>
+      <KnowledgeContent Include="$(ProjectDir)orchestrator\knowledge\**\*.md" />
+    </ItemGroup>
+    <MakeDir Directories="$(TargetDir)orchestrator\knowledge" />
+    <Copy
+      SourceFiles="@(KnowledgeContent)"
+      DestinationFiles="@(KnowledgeContent->'$(TargetDir)orchestrator\knowledge\%(RecursiveDir)%(Filename)%(Extension)')"
+      SkipUnchangedFiles="true" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

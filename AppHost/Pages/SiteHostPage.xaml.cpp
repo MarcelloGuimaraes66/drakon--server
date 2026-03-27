@@ -7,6 +7,7 @@
 #include "../Platform/AppRuntimeConfig.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cwctype>
 #include <nlohmann/json.hpp>
 #include <shellapi.h>
@@ -22,6 +23,7 @@ namespace winrt::DrakonDesktop::implementation
     namespace
     {
         constexpr wchar_t kUiUrlEnvVar[] = L"DRAKON_UI_URL";
+        constexpr auto kOverlayRevealDelay = std::chrono::milliseconds(800);
         constexpr char kNativeResidentRuntimeBridgeScript[] = R"JS(
 (() => {
   if (window.__drakonDesktopNativeBridgeInstalled) {
@@ -298,10 +300,10 @@ namespace winrt::DrakonDesktop::implementation
         Loaded({ this, &SiteHostPage::OnPageLoaded });
 
         SetStatus(
-            winrt::hstring(std::wstring(L"Carregando a interface real de ") + runtimeConfig.displayName),
-            L"O executavel esta inicializando o backend local e a interface web original do sistema.",
+            winrt::hstring(std::wstring(L"Preparando ") + runtimeConfig.displayName),
+            L"Abrindo a interface local do aplicativo.",
             true,
-            true);
+            false);
     }
 
     void SiteHostPage::InitializeComponent()
@@ -343,6 +345,11 @@ namespace winrt::DrakonDesktop::implementation
         {
             overlay.Visibility(showOverlay ? Visibility::Visible : Visibility::Collapsed);
         }
+
+        if (auto actionsHost = FindName(L"OverlayActionsHost").try_as<FrameworkElement>())
+        {
+            actionsHost.Visibility((showOverlay && !isBusy) ? Visibility::Visible : Visibility::Collapsed);
+        }
     }
 
     void SiteHostPage::UpdateNavigationButtons(WebView2 const& webView)
@@ -373,15 +380,37 @@ namespace winrt::DrakonDesktop::implementation
         }
     }
 
+    fire_and_forget SiteHostPage::RevealLoadingOverlayAfterDelay(std::uint64_t navigationToken)
+    {
+        auto lifetime = get_strong();
+        co_await winrt::resume_after(kOverlayRevealDelay);
+
+        if (navigationToken != m_navigationToken || !m_navigationInFlight)
+        {
+            co_return;
+        }
+
+        auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+        SetStatus(
+            winrt::hstring(std::wstring(L"Preparando ") + runtimeConfig.displayName),
+            L"A interface esta iniciando com os servicos locais protegidos.",
+            true,
+            true);
+    }
+
     fire_and_forget SiteHostPage::NavigateToLiveSite(bool forceReload)
     {
         auto lifetime = get_strong();
+        auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+        auto const navigationToken = ++m_navigationToken;
+        m_navigationInFlight = true;
 
         SetStatus(
-            winrt::hstring(std::wstring(L"Carregando a interface real de ") + ::DrakonDesktop::platform::RuntimeConfig().displayName),
-            winrt::hstring(std::wstring(L"Aguardando a interface React original responder em ") + ResolveUiUrl() + L"."),
+            winrt::hstring(std::wstring(L"Preparando ") + runtimeConfig.displayName),
+            L"A interface local esta sendo aberta.",
             true,
-            true);
+            false);
+        RevealLoadingOverlayAfterDelay(navigationToken);
 
         try
         {
@@ -415,6 +444,7 @@ namespace winrt::DrakonDesktop::implementation
         }
         catch (winrt::hresult_error const& ex)
         {
+            m_navigationInFlight = false;
             AppendBootstrapTrace("site-host: webview init failed");
             AppendBootstrapTrace(winrt::to_string(ex.message()));
             SetStatus(
@@ -492,6 +522,7 @@ namespace winrt::DrakonDesktop::implementation
         WebView2 const& sender,
         CoreWebView2NavigationCompletedEventArgs const& args)
     {
+        m_navigationInFlight = false;
         UpdateNavigationButtons(sender);
 
         if (args.IsSuccess())

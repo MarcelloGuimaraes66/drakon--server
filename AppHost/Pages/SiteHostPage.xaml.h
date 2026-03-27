@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace winrt::DrakonDesktop::implementation
 {
     struct SiteHostPage : winrt::Microsoft::UI::Xaml::Controls::PageT<SiteHostPage>
@@ -16,6 +18,7 @@ namespace winrt::DrakonDesktop::implementation
             bool showOverlay);
         void UpdateNavigationButtons(
             winrt::Microsoft::UI::Xaml::Controls::WebView2 const& webView);
+        winrt::fire_and_forget RevealLoadingOverlayAfterDelay(std::uint64_t navigationToken);
         winrt::fire_and_forget NavigateToLiveSite(bool forceReload);
         void OnPageLoaded(
             winrt::Windows::Foundation::IInspectable const& sender,
@@ -43,9 +46,11 @@ namespace winrt::DrakonDesktop::implementation
 
         bool m_initialized{ false };
         bool m_navigationStarted{ false };
+        bool m_navigationInFlight{ false };
         bool m_webViewHooksInstalled{ false };
         bool m_pairingBridgeInstalled{ false };
         bool m_pairingCompleted{ false };
         bool m_pairingRequested{ false };
+        std::uint64_t m_navigationToken{ 0 };
     };
 }

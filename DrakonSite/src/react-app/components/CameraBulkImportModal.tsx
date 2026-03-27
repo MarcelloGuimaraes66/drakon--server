@@ -198,7 +198,7 @@ export default function CameraBulkImportModal({
         }
 
         if (normalizedStatus === "failed") {
-          setError(data.error || "Qwen could not normalize this file.");
+          setError(data.error || "The local import assistant could not normalize this file.");
           setStage("error");
           return;
         }
@@ -364,13 +364,13 @@ export default function CameraBulkImportModal({
             <div>
               <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-blue-500/30 bg-blue-500/10 px-3 py-1 text-xs font-medium text-blue-200">
                 <Sparkles className="h-3.5 w-3.5" />
-                Local Qwen import assist
+                Local import assistant
               </div>
               <h2 className="text-2xl font-semibold text-gray-100">Import cameras from file</h2>
               <p className="mt-2 max-w-3xl text-sm text-gray-400">
-                Upload Excel, CSV, JSON, TSV, or plain text. The local Qwen runtime will try to
-                map each row into camera fields, generate a placeholder address when needed, and
-                warn you about rows that still need required data before they can be created.
+                Upload Excel, CSV, JSON, TSV, or plain text. The local import assistant will try
+                to map each row into camera fields, generate a placeholder address when needed,
+                and warn you about rows that still need required data before they can be created.
               </p>
             </div>
 
@@ -442,7 +442,7 @@ export default function CameraBulkImportModal({
                     ) : (
                       <>
                         <FileUp className="h-4 w-4" />
-                        Analyze with Qwen
+                        Analyze file
                       </>
                     )}
                   </button>
@@ -467,7 +467,7 @@ export default function CameraBulkImportModal({
                   </div>
                   <div className="rounded-xl border border-gray-800 bg-gray-950/80 p-4">
                     <p className="text-xs uppercase tracking-wide text-gray-500">
-                      Rows sent to Qwen
+                      Rows analyzed
                     </p>
                     <p className="mt-1 text-sm font-medium text-gray-100">
                       {uploadMeta.rows_sent_to_llm ?? "-"}
@@ -482,7 +482,7 @@ export default function CameraBulkImportModal({
                 <div className="flex items-center gap-3">
                   <Loader2 className="h-5 w-5 animate-spin" />
                   <div>
-                    <p className="font-medium">Qwen is normalizing the imported rows.</p>
+                    <p className="font-medium">The local import assistant is normalizing the imported rows.</p>
                     <p className="mt-1 text-blue-200/80">
                       We are matching whatever columns exist in the file to the internal camera
                       fields and checking which rows are ready to create.

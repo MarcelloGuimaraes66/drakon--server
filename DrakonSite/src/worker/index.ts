@@ -11043,7 +11043,7 @@ app.post("/api/camera-imports/preview", anyAuthMiddleware, async (c) => {
     return c.json(
       {
         error:
-          "No EXE connected. Camera import preview requires the desktop agent online so Qwen can normalize the file.",
+          "No EXE connected. Camera import preview requires the desktop agent online so the file can be normalized.",
       },
       409
     );

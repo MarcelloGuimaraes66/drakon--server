@@ -6332,22 +6332,26 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (doc.contains("identity_signature_traits")) {
             temporal::appendUniqueTraitsToArray(identitySignatureTraits, doc["identity_signature_traits"]);
         }
-        identitySignatureTraits = temporal::curateIdentitySignatureTraits(
-            identityTypeHint,
-            stableAttributes,
-            doc["updated_traits"],
-            identitySignatureTraits);
+        if (identitySignatureTraits.empty()) {
+            identitySignatureTraits = temporal::curateIdentitySignatureTraits(
+                identityTypeHint,
+                stableAttributes,
+                doc["updated_traits"],
+                identitySignatureTraits);
+        }
         doc["identity_signature_traits"] = identitySignatureTraits;
 
         json identityContextTraits = json::array();
         if (doc.contains("identity_context_traits")) {
             temporal::appendUniqueTraitsToArray(identityContextTraits, doc["identity_context_traits"]);
         }
-        identityContextTraits = temporal::curateIdentityContextTraits(
-            identityTypeHint,
-            stableAttributes,
-            doc["updated_traits"],
-            identityContextTraits);
+        if (identityContextTraits.empty()) {
+            identityContextTraits = temporal::curateIdentityContextTraits(
+                identityTypeHint,
+                stableAttributes,
+                doc["updated_traits"],
+                identityContextTraits);
+        }
         doc["identity_context_traits"] = identityContextTraits;
 
         std::string identitySignatureSummary =
@@ -6362,17 +6366,70 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         return doc;
     };
 
+    auto buildCrossCameraHuntTargetEntity = [&](const json& rawDoc) -> json {
+        const json normalized = normalizeCrossCameraTargetEntity(rawDoc);
+        if (!normalized.is_object() || normalized.empty()) return json::object();
+
+        json projected = json::object();
+        auto copyNonEmptyString = [&](const char* fieldName) {
+            const std::string value = temporal::trim(temporal::strField(normalized, fieldName));
+            if (!value.empty()) projected[fieldName] = value;
+        };
+
+        copyNonEmptyString("entity_id");
+        copyNonEmptyString("entity_key");
+        copyNonEmptyString("entity_type");
+        copyNonEmptyString("known_name");
+
+        json identityTraits = json::array();
+        if (normalized.contains("identity_signature_traits")) {
+            temporal::appendUniqueTraitsToArray(identityTraits, normalized["identity_signature_traits"]);
+        }
+        if (identityTraits.empty() && normalized.contains("stable_attributes")) {
+            temporal::appendUniqueTraitsToArray(identityTraits, normalized["stable_attributes"]);
+        }
+        if (identityTraits.empty() && normalized.contains("key_traits")) {
+            temporal::appendUniqueTraitsToArray(identityTraits, normalized["key_traits"]);
+        }
+        if (identityTraits.size() > 8) {
+            identityTraits.erase(identityTraits.begin() + 8, identityTraits.end());
+        }
+        if (!identityTraits.empty()) {
+            projected["identity_signature_traits"] = identityTraits;
+        }
+
+        std::string identitySignatureSummary =
+            temporal::trim(temporal::strField(normalized, "identity_signature_summary"));
+        if (identitySignatureSummary.empty() && !identityTraits.empty()) {
+            identitySignatureSummary = temporal::buildIdentitySignatureSummary(
+                temporal::trim(temporal::strField(
+                    normalized, "entity_type", temporal::strField(normalized, "entity_key"))),
+                identityTraits);
+        }
+        if (!identitySignatureSummary.empty()) {
+            projected["identity_signature_summary"] = identitySignatureSummary;
+        }
+
+        if (normalized.contains("reference_image_urls") && normalized["reference_image_urls"].is_array() &&
+            !normalized["reference_image_urls"].empty())
+        {
+            projected["reference_image_urls"] = normalized["reference_image_urls"];
+        }
+        if (normalized.contains("resolved_identity") && normalized["resolved_identity"].is_object() &&
+            !normalized["resolved_identity"].empty())
+        {
+            projected["resolved_identity"] = normalized["resolved_identity"];
+        }
+        return projected;
+    };
+
     auto buildCrossCameraSearchPrompt = [&](const json& targetEntity) -> std::string {
         const json normalized = normalizeCrossCameraTargetEntity(targetEntity);
         const std::string entityType = temporal::trim(
             temporal::strField(normalized, "entity_type", temporal::strField(normalized, "entity_key", "object")));
         const std::string knownName = temporal::trim(temporal::strField(normalized, "known_name"));
-        const std::string description = temporal::trim(temporal::strField(normalized, "description"));
-        const std::string appearanceSummary = temporal::trim(temporal::strField(normalized, "appearance_summary"));
         const std::string identitySignatureSummary =
             temporal::trim(temporal::strField(normalized, "identity_signature_summary"));
-        const std::string lastSeenTs = temporal::trim(temporal::strField(normalized, "last_seen_ts_utc"));
-        const std::string lastSeenZone = temporal::trim(temporal::strField(normalized, "last_seen_zone"));
         std::ostringstream prompt;
         auto appendTraitSentence = [&](const char* fieldName, const char* label, std::size_t maxItems) {
             if (!normalized.contains(fieldName) || !normalized[fieldName].is_array() || normalized[fieldName].empty()) {
@@ -6402,8 +6459,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         prompt << "Look for the same " << (entityType.empty() ? "object" : entityType)
                << " from another camera in this job step.";
         prompt << " Treat this shared hunt as a priority task for the receiving camera even if its local task text is unrelated.";
-        prompt << " Prioritize the target's intrinsic appearance, clothing, accessories, carried objects, markings, and vehicle details.";
-        prompt << " Treat room layout, furniture, doors, walls, and surrounding background as low-value unless physically attached to the target.";
+        prompt << " Use only target-centric identity cues such as physical traits, clothing, accessories, carried objects, markings, and vehicle details.";
+        prompt << " Ignore room layout, furniture, doors, walls, lighting, activity, pose, and surrounding background.";
         if (!knownName.empty()) {
             prompt << " Known identity hint: " << knownName << ".";
         }
@@ -6414,14 +6471,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             appendTraitSentence("identity_signature_traits", "Identity signature traits", 8);
         }
         else {
-            if (!description.empty()) {
-                prompt << " Primary description: " << description << ".";
-            }
-            if (!appearanceSummary.empty() && appearanceSummary != description) {
-                prompt << " Stable appearance summary: " << appearanceSummary << ".";
-            }
-            appendTraitSentence("stable_attributes", "Stable appearance attributes", 8);
-            appendTraitSentence("updated_traits", "Current contextual cues", 6);
+            appendTraitSentence("stable_attributes", "Stable identity traits", 8);
+            appendTraitSentence("key_traits", "Identity cues", 8);
         }
         if (normalized.contains("resolved_identity") && normalized["resolved_identity"].is_object()) {
             prompt << " Resolved identity metadata is available and should be treated as strong supporting evidence when the appearance is compatible.";
@@ -6430,12 +6481,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             !normalized["reference_image_urls"].empty())
         {
             prompt << " Reference image metadata is available for this target.";
-        }
-        if (!lastSeenTs.empty()) {
-            prompt << " Last seen at " << lastSeenTs << " UTC.";
-        }
-        if (!lastSeenZone.empty()) {
-            prompt << " Last seen zone/context: " << lastSeenZone << ".";
         }
         prompt << " If this batch strongly matches the shared target despite normal cross-camera changes in angle, lighting, scale, or background, emit a positive watchlist match update for this hunt using the watchlist field from the active response schema, even if the local alert_condition would otherwise stay false or the receiving camera has a different local task.";
         return prompt.str();
@@ -6446,12 +6491,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         json hunt = rawHunt;
         json targetEntity = json::object();
         if (hunt.contains("target_entity") && hunt["target_entity"].is_object()) {
-            targetEntity = normalizeCrossCameraTargetEntity(hunt["target_entity"]);
+            targetEntity = buildCrossCameraHuntTargetEntity(hunt["target_entity"]);
         }
         else if (hunt.contains("entities") && hunt["entities"].is_array()) {
             for (const auto& entityDoc : hunt["entities"]) {
                 if (!entityDoc.is_object()) continue;
-                targetEntity = normalizeCrossCameraTargetEntity(entityDoc);
+                targetEntity = buildCrossCameraHuntTargetEntity(entityDoc);
                 if (!targetEntity.empty()) break;
             }
         }
@@ -6476,11 +6521,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 const std::string sourceEntityType = temporal::trim(temporal::strField(targetEntity, "entity_type"));
                 if (!sourceEntityType.empty()) hunt["source_entity_type"] = sourceEntityType;
             }
-            if (!hunt.contains("search_prompt") || !hunt["search_prompt"].is_string() ||
-                temporal::trim(hunt["search_prompt"].get<std::string>()).empty())
-            {
-                hunt["search_prompt"] = buildCrossCameraSearchPrompt(targetEntity);
-            }
+            hunt["search_prompt"] = buildCrossCameraSearchPrompt(targetEntity);
         }
         return hunt;
     };
@@ -6671,7 +6712,19 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 continue;
             }
 
-            const json targetEntity = normalizeCrossCameraTargetEntity(publishSelection["target_entity"]);
+            const json normalizedTargetEntity = normalizeCrossCameraTargetEntity(publishSelection["target_entity"]);
+            const json targetEntity = buildCrossCameraHuntTargetEntity(normalizedTargetEntity);
+            if (!targetEntity.is_object() || targetEntity.empty()) {
+                Logger::instance().logDebug(
+                    "job",
+                    "runAgentInferenceOnCamera_: skipped cross-camera hunt publish job_id=" +
+                    std::to_string(jobId) + " step_id=" + std::to_string(stepId) +
+                    " camera_id=" + std::to_string(cameraId) +
+                    " operator_id=" + operatorId +
+                    " reason=identity_only_projection_empty"
+                );
+                continue;
+            }
             const std::string searchPrompt = buildCrossCameraSearchPrompt(targetEntity);
             const std::string targetEntityId = temporal::trim(temporal::strField(targetEntity, "entity_id"));
 

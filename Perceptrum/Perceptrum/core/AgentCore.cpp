@@ -13539,6 +13539,7 @@ static void logGroupCameraDebug_(
 static constexpr std::size_t kStructuredVisionMaxAlertRegionIds_ = 16;
 static constexpr std::size_t kStructuredVisionMaxIdentityPatchItems_ = 32;
 static constexpr std::size_t kStructuredVisionMaxIdentityTraitItems_ = 16;
+static constexpr std::size_t kStructuredVisionMaxIdentityContextTraitItems_ = 4;
 static constexpr std::size_t kStructuredVisionMaxObservationItems_ = 48;
 static constexpr std::size_t kStructuredVisionMaxUnknownReasonItems_ = 16;
 static constexpr std::size_t kStructuredVisionMaxFaceIdTargetNames_ = 8;
@@ -14983,6 +14984,9 @@ namespace {
             if (source.contains("stable_attributes")) {
                 target["stable_attributes"] = source["stable_attributes"];
             }
+            if (source.contains("identity_signature_traits")) {
+                target["identity_signature_traits"] = source["identity_signature_traits"];
+            }
 
             const std::string zone = readTemporalEvidenceZone_(source);
             if (!zone.empty() && !target.contains("zone")) target["zone"] = zone;
@@ -14996,6 +15000,12 @@ namespace {
             }
             else if (source.contains("key_traits")) {
                 target["updated_traits"] = source["key_traits"];
+            }
+            if (source.contains("identity_context_traits")) {
+                target["identity_context_traits"] = source["identity_context_traits"];
+            }
+            if (source.contains("scene_brief") && source["scene_brief"].is_string()) {
+                target["scene_brief"] = source["scene_brief"];
             }
             if (source.contains("reference_image_urls") && source["reference_image_urls"].is_array()) {
                 target["reference_image_urls"] = source["reference_image_urls"];
@@ -15777,7 +15787,56 @@ namespace {
         const std::string& role,
         const std::string& rawText)
     {
-        const std::string text = trimAscii(rawText);
+        const auto isPrettyJsonLogMarker = [](const std::string& line) {
+            const std::string trimmed = trimAscii(line);
+            return trimmed == temporal::kTemporalStaticPromptMarker ||
+                trimmed == temporal::kTemporalRuntimePromptMarker;
+        };
+
+        const auto tryPrettyPrintJsonLine = [](const std::string& line) {
+            const std::string trimmed = trimAscii(line);
+            if (trimmed.empty()) {
+                return line;
+            }
+            const char first = trimmed.front();
+            if (first != '{' && first != '[') {
+                return line;
+            }
+            try {
+                return nlohmann::json::parse(trimmed).dump(2);
+            }
+            catch (...) {
+                return line;
+            }
+        };
+
+        const auto normalizePromptTextForLog = [&](const std::string& textForLog) {
+            std::istringstream input(textForLog);
+            std::ostringstream normalized;
+            std::string line;
+            bool wroteAny = false;
+            bool expectJsonAfterMarker = false;
+
+            while (std::getline(input, line)) {
+                if (wroteAny) {
+                    normalized << "\n";
+                }
+
+                if (expectJsonAfterMarker) {
+                    normalized << tryPrettyPrintJsonLine(line);
+                    expectJsonAfterMarker = false;
+                }
+                else {
+                    normalized << line;
+                    expectJsonAfterMarker = isPrettyJsonLogMarker(line);
+                }
+                wroteAny = true;
+            }
+
+            return trimAscii(normalized.str());
+        };
+
+        const std::string text = normalizePromptTextForLog(trimAscii(rawText));
         if (text.empty()) return;
 
         if (out.tellp() > 0) {
@@ -16139,7 +16198,10 @@ namespace {
                         { "short_description", makeNullableStringSchema_() },
                         { "appearance_summary", makeNullableStringSchema_() },
                         { "stable_attributes", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "identity_signature_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "identity_context_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityContextTraitItems_)) },
+                        { "scene_brief", makeNullableStringSchema_() },
                         { "reference_image_urls", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxReferenceImageUrls_)) },
                         { "frame_ref", makeFrameRefSchema_() }
                     },
@@ -16365,8 +16427,14 @@ namespace {
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
         prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, appearance_summary, stable_attributes, and any updated_traits/context cues needed for continuity.\n";
+        prompt << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification. Fill it with strong target-centric physical identity cues only.\n";
+        prompt << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n";
+        prompt << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n";
+        prompt << "- identity_context_traits is optional and should contain only a few brief non-identity cues for current-round continuity. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
+        prompt << "- scene_brief is optional and should be a very short scene hint only when useful for continuity. Keep it to a few words.\n";
         prompt << "- stable_attributes should capture durable target-centric identity cues that survive time and cross-camera changes: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, body build, markings, or vehicle make/model/color/plate fragments when visible.\n";
         prompt << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n";
+        prompt << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits or stable_attributes.\n";
         prompt << "- updated_traits may add transient current-round cues or scene context for continuity, but do not use them as a substitute for stable_attributes.\n";
         prompt << "- visibility_updates are optional. Emit at most one per relevant entity when asserting a current-round visibility state.\n";
         prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
@@ -16747,6 +16815,11 @@ namespace {
             prompt << "- start_condition_update: optional object with step_id integer\n";
             prompt << "- identity_updates: optional array or null (max " <<
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
+            prompt << "- identity_updates[*].identity_signature_traits: optional array of strong physical identity cues or null (max " <<
+                kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
+            prompt << "- identity_updates[*].identity_context_traits: optional array of brief continuity/context cues or null (max " <<
+                kStructuredVisionMaxIdentityContextTraitItems_ << " items)\n";
+            prompt << "- identity_updates[*].scene_brief: optional very short scene hint string or null\n";
             prompt << "- visibility_updates: optional array or null (max " <<
                 kStructuredVisionMaxObservationItems_ << " items)\n";
             prompt << "- event_updates: optional array or null (max " <<

@@ -253,7 +253,7 @@ inline json curateIdentitySignatureTraits(
     json curated = json::array();
     appendUniqueStringsToArray(curated, existingTraits);
 
-    auto appendMatchingTraits = [&](const json& source, bool fallbackNonScene) {
+    auto appendMatchingTraits = [&](const json& source) {
         const json parsed = parseTraitsValue(source);
         if (!parsed.is_array()) return;
         for (const auto& item : parsed) {
@@ -265,20 +265,11 @@ inline json curateIdentitySignatureTraits(
             if (cueLike && !sceneLike) {
                 appendUniqueStringsToArray(curated, trait);
             }
-            else if (fallbackNonScene && !sceneLike && !traitLooksLikeTransientIdentityContext(trait)) {
-                appendUniqueStringsToArray(curated, trait);
-            }
         }
     };
 
-    appendMatchingTraits(stableTraits, false);
-    appendMatchingTraits(contextTraits, false);
-    if (curated.empty()) {
-        appendMatchingTraits(stableTraits, true);
-    }
-    if (curated.empty()) {
-        appendMatchingTraits(contextTraits, true);
-    }
+    appendMatchingTraits(stableTraits);
+    if (curated.empty()) appendMatchingTraits(contextTraits);
     if (curated.size() > 8) {
         curated.erase(curated.begin() + 8, curated.end());
     }
@@ -291,10 +282,11 @@ inline json curateIdentityContextTraits(
     const json& contextTraits,
     const json& existingTraits = json::array())
 {
+    (void)rawEntityType;
     json curated = json::array();
     appendUniqueStringsToArray(curated, existingTraits);
 
-    auto appendContextTraits = [&](const json& source, bool includeNonIdentityFallback) {
+    auto appendContextTraits = [&](const json& source) {
         const json parsed = parseTraitsValue(source);
         if (!parsed.is_array()) return;
         for (const auto& item : parsed) {
@@ -303,17 +295,16 @@ inline json curateIdentityContextTraits(
             if (trait.empty()) continue;
             const bool sceneLike = traitLooksLikeSceneOrBackgroundContext(trait);
             const bool transientLike = traitLooksLikeTransientIdentityContext(trait);
-            const bool identityCue = traitLooksLikeIdentityCueForEntityType(rawEntityType, trait);
-            if (sceneLike || transientLike || (includeNonIdentityFallback && !identityCue)) {
+            if (sceneLike || transientLike) {
                 appendUniqueStringsToArray(curated, trait);
             }
         }
     };
 
-    appendContextTraits(stableTraits, false);
-    appendContextTraits(contextTraits, true);
-    if (curated.size() > 8) {
-        curated.erase(curated.begin() + 8, curated.end());
+    appendContextTraits(contextTraits);
+    if (curated.empty()) appendContextTraits(stableTraits);
+    if (curated.size() > 4) {
+        curated.erase(curated.begin() + 4, curated.end());
     }
     return curated;
 }
@@ -1682,6 +1673,13 @@ inline json extractContextTraitsFromNode(const json& node) {
         return parseTraitsValue(node["updated_traits"]);
     }
     return json::array();
+}
+
+inline std::string extractSceneBriefFromNode(const json& node) {
+    if (!node.is_object() || !node.contains("scene_brief") || !node["scene_brief"].is_string()) {
+        return std::string();
+    }
+    return trim(node["scene_brief"].get<std::string>());
 }
 
 inline json extractTraitsFromNode(const json& node) {
@@ -3692,6 +3690,15 @@ inline void upsertIdentityMemory(
 
     const json stableTraits = extractStableTraitsFromNode(patch);
     const json contextTraits = extractContextTraitsFromNode(patch);
+    const json explicitIdentitySignatureTraits =
+        patch.contains("identity_signature_traits")
+            ? parseTraitsValue(patch["identity_signature_traits"])
+            : json::array();
+    const json explicitIdentityContextTraits =
+        patch.contains("identity_context_traits")
+            ? parseTraitsValue(patch["identity_context_traits"])
+            : json::array();
+    const std::string sceneBrief = extractSceneBriefFromNode(patch);
 
     json mergedStableAttributes = json::array();
     if (mem.contains("stable_attributes")) appendUniqueStringsToArray(mergedStableAttributes, mem["stable_attributes"]);
@@ -3699,9 +3706,6 @@ inline void upsertIdentityMemory(
         appendUniqueStringsToArray(mergedStableAttributes, (*entityState)["stable_attributes"]);
     }
     appendUniqueTraitsToArray(mergedStableAttributes, stableTraits);
-    if (mergedStableAttributes.empty()) {
-        appendUniqueTraitsToArray(mergedStableAttributes, contextTraits);
-    }
     if (!mergedStableAttributes.empty()) {
         mem["stable_attributes"] = mergedStableAttributes;
         if (entityState) (*entityState)["stable_attributes"] = mergedStableAttributes;
@@ -3713,9 +3717,6 @@ inline void upsertIdentityMemory(
         appendUniqueTraitsToArray(mergedKeyTraits, (*entityState)["key_traits"]);
     }
     appendUniqueTraitsToArray(mergedKeyTraits, stableTraits);
-    if (mergedKeyTraits.empty()) {
-        appendUniqueTraitsToArray(mergedKeyTraits, contextTraits);
-    }
     if (!mergedKeyTraits.empty()) {
         mem["key_traits"] = mergedKeyTraits;
         if (entityState) (*entityState)["key_traits"] = mergedKeyTraits;
@@ -3725,6 +3726,10 @@ inline void upsertIdentityMemory(
         mem["latest_context_traits"] = contextTraits;
         if (entityState) (*entityState)["latest_context_traits"] = contextTraits;
     }
+    if (!sceneBrief.empty()) {
+        mem["scene_brief"] = sceneBrief;
+        if (entityState) (*entityState)["scene_brief"] = sceneBrief;
+    }
 
     json mergedIdentitySignatureTraits = json::array();
     if (mem.contains("identity_signature_traits")) {
@@ -3733,11 +3738,16 @@ inline void upsertIdentityMemory(
     if (entityState && entityState->contains("identity_signature_traits")) {
         appendUniqueStringsToArray(mergedIdentitySignatureTraits, (*entityState)["identity_signature_traits"]);
     }
-    mergedIdentitySignatureTraits = curateIdentitySignatureTraits(
-        entityTypeHint,
-        mergedStableAttributes,
-        contextTraits,
-        mergedIdentitySignatureTraits);
+    if (explicitIdentitySignatureTraits.is_array() && !explicitIdentitySignatureTraits.empty()) {
+        appendUniqueStringsToArray(mergedIdentitySignatureTraits, explicitIdentitySignatureTraits);
+    }
+    else {
+        mergedIdentitySignatureTraits = curateIdentitySignatureTraits(
+            entityTypeHint,
+            mergedStableAttributes,
+            contextTraits,
+            mergedIdentitySignatureTraits);
+    }
     if (!mergedIdentitySignatureTraits.empty()) {
         mem["identity_signature_traits"] = mergedIdentitySignatureTraits;
         if (entityState) (*entityState)["identity_signature_traits"] = mergedIdentitySignatureTraits;
@@ -3756,11 +3766,16 @@ inline void upsertIdentityMemory(
     if (entityState && entityState->contains("identity_context_traits")) {
         appendUniqueStringsToArray(mergedIdentityContextTraits, (*entityState)["identity_context_traits"]);
     }
-    mergedIdentityContextTraits = curateIdentityContextTraits(
-        entityTypeHint,
-        mergedStableAttributes,
-        contextTraits,
-        mergedIdentityContextTraits);
+    if (explicitIdentityContextTraits.is_array() && !explicitIdentityContextTraits.empty()) {
+        appendUniqueStringsToArray(mergedIdentityContextTraits, explicitIdentityContextTraits);
+    }
+    else {
+        mergedIdentityContextTraits = curateIdentityContextTraits(
+            entityTypeHint,
+            mergedStableAttributes,
+            contextTraits,
+            mergedIdentityContextTraits);
+    }
     if (!mergedIdentityContextTraits.empty()) {
         mem["identity_context_traits"] = mergedIdentityContextTraits;
         if (entityState) (*entityState)["identity_context_traits"] = mergedIdentityContextTraits;
@@ -5281,6 +5296,11 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"
         << "- identity_patch and observations MUST be arrays of JSON objects (never plain strings).\n"
         << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, appearance_summary, stable_attributes, and updated_traits/key_traits.\n"
+        << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification, focused on strong physical identity cues only.\n"
+        << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n"
+        << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n"
+        << "- identity_context_traits is optional and should contain only a few brief non-identity continuity cues.\n"
+        << "- scene_brief is optional and should be a very short scene hint only when useful for continuity.\n"
         << "- If the same continuous action stays visible across multiple frames, emit one event observation for the first clearly supported transition and use later frames only as continuity for that same episode.\n"
         << "- When you include a continuity object for a later frame of the same episode, mark it with continuation=true and counts_as_new_event=false.\n"
         << "- Reuse stable entity_id/entity_key across rounds for the same real-world entity; create a new ID only when it is clearly a different entity.\n"
@@ -5295,17 +5315,18 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
         << "- Keep stable_attributes concise (2-8 items) and focused on durable target-centric identity cues: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, build, markings, or vehicle make/model/color/plate fragments when visible.\n"
         << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside stable_attributes unless they are physically attached to the target.\n"
+        << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits or stable_attributes.\n"
         << "- updated_traits may capture transient cues or scene context for continuity, but they must not replace the stable appearance signature.\n"
         << "- If a tracked entity is visible, include at least one identity_patch item with decision, confidence, and an appearance snapshot for continuity.\n"
         << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch even when entity_id is inferred from that context.\n"
         << "- If a tracked entity from state_slice or identity_memory is no longer visible in this batch, return identity_patch for that same entity_id with decision set to not_visible_this_segment or absent.\n"
         << "- If TEMPORAL_RUNTIME_INPUT_JSON includes cross_camera_watchlist, treat it as an authoritative watchlist from other cameras in the same Job Step, even if this camera has different local alert logic.\n"
-        << "- Each cross_camera_watchlist entry may include target_entity, entities, and search_prompt. Use target_entity and search_prompt as the primary instructions for what to look for.\n"
+        << "- Each cross_camera_watchlist entry may include target_entity, entities, and search_prompt. Treat target_entity as an identity-only signature from the source camera and use target_entity plus search_prompt as the primary instructions for what to look for.\n"
         << "- target_entity.entity_id and source_entity_id in cross_camera_watchlist refer to the source-camera target that started the hunt, not to a local entity_id in the current camera.\n"
         << "- Treat cross_camera_watchlist as a high-priority shared hunt for this round, even when the local task text is about another class or activity.\n"
         << "- Evaluate cross_camera_watchlist independently from the local alert_condition. A strong watchlist match should still be reported even when the local alert_condition remains false.\n"
         << "- Do not let an unrelated local answer suppress a strong cross_camera_watchlist match.\n"
-        << "- Compare watchlist targets using target-centric appearance traits such as clothing, colors, accessories, carried objects, body markings, vehicle details, and resolved_identity metadata when present. Treat room/background details as low-value unless physically attached to the target. Allow for normal cross-camera differences in angle, lighting, scale, and background.\n"
+        << "- Compare watchlist targets using target-centric identity traits such as physical appearance, clothing, accessories, carried objects, body markings, vehicle details, and resolved_identity metadata when present. Ignore room/background details, furniture, doors, walls, lighting, activity, and surrounding scene unless physically attached to the target. Allow for normal cross-camera differences in angle, lighting, scale, and background.\n"
         << "- If the current batch strongly matches one or more watchlist entries, return " << watchlistMatchField << " as an array of JSON objects with hunt_id, matched_entity_id, confidence, and optional reason.\n"
         << "- matched_entity_id inside " << watchlistMatchField << " must be the local entity_id from the current camera when available. Do not copy target_entity.entity_id as matched_entity_id unless that exact same local ID is already being used in this camera.\n"
         << "- Do not write temporal state directly.\n";

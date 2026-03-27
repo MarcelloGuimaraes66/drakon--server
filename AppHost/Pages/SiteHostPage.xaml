@@ -30,55 +30,107 @@
 
         <Grid
             x:Name="LoadingOverlay"
-            Background="{StaticResource DrakonOverlayBrush}">
+            Background="{StaticResource DrakonOverlayBrush}"
+            Visibility="Collapsed">
             <Border
-                MaxWidth="640"
-                Padding="28"
+                MaxWidth="760"
+                Padding="34"
                 Background="{StaticResource DrakonPanelBrush}"
                 BorderBrush="{StaticResource DrakonPanelBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="24"
                 HorizontalAlignment="Center"
                 VerticalAlignment="Center">
-                <StackPanel Spacing="18">
-                    <ProgressRing
-                        x:Name="LoadingProgressRing"
-                        Width="44"
-                        Height="44"
+                <Grid ColumnSpacing="28">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Grid
+                        Width="104"
+                        Height="104"
                         HorizontalAlignment="Left"
-                        IsActive="True" />
-
-                    <StackPanel Spacing="8">
-                        <TextBlock
-                            x:Name="StatusTitleText"
-                            FontSize="26"
-                            FontWeight="SemiBold"
-                            Foreground="{StaticResource DrakonStrongTextBrush}"
-                            Text="Carregando a interface real do DrakonSite" />
-                        <TextBlock
-                            x:Name="StatusDetailText"
-                            TextWrapping="Wrap"
-                            Style="{StaticResource DrakonBodyTextStyle}"
-                            Text="O executável está inicializando o backend local e a interface React original para manter o comportamento do sistema fonte." />
-                    </StackPanel>
-
-                    <StackPanel Orientation="Horizontal" Spacing="12">
-                        <Button
-                            x:Name="ReloadButton"
-                            Padding="16,10"
-                            Background="{StaticResource DrakonAccentBrush}"
-                            Foreground="White"
-                            Content="Recarregar" />
-                        <Button
-                            x:Name="OpenInBrowserButton"
-                            Padding="16,10"
-                            Background="{StaticResource DrakonShellChipBrush}"
+                        VerticalAlignment="Top">
+                        <Border
+                            Width="104"
+                            Height="104"
+                            Background="{StaticResource DrakonHeroBrush}"
+                            CornerRadius="30"
+                            Opacity="0.9" />
+                        <Border
+                            Width="76"
+                            Height="76"
+                            Background="{StaticResource DrakonShellBackgroundBrush}"
                             BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
                             BorderThickness="1"
-                            Foreground="{StaticResource DrakonStrongTextBrush}"
-                            Content="Abrir no navegador" />
+                            CornerRadius="24"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center">
+                            <Image
+                                Width="42"
+                                Height="42"
+                                HorizontalAlignment="Center"
+                                VerticalAlignment="Center"
+                                Source="ms-appx:///Assets/Branding/icon-dark.png"
+                                Stretch="Uniform" />
+                        </Border>
+                        <ProgressRing
+                            x:Name="LoadingProgressRing"
+                            Width="104"
+                            Height="104"
+                            Foreground="{StaticResource DrakonAccentBrush}"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            IsActive="True" />
+                    </Grid>
+
+                    <StackPanel
+                        Grid.Column="1"
+                        Spacing="18"
+                        VerticalAlignment="Center">
+                        <Image
+                            Height="34"
+                            HorizontalAlignment="Left"
+                            Source="ms-appx:///Assets/Branding/wordmark-dark.png"
+                            Stretch="Uniform" />
+
+                        <StackPanel Spacing="8">
+                            <TextBlock
+                                x:Name="StatusTitleText"
+                                FontSize="30"
+                                FontWeight="SemiBold"
+                                Foreground="{StaticResource DrakonStrongTextBrush}"
+                                Text="Preparando o aplicativo" />
+                            <TextBlock
+                                x:Name="StatusDetailText"
+                                TextWrapping="WrapWholeWords"
+                                Style="{StaticResource DrakonBodyTextStyle}"
+                                Text="Estamos abrindo a interface local com a identidade do produto." />
+                        </StackPanel>
+
+                        <StackPanel
+                            x:Name="OverlayActionsHost"
+                            Orientation="Horizontal"
+                            Spacing="12"
+                            Visibility="Collapsed">
+                            <Button
+                                x:Name="ReloadButton"
+                                Padding="16,10"
+                                Background="{StaticResource DrakonAccentBrush}"
+                                Foreground="White"
+                                Content="Recarregar" />
+                            <Button
+                                x:Name="OpenInBrowserButton"
+                                Padding="16,10"
+                                Background="{StaticResource DrakonShellChipBrush}"
+                                BorderBrush="{StaticResource DrakonShellChipBorderBrush}"
+                                BorderThickness="1"
+                                Foreground="{StaticResource DrakonStrongTextBrush}"
+                                Content="Abrir no navegador" />
+                        </StackPanel>
                     </StackPanel>
-                </StackPanel>
+                </Grid>
             </Border>
         </Grid>
     </Grid>
