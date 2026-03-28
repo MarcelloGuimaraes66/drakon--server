@@ -16465,12 +16465,16 @@ namespace {
         prompt << "TEMPORAL DELTA OUTPUT CONTRACT:\n";
         prompt << "- Return only updates discovered in the current batch.\n";
         prompt << "- Omit any field that has no update for this round, except that visible tracked entities still need a compact identity snapshot for continuity.\n";
+        prompt << "- Never emit null, empty arrays, or empty objects for optional fields. If an optional field has no new information, omit it entirely.\n";
         prompt << "- Do not repeat persisted state, prior counts, or unchanged events from TEMPORAL_RUNTIME_STATE_JSON. Reuse prior identity only as context for the current-round snapshot.\n";
         prompt << "- answer is optional. Omit it unless a short user-facing explanation is needed because of alert, start condition, watchlist match, face match, or a meaningful ambiguity explanation.\n";
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
-        prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one identity_updates item with entity_id when known, short_description, identity_signature_traits, and any updated_traits/context cues needed for continuity.\n";
-        prompt << "- identity_feature_candidates is the authoritative structured identity field when enough detail is visible for reidentification.\n";
+        prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one compact identity_updates item with entity_id when known and only the minimum fields needed for continuity in this batch.\n";
+        prompt << "- short_description is optional and delta-only. Emit it only for a newly seen entity or when the current batch materially changes the concise summary relative to prior description or recent memory.\n";
+        prompt << "- identity_feature_candidates is an optional delta-only structured identity field when enough detail is visible for reidentification.\n";
+        prompt << "- Emit identity_feature_candidates only when the current batch introduces a strong new target-centric cue, clearly corrects or contradicts prior identity memory, or establishes identity for a newly seen entity.\n";
+        prompt << "- If the current batch only reconfirms cues already present in TEMPORAL_RUNTIME_STATE_JSON identity_memory, description, key_traits, or identity_signature_traits, omit identity_feature_candidates instead of repeating unchanged structured identity evidence.\n";
         prompt << "- Each identity_feature_candidates item must include text, category, and relation_to_target.\n";
         prompt << "- Use category values such as physical_trait, clothing, accessory, body_marking, carried_object, vehicle_detail, plate_fragment, pose_or_activity, visibility_condition, continuity_context, nearby_object, or scene.\n";
         prompt << "- Use relation_to_target values such as intrinsic_body, worn_on_target, attached_to_target, carried_by_target, vehicle_body, attached_to_vehicle, plate_on_target, detached_near_target, pose_or_activity, visibility_condition, continuity_context, or background_scene.\n";
@@ -16480,13 +16484,13 @@ namespace {
         prompt << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n";
         prompt << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n";
         prompt << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n";
-        prompt << "- identity_context_traits is optional and should contain only a few brief non-identity cues for current-round continuity. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
+        prompt << "- identity_context_traits is optional, delta-only, and should contain only a few brief non-identity cues for current-round continuity. Emit it only when the current batch adds or changes continuity context. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
         prompt << "- scene_brief is optional and should be a very short scene hint only when useful for continuity. Keep it to a few words.\n";
         prompt << "- Keep identity_signature_traits concise (2-8 items) and focused on durable target-centric identity cues that survive time and cross-camera changes: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, body build, markings, or vehicle make/model/color/plate fragments when visible.\n";
         prompt << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside identity_signature_traits unless they are physically attached to the target.\n";
         prompt << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits.\n";
-        prompt << "- updated_traits may add transient current-round cues or scene context for continuity, but do not use them as a substitute for identity_signature_traits.\n";
-        prompt << "- visibility_updates are optional. Emit at most one per relevant entity when asserting a current-round visibility state.\n";
+        prompt << "- updated_traits are optional and delta-only. Emit them only when the current batch adds or changes transient cues or scene context relative to prior memory; do not use them as a substitute for identity_signature_traits.\n";
+        prompt << "- visibility_updates are optional and delta-only. Emit at most one per relevant entity when the visibility state changed, when absence or uncertainty itself matters, or when visibility needs explicit clarification beyond identity_updates.\n";
         prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
         prompt << "- Use visibility state not_visible_this_segment or absent when a tracked entity from temporal state is clearly not visible in the current batch.\n";
         prompt << "- event_updates are optional. Emit only atomic current-batch events such as picked_up_cup. Never emit cumulative counts like 'third time'.\n";
@@ -16668,10 +16672,10 @@ namespace {
         if (options.hasTemporal) {
             if (options.useTemporalDeltaContract) {
                 prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
-                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself matters.\n";
+                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself changed or otherwise materially matters.\n";
                 prompt << "- Do not repeat the same event just because later frames still show continuity of the same action.\n";
                 prompt << "- When later frames only confirm continuity, use continuation=true and counts_as_new_event=false inside that event update.\n";
-                prompt << "- When temporal context lets you match a visible entity to prior state, still emit an identity update with the current appearance snapshot even when the identity decision itself did not change.\n";
+                prompt << "- When temporal context lets you match a visible entity to prior state, still emit a minimal identity update with the current appearance snapshot even when the identity decision itself did not change; keep short_description, updated_traits, and identity_context_traits omitted unless they add new current-batch information.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
@@ -16809,7 +16813,7 @@ namespace {
         if (options.hasTemporal) {
             if (options.useTemporalDeltaContract) {
                 prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
-                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself matters.\n";
+                prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself changed or otherwise materially matters.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
@@ -16859,32 +16863,35 @@ namespace {
         std::ostringstream prompt;
         if (options.useTemporalDeltaContract) {
             prompt << "RESPONSE FORMAT (RAW JSON ONLY, TEMPORAL DELTA CONTRACT):\n";
-            prompt << "- Omit any field that has no update in this round.\n";
-            prompt << "- answer: optional string or null\n";
-            prompt << "- local_alert_update: optional object with alert_condition boolean, optional alert_region_ids array of strings or null, optional reason string or null\n";
-            prompt << "- start_condition_update: optional object with step_id integer\n";
-            prompt << "- identity_updates: optional array or null (max " <<
+            prompt << "- Omit any field that has no update in this round. Do not emit null, empty arrays, or empty objects for optional fields.\n";
+            prompt << "- answer: optional string; omit when not needed\n";
+            prompt << "- local_alert_update: optional object with alert_condition boolean and optional alert_region_ids or reason; omit when there is no local alert evidence in this batch\n";
+            prompt << "- start_condition_update: optional object with step_id integer; omit when no start condition update is present\n";
+            prompt << "- identity_updates: optional array (max " <<
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
-            prompt << "- identity_updates[*].identity_signature_traits: optional array of strong physical identity cues or null (max " <<
+            prompt << "- identity_updates[*].short_description: optional delta-only string; emit only for a newly seen entity or a material summary change, otherwise omit\n";
+            prompt << "- identity_updates[*].identity_signature_traits: optional array of strong physical identity cues (max " <<
                 kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
-            prompt << "- identity_updates[*].identity_feature_candidates: optional array or null (max " <<
-                kStructuredVisionMaxIdentityFeatureCandidates_ << " items); each item should include text, category, and relation_to_target.\n";
-            prompt << "- identity_updates[*].identity_context_traits: optional array of brief continuity/context cues or null (max " <<
-                kStructuredVisionMaxIdentityContextTraitItems_ << " items)\n";
-            prompt << "- identity_updates[*].scene_brief: optional very short scene hint string or null\n";
-            prompt << "- visibility_updates: optional array or null (max " <<
-                kStructuredVisionMaxObservationItems_ << " items)\n";
-            prompt << "- event_updates: optional array or null (max " <<
-                kStructuredVisionMaxObservationItems_ << " items)\n";
-            prompt << "- unknown_reasons: optional array or null (max " <<
-                kStructuredVisionMaxUnknownReasonItems_ << " items)\n";
+            prompt << "- identity_updates[*].identity_feature_candidates: optional delta-only array (max " <<
+                kStructuredVisionMaxIdentityFeatureCandidates_ << " items); emit it only for new, corrective, or contradictory structured identity cues, or for a newly seen entity. Omit it when merely restating prior identity memory. Each item should include text, category, and relation_to_target.\n";
+            prompt << "- identity_updates[*].updated_traits: optional delta-only array of transient cues or context changes (max " <<
+                kStructuredVisionMaxIdentityTraitItems_ << " items); omit when unchanged from recent memory\n";
+            prompt << "- identity_updates[*].identity_context_traits: optional delta-only array of brief continuity or context cues (max " <<
+                kStructuredVisionMaxIdentityContextTraitItems_ << " items); omit when unchanged from recent memory\n";
+            prompt << "- identity_updates[*].scene_brief: optional very short scene hint string; omit when not useful\n";
+            prompt << "- visibility_updates: optional delta-only array (max " <<
+                kStructuredVisionMaxObservationItems_ << " items); emit only for visibility changes, absence, uncertainty, or when visibility needs explicit clarification\n";
+            prompt << "- event_updates: optional array (max " <<
+                kStructuredVisionMaxObservationItems_ << " items); omit when there is no new event in this batch\n";
+            prompt << "- unknown_reasons: optional array (max " <<
+                kStructuredVisionMaxUnknownReasonItems_ << " items); omit when there is no ambiguity or conflict to explain\n";
             if (options.hasFaceReferences) {
                 prompt << "- faceid_match: optional boolean (emit only for positive match)\n";
-                prompt << "- faceid_target_names: optional array of strings or null (max " <<
+                prompt << "- faceid_target_names: optional array of strings (max " <<
                     kStructuredVisionMaxFaceIdTargetNames_ << " items)\n";
             }
             if (options.hasCrossCameraWatchlist) {
-                prompt << "- watchlist_updates: optional array or null (max " <<
+                prompt << "- watchlist_updates: optional array (max " <<
                     kStructuredVisionMaxCrossCameraMatches_ << " items)\n";
                 prompt << "- When cross_camera_watchlist is present in this temporal delta contract, use watchlist_updates as the only watchlist match field name.\n";
             }

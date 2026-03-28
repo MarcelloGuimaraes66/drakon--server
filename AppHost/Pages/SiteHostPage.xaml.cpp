@@ -426,6 +426,7 @@ namespace winrt::DrakonDesktop::implementation
                 if (!m_webViewHooksInstalled)
                 {
                     core.NavigationStarting({ this, &SiteHostPage::OnNavigationStarting });
+                    core.HistoryChanged({ this, &SiteHostPage::OnHistoryChanged });
                     m_webViewHooksInstalled = true;
                 }
             }
@@ -575,6 +576,22 @@ namespace winrt::DrakonDesktop::implementation
             winrt::hstring(errorMessage),
             false,
             true);
+    }
+
+    void SiteHostPage::OnHistoryChanged(
+        CoreWebView2 const&,
+        Windows::Foundation::IInspectable const&)
+    {
+        try
+        {
+            if (auto webView = FindName(L"SiteWebView").try_as<WebView2>())
+            {
+                UpdateNavigationButtons(webView);
+            }
+        }
+        catch (...)
+        {
+        }
     }
 
     void SiteHostPage::OnNavigationStarting(

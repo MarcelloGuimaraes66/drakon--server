@@ -108,6 +108,9 @@ function createWorkerEnv(DB) {
   const configuredGoogleRedirectUri = String(
     process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
   ).trim();
+  const configuredDesktopGoogleRedirectUri = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || ""
+  ).trim();
 
   return {
     DB,
@@ -117,6 +120,7 @@ function createWorkerEnv(DB) {
     // Leave the redirect unset unless it was explicitly configured so the
     // worker can choose the correct callback per request (desktop vs browser).
     GOOGLE_OAUTH_REDIRECT_URI: configuredGoogleRedirectUri,
+    DESKTOP_GOOGLE_OAUTH_REDIRECT_URI: configuredDesktopGoogleRedirectUri,
     CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
     STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",

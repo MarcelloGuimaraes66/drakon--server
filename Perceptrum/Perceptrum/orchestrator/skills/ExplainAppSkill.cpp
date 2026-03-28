@@ -110,7 +110,8 @@ std::string chooseTopic_(
         return "job_steps";
     }
     if (containsAny_(normalized, {
-            "create job", "jobs", "job creation", "workflow", "schedule", "scheduled workflow",
+            "job", "jobs", "task", "tasks", "tarefa", "tarefas",
+            "create job", "job creation", "workflow", "schedule", "scheduled workflow",
             "criar job", "criar tarefa", "agendamento"
         })) {
         return "jobs";

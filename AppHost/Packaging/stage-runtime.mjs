@@ -178,12 +178,15 @@ async function stageDesktopRuntimeEnv() {
     ]);
   }
 
-  const desktopGoogleRedirectUri = resolveRuntimeEnvValue(
+  let desktopGoogleRedirectUri = resolveRuntimeEnvValue(
     "DESKTOP_GOOGLE_OAUTH_REDIRECT_URI",
     sourceLocalEnv
   );
+  if (!desktopGoogleRedirectUri && activeBrand.features?.googleLoginEnabled) {
+    desktopGoogleRedirectUri = resolveDefaultDesktopGoogleRedirectUri();
+  }
   if (desktopGoogleRedirectUri) {
-    runtimeEnv.GOOGLE_OAUTH_REDIRECT_URI = desktopGoogleRedirectUri;
+    runtimeEnv.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI = desktopGoogleRedirectUri;
   }
 
   await fs.writeFile(
@@ -209,6 +212,19 @@ function resolveRuntimeEnvValue(key, sourceEnv) {
   }
 
   return String(sourceEnv[key] || "").trim();
+}
+
+function resolveDefaultDesktopGoogleRedirectUri() {
+  const siteUrl = String(activeBrand.siteUrl || "").trim();
+  if (!siteUrl) {
+    return "";
+  }
+
+  try {
+    return new URL("/auth/callback", siteUrl).toString();
+  } catch {
+    return "";
+  }
 }
 
 function ensureRequiredRuntimeEnv(envMap, requiredKeys) {

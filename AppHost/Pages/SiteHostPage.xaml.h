@@ -35,6 +35,9 @@ namespace winrt::DrakonDesktop::implementation
         void OnNavigationCompleted(
             winrt::Microsoft::UI::Xaml::Controls::WebView2 const& sender,
             winrt::Microsoft::Web::WebView2::Core::CoreWebView2NavigationCompletedEventArgs const& args);
+        void OnHistoryChanged(
+            winrt::Microsoft::Web::WebView2::Core::CoreWebView2 const& sender,
+            winrt::Windows::Foundation::IInspectable const& args);
         void OnNavigationStarting(
             winrt::Microsoft::Web::WebView2::Core::CoreWebView2 const& sender,
             winrt::Microsoft::Web::WebView2::Core::CoreWebView2NavigationStartingEventArgs const& args);

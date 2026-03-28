@@ -5717,20 +5717,36 @@ function isDesktopHostedGoogleLoginRequest(c: any): boolean {
   return desktopHeader === "1" || desktopHeader === "true" || desktopHeader === "yes";
 }
 
-function resolveGoogleRedirectUri(c: any, options?: { preferAuthoritative?: boolean }): string {
+function resolveGoogleRedirectUri(
+  c: any,
+  options?: { preferAuthoritative?: boolean }
+): { value: string; source: string } {
+  const desktopConfigured = String(c.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || "").trim();
   const configured = String(c.env.GOOGLE_OAUTH_REDIRECT_URI || "").trim();
-  if (configured) {
-    return configured;
-  }
 
   if (options?.preferAuthoritative) {
+    if (desktopConfigured) {
+      return { value: desktopConfigured, source: "desktop_env" };
+    }
+
     const authoritative = resolveAuthoritativeGoogleRedirectUri();
     if (authoritative) {
-      return authoritative;
+      return { value: authoritative, source: "brand_site" };
     }
   }
 
-  return `${resolveBrowserOrigin(c)}/auth/callback`;
+  if (configured) {
+    return { value: configured, source: "web_env" };
+  }
+
+  if (desktopConfigured) {
+    return { value: desktopConfigured, source: "desktop_env" };
+  }
+
+  return {
+    value: `${resolveBrowserOrigin(c)}/auth/callback`,
+    source: "request_origin",
+  };
 }
 
 async function getGoogleOidcDiscovery(): Promise<GoogleOidcDiscovery> {
@@ -5909,17 +5925,21 @@ async function createGoogleOAuthRedirectUrl(c: any): Promise<string> {
   const { clientId } = getGoogleOAuthConfig(c.env);
   const discovery = await getGoogleOidcDiscovery();
   const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
-  const redirectUri = resolveGoogleRedirectUri(c, {
+  const redirectUriResolution = resolveGoogleRedirectUri(c, {
     preferAuthoritative: desktopHosted,
   });
+  const redirectUri = redirectUriResolution.value;
   const state = generateRandomBase64Url(24);
   const nonce = generateRandomBase64Url(24);
   const codeVerifier = generateRandomBase64Url(48);
   const codeChallenge = await sha256Base64Url(codeVerifier);
 
-  if (AUTH_DEBUG) {
-    console.log(
-      `[GOOGLE LOGIN] redirect_uri=${redirectUri} desktop_hosted=${desktopHosted} request_origin=${resolveBrowserOrigin(c)}`
+  console.log(
+    `[GOOGLE LOGIN] redirect_uri=${redirectUri} source=${redirectUriResolution.source} desktop_hosted=${desktopHosted} request_origin=${resolveBrowserOrigin(c)}`
+  );
+  if (desktopHosted && redirectUriResolution.source === "request_origin") {
+    console.warn(
+      `[GOOGLE LOGIN] Desktop flow fell back to request origin; Google OAuth may fail with redirect_uri_mismatch.`
     );
   }
 
@@ -5957,7 +5977,7 @@ async function exchangeGoogleAuthorizationCode(
   const expectedNonce = getCookie(c, GOOGLE_OAUTH_NONCE_COOKIE_NAME);
   const codeVerifier = getCookie(c, GOOGLE_OAUTH_PKCE_COOKIE_NAME);
   const redirectUri =
-    getCookie(c, GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME) || resolveGoogleRedirectUri(c);
+    getCookie(c, GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME) || resolveGoogleRedirectUri(c).value;
 
   if (!expectedState) {
     throw new Error("Missing Google login state.");
@@ -6008,6 +6028,8 @@ async function exchangeGoogleAuthorizationCode(
     audience: clientId,
     issuer: [discovery.issuer, "https://accounts.google.com", "accounts.google.com"],
     maxTokenAge: "15 minutes",
+    // Allow a small amount of clock skew between Google and the desktop host.
+    clockTolerance: 60,
   });
 
   const claims = verification.payload;

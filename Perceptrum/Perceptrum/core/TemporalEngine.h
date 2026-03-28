@@ -29,6 +29,7 @@ inline json effectivePlan(const json& envelope);
 inline bool validateCompilerDecisionConsistency(const json& envelope, std::string* outReason = nullptr);
 inline json parseTraitsValue(const json& value);
 inline void appendUniqueStringsToArray(json& target, const json& value);
+inline std::string normalizeEventName(const std::string& rawEvent);
 
 inline std::string trim(const std::string& s) {
     const auto a = s.find_first_not_of(" \t\r\n");
@@ -1323,6 +1324,61 @@ inline void normalizeEventCatalog(json& plan) {
     plan["event_catalog"] = std::move(normalized);
 }
 
+inline bool eventNameSuggestsPersistentState(const std::string& rawEvent) {
+    const std::string normalized = lower(trim(normalizeEventName(rawEvent)));
+    if (normalized == "stopped" || normalized == "present") return true;
+
+    const std::string token = lower(trim(rawEvent));
+    return token.find("stopped") != std::string::npos ||
+           token.find("parked") != std::string::npos ||
+           token.find("stationary") != std::string::npos ||
+           token.find("idle") != std::string::npos ||
+           token.find("waiting") != std::string::npos ||
+           token.find("queued") != std::string::npos ||
+           token.find("dwell") != std::string::npos ||
+           token.find("lingering") != std::string::npos ||
+           token.find("paused") != std::string::npos ||
+           token.find("present") != std::string::npos;
+}
+
+inline std::string inferDurationAnchorEventFromCatalog(
+    const json& plan,
+    const std::string& rawWithoutEvent)
+{
+    if (!plan.is_object() || !plan.contains("event_catalog") || !plan["event_catalog"].is_array()) {
+        return std::string();
+    }
+
+    const std::string normalizedWithoutEvent = lower(trim(normalizeEventName(rawWithoutEvent)));
+    std::vector<std::string> candidates;
+    std::vector<std::string> persistentStateCandidates;
+    std::unordered_set<std::string> seen;
+
+    for (const auto& ev : plan["event_catalog"]) {
+        const std::string eventName = eventCatalogNameFromNode(ev);
+        if (eventName.empty()) continue;
+
+        const std::string eventKey = lower(trim(eventName));
+        if (!seen.insert(eventKey).second) continue;
+
+        const std::string normalizedEvent = lower(trim(normalizeEventName(eventName)));
+        if (!normalizedWithoutEvent.empty() &&
+            normalizedEvent == normalizedWithoutEvent)
+        {
+            continue;
+        }
+
+        candidates.push_back(eventName);
+        if (eventNameSuggestsPersistentState(eventName)) {
+            persistentStateCandidates.push_back(eventName);
+        }
+    }
+
+    if (candidates.size() == 1) return candidates.front();
+    if (persistentStateCandidates.size() == 1) return persistentStateCandidates.front();
+    return std::string();
+}
+
 inline void normalizeOperators(json& plan) {
     if (!plan.is_object()) return;
     if (!plan.contains("operators") || !plan["operators"].is_array()) return;
@@ -1358,6 +1414,24 @@ inline void normalizeOperators(json& plan) {
             params["trigger_mode"] = "event_observed";
 
             op["type"] = "seen_n_times_in_window_by_entity";
+            op["params"] = params;
+        } else if (typ == "stopped_for_more_than_without_event") {
+            json params = op.value("params", json::object());
+            if (!params.is_object()) params = json::object();
+
+            std::string eventName = trim(strField(params, "event", strField(params, "anchor_event")));
+            if (eventName.empty()) {
+                eventName = inferDurationAnchorEventFromCatalog(plan, strField(params, "without_event"));
+            }
+            if (eventName.empty()) {
+                eventName = "stopped";
+            }
+
+            params["event"] = eventName;
+            if (params.contains("anchor_event")) {
+                params.erase("anchor_event");
+            }
+            ensureEventInCatalog(plan, eventName);
             op["params"] = params;
         }
     }
@@ -1921,6 +1995,13 @@ inline bool validatePlanEnvelope(const json& envelope, std::string* outReason = 
         if (!withoutEvent.empty() && events.find(withoutEvent) == events.end()) {
             return fail("operator_without_event_missing");
         }
+
+        const std::string normalizedOpType = lower(opType);
+        if (normalizedOpType == "stopped_for_more_than_without_event") {
+            if (event.empty()) return fail("operator_event_missing");
+            if (withoutEvent.empty()) return fail("operator_without_event_missing");
+            if (intField(params, "seconds", 0) <= 0) return fail("operator_seconds_invalid");
+        }
     }
 
     for (const auto& rv : plan["runtime_variables"]) {
@@ -2212,8 +2293,8 @@ You are TemporalPlanCompiler v1.
 
 2) Operator dictionary (semantic + params + example)
 - stopped_for_more_than_without_event
-  required_params: entity, seconds, without_event, zone(optional)
-  example: vehicle stopped >300s without occupant_exit at front_gate
+  required_params: entity, event, seconds, without_event, zone(optional)
+  example: vehicle event=stopped >300s without occupant_exit at front_gate
 - seen_n_times_in_window_by_entity
   required_params: entity, event, n, window_seconds, zone(optional)
   example: same person picked_phone 3 times in 3600s
@@ -2388,7 +2469,7 @@ inline json fallbackPlanEnvelope(
             op = json{
                 { "operator_id", "op_stop" },
                 { "type", "stopped_for_more_than_without_event" },
-                { "params", { { "entity", "vehicle" }, { "seconds", 300 }, { "without_event", "occupant_exit" } } }
+                { "params", { { "entity", "vehicle" }, { "event", "stopped" }, { "seconds", 300 }, { "without_event", "occupant_exit" } } }
             };
         } else if (phone) {
             runtimeCounterEvent = "picked_phone";
@@ -2518,8 +2599,6 @@ inline void ensureState(json& st) {
     }
     if (!st["meta"].contains("operator_state") || !st["meta"]["operator_state"].is_object()) st["meta"]["operator_state"] = json::object();
 }
-
-inline std::string normalizeEventName(const std::string& rawEvent);
 
 inline void recordLastRoundEvidenceKey(json& st, const std::string& rawKey) {
     ensureState(st);
@@ -6168,15 +6247,17 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             }
         } else if (typ == "stopped_for_more_than_without_event") {
             const std::string ent = strField(p, "entity");
+            const std::string eventName = strField(p, "event", strField(p, "anchor_event", "stopped"));
             const std::string zone = extractZoneField(p);
             const std::string withoutEvent = strField(p, "without_event");
             const int seconds = intField(p, "seconds", 0);
             result["entity_filter"] = ent;
+            result["event"] = eventName;
             result["without_event"] = withoutEvent;
             result["seconds"] = seconds;
             if (!trim(zone).empty()) result["zone"] = zone;
 
-            if (seconds <= 0 || trim(withoutEvent).empty()) {
+            if (seconds <= 0 || trim(eventName).empty() || trim(withoutEvent).empty()) {
                 unk = true;
             } else {
                 json entities = json::array();
@@ -6184,29 +6265,30 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                 std::unordered_set<std::string> seenContributionKeys;
                 for (const auto& entityId : collectKnownMatchingEntityIds(ent)) {
                     const bool presentNow = isEntityPresentNow(entityId, zone);
-                    const std::string stoppedTs = latestMatchingEventTsForEntity("stopped", entityId, zone);
+                    const std::string eventTs = latestMatchingEventTsForEntity(eventName, entityId, zone);
                     const std::string releaseTs = latestMatchingEventTsForEntity(withoutEvent, entityId, zone);
-                    const bool releasedAfterStop =
-                        !stoppedTs.empty() && !releaseTs.empty() && releaseTs >= stoppedTs;
-                    const long long stoppedDurationSeconds =
-                        stoppedTs.empty()
+                    const bool releasedAfterEvent =
+                        !eventTs.empty() && !releaseTs.empty() && releaseTs >= eventTs;
+                    const long long eventDurationSeconds =
+                        eventTs.empty()
                             ? -1LL
-                            : std::max(0LL, ageSeconds(stoppedTs, nowIsoUtc));
+                            : std::max(0LL, ageSeconds(eventTs, nowIsoUtc));
                     const bool qualifies =
                         presentNow &&
-                        !stoppedTs.empty() &&
-                        !releasedAfterStop &&
-                        stoppedDurationSeconds >= seconds;
+                        !eventTs.empty() &&
+                        !releasedAfterEvent &&
+                        eventDurationSeconds >= seconds;
 
                     json entityDoc = {
                         { "entity_id", entityId },
                         { "present_now", presentNow },
                         { "qualifies", qualifies },
-                        { "released_after_stop", releasedAfterStop }
+                        { "released_after_event", releasedAfterEvent }
                     };
-                    if (!stoppedTs.empty()) {
-                        entityDoc["stopped_ts"] = stoppedTs;
-                        entityDoc["stopped_duration_seconds"] = stoppedDurationSeconds;
+                    if (!eventTs.empty()) {
+                        entityDoc["event"] = eventName;
+                        entityDoc["event_ts"] = eventTs;
+                        entityDoc["event_duration_seconds"] = eventDurationSeconds;
                     }
                     if (!releaseTs.empty()) entityDoc["without_event_ts"] = releaseTs;
                     entities.push_back(std::move(entityDoc));
@@ -6217,14 +6299,14 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                             contributingEvents,
                             seenContributionKeys,
                             collectEventContributionDocs(
-                                "stopped",
+                                eventName,
                                 0,
                                 entityId,
                                 1,
                                 zone,
                                 true));
                         summaryParts.push_back(
-                            entityId + " remained stopped for " + std::to_string(seconds) +
+                            entityId + " maintained " + eventName + " for " + std::to_string(seconds) +
                             "s without " + withoutEvent
                         );
                     }

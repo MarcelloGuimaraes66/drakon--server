@@ -4,6 +4,7 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -60,6 +61,7 @@ async function fetchCurrentUser(): Promise<AuthUser | null> {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isPending, setIsPending] = useState(true);
+  const exchangeRef = useRef<Promise<void> | null>(null);
 
   const loadUser = useCallback(async () => {
     setIsPending(true);
@@ -102,34 +104,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const exchangeCodeForSessionToken = useCallback(async () => {
+    if (exchangeRef.current) {
+      return exchangeRef.current;
+    }
+
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     const state = params.get("state");
     if (!code) {
       return;
     }
-    try {
-      const response = await fetch("/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ code, state }),
-      });
 
-      if (!response.ok) {
-        let payload: { error?: string } | null = null;
-        try {
-          payload = (await response.json()) as { error?: string };
-        } catch {
-          payload = null;
+    exchangeRef.current = (async () => {
+      try {
+        const response = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ code, state }),
+        });
+
+        if (!response.ok) {
+          let payload: { error?: string } | null = null;
+          try {
+            payload = (await response.json()) as { error?: string };
+          } catch {
+            payload = null;
+          }
+          throw new Error(payload?.error || "Failed to exchange auth code.");
         }
-        throw new Error(payload?.error || "Failed to exchange auth code.");
+      } catch (error) {
+        console.error("Failed to exchange auth code:", error);
+        throw error;
       }
-    } catch (error) {
-      console.error("Failed to exchange auth code:", error);
-      throw error;
-    }
-    await loadUser();
+
+      await loadUser();
+    })();
+
+    return exchangeRef.current;
   }, [loadUser]);
 
   const logout = useCallback(async () => {
