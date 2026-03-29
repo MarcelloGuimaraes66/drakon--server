@@ -383,7 +383,9 @@ namespace winrt::DrakonDesktop::implementation
     fire_and_forget SiteHostPage::RevealLoadingOverlayAfterDelay(std::uint64_t navigationToken)
     {
         auto lifetime = get_strong();
+        apartment_context uiThread;
         co_await winrt::resume_after(kOverlayRevealDelay);
+        co_await uiThread;
 
         if (navigationToken != m_navigationToken || !m_navigationInFlight)
         {

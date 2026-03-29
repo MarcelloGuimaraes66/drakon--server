@@ -328,9 +328,9 @@ namespace DrakonDesktop::platform
         auto const exeToken = ReadProtectedLocalText(exeTokenPath).value_or(std::string{});
         auto const clientId = ReadProtectedLocalText(clientIdPath).value_or(std::string{});
         auto const exeId = ReadProtectedLocalText(exeIdPath).value_or(std::string{});
-        if (!exeToken.empty()) WriteProtectedLocalText(exeTokenPath, exeToken);
-        if (!clientId.empty()) WriteProtectedLocalText(clientIdPath, clientId);
-        if (!exeId.empty()) WriteProtectedLocalText(exeIdPath, exeId);
+        if (!exeToken.empty() && !LooksLikeProtectedBlob(exeToken)) WriteProtectedLocalText(exeTokenPath, exeToken);
+        if (!clientId.empty() && !LooksLikeProtectedBlob(clientId)) WriteProtectedLocalText(clientIdPath, clientId);
+        if (!exeId.empty() && !LooksLikeProtectedBlob(exeId)) WriteProtectedLocalText(exeIdPath, exeId);
         auto const hasUsableProvisionedSession =
             !exeToken.empty() &&
             !clientId.empty() &&

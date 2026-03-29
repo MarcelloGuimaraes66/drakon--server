@@ -81,6 +81,7 @@ CREATE TABLE public.app_users (
     auth_provider text NOT NULL,
     country_code text,
     locale text,
+    handle text,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );

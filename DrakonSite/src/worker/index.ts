@@ -4238,6 +4238,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           auth_provider TEXT NOT NULL,
           country_code TEXT,
           locale TEXT,
+          handle TEXT,
           timezone_iana TEXT NOT NULL DEFAULT 'UTC',
           timezone_updated_at TEXT,
           timezone_source TEXT,
@@ -4249,6 +4250,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
       // Forward-compatible column migrations for existing databases.
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN created_at TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN updated_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN handle TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_iana TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_updated_at TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_source TEXT`);
@@ -4808,6 +4810,24 @@ async function ensureSchema(db: D1Database): Promise<void> {
          WHERE timezone_iana IS NULL
             OR TRIM(timezone_iana) = ''`
       ).run();
+
+      if (isPgLike) {
+        await db.prepare(
+          `UPDATE app_users
+           SET handle = split_part(email, '@', 1)
+           WHERE (handle IS NULL OR TRIM(handle) = '')
+             AND email IS NOT NULL
+             AND position('@' in email) > 1`
+        ).run();
+      } else {
+        await db.prepare(
+          `UPDATE app_users
+           SET handle = substr(email, 1, instr(email, '@') - 1)
+           WHERE (handle IS NULL OR TRIM(handle) = '')
+             AND email IS NOT NULL
+             AND instr(email, '@') > 1`
+        ).run();
+      }
 
       if (isPgLike) {
         await db.prepare(
@@ -5557,6 +5577,7 @@ async function ensureAppUserRow(
     auth_provider: string;
     country_code?: string | null;
     locale?: string | null;
+    handle?: string | null;
     timezone_iana?: string | null;
   }
 ): Promise<void> {
@@ -5568,21 +5589,24 @@ async function ensureAppUserRow(
   // Browser/session profile timezone must never define global scheduler timezone.
   // EXE pairing is the only source of truth; until then keep UTC fallback.
   const normalizedTimezone = DEFAULT_GLOBAL_TIMEZONE;
+  const normalizedHandle =
+    normalizeUserHandleInput(userData.handle) ?? deriveHandleFromEmail(userData.email);
   const createdAtConflictSql = isPgLike
     ? "created_at = COALESCE(app_users.created_at, excluded.created_at),"
     : "created_at = COALESCE(NULLIF(TRIM(app_users.created_at), ''), excluded.created_at),";
   
   await db.prepare(
     `INSERT INTO app_users (
-       id, email, auth_provider, country_code, locale,
+       id, email, auth_provider, country_code, locale, handle,
        timezone_iana, timezone_updated_at, timezone_source,
        created_at, updated_at
      )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        email = excluded.email,
        country_code = COALESCE(excluded.country_code, app_users.country_code),
        locale = COALESCE(excluded.locale, app_users.locale),
+       handle = COALESCE(NULLIF(TRIM(app_users.handle), ''), excluded.handle),
        timezone_iana = COALESCE(NULLIF(TRIM(app_users.timezone_iana), ''), excluded.timezone_iana, 'UTC'),
        timezone_updated_at = COALESCE(app_users.timezone_updated_at, excluded.timezone_updated_at),
        timezone_source = COALESCE(app_users.timezone_source, excluded.timezone_source),
@@ -5595,6 +5619,7 @@ async function ensureAppUserRow(
       userData.auth_provider,
       userData.country_code || null,
       userData.locale || null,
+      normalizedHandle,
       normalizedTimezone,
       now,
       "default",
@@ -5604,26 +5629,27 @@ async function ensureAppUserRow(
     .run();
 }
 
-async function getAppUserCreatedAt(
+async function getAppUserProfile(
   db: D1Database,
   userId: string
-): Promise<string | null> {
+): Promise<{ created_at: string | null; handle: string | null }> {
   const row = await db
-    .prepare("SELECT created_at FROM app_users WHERE id = ? LIMIT 1")
+    .prepare("SELECT created_at, handle FROM app_users WHERE id = ? LIMIT 1")
     .bind(userId)
     .first();
   const createdAt = (row as any)?.created_at;
+  const handle = normalizeUserHandleInput((row as any)?.handle);
   if (typeof createdAt === "string" && createdAt.trim()) {
-    return createdAt;
+    return { created_at: createdAt, handle };
   }
   if (createdAt instanceof Date) {
-    return createdAt.toISOString();
+    return { created_at: createdAt.toISOString(), handle };
   }
   if (createdAt !== null && createdAt !== undefined) {
     const asString = String(createdAt).trim();
-    return asString || null;
+    return { created_at: asString || null, handle };
   }
-  return null;
+  return { created_at: null, handle };
 }
 
 type GoogleOidcDiscovery = {
@@ -5667,6 +5693,7 @@ type GoogleSessionUser = {
   auth_provider: "google";
   google_user_data: NonNullable<GoogleOAuthUser["google_user_data"]>;
   created_at: string | null;
+  handle: string | null;
 };
 
 let googleOidcDiscoveryCache: { expiresAt: number; value: GoogleOidcDiscovery } | null = null;
@@ -6104,6 +6131,7 @@ async function getGoogleSessionUser(
        os.provider_subject,
        au.email,
        au.created_at,
+       au.handle,
        oi.profile_json
      FROM oauth_sessions os
      JOIN app_users au ON au.id = os.user_id
@@ -6134,6 +6162,7 @@ async function getGoogleSessionUser(
 
   const providerSubject = String((row as any).provider_subject || "");
   const email = normalizeEmail(String((row as any).email || ""));
+  const handle = normalizeUserHandleInput((row as any).handle);
   const googleUserData =
     parsedProfile ||
     {
@@ -6152,6 +6181,7 @@ async function getGoogleSessionUser(
     email,
     auth_provider: "google",
     google_user_data: googleUserData,
+    handle,
     created_at:
       typeof (row as any).created_at === "string" && (row as any).created_at.trim()
         ? String((row as any).created_at)
@@ -6841,6 +6871,33 @@ function getSessionCookieOptions(c: any) {
 // Helper to normalize email
 function normalizeEmail(email: string): string {
   return email.toLowerCase().trim();
+}
+
+function normalizeUserHandleInput(handle: unknown): string | null {
+  if (typeof handle !== "string") {
+    return null;
+  }
+
+  const normalized = handle.replace(/@/g, "").trim();
+  if (!normalized || /\s/.test(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function deriveHandleFromEmail(email: string): string | null {
+  const normalizedEmail = normalizeEmail(email);
+  const atIndex = normalizedEmail.indexOf("@");
+  if (atIndex <= 0) {
+    return null;
+  }
+
+  return normalizeUserHandleInput(normalizedEmail.slice(0, atIndex));
+}
+
+function isValidUserHandle(handle: string): boolean {
+  return normalizeUserHandleInput(handle) !== null;
 }
 
 // Helper to validate email format
@@ -7864,6 +7921,7 @@ app.get("/api/auth/me", async (c) => {
             email: user.email,
             google_user_data: user.google_user_data,
             created_at: user.created_at,
+            handle: user.handle,
           },
         });
       }
@@ -7896,7 +7954,7 @@ app.get("/api/auth/me", async (c) => {
         country_code: sessionData.country_code || null,
         locale: null,
       });
-      const createdAt = await getAppUserCreatedAt(c.env.DB, appUserId);
+      const profile = await getAppUserProfile(c.env.DB, appUserId);
       console.log("[auth/me] -> local");
       return c.json({
         isAuthenticated: true,
@@ -7905,7 +7963,8 @@ app.get("/api/auth/me", async (c) => {
           id: appUserId,
           email: sessionData.email,
           country_code: sessionData.country_code,
-          created_at: createdAt,
+          created_at: profile.created_at,
+          handle: profile.handle,
         },
       });
     }
@@ -7916,6 +7975,48 @@ app.get("/api/auth/me", async (c) => {
     isAuthenticated: false,
     authProvider: null,
     user: null,
+  });
+});
+
+app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      handle?: string;
+    }>()
+    .catch(() => null);
+
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const normalizedHandle = normalizeUserHandleInput(body.handle);
+  if (!normalizedHandle || !isValidUserHandle(normalizedHandle)) {
+    return c.json({ error: "Handle cannot be empty or contain spaces" }, 400);
+  }
+
+  await ensureAppUserRow(c.env.DB, {
+    id: user.id,
+    email: user.email,
+    auth_provider: user.auth_provider,
+    country_code: user.country_code || null,
+  });
+
+  const now = new Date().toISOString();
+  await c.env.DB
+    .prepare(
+      `UPDATE app_users
+       SET handle = ?, updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(normalizedHandle, now, user.id)
+    .run();
+
+  return c.json({
+    success: true,
+    handle: normalizedHandle,
   });
 });
 
@@ -8022,13 +8123,14 @@ app.get("/api/users/me", async (c) => {
         country_code: sessionData.country_code || null,
         locale: null,
       });
-      const createdAt = await getAppUserCreatedAt(c.env.DB, appUserId);
+      const profile = await getAppUserProfile(c.env.DB, appUserId);
       return c.json({
         id: appUserId,
         email: sessionData.email,
         auth_provider: "local",
         country_code: sessionData.country_code,
-        created_at: createdAt,
+        created_at: profile.created_at,
+        handle: profile.handle,
       });
     }
   }
@@ -8047,6 +8149,7 @@ app.get("/api/users/me", async (c) => {
           auth_provider: "google",
           google_user_data: user.google_user_data,
           created_at: user.created_at,
+          handle: user.handle,
         });
       }
     } catch (error) {

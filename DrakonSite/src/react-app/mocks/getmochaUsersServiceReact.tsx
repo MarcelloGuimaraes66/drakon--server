@@ -14,6 +14,7 @@ type AuthUser = {
   auth_provider?: "local" | "google";
   country_code?: string | null;
   created_at?: string | null;
+  handle?: string | null;
   google_user_data?: any;
 };
 

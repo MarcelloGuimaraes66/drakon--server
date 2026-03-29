@@ -28,6 +28,20 @@ interface PairingStatus {
   timezone_updated_at?: string | null;
 }
 
+function deriveHandleFromEmail(email?: string | null): string {
+  if (typeof email !== "string") {
+    return "";
+  }
+
+  const trimmed = email.trim();
+  const atIndex = trimmed.indexOf("@");
+  return atIndex > 0 ? trimmed.slice(0, atIndex) : "";
+}
+
+function normalizeHandleInput(value: string): string {
+  return value.replace(/@/g, "").trim();
+}
+
 export default function Settings() {
   const openAiKeysUrl = "https://platform.openai.com/api-keys";
   const zAiKeysUrl = "https://z.ai/manage-apikey/apikey-list";
@@ -42,6 +56,11 @@ export default function Settings() {
   const [generating, setGenerating] = useState(false);
   const [pairingStatus, setPairingStatus] = useState<PairingStatus>({ status: "not_connected" });
   const [loadingStatus, setLoadingStatus] = useState(true);
+  const [savedHandle, setSavedHandle] = useState("");
+  const [handleInput, setHandleInput] = useState("");
+  const [handleSaving, setHandleSaving] = useState(false);
+  const [handleMessage, setHandleMessage] = useState("");
+  const [handleMessageType, setHandleMessageType] = useState<"success" | "error" | null>(null);
 
   // Telegram settings state
   const [telegramEnabled, setTelegramEnabled] = useState(false);
@@ -353,12 +372,69 @@ export default function Settings() {
     }
   };
 
+  const saveUserHandle = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    const normalizedHandle = normalizeHandleInput(handleInput);
+    if (!normalizedHandle) {
+      setHandleMessageType("error");
+      setHandleMessage(t("settings.handleRequired"));
+      return;
+    }
+
+    if (/\s/.test(normalizedHandle)) {
+      setHandleMessageType("error");
+      setHandleMessage(t("settings.handleInvalid"));
+      return;
+    }
+
+    setHandleSaving(true);
+    setHandleMessage("");
+    setHandleMessageType(null);
+
+    try {
+      const response = await fetch("/api/user-profile", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ handle: normalizedHandle }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || t("settings.handleSaveFailed"));
+      }
+
+      const nextHandle =
+        typeof data?.handle === "string" && data.handle.trim()
+          ? data.handle
+          : normalizedHandle;
+      setSavedHandle(nextHandle);
+      setHandleInput(nextHandle);
+      setHandleMessageType("success");
+      setHandleMessage(t("settings.handleSaved"));
+    } catch (error: any) {
+      setHandleMessageType("error");
+      setHandleMessage(error?.message || t("settings.handleSaveFailed"));
+    } finally {
+      setHandleSaving(false);
+    }
+  };
+
   useEffect(() => {
     fetchPairingStatus();
     fetchTelegramSettings();
     fetchOpenAiSettings();
     fetchZAiSettings();
   }, []);
+
+  useEffect(() => {
+    const initialHandle =
+      (typeof user?.handle === "string" && user.handle.trim()) ||
+      deriveHandleFromEmail(user?.email);
+    setSavedHandle(initialHandle);
+    setHandleInput(initialHandle);
+    setHandleMessage("");
+    setHandleMessageType(null);
+  }, [user?.email, user?.handle]);
 
   const accountCreatedRaw = (user as { created_at?: string } | null)?.created_at || "";
   const accountCreatedValue = (() => {
@@ -373,6 +449,9 @@ export default function Settings() {
       day: "2-digit",
     }).format(parsedDate);
   })();
+  const normalizedHandleValue = normalizeHandleInput(handleInput);
+  const isHandleDirty = normalizedHandleValue !== savedHandle;
+  const isHandleValid = normalizedHandleValue.length > 0 && !/\s/.test(normalizedHandleValue);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -456,6 +535,53 @@ export default function Settings() {
                 className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
               />
             </div>
+
+            <form onSubmit={saveUserHandle} className="space-y-3">
+              <label className="block text-sm font-medium text-gray-300">
+                {t("settings.handle")}
+              </label>
+              <div className="flex flex-col gap-3 md:flex-row">
+                <div className="flex flex-1 items-center rounded-lg border border-gray-700 bg-gray-800">
+                  <span className="px-4 text-gray-400">@</span>
+                  <input
+                    type="text"
+                    value={handleInput}
+                    onChange={(e) => {
+                      setHandleInput(e.target.value.replace(/@/g, ""));
+                      setHandleMessage("");
+                      setHandleMessageType(null);
+                    }}
+                    placeholder={t("settings.handlePlaceholder")}
+                    disabled={handleSaving}
+                    className="w-full bg-transparent py-2.5 pr-4 text-gray-100 placeholder-gray-500 focus:outline-none disabled:opacity-50"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={handleSaving || !isHandleDirty || !isHandleValid}
+                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 font-medium text-white transition-colors hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500"
+                >
+                  {handleSaving ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {t("settings.handleSaving")}
+                    </>
+                  ) : (
+                    t("settings.handleSave")
+                  )}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500">{t("settings.handleHelp")}</p>
+              {handleMessage ? (
+                <p
+                  className={`text-xs ${
+                    handleMessageType === "success" ? "text-emerald-400" : "text-rose-400"
+                  }`}
+                >
+                  {handleMessage}
+                </p>
+              ) : null}
+            </form>
 
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">
