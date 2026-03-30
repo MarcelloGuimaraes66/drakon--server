@@ -2,6 +2,10 @@ import { Context, MiddlewareHandler } from "hono";
 import { getCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import { brand } from "@/shared/brand";
+import {
+  getLocalSessionUserByToken,
+  resolveCanonicalAppUserIdFromLocalUserRow,
+} from "./localIdentity";
 
 const LOCAL_SESSION_COOKIE_NAME = brand.cookieNames.localSession;
 const GOOGLE_SESSION_COOKIE_NAME = `${brand.id}_google_session`;
@@ -41,19 +45,12 @@ export const localAuthMiddleware: MiddlewareHandler = async (c: Context, next) =
 
   const localSessionToken = getCookie(c, LOCAL_SESSION_COOKIE_NAME);
   if (localSessionToken) {
-    const session = await env.DB.prepare(
-      `SELECT ls.*, lu.email, lu.country_code
-       FROM local_sessions ls
-       JOIN local_users lu ON ls.user_id = lu.id
-       WHERE ls.session_token = ? AND ls.expires_at > ?`
-    )
-      .bind(localSessionToken, new Date().toISOString())
-      .first();
+    const session = await getLocalSessionUserByToken(env.DB, localSessionToken);
 
     if (session) {
       const sessionData = session as any;
       const localUser: LocalUser = {
-        id: String(sessionData.user_id),
+        id: resolveCanonicalAppUserIdFromLocalUserRow(sessionData),
         email: sessionData.email,
         country_code: sessionData.country_code,
         auth_provider: "local",

@@ -81,6 +81,11 @@ async function startServer() {
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
+    CENTRAL_AUTH_PUBLIC_KEY: process.env.CENTRAL_AUTH_PUBLIC_KEY || "",
+    CENTRAL_AUTH_PRIVATE_KEY: process.env.CENTRAL_AUTH_PRIVATE_KEY || "",
+    CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
+    CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };
 
   const server = createServer(async (req, res) => {

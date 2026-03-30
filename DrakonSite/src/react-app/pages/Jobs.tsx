@@ -536,6 +536,7 @@ const normalizeAgentInferenceModel = (value: unknown): AgentInferenceModel => {
   if (
     normalized === "legacy" ||
     normalized === "pro" ||
+    normalized === "light" ||
     normalized === "ultra" ||
     normalized === "core"
   ) {
@@ -811,7 +812,7 @@ interface Target {
 }
 
 type TargetInputType = "video" | "image";
-type AgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type AgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
 type AgentRunEverySeconds = 10 | 60;
 type AgentRunningResolution = 640 | 1024;
 type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
@@ -951,6 +952,9 @@ const getAgentVideoPackagingModeLabel = (mode: AgentVideoPackagingMode): string 
   return "Compact Resolution";
 };
 
+const supportsAdjustableAgentVideoFps = (inferenceModel: AgentInferenceModel): boolean =>
+  inferenceModel === "ultra" || inferenceModel === "light";
+
 const applyAgentExecutionConstraints = (
   inputType: TargetInputType,
   inferenceModel: AgentInferenceModel,
@@ -978,16 +982,16 @@ const applyAgentExecutionConstraints = (
   }
 
   const normalizedInputType = inputType === "image" ? "image" : "video";
-  return {
-    inputType: normalizedInputType,
-    inferenceModel,
-    runEvery: normalizeAgentRunEverySeconds(runEvery, FIXED_AGENT_RUN_EVERY_SECONDS),
-    runningResolution: null,
-    modelFps:
-      inferenceModel === "ultra" && normalizedInputType === "video"
+    return {
+      inputType: normalizedInputType,
+      inferenceModel,
+      runEvery: normalizeAgentRunEverySeconds(runEvery, FIXED_AGENT_RUN_EVERY_SECONDS),
+      runningResolution: null,
+      modelFps:
+      supportsAdjustableAgentVideoFps(inferenceModel) && normalizedInputType === "video"
         ? normalizeAgentModelFps(modelFps)
         : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  };
+    };
 };
 
 const normalizeAgentPriority = (value: unknown): AgentPriority => {
@@ -7345,13 +7349,14 @@ function StepCard({
                             disabled={enhancingPrompt}
                             className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                             title={t("jobs.inferenceModel")}
-                          >
-                            <option value="core">{t("jobs.inferenceModelOption.core")}</option>
-                            <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
-                          </select>
-                          <ModelHostingBadge
-                            modelTier={normalizeAgentInferenceModel(agentForm.inference_model)}
-                          />
+                            >
+                              <option value="core">{t("jobs.inferenceModelOption.core")}</option>
+                              <option value="light">{t("jobs.inferenceModelOption.light")}</option>
+                              <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
+                            </select>
+                            <ModelHostingBadge
+                              modelTier={normalizeAgentInferenceModel(agentForm.inference_model)}
+                            />
                           <select
                             value={promptEditorTargetInputType}
                             onChange={(e) => {
@@ -7456,12 +7461,14 @@ function StepCard({
                                 </p>
                               </div>
                             ) : null}
-                            {normalizeAgentInferenceModel(agentForm.inference_model) === "ultra" &&
+                            {supportsAdjustableAgentVideoFps(
+                              normalizeAgentInferenceModel(agentForm.inference_model)
+                            ) &&
                             promptEditorTargetInputType === "video" ? (
-                              <div className="space-y-2">
-                                <label className="block text-sm font-semibold text-gray-100">
-                                  Video FPS
-                                </label>
+                                <div className="space-y-2">
+                                  <label className="block text-sm font-semibold text-gray-100">
+                                    Video FPS
+                                  </label>
                                 <select
                                   value={agentForm.model_fps}
                                   onChange={(e) =>

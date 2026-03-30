@@ -15014,6 +15014,10 @@ namespace {
             const std::string normalized = normalizeModelNameLocal(m);
             return (normalized == "gpt-5-nano") || (normalized.rfind("gpt-5-nano-", 0) == 0);
         };
+        auto isGpt54MiniModelLocal = [&](const std::string& m) {
+            const std::string normalized = normalizeModelNameLocal(m);
+            return (normalized == "gpt-5.4-mini") || (normalized.rfind("gpt-5.4-mini-", 0) == 0);
+        };
         auto isZAiCoreModelLocal = [&](const std::string& m) {
             const std::string normalized = normalizeModelNameLocal(m);
             return normalized == "glm-4.6v-flash" || (normalized.rfind("glm-4.6v-flash-", 0) == 0);
@@ -15051,6 +15055,24 @@ namespace {
                 return bareJpegBase64;
             }
             const double scale = static_cast<double>(kMaxSide) / static_cast<double>(longestSide);
+            newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
+            newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
+        }
+        else if (isGpt54MiniModelLocal(modelName)) {
+            // Keep light-model low-detail requests cheaper by capping only high-res frames.
+            constexpr int kBypassW = 1024;
+            constexpr int kBypassH = 576;
+            constexpr int kMaxW = 768;
+            constexpr int kMaxH = 432;
+            if (width <= kBypassW && height <= kBypassH) {
+                return bareJpegBase64;
+            }
+            const double scaleW = static_cast<double>(kMaxW) / static_cast<double>(width);
+            const double scaleH = static_cast<double>(kMaxH) / static_cast<double>(height);
+            const double scale = (std::min)(scaleW, scaleH);
+            if (scale >= 1.0) {
+                return bareJpegBase64;
+            }
             newW = (std::max)(1, static_cast<int>(std::round(width * scale)));
             newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
         }
