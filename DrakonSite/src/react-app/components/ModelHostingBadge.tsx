@@ -1,4 +1,4 @@
-type HostedModelTier = "ultra" | "core";
+type HostedModelTier = "ultra" | "light" | "core";
 
 type HostingMeta = {
   flag: string;
@@ -13,6 +13,12 @@ const MODEL_HOSTING_META: Record<HostedModelTier, HostingMeta> = {
     title:
       "Ultra uses GPT-5.1 via OpenAI's default api.openai.com endpoint. This app does not pin Brazil, Latin America, the US, or another regional residency endpoint.",
   },
+  light: {
+    flag: "🌐",
+    location: "Global",
+    title:
+      "Light uses GPT-5.4-mini via OpenAI's default api.openai.com endpoint. This app does not pin Brazil, Latin America, the US, or another regional residency endpoint.",
+  },
   core: {
     flag: "🇸🇬",
     location: "Singapore",
@@ -25,7 +31,7 @@ export function getModelHostingMeta(modelTier: string | null | undefined): Hosti
   if (typeof modelTier !== "string") return null;
 
   const normalizedTier = modelTier.trim().toLowerCase();
-  if (normalizedTier !== "ultra" && normalizedTier !== "core") {
+  if (normalizedTier !== "ultra" && normalizedTier !== "light" && normalizedTier !== "core") {
     return null;
   }
 

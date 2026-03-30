@@ -72,7 +72,7 @@ type ProviderMeta = {
 
 const PANEL_MARGIN_PX = 16;
 const HIGHLIGHT_PADDING_PX = 10;
-const PANEL_MAX_WIDTH_PX = 500;
+const PANEL_MAX_WIDTH_PX = 520;
 const TARGET_POLL_INTERVAL_MS = 150;
 const TARGET_POLL_TIMEOUT_MS = 4000;
 
@@ -196,9 +196,10 @@ function getStepView(
         centered: true,
         showBack: true,
         customChoiceStep: true,
-        panelMaxWidth: 760,
-        minHeight: 620,
-        titleClassName: "text-[2rem] font-semibold leading-[1.15] text-white sm:text-[2.15rem]",
+        panelMaxWidth: 860,
+        minHeight: 600,
+        titleClassName:
+          "max-w-[32rem] text-[1.95rem] font-semibold leading-[1.12] tracking-tight text-white sm:text-[2.1rem]",
         descriptionClassName: "text-base leading-7 text-slate-200",
         accentClassName: "from-violet-500/20 to-blue-500/10 border-violet-400/35 text-violet-100",
       };
@@ -816,11 +817,11 @@ export default function TutorialOverlay() {
   };
 
   const renderChoiceButtons = () => (
-    <div className="grid gap-4 sm:grid-cols-2">
+    <div className="grid gap-4 md:grid-cols-2">
       <button
         type="button"
         onClick={() => void chooseProvider("zai")}
-        className="flex min-h-[242px] flex-col rounded-[26px] border border-cyan-400/25 bg-cyan-500/10 px-6 py-6 text-left transition-colors hover:border-cyan-300/45 hover:bg-cyan-500/15"
+        className="flex min-h-[234px] flex-col rounded-[26px] border border-cyan-400/25 bg-cyan-500/10 px-6 py-6 text-left transition-colors hover:border-cyan-300/45 hover:bg-cyan-500/15"
       >
         <div className="mb-4 flex flex-col items-start gap-2">
           <span className="text-[1.05rem] font-semibold leading-8 text-cyan-100">
@@ -849,7 +850,7 @@ export default function TutorialOverlay() {
       <button
         type="button"
         onClick={() => void chooseProvider("openai")}
-        className="flex min-h-[242px] flex-col rounded-[26px] border border-blue-400/25 bg-blue-500/10 px-6 py-6 text-left transition-colors hover:border-blue-300/45 hover:bg-blue-500/15"
+        className="flex min-h-[234px] flex-col rounded-[26px] border border-blue-400/25 bg-blue-500/10 px-6 py-6 text-left transition-colors hover:border-blue-300/45 hover:bg-blue-500/15"
       >
         <div className="mb-4 flex flex-col items-start gap-2">
           <span className="text-[1.05rem] font-semibold leading-8 text-blue-100">
@@ -1154,7 +1155,7 @@ export default function TutorialOverlay() {
           </button>
 
           <div className="relative z-10 flex min-h-full flex-col p-5 sm:p-6">
-            <div className="mb-4 flex items-start gap-3 pr-10">
+            <div className="mb-4 flex items-start gap-3 pr-14 sm:pr-16">
               <div className="mt-0.5 inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-white/5">
                 {currentStepId === "complete" ? (
                   <CheckCircle2 className="h-5 w-5 text-emerald-300" />

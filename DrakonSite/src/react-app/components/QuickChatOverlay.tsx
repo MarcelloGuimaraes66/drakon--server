@@ -17,7 +17,7 @@ import {
 } from "@/react-app/utils/chatUtils";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
-type ChatModelTier = "ultra" | "core";
+type ChatModelTier = "ultra" | "light" | "core";
 type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
@@ -27,12 +27,19 @@ const QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
 };
 
+const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
+  tier === "ultra" || tier === "light";
+
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
-  return value.trim().toLowerCase() === "core" ? "core" : "ultra";
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "core") return "core";
+  if (normalized === "light") return "light";
+  return "ultra";
 }
 
 function normalizeChatRunningResolution(
@@ -95,6 +102,7 @@ export default function QuickChatOverlay() {
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const modelLabels: Record<ChatModelTier, string> = {
     ultra: "Ultra",
+    light: "Light",
     core: "Core",
   };
 
@@ -243,7 +251,7 @@ export default function QuickChatOverlay() {
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
       modelTier: modelTier,
-      modelFps: modelTier === "ultra" ? modelFps : MODEL_FPS_BY_TIER[modelTier],
+      modelFps: supportsAdjustableVideoFps(modelTier) ? modelFps : MODEL_FPS_BY_TIER[modelTier],
       runningResolution: modelTier === "core" ? runningResolution : null,
     });
   };
@@ -339,7 +347,7 @@ export default function QuickChatOverlay() {
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2">
-              {modelTier === "ultra" && (
+              {supportsAdjustableVideoFps(modelTier) && (
                 <select
                   value={modelFps}
                   onChange={(e) => {

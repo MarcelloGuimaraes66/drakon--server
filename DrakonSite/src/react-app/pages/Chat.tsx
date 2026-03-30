@@ -25,7 +25,7 @@ import {
 } from "@/react-app/utils/coreModelNotice";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
-type ChatModelTier = "ultra" | "core";
+type ChatModelTier = "ultra" | "light" | "core";
 type ChatRunningResolution = 640 | 1024;
 type ChatHeaderDropdown = "fps" | "resolution" | "model" | null;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
@@ -36,13 +36,19 @@ const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
 };
+
+const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
+  tier === "ultra" || tier === "light";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
   const normalized = value.trim().toLowerCase();
-  return normalized === "core" ? "core" : "ultra";
+  if (normalized === "core") return "core";
+  if (normalized === "light") return "light";
+  return "ultra";
 }
 
 function normalizeChatRunningResolution(
@@ -437,7 +443,7 @@ export default function Chat() {
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
       modelTier,
-      modelFps: modelTier === "ultra" ? modelFps : MODEL_FPS_BY_TIER[modelTier],
+      modelFps: supportsAdjustableVideoFps(modelTier) ? modelFps : MODEL_FPS_BY_TIER[modelTier],
       runningResolution: modelTier === "core" ? runningResolution : null,
     });
 
@@ -498,6 +504,7 @@ export default function Chat() {
 
   const modelLabels: Record<ChatModelTier, string> = {
     ultra: t("jobs.inferenceModelOption.ultra"),
+    light: t("jobs.inferenceModelOption.light"),
     core: t("jobs.inferenceModelOption.core"),
   };
 
@@ -775,7 +782,7 @@ export default function Chat() {
                   {openHeaderDropdown && (
                     <div className="fixed inset-0 z-40" onClick={() => setOpenHeaderDropdown(null)} />
                   )}
-                  {modelTier === "ultra" && (
+                  {supportsAdjustableVideoFps(modelTier) && (
                     <div className="relative z-50">
                       <button
                         onClick={() =>
@@ -881,6 +888,18 @@ export default function Chat() {
                             <div className="flex items-center gap-2">
                               <ModelHostingBadge modelTier="ultra" compact />
                               {modelTier === "ultra" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
+                        <button
+                          onClick={() => handleModelSelect("light")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.light")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="light" compact />
+                              {modelTier === "light" && <span className="text-blue-300">&#10003;</span>}
                             </div>
                           </div>
                         </button>

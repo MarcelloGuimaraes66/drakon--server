@@ -161,6 +161,22 @@ function sortChannels(left: DiscoveredCameraDevice, right: DiscoveredCameraDevic
   });
 }
 
+function shouldRenderRecorderGroup(
+  parent: DiscoveredCameraDevice | null,
+  children: DiscoveredCameraDevice[]
+) {
+  if (children.length === 0) {
+    return false;
+  }
+
+  const parentKind = String(parent?.device_kind_guess || "").trim().toUpperCase();
+  if (parentKind === "DVR" || parentKind === "NVR") {
+    return true;
+  }
+
+  return children.some((device) => channelSortValue(device) > 1);
+}
+
 function createSyntheticRecorderGroup(
   children: DiscoveredCameraDevice[],
   ip: string
@@ -198,7 +214,7 @@ function groupDiscoveredDevices(devices: DiscoveredCameraDevice[]): DiscoveryGro
       .filter((device) => String(device.channel_guess || "").trim())
       .sort(sortChannels);
 
-    if (children.length === 0) {
+    if (children.length === 0 || !shouldRenderRecorderGroup(parent, children)) {
       const root = parent || group[0];
       return { key: ip, root, parent, children: [], importableDevices: [root] };
     }

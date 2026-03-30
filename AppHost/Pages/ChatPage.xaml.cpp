@@ -204,7 +204,11 @@ namespace winrt::DrakonDesktop::implementation
         fpsCombo.Items().Clear();
         resolutionCombo.Items().Clear();
 
-        for (auto const& [label, tag] : { std::pair{ L"Ultra", L"ultra" }, std::pair{ L"Core", L"core" } })
+        for (auto const& [label, tag] : {
+            std::pair{ L"Ultra", L"ultra" },
+            std::pair{ L"Light", L"light" },
+            std::pair{ L"Core", L"core" }
+        })
         {
             ComboBoxItem item;
             item.Content(box_value(label));

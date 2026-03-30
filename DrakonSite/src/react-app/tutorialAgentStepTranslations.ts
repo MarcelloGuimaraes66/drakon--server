@@ -39,6 +39,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "This button analyzes your current prompt together with the latest streamed camera image to build a more detailed prompt suggestion that better matches your intent and helps reduce false positives.",
+    "tutorial.agentPolygons.title": "Optional polygons for focused regions",
+    "tutorial.agentPolygons.description":
+      "You can draw named polygons over the image to split the scene into specific analysis areas. The agent can then watch only those regions instead of the full frame all the time.",
     "tutorial.agentExecution.title": "Run every, resolution, and FPS",
     "tutorial.agentExecution.description":
       "For this tutorial we keep High Resolution and 1 FPS. When Ultra is available, Run every stays at 10 seconds. With only Core, the app keeps Core's fixed 60-second cadence.",
@@ -99,6 +102,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Este boton analiza tu prompt actual junto con la ultima imagen transmitida por la camara para construir una sugerencia mas detallada, reforzar tu intencion y reducir falsos positivos.",
+    "tutorial.agentPolygons.title": "Poligonos opcionales para regiones enfocadas",
+    "tutorial.agentPolygons.description":
+      "Puedes dibujar poligonos con nombre sobre la imagen para separar distintas zonas de analisis. Asi el agente puede mirar solo esas regiones y no todo el frame todo el tiempo.",
     "tutorial.agentExecution.title": "Run every, resolution y FPS",
     "tutorial.agentExecution.description":
       "En este tutorial dejamos High Resolution y 1 FPS. Cuando Ultra esta disponible, Run every queda en 10 segundos. Con solo Core, la app mantiene la cadencia fija de 60 segundos de Core.",
@@ -159,6 +165,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Esse botao analisa o prompt atual junto com a imagem streamada mais recente da camera para montar uma sugestao mais detalhada, reforcar sua intencao e reduzir falsos positivos.",
+    "tutorial.agentPolygons.title": "Poligonos opcionais para areas focadas",
+    "tutorial.agentPolygons.description":
+      "Voce pode desenhar poligonos nomeados sobre a imagem para separar diferentes areas de analise. Assim o agente pode observar so essas regioes, em vez do frame inteiro o tempo todo.",
     "tutorial.agentExecution.title": "Run every, resolution e FPS",
     "tutorial.agentExecution.description":
       "Neste tutorial deixamos High Resolution e FPS 1. Quando Ultra esta disponivel, Run every fica em 10 segundos. Com apenas Core, o app mantem a cadencia fixa de 60 segundos do Core.",
@@ -219,6 +228,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Ce bouton analyse votre prompt actuel avec la derniere image transmise par la camera pour produire une suggestion plus detaillee, mieux aligner l intention et reduire les faux positifs.",
+    "tutorial.agentPolygons.title": "Polygones optionnels pour des zones ciblees",
+    "tutorial.agentPolygons.description":
+      "Vous pouvez dessiner des polygones nommes sur l image pour separer differentes zones d analyse. L agent peut ainsi observer uniquement ces regions au lieu de tout le frame en permanence.",
     "tutorial.agentExecution.title": "Run every, resolution et FPS",
     "tutorial.agentExecution.description":
       "Dans ce tutoriel, nous gardons High Resolution et 1 FPS. Quand Ultra est disponible, Run every reste a 10 secondes. Avec seulement Core, l app conserve la cadence fixe de 60 secondes de Core.",
@@ -277,6 +289,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "这个按钮会分析你当前的 prompt 和摄像头最新传输画面，生成更详细的建议，以更贴近你的意图并减少误报。",
+    "tutorial.agentPolygons.title": "可选多边形聚焦区域",
+    "tutorial.agentPolygons.description":
+      "你可以在图像上绘制带名称的多边形，把画面拆分成不同的分析区域。这样 agent 就可以只关注这些区域，而不必一直分析整个画面。",
     "tutorial.agentExecution.title": "Run every、resolution 和 FPS",
     "tutorial.agentExecution.description":
       "本教程保持 High Resolution 和 1 FPS。Ultra 可用时，Run every 保持 10 秒；如果只有 Core，应用会保持 Core 固定的 60 秒频率。",
@@ -335,6 +350,9 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "هذا الزر يحلل الـ prompt الحالي مع آخر صورة متدفقة من الكاميرا ليبني اقتراحاً أكثر تفصيلاً، ويعزز نيتك، ويقلل الإيجابيات الكاذبة.",
+    "tutorial.agentPolygons.title": "مضلعات اختيارية لمناطق مركزة",
+    "tutorial.agentPolygons.description":
+      "يمكنك رسم مضلعات مسماة فوق الصورة لتقسيم المشهد إلى مناطق تحليل مختلفة. وهكذا يستطيع الـ agent مراقبة تلك المناطق فقط بدلا من الإطار كله بشكل مستمر.",
     "tutorial.agentExecution.title": "Run every و resolution و FPS",
     "tutorial.agentExecution.description":
       "في هذا الشرح نبقي على High Resolution و 1 FPS. عندما يكون Ultra متاحاً يبقى Run every على 10 ثوانٍ. ومع وجود Core فقط يحافظ التطبيق على cadence الثابتة البالغة 60 ثانية.",

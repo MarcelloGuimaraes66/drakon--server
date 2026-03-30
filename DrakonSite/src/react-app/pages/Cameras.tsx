@@ -97,6 +97,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     completeCameraTutorial,
   } = useOnboarding();
   const tutorialModalRequestStepRef = useRef<string | null>(null);
+  const onboardingOwnedEditorRef = useRef(false);
 
   const sortedCameras = useMemo(
     () =>
@@ -142,12 +143,14 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setSearchParams(nextParams);
   }, [searchParams, setSearchParams]);
 
-  const openAddModal = useCallback(async () => {
+  const openNewCameraEditor = useCallback(async (fromOnboarding: boolean) => {
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
+      onboardingOwnedEditorRef.current = false;
       return;
     }
 
+    onboardingOwnedEditorRef.current = fromOnboarding;
     clearEditSearchParam();
     setIsImportOpen(false);
     setIsDiscoveryOpen(false);
@@ -156,12 +159,20 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setIsEditorOpen(true);
   }, [checkBillingForCameraCreation, clearEditSearchParam]);
 
+  const openAddModal = useCallback(() => openNewCameraEditor(false), [openNewCameraEditor]);
+
+  const openAddModalFromOnboarding = useCallback(
+    () => openNewCameraEditor(true),
+    [openNewCameraEditor]
+  );
+
   const openImportModal = async () => {
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
     }
 
+    onboardingOwnedEditorRef.current = false;
     clearEditSearchParam();
     setIsDiscoveryOpen(false);
     setIsEditorOpen(false);
@@ -171,6 +182,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   };
 
   const openDiscoveryModal = () => {
+    onboardingOwnedEditorRef.current = false;
     clearEditSearchParam();
     setIsImportOpen(false);
     setEditorCamera(null);
@@ -180,6 +192,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   };
 
   const openEditModal = (camera: CameraType, syncSearchParam = true) => {
+    onboardingOwnedEditorRef.current = false;
     setIsImportOpen(false);
     setIsDiscoveryOpen(false);
     setEditorDraft(null);
@@ -200,6 +213,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   };
 
   const closeEditor = useCallback(() => {
+    onboardingOwnedEditorRef.current = false;
     setIsEditorOpen(false);
     setEditorCamera(null);
     setEditorDraft(null);
@@ -207,17 +221,12 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   }, [clearEditSearchParam]);
 
   useEffect(() => {
-    if (!isOnboardingOpen || !onboardingStepId) {
-      tutorialModalRequestStepRef.current = null;
-      if (isEditorOpen && !editorCamera && !editorDraft) {
-        closeEditor();
-      }
-      return;
-    }
+    const isCameraEditorOnboardingStep =
+      !!onboardingStepId && isOnboardingOpen && CAMERA_EDITOR_ONBOARDING_STEPS.has(onboardingStepId);
 
-    if (!CAMERA_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)) {
+    if (!isCameraEditorOnboardingStep) {
       tutorialModalRequestStepRef.current = null;
-      if (isEditorOpen && !editorCamera && !editorDraft) {
+      if (onboardingOwnedEditorRef.current && isEditorOpen && !editorCamera && !editorDraft) {
         closeEditor();
       }
       return;
@@ -233,7 +242,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     }
 
     tutorialModalRequestStepRef.current = onboardingStepId;
-    void openAddModal();
+    void openAddModalFromOnboarding();
   }, [
     closeEditor,
     editorCamera,
@@ -241,7 +250,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     isEditorOpen,
     isOnboardingOpen,
     onboardingStepId,
-    openAddModal,
+    openAddModalFromOnboarding,
   ]);
 
   useEffect(() => {

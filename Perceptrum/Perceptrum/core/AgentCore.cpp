@@ -4952,11 +4952,15 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
             if (ac.validatorModelName.empty()) ac.validatorModelName = "GLM-4.6V-Flash";
         }
         else {
+            const std::string defaultOpenAIModelName =
+                (ac.inferenceModel == "ultra")
+                ? "gpt-5.1"
+                : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini");
             if (ac.modelName.empty()) {
-                ac.modelName = (ac.inferenceModel == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+                ac.modelName = defaultOpenAIModelName;
             }
-            ac.validatorModelName = trimLocal(jsonStringOr(a, "validator_model_name", "gpt-5.1"));
-            if (ac.validatorModelName.empty()) ac.validatorModelName = "gpt-5.1";
+            ac.validatorModelName = trimLocal(jsonStringOr(a, "validator_model_name", defaultOpenAIModelName));
+            if (ac.validatorModelName.empty()) ac.validatorModelName = defaultOpenAIModelName;
         }
         ac.modelApiKey = trimLocal(jsonStringOr(a, "model_api_key"));
         if (ac.modelApiKey.empty()) {
@@ -6319,11 +6323,15 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 if (ac.validatorModelName.empty()) ac.validatorModelName = "GLM-4.6V-Flash";
             }
             else {
+                const std::string defaultOpenAIModelName =
+                    (ac.inferenceModel == "ultra")
+                    ? "gpt-5.1"
+                    : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini");
                 if (ac.modelName.empty()) {
-                    ac.modelName = (ac.inferenceModel == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+                    ac.modelName = defaultOpenAIModelName;
                 }
-                ac.validatorModelName = trimLocal(jsonStringOr(algo, "validator_model_name", "gpt-5.1"));
-                if (ac.validatorModelName.empty()) ac.validatorModelName = "gpt-5.1";
+                ac.validatorModelName = trimLocal(jsonStringOr(algo, "validator_model_name", defaultOpenAIModelName));
+                if (ac.validatorModelName.empty()) ac.validatorModelName = defaultOpenAIModelName;
             }
             ac.modelApiKey = trimLocal(jsonStringOr(algo, "model_api_key"));
             if (ac.modelApiKey.empty()) {
@@ -8125,7 +8133,7 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
             }
             std::transform(tier.begin(), tier.end(), tier.begin(),
                 [](unsigned char c) { return (char)std::tolower(c); });
-            if (tier == "core" || tier == "ultra" || tier == "pro" || tier == "legacy") {
+            if (tier == "core" || tier == "ultra" || tier == "light" || tier == "pro" || tier == "legacy") {
                 return tier;
             }
             return std::string("ultra");
@@ -8134,7 +8142,9 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
         const std::string modelName =
             (normalizedTier == "core")
             ? std::string("GLM-4.6V-Flash")
-            : ((normalizedTier == "ultra") ? std::string("gpt-5.1") : std::string("gpt-5-mini"));
+            : ((normalizedTier == "ultra")
+                ? std::string("gpt-5.1")
+                : ((normalizedTier == "light") ? std::string("gpt-5.4-mini") : std::string("gpt-5-mini")));
         auto extractRouterText = [](const json& responseJson) {
             if (!responseJson.contains("choices") ||
                 !responseJson["choices"].is_array() ||
@@ -11939,11 +11949,8 @@ static std::string normalizeChatModelTierName(std::string tier)
         c = (char)std::tolower((unsigned char)c);
     }
 
-    if (tier == "legacy" || tier == "pro" || tier == "ultra" || tier == "core") {
+    if (tier == "legacy" || tier == "pro" || tier == "ultra" || tier == "light" || tier == "core") {
         return tier;
-    }
-    if (tier == "light") {
-        return "legacy";
     }
     if (tier == "plus") {
         return "pro";
@@ -12066,14 +12073,16 @@ static int normalizeChatRunningResolutionValue(int value)
 static bool isOpenAIChatModelTier(const std::string& tier)
 {
     const std::string normalized = normalizeChatModelTierName(tier);
-    return normalized == "pro" || normalized == "ultra" || normalized == "core";
+    return normalized == "pro" || normalized == "ultra" || normalized == "light" || normalized == "core";
 }
 
 static std::string chatOpenAIModelNameForTier(const std::string& tier)
 {
     const std::string normalized = normalizeChatModelTierName(tier);
     if (normalized == "core") return "GLM-4.6V-Flash";
-    return (normalized == "ultra") ? "gpt-5.1" : "gpt-5-mini";
+    if (normalized == "ultra") return "gpt-5.1";
+    if (normalized == "light") return "gpt-5.4-mini";
+    return "gpt-5-mini";
 }
 
 void AgentCore::handleOrchestratorQuery_(const json& payload)
@@ -13804,7 +13813,7 @@ static std::string pickGeminiModelName(
     if (t == "legacy") {
         return "gemini-3-flash-preview";
     }
-    if (t == "ultra") {
+    if (t == "ultra" || t == "light") {
         return "gemini-3-flash-preview";
     }
     if (t == "pro") {
@@ -16293,7 +16302,10 @@ namespace {
             return false;
         }
         const std::string normalized = normalizeOpenAIModelName_(modelName);
-        return normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0;
+        return normalized == "gpt-5.1" ||
+            normalized.rfind("gpt-5.1-", 0) == 0 ||
+            normalized == "gpt-5.4-mini" ||
+            normalized.rfind("gpt-5.4-mini-", 0) == 0;
     }
 
     static bool isGpt5MiniModel_(const std::string& modelName)

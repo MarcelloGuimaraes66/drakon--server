@@ -94,6 +94,8 @@
     <OpenCvBinRoot Condition="'$(OpenCvBinRoot)'==''">C:\libs\opencv-4.11.0\build\x64\vc16\bin\</OpenCvBinRoot>
     <PerceptrumLegacyReleaseRoot Condition="'$(PerceptrumLegacyReleaseRoot)'==''">$(MSBuildThisFileDirectory)..\Perceptrum\x64\$(Configuration)\</PerceptrumLegacyReleaseRoot>
     <PerceptrumLegacyReleaseServerRoot Condition="'$(PerceptrumLegacyReleaseServerRoot)'==''">$(MSBuildThisFileDirectory)..\Perceptrum\x64\ReleaseServer\</PerceptrumLegacyReleaseServerRoot>
+    <VcpkgLibraryRoot Condition="'$(Configuration)' == 'Debug'">$(VcpkgInstalledDir)\installed\x64-windows\debug\lib\</VcpkgLibraryRoot>
+    <VcpkgLibraryRoot Condition="'$(VcpkgLibraryRoot)' == ''">$(VcpkgInstalledDir)\installed\x64-windows\lib\</VcpkgLibraryRoot>
     <VcpkgRuntimeBinRoot Condition="'$(Configuration)' == 'Debug'">$(VcpkgInstalledDir)\installed\x64-windows\debug\bin\</VcpkgRuntimeBinRoot>
     <VcpkgRuntimeBinRoot Condition="'$(VcpkgRuntimeBinRoot)' == ''">$(VcpkgInstalledDir)\installed\x64-windows\bin\</VcpkgRuntimeBinRoot>
     <DisableXbfGeneration>true</DisableXbfGeneration>
@@ -121,8 +123,8 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libcurl.lib;avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 

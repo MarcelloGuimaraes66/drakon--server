@@ -1233,6 +1233,40 @@ async function probeRtspResource(ip, port, path) {
   };
 }
 
+function buildInvalidRtspDiscoveryPath() {
+  return `/drakon-discovery-invalid-${randomUUID()}`;
+}
+
+function normalizeRtspAuthSignature(probe) {
+  if (!probe) {
+    return "";
+  }
+
+  return JSON.stringify({
+    status_code: Number(probe.status_code || 0),
+    status_line: String(probe.status_line || "").replace(/\s+/g, " ").trim(),
+    realm: extractAuthRealm(probe.www_authenticate || ""),
+    www_authenticate: String(probe.www_authenticate || "")
+      .replace(/nonce="[^"]*"/gi, 'nonce="*"')
+      .replace(/opaque="[^"]*"/gi, 'opaque="*"')
+      .replace(/\s+/g, " ")
+      .trim(),
+    content_base: String(probe.content_base || "").replace(/\s+/g, " ").trim(),
+  });
+}
+
+function isGenericProtectedRtspResponse(probe, invalidProbe) {
+  if (!probe?.www_authenticate) {
+    return false;
+  }
+
+  if (!invalidProbe?.www_authenticate) {
+    return true;
+  }
+
+  return normalizeRtspAuthSignature(probe) === normalizeRtspAuthSignature(invalidProbe);
+}
+
 async function probeHttpPorts(ip, openHttpPorts) {
   const probes = [];
 
@@ -1362,12 +1396,12 @@ function buildRecorderChannelStrategies(manufacturerGuess, openPorts) {
   return strategies;
 }
 
-function looksLikeExistingRtspResource(probe) {
+function looksLikeExistingRtspResource(probe, invalidProbe = null) {
   if (!probe) {
     return false;
   }
 
-  if (probe.status_code === 200 || probe.status_code === 401) {
+  if (probe.status_code === 200) {
     return true;
   }
 
@@ -1380,12 +1414,21 @@ function looksLikeExistingRtspResource(probe) {
 
   if (
     (probe.status_code === 400 || probe.status_code === 405) &&
-    probe.www_authenticate
+    probe.www_authenticate &&
+    !isGenericProtectedRtspResponse(probe, invalidProbe)
   ) {
     return true;
   }
 
-  return /www-authenticate:/i.test(String(probe.banner || ""));
+  if (
+    probe.status_code === 401 &&
+    probe.www_authenticate &&
+    !isGenericProtectedRtspResponse(probe, invalidProbe)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function computeRecorderChannelConfidence(baseConfidence, probe) {
@@ -1435,6 +1478,39 @@ function buildRecorderChannelFriendlyName(baseDevice, channelLabel, channelGuess
   return `${baseName} - ${suffix}`;
 }
 
+function buildRecorderCanaryIndexes(baseDevice) {
+  const startIndex = isRecorderKind(baseDevice?.device_kind_guess) ? 1 : 2;
+  return Array.from(
+    { length: RECORDER_CHANNEL_CANARY_LIMIT },
+    (_, index) => index + startIndex
+  );
+}
+
+function inferRecorderChannelIndex(channelGuess) {
+  const rawChannel = String(channelGuess || "").trim();
+  if (!rawChannel) {
+    return null;
+  }
+
+  const numericValue = Number.parseInt(rawChannel, 10);
+  if (!Number.isInteger(numericValue)) {
+    return null;
+  }
+
+  if (rawChannel.length >= 3 && rawChannel.endsWith("01")) {
+    return Math.floor(numericValue / 100);
+  }
+
+  return numericValue;
+}
+
+function hasSecondaryRecorderChannel(devices) {
+  return devices.some((device) => {
+    const channelIndex = inferRecorderChannelIndex(device?.channel_guess);
+    return Number.isInteger(channelIndex) && channelIndex > 1;
+  });
+}
+
 function shouldAttemptRecorderChannelInference(
   baseDevice,
   openPorts,
@@ -1474,14 +1550,16 @@ async function detectRecorderChannelStrategy(baseDevice, openPorts) {
     getPreferredRtspPort(openPorts, baseDevice.manufacturer_guess) ||
     baseDevice.rtsp_port_guess ||
     RTSP_PORT;
+  const invalidProbe = await probeRtspResource(
+    baseDevice.ip,
+    rtspPort,
+    buildInvalidRtspDiscoveryPath()
+  );
   const strategies = buildRecorderChannelStrategies(
     baseDevice.manufacturer_guess,
     openPorts
   );
-  const canaryIndexes = Array.from(
-    { length: RECORDER_CHANNEL_CANARY_LIMIT },
-    (_, index) => index + 1
-  );
+  const canaryIndexes = buildRecorderCanaryIndexes(baseDevice);
 
   for (const strategy of strategies) {
     for (const channelIndex of canaryIndexes) {
@@ -1491,11 +1569,12 @@ async function detectRecorderChannelStrategy(baseDevice, openPorts) {
           rtspPort,
           variant.path
         );
-        if (!looksLikeExistingRtspResource(probe)) {
+        if (!looksLikeExistingRtspResource(probe, invalidProbe)) {
           continue;
         }
 
         return {
+          invalidProbe,
           rtspPort,
           strategy,
         };
@@ -1504,6 +1583,7 @@ async function detectRecorderChannelStrategy(baseDevice, openPorts) {
   }
 
   return {
+    invalidProbe,
     rtspPort,
     strategy: null,
   };
@@ -1515,6 +1595,9 @@ async function enumerateRecorderChannelDevices(baseDevice, openPorts, strategyMa
     getPreferredRtspPort(openPorts, baseDevice.manufacturer_guess) ||
     baseDevice.rtsp_port_guess ||
     RTSP_PORT;
+  const invalidProbe =
+    strategyMatch?.invalidProbe ||
+    (await probeRtspResource(baseDevice.ip, rtspPort, buildInvalidRtspDiscoveryPath()));
   const strategies = strategyMatch?.strategy
     ? [strategyMatch.strategy]
     : buildRecorderChannelStrategies(baseDevice.manufacturer_guess, openPorts);
@@ -1534,7 +1617,7 @@ async function enumerateRecorderChannelDevices(baseDevice, openPorts, strategyMa
             rtspPort,
             variant.path
           );
-          if (!looksLikeExistingRtspResource(probe)) {
+          if (!looksLikeExistingRtspResource(probe, invalidProbe)) {
             continue;
           }
 
@@ -1578,6 +1661,13 @@ async function enumerateRecorderChannelDevices(baseDevice, openPorts, strategyMa
 
     const channelDevices = results.filter(Boolean);
     if (channelDevices.length > 0) {
+      if (
+        !isRecorderKind(baseDevice?.device_kind_guess) &&
+        !hasSecondaryRecorderChannel(channelDevices)
+      ) {
+        continue;
+      }
+
       return channelDevices;
     }
   }

@@ -111,7 +111,7 @@ const FACE_TARGET_MAX_IMAGES = 4;
 const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
-type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
 const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
@@ -189,12 +189,16 @@ const normalizeInferenceModel = (
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "light" ||
     normalized === "core"
   ) {
     return normalized;
   }
   return fallback;
 };
+
+const supportsAdjustableVideoFps = (model: CameraAgentInferenceModel): boolean =>
+  model === "ultra" || model === "light";
 
 const normalizeRunningResolution = (
   value: unknown,
@@ -297,7 +301,7 @@ const applyExecutionConstraints = (
     runEvery: normalizeRunEverySeconds(runEvery, 60),
     runningResolution: normalizeRunningResolution(runningResolution),
     modelFps:
-      inferenceModel === "ultra" && normalizedInputType === "video"
+      supportsAdjustableVideoFps(inferenceModel) && normalizedInputType === "video"
         ? normalizeModelFps(modelFps)
         : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   };
@@ -1535,7 +1539,7 @@ export default function CameraCustomAgentEditorModal({
       video_packaging_mode: videoPackagingMode,
       inference_model: inferenceModel,
       model_fps:
-        inferenceModel === "ultra" && inputType === "video"
+        supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
           ? modelFps
           : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
       run_every: runEvery,
@@ -1637,8 +1641,15 @@ export default function CameraCustomAgentEditorModal({
                   className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                   title={t("jobs.inferenceModel")}
                 >
-                  <option value="core">{t("jobs.inferenceModelOption.core")}</option>
                   <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
+                  <option value="light">{t("jobs.inferenceModelOption.light")}</option>
+                  <option value="core">{t("jobs.inferenceModelOption.core")}</option>
+                  {inferenceModel === "pro" ? (
+                    <option value="pro">{t("jobs.inferenceModelOption.pro")}</option>
+                  ) : null}
+                  {inferenceModel === "legacy" ? (
+                    <option value="legacy">{t("jobs.inferenceModelOption.legacy")}</option>
+                  ) : null}
                 </select>
                 <ModelHostingBadge modelTier={inferenceModel} />
               </div>
@@ -2158,7 +2169,7 @@ export default function CameraCustomAgentEditorModal({
                       </p>
                     </div>
                   ) : null}
-                  {inferenceModel === "ultra" && inputType === "video" ? (
+                  {supportsAdjustableVideoFps(inferenceModel) && inputType === "video" ? (
                     <div className="space-y-2">
                       <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
                       <select

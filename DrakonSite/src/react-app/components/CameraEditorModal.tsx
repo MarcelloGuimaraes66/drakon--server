@@ -166,7 +166,7 @@ function getNextTutorialWebcamName(existingCameraNames: string[]): string {
 
   for (const rawName of existingCameraNames) {
     const normalizedName = String(rawName || "").trim();
-    const match = normalizedName.match(/^tutorial webcam(?:\s+(\d+))?$/i);
+    const match = normalizedName.match(/^(?:webcam\s+)?tutorial webcam(?:\s+(\d+))?$/i);
     if (!match) {
       continue;
     }

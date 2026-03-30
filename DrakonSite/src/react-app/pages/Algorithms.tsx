@@ -36,7 +36,7 @@ type CustomAlgorithm = {
   is_enabled: boolean;
   input_type: "video" | "image";
   video_packaging_mode: "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
-  inference_model: "core" | "ultra" | "legacy" | "pro";
+  inference_model: "core" | "ultra" | "light" | "legacy" | "pro";
   model_fps: number;
   run_every: number;
   running_resolution: number | null;
@@ -282,7 +282,7 @@ export default function Algorithms() {
             })(),
             inference_model: (() => {
               const model = String(row?.inference_model || "").trim().toLowerCase();
-              return model === "core" || model === "legacy" || model === "pro" || model === "ultra"
+              return model === "core" || model === "legacy" || model === "pro" || model === "ultra" || model === "light"
                 ? model
                 : "ultra";
             })(),

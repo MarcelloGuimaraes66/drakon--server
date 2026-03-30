@@ -71,7 +71,7 @@ function normalizeTier(tier: string | null | undefined): ModelTier {
 }
 
 type TargetInputType = "video" | "image";
-type AgentInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type AgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
 const FIXED_AGENT_INFERENCE_MODEL: AgentInferenceModel = "ultra";
 type AgentRunEverySeconds = 10 | 60;
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
@@ -165,6 +165,10 @@ const DEFAULT_MODEL_RUNTIME_CONFIG: Record<AgentInferenceModel, ModelRuntimeConf
     api_key: "",
     model_fps: 1,
   },
+  light: {
+    api_key: "",
+    model_fps: 1,
+  },
   core: {
     api_key: "",
     model_fps: 1,
@@ -225,6 +229,7 @@ function normalizeInferenceModel(value: unknown): AgentInferenceModel {
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "light" ||
     normalized === "core"
   ) {
     return normalized;
@@ -818,6 +823,7 @@ async function loadModelRuntimeConfigForPayload(
     legacy: { ...DEFAULT_MODEL_RUNTIME_CONFIG.legacy },
     pro: { ...DEFAULT_MODEL_RUNTIME_CONFIG.pro },
     ultra: { ...DEFAULT_MODEL_RUNTIME_CONFIG.ultra },
+    light: { ...DEFAULT_MODEL_RUNTIME_CONFIG.light },
     core: { ...DEFAULT_MODEL_RUNTIME_CONFIG.core },
   };
 
@@ -854,6 +860,7 @@ async function loadModelRuntimeConfigForPayload(
     modelRuntimeConfig.legacy.api_key = normalizedOpenAiApiKey;
     modelRuntimeConfig.pro.api_key = normalizedOpenAiApiKey;
     modelRuntimeConfig.ultra.api_key = normalizedOpenAiApiKey;
+    modelRuntimeConfig.light.api_key = normalizedOpenAiApiKey;
   }
   const normalizedZAiApiKey = normalizeOpenAIApiKeyInput(zAiApiKey);
   if (normalizedZAiApiKey) {

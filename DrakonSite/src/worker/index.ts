@@ -4988,7 +4988,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
                 ADD CONSTRAINT job_step_agents_inference_model_chk
                 CHECK (
                   LOWER(COALESCE(NULLIF(BTRIM(inference_model), ''), 'ultra')) = ANY (
-                    ARRAY['legacy'::text, 'pro'::text, 'ultra'::text, 'core'::text]
+                    ARRAY['legacy'::text, 'pro'::text, 'ultra'::text, 'light'::text, 'core'::text]
                   )
                 );
             EXCEPTION
@@ -6905,7 +6905,7 @@ function normalizeTier(tier: string | null | undefined): ModelTier {
   return "light";
 }
 
-type ChatModelTier = "legacy" | "pro" | "ultra" | "core";
+type ChatModelTier = "legacy" | "pro" | "ultra" | "light" | "core";
 type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
@@ -6916,6 +6916,7 @@ function normalizeChatModelTier(tier: string | null | undefined): ChatModelTier 
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "light" ||
     normalized === "core"
   ) {
     return normalized;
@@ -13388,7 +13389,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
   if (body.inference_model !== undefined && !requestedInferenceModel) {
-    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, core" }, 400);
+    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, light, core" }, 400);
   }
   const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
   const runEvery = normalizeJobStepRunEverySeconds(
@@ -13665,7 +13666,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
     ? existingInferenceModel
     : normalizeJobStepInferenceModel(body.inference_model);
   if (body.inference_model !== undefined && !requestedInferenceModel) {
-    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, core" }, 400);
+    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, light, core" }, 400);
   }
   const inferenceModel = requestedInferenceModel || existingInferenceModel;
   const existingRunEvery = normalizeJobStepRunEverySeconds(
@@ -26621,7 +26622,7 @@ app.delete("/api/jobs/:id", anyAuthMiddleware, async (c) => {
 });
 
 type JobStepInputType = "video" | "image";
-type JobStepInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type JobStepInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
 type VideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_JOB_STEP_INFERENCE_MODEL: JobStepInferenceModel = "ultra";
 type JobStepRunEverySeconds = 10 | 60;
@@ -26715,6 +26716,7 @@ const normalizeJobStepInferenceModel = (value: unknown): JobStepInferenceModel |
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "light" ||
     normalized === "core"
   ) {
     return normalized;
@@ -28919,7 +28921,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
   if (body.inference_model !== undefined && !requestedInferenceModel) {
-    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, core" }, 400);
+    return c.json({ error: "Invalid inference_model. Allowed values: legacy, pro, ultra, light, core" }, 400);
   }
   const requestedRunEvery = body.run_every === undefined
     ? null
