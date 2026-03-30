@@ -28,6 +28,15 @@ struct VideoCaptureProfile {
  */
 class FrameDiskWriter {
 public:
+    struct RetentionSweepStats {
+        int scannedFiles = 0;
+        int deletedFiles = 0;
+        int parsedByNameTimestamp = 0;
+        int parsedByFileTime = 0;
+        int prunedDirectories = 0;
+        int failed = 0;
+    };
+
     struct IoTelemetrySnapshot {
         std::uint64_t bytesWrittenTotal = 0;
         std::uint64_t writeLatencyTotalUs = 0;
@@ -49,6 +58,10 @@ public:
     void setMinInterval(std::chrono::milliseconds interval);
     void setOutputFps(double fps);
     void setCaptureProfiles(const std::vector<VideoCaptureProfile>& profiles);
+    static RetentionSweepStats runRetentionCleanupNow(
+        const std::string& cameraId,
+        const std::string& baseDir,
+        int retentionDays);
     void runRetentionCleanupIfDue();
     IoTelemetrySnapshot getIoTelemetrySnapshot() const;
 

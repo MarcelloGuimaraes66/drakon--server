@@ -4,6 +4,8 @@ export type CameraDiscoveryProtocol =
   | "HTTP_PROBE"
   | "RTSP_PROBE";
 
+export type CameraDiscoveryDeviceKind = "CAMERA" | "DVR" | "NVR" | "UNKNOWN";
+
 export interface DiscoveredCameraDevice {
   id: string;
   ip: string;
@@ -18,6 +20,8 @@ export interface DiscoveredCameraDevice {
   connection_method_suggested: "RTSP" | "HTTP" | "ONVIF";
   requires_credentials: boolean;
   confidence: number;
+  device_kind_guess: CameraDiscoveryDeviceKind;
+  channel_label: string | null;
 }
 
 export interface CameraDiscoveryResponse {

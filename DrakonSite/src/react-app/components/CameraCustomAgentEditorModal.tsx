@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, Minimize2, Sparkles, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import {
   FACE_ID_MAX_IMAGE_SIDE_PX,
   FACE_ID_MAX_UPLOAD_BYTES,
@@ -96,7 +98,7 @@ type Props = {
   cameraId: number;
   initialAgent: CameraCustomAgentRow | null;
   onClose: () => void;
-  onSaved: () => Promise<void> | void;
+  onSaved: (savedAgentId?: number | null) => Promise<void> | void;
   showToast: (title: string, description: string, variant?: ToastVariant) => void;
 };
 
@@ -117,6 +119,32 @@ const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
+  "agent-model",
+  "agent-input-type",
+  "agent-fields",
+  "agent-enhance",
+  "agent-polygons",
+  "agent-execution",
+  "agent-save",
+]);
+const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
+const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
+const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
+const PROMPT_DOCUMENT_INPUT_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TEXTAREA_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+
+const extractOptionalSuffix = (label: string): string => {
+  const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
+  return match ? ` ${match[1].trim()}` : " (optional)";
+};
+
+const formatPromptDocumentHeading = (
+  label: string,
+  options?: { optional?: boolean; optionalSuffix?: string }
+): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
 
 const clamp01 = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
 
@@ -273,6 +301,25 @@ const applyExecutionConstraints = (
         ? normalizeModelFps(modelFps)
         : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   };
+};
+
+type TutorialProviderAvailability = {
+  openai: boolean;
+  zai: boolean;
+};
+
+const getTutorialInferenceModel = (
+  providerStatus: TutorialProviderAvailability
+): CameraAgentInferenceModel => {
+  if (providerStatus.openai) {
+    return "ultra";
+  }
+
+  if (providerStatus.zai) {
+    return "core";
+  }
+
+  return DEFAULT_CAMERA_AGENT_INFERENCE_MODEL;
 };
 
 const sanitizeRegionId = (value: unknown, idx: number): string => {
@@ -547,6 +594,17 @@ export default function CameraCustomAgentEditorModal({
   showToast,
 }: Props) {
   const { t, i18n } = useTranslation();
+  const {
+    currentStepId: onboardingStepId,
+    isOpen: isOnboardingOpen,
+    providerStatus,
+  } = useOnboarding();
+  const tutorialAgentSeededRef = useRef(false);
+  const localizedOptionalSuffix = extractOptionalSuffix(
+    t("jobs.promptEditor.targetFacesOptionalLabel", {
+      defaultValue: "Target Faces (optional)",
+    })
+  );
   const [displayName, setDisplayName] = useState("");
   const [isEnabled, setIsEnabled] = useState(true);
   const [inputType, setInputType] = useState<"video" | "image">("video");
@@ -820,6 +878,60 @@ export default function CameraCustomAgentEditorModal({
       })
       .finally(() => setSnapshotLoading(false));
   }, [open, initialAgent?.id, cameraId]);
+
+  useEffect(() => {
+    if (!open) {
+      tutorialAgentSeededRef.current = false;
+      return;
+    }
+
+    if (
+      initialAgent ||
+      !isOnboardingOpen ||
+      !onboardingStepId ||
+      !AGENT_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)
+    ) {
+      return;
+    }
+
+    if (!tutorialAgentSeededRef.current) {
+      const preferredModel = getTutorialInferenceModel({
+        openai: providerStatus.openai,
+        zai: providerStatus.zai,
+      });
+      const execution = applyExecutionConstraints(
+        "video",
+        preferredModel,
+        10,
+        DEFAULT_CORE_RUNNING_RESOLUTION,
+        DEFAULT_ULTRA_VIDEO_MODEL_FPS
+      );
+
+      setDisplayName(t("tutorial.agentPreset.name"));
+      setIsEnabled(true);
+      setInputType(execution.inputType);
+      setVideoPackagingMode("frame_sequence");
+      setInferenceModel(execution.inferenceModel);
+      setRunEvery(execution.runEvery);
+      setRunningResolution(execution.runningResolution);
+      setModelFps(execution.modelFps);
+      setOnlyCaptureOnMotion(true);
+      setFields({
+        prompt_template: t("tutorial.agentPreset.promptCore"),
+        alert_condition: t("tutorial.agentPreset.alertCondition"),
+        negative_condition: "",
+      });
+      tutorialAgentSeededRef.current = true;
+    }
+  }, [
+    initialAgent,
+    isOnboardingOpen,
+    onboardingStepId,
+    open,
+    providerStatus.openai,
+    providerStatus.zai,
+    t,
+  ]);
 
   useEffect(() => {
     if (!open) return;
@@ -1456,7 +1568,7 @@ export default function CameraCustomAgentEditorModal({
         setAlgorithmId(savedId);
         await loadNegativeImages(savedId);
       }
-      await onSaved();
+      await onSaved(savedId);
       showToast("Success", "Custom AI agent saved", "default");
       onClose();
     } catch (error) {
@@ -1495,59 +1607,66 @@ export default function CameraCustomAgentEditorModal({
               <p className="text-xs text-gray-400 mt-1">Define the full agent context.</p>
             </div>
             <div className="flex items-center gap-2">
-              <select
-                value={inferenceModel}
-                onChange={(e) => {
-                  const previousModel = inferenceModel;
-                  const nextModel = normalizeInferenceModel(e.target.value);
-                  if (shouldShowCoreModelNotice(nextModel, previousModel)) {
-                    const notice = getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language);
-                    showToast(notice.title, notice.message, "default");
-                  }
-                  const constrained = applyExecutionConstraints(
-                    inputType,
-                    nextModel,
-                    runEvery,
-                    runningResolution,
-                    modelFps
-                  );
-                  setInferenceModel(constrained.inferenceModel);
-                  setInputType(constrained.inputType);
-                  setRunEvery(constrained.runEvery);
-                  setRunningResolution(constrained.runningResolution);
-                  setModelFps(constrained.modelFps);
-                }}
-                disabled={saving || enhancingPrompt}
-                className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                title={t("jobs.inferenceModel")}
+              <div
+                className="flex items-center gap-2"
+                data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorModel}
               >
-                <option value="core">{t("jobs.inferenceModelOption.core")}</option>
-                <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
-              </select>
-              <ModelHostingBadge modelTier={inferenceModel} />
-              <select
-                value={inputType}
-                onChange={(e) => {
-                  const nextInputType = e.target.value === "image" ? "image" : "video";
-                  const constrained = applyExecutionConstraints(
-                    nextInputType,
-                    inferenceModel,
-                    runEvery,
-                    runningResolution,
-                    modelFps
-                  );
-                  setInputType(constrained.inputType);
-                  setRunEvery(constrained.runEvery);
-                  setRunningResolution(constrained.runningResolution);
-                  setModelFps(constrained.modelFps);
-                }}
-                disabled={saving || enhancingPrompt || inferenceModel === "core"}
-                className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                title={t("jobs.inputType")}
-              >
-                <option value="video">{t("jobs.video")}</option>
-                {inferenceModel !== "core" && <option value="image">{t("jobs.image")}</option>}
-              </select>
+                <select
+                  value={inferenceModel}
+                  onChange={(e) => {
+                    const previousModel = inferenceModel;
+                    const nextModel = normalizeInferenceModel(e.target.value);
+                    if (shouldShowCoreModelNotice(nextModel, previousModel)) {
+                      const notice = getCoreModelNoticeCopy(i18n.resolvedLanguage || i18n.language);
+                      showToast(notice.title, notice.message, "default");
+                    }
+                    const constrained = applyExecutionConstraints(
+                      inputType,
+                      nextModel,
+                      runEvery,
+                      runningResolution,
+                      modelFps
+                    );
+                    setInferenceModel(constrained.inferenceModel);
+                    setInputType(constrained.inputType);
+                    setRunEvery(constrained.runEvery);
+                    setRunningResolution(constrained.runningResolution);
+                    setModelFps(constrained.modelFps);
+                  }}
+                  disabled={saving || enhancingPrompt}
+                  className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={t("jobs.inferenceModel")}
+                >
+                  <option value="core">{t("jobs.inferenceModelOption.core")}</option>
+                  <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
+                </select>
+                <ModelHostingBadge modelTier={inferenceModel} />
+              </div>
+              <div data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorInputType}>
+                <select
+                  value={inputType}
+                  onChange={(e) => {
+                    const nextInputType = e.target.value === "image" ? "image" : "video";
+                    const constrained = applyExecutionConstraints(
+                      nextInputType,
+                      inferenceModel,
+                      runEvery,
+                      runningResolution,
+                      modelFps
+                    );
+                    setInputType(constrained.inputType);
+                    setRunEvery(constrained.runEvery);
+                    setRunningResolution(constrained.runningResolution);
+                    setModelFps(constrained.modelFps);
+                  }}
+                  disabled={saving || enhancingPrompt || inferenceModel === "core"}
+                  className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={t("jobs.inputType")}
+                >
+                  <option value="video">{t("jobs.video")}</option>
+                  {inferenceModel !== "core" && <option value="image">{t("jobs.image")}</option>}
+                </select>
+              </div>
               <button
                 type="button"
                 onClick={onClose}
@@ -1568,7 +1687,10 @@ export default function CameraCustomAgentEditorModal({
                     : "grid-rows-[minmax(0,1.35fr)_minmax(0,0.65fr)]"
                 }`}
               >
-                <div className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30">
+                <div
+                  className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30"
+                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorPolygons}
+                >
                   <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
                     <div className="text-xs text-gray-300 truncate">Camera #{cameraId}</div>
                     <div className="flex items-center gap-2">
@@ -1996,106 +2118,169 @@ export default function CameraCustomAgentEditorModal({
                     enhancingPrompt ? "overflow-y-hidden" : "overflow-y-auto"
                   } pr-2 pl-4 space-y-5 p-5`}
                 >
-                <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">
-                    Agent Name <span className="text-red-600">*</span>
-                  </label>
-                  <input type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm" placeholder="Custom agent name" />
-                </div>
-                <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
-                  <select
-                    value={inferenceModel === "core" ? 60 : runEvery}
-                    onChange={(e) => setRunEvery(normalizeRunEverySeconds(e.target.value, 60))}
-                    disabled={inferenceModel === "core"}
-                    className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
-                  >
-                {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
-                  <option key={seconds} value={seconds}>
-                    {getRunEveryOptionLabel(seconds)}
-                  </option>
-                ))}
-                  </select>
-                </div>
-                {inputType === "video" ? (
+                <div
+                  className="space-y-5"
+                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorExecution}
+                >
                   <div className="space-y-2">
-                    <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
+                    <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
                     <select
-                      value={videoPackagingMode}
-                      onChange={(e) =>
-                        setVideoPackagingMode(
-                          normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
-                        )
-                      }
-                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                      value={inferenceModel === "core" ? 60 : runEvery}
+                      onChange={(e) => setRunEvery(normalizeRunEverySeconds(e.target.value, 60))}
+                      disabled={inferenceModel === "core"}
+                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                      <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
-                      <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
-                      <option value="mosaic_3x3">{getVideoPackagingModeLabel("mosaic_3x3")}</option>
+                  {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
+                    <option key={seconds} value={seconds}>
+                      {getRunEveryOptionLabel(seconds)}
+                    </option>
+                  ))}
                     </select>
-                    <p className="text-xs text-gray-400">
-                      Standard Resolution uses a 2x2 mosaic. Compact Resolution uses a 3x3 mosaic and sends fewer image inputs than High Resolution.
-                    </p>
                   </div>
-                ) : null}
-                {inferenceModel === "ultra" && inputType === "video" ? (
-                  <div className="space-y-2">
-                    <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
-                    <select
-                      value={modelFps}
-                      onChange={(e) => setModelFps(normalizeModelFps(e.target.value, modelFps))}
-                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
-                    >
-                      {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
-                        const fps = index + 1;
-                        return (
-                          <option key={fps} value={fps}>
-                            {`${fps} FPS`}
-                          </option>
-                        );
+                  {inputType === "video" ? (
+                    <div className="space-y-2">
+                      <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
+                      <select
+                        value={videoPackagingMode}
+                        onChange={(e) =>
+                          setVideoPackagingMode(
+                            normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
+                          )
+                        }
+                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                      >
+                        <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
+                        <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
+                        <option value="mosaic_3x3">{getVideoPackagingModeLabel("mosaic_3x3")}</option>
+                      </select>
+                      <p className="text-xs text-gray-400">
+                        Standard Resolution uses a 2x2 mosaic. Compact Resolution uses a 3x3 mosaic and sends fewer image inputs than High Resolution.
+                      </p>
+                    </div>
+                  ) : null}
+                  {inferenceModel === "ultra" && inputType === "video" ? (
+                    <div className="space-y-2">
+                      <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
+                      <select
+                        value={modelFps}
+                        onChange={(e) => setModelFps(normalizeModelFps(e.target.value, modelFps))}
+                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                      >
+                        {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
+                          const fps = index + 1;
+                          return (
+                            <option key={fps} value={fps}>
+                              {`${fps} FPS`}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+                  ) : null}
+                  {inferenceModel === "core" ? (
+                    <div className="space-y-2">
+                      <label className="block text-sm font-semibold text-gray-100">
+                        {t("jobs.runningResolution")}
+                      </label>
+                      <select
+                        value={runningResolution}
+                        onChange={(e) =>
+                          setRunningResolution(normalizeRunningResolution(e.target.value))
+                        }
+                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                      >
+                        <option value={640}>
+                          {t("jobs.runningResolutionOption.640")}
+                        </option>
+                        <option value={1024}>
+                          {t("jobs.runningResolutionOption.1024")}
+                        </option>
+                      </select>
+                    </div>
+                  ) : null}
+                </div>
+                <div
+                  className={PROMPT_DOCUMENT_BLOCK_CLASS}
+                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorFields}
+                >
+                  <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading("Agent Name")}
+                      </span>
+                      <span className="text-red-600">*</span>
+                    </div>
+                    <input
+                      aria-label="Agent Name"
+                      type="text"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      className={PROMPT_DOCUMENT_INPUT_CLASS}
+                      placeholder="Custom agent name"
+                    />
+                  </div>
+                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+                      </span>
+                      <span className="text-red-600">*</span>
+                    </div>
+                    <textarea
+                      aria-label={t("jobs.promptEditor.promptCoreLabel")}
+                      value={fields.prompt_template}
+                      onChange={(e) =>
+                        setFields((prev) => ({ ...prev, prompt_template: e.target.value }))
+                      }
+                      rows={8}
+                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+                    />
+                  </div>
+                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+                      </span>
+                      <span className="text-red-600">*</span>
+                    </div>
+                    <textarea
+                      aria-label={t("jobs.promptEditor.alertConditionLabel")}
+                      value={fields.alert_condition}
+                      onChange={(e) =>
+                        setFields((prev) => ({ ...prev, alert_condition: e.target.value }))
+                      }
+                      rows={5}
+                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+                    />
+                  </div>
+                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                    <div className="font-mono text-[13px] font-semibold text-gray-100">
+                      {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+                        optional: true,
+                        optionalSuffix: localizedOptionalSuffix,
                       })}
-                    </select>
-                  </div>
-                ) : null}
-                {inferenceModel === "core" ? (
-                  <div className="space-y-2">
-                    <label className="block text-sm font-semibold text-gray-100">
-                      {t("jobs.runningResolution")}
-                    </label>
-                    <select
-                      value={runningResolution}
+                    </div>
+                    <textarea
+                      aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+                      value={fields.negative_condition}
                       onChange={(e) =>
-                        setRunningResolution(normalizeRunningResolution(e.target.value))
+                        setFields((prev) => ({ ...prev, negative_condition: e.target.value }))
                       }
-                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
-                    >
-                      <option value={640}>
-                        {t("jobs.runningResolutionOption.640")}
-                      </option>
-                      <option value={1024}>
-                        {t("jobs.runningResolutionOption.1024")}
-                      </option>
-                    </select>
+                      rows={4}
+                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+                    />
                   </div>
-                ) : null}
+                </div>
                   <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">
-                    Prompt Core <span className="text-red-600">*</span>
+                  <label className="block font-mono text-[13px] font-semibold text-gray-100">
+                    {formatPromptDocumentHeading("Negative Reference Images", {
+                      optional: true,
+                      optionalSuffix: localizedOptionalSuffix,
+                    })}
                   </label>
-                  <textarea value={fields.prompt_template} onChange={(e) => setFields((prev) => ({ ...prev, prompt_template: e.target.value }))} rows={8} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm" />
-                </div>
-                  <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">
-                    Alert Condition <span className="text-red-600">*</span>
-                  </label>
-                  <textarea value={fields.alert_condition} onChange={(e) => setFields((prev) => ({ ...prev, alert_condition: e.target.value }))} rows={5} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm" />
-                </div>
-                  <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">Negative Condition (optional)</label>
-                  <textarea value={fields.negative_condition} onChange={(e) => setFields((prev) => ({ ...prev, negative_condition: e.target.value }))} rows={4} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm" />
-                </div>
-                  <div className="space-y-2">
-                  <label className="block text-sm font-semibold text-gray-100">Negative Reference Images (optional)</label>
                   <div className="rounded border border-gray-700 bg-gray-800 p-3 space-y-2">
                     <div className="flex items-center justify-between gap-2">
                       <label className={`text-xs ${!algorithmId || negativeImages.length >= NEGATIVE_REFERENCE_MAX_IMAGES ? "text-gray-500 cursor-not-allowed" : "text-blue-400 cursor-pointer"}`}>
@@ -2144,11 +2329,11 @@ export default function CameraCustomAgentEditorModal({
 
           <div className="px-8 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
             <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">Cancel</button>
-            <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
+            <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorEnhance} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
               <Sparkles className="w-3.5 h-3.5" />
               {enhancingPrompt ? "Enhancing..." : "Enhance Prompt with AI"}
             </button>
-            <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
+            <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorSave} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
               {saving ? "Saving..." : "Apply & Save"}
             </button>
           </div>
@@ -2160,10 +2345,48 @@ export default function CameraCustomAgentEditorModal({
                   <h5 className="text-base font-semibold text-gray-100">AI suggestion ready</h5>
                   <p className="text-xs text-gray-400 mt-1">Review and apply suggested prompt improvements.</p>
                 </div>
-                <div className="px-6 py-4 space-y-3 overflow-y-auto">
-                  <textarea value={suggestion.prompt_template} readOnly rows={5} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-sm" />
-                  <textarea value={suggestion.alert_condition} readOnly rows={4} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-sm" />
-                  <textarea value={suggestion.negative_condition} readOnly rows={4} className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-sm" />
+                <div className="px-6 py-4 overflow-y-auto">
+                  <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
+                    <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+                      </div>
+                      <textarea
+                        aria-label={t("jobs.promptEditor.promptCoreLabel")}
+                        value={suggestion.prompt_template}
+                        readOnly
+                        rows={5}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                    <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+                      </div>
+                      <textarea
+                        aria-label={t("jobs.promptEditor.alertConditionLabel")}
+                        value={suggestion.alert_condition}
+                        readOnly
+                        rows={4}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                    <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
+                      <div className="font-mono text-[13px] font-semibold text-gray-100">
+                        {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+                          optional: true,
+                          optionalSuffix: localizedOptionalSuffix,
+                        })}
+                      </div>
+                      <textarea
+                        aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+                        value={suggestion.negative_condition}
+                        readOnly
+                        rows={4}
+                        className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                      />
+                    </div>
+                  </div>
                 </div>
                 <div className="px-6 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
                   <button type="button" onClick={() => setSuggestion(null)} className="px-3 py-1.5 rounded bg-gray-700 text-sm">Keep current</button>

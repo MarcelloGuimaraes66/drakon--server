@@ -34,14 +34,66 @@ bool containsAny_(const std::string& haystack, const std::vector<std::string>& n
 bool hasCameraCreationVerb_(const std::string& normalized)
 {
     return containsAny_(normalized, {
-        "create", "criar", "add", "adicionar", "register", "registrar",
-        "cadastrar", "setup", "configurar", "new camera", "nova camera"
+        "create", "criar", "crio", "add", "adicionar", "adiciono",
+        "register", "registrar", "cadastrar", "setup", "configurar",
+        "configuro", "new camera", "nova camera"
     });
 }
 
 bool hasCameraReference_(const std::string& normalized)
 {
     return containsAny_(normalized, { "camera", "cameras" });
+}
+
+bool hasCameraOnboardingCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "scan network", "nvr", "dvr", "webcam", "rtsp", "camera import",
+        "import camera", "import cameras", "camera csv", "camera json",
+        "camera tsv", "camera excel", "camera plain text", "import csv",
+        "import json", "import tsv", "import excel", "import plain text",
+        "manufacturer", "fabricante", "channel", "subtype", "retention",
+        "retencao", "retenção", "allow public access", "public access",
+        "cep", "zip code", "postal code"
+    });
+}
+
+bool hasAgentCreationVerb_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "create", "criar", "crio", "add", "adicionar", "adiciono",
+        "setup", "configurar", "configuro", "new agent", "novo agente",
+        "new ai agent", "novo ai agent"
+    });
+}
+
+bool hasAgentReference_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "agent", "agents", "agente", "agentes", "camera agent",
+        "camera agents", "ai agent", "ai agents", "custom agent",
+        "custom agents", "agente custom", "agent editor"
+    });
+}
+
+bool hasStepReference_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "step", "steps", "job step", "workflow step", "step agent",
+        "agent in step", "etapa", "etapas", "agente do step",
+        "agente na etapa", "agente na tarefa"
+    });
+}
+
+bool hasAgentConfigurationCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "prompt core", "alert condition", "video packaging", "input type",
+        "snapshot", "snapshots", "polygon", "polygons", "poligono",
+        "poligonos", "target", "targets", "face target", "face targets",
+        "negative condition", "negative conditions", "negative reference",
+        "negative image", "negative images"
+    });
 }
 
 std::string progressLanguage_(const SkillSelection& selection, const nlohmann::json& payload)
@@ -91,15 +143,27 @@ std::string chooseTopic_(
         return "api_keys";
     }
     if ((hasCameraCreationVerb_(normalized) && hasCameraReference_(normalized)) ||
+        (hasCameraReference_(normalized) && hasCameraOnboardingCue_(normalized)) ||
         containsAny_(normalized, {
             "create camera", "add camera", "new camera", "register camera", "camera setup",
-            "criar camera", "adicionar camera", "nova camera", "cadastrar camera", "configurar camera"
+            "criar camera", "adicionar camera", "nova camera", "cadastrar camera", "configurar camera",
+            "scan network", "camera import", "import cameras", "register webcam",
+            "cadastrar webcam", "registrar webcam"
         })) {
         return "camera_creation";
     }
-    if (containsAny_(normalized, {
+    if ((hasStepReference_(normalized) && (hasAgentReference_(normalized) || hasAgentConfigurationCue_(normalized))) ||
+        containsAny_(normalized, {
+            "step agent", "agent in step", "agente do step", "agente na etapa", "agente na tarefa"
+        })) {
+        return "job_steps";
+    }
+    if ((hasAgentReference_(normalized) &&
+         (hasAgentCreationVerb_(normalized) || hasAgentConfigurationCue_(normalized))) ||
+        containsAny_(normalized, {
             "camera agent", "camera agents", "agent on camera", "create agent", "custom agent",
-            "agente na camera", "agentes na camera", "criar agente", "agente custom"
+            "agente na camera", "agentes na camera", "criar agente", "agente custom",
+            "ai agent", "ai agents"
         })) {
         return "camera_agents";
     }
@@ -172,25 +236,30 @@ std::string fallbackDocumentAnswer_(
     else if (topic == "camera_creation") {
         out
             << "## Camera creation\n\n"
-            << "- Add the camera in Cameras.\n"
-            << "- Fill in the connection details and save.\n"
-            << "- Validate the stream and start the local service.\n\n"
+            << "- Cameras can be registered from AI Agents or Cameras.\n"
+            << "- The easiest paths are Scan Network, file import, or manual registration.\n"
+            << "- File import supports Excel, CSV, JSON, TSV, and plain text.\n"
+            << "- Manual registration lets the user choose RTSP/IP camera or Webcam.\n"
+            << "- RTSP/IP uses fields such as name, IP, port, manufacturer, username, password, channel, and subtype.\n"
+            << "- Webcam usually only needs name and webcam index, plus the shared fields.\n"
+            << "- Both flows include address, retention, and allow public access.\n\n"
             << "### Practical example\n\n"
-            << "1. Create a camera named `Front entrance`.\n"
-            << "2. Fill in IP, port, username, and password.\n"
-            << "3. Save the camera.\n"
-            << "4. Start the service so capture, thumbnails, and analysis can run.";
+            << "1. Open AI Agents or Cameras.\n"
+            << "2. Use Scan Network if the device is already on the network.\n"
+            << "3. If needed, register manually as RTSP/IP camera or Webcam.\n"
+            << "4. Save the camera and start the service so capture, thumbnails, and analysis can run.";
     }
     else if (topic == "camera_agents") {
         out
             << "## Camera agents\n\n"
-            << "- A camera agent runs continuously on one specific camera.\n"
-            << "- It uses a prompt, alert rules, and capture settings.\n"
-            << "- Use it for always-on monitoring outside the chat flow.\n\n"
+            << "- There are two places to create agent logic: AI Agents and Jobs / Steps.\n"
+            << "- AI Agents are for continuous monitoring on one camera.\n"
+            << "- Jobs / Steps are for scheduled or multi-camera workflows.\n"
+            << "- The minimum fields are Name, Prompt core, and Alert condition.\n"
+            << "- Advanced options include targets, face targets, negative conditions, negative reference images, model choice, video packaging, input type, and polygons.\n\n"
             << "### Practical example\n\n"
-            << "- Create an intrusion agent for the `Parking lot` camera.\n"
-            << "- Set an alert condition for people detected after business hours.\n"
-            << "- Keep the agent enabled for continuous monitoring.";
+            << "- Create an intrusion watcher in AI Agents for the `Parking lot` camera when the goal is continuous monitoring.\n"
+            << "- Create the same logic inside a job step when the agent must follow a schedule or coordinate with other cameras.";
     }
     else if (topic == "jobs") {
         out
@@ -206,8 +275,9 @@ std::string fallbackDocumentAnswer_(
         out
             << "## Job steps\n\n"
             << "- Each step is one stage inside the workflow.\n"
-            << "- A step defines targets, time window, agents, and alert behavior.\n"
-            << "- A simple job may use one step, while a larger workflow may use several.\n\n"
+            << "- To create an agent in a workflow, create the step first and add the camera as a target.\n"
+            << "- The step agent uses the same core fields as AI Agents: Name, Prompt core, and Alert condition.\n"
+            << "- It can also use targets, face targets, negative guidance, model choice, video packaging, input type, and polygons.\n\n"
             << "### Practical example\n\n"
             << "1. Step 1 checks the `Entrance`.\n"
             << "2. Step 2 checks the `Parking lot`.\n"

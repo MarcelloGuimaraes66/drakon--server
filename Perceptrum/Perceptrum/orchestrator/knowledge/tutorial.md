@@ -16,4 +16,12 @@ Helpful shortcuts:
 - Jobs are for scheduled workflows with multiple steps and targets.
 - Billing manages chat tokens, subscriptions, cards, and payment history.
 
+Camera tutorial note:
+
+- Stage 2 uses the **Cameras** page as the main visual example.
+- The same camera actions are also available in **AI Agents**.
+- The guided flow highlights **Scan Network**, **Import Cameras**, and **Register Camera** first.
+- Then it explains the **IP / RTSP** form, switches to **Webcam**, fills webcam index `0` and the name `tutorial webcam`, saves it, and then continues to Stage 3.
+- Stage 3 opens the tutorial camera's **Algorithms** page, creates a custom AI agent named `thumbs up detector`, explains **Enhance Prompt with AI**, and saves the agent on that camera.
+
 If a request needs the current account state, the chat can use read_state. If it needs a product explanation, the chat can use explain_app.

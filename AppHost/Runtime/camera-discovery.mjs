@@ -1,6 +1,7 @@
 import dgram from "node:dgram";
 import net from "node:net";
 import os from "node:os";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 const WS_DISCOVERY_HOST = "239.255.255.250";
@@ -11,16 +12,22 @@ const MAX_TIMEOUT_MS = 12000;
 const HTTP_PROBE_TIMEOUT_MS = 1200;
 const TCP_PROBE_TIMEOUT_MS = 350;
 const RTSP_PROBE_TIMEOUT_MS = 650;
+const RECORDER_CHANNEL_PROBE_TIMEOUT_MS = 520;
 const ACTIVE_SCAN_CONCURRENCY = 24;
 const MAX_SWEEP_TARGETS = 512;
+const RECORDER_CHANNEL_SCAN_LIMIT = 32;
+const RECORDER_CHANNEL_CANARY_LIMIT = 4;
+const RECORDER_CHANNEL_SCAN_CONCURRENCY = 8;
 const HTTP_SCAN_PORTS = [80, 8080];
 const AUXILIARY_TCP_PORTS = [8000, 37777];
 const RTSP_PORT = 554;
+const RTSP_SCAN_PORTS = [RTSP_PORT, 5544];
+const NEIGHBOR_TABLE_TIMEOUT_MS = 1500;
 
 const MANUFACTURER_PATTERNS = [
   { label: "Hikvision", pattern: /hikvision|hik[-\s]?connect|ds-\d/i },
-  { label: "Dahua", pattern: /dahua|imou/i },
   { label: "Intelbras", pattern: /intelbras|mibo/i },
+  { label: "Dahua", pattern: /dahua|imou/i },
   { label: "Axis", pattern: /\baxis\b|axis-media/i },
   { label: "Hanwha", pattern: /hanwha|wisenet|samsung techwin/i },
   { label: "Uniview", pattern: /uniview|unv\b/i },
@@ -31,7 +38,7 @@ const DEVICE_KIND_PATTERNS = [
   { label: "DVR", pattern: /\bdvr\b|digital video recorder/i },
   { label: "NVR", pattern: /\bnvr\b|network video recorder/i },
   {
-    label: "Camera",
+    label: "CAMERA",
     pattern:
       /\bcamera\b|\bipc\b|ipcam|network video|networkvideotransmitter|networkvideosource|onvif|rtsp|mibo/i,
   },
@@ -51,6 +58,79 @@ const GENERIC_RESPONSE_PATTERNS = [
   /^forbidden$/i,
   /^unauthorized$/i,
 ];
+
+const MAC_OUI_PREFIXES_BY_MANUFACTURER = {
+  Hikvision: [
+    "0C75D2",
+    "240F9B",
+    "2428FD",
+    "2432AE",
+    "244845",
+    "548C81",
+    "8CE748",
+    "ACB92F",
+    "C06DED",
+    "D4E853",
+    "ECC89C",
+  ],
+  Dahua: [
+    "08EDED",
+    "14A78B",
+    "24526A",
+    "38AF29",
+    "3CE36B",
+    "3CEF8C",
+    "4C11BF",
+    "5CF51A",
+    "64FD29",
+    "6C1C71",
+    "74C929",
+    "8CE9B4",
+    "9002A9",
+    "98F9CC",
+    "9C1463",
+    "A0BD1D",
+    "B44C3B",
+    "BC325F",
+    "C0395A",
+    "C4AAC4",
+    "D4430E",
+    "E02EFE",
+    "E0508B",
+    "E4246C",
+    "F4B1C2",
+    "FC5F49",
+    "FCB69D",
+  ],
+  Intelbras: [
+    "001A3F",
+    "180D2C",
+    "24FD0D",
+    "30E1F1",
+    "443B32",
+    "4851CF",
+    "546CAC",
+    "54BAD9",
+    "58108C",
+    "808544",
+    "808FE8",
+    "982A0A",
+    "98E55B",
+    "AC1EA9",
+    "B87EE5",
+    "D8365F",
+    "D8778B",
+  ],
+  Axis: ["00408C", "ACCC8E", "B8A44F", "E82725"],
+  Uniview: ["48EA63", "6CF17E", "88263F", "C47905"],
+};
+
+const MAC_OUI_MANUFACTURER_LOOKUP = new Map(
+  Object.entries(MAC_OUI_PREFIXES_BY_MANUFACTURER).flatMap(
+    ([manufacturer, prefixes]) =>
+      prefixes.map((prefix) => [String(prefix || "").trim().toUpperCase(), manufacturer])
+  )
+);
 
 function clampNumber(value, min, max, fallback) {
   const parsed =
@@ -350,6 +430,264 @@ function uniqueStrings(values) {
   );
 }
 
+function normalizeMacAddress(value) {
+  const compact = String(value || "")
+    .replace(/[^a-fA-F0-9]/g, "")
+    .trim()
+    .toUpperCase();
+
+  if (compact.length !== 12 || !/^[0-9A-F]{12}$/.test(compact)) {
+    return "";
+  }
+
+  return compact.match(/.{2}/g)?.join(":") || "";
+}
+
+function extractMacOuiPrefix(value) {
+  return normalizeMacAddress(value)
+    .split(":")
+    .slice(0, 3)
+    .join("");
+}
+
+function isUsableNeighborMacAddress(value) {
+  const normalized = normalizeMacAddress(value);
+  if (!normalized) {
+    return false;
+  }
+
+  const octets = normalized
+    .split(":")
+    .map((entry) => Number.parseInt(entry, 16))
+    .filter((entry) => Number.isInteger(entry));
+
+  if (octets.length !== 6) {
+    return false;
+  }
+
+  if (octets.every((entry) => entry === 0) || octets.every((entry) => entry === 255)) {
+    return false;
+  }
+
+  return (octets[0] & 1) === 0;
+}
+
+function detectManufacturerFromMacAddress(value) {
+  const ouiPrefix = extractMacOuiPrefix(value);
+  return ouiPrefix ? MAC_OUI_MANUFACTURER_LOOKUP.get(ouiPrefix) || "" : "";
+}
+
+function execFileText(file, args, timeoutMs = NEIGHBOR_TABLE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      },
+      (error, stdout = "", stderr = "") => {
+        if (error) {
+          if (typeof stdout === "string" && stdout.trim()) {
+            resolve(stdout);
+            return;
+          }
+
+          reject(stderr || error);
+          return;
+        }
+
+        resolve(typeof stdout === "string" ? stdout : "");
+      }
+    );
+  });
+}
+
+function parseNeighborMacTableLine(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const windowsMatch = trimmed.match(
+    /^(\d{1,3}(?:\.\d{1,3}){3})\s+((?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})\s+\S+/i
+  );
+  if (windowsMatch) {
+    return {
+      ip: windowsMatch[1],
+      mac_address: normalizeMacAddress(windowsMatch[2]),
+    };
+  }
+
+  const arpMatch = trimmed.match(
+    /^\?\s+\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+((?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|<incomplete>)/i
+  );
+  if (arpMatch && !/incomplete/i.test(arpMatch[2])) {
+    return {
+      ip: arpMatch[1],
+      mac_address: normalizeMacAddress(arpMatch[2]),
+    };
+  }
+
+  const ipNeighMatch = trimmed.match(
+    /^(\d{1,3}(?:\.\d{1,3}){3})\s+dev\s+\S+(?:\s+lladdr\s+((?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}))?/i
+  );
+  if (ipNeighMatch && ipNeighMatch[2]) {
+    return {
+      ip: ipNeighMatch[1],
+      mac_address: normalizeMacAddress(ipNeighMatch[2]),
+    };
+  }
+
+  return null;
+}
+
+function mergeNeighborMetadata(existing, next) {
+  if (!existing) {
+    return next;
+  }
+
+  if (!existing.manufacturer_guess && next.manufacturer_guess) {
+    return next;
+  }
+
+  if (!existing.mac_address && next.mac_address) {
+    return next;
+  }
+
+  return existing;
+}
+
+function parseNeighborMacTable(output) {
+  const metadataByIp = new Map();
+
+  for (const line of String(output || "").split(/\r?\n/)) {
+    const parsed = parseNeighborMacTableLine(line);
+    if (!parsed?.ip || !isUsableNeighborMacAddress(parsed.mac_address)) {
+      continue;
+    }
+
+    metadataByIp.set(
+      parsed.ip,
+      mergeNeighborMetadata(metadataByIp.get(parsed.ip), {
+        mac_address: parsed.mac_address,
+        manufacturer_guess: detectManufacturerFromMacAddress(parsed.mac_address),
+      })
+    );
+  }
+
+  return metadataByIp;
+}
+
+async function readNeighborMacTable() {
+  const commands =
+    process.platform === "win32"
+      ? [{ file: "arp", args: ["-a"] }]
+      : [
+          { file: "arp", args: ["-an"] },
+          { file: "ip", args: ["neigh"] },
+        ];
+  const metadataByIp = new Map();
+
+  for (const command of commands) {
+    try {
+      const output = await execFileText(command.file, command.args);
+      const parsed = parseNeighborMacTable(output);
+
+      for (const [ip, metadata] of parsed.entries()) {
+        metadataByIp.set(ip, mergeNeighborMetadata(metadataByIp.get(ip), metadata));
+      }
+    } catch {
+    }
+  }
+
+  return metadataByIp;
+}
+
+async function resolveMacMetadataByIp(ips) {
+  const requestedIps = uniqueStrings(ips);
+  if (requestedIps.length === 0) {
+    return new Map();
+  }
+
+  const neighborMetadataByIp = await readNeighborMacTable();
+  if (neighborMetadataByIp.size === 0) {
+    return new Map();
+  }
+
+  const resolved = new Map();
+  for (const ip of requestedIps) {
+    const metadata = neighborMetadataByIp.get(ip);
+    if (metadata) {
+      resolved.set(ip, metadata);
+    }
+  }
+
+  return resolved;
+}
+
+function applyMacMetadataToDevice(device, macMetadataByIp) {
+  const ip = String(device?.ip || "").trim();
+  if (!ip) {
+    return device;
+  }
+
+  const metadata = macMetadataByIp.get(ip);
+  const macManufacturer = String(metadata?.manufacturer_guess || "").trim();
+  if (!macManufacturer) {
+    return device;
+  }
+
+  const currentManufacturer = String(device?.manufacturer_guess || "").trim();
+  const channelGuess = String(device?.channel_guess || "").trim();
+  const friendlyName = String(device?.friendly_name || "").trim();
+  const isRecorderDevice = isRecorderKind(normalizeDeviceKind(device?.device_kind_guess));
+  const shouldPreferMacManufacturer =
+    !currentManufacturer ||
+    Boolean(channelGuess) ||
+    isRecorderDevice ||
+    /^recorder(?:\s+\d+\.\d+\.\d+\.\d+)?$/i.test(friendlyName);
+  const nextDevice = { ...device };
+  let changed = false;
+
+  if (shouldPreferMacManufacturer && currentManufacturer !== macManufacturer) {
+    nextDevice.manufacturer_guess = macManufacturer;
+    changed = true;
+  }
+
+  if (channelGuess) {
+    const channelLabel =
+      String(device?.channel_label || "").trim() || `Channel ${channelGuess}`;
+    const nextFriendlyName = buildRecorderChannelFriendlyName(
+      {
+        ...nextDevice,
+        friendly_name: "",
+      },
+      channelLabel,
+      channelGuess,
+      nextDevice.subtype_guess
+    );
+
+    if (nextFriendlyName !== friendlyName) {
+      nextDevice.friendly_name = nextFriendlyName;
+      changed = true;
+    }
+  } else if (
+    nextDevice.manufacturer_guess &&
+    (isRecorderDevice || looksLikeGenericRecorderName(friendlyName, ip))
+  ) {
+    const nextFriendlyName = buildRecorderFriendlyName(nextDevice);
+    if (nextFriendlyName !== friendlyName) {
+      nextDevice.friendly_name = nextFriendlyName;
+      changed = true;
+    }
+  }
+
+  return changed ? nextDevice : device;
+}
+
 function extractIpFromUrl(candidate) {
   try {
     const url = new URL(candidate);
@@ -501,6 +839,37 @@ function detectDeviceKind(...sources) {
   return "";
 }
 
+function normalizeDeviceKind(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (normalized === "CAMERA" || normalized === "DVR" || normalized === "NVR") {
+    return normalized;
+  }
+  return "UNKNOWN";
+}
+
+function isRecorderKind(value) {
+  return value === "DVR" || value === "NVR";
+}
+
+function isRecorderChannelFamilyManufacturer(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+  return (
+    normalized === "hikvision" ||
+    normalized === "dahua" ||
+    normalized === "intelbras"
+  );
+}
+
+function displayDeviceKind(value) {
+  const normalized = normalizeDeviceKind(value);
+  if (normalized === "UNKNOWN") {
+    return "";
+  }
+  return normalized === "CAMERA" ? "Camera" : normalized;
+}
+
 function sanitizeModelGuess(value) {
   const cleaned = String(value || "")
     .replace(/\s+/g, " ")
@@ -516,6 +885,53 @@ function sanitizeModelGuess(value) {
   }
 
   return cleaned;
+}
+
+function looksLikeGenericCameraName(value, ip = "") {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return true;
+  }
+
+  const normalizedIp = String(ip || "").trim();
+  if (normalizedIp && normalized.toLowerCase() === `camera ${normalizedIp}`.toLowerCase()) {
+    return true;
+  }
+
+  return /^camera\s+\d+\.\d+\.\d+\.\d+$/i.test(normalized);
+}
+
+function looksLikeGenericRecorderName(value, ip = "") {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return true;
+  }
+
+  const normalizedIp = String(ip || "").trim();
+  if (normalizedIp && normalized.toLowerCase() === `recorder ${normalizedIp}`.toLowerCase()) {
+    return true;
+  }
+
+  return /^recorder(?:\s+\d+\.\d+\.\d+\.\d+)?$/i.test(normalized);
+}
+
+function hasRtspPortOpen(openPorts) {
+  return openPorts.some((port) => RTSP_SCAN_PORTS.includes(port));
+}
+
+function getPreferredRtspPort(openPorts, manufacturerGuess = "") {
+  const normalizedManufacturer = String(manufacturerGuess || "")
+    .trim()
+    .toLowerCase();
+
+  if (
+    (normalizedManufacturer === "dahua" || normalizedManufacturer === "intelbras") &&
+    openPorts.includes(5544)
+  ) {
+    return 5544;
+  }
+
+  return RTSP_SCAN_PORTS.find((port) => openPorts.includes(port)) || null;
 }
 
 function buildHttpProbeCandidates(ip, xaddrs) {
@@ -731,9 +1147,44 @@ function probeTcpBanner(ip, port, payload, timeoutMs = RTSP_PROBE_TIMEOUT_MS) {
   });
 }
 
-async function probeRtsp(ip) {
-  const payload = `OPTIONS rtsp://${ip}/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: DrakonDesktopCameraDiscovery/1.0\r\n\r\n`;
-  const result = await probeTcpBanner(ip, RTSP_PORT, payload, RTSP_PROBE_TIMEOUT_MS);
+function extractMessageHeaderValue(message, headerName) {
+  const normalizedHeader = String(headerName || "")
+    .trim()
+    .toLowerCase();
+  if (!normalizedHeader) {
+    return "";
+  }
+
+  for (const line of String(message || "").split(/\r?\n/)) {
+    const separatorIndex = line.indexOf(":");
+    if (separatorIndex < 0) {
+      continue;
+    }
+
+    const currentHeader = line.slice(0, separatorIndex).trim().toLowerCase();
+    if (currentHeader !== normalizedHeader) {
+      continue;
+    }
+
+    return line.slice(separatorIndex + 1).trim();
+  }
+
+  return "";
+}
+
+function parseRtspStatusCode(statusLine) {
+  const match = String(statusLine || "").match(/^RTSP\/\d+\.\d+\s+(\d{3})\b/i);
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+async function probeRtsp(ip, port = RTSP_PORT) {
+  const payload = `OPTIONS rtsp://${ip}:${port}/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: DrakonDesktopCameraDiscovery/1.0\r\n\r\n`;
+  const result = await probeTcpBanner(ip, port, payload, RTSP_PROBE_TIMEOUT_MS);
   if (!result || !result.connected) {
     return null;
   }
@@ -742,9 +1193,43 @@ async function probeRtsp(ip) {
   const statusLine = banner.split(/\r?\n/, 1)[0] || "";
 
   return {
-    port: RTSP_PORT,
+    port,
     status_line: statusLine,
+    status_code: parseRtspStatusCode(statusLine),
     banner,
+  };
+}
+
+async function probeRtspResource(ip, port, path) {
+  const normalizedPath = String(path || "").trim().startsWith("/")
+    ? String(path || "").trim()
+    : `/${String(path || "").trim()}`;
+  const payload =
+    `DESCRIBE rtsp://${ip}:${port}${normalizedPath} RTSP/1.0\r\n` +
+    `CSeq: 1\r\n` +
+    `Accept: application/sdp\r\n` +
+    `User-Agent: DrakonDesktopCameraDiscovery/1.0\r\n\r\n`;
+  const result = await probeTcpBanner(
+    ip,
+    port,
+    payload,
+    RECORDER_CHANNEL_PROBE_TIMEOUT_MS
+  );
+  if (!result || !result.connected) {
+    return null;
+  }
+
+  const banner = String(result.data || "").slice(0, 1400);
+  const statusLine = banner.split(/\r?\n/, 1)[0] || "";
+
+  return {
+    port,
+    path: normalizedPath,
+    status_line: statusLine,
+    status_code: parseRtspStatusCode(statusLine),
+    banner,
+    www_authenticate: extractMessageHeaderValue(banner, "WWW-Authenticate"),
+    content_base: extractMessageHeaderValue(banner, "Content-Base"),
   };
 }
 
@@ -789,6 +1274,317 @@ function collectProbeStrings(httpProbes, rtspProbe, openPorts) {
   return values.filter(Boolean);
 }
 
+function buildRecorderChannelStrategies(manufacturerGuess, openPorts) {
+  const strategies = [];
+  const normalizedManufacturer = String(manufacturerGuess || "")
+    .trim()
+    .toLowerCase();
+
+  const pushStrategy = (strategy) => {
+    if (!strategies.some((current) => current.key === strategy.key)) {
+      strategies.push(strategy);
+    }
+  };
+
+  const hikvisionStrategy = {
+    key: "hikvision",
+    manufacturer_label: "Hikvision",
+    buildVariants(channelIndex) {
+      const channelToken = `${channelIndex}01`;
+      return [
+        {
+          channel_index: channelIndex,
+          channel_label: `Channel ${channelIndex}`,
+          channel_guess: channelToken,
+          subtype_guess: null,
+          path: `/Streaming/Channels/${channelToken}`,
+        },
+      ];
+    },
+  };
+
+  const dahuaFamilyStrategy = (manufacturerLabel) => ({
+    key: "dahua-family",
+    manufacturer_label: manufacturerLabel,
+    buildVariants(channelIndex) {
+      const channelToken = String(channelIndex);
+      return [
+        {
+          channel_index: channelIndex,
+          channel_label: `Channel ${channelIndex}`,
+          channel_guess: channelToken,
+          subtype_guess: "0",
+          path: `/cam/realmonitor?channel=${channelToken}&subtype=0`,
+        },
+        {
+          channel_index: channelIndex,
+          channel_label: `Channel ${channelIndex}`,
+          channel_guess: channelToken,
+          subtype_guess: "1",
+          path: `/cam/realmonitor?channel=${channelToken}&subtype=1`,
+        },
+      ];
+    },
+  });
+
+  if (normalizedManufacturer === "hikvision") {
+    pushStrategy(hikvisionStrategy);
+  }
+  if (normalizedManufacturer === "intelbras") {
+    pushStrategy(dahuaFamilyStrategy("Intelbras"));
+  }
+  if (normalizedManufacturer === "dahua") {
+    pushStrategy(dahuaFamilyStrategy("Dahua"));
+  }
+
+  if (strategies.length === 0) {
+    if (openPorts.includes(8000)) {
+      pushStrategy(hikvisionStrategy);
+    }
+    if (openPorts.includes(37777)) {
+      pushStrategy(
+        dahuaFamilyStrategy(
+          normalizedManufacturer === "intelbras" ? "Intelbras" : "Dahua"
+        )
+      );
+    }
+  }
+
+  if (strategies.length === 0) {
+    pushStrategy(hikvisionStrategy);
+    pushStrategy(
+      dahuaFamilyStrategy(
+        normalizedManufacturer === "intelbras" ? "Intelbras" : "Dahua"
+      )
+    );
+  }
+
+  return strategies;
+}
+
+function looksLikeExistingRtspResource(probe) {
+  if (!probe) {
+    return false;
+  }
+
+  if (probe.status_code === 200 || probe.status_code === 401) {
+    return true;
+  }
+
+  if (
+    (probe.status_code === 301 || probe.status_code === 302) &&
+    probe.content_base
+  ) {
+    return true;
+  }
+
+  if (
+    (probe.status_code === 400 || probe.status_code === 405) &&
+    probe.www_authenticate
+  ) {
+    return true;
+  }
+
+  return /www-authenticate:/i.test(String(probe.banner || ""));
+}
+
+function computeRecorderChannelConfidence(baseConfidence, probe) {
+  let score = Math.max(0.58, Number(baseConfidence || 0) - 0.08);
+
+  if (probe?.status_code === 200) {
+    score = Math.max(score, Math.min(0.93, Number(baseConfidence || 0) + 0.02));
+  } else if (probe?.status_code === 401) {
+    score = Math.max(score, Math.min(0.88, Number(baseConfidence || 0) - 0.01));
+  } else if (probe?.www_authenticate) {
+    score = Math.max(score, 0.74);
+  }
+
+  return Number(score.toFixed(2));
+}
+
+function buildRecorderFriendlyName(baseDevice) {
+  const existingName = String(baseDevice?.friendly_name || "").trim();
+  if (
+    existingName &&
+    !looksLikeGenericCameraName(existingName, baseDevice?.ip) &&
+    !looksLikeGenericRecorderName(existingName, baseDevice?.ip)
+  ) {
+    return existingName;
+  }
+
+  const manufacturer = String(baseDevice?.manufacturer_guess || "").trim();
+  const deviceKind = displayDeviceKind(baseDevice?.device_kind_guess);
+  const recorderKind = isRecorderKind(baseDevice?.device_kind_guess)
+    ? deviceKind
+    : "Recorder";
+  const combined = [manufacturer, recorderKind].filter(Boolean).join(" ").trim();
+  return combined || `Recorder ${String(baseDevice?.ip || "").trim()}`;
+}
+
+function buildRecorderChannelFriendlyName(baseDevice, channelLabel, channelGuess, subtypeGuess) {
+  const baseName = buildRecorderFriendlyName(baseDevice);
+
+  let suffix = channelLabel;
+  if (channelGuess && channelGuess !== channelLabel) {
+    suffix += ` (${channelGuess})`;
+  }
+  if (subtypeGuess && subtypeGuess !== "0") {
+    suffix += ` subtype ${subtypeGuess}`;
+  }
+
+  return `${baseName} - ${suffix}`;
+}
+
+function shouldAttemptRecorderChannelInference(
+  baseDevice,
+  openPorts,
+  httpProbes,
+  rtspProbe,
+  onvifXaddrs
+) {
+  if (!hasRtspPortOpen(openPorts) || !rtspProbe) {
+    return false;
+  }
+
+  if (isRecorderKind(baseDevice?.device_kind_guess)) {
+    return true;
+  }
+
+  if (isRecorderChannelFamilyManufacturer(baseDevice?.manufacturer_guess)) {
+    return true;
+  }
+
+  if (
+    openPorts.includes(8000) ||
+    openPorts.includes(37777) ||
+    openPorts.includes(5544)
+  ) {
+    return true;
+  }
+
+  return (
+    httpProbes.length > 0 &&
+    onvifXaddrs.length === 0 &&
+    looksLikeGenericCameraName(baseDevice?.friendly_name, baseDevice?.ip)
+  );
+}
+
+async function detectRecorderChannelStrategy(baseDevice, openPorts) {
+  const rtspPort =
+    getPreferredRtspPort(openPorts, baseDevice.manufacturer_guess) ||
+    baseDevice.rtsp_port_guess ||
+    RTSP_PORT;
+  const strategies = buildRecorderChannelStrategies(
+    baseDevice.manufacturer_guess,
+    openPorts
+  );
+  const canaryIndexes = Array.from(
+    { length: RECORDER_CHANNEL_CANARY_LIMIT },
+    (_, index) => index + 1
+  );
+
+  for (const strategy of strategies) {
+    for (const channelIndex of canaryIndexes) {
+      for (const variant of strategy.buildVariants(channelIndex)) {
+        const probe = await probeRtspResource(
+          baseDevice.ip,
+          rtspPort,
+          variant.path
+        );
+        if (!looksLikeExistingRtspResource(probe)) {
+          continue;
+        }
+
+        return {
+          rtspPort,
+          strategy,
+        };
+      }
+    }
+  }
+
+  return {
+    rtspPort,
+    strategy: null,
+  };
+}
+
+async function enumerateRecorderChannelDevices(baseDevice, openPorts, strategyMatch = null) {
+  const rtspPort =
+    strategyMatch?.rtspPort ||
+    getPreferredRtspPort(openPorts, baseDevice.manufacturer_guess) ||
+    baseDevice.rtsp_port_guess ||
+    RTSP_PORT;
+  const strategies = strategyMatch?.strategy
+    ? [strategyMatch.strategy]
+    : buildRecorderChannelStrategies(baseDevice.manufacturer_guess, openPorts);
+  const channelIndexes = Array.from(
+    { length: RECORDER_CHANNEL_SCAN_LIMIT },
+    (_, index) => index + 1
+  );
+
+  for (const strategy of strategies) {
+    const results = await mapWithConcurrency(
+      channelIndexes,
+      RECORDER_CHANNEL_SCAN_CONCURRENCY,
+      async (channelIndex) => {
+        for (const variant of strategy.buildVariants(channelIndex)) {
+          const probe = await probeRtspResource(
+            baseDevice.ip,
+            rtspPort,
+            variant.path
+          );
+          if (!looksLikeExistingRtspResource(probe)) {
+            continue;
+          }
+
+          return {
+            id: `${baseDevice.ip}|channel:${variant.channel_guess}|subtype:${
+              variant.subtype_guess || "main"
+            }`,
+            ip: baseDevice.ip,
+            friendly_name: buildRecorderChannelFriendlyName(
+              baseDevice,
+              variant.channel_label,
+              variant.channel_guess,
+              variant.subtype_guess
+            ),
+            manufacturer_guess:
+              String(baseDevice.manufacturer_guess || "").trim() ||
+              strategy.manufacturer_label,
+            model_guess: baseDevice.model_guess,
+            discovery_protocols: uniqueStrings([
+              ...baseDevice.discovery_protocols,
+              "RTSP_PROBE",
+            ]),
+            onvif_xaddrs: [...baseDevice.onvif_xaddrs],
+            rtsp_port_guess: rtspPort,
+            channel_guess: variant.channel_guess,
+            subtype_guess: variant.subtype_guess,
+            connection_method_suggested: "RTSP",
+            requires_credentials: true,
+            confidence: computeRecorderChannelConfidence(
+              baseDevice.confidence,
+              probe
+            ),
+            device_kind_guess: "CAMERA",
+            channel_label: variant.channel_label,
+          };
+        }
+
+        return null;
+      }
+    );
+
+    const channelDevices = results.filter(Boolean);
+    if (channelDevices.length > 0) {
+      return channelDevices;
+    }
+  }
+
+  return [];
+}
+
 function looksLikeCameraFromActiveProbe(httpProbes, rtspProbe, openPorts, manufacturerGuess, deviceKind) {
   const onvifHttpProbe = httpProbes.find(
     (probe) =>
@@ -816,7 +1612,7 @@ function looksLikeCameraFromActiveProbe(httpProbes, rtspProbe, openPorts, manufa
     .filter(Boolean)
     .join(" ");
 
-  if (deviceKind === "NVR" || deviceKind === "DVR") {
+  if (isRecorderKind(deviceKind)) {
     return true;
   }
 
@@ -831,7 +1627,7 @@ function looksLikeCameraFromActiveProbe(httpProbes, rtspProbe, openPorts, manufa
     return true;
   }
 
-  return openPorts.includes(RTSP_PORT) && openPorts.some((port) => port !== RTSP_PORT);
+  return hasRtspPortOpen(openPorts) && openPorts.some((port) => !RTSP_SCAN_PORTS.includes(port));
 }
 
 function computeActiveConfidenceScore(httpProbes, rtspProbe, openPorts, manufacturerGuess, deviceKind) {
@@ -863,9 +1659,9 @@ function computeActiveConfidenceScore(httpProbes, rtspProbe, openPorts, manufact
     score += 0.07;
   }
 
-  if (deviceKind === "NVR" || deviceKind === "DVR") {
+  if (isRecorderKind(deviceKind)) {
     score += 0.07;
-  } else if (deviceKind === "Camera") {
+  } else if (deviceKind === "CAMERA") {
     score += 0.05;
   }
 
@@ -877,7 +1673,7 @@ function computeActiveConfidenceScore(httpProbes, rtspProbe, openPorts, manufact
 }
 
 async function scanActiveHost(ip) {
-  const portsToCheck = [...HTTP_SCAN_PORTS, RTSP_PORT, ...AUXILIARY_TCP_PORTS];
+  const portsToCheck = [...HTTP_SCAN_PORTS, ...RTSP_SCAN_PORTS, ...AUXILIARY_TCP_PORTS];
   const portStates = await Promise.all(
     portsToCheck.map(async (port) => ({
       port,
@@ -887,15 +1683,17 @@ async function scanActiveHost(ip) {
 
   const openPorts = portStates.filter((entry) => entry.isOpen).map((entry) => entry.port);
   if (openPorts.length === 0) {
-    return null;
+    return [];
   }
+
+  const preferredRtspPort = getPreferredRtspPort(openPorts);
 
   const [httpProbes, rtspProbe] = await Promise.all([
     probeHttpPorts(
       ip,
       openPorts.filter((port) => HTTP_SCAN_PORTS.includes(port))
     ),
-    openPorts.includes(RTSP_PORT) ? probeRtsp(ip) : Promise.resolve(null),
+    preferredRtspPort ? probeRtsp(ip, preferredRtspPort) : Promise.resolve(null),
   ]);
 
   const onvifXaddrs = uniqueStrings(
@@ -910,14 +1708,16 @@ async function scanActiveHost(ip) {
 
   const evidenceStrings = collectProbeStrings(httpProbes, rtspProbe, openPorts);
   const manufacturerGuess = detectManufacturer(...evidenceStrings);
-  const deviceKind = detectDeviceKind(
-    ...httpProbes.flatMap((probe) => [
-      probe.server,
-      extractAuthRealm(probe.www_authenticate),
-      probe.title,
-    ]),
-    rtspProbe?.status_line || "",
-    rtspProbe?.banner || ""
+  const deviceKind = normalizeDeviceKind(
+    detectDeviceKind(
+      ...httpProbes.flatMap((probe) => [
+        probe.server,
+        extractAuthRealm(probe.www_authenticate),
+        probe.title,
+      ]),
+      rtspProbe?.status_line || "",
+      rtspProbe?.banner || ""
+    )
   );
   if (
     !looksLikeCameraFromActiveProbe(
@@ -937,12 +1737,17 @@ async function scanActiveHost(ip) {
     sanitizeModelGuess(titleGuess) ||
     sanitizeModelGuess(realmGuess) ||
     sanitizeModelGuess(rtspProbe?.status_line || "");
+  const deviceKindLabel = displayDeviceKind(deviceKind);
+  const recorderAwareRtspPort =
+    getPreferredRtspPort(openPorts, manufacturerGuess) ||
+    preferredRtspPort ||
+    RTSP_PORT;
 
   const friendlyName =
     sanitizeModelGuess(titleGuess) ||
     sanitizeModelGuess(realmGuess) ||
     (manufacturerGuess
-      ? [manufacturerGuess, deviceKind].filter(Boolean).join(" ").trim()
+      ? [manufacturerGuess, deviceKindLabel].filter(Boolean).join(" ").trim()
       : "") ||
     `Camera ${ip}`;
 
@@ -953,11 +1758,11 @@ async function scanActiveHost(ip) {
   if (httpProbes.length > 0) {
     discoveryProtocols.push("HTTP_PROBE");
   }
-  if (rtspProbe || openPorts.includes(RTSP_PORT)) {
+  if (rtspProbe || hasRtspPortOpen(openPorts)) {
     discoveryProtocols.push("RTSP_PROBE");
   }
 
-  return {
+  const baseDevice = {
     id: `${ip}|active-probe`,
     ip,
     friendly_name: friendlyName,
@@ -965,11 +1770,13 @@ async function scanActiveHost(ip) {
     model_guess: modelGuess,
     discovery_protocols: uniqueStrings(discoveryProtocols),
     onvif_xaddrs: onvifXaddrs,
-    rtsp_port_guess: openPorts.includes(RTSP_PORT) ? RTSP_PORT : 554,
+    rtsp_port_guess: recorderAwareRtspPort,
     channel_guess: null,
     subtype_guess: null,
     connection_method_suggested: "RTSP",
     requires_credentials: true,
+    device_kind_guess: deviceKind,
+    channel_label: null,
     confidence: computeActiveConfidenceScore(
       httpProbes,
       rtspProbe,
@@ -978,6 +1785,42 @@ async function scanActiveHost(ip) {
       deviceKind
     ),
   };
+
+  if (
+    !shouldAttemptRecorderChannelInference(
+      baseDevice,
+      openPorts,
+      httpProbes,
+      rtspProbe,
+      onvifXaddrs
+    )
+  ) {
+    return [baseDevice];
+  }
+
+  const strategyMatch = isRecorderKind(deviceKind)
+    ? null
+    : await detectRecorderChannelStrategy(baseDevice, openPorts);
+  if (!isRecorderKind(deviceKind) && !strategyMatch?.strategy) {
+    return [baseDevice];
+  }
+
+  const channelDevices = await enumerateRecorderChannelDevices(
+    baseDevice,
+    openPorts,
+    strategyMatch
+  );
+  if (channelDevices.length === 0) {
+    return [baseDevice];
+  }
+
+  return [
+    {
+      ...baseDevice,
+      friendly_name: buildRecorderFriendlyName(baseDevice),
+    },
+    ...channelDevices,
+  ];
 }
 
 async function mapWithConcurrency(items, limit, worker) {
@@ -1016,7 +1859,7 @@ async function runActiveSubnetSweep() {
     async (ip) => scanActiveHost(ip)
   );
 
-  return results.filter(Boolean);
+  return results.flat().filter(Boolean);
 }
 
 function computeConfidenceScore(candidate, httpProbe, manufacturerGuess, friendlyName, modelGuess) {
@@ -1073,6 +1916,18 @@ async function enrichCandidate(candidate) {
       httpProbe?.title || "",
       httpProbe?.body_snippet || ""
     ) || "";
+  const deviceKind = normalizeDeviceKind(
+    detectDeviceKind(
+      candidate.scopes.join(" "),
+      candidate.xaddrs.join(" "),
+      candidate.types.join(" "),
+      httpProbe?.server || "",
+      httpProbe?.www_authenticate || "",
+      httpProbe?.title || "",
+      httpProbe?.body_snippet || ""
+    )
+  );
+  const deviceKindLabel = displayDeviceKind(deviceKind);
 
   const modelGuess =
     sanitizeModelGuess(scopeHardware) ||
@@ -1082,7 +1937,10 @@ async function enrichCandidate(candidate) {
   const friendlyName =
     sanitizeModelGuess(scopeName) ||
     sanitizeModelGuess(httpProbe?.title || "") ||
-    (modelGuess ? `${manufacturerGuess || "Camera"} ${modelGuess}`.trim() : `Camera ${candidate.ip}`);
+    (modelGuess
+      ? `${manufacturerGuess || deviceKindLabel || "Camera"} ${modelGuess}`.trim()
+      : [manufacturerGuess, deviceKindLabel].filter(Boolean).join(" ").trim()) ||
+    `Camera ${candidate.ip}`;
 
   return {
     id: `${candidate.ip}|${(candidate.endpoint_address || candidate.xaddrs[0] || "device").trim()}`,
@@ -1097,6 +1955,8 @@ async function enrichCandidate(candidate) {
     subtype_guess: null,
     connection_method_suggested: "RTSP",
     requires_credentials: true,
+    device_kind_guess: deviceKind,
+    channel_label: null,
     confidence: computeConfidenceScore(
       candidate,
       httpProbe,
@@ -1123,6 +1983,28 @@ function choosePreferredText(currentValue, nextValue, ip) {
   };
 
   return score(nextValue) > score(currentValue) ? nextValue : currentValue;
+}
+
+function choosePreferredDeviceKind(currentValue, nextValue) {
+  const current = normalizeDeviceKind(currentValue);
+  const next = normalizeDeviceKind(nextValue);
+
+  if (current === next) {
+    return current;
+  }
+  if (current === "UNKNOWN") {
+    return next;
+  }
+  if (next === "UNKNOWN") {
+    return current;
+  }
+  if (isRecorderKind(next) && current === "CAMERA") {
+    return next;
+  }
+  if (isRecorderKind(current) && next === "CAMERA") {
+    return current;
+  }
+  return current;
 }
 
 function mergeDiscoveredDevice(existing, next) {
@@ -1152,12 +2034,72 @@ function mergeDiscoveredDevice(existing, next) {
       ...next.discovery_protocols,
     ]),
     onvif_xaddrs: uniqueStrings([...existing.onvif_xaddrs, ...next.onvif_xaddrs]),
-    rtsp_port_guess: existing.rtsp_port_guess || next.rtsp_port_guess || RTSP_PORT,
+    rtsp_port_guess:
+      preferred.rtsp_port_guess ||
+      existing.rtsp_port_guess ||
+      next.rtsp_port_guess ||
+      RTSP_PORT,
     channel_guess: existing.channel_guess || next.channel_guess || null,
     subtype_guess: existing.subtype_guess || next.subtype_guess || null,
+    device_kind_guess: choosePreferredDeviceKind(
+      existing.device_kind_guess,
+      next.device_kind_guess
+    ),
+    channel_label: existing.channel_label || next.channel_label || null,
     requires_credentials: existing.requires_credentials || next.requires_credentials,
     confidence: Math.max(existing.confidence, next.confidence),
   };
+}
+
+function buildDiscoveryMergeKey(device) {
+  const channelGuess = String(device?.channel_guess || "").trim();
+  if (!channelGuess) {
+    return String(device?.ip || "").trim();
+  }
+
+  const subtypeGuess = String(device?.subtype_guess || "").trim() || "main";
+  return `${String(device?.ip || "").trim()}|channel:${channelGuess}|subtype:${subtypeGuess}`;
+}
+
+function discoveryChannelSortValue(device) {
+  const rawChannel = String(device?.channel_guess || "").trim();
+  if (!rawChannel) {
+    return 0;
+  }
+
+  const numericValue = Number.parseInt(rawChannel, 10);
+  if (!Number.isInteger(numericValue)) {
+    return 1;
+  }
+
+  if (rawChannel.length >= 3 && rawChannel.endsWith("01")) {
+    return Math.floor(numericValue / 100) + 1;
+  }
+
+  return numericValue + 1;
+}
+
+function compareDiscoveredDevices(left, right) {
+  if (left.ip === right.ip) {
+    const leftChannel = discoveryChannelSortValue(left);
+    const rightChannel = discoveryChannelSortValue(right);
+    if (leftChannel !== rightChannel) {
+      return leftChannel - rightChannel;
+    }
+  }
+
+  if (right.confidence !== left.confidence) {
+    return right.confidence - left.confidence;
+  }
+
+  const ipCompare = String(left.ip || "").localeCompare(String(right.ip || ""), undefined, {
+    numeric: true,
+  });
+  if (ipCompare !== 0) {
+    return ipCompare;
+  }
+
+  return String(left.friendly_name || "").localeCompare(String(right.friendly_name || ""));
 }
 
 export async function discoverCameraDevices(options = {}) {
@@ -1176,24 +2118,24 @@ export async function discoverCameraDevices(options = {}) {
 
   const parsedCandidates = parseWsDiscoveryResponses(responses);
   const wsDevices = await Promise.all(parsedCandidates.map((candidate) => enrichCandidate(candidate)));
-  const mergedByIp = new Map();
+  const mergedByKey = new Map();
 
   for (const device of [...wsDevices, ...activeDevices]) {
-    mergedByIp.set(device.ip, mergeDiscoveredDevice(mergedByIp.get(device.ip), device));
+    const mergeKey = buildDiscoveryMergeKey(device);
+    mergedByKey.set(
+      mergeKey,
+      mergeDiscoveredDevice(mergedByKey.get(mergeKey), device)
+    );
   }
 
-  const devices = Array.from(mergedByIp.values());
-
-  devices.sort((left, right) => {
-    if (right.confidence !== left.confidence) {
-      return right.confidence - left.confidence;
-    }
-    return left.ip.localeCompare(right.ip);
-  });
+  const devices = Array.from(mergedByKey.values());
+  const macMetadataByIp = await resolveMacMetadataByIp(devices.map((device) => device.ip));
+  const enrichedDevices = devices.map((device) => applyMacMetadataToDevice(device, macMetadataByIp));
+  enrichedDevices.sort(compareDiscoveredDevices);
 
   return {
     elapsed_ms: Date.now() - startedAt,
     timeout_ms: timeoutMs,
-    devices,
+    devices: enrichedDevices,
   };
 }

@@ -1,6 +1,10 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useAuth } from "@getmocha/users-service/react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp, Eye, EyeOff, X } from "lucide-react";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
+import { normalizeCountryCode } from "@/shared/brazilStates";
 
 const CAMERA_LABEL_OPTIONS = [
   { value: "kitchen", label: "Kitchen" },
@@ -78,6 +82,28 @@ type EditFormData = BaseFormData & {
   webcam_index: number | null;
 };
 
+type AddressLookupStatus = "idle" | "loading" | "success" | "warning" | "error";
+
+type AddressLookupState = {
+  status: AddressLookupStatus;
+  message: string | null;
+};
+
+type AddressLookupResponse = {
+  found: boolean;
+  source: "viacep" | "google-geocoding" | null;
+  postal_code: string;
+  country: string | null;
+  country_code: string | null;
+  street: string | null;
+  city: string | null;
+  state: string | null;
+  state_code: string | null;
+  confidence: "high" | "medium" | null;
+  auto_filled_fields: Array<"street" | "city" | "state" | "country">;
+  message: string | null;
+};
+
 export type CameraEditorCamera = {
   id: number;
   name: string;
@@ -103,17 +129,24 @@ export type CameraEditorCamera = {
 
 export type CameraEditorDraft = Partial<Omit<CameraEditorCamera, "id">>;
 
+export type CameraEditorSavedResult = {
+  cameraId: number | null;
+  cameraName: string | null;
+  connectionMethod: string | null;
+};
+
 type CameraEditorModalProps = {
   isOpen: boolean;
   camera: CameraEditorCamera | null;
   draftCamera?: CameraEditorDraft | null;
+  existingCameraNames?: string[];
   onClose: () => void;
-  onSaved?: () => Promise<void> | void;
+  onSaved?: (result?: CameraEditorSavedResult) => Promise<void> | void;
 };
 
 const VALID_RETENTION_DAYS: RetentionDays[] = [1, 3, 7, 15, 30, 90, 180];
 
-function createEmptyWebcamForm(): WebcamFormData {
+function createEmptyWebcamForm(country = ""): WebcamFormData {
   return {
     name: "",
     webcam_index: null,
@@ -122,13 +155,56 @@ function createEmptyWebcamForm(): WebcamFormData {
     city: "",
     state: "",
     zip_code: "",
-    country: "",
+    country,
     retention_days: 1,
     allowpublicaccess: false,
   };
 }
 
-function createEmptyRtspForm(): RtspFormData {
+function getNextTutorialWebcamName(existingCameraNames: string[]): string {
+  let highestTutorialIndex = 0;
+
+  for (const rawName of existingCameraNames) {
+    const normalizedName = String(rawName || "").trim();
+    const match = normalizedName.match(/^tutorial webcam(?:\s+(\d+))?$/i);
+    if (!match) {
+      continue;
+    }
+
+    const parsedIndex = match[1] ? Number.parseInt(match[1], 10) : 1;
+    if (Number.isInteger(parsedIndex) && parsedIndex > highestTutorialIndex) {
+      highestTutorialIndex = parsedIndex;
+    }
+  }
+
+  return highestTutorialIndex <= 0
+    ? "tutorial webcam"
+    : `tutorial webcam ${highestTutorialIndex + 1}`;
+}
+
+function createTutorialWebcamForm(
+  name = "tutorial webcam",
+  country = "",
+  countryCode: string | null = null
+): WebcamFormData {
+  const fallbackCountry =
+    country.trim() || (countryCode === "BR" ? "Brazil" : "United States");
+
+  return {
+    name,
+    webcam_index: 0,
+    street: "Tutorial setup",
+    number: "0",
+    city: "Tutorial City",
+    state: "Tutorial State",
+    zip_code: countryCode === "BR" ? "00000000" : "00000",
+    country: fallbackCountry,
+    retention_days: 1,
+    allowpublicaccess: false,
+  };
+}
+
+function createEmptyRtspForm(country = ""): RtspFormData {
   return {
     name: "",
     ip_address: "",
@@ -144,10 +220,81 @@ function createEmptyRtspForm(): RtspFormData {
     city: "",
     state: "",
     zip_code: "",
-    country: "",
+    country,
     retention_days: 1,
     allowpublicaccess: false,
   };
+}
+
+function resolveCountryName(countryCode: string | null | undefined): string {
+  const normalized = typeof countryCode === "string" ? countryCode.trim().toUpperCase() : "";
+  if (!normalized) {
+    return "";
+  }
+
+  try {
+    const displayNames = new Intl.DisplayNames(["en"], { type: "region" });
+    return displayNames.of(normalized) || normalized;
+  } catch {
+    return normalized;
+  }
+}
+
+function normalizePostalCodeForLookup(value: string, countryCode: string | null): string {
+  const raw = value.trim();
+  if (!raw) {
+    return "";
+  }
+
+  if (countryCode === "BR") {
+    return raw.replace(/\D+/g, "").slice(0, 8);
+  }
+
+  return raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9 -]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isPostalCodeReadyForLookup(postalCode: string, countryCode: string | null): boolean {
+  if (!postalCode) {
+    return false;
+  }
+
+  if (countryCode === "BR") {
+    return postalCode.length === 8;
+  }
+
+  return postalCode.length >= 3;
+}
+
+function formatAddressLookupSource(source: AddressLookupResponse["source"]): string {
+  if (source === "viacep") {
+    return "ViaCEP";
+  }
+
+  if (source === "google-geocoding") {
+    return "Google Geocoding";
+  }
+
+  return "address lookup";
+}
+
+function formatAddressLookupFields(
+  fields: AddressLookupResponse["auto_filled_fields"]
+): string {
+  const labelByField: Record<AddressLookupResponse["auto_filled_fields"][number], string> = {
+    street: "Street",
+    city: "City",
+    state: "State",
+    country: "Country",
+  };
+
+  return fields
+    .filter((field) => field !== "country")
+    .map((field) => labelByField[field])
+    .join(", ");
 }
 
 function normalizeManufacturerValue(value: unknown): string {
@@ -229,7 +376,7 @@ function buildEditForm(camera: CameraEditorCamera): EditFormData {
   };
 }
 
-function buildDraftWebcamForm(camera: CameraEditorDraft): WebcamFormData {
+function buildDraftWebcamForm(camera: CameraEditorDraft, fallbackCountry = ""): WebcamFormData {
   return {
     ...createEmptyWebcamForm(),
     name: camera.name || "",
@@ -240,13 +387,13 @@ function buildDraftWebcamForm(camera: CameraEditorDraft): WebcamFormData {
     city: camera.city || "",
     state: camera.state || "",
     zip_code: camera.zip_code || "",
-    country: camera.country || "",
+    country: camera.country || fallbackCountry,
     retention_days: normalizeRetentionDays(camera.retention_days),
     allowpublicaccess: Boolean(camera.allowpublicaccess),
   };
 }
 
-function buildDraftRtspForm(camera: CameraEditorDraft): RtspFormData {
+function buildDraftRtspForm(camera: CameraEditorDraft, fallbackCountry = ""): RtspFormData {
   return {
     ...createEmptyRtspForm(),
     name: camera.name || "",
@@ -266,7 +413,7 @@ function buildDraftRtspForm(camera: CameraEditorDraft): RtspFormData {
     city: camera.city || "",
     state: camera.state || "",
     zip_code: camera.zip_code || "",
-    country: camera.country || "",
+    country: camera.country || fallbackCountry,
     retention_days: normalizeRetentionDays(camera.retention_days),
     allowpublicaccess: Boolean(camera.allowpublicaccess),
   };
@@ -330,14 +477,83 @@ async function parseApiError(response: Response, fallback: string): Promise<stri
   return fallback;
 }
 
+function normalizeCameraId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function getSavedCameraResult(
+  responseData: unknown,
+  fallback: {
+    cameraId?: number | null;
+    cameraName?: string | null;
+    connectionMethod?: string | null;
+  }
+): CameraEditorSavedResult {
+  const data =
+    responseData && typeof responseData === "object"
+      ? (responseData as Record<string, unknown>)
+      : null;
+  const cameraData =
+    data?.camera && typeof data.camera === "object"
+      ? (data.camera as Record<string, unknown>)
+      : null;
+
+  const cameraId =
+    normalizeCameraId(cameraData?.id) ??
+    normalizeCameraId(data?.camera_id) ??
+    normalizeCameraId(data?.id) ??
+    normalizeCameraId(fallback.cameraId);
+
+  const cameraName =
+    typeof cameraData?.name === "string" && cameraData.name.trim()
+      ? cameraData.name.trim()
+      : typeof fallback.cameraName === "string" && fallback.cameraName.trim()
+      ? fallback.cameraName.trim()
+      : null;
+
+  const connectionMethod =
+    typeof cameraData?.connection_method === "string" && cameraData.connection_method.trim()
+      ? cameraData.connection_method.trim()
+      : typeof fallback.connectionMethod === "string" && fallback.connectionMethod.trim()
+      ? fallback.connectionMethod.trim()
+      : null;
+
+  return {
+    cameraId,
+    cameraName,
+    connectionMethod,
+  };
+}
+
 export default function CameraEditorModal({
   isOpen,
   camera,
   draftCamera = null,
+  existingCameraNames = [],
   onClose,
   onSaved,
 }: CameraEditorModalProps) {
   const { t } = useTranslation();
+  const { user } = useAuth();
+  const { currentStepId: onboardingStepId, isOpen: isOnboardingOpen } = useOnboarding();
+  const userCountryCode = normalizeCountryCode(user?.country_code, null);
+  const userCountryName = resolveCountryName(user?.country_code);
+  const latestUserCountryNameRef = useRef(userCountryName);
+  const tutorialWebcamSeededRef = useRef(false);
+  const addressLookupRequestIdRef = useRef(0);
+  const lookupAddressForCurrentFormRef = useRef<(() => Promise<void>) | null>(null);
+  const lastAutoLookupKeyRef = useRef("");
   const [activeTab, setActiveTab] = useState<CameraConnectionTab>("IP_RTSP");
   const [webcamForm, setWebcamForm] = useState<WebcamFormData>(createEmptyWebcamForm);
   const [rtspForm, setRtspForm] = useState<RtspFormData>(createEmptyRtspForm);
@@ -346,18 +562,33 @@ export default function CameraEditorModal({
   const [descriptionText, setDescriptionText] = useState("");
   const [isAddressExpanded, setIsAddressExpanded] = useState(false);
   const [addressErrors, setAddressErrors] = useState<Record<string, boolean>>({});
+  const [addressLookupState, setAddressLookupState] = useState<AddressLookupState>({
+    status: "idle",
+    message: null,
+  });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [showPublicAccessModal, setShowPublicAccessModal] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const isEditing = !!camera;
+
+  useEffect(() => {
+    latestUserCountryNameRef.current = userCountryName;
+  }, [userCountryName]);
 
   useEffect(() => {
     if (!isOpen) {
+      tutorialWebcamSeededRef.current = false;
       return;
     }
 
+    const defaultCountry = latestUserCountryNameRef.current;
+
+    addressLookupRequestIdRef.current += 1;
+    lastAutoLookupKeyRef.current = "";
     setSubmitError(null);
     setAddressErrors({});
+    setAddressLookupState({ status: "idle", message: null });
     setIsAddressExpanded(false);
     setIsSubmitting(false);
     setShowPublicAccessModal(false);
@@ -379,8 +610,8 @@ export default function CameraEditorModal({
         draftCamera.connection_method === "WEBCAM" || draftCamera.webcam_index != null;
 
       setActiveTab(isWebcam ? "WEBCAM" : "IP_RTSP");
-      setWebcamForm(buildDraftWebcamForm(draftCamera));
-      setRtspForm(buildDraftRtspForm(draftCamera));
+      setWebcamForm(buildDraftWebcamForm(draftCamera, defaultCountry));
+      setRtspForm(buildDraftRtspForm(draftCamera, defaultCountry));
       setEditForm(null);
       setDescriptionLabel("other_indoor");
       setDescriptionText("");
@@ -389,18 +620,88 @@ export default function CameraEditorModal({
     }
 
     setActiveTab("IP_RTSP");
-    setWebcamForm(createEmptyWebcamForm());
-    setRtspForm(createEmptyRtspForm());
+    setWebcamForm(createEmptyWebcamForm(defaultCountry));
+    setRtspForm(createEmptyRtspForm(defaultCountry));
     setEditForm(null);
     setDescriptionLabel("other_indoor");
     setDescriptionText("");
   }, [camera, draftCamera, isOpen]);
 
-  if (!isOpen) {
-    return null;
-  }
+  useEffect(() => {
+    if (!isOpen || isEditing || !isOnboardingOpen || !onboardingStepId) {
+      if (!isOpen) {
+        tutorialWebcamSeededRef.current = false;
+      }
+      return;
+    }
 
-  const isEditing = !!camera;
+    const isRtspTutorialStep =
+      onboardingStepId === "camera-rtsp-form" ||
+      onboardingStepId === "camera-address" ||
+      onboardingStepId === "camera-storage";
+    const isWebcamTutorialStep =
+      onboardingStepId === "camera-webcam-form" ||
+      onboardingStepId === "camera-webcam-save";
+
+    if (isRtspTutorialStep && activeTab !== "IP_RTSP") {
+      addressLookupRequestIdRef.current += 1;
+      lastAutoLookupKeyRef.current = "";
+      setActiveTab("IP_RTSP");
+      setAddressErrors({});
+      setAddressLookupState({ status: "idle", message: null });
+      setSubmitError(null);
+    }
+
+    if (
+      onboardingStepId === "camera-address" ||
+      onboardingStepId === "camera-storage" ||
+      isWebcamTutorialStep
+    ) {
+      setIsAddressExpanded(true);
+    }
+
+    if (!isWebcamTutorialStep) {
+      return;
+    }
+
+    if (activeTab !== "WEBCAM") {
+      addressLookupRequestIdRef.current += 1;
+      lastAutoLookupKeyRef.current = "";
+      setActiveTab("WEBCAM");
+      setAddressErrors({});
+      setAddressLookupState({ status: "idle", message: null });
+      setSubmitError(null);
+    }
+
+    if (!tutorialWebcamSeededRef.current) {
+      const defaultCountry =
+        latestUserCountryNameRef.current.trim() ||
+        (userCountryCode === "BR" ? "Brazil" : "United States");
+      const tutorialCameraName = getNextTutorialWebcamName(existingCameraNames);
+
+      setWebcamForm(createTutorialWebcamForm(tutorialCameraName, defaultCountry, userCountryCode));
+      tutorialWebcamSeededRef.current = true;
+    }
+  }, [activeTab, existingCameraNames, isEditing, isOnboardingOpen, isOpen, onboardingStepId, userCountryCode]);
+
+  useEffect(() => {
+    if (!isOpen || !userCountryName) {
+      return;
+    }
+
+    setWebcamForm((current) =>
+      current.country.trim() ? current : { ...current, country: userCountryName }
+    );
+    setRtspForm((current) =>
+      current.country.trim() ? current : { ...current, country: userCountryName }
+    );
+    setEditForm((current) =>
+      current && !current.country.trim()
+        ? { ...current, country: userCountryName }
+        : current
+    );
+  }, [isOpen, userCountryName]);
+
   const formData = isEditing ? editForm : activeTab === "WEBCAM" ? webcamForm : rtspForm;
   const currentManufacturer =
     formData && "manufacturer" in formData ? formData.manufacturer : undefined;
@@ -410,8 +711,11 @@ export default function CameraEditorModal({
   const rtspFields = formData && "ip_address" in formData ? formData : null;
 
   const handleTabChange = (tab: CameraConnectionTab) => {
+    addressLookupRequestIdRef.current += 1;
+    lastAutoLookupKeyRef.current = "";
     setActiveTab(tab);
     setAddressErrors({});
+    setAddressLookupState({ status: "idle", message: null });
     setSubmitError(null);
   };
 
@@ -438,6 +742,183 @@ export default function CameraEditorModal({
       ...(updates as Partial<RtspFormData>),
     }));
   };
+
+  const handleZipCodeChange = (value: string) => {
+    addressLookupRequestIdRef.current += 1;
+    lastAutoLookupKeyRef.current = "";
+    setAddressLookupState({ status: "idle", message: null });
+    updateCurrentFormData({ zip_code: value });
+  };
+
+  const handleCountryChange = (value: string) => {
+    addressLookupRequestIdRef.current += 1;
+    lastAutoLookupKeyRef.current = "";
+    setAddressLookupState({ status: "idle", message: null });
+    updateCurrentFormData({ country: value });
+  };
+
+  const lookupAddressForCurrentForm = async () => {
+    if (!formData) {
+      return;
+    }
+
+    const fallbackCountryCode = userCountryCode;
+    const effectiveCountryCode =
+      normalizeCountryCode(formData.country, null) || fallbackCountryCode;
+    const normalizedPostalCode = normalizePostalCodeForLookup(
+      formData.zip_code || "",
+      effectiveCountryCode
+    );
+
+    if (
+      !effectiveCountryCode ||
+      !isPostalCodeReadyForLookup(normalizedPostalCode, effectiveCountryCode)
+    ) {
+      return;
+    }
+
+    const lookupRequestId = ++addressLookupRequestIdRef.current;
+    const targetForm = isEditing ? "EDIT" : activeTab;
+    const sourceName = formData.country.trim() || userCountryName || undefined;
+
+    setAddressLookupState({
+      status: "loading",
+      message: "Looking up address...",
+    });
+
+    try {
+      const response = await fetch("/api/address-lookup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          postal_code: normalizedPostalCode,
+          country_code: effectiveCountryCode,
+          country: sourceName,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseApiError(response, "Failed to look up address"));
+      }
+
+      const result = (await response.json()) as AddressLookupResponse;
+      if (lookupRequestId !== addressLookupRequestIdRef.current) {
+        return;
+      }
+
+      if (!result.found) {
+        setAddressLookupState({
+          status: "warning",
+          message: result.message || "No address data was found for this postal code.",
+        });
+        return;
+      }
+
+      const applyLookupResult = <T extends BaseFormData>(current: T): T => {
+        if (
+          normalizePostalCodeForLookup(current.zip_code, effectiveCountryCode) !==
+          normalizedPostalCode
+        ) {
+          return current;
+        }
+
+        return {
+          ...current,
+          street: result.street ?? current.street,
+          city: result.city ?? current.city,
+          state: result.state ?? current.state,
+          country: result.country ?? current.country,
+        };
+      };
+
+      if (targetForm === "EDIT") {
+        setEditForm((current) => (current ? applyLookupResult(current) : current));
+      } else if (targetForm === "WEBCAM") {
+        setWebcamForm((current) => applyLookupResult(current));
+      } else {
+        setRtspForm((current) => applyLookupResult(current));
+      }
+
+      setAddressErrors((current) => {
+        const next = { ...current };
+        delete next.zip_code;
+        if (result.street) {
+          delete next.street;
+        }
+        if (result.city) {
+          delete next.city;
+        }
+        if (result.state) {
+          delete next.state;
+        }
+        if (result.country) {
+          delete next.country;
+        }
+        return next;
+      });
+
+      const filledFields = formatAddressLookupFields(result.auto_filled_fields);
+      setAddressLookupState({
+        status: "success",
+        message: filledFields
+          ? `Filled ${filledFields} from ${formatAddressLookupSource(result.source)}.`
+          : `Address found via ${formatAddressLookupSource(result.source)}.`,
+      });
+    } catch (error) {
+      if (lookupRequestId !== addressLookupRequestIdRef.current) {
+        return;
+      }
+
+      console.error("Failed to look up address:", error);
+      setAddressLookupState({
+        status: "error",
+        message: getErrorMessage(error, "Failed to look up address."),
+      });
+    }
+  };
+
+  lookupAddressForCurrentFormRef.current = lookupAddressForCurrentForm;
+
+  useEffect(() => {
+    if (!isOpen || !formData) {
+      lastAutoLookupKeyRef.current = "";
+      return;
+    }
+
+    const effectiveCountryCode =
+      normalizeCountryCode(formData.country, null) || userCountryCode;
+    const normalizedPostalCode = normalizePostalCodeForLookup(
+      formData.zip_code || "",
+      effectiveCountryCode
+    );
+
+    if (
+      !effectiveCountryCode ||
+      !isPostalCodeReadyForLookup(normalizedPostalCode, effectiveCountryCode)
+    ) {
+      lastAutoLookupKeyRef.current = "";
+      return;
+    }
+
+    const nextLookupKey = `${isEditing ? "EDIT" : activeTab}:${effectiveCountryCode}:${normalizedPostalCode}`;
+    if (nextLookupKey === lastAutoLookupKeyRef.current) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      if (nextLookupKey !== lastAutoLookupKeyRef.current) {
+        lastAutoLookupKeyRef.current = nextLookupKey;
+        void lookupAddressForCurrentFormRef.current?.();
+      }
+    }, 350);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [activeTab, formData?.country, formData?.zip_code, isEditing, isOpen, userCountryCode]);
+
+  if (!isOpen) {
+    return null;
+  }
 
   const handlePublicAccessToggle = (newValue: boolean) => {
     const currentValue = Boolean(formData?.allowpublicaccess);
@@ -567,7 +1048,17 @@ export default function CameraEditorModal({
           throw new Error(await parseApiError(response, "Failed to update camera"));
         }
 
-        await onSaved?.();
+        const responseData = await response.json().catch(() => null);
+        await onSaved?.(
+          getSavedCameraResult(responseData, {
+            cameraId: camera.id,
+            cameraName: typeof payload.name === "string" ? payload.name : camera.name,
+            connectionMethod:
+              typeof payload.connection_method === "string"
+                ? payload.connection_method
+                : camera.connection_method,
+          })
+        );
         onClose();
       } catch (error) {
         console.error("Failed to update camera:", error);
@@ -675,7 +1166,14 @@ export default function CameraEditorModal({
         throw new Error(await parseApiError(response, "Failed to create camera"));
       }
 
-      await onSaved?.();
+      const responseData = await response.json().catch(() => null);
+      await onSaved?.(
+        getSavedCameraResult(responseData, {
+          cameraName: typeof payload.name === "string" ? payload.name : null,
+          connectionMethod:
+            typeof payload.connection_method === "string" ? payload.connection_method : null,
+        })
+      );
       onClose();
     } catch (error) {
       console.error("Failed to create camera:", error);
@@ -696,6 +1194,14 @@ export default function CameraEditorModal({
       key !== "password" &&
       key !== "name"
   ).length;
+  const addressLookupMessageClassName =
+    addressLookupState.status === "error"
+      ? "text-red-400"
+      : addressLookupState.status === "warning"
+        ? "text-amber-300"
+        : addressLookupState.status === "success"
+          ? "text-emerald-300"
+          : "text-gray-400";
 
   return (
     <>
@@ -760,7 +1266,10 @@ export default function CameraEditorModal({
             )}
 
             {activeTab === "WEBCAM" && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              <div
+                className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6"
+                data-onboarding-target={ONBOARDING_TARGETS.cameraEditorWebcamForm}
+              >
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium text-gray-300 mb-2">Camera Name *</label>
                   <input
@@ -799,7 +1308,10 @@ export default function CameraEditorModal({
             )}
 
             {activeTab === "IP_RTSP" && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+              <div
+                className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6"
+                data-onboarding-target={ONBOARDING_TARGETS.cameraEditorRtspForm}
+              >
                 {!isEditing && (
                   <div className="sr-only" aria-hidden="true">
                     <input type="text" name="username" autoComplete="username" tabIndex={-1} />
@@ -1001,6 +1513,7 @@ export default function CameraEditorModal({
             )}
 
             <div
+              data-onboarding-target={ONBOARDING_TARGETS.cameraEditorAddress}
               className={`mb-6 border rounded-lg overflow-hidden transition-all ${
                 Object.keys(addressErrors).length > 0 ? "border-red-500/50" : "border-gray-700"
               }`}
@@ -1025,6 +1538,27 @@ export default function CameraEditorModal({
 
               {isAddressExpanded && (
                 <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4 animate-slide-down">
+                  <div className="md:col-span-2">
+                    <label className="block text-sm font-medium text-gray-300 mb-2">ZIP Code *</label>
+                    <input
+                      type="text"
+                      name="camera_location_zip"
+                      value={formData?.zip_code || ""}
+                      onChange={(e) => handleZipCodeChange(e.target.value)}
+                      autoComplete="section-camera-location postal-code"
+                      className={`w-full px-4 py-2.5 bg-gray-800 border ${
+                        addressErrors.zip_code ? "border-red-500" : "border-gray-700"
+                      } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
+                      placeholder="10001"
+                    />
+                    {addressErrors.zip_code && <p className="text-red-400 text-xs mt-1">Required</p>}
+                    {addressLookupState.message && (
+                      <p className={`text-xs mt-1 ${addressLookupMessageClassName}`}>
+                        {addressLookupState.message}
+                      </p>
+                    )}
+                  </div>
+
                   <div className="md:col-span-2">
                     <label className="block text-sm font-medium text-gray-300 mb-2">Street *</label>
                     <input
@@ -1090,28 +1624,12 @@ export default function CameraEditorModal({
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-gray-300 mb-2">ZIP Code *</label>
-                    <input
-                      type="text"
-                      name="camera_location_zip"
-                      value={formData?.zip_code || ""}
-                      onChange={(e) => updateCurrentFormData({ zip_code: e.target.value })}
-                      autoComplete="section-camera-location postal-code"
-                      className={`w-full px-4 py-2.5 bg-gray-800 border ${
-                        addressErrors.zip_code ? "border-red-500" : "border-gray-700"
-                      } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
-                      placeholder="10001"
-                    />
-                    {addressErrors.zip_code && <p className="text-red-400 text-xs mt-1">Required</p>}
-                  </div>
-
-                  <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Country *</label>
                     <input
                       type="text"
                       name="camera_location_country"
                       value={formData?.country || ""}
-                      onChange={(e) => updateCurrentFormData({ country: e.target.value })}
+                      onChange={(e) => handleCountryChange(e.target.value)}
                       autoComplete="section-camera-location country-name"
                       className={`w-full px-4 py-2.5 bg-gray-800 border ${
                         addressErrors.country ? "border-red-500" : "border-gray-700"
@@ -1165,62 +1683,67 @@ export default function CameraEditorModal({
               </div>
             )}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 pt-4 border-t border-gray-800">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center gap-3">
-                  <div className="relative inline-flex items-center opacity-75">
-                    <div className="w-11 h-6 bg-blue-500 rounded-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:translate-x-full" />
+            <div
+              className="mb-6 border-t border-gray-800 pt-4"
+              data-onboarding-target={ONBOARDING_TARGETS.cameraEditorStorage}
+            >
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-3">
+                    <div className="relative inline-flex items-center opacity-75">
+                      <div className="w-11 h-6 bg-blue-500 rounded-full after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:translate-x-full" />
+                    </div>
+                    <span className="text-sm font-medium text-gray-300">Store Frames for Past Search</span>
                   </div>
-                  <span className="text-sm font-medium text-gray-300">Store Frames for Past Search</span>
+                  <p className="text-xs text-gray-500 ml-14">Required for timeline & past search</p>
                 </div>
-                <p className="text-xs text-gray-500 ml-14">Required for timeline & past search</p>
-              </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  {t("cameras.retention")}
-                </label>
-                <select
-                  value={formData?.retention_days || 1}
-                  onChange={(e) =>
-                    updateCurrentFormData({
-                      retention_days: parseInt(e.target.value, 10) as RetentionDays,
-                    })
-                  }
-                  className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
-                >
-                  <option value={1}>1 day</option>
-                  <option value={3}>3 days</option>
-                  <option value={7}>7 days</option>
-                  <option value={15}>15 days</option>
-                  <option value={30}>30 days</option>
-                  <option value={90}>90 days</option>
-                  <option value={180}>180 days</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6 border-t border-gray-800 pt-4">
-              <div className="md:col-span-2 flex flex-col gap-2">
-                <div className="flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => handlePublicAccessToggle(!Boolean(formData?.allowpublicaccess))}
-                    className={`relative inline-flex items-center h-6 w-11 rounded-full transition-colors ${
-                      formData?.allowpublicaccess ? "bg-blue-500" : "bg-gray-600"
-                    }`}
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">
+                    {t("cameras.retention")}
+                  </label>
+                  <select
+                    value={formData?.retention_days || 1}
+                    onChange={(e) =>
+                      updateCurrentFormData({
+                        retention_days: parseInt(e.target.value, 10) as RetentionDays,
+                      })
+                    }
+                    className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
                   >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white border border-gray-300 transition-transform ${
-                        formData?.allowpublicaccess ? "translate-x-6" : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
-                  <span className="text-sm font-medium text-gray-300">Allow Public Access</span>
+                    <option value={1}>1 day</option>
+                    <option value={3}>3 days</option>
+                    <option value={7}>7 days</option>
+                    <option value={15}>15 days</option>
+                    <option value={30}>30 days</option>
+                    <option value={90}>90 days</option>
+                    <option value={180}>180 days</option>
+                  </select>
                 </div>
-                <p className="text-xs text-gray-500 ml-14">
-                  Enable authorized law enforcement access to this camera
-                </p>
+              </div>
+
+              <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-gray-800 pt-4">
+                <div className="md:col-span-2 flex flex-col gap-2">
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handlePublicAccessToggle(!Boolean(formData?.allowpublicaccess))}
+                      className={`relative inline-flex items-center h-6 w-11 rounded-full transition-colors ${
+                        formData?.allowpublicaccess ? "bg-blue-500" : "bg-gray-600"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white border border-gray-300 transition-transform ${
+                          formData?.allowpublicaccess ? "translate-x-6" : "translate-x-0.5"
+                        }`}
+                      />
+                    </button>
+                    <span className="text-sm font-medium text-gray-300">Allow Public Access</span>
+                  </div>
+                  <p className="text-xs text-gray-500 ml-14">
+                    Enable authorized law enforcement access to this camera
+                  </p>
+                </div>
               </div>
             </div>
 
@@ -1235,6 +1758,7 @@ export default function CameraEditorModal({
               <button
                 type="submit"
                 disabled={isSubmitting}
+                data-onboarding-target={ONBOARDING_TARGETS.cameraEditorSave}
                 className="w-full md:w-auto px-5 py-3 md:py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 min-h-[44px] md:min-h-0 flex items-center justify-center gap-2"
               >
                 {isSubmitting && (

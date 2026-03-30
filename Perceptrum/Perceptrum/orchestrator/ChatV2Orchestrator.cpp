@@ -51,17 +51,20 @@ bool isInstructionalIntent_(const std::string& normalized)
 {
     return containsAny_(normalized, {
         "how to", "how do i", "how can i", "how can we", "can you explain",
-        "explain", "explain how", "me explique", "explique", "como criar",
-        "como adicionar", "como cadastrar", "como configurar", "como faco",
-        "como faço", "tutorial", "guia", "guide", "passo a passo", "step by step"
+        "where do i", "where can i", "explain", "explain how", "me explique",
+        "explique", "como eu", "onde eu", "como criar", "como adicionar",
+        "como cadastrar", "como configurar", "como faco", "como faço",
+        "como posso", "onde criar", "onde posso criar", "tutorial", "guia",
+        "guide", "passo a passo", "step by step"
     });
 }
 
 bool hasCameraCreationVerb_(const std::string& normalized)
 {
     return containsAny_(normalized, {
-        "create", "criar", "add", "adicionar", "register", "registrar",
-        "cadastrar", "setup", "configurar", "new camera", "nova camera"
+        "create", "criar", "crio", "add", "adicionar", "adiciono",
+        "register", "registrar", "cadastrar", "setup", "configurar",
+        "configuro", "new camera", "nova camera"
     });
 }
 
@@ -69,6 +72,57 @@ bool hasCameraReference_(const std::string& normalized)
 {
     return containsAny_(normalized, {
         "camera", "cameras"
+    });
+}
+
+bool hasCameraOnboardingCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "scan network", "nvr", "dvr", "webcam", "rtsp", "camera import",
+        "import camera", "import cameras", "camera csv", "camera json",
+        "camera tsv", "camera excel", "camera plain text", "import csv",
+        "import json", "import tsv", "import excel", "import plain text",
+        "manufacturer", "fabricante", "channel", "subtype", "retention",
+        "retencao", "retenção", "allow public access", "public access",
+        "cep", "zip code", "postal code"
+    });
+}
+
+bool hasAgentCreationVerb_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "create", "criar", "crio", "add", "adicionar", "adiciono",
+        "setup", "configurar", "configuro", "new agent", "novo agente",
+        "new ai agent", "novo ai agent"
+    });
+}
+
+bool hasAgentReference_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "agent", "agents", "agente", "agentes", "camera agent",
+        "camera agents", "ai agent", "ai agents", "custom agent",
+        "custom agents", "agente custom", "agent editor"
+    });
+}
+
+bool hasJobStepReference_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "step", "steps", "job step", "workflow step", "step agent",
+        "agent in step", "etapa", "etapas", "agente do step",
+        "agente na etapa", "agente na tarefa"
+    });
+}
+
+bool hasAgentConfigurationCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "prompt core", "alert condition", "video packaging", "input type",
+        "snapshot", "snapshots", "polygon", "polygons", "poligono",
+        "poligonos", "target", "targets", "face target", "face targets",
+        "negative condition", "negative conditions", "negative reference",
+        "negative image", "negative images"
     });
 }
 
@@ -138,6 +192,15 @@ bool isCameraSetupHelpRequest_(const std::string& normalized)
     return hasCameraReference_(normalized) && hasConnectionConfigCue_(normalized);
 }
 
+bool isCameraOnboardingHelpRequest_(const std::string& normalized)
+{
+    return (hasCameraReference_(normalized) && hasCameraOnboardingCue_(normalized)) ||
+        containsAny_(normalized, {
+            "scan network", "camera import", "import cameras", "register webcam",
+            "cadastrar webcam", "cadastro webcam", "registrar webcam"
+        });
+}
+
 bool isJobCreationHelpRequest_(const std::string& normalized)
 {
     return isInstructionalIntent_(normalized) && containsAny_(normalized, {
@@ -146,12 +209,27 @@ bool isJobCreationHelpRequest_(const std::string& normalized)
     });
 }
 
+bool isCameraAgentHelpRequest_(const std::string& normalized)
+{
+    return hasAgentReference_(normalized) &&
+        (isInstructionalIntent_(normalized) || hasAgentConfigurationCue_(normalized));
+}
+
 bool isCameraAgentCreationHelpRequest_(const std::string& normalized)
 {
-    return isInstructionalIntent_(normalized) && containsAny_(normalized, {
-        "create agent", "criar agente", "camera agent", "agente na camera",
-        "custom agent", "agente custom", "novo agente", "agent on camera"
-    });
+    return isCameraAgentHelpRequest_(normalized) &&
+        (hasAgentCreationVerb_(normalized) || containsAny_(normalized, {
+            "create agent", "criar agente", "camera agent", "agente na camera",
+            "custom agent", "agente custom", "novo agente", "agent on camera"
+        }));
+}
+
+std::string agentHelpTopicForQuery_(const std::string& normalized)
+{
+    if (hasJobStepReference_(normalized)) {
+        return "job_steps";
+    }
+    return "camera_agents";
 }
 
 int progressStepCountForSkill_(const std::string& skillName)
@@ -166,39 +244,25 @@ int progressStepCountForSkill_(const std::string& skillName)
 SkillSelection rewriteInstructionalSelection_(SkillSelection selection, const std::string& userMessage)
 {
     const std::string normalized = lowerAsciiCopy_(userMessage);
-    if (selection.selectedSkill == "video_search" && !isVideoObservationRequest_(normalized)) {
-        if (isCameraSetupHelpRequest_(normalized) || isCameraCreationHelpRequest_(normalized)) {
-            selection.selectedSkill = "explain_app";
-            selection.confidence = std::max(selection.confidence, 0.99);
-            selection.reason = "camera_setup_help_request";
-            selection.replyPreview = "Vou explicar como configurar a câmera.";
-            selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
-            return selection;
-        }
-
-        selection.selectedSkill = "general_answer";
-        selection.confidence = std::max(selection.confidence, 0.55);
-        selection.reason = "video_search_not_strong_match";
-        selection.replyPreview = "Vou responder diretamente.";
-        selection.arguments = nlohmann::json::object();
-        return selection;
-    }
-    if (selection.selectedSkill == "create_camera" && isCameraCreationHelpRequest_(normalized)) {
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "create_camera") &&
+        (isCameraSetupHelpRequest_(normalized) ||
+         isCameraCreationHelpRequest_(normalized) ||
+         isCameraOnboardingHelpRequest_(normalized))) {
         selection.selectedSkill = "explain_app";
-        selection.confidence = std::max(selection.confidence, 0.99);
-        selection.reason = "camera_creation_help_request";
-        selection.replyPreview = "Vou explicar como cadastrar uma camera.";
-        selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
-        return selection;
-    }
-    if (selection.selectedSkill == "explain_app" && isCameraSetupHelpRequest_(normalized)) {
         selection.confidence = std::max(selection.confidence, 0.99);
         selection.reason = "camera_setup_help_request";
         selection.replyPreview = "Vou explicar como configurar a câmera.";
         selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
         return selection;
     }
-    if (selection.selectedSkill == "create_job" && isJobCreationHelpRequest_(normalized)) {
+
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "create_job") &&
+        !isCameraAgentHelpRequest_(normalized) &&
+        isJobCreationHelpRequest_(normalized)) {
         selection.selectedSkill = "explain_app";
         selection.confidence = std::max(selection.confidence, 0.99);
         selection.reason = "job_creation_help_request";
@@ -206,12 +270,34 @@ SkillSelection rewriteInstructionalSelection_(SkillSelection selection, const st
         selection.arguments = nlohmann::json::object({ { "topic", "jobs" } });
         return selection;
     }
-    if (selection.selectedSkill == "create_camera_agent" && isCameraAgentCreationHelpRequest_(normalized)) {
+
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "create_camera_agent") &&
+        isCameraAgentHelpRequest_(normalized)) {
         selection.selectedSkill = "explain_app";
         selection.confidence = std::max(selection.confidence, 0.99);
-        selection.reason = "camera_agent_creation_help_request";
-        selection.replyPreview = "Vou explicar como criar um agente na camera.";
-        selection.arguments = nlohmann::json::object({ { "topic", "camera_agents" } });
+        selection.reason = isCameraAgentCreationHelpRequest_(normalized)
+            ? "camera_agent_creation_help_request"
+            : "camera_agent_help_request";
+        selection.replyPreview = "Vou explicar como configurar um agente.";
+        selection.arguments = nlohmann::json::object({ { "topic", agentHelpTopicForQuery_(normalized) } });
+        return selection;
+    }
+
+    if (selection.selectedSkill == "video_search" && !isVideoObservationRequest_(normalized)) {
+        selection.selectedSkill = "general_answer";
+        selection.confidence = std::max(selection.confidence, 0.55);
+        selection.reason = "video_search_not_strong_match";
+        selection.replyPreview = "Vou responder diretamente.";
+        selection.arguments = nlohmann::json::object();
+        return selection;
+    }
+    if (selection.selectedSkill == "explain_app" && isCameraSetupHelpRequest_(normalized)) {
+        selection.confidence = std::max(selection.confidence, 0.99);
+        selection.reason = "camera_setup_help_request";
+        selection.replyPreview = "Vou explicar como configurar a câmera.";
+        selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
         return selection;
     }
     return selection;
@@ -1017,8 +1103,9 @@ SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
     }
 
     if ((hasCameraCreationVerb_(normalized) && hasCameraReference_(normalized)) ||
+        isCameraOnboardingHelpRequest_(normalized) ||
         containsAny_(normalized, { "connect camera" })) {
-        if (isCameraSetupHelpRequest_(normalized)) {
+        if (isCameraSetupHelpRequest_(normalized) || isCameraOnboardingHelpRequest_(normalized)) {
             selection.selectedSkill = "explain_app";
             selection.confidence = 0.99;
             selection.reason = "camera_setup_help_request";
@@ -1041,7 +1128,7 @@ SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
         return selection;
     }
 
-    if (containsAny_(normalized, {
+    if (!isCameraAgentHelpRequest_(normalized) && containsAny_(normalized, {
         "create job", "criar job", "novo job", "schedule job", "agendar job", "montar job",
         "job recorrente", "workflow", "agendamento", "cronograma"
     })) {
@@ -1060,16 +1147,20 @@ SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
         return selection;
     }
 
-    if (containsAny_(normalized, {
-        "create agent", "criar agente", "camera agent", "agente na camera", "algoritmo na camera",
-        "custom agent", "agente custom", "novo agente"
-    })) {
-        if (isCameraAgentCreationHelpRequest_(normalized)) {
+    if ((hasAgentCreationVerb_(normalized) && hasAgentReference_(normalized)) ||
+        isCameraAgentHelpRequest_(normalized) ||
+        containsAny_(normalized, {
+            "create agent", "criar agente", "camera agent", "agente na camera", "algoritmo na camera",
+            "custom agent", "agente custom", "novo agente", "ai agent", "ai agents"
+        })) {
+        if (isCameraAgentHelpRequest_(normalized)) {
             selection.selectedSkill = "explain_app";
             selection.confidence = 0.99;
-            selection.reason = "camera_agent_creation_help_request";
-            selection.replyPreview = "Vou explicar como criar um agente na camera.";
-            selection.arguments = nlohmann::json::object({ { "topic", "camera_agents" } });
+            selection.reason = isCameraAgentCreationHelpRequest_(normalized)
+                ? "camera_agent_creation_help_request"
+                : "camera_agent_help_request";
+            selection.replyPreview = "Vou explicar como configurar um agente.";
+            selection.arguments = nlohmann::json::object({ { "topic", agentHelpTopicForQuery_(normalized) } });
             return selection;
         }
         selection.selectedSkill = "create_camera_agent";

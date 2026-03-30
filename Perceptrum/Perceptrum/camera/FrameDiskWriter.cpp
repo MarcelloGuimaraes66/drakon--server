@@ -893,6 +893,147 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
     }
 }
 
+FrameDiskWriter::RetentionSweepStats FrameDiskWriter::runRetentionCleanupNow(
+    const std::string& cameraId,
+    const std::string& baseDir,
+    int retentionDays)
+{
+    RetentionSweepStats stats;
+    if (retentionDays <= 0) {
+        return stats;
+    }
+
+    const auto nowSys = std::chrono::system_clock::now();
+    const auto cutoff =
+        nowSys - std::chrono::hours(24LL * static_cast<long long>(retentionDays));
+    const fs::path root = fs::path(baseDir) / ("cam_" + cameraId);
+
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) {
+        return stats;
+    }
+
+    std::vector<fs::path> directories;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    if (ec) {
+        return stats;
+    }
+
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        const auto& entry = *it;
+        if (entry.is_directory(ec) && !ec) {
+            directories.push_back(entry.path());
+            continue;
+        }
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::path path = entry.path();
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (ext != ".mp4") continue;
+
+        ++stats.scannedFiles;
+
+        std::chrono::system_clock::time_point clipEndTs;
+        bool hasTs = false;
+
+        std::string parsedCameraId;
+        std::string startDate;
+        std::string startTime;
+        std::string endDate;
+        std::string endTime;
+        if (parseClipNameParts(
+            path.filename().string(),
+            parsedCameraId,
+            startDate,
+            startTime,
+            endDate,
+            endTime))
+        {
+            if (parseClipLocalTimestamp_(endDate, endTime, clipEndTs)) {
+                hasTs = true;
+                ++stats.parsedByNameTimestamp;
+            }
+        }
+
+        if (!hasTs) {
+            auto ft = entry.last_write_time(ec);
+            if (!ec) {
+                clipEndTs = fileTimeToSystemClock_(ft);
+                hasTs = true;
+                ++stats.parsedByFileTime;
+            }
+            else {
+                ec.clear();
+            }
+        }
+
+        if (!hasTs) {
+            ++stats.failed;
+            continue;
+        }
+
+        if (clipEndTs < cutoff) {
+            fs::remove(path, ec);
+            if (ec) {
+                ++stats.failed;
+                ec.clear();
+            }
+            else {
+                ++stats.deletedFiles;
+            }
+        }
+    }
+
+    std::sort(directories.begin(), directories.end(), [](const fs::path& a, const fs::path& b) {
+        return a.native().size() > b.native().size();
+    });
+
+    for (const auto& dir : directories) {
+        if (dir == root) continue;
+
+        std::error_code dirEc;
+        if (!fs::exists(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+        if (!fs::is_directory(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+        if (!fs::is_empty(dir, dirEc) || dirEc) {
+            dirEc.clear();
+            continue;
+        }
+
+        fs::remove(dir, dirEc);
+        if (dirEc) {
+            ++stats.failed;
+            dirEc.clear();
+        }
+        else {
+            ++stats.prunedDirectories;
+        }
+    }
+
+    return stats;
+}
+
 void FrameDiskWriter::runRetentionCleanupIfDue() {
     if (retentionDays_ <= 0) return;
 
@@ -904,97 +1045,18 @@ void FrameDiskWriter::runRetentionCleanupIfDue() {
     }
     lastRetentionSweep_ = nowSteady;
 
-    const auto nowSys = std::chrono::system_clock::now();
-    const auto cutoff = nowSys - std::chrono::hours(24LL * static_cast<long long>(retentionDays_));
-
-    const std::vector<fs::path> roots = {
-        fs::path(baseDir_) / ("cam_" + cameraId_)
-    };
-
-    int scanned = 0;
-    int deleted = 0;
-    int byNameTs = 0;
-    int byFileTime = 0;
-    int failed = 0;
-
-    for (const auto& root : roots) {
-        std::error_code ec;
-        if (!fs::exists(root, ec) || ec) continue;
-
-        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
-        fs::recursive_directory_iterator end;
-        if (ec) continue;
-
-        for (; it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-
-            const auto& entry = *it;
-            if (!entry.is_regular_file(ec) || ec) {
-                ec.clear();
-                continue;
-            }
-
-            const fs::path path = entry.path();
-            std::string ext = path.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
-                return static_cast<char>(std::tolower(ch));
-            });
-            if (ext != ".mp4") continue;
-
-            ++scanned;
-
-            std::chrono::system_clock::time_point clipEndTs;
-            bool hasTs = false;
-
-            std::string camId, startDate, startTime, endDate, endTime;
-            if (parseClipNameParts(path.filename().string(), camId, startDate, startTime, endDate, endTime)) {
-                if (parseClipLocalTimestamp_(endDate, endTime, clipEndTs)) {
-                    hasTs = true;
-                    ++byNameTs;
-                }
-            }
-
-            if (!hasTs) {
-                auto ft = entry.last_write_time(ec);
-                if (!ec) {
-                    clipEndTs = fileTimeToSystemClock_(ft);
-                    hasTs = true;
-                    ++byFileTime;
-                }
-                else {
-                    ec.clear();
-                }
-            }
-
-            if (!hasTs) {
-                ++failed;
-                continue;
-            }
-
-            if (clipEndTs < cutoff) {
-                fs::remove(path, ec);
-                if (ec) {
-                    ++failed;
-                    ec.clear();
-                }
-                else {
-                    ++deleted;
-                }
-            }
-        }
-    }
+    const RetentionSweepStats stats =
+        FrameDiskWriter::runRetentionCleanupNow(cameraId_, baseDir_, retentionDays_);
 
     Logger::instance().logDebug(
         cameraId_,
         "FrameDiskWriter: retention sweep days=" + std::to_string(retentionDays_) +
-        " scanned=" + std::to_string(scanned) +
-        " deleted=" + std::to_string(deleted) +
-        " byNameTs=" + std::to_string(byNameTs) +
-        " byFileTime=" + std::to_string(byFileTime) +
-        " failed=" + std::to_string(failed)
+        " scanned=" + std::to_string(stats.scannedFiles) +
+        " deleted=" + std::to_string(stats.deletedFiles) +
+        " byNameTs=" + std::to_string(stats.parsedByNameTimestamp) +
+        " byFileTime=" + std::to_string(stats.parsedByFileTime) +
+        " prunedDirs=" + std::to_string(stats.prunedDirectories) +
+        " failed=" + std::to_string(stats.failed)
     );
 }
 

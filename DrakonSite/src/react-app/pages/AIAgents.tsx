@@ -7,22 +7,28 @@ import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
   type CameraEditorDraft,
+  type CameraEditorSavedResult,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import {
   getCameraConnectionState,
   isCameraOnline,
   isCameraServiceRunning,
 } from "@/react-app/lib/cameraStatus";
 import { Camera as CameraType, dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
-import { buildDraftCameraFromDiscovery } from "@/react-app/utils/cameraDiscovery";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
+import {
+  createCamerasFromDiscoveryImport,
+  formatDiscoveryImportErrorMessage,
+  type CameraDiscoveryImportRequest,
+} from "@/react-app/utils/cameraDiscovery";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
-import type { DiscoveredCameraDevice } from "@/shared/cameraDiscovery";
 import {
   Camera,
   Plus,
@@ -40,6 +46,11 @@ import {
 function AIAgentsContent() {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const {
+    isOpen: isOnboardingOpen,
+    currentStepId: onboardingStepId,
+    tutorialCameraId,
+  } = useOnboarding();
   const billingEnabled = brand.features.billingEnabled;
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
@@ -76,6 +87,10 @@ function AIAgentsContent() {
         (a, b) => (b.is_service_running ?? 0) - (a.is_service_running ?? 0)
       ),
     [filteredCameras]
+  );
+  const existingCameraNames = useMemo(
+    () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
+    [cameras]
   );
 
   const updatePendingCameraState = (cameraId: number, isPending: boolean) => {
@@ -208,8 +223,23 @@ function AIAgentsContent() {
     setIsEditorOpen(false);
   };
 
-  const handleCameraSaved = async () => {
+  const handleCameraSaved = async (_saved?: CameraEditorSavedResult) => {
     dashboardSummaryStore.refresh();
+  };
+
+  const openAddModal = async () => {
+    const canAdd = await checkBillingForCameraCreation();
+    if (!canAdd) {
+      return;
+    }
+
+    setIsImportOpen(false);
+    setIsDiscoveryOpen(false);
+    editRequestCameraId.current = null;
+    setLoadingEditCameraId(null);
+    setEditingCamera(null);
+    setEditorDraft(null);
+    setIsEditorOpen(true);
   };
 
   const openImportModal = async () => {
@@ -229,17 +259,23 @@ function AIAgentsContent() {
     setIsDiscoveryOpen(true);
   };
 
-  const handleDiscoveryImport = async (device: DiscoveredCameraDevice) => {
+  const handleDiscoveryImport = async (request: CameraDiscoveryImportRequest) => {
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
     }
 
+    const result = await createCamerasFromDiscoveryImport(request);
+    dashboardSummaryStore.refresh();
+    if (result.failures.length > 0) {
+      throw new Error(formatDiscoveryImportErrorMessage(result));
+    }
+
     setIsImportOpen(false);
     closeEditCamera();
-    setEditorDraft(buildDraftCameraFromDiscovery(device));
+    setEditorDraft(null);
     setIsDiscoveryOpen(false);
-    setIsEditorOpen(true);
+    setIsEditorOpen(false);
   };
 
   const handleImportSaved = async () => {
@@ -253,6 +289,13 @@ function AIAgentsContent() {
     const isOverlay = mode === "overlay";
     const isRunning = isCameraServiceRunning(camera);
     const isTogglePending = pendingCameraIds.has(camera.id);
+    const isTutorialCameraStartTarget =
+      !isOverlay &&
+      isOnboardingOpen &&
+      onboardingStepId === "ai-agents-camera-start" &&
+      typeof tutorialCameraId === "number" &&
+      tutorialCameraId > 0 &&
+      tutorialCameraId === camera.id;
 
     return (
       <div
@@ -279,6 +322,10 @@ function AIAgentsContent() {
           onClick={() => toggleService(camera)}
           disabled={isTogglePending}
           aria-busy={isTogglePending}
+          data-camera-running={isRunning ? "true" : "false"}
+          data-onboarding-target={
+            isTutorialCameraStartTarget ? ONBOARDING_TARGETS.aiAgentsCameraStart : undefined
+          }
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
             isRunning
               ? isOverlay
@@ -370,12 +417,7 @@ function AIAgentsContent() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
           {/* Add camera card */}
           <button
-            onClick={async () => {
-              const canAdd = await checkBillingForCameraCreation();
-              if (canAdd) {
-                navigate("/cameras");
-              }
-            }}
+            onClick={openAddModal}
             className="group relative bg-gradient-to-br from-gray-800/50 to-gray-900/50 dark:from-gray-800/50 dark:to-gray-900/50 backdrop-blur-sm border-2 border-dashed border-gray-700 hover:border-blue-500/50 rounded-2xl p-6 md:p-8 transition-all duration-300 hover:shadow-lg hover:shadow-blue-500/20 flex flex-col items-center justify-center min-h-[200px] md:min-h-[280px]"
           >
             <div className="w-12 md:w-16 h-12 md:h-16 bg-gray-800 group-hover:bg-blue-500/10 rounded-2xl flex items-center justify-center mb-3 md:mb-4 transition-colors">
@@ -392,6 +434,12 @@ function AIAgentsContent() {
             const isRunning = isCameraServiceRunning(camera);
             const isOnline = isCameraOnline(camera);
             const isReconnecting = connectionState === "reconnecting";
+            const showInlineActionsForTutorial =
+              isOnboardingOpen &&
+              onboardingStepId === "ai-agents-camera-start" &&
+              typeof tutorialCameraId === "number" &&
+              tutorialCameraId > 0 &&
+              tutorialCameraId === camera.id;
 
             return (
             <div
@@ -483,7 +531,9 @@ function AIAgentsContent() {
                 </p>
 
                 {/* Actions */}
-                <div className="md:hidden">{renderCameraActions(camera)}</div>
+                <div className={showInlineActionsForTutorial ? "" : "md:hidden"}>
+                  {renderCameraActions(camera)}
+                </div>
               </div>
             </div>
           )})}
@@ -500,12 +550,7 @@ function AIAgentsContent() {
               {t("dashboard.noCamerasDesc")}
             </p>
             <button
-              onClick={async () => {
-                const canAdd = await checkBillingForCameraCreation();
-                if (canAdd) {
-                  navigate("/cameras");
-                }
-              }}
+              onClick={openAddModal}
               className="inline-flex items-center gap-2 px-6 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors min-h-[44px]"
             >
               <Plus className="w-5 h-5" />
@@ -554,6 +599,7 @@ function AIAgentsContent() {
         isOpen={isEditorOpen}
         camera={editingCamera}
         draftCamera={!editingCamera ? editorDraft : null}
+        existingCameraNames={existingCameraNames}
         onClose={closeEditCamera}
         onSaved={handleCameraSaved}
       />

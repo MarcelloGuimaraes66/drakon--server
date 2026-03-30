@@ -1,58 +1,104 @@
 # Camera Agents
 
-Use **AI Agents** when you want continuous or recurring analysis on a specific camera without manually asking the chat each time.
+When a user asks how to create an agent, the correct answer depends on the workflow. Today there are two places where agent logic can live.
 
-## What a camera agent does
+## The two places where an agent can be created
 
-- Watches one camera continuously or on a recurring cadence.
-- Uses a prompt that defines what should be detected, summarized, or supervised.
-- Can generate alerts when the configured condition is met.
-- Can include negative logic so the monitoring does not trigger on the wrong situation.
-- Can use visual guidance such as analysis regions, face targets, and negative reference images.
-- Is best for ongoing monitoring of a known scenario on one camera.
+1. **AI Agents**: the agent runs directly on one camera. This is the right place for continuous per-camera monitoring without schedules or cross-camera output orchestration.
+2. **Jobs / Steps**: the agent runs inside a step after a camera is added as a target. This is the right place when the agent must be part of a schedule, a multi-step workflow, or an output chain across cameras.
 
-Camera agents are not only useful on their own. They are also a fundamental building block for the broader workflow model used by cameras, jobs, steps, and agents. If you understand how to define a good camera agent, you already understand most of what a job step agent needs.
+## Which one to choose
 
-## Good use cases
+- Use **AI Agents** when one camera should keep watching continuously.
+- Use **Jobs / Steps** when you need schedules, dependencies, multiple cameras, or output coordination across stages.
+- Both places use the same base idea: define what the agent must recognize, when it should alert, and what it must ignore.
 
-- Detect intrusions after business hours.
-- Watch a loading dock for trucks or people entering a restricted area.
-- Track whether a queue is forming at a reception desk.
-- Detect safety issues such as a fallen person or a crowd.
-- Supervise whether a receiving dock is active during the expected window.
-- Monitor whether a route, area, or station is being used correctly.
-- Keep continuous watch over an operational stage that may later become one part of a bigger job workflow.
+## Minimum required fields
 
-## Typical flow
+- **Name**: a clear name for the agent.
+- **Prompt core**: explain what the agent must recognize and under which circumstances.
+- **Alert condition**: define the exact condition that should trigger an alert.
+
+## Optional guidance and filters
+
+- **Targets**: you can define specific targets for the analysis.
+- **Face targets**: you can add face photos when the scenario depends on recognizing a specific person.
+- **Negative condition**: describe what should not trigger an alert.
+- **Negative reference images**: add negative image references when the model needs clearer examples of what to ignore.
+
+## Enhance Prompt with AI
+
+- In the camera-agent editor there is a button called **Enhance Prompt with AI**.
+- It analyzes the user's current prompt together with the latest camera preview or streamed snapshot from that camera feed.
+- The goal is to build a more complete and detailed prompt suggestion that better enforces the user's intent and reduces false positives.
+- The button improves the text suggestion, but the user should still review the result before applying it.
+
+## Model and alert cadence
+
+- **Ultra**: lower latency and can emit alerts every 10 seconds.
+- **Core**: free tier, higher latency, and fixed 60-second alert cadence.
+- Choose **Ultra** when the scenario needs faster reaction.
+- Choose **Core** when 60-second cadence is acceptable and lower cost matters more.
+
+## Video packaging
+
+- **High resolution**: sends frames at their original size.
+- **Standard resolution**: sends the image about 4x smaller.
+- **Compact resolution**: sends the image about 6x smaller.
+- Smaller packaging reduces input-token usage, but it can also reduce analysis quality.
+- Small objects analyzed with **Compact resolution** may cause more false positives or false negatives.
+
+## Input type
+
+- **Video**: sends a sequence of frames. Use it when the model must understand short actions, rapid movements, or brief temporal context.
+- **Image**: sends snapshots. With a 10-second cadence it sends one snapshot every 10 seconds; with a 60-second cadence it sends one snapshot every 60 seconds.
+- **Image + 10s** is often a strong choice when short temporal analysis is not required, because it usually costs fewer tokens than video while still keeping good coverage.
+- Practical rule: use **Video** for short motion and quick actions; use **Image** when periodic snapshots are enough.
+
+## Polygons and motion-gated regions
+
+- In the upper-left corner of the editor, the user can create named polygons.
+- The program sends inference only when movement happens inside one of those polygons.
+- This lets the user analyze only specific quadrants or regions of the scene instead of the full frame all the time.
+
+## Typical flow in AI Agents
 
 1. Open **AI Agents**.
-2. Choose the camera you want to monitor.
-3. Define the display name and prompt core.
-4. Define the alert condition and, if needed, a negative condition.
-5. Configure visual guidance such as full frame or analysis regions, face targets, and negative reference images.
-6. Choose the model or execution settings that fit the scenario.
-7. Save the agent.
-8. Enable the agent and verify that it is running.
+2. Choose the camera.
+3. Open that camera's **Configure AI Agents / Algorithms** page.
+4. Click **Create Custom AI Agent**.
+5. Fill in **Name**, **Prompt core**, and **Alert condition**.
+6. If needed, add targets, face photos, negative conditions, and negative reference images.
+7. Choose the model, cadence, input type, and **Video packaging** mode.
+8. Create polygons if the analysis should watch only specific regions.
+9. Save and enable the agent.
 
-## Practical example
+## Typical flow in Jobs / Steps
 
-Example: supervised receiving dock monitoring.
+1. Open **Jobs**.
+2. Create or edit the job.
+3. Create a **step**.
+4. Add the camera as a target inside that step.
+5. Open the step-level agent editor.
+6. Configure **Name**, **Prompt core**, **Alert condition**, and the same visual and execution settings used by camera agents.
+7. Use this path when the agent belongs to a schedule or to a workflow that coordinates several cameras or stages.
 
-- Camera: `Receiving Dock`
-- Prompt core: monitor whether trucks, pallets, or unloading activity are present during the expected receiving window
-- Alert condition: send an alert when the expected unloading activity is missing, delayed, or happening in the wrong way
-- Negative condition: do not alert when the area is simply empty outside the scheduled receiving window
-- Result: the agent keeps watching the camera without requiring a manual chat request
+## Tutorial Stage 3 note
 
-## How camera agents differ from chat
+- The guided tutorial uses the continuous per-camera **AI Agents** path.
+- Stage 2 creates the tutorial camera from the **Cameras** page, but the same camera-registration entry points also exist in **AI Agents**.
+- After the tutorial camera exists, Stage 3 opens that camera's **Algorithms** page and creates a custom AI agent there.
+- The example agent is named **thumbs up detector**. In Portuguese UI copy, the same example is presented as **detector de afirmativo**.
+- The tutorial preset uses:
+  - **Prompt core**: recognize any person making a thumbs up or affirmative hand gesture.
+  - **Alert condition**: alert if any person is making a thumbs up or affirmative hand gesture.
+- If **OpenAI** is available, the tutorial prefers **Ultra**, **Video**, **High resolution**, **10-second cadence**, and **1 FPS**.
+- If only **Z.ai** is configured, the tutorial uses **Core**. **High resolution** remains selected, but the app keeps Core's fixed **60-second cadence**.
+- The tutorial explains the **model** selector first and the **input type** selector right after it as two separate highlighted steps.
+- After saving the agent, the tutorial returns to the camera's **Algorithms** page to explain the toggle that enables or pauses that agent on that camera.
+- The last guided action goes back to **AI Agents** and starts the tutorial camera service so the user can immediately test the thumbs up detector.
 
-- Chat is best for ad hoc questions such as `what happened in the parking lot today?`
-- Camera agents are best when the same type of monitoring should keep running automatically
-- Chat asks after the fact; camera agents stay ready before, during, and after the event window
+## Practical rule of thumb
 
-## How camera agents differ from jobs
-
-- Camera agents focus on one camera and one continuous monitoring setup.
-- Jobs are better when you need a scheduled workflow, multiple steps, dependencies, or coordination across multiple targets.
-- Camera agents define monitoring behavior at the camera level; jobs orchestrate behavior across stages.
-- A camera agent can be a strong starting pattern for a future job step, because the same kinds of prompt, alert, region, and execution choices appear again inside job-step agents.
+- Choose **AI Agents** for a direct continuous watcher on one camera.
+- Choose **Jobs / Steps** when the agent must be scheduled or integrated with other cameras, steps, or outputs.

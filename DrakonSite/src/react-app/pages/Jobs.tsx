@@ -37,6 +37,7 @@ import {
   Maximize2,
   Minimize2,
   Play,
+  StopCircle,
 } from "lucide-react";
 import {
   FACE_ID_MAX_IMAGE_SIDE_PX,
@@ -115,6 +116,24 @@ type PromptEnhanceSuggestion = PromptEditorFields & {
   snapshot_source?: string;
   snapshot_ts_utc_iso?: string;
 };
+
+const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
+const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
+const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
+const PROMPT_DOCUMENT_INPUT_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TEXTAREA_CLASS =
+  "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+
+const extractOptionalSuffix = (label: string): string => {
+  const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
+  return match ? ` ${match[1].trim()}` : " (optional)";
+};
+
+const formatPromptDocumentHeading = (
+  label: string,
+  options?: { optional?: boolean; optionalSuffix?: string }
+): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
 
 const parsePromptTemplate = (
   template: string,
@@ -1265,6 +1284,7 @@ export default function JobsPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [globalTimezone, setGlobalTimezone] = useState<string>("UTC");
   const [startingJobIds, setStartingJobIds] = useState<Set<number>>(new Set());
+  const [stoppingJobIds, setStoppingJobIds] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(cameras);
   const [confirmDelete, setConfirmDelete] = useState<{ isOpen: boolean; jobId: number | null }>({
@@ -1909,6 +1929,49 @@ export default function JobsPage() {
       setToast({ message: listActionCopy.failedMessage, type: "error" });
     } finally {
       setStartingJobIds((current) => {
+        const next = new Set(current);
+        next.delete(job.id);
+        return next;
+      });
+    }
+  };
+
+  const handleStopJobFromRow = async (job: Job) => {
+    setStoppingJobIds((current) => {
+      const next = new Set(current);
+      next.add(job.id);
+      return next;
+    });
+
+    try {
+      const response = await fetch(`/api/jobs/${job.id}/stop`, {
+        method: "POST",
+      });
+
+      if (response.ok) {
+        setToast({ message: t("dashboard.stopJobRequested", { jobName: job.name }), type: "success" });
+        await fetchJobs();
+
+        // Fast follow refreshes keep the list in sync even when backend status takes a moment to settle.
+        setTimeout(() => {
+          void fetchJobs();
+        }, 1500);
+        setTimeout(() => {
+          void fetchJobs();
+        }, 3500);
+        return;
+      }
+
+      const error = (await readApiResponseBody(response)) || {};
+      setToast({
+        message: String(error.error || error.message || t("dashboard.stopJobFailed")),
+        type: "error",
+      });
+    } catch (error) {
+      console.error("Failed to stop job:", error);
+      setToast({ message: t("dashboard.stopJobFailed"), type: "error" });
+    } finally {
+      setStoppingJobIds((current) => {
         const next = new Set(current);
         next.delete(job.id);
         return next;
@@ -2831,7 +2894,10 @@ export default function JobsPage() {
                 <tbody>
                   {filteredJobs.map((job) => {
                     const jobTimeRange = getJobListTimeRange(job);
+                    const displayStatus = getDisplayStatus(job);
                     const isStarting = startingJobIds.has(job.id);
+                    const isStopping = displayStatus === "stopping" || stoppingJobIds.has(job.id);
+                    const showStopAction = displayStatus === "running" || isStopping;
                     const canStart = canStartJobFromList(job);
 
                     return (
@@ -2843,7 +2909,7 @@ export default function JobsPage() {
                           <div className="flex items-center gap-2">
                             <span className="text-gray-200 font-medium">{job.name}</span>
                             <span
-                              className={`px-2 py-0.5 rounded text-xs font-medium ${getStatusColor(getDisplayStatus(job))}`}
+                              className={`px-2 py-0.5 rounded text-xs font-medium ${getStatusColor(displayStatus)}`}
                             >
                               {getDisplayStatusLabel(job)}
                             </span>
@@ -2887,19 +2953,35 @@ export default function JobsPage() {
                         </td>
                         <td className="py-3 px-4">
                           <div className="flex items-center justify-end gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handleStartJobFromRow(job)}
-                              disabled={!canStart || isStarting}
-                              className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors ${
-                                !canStart || isStarting
-                                  ? "cursor-not-allowed bg-gray-800 text-gray-500"
-                                  : "bg-emerald-600 hover:bg-emerald-500 text-white"
-                              }`}
-                            >
-                              <Play className="w-3.5 h-3.5" />
-                              {isStarting ? listActionCopy.starting : listActionCopy.start}
-                            </button>
+                            {showStopAction ? (
+                              <button
+                                type="button"
+                                onClick={() => handleStopJobFromRow(job)}
+                                disabled={isStopping}
+                                className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors ${
+                                  isStopping
+                                    ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                                    : "bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20"
+                                }`}
+                              >
+                                <StopCircle className="w-3.5 h-3.5" />
+                                {t("dashboard.stop")}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleStartJobFromRow(job)}
+                                disabled={!canStart || isStarting}
+                                className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors ${
+                                  !canStart || isStarting
+                                    ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                                    : "bg-emerald-600 hover:bg-emerald-500 text-white"
+                                }`}
+                              >
+                                <Play className="w-3.5 h-3.5" />
+                                {isStarting ? listActionCopy.starting : listActionCopy.start}
+                              </button>
+                            )}
                             <button
                               onClick={() => handleOpenJob(job)}
                               className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded text-sm transition-colors"
@@ -2954,6 +3036,11 @@ function StepCard({
 }: StepCardProps) {
   const { t, i18n } = useTranslation();
   const stepLocale = (i18n.resolvedLanguage || i18n.language || "en").replace("_", "-");
+  const localizedOptionalSuffix = extractOptionalSuffix(
+    t("jobs.promptEditor.targetFacesOptionalLabel", {
+      defaultValue: "Target Faces (optional)",
+    })
+  );
   const [targets, setTargets] = useState<Target[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [alerts, setAlerts] = useState<AlertRule[]>([]);
@@ -7306,23 +7393,6 @@ function StepCard({
                             >
                             <div className="space-y-2">
                               <label className="block text-sm font-semibold text-gray-100">
-                                {t("jobs.agentKey")} <span className="text-red-600">*</span>
-                              </label>
-                              <input
-                                type="text"
-                                value={agentForm.agent_key}
-                                onChange={(e) =>
-                                  setAgentForm((prev) => ({
-                                    ...prev,
-                                    agent_key: e.target.value,
-                                  }))
-                                }
-                                className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
-                                placeholder={t("jobs.agentKeyPlaceholder")}
-                              />
-                            </div>
-                            <div className="space-y-2">
-                              <label className="block text-sm font-semibold text-gray-100">
                                 {t("jobs.runEvery")}
                               </label>
                               <select
@@ -7473,91 +7543,132 @@ function StepCard({
                                 </label>
                               </div>
                             ) : null}
-                            <div className="space-y-2">
-                              <label className="block text-sm font-semibold text-gray-100">
-                                {t("jobs.promptEditor.promptCoreLabel")} <span className="text-red-600">*</span>
-                              </label>
-                              <p className="text-xs text-gray-400">
-                                {t("jobs.promptEditor.promptCoreDescription")}
-                              </p>
-                              <textarea
-                                value={promptEditorDraft.prompt_template}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  setPromptEditorDraft((prev) => ({
-                                    ...prev,
-                                    prompt_template: value,
-                                  }));
-                                  setPromptEditorRegions((prev) =>
-                                    prev.map((region) => ({
-                                      ...region,
-                                      prompt_core: value,
+                            <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
+                              <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(t("jobs.agentKey"))}
+                                  </span>
+                                  <span className="text-red-600">*</span>
+                                </div>
+                                <input
+                                  aria-label={t("jobs.agentKey")}
+                                  type="text"
+                                  value={agentForm.agent_key}
+                                  onChange={(e) =>
+                                    setAgentForm((prev) => ({
+                                      ...prev,
+                                      agent_key: e.target.value,
                                     }))
-                                  );
-                                }}
-                                rows={8}
-                                className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
-                                placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
-                              />
-                            </div>
-                            <div className="space-y-2">
-                              <label className="block text-sm font-semibold text-gray-100">
-                                {t("jobs.promptEditor.alertConditionLabel")}{" "}
-                                <span className="text-red-600">*</span>
-                              </label>
-                              <p className="text-xs text-gray-400">
-                                {t("jobs.promptEditor.alertConditionDescription")}
-                              </p>
-                              <textarea
-                                value={promptEditorDraft.alert_condition}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  setPromptEditorDraft((prev) => ({
-                                    ...prev,
-                                    alert_condition: value,
-                                  }));
-                                  setPromptEditorRegions((prev) =>
-                                    prev.map((region) => ({
-                                      ...region,
+                                  }
+                                  className={PROMPT_DOCUMENT_INPUT_CLASS}
+                                  placeholder={t("jobs.agentKeyPlaceholder")}
+                                />
+                              </div>
+                              <div
+                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(
+                                      t("jobs.promptEditor.promptCoreLabel")
+                                    )}
+                                  </span>
+                                  <span className="text-red-600">*</span>
+                                </div>
+                                <textarea
+                                  aria-label={t("jobs.promptEditor.promptCoreLabel")}
+                                  value={promptEditorDraft.prompt_template}
+                                  onChange={(e) => {
+                                    const value = e.target.value;
+                                    setPromptEditorDraft((prev) => ({
+                                      ...prev,
+                                      prompt_template: value,
+                                    }));
+                                    setPromptEditorRegions((prev) =>
+                                      prev.map((region) => ({
+                                        ...region,
+                                        prompt_core: value,
+                                      }))
+                                    );
+                                  }}
+                                  rows={8}
+                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+                                />
+                              </div>
+                              <div
+                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(
+                                      t("jobs.promptEditor.alertConditionLabel")
+                                    )}
+                                  </span>
+                                  <span className="text-red-600">*</span>
+                                </div>
+                                <textarea
+                                  aria-label={t("jobs.promptEditor.alertConditionLabel")}
+                                  value={promptEditorDraft.alert_condition}
+                                  onChange={(e) => {
+                                    const value = e.target.value;
+                                    setPromptEditorDraft((prev) => ({
+                                      ...prev,
                                       alert_condition: value,
-                                    }))
-                                  );
-                                }}
-                                rows={5}
-                                className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
-                                placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
-                              />
-                            </div>
-                            <div className="space-y-2">
-                              <label className="block text-sm font-semibold text-gray-100">
-                                {t("jobs.promptEditor.negativeConditionLabel")} (optional)
-                              </label>
-                              <p className="text-xs text-gray-400">
-                                {t("jobs.promptEditor.negativeConditionDescription")}
-                              </p>
-                              <textarea
-                                value={promptEditorDraft.negative_condition}
-                                onChange={(e) => {
-                                  const value = e.target.value;
-                                  setPromptEditorDraft((prev) => ({
-                                    ...prev,
-                                    negative_condition: value,
-                                  }));
-                                  setPromptEditorRegions((prev) =>
-                                    prev.map((region) => ({
-                                      ...region,
+                                    }));
+                                    setPromptEditorRegions((prev) =>
+                                      prev.map((region) => ({
+                                        ...region,
+                                        alert_condition: value,
+                                      }))
+                                    );
+                                  }}
+                                  rows={5}
+                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+                                />
+                              </div>
+                              <div
+                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
+                              >
+                                <div className="font-mono text-[13px] font-semibold text-gray-100">
+                                  {formatPromptDocumentHeading(
+                                    t("jobs.promptEditor.negativeConditionLabel"),
+                                    {
+                                      optional: true,
+                                      optionalSuffix: localizedOptionalSuffix,
+                                    }
+                                  )}
+                                </div>
+                                <textarea
+                                  aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+                                  value={promptEditorDraft.negative_condition}
+                                  onChange={(e) => {
+                                    const value = e.target.value;
+                                    setPromptEditorDraft((prev) => ({
+                                      ...prev,
                                       negative_condition: value,
-                                    }))
-                                  );
-                                }}
-                                rows={4}
-                                className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
-                                placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
-                              />
+                                    }));
+                                    setPromptEditorRegions((prev) =>
+                                      prev.map((region) => ({
+                                        ...region,
+                                        negative_condition: value,
+                                      }))
+                                    );
+                                  }}
+                                  rows={4}
+                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+                                />
+                              </div>
                             </div>
                             <div className="space-y-2">
-                              <label className="block text-sm font-semibold text-gray-100">
-                                Negative Reference Images (optional)
+                              <label className="block font-mono text-[13px] font-semibold text-gray-100">
+                                {formatPromptDocumentHeading("Negative Reference Images", {
+                                  optional: true,
+                                  optionalSuffix: localizedOptionalSuffix,
+                                })}
                               </label>
                               <p className="text-xs text-gray-400">
                                 Upload up to {NEGATIVE_REFERENCE_MAX_IMAGES} examples. Selection applies to the whole agent.
@@ -8450,39 +8561,58 @@ function StepCard({
                                 </p>
                               )}
                             </div>
-                            <div className="px-6 py-4 space-y-4 overflow-y-auto">
-                              <div className="space-y-1.5">
-                                <label className="text-sm font-semibold text-gray-100">
-                                  {t("jobs.promptEditor.promptCoreLabel")}
-                                </label>
-                                <textarea
-                                  value={promptEnhanceSuggestion.prompt_template}
-                                  readOnly
-                                  rows={5}
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800/70 text-gray-100 text-sm"
-                                />
-                              </div>
-                              <div className="space-y-1.5">
-                                <label className="text-sm font-semibold text-gray-100">
-                                  {t("jobs.promptEditor.alertConditionLabel")}
-                                </label>
-                                <textarea
-                                  value={promptEnhanceSuggestion.alert_condition}
-                                  readOnly
-                                  rows={4}
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800/70 text-gray-100 text-sm"
-                                />
-                              </div>
-                              <div className="space-y-1.5">
-                                <label className="text-sm font-semibold text-gray-100">
-                                  {t("jobs.promptEditor.negativeConditionLabel")} (optional)
-                                </label>
-                                <textarea
-                                  value={promptEnhanceSuggestion.negative_condition}
-                                  readOnly
-                                  rows={4}
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800/70 text-gray-100 text-sm"
-                                />
+                            <div className="px-6 py-4 overflow-y-auto">
+                              <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
+                                <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
+                                  <div className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(
+                                      t("jobs.promptEditor.promptCoreLabel")
+                                    )}
+                                  </div>
+                                  <textarea
+                                    aria-label={t("jobs.promptEditor.promptCoreLabel")}
+                                    value={promptEnhanceSuggestion.prompt_template}
+                                    readOnly
+                                    rows={5}
+                                    className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  />
+                                </div>
+                                <div
+                                  className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
+                                >
+                                  <div className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(
+                                      t("jobs.promptEditor.alertConditionLabel")
+                                    )}
+                                  </div>
+                                  <textarea
+                                    aria-label={t("jobs.promptEditor.alertConditionLabel")}
+                                    value={promptEnhanceSuggestion.alert_condition}
+                                    readOnly
+                                    rows={4}
+                                    className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  />
+                                </div>
+                                <div
+                                  className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
+                                >
+                                  <div className="font-mono text-[13px] font-semibold text-gray-100">
+                                    {formatPromptDocumentHeading(
+                                      t("jobs.promptEditor.negativeConditionLabel"),
+                                      {
+                                        optional: true,
+                                        optionalSuffix: localizedOptionalSuffix,
+                                      }
+                                    )}
+                                  </div>
+                                  <textarea
+                                    aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+                                    value={promptEnhanceSuggestion.negative_condition}
+                                    readOnly
+                                    rows={4}
+                                    className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+                                  />
+                                </div>
                               </div>
                             </div>
                             <div className="px-6 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">

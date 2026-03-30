@@ -3,6 +3,7 @@ import { zValidator } from "@hono/zod-validator";
 import { getCookie, setCookie } from "hono/cookie";
 import {
   CreateCameraSchema,
+  LookupAddressSchema,
   UpdateCameraSchema,
   SendChatMessageSchema,
   CreateAlgorithmSchema,
@@ -1470,6 +1471,458 @@ function normalizeCameraGeography(stateValue: unknown, countryValue: unknown) {
     stateCode,
     countryCode,
   };
+}
+
+type AddressLookupField = "street" | "city" | "state" | "country";
+type AddressLookupSource = "viacep" | "google-geocoding";
+
+type AddressLookupResult = {
+  found: boolean;
+  source: AddressLookupSource | null;
+  postal_code: string;
+  country: string | null;
+  country_code: string | null;
+  street: string | null;
+  city: string | null;
+  state: string | null;
+  state_code: string | null;
+  confidence: "high" | "medium" | null;
+  auto_filled_fields: AddressLookupField[];
+  message: string | null;
+};
+
+type ViaCepLookupResponse = {
+  cep?: unknown;
+  logradouro?: unknown;
+  localidade?: unknown;
+  uf?: unknown;
+  estado?: unknown;
+  erro?: boolean;
+};
+
+type GoogleGeocodingAddressComponent = {
+  long_name?: unknown;
+  short_name?: unknown;
+  types?: unknown;
+};
+
+type GoogleGeocodingResult = {
+  address_components?: unknown;
+  partial_match?: unknown;
+  types?: unknown;
+};
+
+type GoogleGeocodingPayload = {
+  status?: unknown;
+  error_message?: unknown;
+  results?: unknown;
+};
+
+function resolveCountryDisplayName(countryCode: string | null): string | null {
+  const normalized = typeof countryCode === "string" ? countryCode.trim().toUpperCase() : "";
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const displayNames = new Intl.DisplayNames(["en"], { type: "region" });
+    return displayNames.of(normalized) || normalized;
+  } catch {
+    return normalized;
+  }
+}
+
+function normalizePostalCodeForLookup(value: unknown, countryCode: string | null): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const raw = value.trim();
+  if (!raw) {
+    return "";
+  }
+
+  if (countryCode === "BR") {
+    return raw.replace(/\D+/g, "").slice(0, 8);
+  }
+
+  return raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9 -]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildPostalCodeComparisonKey(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.toUpperCase().replace(/[^A-Z0-9]+/g, "");
+}
+
+function buildAddressLookupAutoFilledFields(fields: {
+  street?: string | null;
+  city?: string | null;
+  state?: string | null;
+  country?: string | null;
+}): AddressLookupField[] {
+  const result: AddressLookupField[] = [];
+  if (fields.street) {
+    result.push("street");
+  }
+  if (fields.city) {
+    result.push("city");
+  }
+  if (fields.state) {
+    result.push("state");
+  }
+  if (fields.country) {
+    result.push("country");
+  }
+  return result;
+}
+
+function buildAddressLookupNotFound(
+  postalCode: string,
+  countryCode: string,
+  source: AddressLookupSource | null,
+  message: string
+): AddressLookupResult {
+  return {
+    found: false,
+    source,
+    postal_code: postalCode,
+    country: resolveCountryDisplayName(countryCode),
+    country_code: countryCode,
+    street: null,
+    city: null,
+    state: null,
+    state_code: null,
+    confidence: null,
+    auto_filled_fields: [],
+    message,
+  };
+}
+
+async function lookupBrazilAddressByPostalCode(postalCode: string): Promise<AddressLookupResult> {
+  const response = await fetch(`https://viacep.com.br/ws/${postalCode}/json/`, {
+    headers: {
+      accept: "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`ViaCEP lookup failed with status ${response.status}.`);
+  }
+
+  const payload = (await response.json()) as ViaCepLookupResponse;
+  if (payload.erro === true) {
+    return buildAddressLookupNotFound(postalCode, "BR", "viacep", "CEP not found.");
+  }
+
+  const street = normalizeOptionalCameraField(payload.logradouro);
+  const city = normalizeOptionalCameraField(payload.localidade);
+  const stateCode =
+    normalizeBrazilStateCode(payload.uf) || normalizeBrazilStateCode(payload.estado);
+  const state = stateCode
+    ? BRAZIL_STATE_NAME_BY_CODE[stateCode]
+    : normalizeOptionalCameraField(payload.estado) || normalizeOptionalCameraField(payload.uf);
+  const country = resolveCountryDisplayName("BR");
+  const autoFilledFields = buildAddressLookupAutoFilledFields({
+    street,
+    city,
+    state,
+    country,
+  });
+
+  if (!street && !city && !state) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      "BR",
+      "viacep",
+      "CEP found but no address fields were returned."
+    );
+  }
+
+  return {
+    found: true,
+    source: "viacep",
+    postal_code: normalizePostalCodeForLookup(
+      typeof payload.cep === "string" ? payload.cep : postalCode,
+      "BR"
+    ),
+    country,
+    country_code: "BR",
+    street,
+    city,
+    state,
+    state_code: stateCode,
+    confidence: street && city && state ? "high" : "medium",
+    auto_filled_fields: autoFilledFields,
+    message: null,
+  };
+}
+
+function getGoogleGeocodingTypes(result: GoogleGeocodingResult): string[] {
+  if (!Array.isArray(result.types)) {
+    return [];
+  }
+
+  return result.types.filter((type): type is string => typeof type === "string");
+}
+
+function getGoogleGeocodingComponents(
+  result: GoogleGeocodingResult
+): GoogleGeocodingAddressComponent[] {
+  if (!Array.isArray(result.address_components)) {
+    return [];
+  }
+
+  return result.address_components.filter(
+    (component): component is GoogleGeocodingAddressComponent =>
+      Boolean(component) && typeof component === "object"
+  );
+}
+
+function getGoogleGeocodingComponent(
+  result: GoogleGeocodingResult,
+  type: string
+): GoogleGeocodingAddressComponent | null {
+  return (
+    getGoogleGeocodingComponents(result).find((component) =>
+      Array.isArray(component.types)
+        ? component.types.some((componentType) => componentType === type)
+        : false
+    ) || null
+  );
+}
+
+function getGoogleGeocodingComponentText(
+  result: GoogleGeocodingResult,
+  types: string[],
+  variant: "long_name" | "short_name" = "long_name"
+): string | null {
+  for (const type of types) {
+    const component = getGoogleGeocodingComponent(result, type);
+    if (!component) {
+      continue;
+    }
+
+    const candidate = component[variant];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function selectGoogleGeocodingResult(
+  results: GoogleGeocodingResult[],
+  requestedPostalKey: string
+): GoogleGeocodingResult | null {
+  let bestMatch: { result: GoogleGeocodingResult; score: number } | null = null;
+
+  for (const result of results) {
+    const types = getGoogleGeocodingTypes(result);
+    const resultPostalKey = buildPostalCodeComparisonKey(
+      getGoogleGeocodingComponentText(result, ["postal_code"]) || ""
+    );
+    let score = 0;
+
+    if (types.includes("postal_code")) {
+      score += 100;
+    }
+    if (types.includes("postal_code_prefix")) {
+      score += 15;
+    }
+    if (result.partial_match === false) {
+      score += 10;
+    }
+    if (requestedPostalKey && resultPostalKey === requestedPostalKey) {
+      score += 50;
+    } else if (
+      requestedPostalKey &&
+      resultPostalKey &&
+      (resultPostalKey.startsWith(requestedPostalKey) ||
+        requestedPostalKey.startsWith(resultPostalKey))
+    ) {
+      score += 10;
+    }
+
+    if (!bestMatch || score > bestMatch.score) {
+      bestMatch = { result, score };
+    }
+  }
+
+  return bestMatch && bestMatch.score >= 40 ? bestMatch.result : null;
+}
+
+async function lookupGoogleAddressByPostalCode(
+  env: Env,
+  postalCode: string,
+  countryCode: string
+): Promise<AddressLookupResult> {
+  const apiKey = String(env.GOOGLE_GEOCODING_API_KEY || "").trim();
+  if (!apiKey) {
+    throw new Error(
+      `Address lookup for ${countryCode} is not configured. Set GOOGLE_GEOCODING_API_KEY.`
+    );
+  }
+
+  const params = new URLSearchParams({
+    address: postalCode,
+    components: `country:${countryCode}|postal_code:${postalCode}`,
+    key: apiKey,
+  });
+
+  const response = await fetch(
+    `https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`,
+    {
+      headers: {
+        accept: "application/json",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Google Geocoding lookup failed with status ${response.status}.`);
+  }
+
+  const payload = (await response.json()) as GoogleGeocodingPayload;
+  const status = typeof payload.status === "string" ? payload.status : "UNKNOWN_ERROR";
+
+  if (status === "ZERO_RESULTS") {
+    return buildAddressLookupNotFound(
+      postalCode,
+      countryCode,
+      "google-geocoding",
+      "Postal code not found."
+    );
+  }
+
+  if (status !== "OK") {
+    const errorMessage =
+      typeof payload.error_message === "string" && payload.error_message.trim()
+        ? payload.error_message.trim()
+        : `Google Geocoding returned ${status}.`;
+    throw new Error(errorMessage);
+  }
+
+  const results = Array.isArray(payload.results)
+    ? payload.results.filter((result): result is GoogleGeocodingResult =>
+        Boolean(result) && typeof result === "object"
+      )
+    : [];
+  const requestedPostalKey = buildPostalCodeComparisonKey(postalCode);
+  const result = selectGoogleGeocodingResult(results, requestedPostalKey);
+
+  if (!result) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      countryCode,
+      "google-geocoding",
+      "No reliable postal code match was returned."
+    );
+  }
+
+  const returnedPostalKey = buildPostalCodeComparisonKey(
+    getGoogleGeocodingComponentText(result, ["postal_code"]) || ""
+  );
+  if (
+    requestedPostalKey &&
+    returnedPostalKey &&
+    returnedPostalKey !== requestedPostalKey &&
+    !returnedPostalKey.startsWith(requestedPostalKey) &&
+    !requestedPostalKey.startsWith(returnedPostalKey)
+  ) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      countryCode,
+      "google-geocoding",
+      "No exact postal code match was returned."
+    );
+  }
+
+  const street = getGoogleGeocodingComponentText(result, ["route"]);
+  const city = getGoogleGeocodingComponentText(result, [
+    "locality",
+    "postal_town",
+    "sublocality_level_1",
+    "administrative_area_level_2",
+  ]);
+  const rawState = getGoogleGeocodingComponentText(result, ["administrative_area_level_1"]);
+  const rawStateCode = getGoogleGeocodingComponentText(
+    result,
+    ["administrative_area_level_1"],
+    "short_name"
+  );
+  const resolvedCountryCode =
+    normalizeCountryCode(
+      getGoogleGeocodingComponentText(result, ["country"], "short_name") || countryCode,
+      countryCode === "BR" ? normalizeBrazilStateCode(rawStateCode || rawState) : null
+    ) || countryCode;
+  const brazilStateCode =
+    resolvedCountryCode === "BR" ? normalizeBrazilStateCode(rawStateCode || rawState) : null;
+  const state =
+    resolvedCountryCode === "BR" && brazilStateCode
+      ? BRAZIL_STATE_NAME_BY_CODE[brazilStateCode]
+      : rawState;
+  const stateCode =
+    resolvedCountryCode === "BR"
+      ? brazilStateCode
+      : normalizeOptionalCameraField(rawStateCode);
+  const country =
+    getGoogleGeocodingComponentText(result, ["country"]) ||
+    resolveCountryDisplayName(resolvedCountryCode);
+  const autoFilledFields = buildAddressLookupAutoFilledFields({
+    street,
+    city,
+    state,
+    country,
+  });
+
+  if (!street && !city && !state) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      resolvedCountryCode,
+      "google-geocoding",
+      "Postal code found but no address fields were returned."
+    );
+  }
+
+  return {
+    found: true,
+    source: "google-geocoding",
+    postal_code: postalCode,
+    country,
+    country_code: resolvedCountryCode,
+    street,
+    city,
+    state,
+    state_code: stateCode,
+    confidence:
+      getGoogleGeocodingTypes(result).includes("postal_code") &&
+      result.partial_match !== true &&
+      returnedPostalKey === requestedPostalKey
+        ? "high"
+        : "medium",
+    auto_filled_fields: autoFilledFields,
+    message: null,
+  };
+}
+
+async function lookupAddressByPostalCode(
+  env: Env,
+  postalCode: string,
+  countryCode: string
+): Promise<AddressLookupResult> {
+  if (countryCode === "BR") {
+    return lookupBrazilAddressByPostalCode(postalCode);
+  }
+
+  return lookupGoogleAddressByPostalCode(env, postalCode, countryCode);
 }
 
 async function createDrakonFindAuditLog(
@@ -5629,6 +6082,27 @@ async function ensureAppUserRow(
     .run();
 }
 
+async function updateAppUserCountryCodeIfMissing(
+  db: D1Database,
+  userId: string,
+  countryCode: string | null | undefined
+): Promise<void> {
+  const normalizedCountryCode = normalizeCountryCode(countryCode, null);
+  if (!normalizedCountryCode) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE app_users
+       SET country_code = ?, updated_at = ?
+       WHERE id = ?
+         AND COALESCE(NULLIF(TRIM(country_code), ''), '') = ''`
+    )
+    .bind(normalizedCountryCode, new Date().toISOString(), userId)
+    .run();
+}
+
 async function getAppUserProfile(
   db: D1Database,
   userId: string
@@ -5692,6 +6166,7 @@ type GoogleSessionUser = {
   email: string;
   auth_provider: "google";
   google_user_data: NonNullable<GoogleOAuthUser["google_user_data"]>;
+  country_code: string | null;
   created_at: string | null;
   handle: string | null;
 };
@@ -5948,7 +6423,10 @@ async function markAppUserAsGoogleLinked(
   );
 }
 
-async function createGoogleOAuthRedirectUrl(c: any): Promise<string> {
+async function createGoogleOAuthRedirectUrl(
+  c: any,
+  countryCode?: string | null
+): Promise<string> {
   const { clientId } = getGoogleOAuthConfig(c.env);
   const discovery = await getGoogleOidcDiscovery();
   const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
@@ -5979,6 +6457,17 @@ async function createGoogleOAuthRedirectUrl(c: any): Promise<string> {
     redirectUri,
     GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS
   );
+  const normalizedCountryCode = normalizeCountryCode(countryCode, null);
+  if (normalizedCountryCode) {
+    setSessionCookie(
+      c,
+      GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME,
+      normalizedCountryCode,
+      GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS
+    );
+  } else {
+    clearSessionCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME);
+  }
 
   const authorizationUrl = new URL(discovery.authorization_endpoint);
   authorizationUrl.searchParams.set("client_id", clientId);
@@ -6084,6 +6573,7 @@ function clearGoogleOAuthFlowCookies(c: any) {
   clearSessionCookie(c, GOOGLE_OAUTH_NONCE_COOKIE_NAME);
   clearSessionCookie(c, GOOGLE_OAUTH_PKCE_COOKIE_NAME);
   clearSessionCookie(c, GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME);
+  clearSessionCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME);
 }
 
 async function createGoogleSession(
@@ -6130,6 +6620,7 @@ async function getGoogleSessionUser(
        os.user_id,
        os.provider_subject,
        au.email,
+       au.country_code,
        au.created_at,
        au.handle,
        oi.profile_json
@@ -6181,6 +6672,10 @@ async function getGoogleSessionUser(
     email,
     auth_provider: "google",
     google_user_data: googleUserData,
+    country_code:
+      typeof (row as any).country_code === "string" && (row as any).country_code.trim()
+        ? String((row as any).country_code).trim()
+        : null,
     handle,
     created_at:
       typeof (row as any).created_at === "string" && (row as any).created_at.trim()
@@ -6193,12 +6688,15 @@ async function getGoogleSessionUser(
 // then fall back to the verified, authoritative email only for the initial link.
 async function resolveOrCreateGoogleAppUser(
   db: D1Database,
-  mochaUser: GoogleOAuthUser
+  mochaUser: GoogleOAuthUser,
+  preferredCountryCode?: string | null
 ): Promise<string> {
   const normalizedEmail = getNormalizedGoogleEmail(mochaUser);
   const googleSubject = getGoogleSubject(mochaUser);
   const googleProfileJson = JSON.stringify(mochaUser.google_user_data || {});
   const signedInAt = new Date().toISOString();
+  const normalizedPreferredCountryCode =
+    normalizeCountryCode(preferredCountryCode, null) || null;
 
   if (!isValidEmail(normalizedEmail)) {
     throw new Error("Google account email is invalid.");
@@ -6222,6 +6720,11 @@ async function resolveOrCreateGoogleAppUser(
 
   if (existingLinkedIdentity) {
     const canonicalId = String((existingLinkedIdentity as any).user_id);
+    await updateAppUserCountryCodeIfMissing(
+      db,
+      canonicalId,
+      normalizedPreferredCountryCode
+    );
     await markAppUserAsGoogleLinked(db, canonicalId, normalizedEmail);
     await upsertOAuthIdentityLink(
       db,
@@ -6249,6 +6752,11 @@ async function resolveOrCreateGoogleAppUser(
     
     if (existingAppUser) {
       const canonicalId = String((existingAppUser as any).id);
+      await updateAppUserCountryCodeIfMissing(
+        db,
+        canonicalId,
+        normalizedPreferredCountryCode
+      );
       await markAppUserAsGoogleLinked(db, canonicalId, normalizedEmail);
       await upsertOAuthIdentityLink(
         db,
@@ -6281,6 +6789,7 @@ async function resolveOrCreateGoogleAppUser(
         id: canonicalId,
         email: normalizedEmail,
         auth_provider: "google",
+        country_code: normalizedPreferredCountryCode,
       });
       await markAppUserAsGoogleLinked(db, canonicalId, normalizedEmail);
       await upsertOAuthIdentityLink(
@@ -6307,6 +6816,7 @@ async function resolveOrCreateGoogleAppUser(
     id: canonicalId,
     email: normalizedEmail,
     auth_provider: "google",
+    country_code: normalizedPreferredCountryCode,
   });
   await upsertOAuthIdentityLink(
     db,
@@ -6770,6 +7280,7 @@ const GOOGLE_OAUTH_STATE_COOKIE_NAME = `${brand.id}_google_oauth_state`;
 const GOOGLE_OAUTH_NONCE_COOKIE_NAME = `${brand.id}_google_oauth_nonce`;
 const GOOGLE_OAUTH_PKCE_COOKIE_NAME = `${brand.id}_google_oauth_pkce`;
 const GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME = `${brand.id}_google_oauth_redirect_uri`;
+const GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME = `${brand.id}_google_oauth_country_code`;
 const SESSION_DURATION_DAYS = 30;
 const AUTH_DEBUG = process.env.AUTH_DEBUG === "1";
 const GOOGLE_OIDC_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration";
@@ -7173,6 +7684,7 @@ const anyAuthMiddleware = async (c: any, next: any) => {
           id: user.id,
           email: user.email,
           auth_provider: "google",
+          country_code: user.country_code || null,
           google_user_data: user.google_user_data || null,
         });
         return next();
@@ -7919,6 +8431,7 @@ app.get("/api/auth/me", async (c) => {
           user: {
             id: user.id,
             email: user.email,
+            country_code: user.country_code || null,
             google_user_data: user.google_user_data,
             created_at: user.created_at,
             handle: user.handle,
@@ -8023,7 +8536,11 @@ app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
 // OAuth endpoints
 app.get("/api/oauth/google/redirect_url", async (c) => {
   try {
-    const redirectUrl = await createGoogleOAuthRedirectUrl(c);
+    const requestedCountryCode =
+      normalizeCountryCode(c.req.query("country_code"), null) ||
+      normalizeCountryCode(c.req.header("CF-IPCountry"), null) ||
+      null;
+    const redirectUrl = await createGoogleOAuthRedirectUrl(c, requestedCountryCode);
     return c.json({ redirectUrl }, 200);
   } catch (error) {
     console.error("[GOOGLE LOGIN] Failed to build redirect URL:", error);
@@ -8052,7 +8569,15 @@ app.post("/api/sessions", async (c) => {
   try {
     const state = typeof body.state === "string" ? body.state : "";
     const googleUser = await exchangeGoogleAuthorizationCode(c, body.code, state);
-    const canonicalUserId = await resolveOrCreateGoogleAppUser(c.env.DB, googleUser);
+    const requestedCountryCode = normalizeCountryCode(
+      getCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME),
+      null
+    );
+    const canonicalUserId = await resolveOrCreateGoogleAppUser(
+      c.env.DB,
+      googleUser,
+      requestedCountryCode
+    );
     const providerSubject = getGoogleSubject(googleUser);
     const sessionToken = await createGoogleSession(c.env.DB, canonicalUserId, providerSubject);
 
@@ -8073,6 +8598,7 @@ app.post("/api/sessions", async (c) => {
         id: canonicalUserId,
         email: googleUser.email,
         auth_provider: "google",
+        country_code: requestedCountryCode,
       }
     }, 200);
   } catch (error) {
@@ -8147,6 +8673,7 @@ app.get("/api/users/me", async (c) => {
           id: user.id,
           email: user.email,
           auth_provider: "google",
+          country_code: user.country_code || null,
           google_user_data: user.google_user_data,
           created_at: user.created_at,
           handle: user.handle,
@@ -11170,6 +11697,65 @@ app.get("/api/cameras", anyAuthMiddleware, async (c) => {
   return c.json(camerasWithOffset);
 });
 
+app.post(
+  "/api/address-lookup",
+  anyAuthMiddleware,
+  zValidator("json", LookupAddressSchema, (result, c) => {
+    if (!result.success) {
+      return c.json(
+        {
+          error: "Validation failed",
+          details: result.error.issues,
+        },
+        400
+      );
+    }
+  }),
+  async (c) => {
+    const user = c.get("user")!;
+    const data = c.req.valid("json");
+    const effectiveCountryCode =
+      normalizeCountryCode(
+        data.country_code || data.country || (user as any)?.country_code,
+        null
+      ) || null;
+
+    if (!effectiveCountryCode) {
+      return c.json({ error: "A country is required for postal code lookup." }, 400);
+    }
+
+    const normalizedPostalCode = normalizePostalCodeForLookup(
+      data.postal_code,
+      effectiveCountryCode
+    );
+
+    if (!normalizedPostalCode) {
+      return c.json({ error: "A valid postal code is required." }, 400);
+    }
+
+    if (effectiveCountryCode === "BR" && normalizedPostalCode.length !== 8) {
+      return c.json({ error: "Brazilian CEP must contain 8 digits." }, 400);
+    }
+
+    try {
+      const result = await lookupAddressByPostalCode(
+        c.env,
+        normalizedPostalCode,
+        effectiveCountryCode
+      );
+      return c.json(result);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to look up the postal code";
+      const status =
+        message.includes("GOOGLE_GEOCODING_API_KEY") || message.includes("not configured")
+          ? 503
+          : 502;
+      return c.json({ error: message }, status);
+    }
+  }
+);
+
 app.post("/api/cameras", anyAuthMiddleware, zValidator("json", CreateCameraSchema, (result, c) => {
   if (!result.success) {
     console.error("[POST /api/cameras] Validation failed:", JSON.stringify(result.error, null, 2));
@@ -12162,6 +12748,54 @@ app.post("/api/agent/bootstrap-cameras", async (c) => {
   return c.json({
     ok: true,
     enqueued_camera_ids: enqueuedCameraIds,
+  });
+});
+
+app.get("/api/agent/frame-retention-policies", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json({ error: "Missing or invalid Authorization header" }, 401);
+  }
+
+  const exeToken = authHeader.slice("Bearer ".length).trim();
+  const exeTokenHash = await hashToken(exeToken);
+
+  const pairing = await c.env.DB.prepare(
+    `SELECT user_id FROM exe_pairings
+     WHERE client_id = ? AND exe_token_hash = ? AND status = 'connected'`
+  )
+    .bind(clientId, exeTokenHash)
+    .first();
+
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const userId = (pairing as any).user_id;
+  const { results: cameras } = await c.env.DB.prepare(
+    `SELECT id, retention_days
+     FROM cameras
+     WHERE user_id = ?
+       AND store_frames = 1
+       AND COALESCE(retention_days, 0) > 0
+     ORDER BY created_at ASC`
+  )
+    .bind(userId)
+    .all();
+
+  return c.json({
+    ok: true,
+    policies: (cameras || []).map((camera: any) => ({
+      camera_id: Number(camera.id),
+      retention_days: Number(camera.retention_days || 0),
+    })),
   });
 });
 

@@ -46,6 +46,12 @@ export const UpdateCameraSchema = z.object({
   is_service_running: z.number().min(0).max(1).optional(),
 });
 
+export const LookupAddressSchema = z.object({
+  postal_code: z.string().trim().min(1).max(32),
+  country_code: z.string().trim().min(2).max(3).optional(),
+  country: z.string().trim().min(1).max(120).optional(),
+});
+
 // Algorithm schema
 export const CreateAlgorithmSchema = z.object({
   algorithm_type: z.string(),

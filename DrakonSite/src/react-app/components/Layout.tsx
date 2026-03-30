@@ -9,7 +9,9 @@ import MinimizedChatTabs from "@/react-app/components/MinimizedChatTabs";
 import LanguageSelector from "@/react-app/components/LanguageSelector";
 import BrandLogo from "@/react-app/components/BrandLogo";
 import SystemActivityModal from "@/react-app/components/SystemActivityModal";
+import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { useTheme } from "@/react-app/hooks/useTheme";
 import { brand, getBrandStorageKey, getBrandWindowEventName } from "@/shared/brand";
 import {
@@ -33,6 +35,7 @@ import {
   Moon,
   Sun,
   Radar,
+  Sparkles,
 } from "lucide-react";
 
 interface LayoutProps {
@@ -50,6 +53,7 @@ const CHAT_AUTO_EXPAND_DELAY_MS = 1000;
 export default function Layout({ children }: LayoutProps) {
   const { t } = useTranslation();
   const { user, logout } = useAuth();
+  const { startTutorial, status: onboardingStatus } = useOnboarding();
   const { theme, setTheme } = useTheme();
   const location = useLocation();
   const navigate = useNavigate();
@@ -74,6 +78,7 @@ export default function Layout({ children }: LayoutProps) {
   const clearCueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expandTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousUnreadCountRef = useRef(0);
+  const notificationsContainerRef = useRef<HTMLDivElement>(null);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
   const isSidebarCollapsed = isDesktop && (isSidebarCollapsedDesktop || isChatAutoCollapsedDesktop);
   const billingEnabled = brand.features.billingEnabled;
@@ -176,6 +181,36 @@ export default function Layout({ children }: LayoutProps) {
     }
     previousUnreadCountRef.current = unreadCount;
   }, [unreadCount]);
+
+  useEffect(() => {
+    if (!isNotificationsOpen) return;
+
+    const closeNotifications = () => {
+      setIsNotificationsBadgeDismissed(true);
+      setIsNotificationsOpen(false);
+    };
+
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (notificationsContainerRef.current?.contains(target)) return;
+      closeNotifications();
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeNotifications();
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [isNotificationsOpen]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -407,6 +442,10 @@ export default function Layout({ children }: LayoutProps) {
   }, [billingEnabled, drakonFindEnabled, location.pathname, location.search, t]);
 
   const currentBreadcrumb = breadcrumbs[breadcrumbs.length - 1]?.label || "";
+  const tutorialButtonLabel =
+    onboardingStatus === "never_started"
+      ? t("tutorial.entry.getStarted")
+      : t("tutorial.entry.tutorial");
 
   return (
     <div className="h-screen bg-gray-950 flex overflow-hidden">
@@ -657,9 +696,19 @@ export default function Layout({ children }: LayoutProps) {
               <span className="hidden sm:inline">System Activity</span>
             </button>
 
+            <button
+              type="button"
+              onClick={startTutorial}
+              className="inline-flex items-center gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-1.5 text-sm font-medium text-blue-100 transition-colors hover:border-blue-400/45 hover:bg-blue-500/15 hover:text-white"
+              aria-label={t("tutorial.entry.openAria")}
+            >
+              <Sparkles className="h-4 w-4 text-blue-200" />
+              <span className="hidden sm:inline">{tutorialButtonLabel}</span>
+            </button>
+
             <LanguageSelector />
             
-            <div className="relative">
+            <div ref={notificationsContainerRef} className="relative">
               <button
                 onClick={handleNotificationClick}
                 className="p-2 text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors relative"
@@ -692,6 +741,7 @@ export default function Layout({ children }: LayoutProps) {
         cameras={cameras}
         dashboard={dashboard}
       />
+      <TutorialOverlay />
 
       {showOpenAiKeyPrompt && !isSettingsRoute && (
         <div className="fixed bottom-4 right-4 z-40 max-w-md pointer-events-none">

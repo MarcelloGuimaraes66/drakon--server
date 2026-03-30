@@ -4562,6 +4562,10 @@ void AgentCore::releaseCoreChatPriorityReservation_()
 
 // Tick endpoint path on the Worker:
 static const char* kSchedulerTickPath = "/api/scheduler/tick";
+static const char* kFrameRetentionPoliciesPath = "/api/agent/frame-retention-policies";
+static long HttpGetJson(const std::string& url,
+    const std::string& bearerToken,
+    std::string& outResponse);
 
 // How often the EXE should trigger the scheduler tick:
 static constexpr int kSchedulerTickIntervalSeconds = 60;
@@ -5204,6 +5208,29 @@ void AgentCore::schedulerPingLoop_() {
             );
         }
 
+        try {
+            runConfiguredFrameRetentionSweepIfDue_();
+        }
+        catch (const std::exception& e) {
+            logAgentException_(
+                "agent",
+                "agent",
+                "AgentCore::schedulerPingLoop_",
+                "frame_retention_sweep",
+                json::object(),
+                e
+            );
+        }
+        catch (...) {
+            logAgentUnknownException_(
+                "agent",
+                "agent",
+                "AgentCore::schedulerPingLoop_",
+                "frame_retention_sweep",
+                json::object()
+            );
+        }
+
         // Loop continues; next desired tick will be next minute at :05
     }
 }
@@ -5297,6 +5324,113 @@ void AgentCore::triggerSchedulerTickOnce_() {
         // For non-timeout errors OR if we're out of retries, stop.
         return;
     }
+}
+
+void AgentCore::runConfiguredFrameRetentionSweepIfDue_(bool force)
+{
+    if (exeToken_.empty() || clientId_.empty()) {
+        return;
+    }
+
+    constexpr auto kSweepInterval = std::chrono::hours(1);
+    const auto nowSteady = std::chrono::steady_clock::now();
+    if (!force &&
+        lastConfiguredRetentionSweep_.time_since_epoch().count() != 0 &&
+        (nowSteady - lastConfiguredRetentionSweep_) < kSweepInterval)
+    {
+        return;
+    }
+
+    const std::string url =
+        baseUrl_ + kFrameRetentionPoliciesPath + "?client_id=" + clientId_;
+    auto truncateResponse = [](const std::string& text) -> std::string {
+        constexpr std::size_t kMaxLen = 1000;
+        if (text.size() <= kMaxLen) {
+            return text;
+        }
+        return text.substr(0, kMaxLen) + "...(truncated " +
+            std::to_string(text.size() - kMaxLen) + " chars)";
+    };
+
+    Logger::instance().logDebug("agent", "FrameRetention: GET " + url);
+
+    std::string response;
+    const long httpCode = HttpGetJson(url, exeToken_, response);
+    if (httpCode != 200) {
+        Logger::instance().logDebug(
+            "agent",
+            "FrameRetention: HTTP " + std::to_string(httpCode) +
+            " response=" + truncateResponse(response)
+        );
+        return;
+    }
+
+    json payload;
+    try {
+        payload = json::parse(response);
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("FrameRetention: parse error: ") + e.what()
+        );
+        return;
+    }
+
+    if (!payload.contains("policies") || !payload["policies"].is_array()) {
+        Logger::instance().logDebug(
+            "agent",
+            "FrameRetention: missing policies array"
+        );
+        return;
+    }
+
+    int appliedPolicies = 0;
+    for (const auto& item : payload["policies"]) {
+        if (!item.is_object()) continue;
+
+        int cameraId = -1;
+        int retentionDays = 0;
+
+        if (item.contains("camera_id") && item["camera_id"].is_number_integer()) {
+            cameraId = item["camera_id"].get<int>();
+        }
+        if (item.contains("retention_days") && item["retention_days"].is_number_integer()) {
+            retentionDays = item["retention_days"].get<int>();
+        }
+
+        if (cameraId <= 0 || retentionDays <= 0) {
+            continue;
+        }
+        if (getCameraSession(cameraId) != nullptr) {
+            continue;
+        }
+
+        ++appliedPolicies;
+        const auto stats = FrameDiskWriter::runRetentionCleanupNow(
+            std::to_string(cameraId),
+            "frames",
+            retentionDays
+        );
+
+        Logger::instance().logDebug(
+            std::to_string(cameraId),
+            "FrameDiskWriter: retention sweep days=" + std::to_string(retentionDays) +
+            " scanned=" + std::to_string(stats.scannedFiles) +
+            " deleted=" + std::to_string(stats.deletedFiles) +
+            " byNameTs=" + std::to_string(stats.parsedByNameTimestamp) +
+            " byFileTime=" + std::to_string(stats.parsedByFileTime) +
+            " prunedDirs=" + std::to_string(stats.prunedDirectories) +
+            " failed=" + std::to_string(stats.failed)
+        );
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "FrameRetention: applied policies=" + std::to_string(appliedPolicies)
+    );
+
+    lastConfiguredRetentionSweep_ = nowSteady;
 }
 
 
@@ -7535,6 +7669,22 @@ bool AgentCore::bootstrapCameras_()
             Logger::instance().logDebug(
                 "agent",
                 std::string("bootstrapCameras_: parse response error: ") + e.what()
+            );
+        }
+
+        try {
+            runConfiguredFrameRetentionSweepIfDue_(true);
+        }
+        catch (const std::exception& e) {
+            Logger::instance().logDebug(
+                "agent",
+                std::string("bootstrapCameras_: frame retention sweep exception: ") + e.what()
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug(
+                "agent",
+                "bootstrapCameras_: frame retention sweep unknown exception"
             );
         }
 
@@ -13922,6 +14072,219 @@ namespace {
         );
     }
 
+    static int extractOpenAIRequestedOutputBudget_(const nlohmann::json& bodyJson)
+    {
+        auto readBudget = [&](const char* key) -> int {
+            if (!bodyJson.contains(key)) return 0;
+            const auto& value = bodyJson[key];
+            if (value.is_number_integer()) return value.get<int>();
+            if (value.is_number()) return static_cast<int>(std::llround(value.get<double>()));
+            return 0;
+        };
+
+        int requestedOutputBudget = readBudget("max_output_tokens");
+        if (requestedOutputBudget <= 0) {
+            requestedOutputBudget = readBudget("max_completion_tokens");
+        }
+        if (requestedOutputBudget <= 0) {
+            requestedOutputBudget = readBudget("max_tokens");
+        }
+        return requestedOutputBudget;
+    }
+
+    static nlohmann::json convertOpenAIChatResponseFormatToResponsesTextFormat_(
+        const nlohmann::json& responseFormat)
+    {
+        if (!responseFormat.is_object() || responseFormat.empty()) {
+            return nlohmann::json::object();
+        }
+
+        const std::string type = responseFormat.value("type", std::string());
+        if (type == "json_object" || type == "text") {
+            return nlohmann::json{ { "type", type } };
+        }
+        if (type != "json_schema") {
+            return nlohmann::json::object();
+        }
+
+        const nlohmann::json* schemaConfig = nullptr;
+        if (responseFormat.contains("json_schema") && responseFormat["json_schema"].is_object()) {
+            schemaConfig = &responseFormat["json_schema"];
+        }
+        else {
+            schemaConfig = &responseFormat;
+        }
+
+        nlohmann::json format = {
+            { "type", "json_schema" },
+            { "name", schemaConfig->value("name", std::string("response")) },
+            { "schema", schemaConfig->value("schema", nlohmann::json::object()) }
+        };
+        if (schemaConfig->contains("strict")) {
+            format["strict"] = (*schemaConfig)["strict"];
+        }
+        if (schemaConfig->contains("description")) {
+            format["description"] = (*schemaConfig)["description"];
+        }
+        return format;
+    }
+
+    static bool tryConvertOpenAIChatMessageContentPartToResponsesInputPart_(
+        const nlohmann::json& part,
+        nlohmann::json& outPart)
+    {
+        outPart = nlohmann::json::object();
+        if (part.is_string()) {
+            outPart = {
+                { "type", "input_text" },
+                { "text", part.get<std::string>() }
+            };
+            return true;
+        }
+        if (!part.is_object()) {
+            return false;
+        }
+
+        const std::string type = part.value("type", std::string());
+        if ((type == "text" || type == "input_text" || type.empty()) &&
+            part.contains("text") &&
+            part["text"].is_string())
+        {
+            outPart = {
+                { "type", "input_text" },
+                { "text", part["text"].get<std::string>() }
+            };
+            return true;
+        }
+
+        if ((type == "image_url" || type == "input_image") && part.contains("image_url")) {
+            std::string imageUrl;
+            std::string detail;
+            const auto& imageNode = part["image_url"];
+            if (imageNode.is_object()) {
+                if (imageNode.contains("url") && imageNode["url"].is_string()) {
+                    imageUrl = imageNode["url"].get<std::string>();
+                }
+                if (imageNode.contains("detail") && imageNode["detail"].is_string()) {
+                    detail = imageNode["detail"].get<std::string>();
+                }
+            }
+            else if (imageNode.is_string()) {
+                imageUrl = imageNode.get<std::string>();
+            }
+
+            if (detail.empty() && part.contains("detail") && part["detail"].is_string()) {
+                detail = part["detail"].get<std::string>();
+            }
+
+            if (!imageUrl.empty()) {
+                outPart = {
+                    { "type", "input_image" },
+                    { "image_url", imageUrl }
+                };
+                if (!detail.empty()) {
+                    outPart["detail"] = detail;
+                }
+                return true;
+            }
+        }
+
+        if (part.contains("text") && part["text"].is_string()) {
+            outPart = {
+                { "type", "input_text" },
+                { "text", part["text"].get<std::string>() }
+            };
+            return true;
+        }
+
+        return false;
+    }
+
+    static nlohmann::json convertOpenAIChatMessageToResponsesInputItem_(const nlohmann::json& message)
+    {
+        nlohmann::json item = nlohmann::json::object();
+        if (!message.is_object()) {
+            return item;
+        }
+
+        item["role"] = message.value("role", std::string("user"));
+        if (!message.contains("content")) {
+            return item;
+        }
+
+        const auto& content = message["content"];
+        if (content.is_string()) {
+            item["content"] = content;
+            return item;
+        }
+        if (!content.is_array()) {
+            return item;
+        }
+
+        nlohmann::json convertedContent = nlohmann::json::array();
+        for (const auto& part : content) {
+            nlohmann::json convertedPart;
+            if (tryConvertOpenAIChatMessageContentPartToResponsesInputPart_(part, convertedPart)) {
+                convertedContent.push_back(std::move(convertedPart));
+            }
+        }
+        item["content"] = std::move(convertedContent);
+        return item;
+    }
+
+    static nlohmann::json convertOpenAIChatCompletionsBodyToResponsesBody_(
+        const nlohmann::json& chatCompletionsBody)
+    {
+        nlohmann::json responsesBody = nlohmann::json::object();
+        if (chatCompletionsBody.contains("model")) {
+            responsesBody["model"] = chatCompletionsBody["model"];
+        }
+
+        nlohmann::json input = nlohmann::json::array();
+        if (chatCompletionsBody.contains("messages") && chatCompletionsBody["messages"].is_array()) {
+            for (const auto& message : chatCompletionsBody["messages"]) {
+                input.push_back(convertOpenAIChatMessageToResponsesInputItem_(message));
+            }
+        }
+        responsesBody["input"] = std::move(input);
+
+        static constexpr const char* kPassthroughKeys[] = {
+            "temperature",
+            "top_p",
+            "service_tier",
+            "store",
+            "user",
+            "metadata",
+            "prompt_cache_key",
+            "prompt_cache_retention"
+        };
+        for (const char* key : kPassthroughKeys) {
+            if (chatCompletionsBody.contains(key)) {
+                responsesBody[key] = chatCompletionsBody[key];
+            }
+        }
+
+        const int requestedOutputBudget = extractOpenAIRequestedOutputBudget_(chatCompletionsBody);
+        if (requestedOutputBudget > 0) {
+            responsesBody["max_output_tokens"] = requestedOutputBudget;
+        }
+
+        if (chatCompletionsBody.contains("response_format") &&
+            chatCompletionsBody["response_format"].is_object())
+        {
+            const nlohmann::json format =
+                convertOpenAIChatResponseFormatToResponsesTextFormat_(
+                    chatCompletionsBody["response_format"]);
+            if (format.is_object() && !format.empty()) {
+                responsesBody["text"] = {
+                    { "format", format }
+                };
+            }
+        }
+
+        return responsesBody;
+    }
+
     // Mirrors Gemini retry behavior for OpenAI /v1/chat/completions.
     static std::string httpPostJsonOpenAI(
         const std::string& apiKey,
@@ -13962,17 +14325,7 @@ namespace {
                 [](unsigned char c) { return (char)std::tolower(c); });
         }
         const bool isGpt5Family = normalizedModelName.rfind("gpt-5", 0) == 0;
-        int requestedOutputBudget = 0;
-        if (bodyJson.contains("max_completion_tokens")) {
-            const auto& v = bodyJson["max_completion_tokens"];
-            if (v.is_number_integer()) requestedOutputBudget = v.get<int>();
-            else if (v.is_number()) requestedOutputBudget = static_cast<int>(std::llround(v.get<double>()));
-        }
-        if (requestedOutputBudget <= 0 && bodyJson.contains("max_tokens")) {
-            const auto& v = bodyJson["max_tokens"];
-            if (v.is_number_integer()) requestedOutputBudget = v.get<int>();
-            else if (v.is_number()) requestedOutputBudget = static_cast<int>(std::llround(v.get<double>()));
-        }
+        const int requestedOutputBudget = extractOpenAIRequestedOutputBudget_(bodyJson);
 
         long requestTimeoutSec = 120L;
         int maxAttempts = 3;
@@ -14137,6 +14490,127 @@ namespace {
         throw std::runtime_error(lastErr.empty() ? "httpPostJsonOpenAI failed" : lastErr);
     }
 
+    static std::string httpPostJsonOpenAIResponses(
+        const std::string& apiKey,
+        const nlohmann::json& chatCompletionsBodyJson,
+        const std::function<void()>& onFirstRetry,
+        const std::string& cameraLogId = "")
+    {
+        const nlohmann::json bodyJson =
+            convertOpenAIChatCompletionsBodyToResponsesBody_(chatCompletionsBodyJson);
+        const std::string modelName = bodyJson.value("model", std::string());
+        std::string normalizedModelName = modelName;
+        {
+            const auto first = std::find_if_not(normalizedModelName.begin(), normalizedModelName.end(),
+                [](unsigned char c) { return std::isspace(c) != 0; });
+            const auto last = std::find_if_not(normalizedModelName.rbegin(), normalizedModelName.rend(),
+                [](unsigned char c) { return std::isspace(c) != 0; }).base();
+            if (first >= last) {
+                normalizedModelName.clear();
+            }
+            else {
+                normalizedModelName.assign(first, last);
+            }
+            std::transform(normalizedModelName.begin(), normalizedModelName.end(), normalizedModelName.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+        }
+
+        const bool isGpt5Family = normalizedModelName.rfind("gpt-5", 0) == 0;
+        const int requestedOutputBudget = extractOpenAIRequestedOutputBudget_(bodyJson);
+
+        long requestTimeoutSec = 120L;
+        int maxAttempts = 3;
+        if (isGpt5Family) {
+            if (requestedOutputBudget >= 4000) requestTimeoutSec = 360L;
+            else if (requestedOutputBudget >= 3000) requestTimeoutSec = 300L;
+            else if (requestedOutputBudget >= 2200) requestTimeoutSec = 240L;
+            else requestTimeoutSec = 180L;
+            maxAttempts = 2;
+        }
+
+        const std::string url = "https://api.openai.com/v1/responses";
+        const std::string providerLabel = "OpenAI";
+        const std::string body = bodyJson.dump();
+        bool notified = false;
+        std::string lastErr;
+
+        for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
+            CURL* curl = curl_easy_init();
+            if (!curl) throw std::runtime_error("curl_easy_init failed");
+
+            std::string response;
+            long httpCode = 0;
+
+            struct curl_slist* headers = nullptr;
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            headers = curl_slist_append(headers, "Accept: application/json");
+            headers = curl_slist_append(headers, ("Authorization: Bearer " + apiKey).c_str());
+
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, requestTimeoutSec);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+            const CURLcode res = curl_easy_perform(curl);
+            if (res == CURLE_OK) {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+            }
+
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+
+            if (res == CURLE_OK && httpCode >= 200 && httpCode < 300) {
+                return response;
+            }
+
+            bool shouldRetry = false;
+            if (res != CURLE_OK) {
+                switch (res) {
+                case CURLE_OPERATION_TIMEDOUT:
+                case CURLE_COULDNT_CONNECT:
+                case CURLE_COULDNT_RESOLVE_HOST:
+                case CURLE_SEND_ERROR:
+                case CURLE_RECV_ERROR:
+                    shouldRetry = true;
+                    break;
+                default:
+                    shouldRetry = false;
+                    break;
+                }
+                lastErr = providerLabel + " curl error: " + curl_easy_strerror(res);
+            }
+            else {
+                shouldRetry = isTransientOpenAIHttpCode(httpCode);
+                lastErr = providerLabel + " HTTP " + std::to_string(httpCode) +
+                    " body=" + truncateForLog_(response);
+            }
+
+            if (attempt < maxAttempts && shouldRetry) {
+                if (!notified && onFirstRetry) {
+                    notified = true;
+                    try { onFirstRetry(); }
+                    catch (...) {}
+                }
+                int backoffMs = (attempt == 1) ? 300 : 700;
+                if (res == CURLE_OK && httpCode == 429) {
+                    backoffMs = (attempt == 1) ? 3000 : 10000;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+                continue;
+            }
+
+            throw std::runtime_error(lastErr);
+        }
+
+        throw std::runtime_error(lastErr.empty() ? "httpPostJsonOpenAIResponses failed" : lastErr);
+    }
+
     struct OpenAIUsageStats_ {
         int promptTokens = 0;
         int outputTokens = 0;
@@ -14150,12 +14624,16 @@ namespace {
         if (!respJson.contains("usage") || !respJson["usage"].is_object()) return stats;
 
         const auto& u = respJson["usage"];
-        stats.promptTokens = u.value("prompt_tokens", 0);
-        stats.outputTokens = u.value("completion_tokens", 0);
+        stats.promptTokens = u.value("prompt_tokens", u.value("input_tokens", 0));
+        stats.outputTokens = u.value("completion_tokens", u.value("output_tokens", 0));
         stats.totalTokens = u.value("total_tokens", 0);
         if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object()) {
             stats.cachedPromptTokens =
                 u["prompt_tokens_details"].value("cached_tokens", 0);
+        }
+        else if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object()) {
+            stats.cachedPromptTokens =
+                u["input_tokens_details"].value("cached_tokens", 0);
         }
         return stats;
     }
@@ -14178,6 +14656,27 @@ namespace {
             !respJson["choices"].is_array() ||
             respJson["choices"].empty())
         {
+            if (!respJson.contains("status") || !respJson["status"].is_string()) {
+                return "";
+            }
+
+            const std::string status = respJson["status"].get<std::string>();
+            if (status == "completed") {
+                return "stop";
+            }
+            if (status == "incomplete" &&
+                respJson.contains("incomplete_details") &&
+                respJson["incomplete_details"].is_object())
+            {
+                const std::string reason =
+                    respJson["incomplete_details"].value("reason", std::string());
+                if (reason == "max_output_tokens") {
+                    return "length";
+                }
+                if (reason == "content_filter") {
+                    return "content_filter";
+                }
+            }
             return "";
         }
 
@@ -14187,13 +14686,54 @@ namespace {
         return c0["finish_reason"].get<std::string>();
     }
 
+    static void appendOpenAITextFromContentNode_(
+        const nlohmann::json& node,
+        std::string& text)
+    {
+        if (node.is_string()) {
+            text += node.get<std::string>();
+            return;
+        }
+
+        if (node.is_array()) {
+            for (const auto& item : node) {
+                appendOpenAITextFromContentNode_(item, text);
+            }
+            return;
+        }
+
+        if (!node.is_object()) {
+            return;
+        }
+
+        if (node.contains("text") && node["text"].is_string()) {
+            text += node["text"].get<std::string>();
+            return;
+        }
+
+        if (node.contains("content")) {
+            appendOpenAITextFromContentNode_(node["content"], text);
+        }
+    }
+
     static std::string extractOpenAITextFromResponse(const nlohmann::json& respJson)
     {
         if (!respJson.contains("choices") ||
             !respJson["choices"].is_array() ||
             respJson["choices"].empty())
         {
-            return "";
+            if (!respJson.contains("output") || !respJson["output"].is_array()) {
+                return "";
+            }
+
+            std::string text;
+            for (const auto& item : respJson["output"]) {
+                if (!item.is_object()) continue;
+                if (item.value("type", std::string()) != "message") continue;
+                if (!item.contains("content")) continue;
+                appendOpenAITextFromContentNode_(item["content"], text);
+            }
+            return text;
         }
 
         const auto& c0 = respJson["choices"][0];
@@ -14203,32 +14743,8 @@ namespace {
         if (!msg.contains("content")) return "";
 
         const auto& content = msg["content"];
-        if (content.is_string()) {
-            return content.get<std::string>();
-        }
-
-        if (!content.is_array()) return "";
-
         std::string text;
-        for (const auto& part : content) {
-            if (part.is_string()) {
-                text += part.get<std::string>();
-                continue;
-            }
-            if (!part.is_object()) continue;
-            if (part.contains("text") && part["text"].is_string()) {
-                text += part["text"].get<std::string>();
-                continue;
-            }
-            if (part.contains("type") && part["type"].is_string()) {
-                const std::string type = part["type"].get<std::string>();
-                if ((type == "text" || type == "output_text") &&
-                    part.contains("text") && part["text"].is_string())
-                {
-                    text += part["text"].get<std::string>();
-                }
-            }
-        }
+        appendOpenAITextFromContentNode_(content, text);
         return text;
     }
 
@@ -14292,6 +14808,155 @@ namespace {
 
         outJsonSlice = text.substr(firstBrace, lastBrace - firstBrace + 1);
         return true;
+    }
+
+    static std::string dumpJsonForLog_(const nlohmann::json& value)
+    {
+        try {
+            return value.dump(2);
+        }
+        catch (...) {
+            try {
+                return value.dump();
+            }
+            catch (...) {
+                return std::string();
+            }
+        }
+    }
+
+    static nlohmann::json buildOpenAIAssistantOutputForLog_(
+        const OpenAITextObjectResponse_& response)
+    {
+        if (response.hasValidJsonObject) {
+            return response.jsonObject;
+        }
+
+        const std::string trimmedText = trimAscii(response.text);
+        if (trimmedText.empty()) {
+            return nullptr;
+        }
+
+        nlohmann::json parsed = nlohmann::json::parse(trimmedText, nullptr, false);
+        if (!parsed.is_discarded()) {
+            return parsed;
+        }
+
+        return trimmedText;
+    }
+
+    static void compactOpenAIResponseJsonForLog_(nlohmann::json& respJson)
+    {
+        stripJsonKeyRecursive_(respJson, "thoughtSignature");
+        stripJsonKeyRecursive_(respJson, "reasoning_content");
+        stripJsonKeyRecursive_(respJson, "logprobs");
+        stripJsonKeyRecursive_(respJson, "annotations");
+        expandNestedJsonStringsForLogRecursive_(respJson);
+
+        if (respJson.contains("text") &&
+            respJson["text"].is_object() &&
+            respJson["text"].contains("format") &&
+            respJson["text"]["format"].is_object())
+        {
+            auto& format = respJson["text"]["format"];
+            if (format.contains("schema")) {
+                nlohmann::json schemaSummary = nlohmann::json::object();
+                const auto& schema = format["schema"];
+                schemaSummary["schema_bytes"] =
+                    static_cast<unsigned long long>(schema.dump().size());
+
+                if (schema.is_object()) {
+                    const std::string schemaType = schema.value("type", std::string());
+                    if (!schemaType.empty()) {
+                        schemaSummary["type"] = schemaType;
+                    }
+                    if (schema.contains("properties") && schema["properties"].is_object()) {
+                        nlohmann::json topLevelProperties = nlohmann::json::array();
+                        for (auto it = schema["properties"].begin(); it != schema["properties"].end(); ++it) {
+                            topLevelProperties.push_back(it.key());
+                        }
+                        schemaSummary["top_level_properties"] = std::move(topLevelProperties);
+                    }
+                    if (schema.contains("required")) {
+                        schemaSummary["required"] = schema["required"];
+                    }
+                }
+
+                format.erase("schema");
+                format["schema_omitted_for_log"] = true;
+                format["schema_summary"] = std::move(schemaSummary);
+            }
+            if (format.contains("description") && format["description"].is_null()) {
+                format.erase("description");
+            }
+        }
+    }
+
+    static std::string buildOpenAIResponseLogBlock_(
+        const std::string& scope,
+        const std::string& rawResp,
+        const OpenAITextObjectResponse_& response)
+    {
+        std::ostringstream oss;
+        oss << scope << ": llm_response\n";
+
+        if (!response.hasValidResponseJson) {
+            oss << "META:\n";
+            oss << "- valid_response_json: false\n";
+            oss << "RAW_RESPONSE_TEXT:\n";
+            oss << rawResp;
+            return oss.str();
+        }
+
+        nlohmann::json logRespJson = response.respJson;
+        compactOpenAIResponseJsonForLog_(logRespJson);
+
+        const std::string objectType = logRespJson.value("object", std::string());
+        const std::string modelName = logRespJson.value("model", std::string());
+        const std::string status = logRespJson.value("status", std::string());
+        const std::string responseId = logRespJson.value("id", std::string());
+        const int uncachedInputTokens = (std::max)(
+            0,
+            response.usageStats.promptTokens - response.usageStats.cachedPromptTokens);
+
+        oss << "META:\n";
+        if (!objectType.empty()) {
+            oss << "- object: " << objectType << "\n";
+        }
+        if (!responseId.empty()) {
+            oss << "- id: " << responseId << "\n";
+        }
+        if (!modelName.empty()) {
+            oss << "- model: " << modelName << "\n";
+        }
+        if (!status.empty()) {
+            oss << "- status: " << status << "\n";
+        }
+        if (!response.finishReason.empty()) {
+            oss << "- finish_reason: " << response.finishReason << "\n";
+        }
+
+        oss << "USAGE:\n";
+        oss << "- input_tokens: " << response.usageStats.promptTokens << "\n";
+        oss << "- cached_input_tokens: " << response.usageStats.cachedPromptTokens << "\n";
+        oss << "- uncached_input_tokens: " << uncachedInputTokens << "\n";
+        oss << "- output_tokens: " << response.usageStats.outputTokens << "\n";
+        oss << "- total_tokens: " << response.usageStats.totalTokens << "\n";
+
+        const nlohmann::json assistantOutput = buildOpenAIAssistantOutputForLog_(response);
+        if (!assistantOutput.is_null()) {
+            oss << "ASSISTANT_OUTPUT:\n";
+            if (assistantOutput.is_string()) {
+                oss << assistantOutput.get<std::string>() << "\n";
+            }
+            else {
+                oss << dumpJsonForLog_(assistantOutput) << "\n";
+            }
+        }
+
+        oss << "RAW_RESPONSE_JSON:\n";
+        oss << dumpJsonForLog_(logRespJson);
+        return oss.str();
     }
 
     static std::string resolveOpenAIImageDetailForModel_(const std::string& modelName)
@@ -15622,6 +16287,15 @@ namespace {
             normalized.rfind("glm-4.6v-flash-", 0) == 0;
     }
 
+    static bool shouldUseOpenAIResponsesTransportForModel_(const std::string& modelName)
+    {
+        if (isZAiCoreModelName_(modelName)) {
+            return false;
+        }
+        const std::string normalized = normalizeOpenAIModelName_(modelName);
+        return normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0;
+    }
+
     static bool isGpt5MiniModel_(const std::string& modelName)
     {
         const std::string normalized = normalizeOpenAIModelName_(modelName);
@@ -16940,6 +17614,30 @@ namespace {
         return prompt.str();
     }
 
+    static std::string normalizeOpenAIPromptCacheKeyForApi_(
+        const std::string& modelName,
+        const std::string& prefixHash,
+        const std::string& rawKey)
+    {
+        static constexpr size_t kOpenAIMaxPromptCacheKeyLength_ = 64;
+
+        const std::string trimmedRawKey = trimAscii(rawKey);
+        if (trimmedRawKey.empty()) {
+            return std::string();
+        }
+        if (trimmedRawKey.size() <= kOpenAIMaxPromptCacheKeyLength_) {
+            return trimmedRawKey;
+        }
+
+        const std::string compactKey =
+            "vision:" + normalizeOpenAIModelName_(modelName) + ":" + trimAscii(prefixHash);
+        if (compactKey.size() <= kOpenAIMaxPromptCacheKeyLength_) {
+            return compactKey;
+        }
+
+        return "visionh:" + hashString64Hex_(trimmedRawKey);
+    }
+
     static std::string buildOpenAIVisionCacheKey_(
         const std::string& modelName,
         const std::string& cacheVariant,
@@ -16960,9 +17658,12 @@ namespace {
             "negative=" + negativeRefsHash
         );
 
-        return "vision:" + normalizeOpenAIModelName_(modelName) +
+        const std::string rawKey =
+            "vision:" + normalizeOpenAIModelName_(modelName) +
             ":" + trimAscii(cacheVariant) +
             ":" + prefixHash;
+
+        return normalizeOpenAIPromptCacheKeyForApi_(modelName, prefixHash, rawKey);
     }
 
     static std::string buildOpenAIVisionCacheKey_(
@@ -19926,6 +20627,25 @@ std::string AgentCore::postOpenAIChatCompletionsWithCoreLease_(
     return httpPostJsonOpenAI(apiKey, bodyJson, onFirstRetry, cameraLogId);
 }
 
+std::string AgentCore::postOpenAIResponsesWithCoreLease_(
+    const std::string& apiKey,
+    const nlohmann::json& chatCompletionsBodyJson,
+    const std::function<void()>& onFirstRetry,
+    bool requestChatPriority,
+    const std::function<bool()>& shouldAbort,
+    const std::string& waitScope,
+    const std::string& cameraLogId)
+{
+    auto lease = acquireCoreModelExecutionLease_(
+        chatCompletionsBodyJson.value("model", std::string()),
+        requestChatPriority,
+        shouldAbort,
+        waitScope,
+        cameraLogId
+    );
+    return httpPostJsonOpenAIResponses(apiKey, chatCompletionsBodyJson, onFirstRetry, cameraLogId);
+}
+
 VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     const EncodedVideoSegment& segment,
     const std::string& userQuestion,
@@ -20083,6 +20803,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, 4000);
         const int secondEffectiveLimit = std::min(6000, firstEffectiveLimit + 1200);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
 
         std::string rawResp;
         OpenAITextObjectResponse_ parsedResponse;
@@ -20092,15 +20813,28 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             const auto coreRequestStart = std::chrono::steady_clock::now();
 
             try {
-                rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                    openAiApiKey,
-                    reqBody,
-                    []() { MaybeNotifyFirstRetry(); },
-                    requestCoreChatPriority,
-                    shouldAbort,
-                    requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
-                    camLogId
-                );
+                if (useResponsesTransport) {
+                    rawResp = postOpenAIResponsesWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        requestCoreChatPriority,
+                        shouldAbort,
+                        requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
+                        camLogId
+                    );
+                }
+                else {
+                    rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        requestCoreChatPriority,
+                        shouldAbort,
+                        requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
+                        camLogId
+                    );
+                }
             }
             catch (const std::exception& e) {
                 if (useCoreModel) {
@@ -20150,13 +20884,14 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                 );
             }
 
-            Logger::instance().logDebug(
-                camLogId,
-                "callOpenAIVisionVideoSegment_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
-                    sanitizeModelRawRespForLog_(rawResp)
-            );
-
             parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            Logger::instance().logDebugNoEscalation(
+                camLogId,
+                buildOpenAIResponseLogBlock_(
+                    "callOpenAIVisionVideoSegment_: rawResp (attempt=" + std::to_string(attemptNo) + ")",
+                    rawResp,
+                    parsedResponse)
+            );
             if (!parsedResponse.hasValidResponseJson) {
                 Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: invalid JSON response");
                 emitAgentApiErrorEvent_(
@@ -20184,8 +20919,14 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                 " variant=" + requestBuild.cacheVariant +
                 " cache_key=" + requestBuild.cacheKey +
                 " attempt=" + std::to_string(attemptNo) +
+                " input_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
                 " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_input_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
                 " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_input_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
                 " uncached_prompt_tokens=" +
                     std::to_string((std::max)(
                         0,
@@ -20513,6 +21254,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
         const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, 4000);
         const int secondEffectiveLimit = std::min(6000, firstEffectiveLimit + 1200);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
 
         std::string rawResp;
         OpenAITextObjectResponse_ parsedResponse;
@@ -20522,15 +21264,28 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             const auto coreRequestStart = std::chrono::steady_clock::now();
 
             try {
-                rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                    openAiApiKey,
-                    reqBody,
-                    []() { MaybeNotifyFirstRetry(); },
-                    false,
-                    {},
-                    "background_video_segment_job",
-                    camLogId
-                );
+                if (useResponsesTransport) {
+                    rawResp = postOpenAIResponsesWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "background_video_segment_job",
+                        camLogId
+                    );
+                }
+                else {
+                    rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "background_video_segment_job",
+                        camLogId
+                    );
+                }
             }
             catch (const std::exception& e) {
                 if (useCoreModel) {
@@ -20580,13 +21335,14 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
                 );
             }
 
-            Logger::instance().logDebug(
-                camLogId,
-                "callOpenAIVisionVideoSegmentJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
-                    sanitizeModelRawRespForLog_(rawResp)
-            );
-
             parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            Logger::instance().logDebugNoEscalation(
+                camLogId,
+                buildOpenAIResponseLogBlock_(
+                    "callOpenAIVisionVideoSegmentJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ")",
+                    rawResp,
+                    parsedResponse)
+            );
             if (!parsedResponse.hasValidResponseJson) {
                 Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegmentJOB_: invalid JSON response");
                 emitAgentApiErrorEvent_(
@@ -20614,8 +21370,14 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
                 " variant=" + requestBuild.cacheVariant +
                 " cache_key=" + requestBuild.cacheKey +
                 " attempt=" + std::to_string(attemptNo) +
+                " input_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
                 " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_input_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
                 " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_input_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
                 " uncached_prompt_tokens=" +
                     std::to_string((std::max)(
                         0,
@@ -21528,6 +22290,7 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
         const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, baseRequestedLimit);
         const int secondEffectiveLimit = std::min(3000, firstEffectiveLimit + 800);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
 
         std::string rawResp;
         OpenAITextObjectResponse_ parsedResponse;
@@ -21538,15 +22301,28 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
             const auto coreRequestStart = std::chrono::steady_clock::now();
 
             try {
-                rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                    openAiApiKey,
-                    reqBody,
-                    []() { MaybeNotifyFirstRetry(); },
-                    false,
-                    {},
-                    "background_image_job",
-                    camLogId
-                );
+                if (useResponsesTransport) {
+                    rawResp = postOpenAIResponsesWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "background_image_job",
+                        camLogId
+                    );
+                }
+                else {
+                    rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                        openAiApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "background_image_job",
+                        camLogId
+                    );
+                }
             }
             catch (const std::exception& e) {
                 if (useCoreModel) {
@@ -21592,13 +22368,14 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                 );
             }
 
-            Logger::instance().logDebug(
-                camLogId,
-                "callOpenAIVisionImageJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ") = " +
-                    sanitizeModelRawRespForLog_(rawResp)
-            );
-
             parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            Logger::instance().logDebugNoEscalation(
+                camLogId,
+                buildOpenAIResponseLogBlock_(
+                    "callOpenAIVisionImageJOB_: rawResp (attempt=" + std::to_string(attemptNo) + ")",
+                    rawResp,
+                    parsedResponse)
+            );
             if (!parsedResponse.hasValidResponseJson) {
                 Logger::instance().logDebug("agent", "callOpenAIVisionImageJOB_: invalid JSON response");
                 emitAgentApiErrorEvent_(
@@ -21625,8 +22402,14 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                 " variant=" + requestBuild.cacheVariant +
                 " cache_key=" + requestBuild.cacheKey +
                 " attempt=" + std::to_string(attemptNo) +
+                " input_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
                 " prompt_tokens=" + std::to_string(parsedResponse.usageStats.promptTokens) +
+                " cached_input_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
                 " cached_prompt_tokens=" + std::to_string(parsedResponse.usageStats.cachedPromptTokens) +
+                " uncached_input_tokens=" +
+                    std::to_string((std::max)(
+                        0,
+                        parsedResponse.usageStats.promptTokens - parsedResponse.usageStats.cachedPromptTokens)) +
                 " uncached_prompt_tokens=" +
                     std::to_string((std::max)(
                         0,
@@ -21869,18 +22652,31 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
         applyOpenAITemperatureField_(body, modelName, 0.0);
         applyOpenAITokenLimitField_(body, modelName, 4000);
         const bool useCoreModel = isZAiCoreModelName_(modelName);
+        const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
         const auto coreRequestStart = std::chrono::steady_clock::now();
 
         std::string rawResp;
         try {
-            rawResp = postOpenAIChatCompletionsWithCoreLease_(
-                openAiApiKey,
-                body,
-                []() { MaybeNotifyFirstRetry(); },
-                false,
-                {},
-                "background_image_group_job"
-            );
+            if (useResponsesTransport) {
+                rawResp = postOpenAIResponsesWithCoreLease_(
+                    openAiApiKey,
+                    body,
+                    []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "background_image_group_job"
+                );
+            }
+            else {
+                rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                    openAiApiKey,
+                    body,
+                    []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "background_image_group_job"
+                );
+            }
         }
         catch (const std::exception& e) {
             if (useCoreModel) {
@@ -21935,14 +22731,17 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
             );
         }
 
+        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
+        const OpenAITextObjectResponse_ parsedGroupResponse =
+            extractOpenAITextObjectResponse_(rawResp);
         logGroupCameraDebug_(
             inputs,
-            "callOpenAIVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ") = " +
-                sanitizeModelRawRespForLog_(rawResp),
+            buildOpenAIResponseLogBlock_(
+                "callOpenAIVisionImageGroupJOB_: rawResp (input_sources=" + inputSourceSummary + ")",
+                rawResp,
+                parsedGroupResponse),
             /*forceCameraStream*/ true
         );
-
-        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
         if (respJson.is_discarded() || !respJson.is_object()) {
             Logger::instance().logDebug("agent", "callOpenAIVisionImageGroupJOB_: invalid JSON response");
             emitAgentApiErrorEvent_(
@@ -21969,8 +22768,12 @@ VideoHit AgentCore::callOpenAIVisionImageGroupJOB_(
             "callOpenAIVisionImageGroupJOB_: prompt cache usage model=" + modelName +
             " variant=" + requestBuild.cacheVariant +
             " cache_key=" + requestBuild.cacheKey +
+            " input_tokens=" + std::to_string(usageStats.promptTokens) +
             " prompt_tokens=" + std::to_string(usageStats.promptTokens) +
+            " cached_input_tokens=" + std::to_string(usageStats.cachedPromptTokens) +
             " cached_prompt_tokens=" + std::to_string(usageStats.cachedPromptTokens) +
+            " uncached_input_tokens=" +
+                std::to_string((std::max)(0, usageStats.promptTokens - usageStats.cachedPromptTokens)) +
             " uncached_prompt_tokens=" +
                 std::to_string((std::max)(0, usageStats.promptTokens - usageStats.cachedPromptTokens)) +
             " output_tokens=" + std::to_string(usageStats.outputTokens) +

@@ -492,6 +492,14 @@ private:
         const std::function<bool()>& shouldAbort = {},
         const std::string& waitScope = "",
         const std::string& cameraLogId = "");
+    std::string postOpenAIResponsesWithCoreLease_(
+        const std::string& apiKey,
+        const nlohmann::json& chatCompletionsBodyJson,
+        const std::function<void()>& onFirstRetry,
+        bool requestChatPriority = false,
+        const std::function<bool()>& shouldAbort = {},
+        const std::string& waitScope = "",
+        const std::string& cameraLogId = "");
 
     long long timeOffsetSeconds_ = 0;
 
@@ -699,6 +707,7 @@ private:
         const std::function<bool()>& shouldAbort = {});
 
     void updateCameraAlgorithms_(int cameraId, const nlohmann::json& payload);
+    void runConfiguredFrameRetentionSweepIfDue_(bool force = false);
 
     // scheduler to check jobs
     void schedulerPingLoop_();
@@ -719,6 +728,7 @@ private:
 
     std::atomic<bool> schedulerPingerRunning_{ false };
     std::thread       schedulerPingerThread_;
+    std::chrono::steady_clock::time_point lastConfiguredRetentionSweep_{};
 
     struct ChatTemporalState {
         nlohmann::json planEnvelope = nlohmann::json::object();

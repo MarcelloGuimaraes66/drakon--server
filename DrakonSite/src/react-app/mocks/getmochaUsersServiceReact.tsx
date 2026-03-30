@@ -21,7 +21,7 @@ type AuthUser = {
 type AuthContextValue = {
   user: AuthUser | null;
   isPending: boolean;
-  redirectToLogin: () => Promise<void>;
+  redirectToLogin: (countryCode?: string | null) => Promise<void>;
   exchangeCodeForSessionToken: () => Promise<void>;
   logout: () => Promise<void>;
 };
@@ -75,10 +75,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loadUser();
   }, [loadUser]);
 
-  const redirectToLogin = useCallback(async () => {
+  const redirectToLogin = useCallback(async (countryCode?: string | null) => {
     const isDesktopHosted = isDesktopHostedShell();
-    const endpoint = isDesktopHosted
-      ? "/api/oauth/google/redirect_url?desktop_host=1"
+    const params = new URLSearchParams();
+    const normalizedCountryCode = countryCode?.trim().toUpperCase() || "";
+    if (isDesktopHosted) {
+      params.set("desktop_host", "1");
+    }
+    if (normalizedCountryCode) {
+      params.set("country_code", normalizedCountryCode);
+    }
+    const query = params.toString();
+    const endpoint = query
+      ? `/api/oauth/google/redirect_url?${query}`
       : "/api/oauth/google/redirect_url";
 
     const response = await fetch(endpoint, {

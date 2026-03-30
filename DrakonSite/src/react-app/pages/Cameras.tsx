@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import { Camera, FileUp, Play, Plus, Square, Wifi } from "lucide-react";
@@ -9,22 +9,74 @@ import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
   type CameraEditorDraft,
+  type CameraEditorSavedResult,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { getCameraConnectionState, isCameraServiceRunning } from "@/react-app/lib/cameraStatus";
-import { buildDraftCameraFromDiscovery } from "@/react-app/utils/cameraDiscovery";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
+import {
+  createCamerasFromDiscoveryImport,
+  formatDiscoveryImportErrorMessage,
+  type CameraDiscoveryImportRequest,
+} from "@/react-app/utils/cameraDiscovery";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
-import type { DiscoveredCameraDevice } from "@/shared/cameraDiscovery";
 import { Camera as CameraType } from "@/shared/types";
 
 type CamerasContentProps = {
   cameras: CameraType[];
-  refreshCameras: () => Promise<void>;
+  refreshCameras: () => Promise<CameraType[]>;
   patchCamera: (cameraId: number, patch: Partial<CameraType>) => void;
 };
+
+const CAMERA_EDITOR_ONBOARDING_STEPS = new Set([
+  "camera-rtsp-form",
+  "camera-address",
+  "camera-storage",
+  "camera-webcam-form",
+  "camera-webcam-save",
+]);
+
+function findSavedCameraId(
+  cameras: CameraType[],
+  saved?: CameraEditorSavedResult
+): number | null {
+  if (typeof saved?.cameraId === "number" && Number.isInteger(saved.cameraId) && saved.cameraId > 0) {
+    return saved.cameraId;
+  }
+
+  const normalizedName =
+    typeof saved?.cameraName === "string" ? saved.cameraName.trim().toLowerCase() : "";
+  const normalizedConnectionMethod =
+    typeof saved?.connectionMethod === "string"
+      ? saved.connectionMethod.trim().toUpperCase()
+      : "";
+
+  const matches = cameras.filter((camera) => {
+    const nameMatches = normalizedName
+      ? String(camera.name || "").trim().toLowerCase() === normalizedName
+      : true;
+    const connectionMatches = normalizedConnectionMethod
+      ? String(camera.connection_method || "").trim().toUpperCase() === normalizedConnectionMethod
+      : true;
+    return nameMatches && connectionMatches;
+  });
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const [latestCamera] = [...matches].sort((left, right) => {
+    const leftTime = new Date(left.updated_at || left.created_at || 0).getTime();
+    const rightTime = new Date(right.updated_at || right.created_at || 0).getTime();
+    return rightTime - leftTime;
+  });
+
+  return latestCamera?.id ?? null;
+}
 
 function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContentProps) {
   const { t } = useTranslation();
@@ -39,12 +91,22 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast, pushToast } = useEvents();
+  const {
+    currentStepId: onboardingStepId,
+    isOpen: isOnboardingOpen,
+    completeCameraTutorial,
+  } = useOnboarding();
+  const tutorialModalRequestStepRef = useRef<string | null>(null);
 
   const sortedCameras = useMemo(
     () =>
       [...cameras].sort(
         (a, b) => (b.is_service_running ?? 0) - (a.is_service_running ?? 0)
       ),
+    [cameras]
+  );
+  const existingCameraNames = useMemo(
+    () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
   );
 
@@ -80,7 +142,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setSearchParams(nextParams);
   }, [searchParams, setSearchParams]);
 
-  const openAddModal = async () => {
+  const openAddModal = useCallback(async () => {
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
@@ -92,7 +154,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setEditorCamera(null);
     setEditorDraft(null);
     setIsEditorOpen(true);
-  };
+  }, [checkBillingForCameraCreation, clearEditSearchParam]);
 
   const openImportModal = async () => {
     const canAdd = await checkBillingForCameraCreation();
@@ -137,29 +199,90 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setSearchParams(nextParams);
   };
 
-  const closeEditor = () => {
+  const closeEditor = useCallback(() => {
     setIsEditorOpen(false);
     setEditorCamera(null);
     setEditorDraft(null);
     clearEditSearchParam();
-  };
+  }, [clearEditSearchParam]);
 
-  const handleDiscoveryImport = async (device: DiscoveredCameraDevice) => {
+  useEffect(() => {
+    if (!isOnboardingOpen || !onboardingStepId) {
+      tutorialModalRequestStepRef.current = null;
+      if (isEditorOpen && !editorCamera && !editorDraft) {
+        closeEditor();
+      }
+      return;
+    }
+
+    if (!CAMERA_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)) {
+      tutorialModalRequestStepRef.current = null;
+      if (isEditorOpen && !editorCamera && !editorDraft) {
+        closeEditor();
+      }
+      return;
+    }
+
+    if (isEditorOpen) {
+      tutorialModalRequestStepRef.current = onboardingStepId;
+      return;
+    }
+
+    if (tutorialModalRequestStepRef.current === onboardingStepId) {
+      return;
+    }
+
+    tutorialModalRequestStepRef.current = onboardingStepId;
+    void openAddModal();
+  }, [
+    closeEditor,
+    editorCamera,
+    editorDraft,
+    isEditorOpen,
+    isOnboardingOpen,
+    onboardingStepId,
+    openAddModal,
+  ]);
+
+  useEffect(() => {
+    if (!isOnboardingOpen || !onboardingStepId) {
+      return;
+    }
+
+    if (onboardingStepId !== "camera-scan-network" && isDiscoveryOpen) {
+      setIsDiscoveryOpen(false);
+    }
+
+    if (onboardingStepId !== "camera-import" && isImportOpen) {
+      setIsImportOpen(false);
+    }
+  }, [isDiscoveryOpen, isImportOpen, isOnboardingOpen, onboardingStepId]);
+
+  const handleDiscoveryImport = async (request: CameraDiscoveryImportRequest) => {
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
     }
 
+    const result = await createCamerasFromDiscoveryImport(request);
+    await refreshCameras();
+    if (result.failures.length > 0) {
+      throw new Error(formatDiscoveryImportErrorMessage(result));
+    }
+
     clearEditSearchParam();
     setEditorCamera(null);
-    setEditorDraft(buildDraftCameraFromDiscovery(device));
+    setEditorDraft(null);
     setIsImportOpen(false);
     setIsDiscoveryOpen(false);
-    setIsEditorOpen(true);
+    setIsEditorOpen(false);
   };
 
-  const handleEditorSaved = async () => {
-    await refreshCameras();
+  const handleEditorSaved = async (saved?: CameraEditorSavedResult) => {
+    const refreshedCameras = await refreshCameras();
+    if (onboardingStepId === "camera-webcam-save") {
+      completeCameraTutorial(findSavedCameraId(refreshedCameras, saved));
+    }
   };
 
   const handleImportSaved = async () => {
@@ -254,6 +377,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
             <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
               <button
                 onClick={openDiscoveryModal}
+                data-onboarding-target={ONBOARDING_TARGETS.camerasScanNetwork}
                 className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
               >
                 <Wifi className="h-4 w-4" />
@@ -261,6 +385,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
               </button>
               <button
                 onClick={openImportModal}
+                data-onboarding-target={ONBOARDING_TARGETS.camerasImport}
                 className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
               >
                 <FileUp className="h-4 w-4" />
@@ -268,6 +393,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
               </button>
               <button
                 onClick={openAddModal}
+                data-onboarding-target={ONBOARDING_TARGETS.camerasRegister}
                 className="w-full md:w-auto flex items-center justify-center gap-2 px-5 py-3 md:py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 min-h-[44px] md:min-h-0"
               >
                 <Plus className="w-5 h-5" />
@@ -391,6 +517,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
         isOpen={isEditorOpen}
         camera={editorCamera}
         draftCamera={!editorCamera ? editorDraft : null}
+        existingCameraNames={existingCameraNames}
         onClose={closeEditor}
         onSaved={handleEditorSaved}
       />
@@ -457,7 +584,7 @@ export default function Cameras() {
     );
   }, []);
 
-  const refreshCameras = useCallback(async () => {
+  const refreshCameras = useCallback(async (): Promise<CameraType[]> => {
     try {
       const response = await fetch("/api/cameras", {
         credentials: "include",
@@ -469,8 +596,10 @@ export default function Cameras() {
 
       const data = await response.json();
       setCameras(data);
+      return Array.isArray(data) ? data : [];
     } catch (error) {
       console.error("Failed to fetch cameras:", error);
+      return [];
     }
   }, []);
 

@@ -2,6 +2,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router";
 import { AuthProvider, useAuth } from "@getmocha/users-service/react";
 import { ThemeProvider } from "@/react-app/hooks/useTheme";
 import { QuickChatProvider } from "@/react-app/hooks/useQuickChat";
+import { OnboardingProvider } from "@/react-app/hooks/useOnboarding";
 import { I18nextProvider } from "react-i18next";
 import i18n from "@/react-app/i18n";
 import LoginPage from "@/react-app/pages/Login";
@@ -144,7 +145,9 @@ export default function App() {
         <ThemeProvider>
           <QuickChatProvider>
             <Router>
-              <AppRoutes />
+              <OnboardingProvider>
+                <AppRoutes />
+              </OnboardingProvider>
             </Router>
           </QuickChatProvider>
         </ThemeProvider>

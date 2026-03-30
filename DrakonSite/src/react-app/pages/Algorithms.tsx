@@ -1,10 +1,12 @@
 import { useParams, useNavigate } from "react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import CameraCustomAgentEditorModal, {
   CameraCustomAgentRow,
 } from "@/react-app/components/CameraCustomAgentEditorModal";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import {
   emitOpenAiKeyRequiredPrompt,
   isOpenAiKeyRequiredError,
@@ -58,10 +60,45 @@ type ToastMessage = {
   variant: "default" | "destructive";
 };
 
+const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
+  "agent-model",
+  "agent-input-type",
+  "agent-fields",
+  "agent-enhance",
+  "agent-polygons",
+  "agent-execution",
+  "agent-save",
+]);
+
+const AGENT_TUTORIAL_COMPLETION_STEPS = new Set([
+  "agent-create",
+  "agent-model",
+  "agent-input-type",
+  "agent-fields",
+  "agent-enhance",
+  "agent-polygons",
+  "agent-execution",
+  "agent-save",
+]);
+
 export default function Algorithms() {
   const { t } = useTranslation();
   const { cameraId } = useParams();
   const navigate = useNavigate();
+  const {
+    currentStepId: onboardingStepId,
+    isOpen: isOnboardingOpen,
+    tutorialCameraId,
+    tutorialAgentId,
+    completeAgentTutorial,
+  } = useOnboarding();
+  const tutorialManagedEditorRef = useRef(false);
+  const numericCameraId = Number(cameraId || 0);
+  const isTutorialCamera =
+    typeof tutorialCameraId === "number" &&
+    Number.isInteger(tutorialCameraId) &&
+    tutorialCameraId > 0 &&
+    tutorialCameraId === numericCameraId;
   
   const [algorithmState, setAlgorithmState] = useState<AlgorithmState>({});
   const [customAlgorithms, setCustomAlgorithms] = useState<CustomAlgorithm[]>([]);
@@ -363,14 +400,57 @@ export default function Algorithms() {
     setShowCustomEditor(true);
   };
 
-  const handleCustomEditorSaved = async () => {
+  const handleCustomEditorSaved = async (savedAgentId?: number | null) => {
     await fetchCustomAlgorithms();
+    if (
+      isOnboardingOpen &&
+      isTutorialCamera &&
+      onboardingStepId &&
+      AGENT_TUTORIAL_COMPLETION_STEPS.has(onboardingStepId)
+    ) {
+      completeAgentTutorial(savedAgentId);
+    }
   };
 
   const closeCustomEditor = () => {
     setShowCustomEditor(false);
     setCustomEditorAgent(null);
   };
+
+  useEffect(() => {
+    if (!isTutorialCamera || !isOnboardingOpen || !onboardingStepId) {
+      if (tutorialManagedEditorRef.current && showCustomEditor) {
+        setShowCustomEditor(false);
+        setCustomEditorAgent(null);
+      }
+      tutorialManagedEditorRef.current = false;
+      return;
+    }
+
+    if (onboardingStepId === "agent-intro" || onboardingStepId === "agent-create") {
+      if (tutorialManagedEditorRef.current && showCustomEditor) {
+        setShowCustomEditor(false);
+        setCustomEditorAgent(null);
+      }
+      tutorialManagedEditorRef.current = false;
+      return;
+    }
+
+    if (AGENT_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)) {
+      tutorialManagedEditorRef.current = true;
+      if (!showCustomEditor) {
+        setCustomEditorAgent(null);
+        setShowCustomEditor(true);
+      }
+      return;
+    }
+
+    if (tutorialManagedEditorRef.current && showCustomEditor) {
+      setShowCustomEditor(false);
+      setCustomEditorAgent(null);
+    }
+    tutorialManagedEditorRef.current = false;
+  }, [isOnboardingOpen, isTutorialCamera, onboardingStepId, showCustomEditor]);
 
   // Auto-save when toggling algorithm on/off
   const toggleAlgorithm = async (algorithmType: string) => {
@@ -926,6 +1006,7 @@ export default function Algorithms() {
         <div className="mb-6">
           <button
             onClick={openCreateCustomEditor}
+            data-onboarding-target={ONBOARDING_TARGETS.algorithmsCreateCustom}
             className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-purple-500/20 to-pink-500/20 hover:from-purple-500/30 hover:to-pink-500/30 border border-purple-500/30 text-purple-300 rounded-xl font-medium transition-all shadow-lg shadow-purple-500/10"
           >
             <Plus className="w-5 h-5" />
@@ -1041,6 +1122,12 @@ export default function Algorithms() {
           <div className="space-y-3 mb-6 md:mb-8">
             {customAlgorithms.map((custom) => {
               const isEnabled = !!custom.is_enabled;
+              const isTutorialAgentToggleTarget =
+                isOnboardingOpen &&
+                onboardingStepId === "agent-toggle" &&
+                typeof tutorialAgentId === "number" &&
+                tutorialAgentId > 0 &&
+                tutorialAgentId === custom.id;
               const regionCount = Array.isArray(custom.analysis_regions)
                 ? custom.analysis_regions.filter((region: any) => !region?.full_frame).length
                 : 0;
@@ -1098,6 +1185,11 @@ export default function Algorithms() {
                       </button>
                       <button
                         onClick={() => void toggleCustomAlgorithm(custom)}
+                        data-onboarding-target={
+                          isTutorialAgentToggleTarget
+                            ? ONBOARDING_TARGETS.algorithmsCustomAgentToggle
+                            : undefined
+                        }
                         className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
                           isEnabled ? "bg-purple-500" : "bg-gray-700"
                         }`}

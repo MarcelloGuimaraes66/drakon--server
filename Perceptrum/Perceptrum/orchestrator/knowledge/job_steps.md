@@ -1,92 +1,43 @@
 # Job Steps
 
-Use **steps** to break a job into clear stages. Each step represents one part of the workflow and is the main execution unit inside the job.
+A step is where a job becomes operational. If a user asks how to create an agent inside a scheduled workflow, the right answer is: create the step first, add the camera as a target, and then configure the agent inside that step.
 
-## What a step controls
+## When to use a step agent instead of AI Agents
 
-- which stage of the workflow is being executed
-- the step order and timeout for that stage
-- which targets are used in that stage
-- which agent or prompt logic is applied
-- which execution settings are used
-- which start condition or dependency controls when the step can begin
-- which pipeline input, grouped inference, or shared context is used
-- what alert behavior should happen if the condition is met
+- Use a step agent when the analysis must follow a schedule.
+- Use a step agent when multiple cameras or stages must work together.
+- Use a step agent when one stage depends on another stage, on a timeout, or on shared output.
+- Use **AI Agents** instead when one camera only needs a direct continuous watcher outside a workflow.
 
-## Why steps matter
+## Minimum required fields inside the step agent editor
 
-Steps let one job handle different scenarios cleanly instead of putting all logic into one large block.
+- **Name**: a clear name for the step agent.
+- **Prompt core**: explain what the step agent must recognize and under which circumstances.
+- **Alert condition**: define the condition that should trigger the alert for that stage.
 
-A job without well-defined steps is only a schedule. The step is where the workflow becomes operational: cameras are attached, agents are applied, timing is enforced, dependencies are evaluated, and alerts are decided.
+## Advanced options shared with camera agents
 
-## Common step patterns
+- **Targets**: the step must already contain target cameras, and the agent can use target-specific logic.
+- **Face targets**: face photos can guide recognition when a specific person matters.
+- **Negative condition**: define what should not trigger the alert.
+- **Negative reference images**: give the model clearer visual examples of what to ignore.
+- **Model**: **Ultra** supports lower latency and 10-second alert cadence; **Core** is slower and fixed at 60 seconds.
+- **Video packaging**: **High resolution**, **Standard resolution**, and **Compact resolution** trade token usage against analysis quality.
+- **Input type**: **Video** is best for short actions and motion; **Image** is best for periodic snapshots.
+- **Polygons**: named polygons can limit inference to motion inside specific regions.
 
-- one step per camera
-- one step for entrance monitoring and another for parking
-- one step for detection and another for follow-up review
-- one step for receiving, another for transfer, and another for destination confirmation
-- one step for normal execution and another for exception handling
-- one step that starts only after a previous step produced the expected result
+## Typical flow
 
-## Practical example
+1. Open **Jobs**.
+2. Create or edit the job.
+3. Create the **step**.
+4. Add one or more cameras as targets inside the step.
+5. Open the step-level agent editor for that target or stage.
+6. Fill in **Name**, **Prompt core**, and **Alert condition**.
+7. Configure visual guidance, model, cadence, **Video packaging**, **Input type**, and polygons when needed.
+8. Save the step and activate the job.
 
-Example: job with four steps.
+## Practical rule of thumb
 
-Job: `Receiving to destination verification`
-
-Step 1:
-
-- Stage: `Receiving confirmation`
-- Target: `Receiving Dock`
-- Purpose: confirm that the expected load arrived and was unloaded
-- Agent logic: detect unloading activity and confirm that the receiving event really happened
-
-Step 2:
-
-- Stage: `Transfer path review`
-- Target: `Internal Corridor`
-- Purpose: confirm that the same process continued through the expected path
-- Agent logic: review movement through the transfer area
-- Start condition: begin only after the receiving step produced the expected positive result
-
-Step 3:
-
-- Stage: `Destination confirmation`
-- Target: `Storage Area B`
-- Purpose: confirm that the load reached the correct destination
-- Agent logic: check whether the delivery ended in the expected area instead of a wrong zone
-
-Step 4:
-
-- Stage: `Exception review`
-- Target: one or more exception cameras
-- Purpose: review delay, wrong routing, or missing completion
-- Agent logic: escalate when the expected handoff, route, or destination did not happen in time
-
-## What to configure in each step
-
-- **Step name**: short label for the stage.
-- **Step order**: where this stage belongs in the workflow sequence.
-- **Timeout**: how long the stage can run before timing out.
-- **Targets**: which camera or cameras the step should inspect. In the current workflow model, targets are added after the step exists.
-- **Agent or prompt**: what the step should look for.
-- **Prompt behavior**: prompt core, alert condition, and optional negative condition.
-- **Execution settings**: input type, video packaging mode, inference model, cadence, running resolution, motion-only behavior, and temporal context behavior.
-- **Visual guidance**: analysis regions, face targets, and negative reference images when the scenario needs them.
-- **Start condition**: whether the step should start by sequence, by time, or from the result of a previous step.
-- **Pipeline input**: whether the step should receive input or named keys from a previous step.
-- **Missing-input handling**: what should happen when the expected upstream input does not exist.
-- **Grouped execution**: whether multiple targets inside the step should be handled as an inference group with a source target and optional region bindings.
-- **Alerts**: which notifications or escalations should be sent when the step condition is met.
-
-## Practical guidance
-
-- Use one step when the workflow is simple and focused.
-- Use multiple steps when each stage has a different purpose, timing rule, or camera set.
-- Keep step names explicit so the workflow is easy to review later.
-- Add targets only after the step is created, because targets belong to the step.
-- Treat the step as the place where schedule becomes action: order, timeout, targets, agent behavior, and alerts all come together here.
-- Use start conditions when one stage should wait for another stage or for a specific time.
-- Use pipeline inputs when one step should consume named output from an earlier step.
-- Use grouped inference only when multiple targets really need to act as one combined stage.
-- Keep unrelated goals in separate steps when that makes the workflow easier to understand, maintain, and audit.
+- Use a step agent when the agent belongs to a schedule, a sequence, or a multi-camera workflow.
+- Use a camera agent in **AI Agents** when the same logic should run continuously on one camera by itself.

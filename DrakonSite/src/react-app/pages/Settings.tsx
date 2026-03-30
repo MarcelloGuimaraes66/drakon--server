@@ -3,6 +3,8 @@ import { useAuth } from "@getmocha/users-service/react";
 import { useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { brand } from "@/shared/brand";
 import {
   User,
@@ -17,6 +19,7 @@ import {
   ChevronRight,
   Clock3,
   ExternalLink,
+  Sparkles,
 } from "lucide-react";
 
 interface PairingStatus {
@@ -47,6 +50,7 @@ export default function Settings() {
   const zAiKeysUrl = "https://z.ai/manage-apikey/apikey-list";
   const { t, i18n } = useTranslation();
   const { user } = useAuth();
+  const { startTutorial, status: onboardingStatus, syncProviderStatus } = useOnboarding();
   const location = useLocation();
   const [pairCode, setPairCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
@@ -218,7 +222,7 @@ export default function Settings() {
     e.preventDefault();
     if (!openAiKeyInput.trim()) {
       setOpenAiMessageType("error");
-      setOpenAiMessage("Please enter an OpenAI API key.");
+      setOpenAiMessage(t("settings.apiKeys.validation.enter", { provider: openAiProviderLabel }));
       return;
     }
 
@@ -233,17 +237,21 @@ export default function Settings() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to save OpenAI key");
+        throw new Error(
+          data?.error || t("settings.apiKeys.validation.saveFailed", { provider: openAiProviderLabel })
+        );
       }
 
       setOpenAiHasKey(!!data?.has_key);
       setOpenAiKeyPreview(typeof data?.api_key_preview === "string" ? data.api_key_preview : "");
       setOpenAiKeyInput("");
       setOpenAiMessageType("success");
-      setOpenAiMessage("OpenAI API key saved.");
+      setOpenAiMessage(t("settings.apiKeys.messages.saved", { provider: openAiProviderLabel }));
     } catch (error: any) {
       setOpenAiMessageType("error");
-      setOpenAiMessage(error?.message || "Failed to save OpenAI key");
+      setOpenAiMessage(
+        error?.message || t("settings.apiKeys.validation.saveFailed", { provider: openAiProviderLabel })
+      );
     } finally {
       setOpenAiSaving(false);
     }
@@ -261,17 +269,21 @@ export default function Settings() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to remove OpenAI key");
+        throw new Error(
+          data?.error || t("settings.apiKeys.validation.removeFailed", { provider: openAiProviderLabel })
+        );
       }
 
       setOpenAiHasKey(false);
       setOpenAiKeyPreview("");
       setOpenAiKeyInput("");
       setOpenAiMessageType("success");
-      setOpenAiMessage("OpenAI API key removed.");
+      setOpenAiMessage(t("settings.apiKeys.messages.removed", { provider: openAiProviderLabel }));
     } catch (error: any) {
       setOpenAiMessageType("error");
-      setOpenAiMessage(error?.message || "Failed to remove OpenAI key");
+      setOpenAiMessage(
+        error?.message || t("settings.apiKeys.validation.removeFailed", { provider: openAiProviderLabel })
+      );
     } finally {
       setOpenAiSaving(false);
     }
@@ -281,7 +293,7 @@ export default function Settings() {
     e.preventDefault();
     if (!zAiKeyInput.trim()) {
       setZAiMessageType("error");
-      setZAiMessage("Please enter a Z.ai API key.");
+      setZAiMessage(t("settings.apiKeys.validation.enter", { provider: zAiProviderLabel }));
       return;
     }
 
@@ -296,17 +308,21 @@ export default function Settings() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to save Z.ai key");
+        throw new Error(
+          data?.error || t("settings.apiKeys.validation.saveFailed", { provider: zAiProviderLabel })
+        );
       }
 
       setZAiHasKey(!!data?.has_key);
       setZAiKeyPreview(typeof data?.api_key_preview === "string" ? data.api_key_preview : "");
       setZAiKeyInput("");
       setZAiMessageType("success");
-      setZAiMessage("Z.ai API key saved.");
+      setZAiMessage(t("settings.apiKeys.messages.saved", { provider: zAiProviderLabel }));
     } catch (error: any) {
       setZAiMessageType("error");
-      setZAiMessage(error?.message || "Failed to save Z.ai key");
+      setZAiMessage(
+        error?.message || t("settings.apiKeys.validation.saveFailed", { provider: zAiProviderLabel })
+      );
     } finally {
       setZAiSaving(false);
     }
@@ -324,17 +340,21 @@ export default function Settings() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data?.error || "Failed to remove Z.ai key");
+        throw new Error(
+          data?.error || t("settings.apiKeys.validation.removeFailed", { provider: zAiProviderLabel })
+        );
       }
 
       setZAiHasKey(false);
       setZAiKeyPreview("");
       setZAiKeyInput("");
       setZAiMessageType("success");
-      setZAiMessage("Z.ai API key removed.");
+      setZAiMessage(t("settings.apiKeys.messages.removed", { provider: zAiProviderLabel }));
     } catch (error: any) {
       setZAiMessageType("error");
-      setZAiMessage(error?.message || "Failed to remove Z.ai key");
+      setZAiMessage(
+        error?.message || t("settings.apiKeys.validation.removeFailed", { provider: zAiProviderLabel })
+      );
     } finally {
       setZAiSaving(false);
     }
@@ -452,6 +472,12 @@ export default function Settings() {
   const normalizedHandleValue = normalizeHandleInput(handleInput);
   const isHandleDirty = normalizedHandleValue !== savedHandle;
   const isHandleValid = normalizedHandleValue.length > 0 && !/\s/.test(normalizedHandleValue);
+  const zAiProviderLabel = t("settings.apiKeys.providers.zai");
+  const openAiProviderLabel = t("settings.apiKeys.providers.openai");
+  const tutorialButtonLabel =
+    onboardingStatus === "never_started"
+      ? t("tutorial.settingsCard.start")
+      : t("tutorial.settingsCard.reopen");
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -493,6 +519,13 @@ export default function Settings() {
     }
   }, [pairingStatus.status]);
 
+  useEffect(() => {
+    syncProviderStatus({
+      openai: openAiHasKey,
+      zai: zAiHasKey,
+    });
+  }, [openAiHasKey, syncProviderStatus, zAiHasKey]);
+
   return (
     <Layout>
       <div className="max-w-4xl mx-auto">
@@ -500,6 +533,27 @@ export default function Settings() {
         <div className="mb-6 md:mb-8">
           <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">{t("settings.title")}</h1>
           <p className="text-sm md:text-base text-gray-400">{t("settings.subtitle")}</p>
+        </div>
+
+        <div className="mb-4 md:mb-6 rounded-2xl border border-blue-500/20 bg-gradient-to-br from-blue-500/10 via-slate-900/40 to-cyan-500/10 p-4 md:p-5">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-start gap-3">
+              <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-blue-400/20 bg-blue-500/10 text-blue-200">
+                <Sparkles className="h-5 w-5" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-gray-100">{t("tutorial.settingsCard.title")}</p>
+                <p className="mt-1 text-sm text-gray-300">{t("tutorial.settingsCard.description")}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={startTutorial}
+              className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-400"
+            >
+              {tutorialButtonLabel}
+            </button>
+          </div>
         </div>
 
         {/* User Profile */}
@@ -820,6 +874,7 @@ export default function Settings() {
         {/* Z.ai API Key */}
         <div
           ref={zAiCardRef}
+          data-onboarding-target={ONBOARDING_TARGETS.settingsZAiCard}
           className={`bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mt-4 md:mt-6 transition-all ${
             highlightZAiCard
               ? "ring-2 ring-cyan-400/80 shadow-[0_0_0_4px_rgba(34,211,238,0.2)] animate-pulse"
@@ -829,17 +884,20 @@ export default function Settings() {
           <div className="flex items-center justify-between gap-3 mb-6">
             <div className="flex items-center gap-3">
               <KeyRound className="w-5 h-5 text-gray-400" />
-              <h2 className="text-lg font-semibold text-gray-100">Z.ai API Key</h2>
+              <h2 className="text-lg font-semibold text-gray-100">
+                {t("settings.apiKeys.sectionTitle", { provider: zAiProviderLabel })}
+              </h2>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <a
                 href={zAiKeysUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                data-onboarding-target={ONBOARDING_TARGETS.settingsZAiOpenButton}
                 className="inline-flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-sm font-medium text-cyan-300 transition-colors hover:bg-cyan-500/15 hover:text-cyan-200"
               >
                 <ExternalLink className="w-4 h-4" />
-                Open Z.ai API Keys
+                {t("settings.apiKeys.openButton", { provider: zAiProviderLabel })}
               </a>
               <span
                 className={`inline-flex items-center rounded-full px-4 py-1.5 text-sm font-semibold border ${
@@ -850,7 +908,11 @@ export default function Settings() {
                     : "border-amber-500/30 bg-amber-500/20 text-amber-300"
                 }`}
               >
-                {zAiLoading ? "Checking..." : zAiHasKey ? "Configured" : "Not Configured"}
+                {zAiLoading
+                  ? t("settings.apiKeys.status.checking")
+                  : zAiHasKey
+                    ? t("settings.apiKeys.status.configured")
+                    : t("settings.apiKeys.status.notConfigured")}
               </span>
             </div>
           </div>
@@ -862,26 +924,26 @@ export default function Settings() {
           ) : (
             <form onSubmit={saveZAiSettings} className="space-y-4">
               <p className="text-sm text-gray-400">
-                Need a new Z.ai key? Open the official dashboard, create or copy the key there, and paste it below.
+                {t("settings.apiKeys.needNew", { provider: zAiProviderLabel })}
               </p>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Stored key preview
+                  {t("settings.apiKeys.storedPreview")}
                 </label>
                 <input
                   type="text"
-                  value={zAiHasKey ? zAiKeyPreview : "No key configured"}
+                  value={zAiHasKey ? zAiKeyPreview : t("settings.apiKeys.noKeyConfigured")}
                   readOnly
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none"
                 />
                 <p className="mt-2 text-xs text-gray-500">
-                  For security, only the beginning of the key is displayed.
+                  {t("settings.apiKeys.securityHint")}
                 </p>
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  New Z.ai API key
+                  {t("settings.apiKeys.newLabel", { provider: zAiProviderLabel })}
                 </label>
                 <input
                   type="password"
@@ -889,6 +951,7 @@ export default function Settings() {
                   onChange={(e) => setZAiKeyInput(e.target.value)}
                   placeholder="zai-..."
                   disabled={zAiSaving}
+                  data-onboarding-target={ONBOARDING_TARGETS.settingsZAiInput}
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 transition-all disabled:opacity-50"
                 />
               </div>
@@ -910,20 +973,21 @@ export default function Settings() {
                   disabled={zAiSaving || !zAiHasKey}
                   className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 text-gray-100 rounded-lg font-medium transition-colors"
                 >
-                  Remove Key
+                  {t("settings.apiKeys.remove")}
                 </button>
                 <button
                   type="submit"
                   disabled={zAiSaving || !zAiKeyInput.trim()}
+                  data-onboarding-target={ONBOARDING_TARGETS.settingsZAiSave}
                   className="px-5 py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors shadow-lg shadow-cyan-500/30 disabled:shadow-none flex items-center gap-2"
                 >
                   {zAiSaving ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      Saving...
+                      {t("settings.apiKeys.saving")}
                     </>
                   ) : (
-                    "Save Z.ai Key"
+                    t("settings.apiKeys.save", { provider: zAiProviderLabel })
                   )}
                 </button>
               </div>
@@ -935,6 +999,7 @@ export default function Settings() {
         {/* OpenAI API Key */}
         <div
           ref={openAiCardRef}
+          data-onboarding-target={ONBOARDING_TARGETS.settingsOpenAiCard}
           className={`bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mt-4 md:mt-6 transition-all ${
             highlightOpenAiCard
               ? "ring-2 ring-blue-400/80 shadow-[0_0_0_4px_rgba(59,130,246,0.2)] animate-pulse"
@@ -944,17 +1009,20 @@ export default function Settings() {
           <div className="flex items-center justify-between gap-3 mb-6">
             <div className="flex items-center gap-3">
               <KeyRound className="w-5 h-5 text-gray-400" />
-              <h2 className="text-lg font-semibold text-gray-100">OpenAI API Key</h2>
+              <h2 className="text-lg font-semibold text-gray-100">
+                {t("settings.apiKeys.sectionTitle", { provider: openAiProviderLabel })}
+              </h2>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <a
                 href={openAiKeysUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                data-onboarding-target={ONBOARDING_TARGETS.settingsOpenAiOpenButton}
                 className="inline-flex items-center gap-2 rounded-lg border border-blue-500/20 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-300 transition-colors hover:bg-blue-500/15 hover:text-blue-200"
               >
                 <ExternalLink className="w-4 h-4" />
-                Open OpenAI API Keys
+                {t("settings.apiKeys.openButton", { provider: openAiProviderLabel })}
               </a>
               <span
                 className={`inline-flex items-center rounded-full px-4 py-1.5 text-sm font-semibold border ${
@@ -965,7 +1033,11 @@ export default function Settings() {
                     : "border-amber-500/30 bg-amber-500/20 text-amber-300"
                 }`}
               >
-                {openAiLoading ? "Checking..." : openAiHasKey ? "Configured" : "Not Configured"}
+                {openAiLoading
+                  ? t("settings.apiKeys.status.checking")
+                  : openAiHasKey
+                    ? t("settings.apiKeys.status.configured")
+                    : t("settings.apiKeys.status.notConfigured")}
               </span>
             </div>
           </div>
@@ -977,26 +1049,26 @@ export default function Settings() {
           ) : (
             <form onSubmit={saveOpenAiSettings} className="space-y-4">
               <p className="text-sm text-gray-400">
-                Need a new OpenAI key? Open the official dashboard, create or copy the key there, and paste it below.
+                {t("settings.apiKeys.needNew", { provider: openAiProviderLabel })}
               </p>
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Stored key preview
+                  {t("settings.apiKeys.storedPreview")}
                 </label>
                 <input
                   type="text"
-                  value={openAiHasKey ? openAiKeyPreview : "No key configured"}
+                  value={openAiHasKey ? openAiKeyPreview : t("settings.apiKeys.noKeyConfigured")}
                   readOnly
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none"
                 />
                 <p className="mt-2 text-xs text-gray-500">
-                  For security, only the beginning of the key is displayed.
+                  {t("settings.apiKeys.securityHint")}
                 </p>
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  New OpenAI API key
+                  {t("settings.apiKeys.newLabel", { provider: openAiProviderLabel })}
                 </label>
                 <input
                   type="password"
@@ -1004,6 +1076,7 @@ export default function Settings() {
                   onChange={(e) => setOpenAiKeyInput(e.target.value)}
                   placeholder="sk-..."
                   disabled={openAiSaving}
+                  data-onboarding-target={ONBOARDING_TARGETS.settingsOpenAiInput}
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
                 />
               </div>
@@ -1025,20 +1098,21 @@ export default function Settings() {
                   disabled={openAiSaving || !openAiHasKey}
                   className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 text-gray-100 rounded-lg font-medium transition-colors"
                 >
-                  Remove Key
+                  {t("settings.apiKeys.remove")}
                 </button>
                 <button
                   type="submit"
                   disabled={openAiSaving || !openAiKeyInput.trim()}
+                  data-onboarding-target={ONBOARDING_TARGETS.settingsOpenAiSave}
                   className="px-5 py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 disabled:shadow-none flex items-center gap-2"
                 >
                   {openAiSaving ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      Saving...
+                      {t("settings.apiKeys.saving")}
                     </>
                   ) : (
-                    "Save OpenAI Key"
+                    t("settings.apiKeys.save", { provider: openAiProviderLabel })
                   )}
                 </button>
               </div>

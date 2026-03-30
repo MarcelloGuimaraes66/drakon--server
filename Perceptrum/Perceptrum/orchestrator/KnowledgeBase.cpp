@@ -421,13 +421,29 @@ void KnowledgeBase::loadDocuments_()
             "camera_creation",
             "Camera Creation",
             "camera_creation.md",
-            { "create camera", "add camera", "new camera", "register camera", "camera setup", "criar camera", "adicionar camera", "cadastrar camera", "configurar camera" },
+            {
+                "create camera", "add camera", "new camera", "register camera",
+                "camera setup", "scan network", "camera import", "import cameras",
+                "webcam", "rtsp", "nvr", "dvr", "csv", "excel", "json",
+                "tsv", "plain text", "retention", "retencao", "retenção",
+                "allow public access", "public access", "cep", "zip code",
+                "postal code", "criar camera", "adicionar camera",
+                "cadastrar camera", "configurar camera"
+            },
         },
         {
             "camera_agents",
             "Camera Agents",
             "camera_agents.md",
-            { "camera agent", "camera agents", "custom agent", "agent on camera", "agente na camera", "agentes na camera", "agente custom" },
+            {
+                "camera agent", "camera agents", "custom agent", "agent on camera",
+                "ai agent", "ai agents", "create agent", "prompt core",
+                "alert condition", "video packaging", "input type", "snapshot",
+                "snapshots", "polygon", "polygons", "poligono", "poligonos",
+                "face target", "face targets", "negative condition",
+                "negative reference image", "agente", "agentes",
+                "agente na camera", "agentes na camera", "agente custom"
+            },
         },
         {
             "jobs",
@@ -439,7 +455,12 @@ void KnowledgeBase::loadDocuments_()
             "job_steps",
             "Job Steps",
             "job_steps.md",
-            { "step", "steps", "job step", "workflow step", "step agent", "etapa", "etapas", "step do job", "passo do workflow" },
+            {
+                "step", "steps", "job step", "workflow step", "step agent",
+                "agent in step", "step target", "camera target", "etapa",
+                "etapas", "step do job", "passo do workflow", "agente do step",
+                "agente na etapa", "agente na tarefa"
+            },
         },
     };
 

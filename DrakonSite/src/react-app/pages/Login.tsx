@@ -373,7 +373,7 @@ export default function Login() {
     setError("");
     setIsGoogleLoading(true);
     try {
-      await redirectToLogin();
+      await redirectToLogin(countryCode || detectedCountry || null);
     } catch (err) {
       const message =
         err instanceof Error && err.message.trim()
