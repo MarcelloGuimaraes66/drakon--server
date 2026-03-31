@@ -22,7 +22,7 @@ type AuthContextValue = {
   user: AuthUser | null;
   isPending: boolean;
   redirectToLogin: (countryCode?: string | null) => Promise<void>;
-  exchangeCodeForSessionToken: () => Promise<void>;
+  exchangeCodeForSessionToken: () => Promise<AuthUser | null>;
   logout: () => Promise<void>;
 };
 
@@ -62,13 +62,14 @@ async function fetchCurrentUser(): Promise<AuthUser | null> {
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isPending, setIsPending] = useState(true);
-  const exchangeRef = useRef<Promise<void> | null>(null);
+  const exchangeRef = useRef<Promise<AuthUser | null> | null>(null);
 
-  const loadUser = useCallback(async () => {
+  const loadUser = useCallback(async (): Promise<AuthUser | null> => {
     setIsPending(true);
     const currentUser = await fetchCurrentUser();
     setUser(currentUser);
     setIsPending(false);
+    return currentUser;
   }, []);
 
   useEffect(() => {
@@ -122,10 +123,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const code = params.get("code");
     const state = params.get("state");
     if (!code) {
-      return;
+      return null;
     }
 
     exchangeRef.current = (async () => {
+      let payload: { error?: string; user?: AuthUser } | null = null;
       try {
         const response = await fetch("/api/sessions", {
           method: "POST",
@@ -134,13 +136,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           body: JSON.stringify({ code, state }),
         });
 
+        try {
+          payload = (await response.json()) as { error?: string; user?: AuthUser };
+        } catch {
+          payload = null;
+        }
+
         if (!response.ok) {
-          let payload: { error?: string } | null = null;
-          try {
-            payload = (await response.json()) as { error?: string };
-          } catch {
-            payload = null;
-          }
           throw new Error(payload?.error || "Failed to exchange auth code.");
         }
       } catch (error) {
@@ -148,7 +150,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw error;
       }
 
-      await loadUser();
+      if (payload?.user) {
+        setUser(payload.user);
+        setIsPending(false);
+        return payload.user;
+      }
+
+      return loadUser();
     })();
 
     return exchangeRef.current;

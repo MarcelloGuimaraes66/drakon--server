@@ -4,7 +4,12 @@ export type CameraDiscoveryProtocol =
   | "HTTP_PROBE"
   | "RTSP_PROBE";
 
-export type CameraDiscoveryDeviceKind = "CAMERA" | "DVR" | "NVR" | "UNKNOWN";
+export type CameraDiscoveryDeviceKind =
+  | "CAMERA"
+  | "DVR"
+  | "NVR"
+  | "RECORDER"
+  | "UNKNOWN";
 
 export interface DiscoveredCameraDevice {
   id: string;

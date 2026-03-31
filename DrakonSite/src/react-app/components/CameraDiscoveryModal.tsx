@@ -44,6 +44,25 @@ type SelectionCheckboxProps = {
   onChange: (event: ChangeEvent<HTMLInputElement>) => void;
 };
 
+function isRecorderDeviceKind(value: unknown) {
+  const normalized = String(value || "").trim().toUpperCase();
+  return normalized === "DVR" || normalized === "NVR" || normalized === "RECORDER";
+}
+
+function looksLikeGenericManufacturerKindName(
+  value: string,
+  manufacturer: string,
+  kindLabel: string
+) {
+  const normalized = String(value || "").trim();
+  const normalizedManufacturer = String(manufacturer || "").trim();
+  if (!normalized || !normalizedManufacturer) {
+    return false;
+  }
+
+  return normalized.toLowerCase() === `${normalizedManufacturer} ${kindLabel}`.toLowerCase();
+}
+
 function formatConfidence(value: number) {
   const normalized = Number.isFinite(value) ? Math.round(value * 100) : 0;
   return `${normalized}% confidence`;
@@ -57,11 +76,16 @@ function formatProtocols(device: DiscoveredCameraDevice) {
 
 function looksLikeGenericCameraName(device: DiscoveredCameraDevice) {
   const normalizedName = String(device.friendly_name || "").trim();
+  const manufacturer = String(device.manufacturer_guess || "").trim();
   if (!normalizedName) {
     return true;
   }
 
   if (normalizedName.toLowerCase() === `camera ${device.ip}`.toLowerCase()) {
+    return true;
+  }
+
+  if (looksLikeGenericManufacturerKindName(normalizedName, manufacturer, "camera")) {
     return true;
   }
 
@@ -101,7 +125,13 @@ function formatDeviceKind(
     return "";
   }
 
-  return kind === "CAMERA" ? "Camera" : kind;
+  if (kind === "CAMERA") {
+    return "Camera";
+  }
+  if (kind === "RECORDER") {
+    return "Recorder";
+  }
+  return kind;
 }
 
 function formatChannelHint(device: DiscoveredCameraDevice) {
@@ -120,12 +150,12 @@ function formatDeviceTitle(
   options?: { recorderGroup?: boolean }
 ) {
   const friendlyName = String(device.friendly_name || "").trim();
+  const manufacturer = String(device.manufacturer_guess || "").trim();
   if (friendlyName && !(options?.recorderGroup && looksLikeGenericCameraName(device))) {
     return friendlyName;
   }
 
-  if (options?.recorderGroup) {
-    const manufacturer = String(device.manufacturer_guess || "").trim();
+  if (options?.recorderGroup || isRecorderDeviceKind(device.device_kind_guess)) {
     return manufacturer ? `${manufacturer} Recorder` : `Recorder ${device.ip}`;
   }
 
@@ -170,7 +200,7 @@ function shouldRenderRecorderGroup(
   }
 
   const parentKind = String(parent?.device_kind_guess || "").trim().toUpperCase();
-  if (parentKind === "DVR" || parentKind === "NVR") {
+  if (isRecorderDeviceKind(parentKind)) {
     return true;
   }
 
@@ -191,10 +221,9 @@ function createSyntheticRecorderGroup(
     channel_guess: null,
     subtype_guess: null,
     channel_label: null,
-    device_kind_guess:
-      representative.device_kind_guess === "DVR" || representative.device_kind_guess === "NVR"
-        ? representative.device_kind_guess
-        : "UNKNOWN",
+    device_kind_guess: isRecorderDeviceKind(representative.device_kind_guess)
+      ? representative.device_kind_guess
+      : "RECORDER",
   };
 }
 

@@ -146,6 +146,8 @@ export interface DashboardPayload {
   }>>;
   etagHints?: {
     camerasUpdatedAtMax: number;
+    camerasCount: number;
+    camerasDigest: string;
     lastEventId: number;
     lastDetectionId: number;
     lastJobFireId: number;
@@ -246,6 +248,40 @@ class DashboardSummaryStore {
   }
 
   /**
+   * Remove a single camera locally so all dashboard consumers stay in sync.
+   */
+  removeCameraLocal(cameraId: number): void {
+    const next = this.summary.cameras.filter((camera) => camera.id !== cameraId);
+    if (next.length === this.summary.cameras.length) return;
+
+    this.summary = {
+      ...this.summary,
+      cameras: next,
+      lastUpdatedAt: new Date().toISOString(),
+      dashboard: this.summary.dashboard
+        ? {
+            ...this.summary.dashboard,
+            stats: this.summary.dashboard.stats
+              ? {
+                  ...this.summary.dashboard.stats,
+                  cameras_total: Math.max(0, next.length),
+                  cameras_running: next.filter((camera) => camera.is_service_running === 1).length,
+                  cameras_online: next.filter((camera) => camera.is_service_running === 1).length,
+                }
+              : this.summary.dashboard.stats,
+            perCamera: Object.fromEntries(
+              Object.entries(this.summary.dashboard.perCamera || {}).filter(
+                ([candidateCameraId]) => Number(candidateCameraId) !== cameraId
+              )
+            ),
+          }
+        : this.summary.dashboard,
+    };
+
+    this.listeners.forEach(listener => listener(this.summary));
+  }
+
+  /**
    * Start polling /api/dashboard-summary
    */
   private startPolling(): void {
@@ -268,6 +304,8 @@ class DashboardSummaryStore {
             const oldHints = this.summary.dashboard.etagHints;
             const newHints = dashboard.etagHints;
             return (
+              oldHints.camerasCount !== newHints.camerasCount ||
+              oldHints.camerasDigest !== newHints.camerasDigest ||
               oldHints.lastEventId !== newHints.lastEventId ||
               oldHints.lastDetectionId !== newHints.lastDetectionId ||
               oldHints.lastJobFireId !== newHints.lastJobFireId ||

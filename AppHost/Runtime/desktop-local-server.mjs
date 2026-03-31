@@ -104,6 +104,25 @@ function summarizeError(error) {
   return String(error || "Unknown error");
 }
 
+function resolveOptionalEnvSecretValue(inlineValue, filePathValue) {
+  const secretPath = String(filePathValue || "").trim();
+  if (secretPath) {
+    const resolvedPath = path.isAbsolute(secretPath)
+      ? secretPath
+      : path.resolve(process.cwd(), secretPath);
+
+    try {
+      return fs.readFileSync(resolvedPath, "utf8").trim();
+    } catch (error) {
+      throw new Error(
+        `Failed to read desktop runtime secret file at ${resolvedPath}: ${String(error)}`
+      );
+    }
+  }
+
+  return String(inlineValue || "").replace(/\\n/g, "\n").trim();
+}
+
 function createWorkerEnv(DB) {
   const configuredGoogleRedirectUri = String(
     process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
@@ -111,6 +130,10 @@ function createWorkerEnv(DB) {
   const configuredDesktopGoogleRedirectUri = String(
     process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || ""
   ).trim();
+  const centralAuthPublicKey = resolveOptionalEnvSecretValue(
+    process.env.CENTRAL_AUTH_PUBLIC_KEY,
+    process.env.CENTRAL_AUTH_PUBLIC_KEY_PATH
+  );
 
   return {
     DB,
@@ -130,6 +153,10 @@ function createWorkerEnv(DB) {
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
+    CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
+    CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
+    CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };
 }
 

@@ -1460,13 +1460,14 @@ static std::string toLowerCopy(std::string s) {
 
 static std::string normalizeInferenceModel_(std::string s) {
     s = toLowerCopy(std::move(s));
-    if (s == "legacy" || s == "pro" || s == "ultra" || s == "light" || s == "core") return s;
+    if (s == "ultra+" || s == "ultra-plus" || s == "ultra_plus") return "ultra_plus";
+    if (s == "legacy" || s == "pro" || s == "ultra" || s == "ultra_plus" || s == "light" || s == "core") return s;
     return "legacy";
 }
 
 static bool isOpenAIInferenceModel_(const std::string& inferenceModel) {
     const std::string m = normalizeInferenceModel_(inferenceModel);
-    return m == "pro" || m == "ultra" || m == "light";
+    return m == "pro" || m == "ultra" || m == "ultra_plus" || m == "light";
 }
 
 static bool isCoreInferenceModel_(const std::string& inferenceModel) {
@@ -1477,6 +1478,7 @@ static std::string openAIModelNameForInferenceModel_(const std::string& inferenc
     const std::string m = normalizeInferenceModel_(inferenceModel);
     if (m == "core") return "GLM-4.6V-Flash";
     if (m == "ultra") return "gpt-5.1";
+    if (m == "ultra_plus") return "gpt-5.4";
     if (m == "light") return "gpt-5.4-mini";
     return "gpt-5-mini"; // "pro" / "legacy"
 }

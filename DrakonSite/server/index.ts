@@ -34,6 +34,25 @@ const appBaseUrl = process.env.APP_BASE_URL || `http://localhost:${port}`;
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
 
+function resolveSecretValue(
+  inlineValue: string | undefined,
+  filePathValue: string | undefined
+) {
+  const secretPath = filePathValue?.trim();
+  if (secretPath) {
+    const resolvedPath = path.isAbsolute(secretPath)
+      ? secretPath
+      : path.resolve(process.cwd(), secretPath);
+    try {
+      return fs.readFileSync(resolvedPath, "utf8").trim();
+    } catch (error) {
+      throw new Error(`Failed to read secret file at ${resolvedPath}: ${String(error)}`);
+    }
+  }
+
+  return (inlineValue || "").replace(/\\n/g, "\n").trim();
+}
+
 type ClosableDatabase = {
   close: () => void;
 };
@@ -63,6 +82,14 @@ async function createDatabase() {
 
 async function startServer() {
   const DB = await createDatabase();
+  const centralAuthPublicKey = resolveSecretValue(
+    process.env.CENTRAL_AUTH_PUBLIC_KEY,
+    process.env.CENTRAL_AUTH_PUBLIC_KEY_PATH
+  );
+  const centralAuthPrivateKey = resolveSecretValue(
+    process.env.CENTRAL_AUTH_PRIVATE_KEY,
+    process.env.CENTRAL_AUTH_PRIVATE_KEY_PATH
+  );
   const env = {
     DB,
     R2_BUCKET,
@@ -81,9 +108,10 @@ async function startServer() {
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    APP_SCHEMA_SCOPE: process.env.APP_SCHEMA_SCOPE || "",
     CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
-    CENTRAL_AUTH_PUBLIC_KEY: process.env.CENTRAL_AUTH_PUBLIC_KEY || "",
-    CENTRAL_AUTH_PRIVATE_KEY: process.env.CENTRAL_AUTH_PRIVATE_KEY || "",
+    CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
+    CENTRAL_AUTH_PRIVATE_KEY: centralAuthPrivateKey,
     CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
     CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };

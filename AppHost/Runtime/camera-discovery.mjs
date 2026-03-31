@@ -35,8 +35,8 @@ const MANUFACTURER_PATTERNS = [
 ];
 
 const DEVICE_KIND_PATTERNS = [
-  { label: "DVR", pattern: /\bdvr\b|digital video recorder/i },
-  { label: "NVR", pattern: /\bnvr\b|network video recorder/i },
+  { label: "DVR", pattern: /\bdvr\b|\bxvr\b|\bmhdx\b|digital video recorder/i },
+  { label: "NVR", pattern: /\bnvr\b|\bnvd\b|network video recorder/i },
   {
     label: "CAMERA",
     pattern:
@@ -839,16 +839,40 @@ function detectDeviceKind(...sources) {
   return "";
 }
 
+function looksLikeGenericManufacturerKindName(value, kindLabel) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return false;
+  }
+
+  const pattern = new RegExp(`^(.+)\\s+${kindLabel}$`, "i");
+  const match = normalized.match(pattern);
+  if (!match || !match[1]) {
+    return false;
+  }
+
+  return Boolean(detectManufacturer(match[1]));
+}
+
 function normalizeDeviceKind(value) {
   const normalized = String(value || "").trim().toUpperCase();
-  if (normalized === "CAMERA" || normalized === "DVR" || normalized === "NVR") {
+  if (
+    normalized === "CAMERA" ||
+    normalized === "DVR" ||
+    normalized === "NVR" ||
+    normalized === "RECORDER"
+  ) {
     return normalized;
   }
   return "UNKNOWN";
 }
 
-function isRecorderKind(value) {
+function isSpecificRecorderKind(value) {
   return value === "DVR" || value === "NVR";
+}
+
+function isRecorderKind(value) {
+  return isSpecificRecorderKind(value) || value === "RECORDER";
 }
 
 function isRecorderChannelFamilyManufacturer(value) {
@@ -867,7 +891,13 @@ function displayDeviceKind(value) {
   if (normalized === "UNKNOWN") {
     return "";
   }
-  return normalized === "CAMERA" ? "Camera" : normalized;
+  if (normalized === "CAMERA") {
+    return "Camera";
+  }
+  if (normalized === "RECORDER") {
+    return "Recorder";
+  }
+  return normalized;
 }
 
 function sanitizeModelGuess(value) {
@@ -898,6 +928,10 @@ function looksLikeGenericCameraName(value, ip = "") {
     return true;
   }
 
+  if (looksLikeGenericManufacturerKindName(normalized, "camera")) {
+    return true;
+  }
+
   return /^camera\s+\d+\.\d+\.\d+\.\d+$/i.test(normalized);
 }
 
@@ -912,11 +946,19 @@ function looksLikeGenericRecorderName(value, ip = "") {
     return true;
   }
 
+  if (looksLikeGenericManufacturerKindName(normalized, "recorder")) {
+    return true;
+  }
+
   return /^recorder(?:\s+\d+\.\d+\.\d+\.\d+)?$/i.test(normalized);
 }
 
 function hasRtspPortOpen(openPorts) {
   return openPorts.some((port) => RTSP_SCAN_PORTS.includes(port));
+}
+
+function hasRecorderControlPort(openPorts) {
+  return openPorts.includes(8000) || openPorts.includes(37777) || openPorts.includes(5544);
 }
 
 function getPreferredRtspPort(openPorts, manufacturerGuess = "") {
@@ -1511,6 +1553,55 @@ function hasSecondaryRecorderChannel(devices) {
   });
 }
 
+function inferRecorderLikeKind(
+  currentKind,
+  manufacturerGuess,
+  openPorts,
+  onvifXaddrs,
+  friendlyName,
+  modelGuess,
+  ip = ""
+) {
+  const normalizedKind = normalizeDeviceKind(currentKind);
+  if (isRecorderKind(normalizedKind)) {
+    return normalizedKind;
+  }
+
+  if (!hasRecorderControlPort(openPorts)) {
+    return normalizedKind;
+  }
+
+  if (!isRecorderChannelFamilyManufacturer(manufacturerGuess)) {
+    return normalizedKind;
+  }
+
+  const hasOnvif = Array.isArray(onvifXaddrs) && onvifXaddrs.length > 0;
+  const genericName =
+    looksLikeGenericCameraName(friendlyName, ip) || looksLikeGenericRecorderName(friendlyName, ip);
+  const hasModelHint = Boolean(String(modelGuess || "").trim());
+  const hasStrongRecorderPort = openPorts.includes(8000) || openPorts.includes(5544);
+  let heuristicScore = 0;
+
+  if (!hasOnvif) {
+    heuristicScore += 1;
+  }
+  if (genericName) {
+    heuristicScore += 1;
+  }
+  if (!hasModelHint) {
+    heuristicScore += 1;
+  }
+  if (hasStrongRecorderPort) {
+    heuristicScore += 1;
+  }
+
+  if (heuristicScore >= 2) {
+    return "RECORDER";
+  }
+
+  return normalizedKind;
+}
+
 function shouldAttemptRecorderChannelInference(
   baseDevice,
   openPorts,
@@ -1798,7 +1889,7 @@ async function scanActiveHost(ip) {
 
   const evidenceStrings = collectProbeStrings(httpProbes, rtspProbe, openPorts);
   const manufacturerGuess = detectManufacturer(...evidenceStrings);
-  const deviceKind = normalizeDeviceKind(
+  const detectedDeviceKind = normalizeDeviceKind(
     detectDeviceKind(
       ...httpProbes.flatMap((probe) => [
         probe.server,
@@ -1808,6 +1899,28 @@ async function scanActiveHost(ip) {
       rtspProbe?.status_line || "",
       rtspProbe?.banner || ""
     )
+  );
+  const realmGuess = uniqueStrings(httpProbes.map((probe) => extractAuthRealm(probe.www_authenticate)))[0] || "";
+  const titleGuess = uniqueStrings(httpProbes.map((probe) => probe.title))[0] || "";
+  const modelGuess =
+    sanitizeModelGuess(titleGuess) ||
+    sanitizeModelGuess(realmGuess) ||
+    sanitizeModelGuess(rtspProbe?.status_line || "");
+  const preKindFriendlyName =
+    sanitizeModelGuess(titleGuess) ||
+    sanitizeModelGuess(realmGuess) ||
+    (manufacturerGuess
+      ? [manufacturerGuess, displayDeviceKind(detectedDeviceKind)].filter(Boolean).join(" ").trim()
+      : "") ||
+    `Camera ${ip}`;
+  const deviceKind = inferRecorderLikeKind(
+    detectedDeviceKind,
+    manufacturerGuess,
+    openPorts,
+    onvifXaddrs,
+    preKindFriendlyName,
+    modelGuess,
+    ip
   );
   if (
     !looksLikeCameraFromActiveProbe(
@@ -1821,12 +1934,6 @@ async function scanActiveHost(ip) {
     return null;
   }
 
-  const realmGuess = uniqueStrings(httpProbes.map((probe) => extractAuthRealm(probe.www_authenticate)))[0] || "";
-  const titleGuess = uniqueStrings(httpProbes.map((probe) => probe.title))[0] || "";
-  const modelGuess =
-    sanitizeModelGuess(titleGuess) ||
-    sanitizeModelGuess(realmGuess) ||
-    sanitizeModelGuess(rtspProbe?.status_line || "");
   const deviceKindLabel = displayDeviceKind(deviceKind);
   const recorderAwareRtspPort =
     getPreferredRtspPort(openPorts, manufacturerGuess) ||
@@ -1888,7 +1995,7 @@ async function scanActiveHost(ip) {
     return [baseDevice];
   }
 
-  const strategyMatch = isRecorderKind(deviceKind)
+  const strategyMatch = isSpecificRecorderKind(deviceKind)
     ? null
     : await detectRecorderChannelStrategy(baseDevice, openPorts);
   if (!isRecorderKind(deviceKind) && !strategyMatch?.strategy) {
@@ -2063,10 +2170,11 @@ function choosePreferredText(currentValue, nextValue, ip) {
     if (!normalized) {
       return 0;
     }
-    if (normalized === ip || normalized === `Camera ${ip}`) {
-      return 1;
-    }
-    if (/^camera\s+\d+\.\d+\.\d+\.\d+$/i.test(normalized)) {
+    if (
+      normalized === ip ||
+      looksLikeGenericCameraName(normalized, ip) ||
+      looksLikeGenericRecorderName(normalized, ip)
+    ) {
       return 1;
     }
     return 2 + Math.min(3, Math.floor(normalized.length / 12));
@@ -2088,13 +2196,56 @@ function choosePreferredDeviceKind(currentValue, nextValue) {
   if (next === "UNKNOWN") {
     return current;
   }
-  if (isRecorderKind(next) && current === "CAMERA") {
+
+  const rank = (kind) => {
+    if (kind === "DVR" || kind === "NVR") {
+      return 4;
+    }
+    if (kind === "RECORDER") {
+      return 3;
+    }
+    if (kind === "CAMERA") {
+      return 2;
+    }
+    return 1;
+  };
+
+  if (rank(next) > rank(current)) {
     return next;
   }
-  if (isRecorderKind(current) && next === "CAMERA") {
-    return current;
-  }
   return current;
+}
+
+function applyDiscoveryPresentationHints(device) {
+  const channelGuess = String(device?.channel_guess || "").trim();
+  if (channelGuess) {
+    const channelLabel = String(device?.channel_label || "").trim() || `Channel ${channelGuess}`;
+    const nextFriendlyName = buildRecorderChannelFriendlyName(
+      device,
+      channelLabel,
+      channelGuess,
+      device?.subtype_guess
+    );
+    if (nextFriendlyName !== String(device?.friendly_name || "").trim()) {
+      return {
+        ...device,
+        friendly_name: nextFriendlyName,
+      };
+    }
+    return device;
+  }
+
+  if (isRecorderKind(normalizeDeviceKind(device?.device_kind_guess))) {
+    const nextFriendlyName = buildRecorderFriendlyName(device);
+    if (nextFriendlyName !== String(device?.friendly_name || "").trim()) {
+      return {
+        ...device,
+        friendly_name: nextFriendlyName,
+      };
+    }
+  }
+
+  return device;
 }
 
 function mergeDiscoveredDevice(existing, next) {
@@ -2220,7 +2371,9 @@ export async function discoverCameraDevices(options = {}) {
 
   const devices = Array.from(mergedByKey.values());
   const macMetadataByIp = await resolveMacMetadataByIp(devices.map((device) => device.ip));
-  const enrichedDevices = devices.map((device) => applyMacMetadataToDevice(device, macMetadataByIp));
+  const enrichedDevices = devices.map((device) =>
+    applyDiscoveryPresentationHints(applyMacMetadataToDevice(device, macMetadataByIp))
+  );
   enrichedDevices.sort(compareDiscoveredDevices);
 
   return {

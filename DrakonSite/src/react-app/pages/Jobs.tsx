@@ -533,6 +533,9 @@ const FIXED_AGENT_INFERENCE_MODEL = "ultra" as const;
 const normalizeAgentInferenceModel = (value: unknown): AgentInferenceModel => {
   if (typeof value !== "string") return FIXED_AGENT_INFERENCE_MODEL;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (
     normalized === "legacy" ||
     normalized === "pro" ||
@@ -812,7 +815,7 @@ interface Target {
 }
 
 type TargetInputType = "video" | "image";
-type AgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
+type AgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type AgentRunEverySeconds = 10 | 60;
 type AgentRunningResolution = 640 | 1024;
 type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
@@ -953,7 +956,7 @@ const getAgentVideoPackagingModeLabel = (mode: AgentVideoPackagingMode): string 
 };
 
 const supportsAdjustableAgentVideoFps = (inferenceModel: AgentInferenceModel): boolean =>
-  inferenceModel === "ultra" || inferenceModel === "light";
+  inferenceModel === "ultra" || inferenceModel === "ultra_plus" || inferenceModel === "light";
 
 const applyAgentExecutionConstraints = (
   inputType: TargetInputType,
@@ -7350,9 +7353,10 @@ function StepCard({
                             className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                             title={t("jobs.inferenceModel")}
                             >
-                              <option value="core">{t("jobs.inferenceModelOption.core")}</option>
-                              <option value="light">{t("jobs.inferenceModelOption.light")}</option>
+                              <option value="ultra_plus">{t("jobs.inferenceModelOption.ultraPlus")}</option>
                               <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
+                              <option value="light">{t("jobs.inferenceModelOption.light")}</option>
+                              <option value="core">{t("jobs.inferenceModelOption.core")}</option>
                             </select>
                             <ModelHostingBadge
                               modelTier={normalizeAgentInferenceModel(agentForm.inference_model)}

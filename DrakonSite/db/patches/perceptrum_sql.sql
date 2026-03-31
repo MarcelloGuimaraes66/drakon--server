@@ -758,7 +758,7 @@ CREATE TABLE public.job_step_agents (
     inference_model text DEFAULT 'ultra'::text NOT NULL,
     run_every integer DEFAULT 60 NOT NULL,
     analysis_regions text,
-    CONSTRAINT job_step_agents_inference_model_chk CHECK ((inference_model = ANY (ARRAY['legacy'::text, 'pro'::text, 'ultra'::text, 'light'::text, 'core'::text]))),
+    CONSTRAINT job_step_agents_inference_model_chk CHECK ((inference_model = ANY (ARRAY['legacy'::text, 'pro'::text, 'ultra'::text, 'ultra_plus'::text, 'light'::text, 'core'::text]))),
     CONSTRAINT job_step_agents_input_type_chk CHECK ((input_type = ANY (ARRAY['video'::text, 'image'::text]))),
     CONSTRAINT job_step_agents_run_every_chk CHECK ((run_every = ANY (ARRAY[10, 30, 60, 300, 600, 1800, 3600, 10800])))
 );

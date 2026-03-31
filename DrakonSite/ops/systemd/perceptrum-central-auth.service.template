@@ -1,0 +1,20 @@
+[Unit]
+Description=Perceptrum Central Auth Backend
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__BACKEND_DIR__
+EnvironmentFile=__ENV_FILE__
+ExecStart=/usr/bin/env bash -lc 'exec ./node_modules/.bin/tsx --tsconfig tsconfig.worker.json server/index.ts'
+Restart=always
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=15
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

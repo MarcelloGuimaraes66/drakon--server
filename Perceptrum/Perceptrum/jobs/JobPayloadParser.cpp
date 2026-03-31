@@ -116,7 +116,8 @@ static std::string normalizeInferenceModelName(std::string v) {
     while (!v.empty() && is_space((unsigned char)v.front())) v.erase(v.begin());
     while (!v.empty() && is_space((unsigned char)v.back())) v.pop_back();
     for (char& c : v) c = (char)std::tolower((unsigned char)c);
-    if (v == "legacy" || v == "pro" || v == "ultra" || v == "light" || v == "core") return v;
+    if (v == "ultra+" || v == "ultra-plus" || v == "ultra_plus") return "ultra_plus";
+    if (v == "legacy" || v == "pro" || v == "ultra" || v == "ultra_plus" || v == "light" || v == "core") return v;
     return "legacy";
 }
 

@@ -16,6 +16,7 @@ import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { getCameraConnectionState, isCameraServiceRunning } from "@/react-app/lib/cameraStatus";
+import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import {
   createCamerasFromDiscoveryImport,
@@ -98,6 +99,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   } = useOnboarding();
   const tutorialModalRequestStepRef = useRef<string | null>(null);
   const onboardingOwnedEditorRef = useRef(false);
+  const refreshDashboardSummary = useCallback(() => {
+    dashboardSummaryStore.refresh();
+  }, []);
 
   const sortedCameras = useMemo(
     () =>
@@ -275,6 +279,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
     const result = await createCamerasFromDiscoveryImport(request);
     await refreshCameras();
+    refreshDashboardSummary();
     if (result.failures.length > 0) {
       throw new Error(formatDiscoveryImportErrorMessage(result));
     }
@@ -289,6 +294,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
   const handleEditorSaved = async (saved?: CameraEditorSavedResult) => {
     const refreshedCameras = await refreshCameras();
+    refreshDashboardSummary();
     if (onboardingStepId === "camera-webcam-save") {
       completeCameraTutorial(findSavedCameraId(refreshedCameras, saved));
     }
@@ -296,6 +302,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
   const handleImportSaved = async () => {
     await refreshCameras();
+    refreshDashboardSummary();
   };
 
   const handleDelete = async (cameraId: number) => {
@@ -304,7 +311,17 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     }
 
     try {
-      await fetch(`/api/cameras/${cameraId}`, { method: "DELETE" });
+      const response = await fetch(`/api/cameras/${cameraId}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to delete camera (${response.status})`);
+      }
+
+      dashboardSummaryStore.removeCameraLocal(cameraId);
+      refreshDashboardSummary();
       await refreshCameras();
 
       if (editorCamera?.id === cameraId) {
@@ -366,6 +383,13 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
         is_service_running: result.nextRunning,
       });
 
+      dashboardSummaryStore.patchCameraLocal(camera.id, {
+        is_service_running: result.nextRunning,
+        ...(result.nextRunning === 0
+          ? { thumbnail_url: null, last_thumbnail_update: null }
+          : {}),
+      });
+      refreshDashboardSummary();
       void refreshCameras();
     } catch (error) {
       console.error("Failed to toggle service:", error);

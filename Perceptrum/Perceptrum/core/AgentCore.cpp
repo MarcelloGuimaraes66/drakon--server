@@ -4955,7 +4955,9 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
             const std::string defaultOpenAIModelName =
                 (ac.inferenceModel == "ultra")
                 ? "gpt-5.1"
-                : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini");
+                : ((ac.inferenceModel == "ultra_plus")
+                    ? "gpt-5.4"
+                    : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini"));
             if (ac.modelName.empty()) {
                 ac.modelName = defaultOpenAIModelName;
             }
@@ -6326,7 +6328,9 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 const std::string defaultOpenAIModelName =
                     (ac.inferenceModel == "ultra")
                     ? "gpt-5.1"
-                    : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini");
+                    : ((ac.inferenceModel == "ultra_plus")
+                        ? "gpt-5.4"
+                        : ((ac.inferenceModel == "light") ? "gpt-5.4-mini" : "gpt-5-mini"));
                 if (ac.modelName.empty()) {
                     ac.modelName = defaultOpenAIModelName;
                 }
@@ -8133,7 +8137,10 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
             }
             std::transform(tier.begin(), tier.end(), tier.begin(),
                 [](unsigned char c) { return (char)std::tolower(c); });
-            if (tier == "core" || tier == "ultra" || tier == "light" || tier == "pro" || tier == "legacy") {
+            if (tier == "ultra+" || tier == "ultra-plus" || tier == "ultra_plus") {
+                return std::string("ultra_plus");
+            }
+            if (tier == "core" || tier == "ultra" || tier == "ultra_plus" || tier == "light" || tier == "pro" || tier == "legacy") {
                 return tier;
             }
             return std::string("ultra");
@@ -8144,7 +8151,9 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
             ? std::string("GLM-4.6V-Flash")
             : ((normalizedTier == "ultra")
                 ? std::string("gpt-5.1")
-                : ((normalizedTier == "light") ? std::string("gpt-5.4-mini") : std::string("gpt-5-mini")));
+                : ((normalizedTier == "ultra_plus")
+                    ? std::string("gpt-5.4")
+                    : ((normalizedTier == "light") ? std::string("gpt-5.4-mini") : std::string("gpt-5-mini"))));
         auto extractRouterText = [](const json& responseJson) {
             if (!responseJson.contains("choices") ||
                 !responseJson["choices"].is_array() ||
@@ -11945,11 +11954,15 @@ static std::string formatTsHumanBR(const std::string& ts) {
 
 static std::string normalizeChatModelTierName(std::string tier)
 {
+    tier = trimAscii(tier);
     for (auto& c : tier) {
         c = (char)std::tolower((unsigned char)c);
     }
 
-    if (tier == "legacy" || tier == "pro" || tier == "ultra" || tier == "light" || tier == "core") {
+    if (tier == "ultra+" || tier == "ultra-plus" || tier == "ultra_plus") {
+        return "ultra_plus";
+    }
+    if (tier == "legacy" || tier == "pro" || tier == "ultra" || tier == "ultra_plus" || tier == "light" || tier == "core") {
         return tier;
     }
     if (tier == "plus") {
@@ -12073,7 +12086,7 @@ static int normalizeChatRunningResolutionValue(int value)
 static bool isOpenAIChatModelTier(const std::string& tier)
 {
     const std::string normalized = normalizeChatModelTierName(tier);
-    return normalized == "pro" || normalized == "ultra" || normalized == "light" || normalized == "core";
+    return normalized == "pro" || normalized == "ultra" || normalized == "ultra_plus" || normalized == "light" || normalized == "core";
 }
 
 static std::string chatOpenAIModelNameForTier(const std::string& tier)
@@ -12081,6 +12094,7 @@ static std::string chatOpenAIModelNameForTier(const std::string& tier)
     const std::string normalized = normalizeChatModelTierName(tier);
     if (normalized == "core") return "GLM-4.6V-Flash";
     if (normalized == "ultra") return "gpt-5.1";
+    if (normalized == "ultra_plus") return "gpt-5.4";
     if (normalized == "light") return "gpt-5.4-mini";
     return "gpt-5-mini";
 }
@@ -13813,7 +13827,7 @@ static std::string pickGeminiModelName(
     if (t == "legacy") {
         return "gemini-3-flash-preview";
     }
-    if (t == "ultra" || t == "light") {
+    if (t == "ultra" || t == "ultra_plus" || t == "light") {
         return "gemini-3-flash-preview";
     }
     if (t == "pro") {
@@ -14970,8 +14984,28 @@ namespace {
 
     static std::string resolveOpenAIImageDetailForModel_(const std::string& modelName)
     {
-        (void)modelName;
-        return std::string("low");
+        std::string normalized = modelName;
+        const auto first = std::find_if_not(normalized.begin(), normalized.end(),
+            [](unsigned char c) { return std::isspace(c) != 0; });
+        const auto last = std::find_if_not(normalized.rbegin(), normalized.rend(),
+            [](unsigned char c) { return std::isspace(c) != 0; }).base();
+
+        if (first >= last) {
+            normalized.clear();
+        }
+        else {
+            normalized.assign(first, last);
+        }
+
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+
+        const bool isGpt54 =
+            normalized == "gpt-5.4" ||
+            (normalized.rfind("gpt-5.4-", 0) == 0 &&
+                normalized != "gpt-5.4-mini" &&
+                normalized.rfind("gpt-5.4-mini-", 0) != 0);
+        return isGpt54 ? std::string("high") : std::string("low");
     }
 
     static nlohmann::json makeOpenAIImageContentFromBareJpeg(
@@ -15059,11 +15093,11 @@ namespace {
             newH = (std::max)(1, static_cast<int>(std::round(height * scale)));
         }
         else if (isGpt54MiniModelLocal(modelName)) {
-            // Keep light-model low-detail requests cheaper by capping only high-res frames.
-            constexpr int kBypassW = 1024;
-            constexpr int kBypassH = 576;
-            constexpr int kMaxW = 768;
-            constexpr int kMaxH = 432;
+            // Keep light-model low-detail requests cheaper by capping frames more aggressively.
+            constexpr int kBypassW = 640;
+            constexpr int kBypassH = 360;
+            constexpr int kMaxW = 640;
+            constexpr int kMaxH = 360;
             if (width <= kBypassW && height <= kBypassH) {
                 return bareJpegBase64;
             }
@@ -16326,6 +16360,8 @@ namespace {
         const std::string normalized = normalizeOpenAIModelName_(modelName);
         return normalized == "gpt-5.1" ||
             normalized.rfind("gpt-5.1-", 0) == 0 ||
+            normalized == "gpt-5.4" ||
+            normalized.rfind("gpt-5.4-", 0) == 0 ||
             normalized == "gpt-5.4-mini" ||
             normalized.rfind("gpt-5.4-mini-", 0) == 0;
     }
@@ -16647,7 +16683,14 @@ namespace {
         if (!supportsCaching || trimAscii(cacheKey).empty()) {
             return "disabled";
         }
-        if (normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0) {
+        const bool supports24HourRetention =
+            normalized == "gpt-5.1" ||
+            normalized.rfind("gpt-5.1-", 0) == 0 ||
+            normalized == "gpt-5.4" ||
+            (normalized.rfind("gpt-5.4-", 0) == 0 &&
+                normalized != "gpt-5.4-mini" &&
+                normalized.rfind("gpt-5.4-mini-", 0) != 0);
+        if (supports24HourRetention) {
             return "24h";
         }
         return "in_memory";
@@ -16748,7 +16791,12 @@ namespace {
     static bool supportsOpenAIPromptCacheRetention24h_(const std::string& modelName)
     {
         const std::string normalized = normalizeOpenAIModelName_(modelName);
-        return normalized == "gpt-5.1" || normalized.rfind("gpt-5.1-", 0) == 0;
+        return normalized == "gpt-5.1" ||
+            normalized.rfind("gpt-5.1-", 0) == 0 ||
+            normalized == "gpt-5.4" ||
+            (normalized.rfind("gpt-5.4-", 0) == 0 &&
+                normalized != "gpt-5.4-mini" &&
+                normalized.rfind("gpt-5.4-mini-", 0) != 0);
     }
 
     static bool supportsOpenAIJsonSchemaResponseFormat_(const std::string& modelName)

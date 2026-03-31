@@ -31,7 +31,7 @@ export type PendingExecutionState =
       ageSeconds?: number | null;
     };
 
-type ChatModelTier = "legacy" | "pro" | "ultra" | "light" | "core";
+type ChatModelTier = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 const FIXED_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
@@ -47,6 +47,7 @@ const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   legacy: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   pro: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  ultra_plus: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
 };
@@ -109,6 +110,7 @@ function getCancelledAssistantMessage(reason: NonNullable<CancelMessageOptions["
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return FIXED_CHAT_MODEL_TIER;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") return "ultra_plus";
   if (normalized === "core") return "core";
   if (normalized === "ultra") return "ultra";
   if (normalized === "light") return "light";

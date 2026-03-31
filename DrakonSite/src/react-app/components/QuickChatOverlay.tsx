@@ -17,7 +17,7 @@ import {
 } from "@/react-app/utils/chatUtils";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
-type ChatModelTier = "ultra" | "light" | "core";
+type ChatModelTier = "ultra" | "ultra_plus" | "light" | "core";
 type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
@@ -27,16 +27,20 @@ const QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  ultra_plus: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
 };
 
 const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
-  tier === "ultra" || tier === "light";
+  tier === "ultra" || tier === "ultra_plus" || tier === "light";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (normalized === "core") return "core";
   if (normalized === "light") return "light";
   return "ultra";
@@ -101,6 +105,7 @@ export default function QuickChatOverlay() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const modelLabels: Record<ChatModelTier, string> = {
+    ultra_plus: "Ultra+",
     ultra: "Ultra",
     light: "Light",
     core: "Core",

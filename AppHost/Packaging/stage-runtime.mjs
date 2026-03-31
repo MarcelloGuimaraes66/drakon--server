@@ -33,6 +33,9 @@ const desktopRuntimeEnvKeys = [
   "STRIPE_CHAT_PAYG_PRICE_ID",
   "USD_TO_BRL",
   "SCHEDULER_TICK_SECRET",
+  "CENTRAL_AUTH_BASE_URL",
+  "CENTRAL_AUTH_GRANT_TTL_HOURS",
+  "CENTRAL_AUTH_KEY_ID",
 ];
 
 function parseArgs(argv) {
@@ -171,6 +174,30 @@ async function stageDesktopRuntimeEnv() {
     }
   }
 
+  const centralAuthPublicKey = await resolveDesktopCentralAuthPublicKey(sourceLocalEnv);
+  const centralAuthBaseUrl = String(runtimeEnv.CENTRAL_AUTH_BASE_URL || "").trim();
+  const centralAuthConfigured = Boolean(
+    centralAuthBaseUrl ||
+      centralAuthPublicKey ||
+      resolveRuntimeEnvValue("CENTRAL_AUTH_PUBLIC_KEY_PATH", sourceLocalEnv)
+  );
+
+  if (centralAuthConfigured) {
+    if (!centralAuthBaseUrl) {
+      throw new Error(
+        "Desktop runtime central auth is partially configured: CENTRAL_AUTH_BASE_URL is required."
+      );
+    }
+    if (!centralAuthPublicKey) {
+      throw new Error(
+        "Desktop runtime central auth is partially configured: CENTRAL_AUTH_PUBLIC_KEY or CENTRAL_AUTH_PUBLIC_KEY_PATH is required."
+      );
+    }
+
+    runtimeEnv.CENTRAL_AUTH_BASE_URL = centralAuthBaseUrl;
+    runtimeEnv.CENTRAL_AUTH_PUBLIC_KEY = centralAuthPublicKey;
+  }
+
   if (activeBrand.features?.googleLoginEnabled) {
     ensureRequiredRuntimeEnv(runtimeEnv, [
       "GOOGLE_OAUTH_CLIENT_ID",
@@ -182,9 +209,6 @@ async function stageDesktopRuntimeEnv() {
     "DESKTOP_GOOGLE_OAUTH_REDIRECT_URI",
     sourceLocalEnv
   );
-  if (!desktopGoogleRedirectUri && activeBrand.features?.googleLoginEnabled) {
-    desktopGoogleRedirectUri = resolveDefaultDesktopGoogleRedirectUri();
-  }
   if (desktopGoogleRedirectUri) {
     runtimeEnv.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI = desktopGoogleRedirectUri;
   }
@@ -214,17 +238,28 @@ function resolveRuntimeEnvValue(key, sourceEnv) {
   return String(sourceEnv[key] || "").trim();
 }
 
-function resolveDefaultDesktopGoogleRedirectUri() {
-  const siteUrl = String(activeBrand.siteUrl || "").trim();
-  if (!siteUrl) {
+async function resolveDesktopCentralAuthPublicKey(sourceEnv) {
+  const inlineValue = resolveRuntimeEnvValue("CENTRAL_AUTH_PUBLIC_KEY", sourceEnv);
+  if (inlineValue) {
+    return inlineValue;
+  }
+
+  const configuredPath = resolveRuntimeEnvValue("CENTRAL_AUTH_PUBLIC_KEY_PATH", sourceEnv);
+  if (!configuredPath) {
     return "";
   }
 
-  try {
-    return new URL("/auth/callback", siteUrl).toString();
-  } catch {
-    return "";
+  const resolvedPath = path.isAbsolute(configuredPath)
+    ? configuredPath
+    : path.resolve(drakonSiteRoot, configuredPath);
+
+  if (!(await exists(resolvedPath))) {
+    throw new Error(
+      `Desktop runtime central auth public key file was not found at ${resolvedPath}`
+    );
   }
+
+  return (await fs.readFile(resolvedPath, "utf8")).trim();
 }
 
 function ensureRequiredRuntimeEnv(envMap, requiredKeys) {

@@ -71,7 +71,7 @@ function normalizeTier(tier: string | null | undefined): ModelTier {
 }
 
 type TargetInputType = "video" | "image";
-type AgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
+type AgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 const FIXED_AGENT_INFERENCE_MODEL: AgentInferenceModel = "ultra";
 type AgentRunEverySeconds = 10 | 60;
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
@@ -165,6 +165,10 @@ const DEFAULT_MODEL_RUNTIME_CONFIG: Record<AgentInferenceModel, ModelRuntimeConf
     api_key: "",
     model_fps: 1,
   },
+  ultra_plus: {
+    api_key: "",
+    model_fps: 1,
+  },
   light: {
     api_key: "",
     model_fps: 1,
@@ -225,10 +229,14 @@ function normalizePriorityLevel(value: unknown): string | null {
 function normalizeInferenceModel(value: unknown): AgentInferenceModel {
   if (typeof value !== "string") return FIXED_AGENT_INFERENCE_MODEL;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "ultra_plus" ||
     normalized === "light" ||
     normalized === "core"
   ) {
@@ -823,6 +831,7 @@ async function loadModelRuntimeConfigForPayload(
     legacy: { ...DEFAULT_MODEL_RUNTIME_CONFIG.legacy },
     pro: { ...DEFAULT_MODEL_RUNTIME_CONFIG.pro },
     ultra: { ...DEFAULT_MODEL_RUNTIME_CONFIG.ultra },
+    ultra_plus: { ...DEFAULT_MODEL_RUNTIME_CONFIG.ultra_plus },
     light: { ...DEFAULT_MODEL_RUNTIME_CONFIG.light },
     core: { ...DEFAULT_MODEL_RUNTIME_CONFIG.core },
   };
@@ -860,6 +869,7 @@ async function loadModelRuntimeConfigForPayload(
     modelRuntimeConfig.legacy.api_key = normalizedOpenAiApiKey;
     modelRuntimeConfig.pro.api_key = normalizedOpenAiApiKey;
     modelRuntimeConfig.ultra.api_key = normalizedOpenAiApiKey;
+    modelRuntimeConfig.ultra_plus.api_key = normalizedOpenAiApiKey;
     modelRuntimeConfig.light.api_key = normalizedOpenAiApiKey;
   }
   const normalizedZAiApiKey = normalizeOpenAIApiKeyInput(zAiApiKey);

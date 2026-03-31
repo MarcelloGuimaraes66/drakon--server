@@ -56,7 +56,12 @@ function normalizeDeviceKind(
     .trim()
     .toUpperCase();
 
-  if (normalized === "CAMERA" || normalized === "DVR" || normalized === "NVR") {
+  if (
+    normalized === "CAMERA" ||
+    normalized === "DVR" ||
+    normalized === "NVR" ||
+    normalized === "RECORDER"
+  ) {
     return normalized;
   }
 

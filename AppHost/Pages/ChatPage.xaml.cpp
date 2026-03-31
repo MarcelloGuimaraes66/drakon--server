@@ -205,6 +205,7 @@ namespace winrt::DrakonDesktop::implementation
         resolutionCombo.Items().Clear();
 
         for (auto const& [label, tag] : {
+            std::pair{ L"Ultra+", L"ultra_plus" },
             std::pair{ L"Ultra", L"ultra" },
             std::pair{ L"Light", L"light" },
             std::pair{ L"Core", L"core" }

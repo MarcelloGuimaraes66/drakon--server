@@ -56,7 +56,7 @@ struct JobAgentDef {
     std::optional<int> camera_id; // null means default
 
     std::string priority_level;
-    std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "light" | "core"
+    std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core"
     std::string api_key;
     int model_fps = 1;
     int run_every_seconds = 10;
@@ -114,7 +114,7 @@ struct JobInferenceGroup {
     std::string video_packaging_mode = "mosaic_3x3"; // payload field: videoPackagingMode
     std::vector<int> target_ids;    // ids of JobTarget inside this step (payload field: targetIds)
     std::string priority_level;
-    std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "light" | "core"
+    std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core"
     std::string api_key;
     int model_fps = 1;
     int run_every_seconds = 10;

@@ -271,6 +271,8 @@ export default function Login() {
     activeTab === "login"
       ? isEmailValid && password.length > 0
       : signupBlockingReasons.length === 0;
+  const isGoogleSignupBlocked =
+    activeTab === "signup" && (!agreeTerms || !hasSelectedCountry);
 
   const handleLocalSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -371,6 +373,18 @@ export default function Login() {
 
   const handleGoogleLogin = async () => {
     setError("");
+
+    if (activeTab === "signup") {
+      if (!agreeTerms) {
+        setError(t("login.errorAgreeTerms"));
+        return;
+      }
+      if (!hasSelectedCountry) {
+        setError(t("login.errorSelectCountry"));
+        return;
+      }
+    }
+
     setIsGoogleLoading(true);
     try {
       await redirectToLogin(countryCode || detectedCountry || null);
@@ -578,7 +592,7 @@ export default function Login() {
                     <button
                       type="button"
                       onClick={handleGoogleLogin}
-                      disabled={isLoading || isGoogleLoading}
+                      disabled={isLoading || isGoogleLoading || isGoogleSignupBlocked}
                       className={iconButtonClass}
                       aria-label={t("login.continueWithGoogle")}
                     >
@@ -792,7 +806,7 @@ export default function Login() {
                     <button
                       type="button"
                       onClick={handleGoogleLogin}
-                      disabled={isLoading || isGoogleLoading}
+                      disabled={isLoading || isGoogleLoading || isGoogleSignupBlocked}
                       className={iconButtonClass}
                       aria-label={t("login.continueWithGoogle")}
                     >

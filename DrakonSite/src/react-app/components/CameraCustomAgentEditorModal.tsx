@@ -111,7 +111,7 @@ const FACE_TARGET_MAX_IMAGES = 4;
 const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
-type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "light" | "core";
+type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
 const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
@@ -185,10 +185,14 @@ const normalizeInferenceModel = (
 ): CameraAgentInferenceModel => {
   if (typeof value !== "string") return fallback;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "ultra_plus" ||
     normalized === "light" ||
     normalized === "core"
   ) {
@@ -198,7 +202,7 @@ const normalizeInferenceModel = (
 };
 
 const supportsAdjustableVideoFps = (model: CameraAgentInferenceModel): boolean =>
-  model === "ultra" || model === "light";
+  model === "ultra" || model === "ultra_plus" || model === "light";
 
 const normalizeRunningResolution = (
   value: unknown,
@@ -1641,6 +1645,7 @@ export default function CameraCustomAgentEditorModal({
                   className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                   title={t("jobs.inferenceModel")}
                 >
+                  <option value="ultra_plus">{t("jobs.inferenceModelOption.ultraPlus")}</option>
                   <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
                   <option value="light">{t("jobs.inferenceModelOption.light")}</option>
                   <option value="core">{t("jobs.inferenceModelOption.core")}</option>

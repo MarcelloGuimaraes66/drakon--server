@@ -54,7 +54,7 @@ type BuildEnabledAlgorithmsArgs = {
   algorithmDisplayNames?: Record<string, string>;
 };
 
-type CameraCustomInferenceModel = "legacy" | "pro" | "ultra" | "core";
+type CameraCustomInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type CameraCustomRunEvery = 10 | 60;
 type CameraCustomRunningResolution = 640 | 1024;
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
@@ -434,10 +434,15 @@ const parseConfigJson = (value: unknown): Record<string, any> => {
 const normalizeInferenceModel = (value: unknown): CameraCustomInferenceModel => {
   if (typeof value !== "string") return FIXED_CAMERA_CUSTOM_INFERENCE_MODEL;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (
     normalized === "legacy" ||
     normalized === "pro" ||
     normalized === "ultra" ||
+    normalized === "ultra_plus" ||
+    normalized === "light" ||
     normalized === "core"
   ) {
     return normalized;
@@ -480,7 +485,14 @@ const normalizeExecutionSettings = (
 
   const inputType = normalizeCameraAgentInputType(rawInputType);
   const runEvery = normalizeCameraAgentRunEvery(rawRunEvery, DEFAULT_CAMERA_CUSTOM_RUN_EVERY);
-  const modelName = inferenceModel === "ultra" ? "gpt-5.1" : "gpt-5-mini";
+  const modelName =
+    inferenceModel === "ultra"
+      ? "gpt-5.1"
+      : inferenceModel === "ultra_plus"
+      ? "gpt-5.4"
+      : inferenceModel === "light"
+      ? "gpt-5.4-mini"
+      : "gpt-5-mini";
   return {
     inputType,
     videoPackagingMode,
@@ -488,11 +500,11 @@ const normalizeExecutionSettings = (
     runEvery,
     runningResolution: null,
     modelFps:
-      inferenceModel === "ultra" && inputType === "video"
+      (inferenceModel === "ultra" || inferenceModel === "ultra_plus") && inputType === "video"
         ? normalizeCameraAgentModelFps(rawModelFps)
         : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
     modelName,
-    validatorModelName: "gpt-5.1",
+    validatorModelName: modelName,
   };
 };
 

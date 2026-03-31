@@ -18,6 +18,7 @@ declare global {
     USD_TO_BRL?: string;
     SCHEDULER_TICK_SECRET?: string;
     CHAT_V2_ENABLED?: string;
+    APP_SCHEMA_SCOPE?: string;
     CENTRAL_AUTH_BASE_URL?: string;
     CENTRAL_AUTH_PUBLIC_KEY?: string;
     CENTRAL_AUTH_PRIVATE_KEY?: string;

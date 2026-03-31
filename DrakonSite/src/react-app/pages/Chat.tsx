@@ -25,7 +25,7 @@ import {
 } from "@/react-app/utils/coreModelNotice";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
-type ChatModelTier = "ultra" | "light" | "core";
+type ChatModelTier = "ultra" | "ultra_plus" | "light" | "core";
 type ChatRunningResolution = 640 | 1024;
 type ChatHeaderDropdown = "fps" | "resolution" | "model" | null;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
@@ -36,16 +36,20 @@ const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 
 const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
   ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  ultra_plus: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
   core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
 };
 
 const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
-  tier === "ultra" || tier === "light";
+  tier === "ultra" || tier === "ultra_plus" || tier === "light";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
   const normalized = value.trim().toLowerCase();
+  if (normalized === "ultra+" || normalized === "ultra-plus" || normalized === "ultra_plus") {
+    return "ultra_plus";
+  }
   if (normalized === "core") return "core";
   if (normalized === "light") return "light";
   return "ultra";
@@ -503,6 +507,7 @@ export default function Chat() {
   };
 
   const modelLabels: Record<ChatModelTier, string> = {
+    ultra_plus: t("jobs.inferenceModelOption.ultraPlus"),
     ultra: t("jobs.inferenceModelOption.ultra"),
     light: t("jobs.inferenceModelOption.light"),
     core: t("jobs.inferenceModelOption.core"),
@@ -879,6 +884,18 @@ export default function Chat() {
 
                   {canChangeModelTier && openHeaderDropdown === "model" && (
                       <div className="absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
+                        <button
+                          onClick={() => handleModelSelect("ultra_plus")}
+                          className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium">{t("jobs.inferenceModelOption.ultraPlus")}</span>
+                            <div className="flex items-center gap-2">
+                              <ModelHostingBadge modelTier="ultra_plus" compact />
+                              {modelTier === "ultra_plus" && <span className="text-blue-300">&#10003;</span>}
+                            </div>
+                          </div>
+                        </button>
                         <button
                           onClick={() => handleModelSelect("ultra")}
                           className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
