@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
@@ -7,6 +8,13 @@ import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
 import ScheduleBuilder from "@/react-app/components/ScheduleBuilder";
+import JobsBoardView, { type JobsBoardCardData } from "@/react-app/components/jobs/JobsBoardView";
+import JobCreateView from "@/react-app/components/jobs/JobCreateView";
+import JobFlowView from "@/react-app/components/jobs/JobFlowView";
+import JobsTabs from "@/react-app/components/jobs/JobsTabs";
+import StepFlowCard from "@/react-app/components/jobs/StepFlowCard";
+import CameraTargetCard from "@/react-app/components/jobs/CameraTargetCard";
+import type { KnowledgeShareConnection } from "@/react-app/components/jobs/KnowledgeShareCanvas";
 import {
   parseScheduleFromDescription,
   formatDateTimeLocal,
@@ -38,6 +46,8 @@ import {
   Minimize2,
   Play,
   StopCircle,
+  SlidersHorizontal,
+  Settings,
 } from "lucide-react";
 import {
   FACE_ID_MAX_IMAGE_SIDE_PX,
@@ -74,6 +84,8 @@ interface Job {
   runtime_status?: 'running' | 'stopping' | 'stopped' | 'failed' | 'completed' | 'staled' | null;
   runtime_started_at_utc?: string | null;
   runtime_updated_at?: string | null;
+  step_count?: number | null;
+  target_count?: number | null;
 }
 
 interface Step {
@@ -94,6 +106,7 @@ interface Step {
 interface StepPipelineConfig {
   input_from_step_id: number;
   input_inject_keys: string[];
+  input_target_ids?: number[];
   target_camera_id?: number | null;
   target_camera_name?: string | null;
 }
@@ -102,8 +115,12 @@ interface PipelineFormRow {
   id: string;
   input_from_step_id: string;
   input_inject_keys: string[];
+  input_target_ids: string[];
   target_camera_id: string;
 }
+
+type JobsViewMode = "list" | "create" | "steps";
+type FlowDensity = "normal" | "compact";
 
 type PromptEditorFields = {
   prompt_template: string;
@@ -744,6 +761,14 @@ const parsePipelinesFromStep = (step: Step): StepPipelineConfig[] => {
                   : []
               );
               if (keys.length === 0) return null;
+              const targetIdsRaw: unknown[] = Array.isArray(p?.input_target_ids) ? p.input_target_ids : [];
+              const inputTargetIds = Array.from(
+                new Set(
+                  targetIdsRaw
+                    .map((value: unknown) => Number(value))
+                    .filter((value: number) => Number.isInteger(value) && value > 0)
+                )
+              );
               const targetCameraIdRaw = p?.target_camera_id;
               const targetCameraId =
                 targetCameraIdRaw === null || targetCameraIdRaw === undefined || targetCameraIdRaw === ""
@@ -755,6 +780,7 @@ const parsePipelinesFromStep = (step: Step): StepPipelineConfig[] => {
               return {
                 input_from_step_id: fromStepId,
                 input_inject_keys: keys,
+                input_target_ids: inputTargetIds,
                 target_camera_id: Number.isFinite(targetCameraId) ? targetCameraId : null,
                 target_camera_name: targetCameraName || null,
               };
@@ -779,6 +805,7 @@ const parsePipelinesFromStep = (step: Step): StepPipelineConfig[] => {
       {
         input_from_step_id: step.input_from_step_id,
         input_inject_keys: [step.input_inject_key],
+        input_target_ids: [],
         target_camera_id: null,
       },
     ];
@@ -794,6 +821,7 @@ const buildPipelineFormRows = (pipelines: StepPipelineConfig[], stepId: number):
         id: `pipeline-${stepId}-0`,
         input_from_step_id: "",
         input_inject_keys: [],
+        input_target_ids: [],
         target_camera_id: "",
       },
     ];
@@ -802,6 +830,9 @@ const buildPipelineFormRows = (pipelines: StepPipelineConfig[], stepId: number):
     id: `pipeline-${stepId}-${idx}-${p.input_from_step_id}`,
     input_from_step_id: String(p.input_from_step_id),
     input_inject_keys: [...p.input_inject_keys],
+    input_target_ids: Array.isArray(p.input_target_ids)
+      ? p.input_target_ids.map((value) => String(value))
+      : [],
     target_camera_id: p.target_camera_id != null ? String(p.target_camera_id) : "",
   }));
 };
@@ -1078,10 +1109,48 @@ const hourMinutePartsToTimeoutSeconds = (hours: number, minutes: number): number
   return Math.max(MIN_STEP_TIMEOUT_SECONDS, (safeHours * 60 + safeMinutes) * 60);
 };
 
+const durationSecondsToHourMinuteParts = (
+  durationSeconds: number
+): { hours: number; minutes: number } => {
+  const safeSeconds = Number.isFinite(durationSeconds) ? Math.max(0, Math.floor(durationSeconds)) : 0;
+  const totalMinutes = Math.floor(safeSeconds / 60);
+  return {
+    hours: Math.floor(totalMinutes / 60),
+    minutes: totalMinutes % 60,
+  };
+};
+
+const hourMinutePartsToDurationSeconds = (hours: number, minutes: number): number => {
+  const safeHours = Number.isFinite(hours) ? Math.max(0, Math.floor(hours)) : 0;
+  const safeMinutesRaw = Number.isFinite(minutes) ? Math.floor(minutes) : 0;
+  const safeMinutes = Math.min(59, Math.max(0, safeMinutesRaw));
+  return (safeHours * 60 + safeMinutes) * 60;
+};
+
+const formatDurationHuman = (durationSeconds: number): string => {
+  const safeSeconds = Number.isFinite(durationSeconds) ? Math.max(0, Math.floor(durationSeconds)) : 0;
+  const totalMinutes = Math.floor(safeSeconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
+  if (hours > 0) return `${hours}h`;
+  return `${minutes}m`;
+};
+
 const parseNonNegativeIntegerInput = (value: string): number => {
   const parsed = parseInt(value, 10);
   return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
 };
+
+const getJobsViewModeFromParams = (params: URLSearchParams): JobsViewMode => {
+  const raw = params.get("view");
+  if (raw === "create" || raw === "steps") return raw;
+  return "list";
+};
+
+const buildCameraAnchorKey = (stepId: number, targetId: number): string =>
+  `step-${stepId}-target-${targetId}`;
 
 const formatStepTimeoutHuman = (timeoutSeconds: number): string => {
   const normalizedSeconds = normalizeTimeoutForHourMinuteUi(timeoutSeconds);
@@ -1256,10 +1325,13 @@ const getNegativeReferenceImageCount = (
 export default function JobsPage() {
   const { t, i18n } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const jobsViewMode = useMemo(() => getJobsViewModeFromParams(searchParams), [searchParams]);
+  const useModernJobsLayout = useMemo(() => searchParams.get("layout") !== "legacy", [searchParams]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [steps, setSteps] = useState<Step[]>([]);
+  const [stepTargetsByStepId, setStepTargetsByStepId] = useState<Record<number, Target[]>>({});
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
   const [_scheduleMode, _setScheduleMode] = useState<"recurring">("recurring");
@@ -1273,6 +1345,7 @@ export default function JobsPage() {
   const [activeFrom, setActiveFrom] = useState("");
   const [activeUntil, setActiveUntil] = useState("");
   const [showNewStepForm, setShowNewStepForm] = useState(false);
+  const [flowDensity, setFlowDensity] = useState<FlowDensity>("normal");
   const [newStep, setNewStep] = useState({
     name: "",
     step_order: 1,
@@ -1280,6 +1353,7 @@ export default function JobsPage() {
   });
   const [editingJob, setEditingJob] = useState(false);
   const [editJobForm, setEditJobForm] = useState({
+    name: "",
     start_at: "",
     end_at: "",
   });
@@ -1302,6 +1376,8 @@ export default function JobsPage() {
     isOpen: false,
     stepId: null,
   });
+  const [cameraAnchorElements, setCameraAnchorElements] = useState<Record<string, HTMLDivElement | null>>({});
+  const flowContainerRef = useRef<HTMLDivElement | null>(null);
   const selectedJobMaxTimeoutSeconds = useMemo(
     () => getJobMaxStepTimeoutSeconds(selectedJob),
     [selectedJob]
@@ -1387,22 +1463,30 @@ export default function JobsPage() {
     }
   }, [newJob.name]);
 
-  const setSelectedJobSearchParam = (jobId: number | null) => {
-    const currentValue = searchParams.get("job");
-    const nextValue = jobId && Number.isInteger(jobId) && jobId > 0 ? String(jobId) : null;
+  const setJobsRouteState = useCallback(
+    (view: JobsViewMode, jobId?: number | null) => {
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.set("view", view);
+      if (jobId && Number.isInteger(jobId) && jobId > 0) {
+        nextParams.set("job", String(jobId));
+      } else {
+        nextParams.delete("job");
+      }
+      setSearchParams(nextParams, { replace: true });
+    },
+    [searchParams, setSearchParams]
+  );
 
-    if (currentValue === nextValue || (!currentValue && !nextValue)) {
-      return;
-    }
-
-    const nextParams = new URLSearchParams(searchParams);
-    if (nextValue) {
-      nextParams.set("job", nextValue);
-    } else {
-      nextParams.delete("job");
-    }
-    setSearchParams(nextParams, { replace: true });
-  };
+  const resetSelectedJobView = useCallback(() => {
+    setJobsRouteState("list");
+    setSelectedJob(null);
+    setSteps([]);
+    setStepTargetsByStepId({});
+    setExpandedSteps(new Set());
+    setEditingJob(false);
+    setShowNewStepForm(false);
+    setCameraAnchorElements({});
+  }, [setJobsRouteState]);
 
   useEffect(() => {
     fetchJobs();
@@ -1449,6 +1533,34 @@ export default function JobsPage() {
     }
   };
 
+  const fetchTargetsForSteps = useCallback(async (jobSteps: Step[]) => {
+    if (!Array.isArray(jobSteps) || jobSteps.length === 0) {
+      setStepTargetsByStepId({});
+      return;
+    }
+
+    try {
+      const results = await Promise.all(
+        jobSteps.map(async (jobStep) => {
+          const response = await fetch(`/api/job-steps/${jobStep.id}/targets`);
+          if (!response.ok) {
+            return [jobStep.id, []] as const;
+          }
+          const data = await response.json().catch(() => ({}));
+          return [jobStep.id, Array.isArray(data?.targets) ? data.targets : []] as const;
+        })
+      );
+
+      const next: Record<number, Target[]> = {};
+      results.forEach(([stepId, targets]) => {
+        next[stepId] = targets;
+      });
+      setStepTargetsByStepId(next);
+    } catch (error) {
+      console.error("Failed to fetch step targets for flow view:", error);
+    }
+  }, []);
+
   const fetchSteps = async (jobId: number): Promise<Step[]> => {
     try {
       const response = await fetch(`/api/jobs/${jobId}/steps`);
@@ -1456,6 +1568,7 @@ export default function JobsPage() {
         const data = await response.json();
         const nextSteps = data.steps || [];
         setSteps(nextSteps);
+        void fetchTargetsForSteps(nextSteps);
         return nextSteps;
       }
     } catch (error) {
@@ -1464,10 +1577,20 @@ export default function JobsPage() {
     return [];
   };
 
-  const handleOpenJob = async (job: Job) => {
-    setSelectedJobSearchParam(job.id);
+  const handleOpenJob = async (
+    job: Job,
+    options: { syncRoute?: boolean; expandAllSteps?: boolean } = {}
+  ) => {
+    const { syncRoute = true, expandAllSteps = true } = options;
+    if (syncRoute) {
+      setJobsRouteState("steps", job.id);
+    }
     setSelectedJob(job);
-    await fetchSteps(job.id);
+    setCameraAnchorElements({});
+    const nextSteps = await fetchSteps(job.id);
+    if (expandAllSteps) {
+      setExpandedSteps(new Set(nextSteps.map((item) => item.id)));
+    }
     setShowNewStepForm(false);
     
     // Initialize edit form with current job data
@@ -1476,11 +1599,12 @@ export default function JobsPage() {
       setEditScheduleMode("recurring");
       setEditRecurringMode(job.schedule_mode as ScheduleMode);
       setEditScheduleDays(job.schedule_days || []);
-      setEditJobForm({ start_at: "", end_at: "" });
+      setEditJobForm({ name: job.name || "", start_at: "", end_at: "" });
     } else if (job.schedule_mode === "one_shot") {
       // Legacy one-time job (view only, can switch to recurring)
       setEditScheduleMode("one-time");
       setEditJobForm({
+        name: job.name || "",
         start_at: job.start_at ? formatDateTimeLocal(new Date(job.start_at)) : "",
         end_at: job.end_at ? formatDateTimeLocal(new Date(job.end_at)) : "",
       });
@@ -1493,9 +1617,11 @@ export default function JobsPage() {
         setEditScheduleMode("recurring");
         setEditRecurringMode("weekly");
         setEditScheduleDays([]);
+        setEditJobForm({ name: job.name || "", start_at: "", end_at: "" });
       } else {
         setEditScheduleMode("one-time");
         setEditJobForm({
+          name: job.name || "",
           start_at: job.start_at ? formatDateTimeLocal(new Date(job.start_at)) : "",
           end_at: job.end_at ? formatDateTimeLocal(new Date(job.end_at)) : "",
         });
@@ -1512,40 +1638,43 @@ export default function JobsPage() {
 
     const rawJobId = searchParams.get("job");
 
-    // If URL has no selected job, force list view.
     if (!rawJobId) {
       if (selectedJob) {
         setSelectedJob(null);
         setSteps([]);
+        setStepTargetsByStepId({});
         setExpandedSteps(new Set());
         setEditingJob(false);
         setShowNewStepForm(false);
+        setCameraAnchorElements({});
       }
       return;
     }
 
     const jobId = Number(rawJobId);
     if (!Number.isInteger(jobId) || jobId <= 0) {
-      setSelectedJobSearchParam(null);
+      setJobsRouteState("list");
       return;
     }
 
-    // Keep current detail view in sync with refreshed jobs data.
     if (selectedJob?.id === jobId) {
       const refreshedJob = jobs.find((item) => item.id === jobId);
       if (refreshedJob && refreshedJob !== selectedJob) {
         setSelectedJob(refreshedJob);
+      }
+      if (jobsViewMode !== "steps") {
+        setJobsRouteState("steps", jobId);
       }
       return;
     }
 
     const job = jobs.find((item) => item.id === jobId);
     if (job) {
-      void handleOpenJob(job);
+      void handleOpenJob(job, { syncRoute: false });
     } else if (jobs.length > 0) {
-      setSelectedJobSearchParam(null);
+      setJobsRouteState("list");
     }
-  }, [loading, selectedJob, jobs, searchParams]);
+  }, [loading, selectedJob, jobs, searchParams, jobsViewMode, setJobsRouteState]);
 
   const handleCreateJob = async () => {
     if (!newJob.name) {
@@ -1624,8 +1753,7 @@ export default function JobsPage() {
         // Remove from local state immediately
         setJobs(jobs.filter(j => j.id !== jobId));
         if (selectedJob?.id === jobId) {
-          setSelectedJobSearchParam(null);
-          setSelectedJob(null);
+          resetSelectedJobView();
         }
       }
     } catch (error) {
@@ -1707,11 +1835,17 @@ export default function JobsPage() {
 
   const handleUpdateJobSchedule = async () => {
     if (!selectedJob) return;
+    const trimmedJobName = String(editJobForm.name || "").trim();
+    if (!trimmedJobName) {
+      alert(t("jobs.validation.jobNameRequired", { defaultValue: "Job name is required" }));
+      return;
+    }
 
     // Parse the current description to extract human text (for legacy cleanup)
     const { humanText } = parseScheduleFromDescription(selectedJob.description || "");
 
     let payload: any = {
+      name: trimmedJobName,
       description: humanText || selectedJob.description,
     };
 
@@ -2337,6 +2471,90 @@ export default function JobsPage() {
     }
   };
 
+  const registerCameraAnchor = useCallback((stepId: number, targetId: number, node: HTMLDivElement | null) => {
+    const key = buildCameraAnchorKey(stepId, targetId);
+    setCameraAnchorElements((prev) => {
+      if (prev[key] === node) return prev;
+      return {
+        ...prev,
+        [key]: node,
+      };
+    });
+  }, []);
+
+  const handleStepTargetsLoaded = useCallback((stepId: number, nextTargets: Target[]) => {
+    setStepTargetsByStepId((prev) => ({
+      ...prev,
+      [stepId]: nextTargets,
+    }));
+  }, []);
+
+  const knowledgeConnections = useMemo<KnowledgeShareConnection[]>(() => {
+    const next: KnowledgeShareConnection[] = [];
+    const seenConnectionIds = new Set<string>();
+
+    steps.forEach((step) => {
+      const currentTargets = stepTargetsByStepId[step.id] || [];
+      const currentTargetsByCameraId = new Map<number, Target>();
+      const currentTargetsByName = new Map<string, Target>();
+      currentTargets.forEach((target) => {
+        currentTargetsByCameraId.set(target.camera_id, target);
+        currentTargetsByName.set(target.camera_name || `Camera ${target.camera_id}`, target);
+      });
+
+      parsePipelinesFromStep(step).forEach((pipeline, pipelineIndex) => {
+        const sourceTargets = stepTargetsByStepId[pipeline.input_from_step_id] || [];
+        if (sourceTargets.length === 0) return;
+
+        const destinationTargets =
+          pipeline.target_camera_id
+            ? [
+                currentTargetsByCameraId.get(pipeline.target_camera_id) ||
+                  (pipeline.target_camera_name
+                    ? currentTargetsByName.get(pipeline.target_camera_name) || null
+                    : null),
+              ].filter(Boolean) as Target[]
+            : currentTargets;
+        if (destinationTargets.length === 0) return;
+
+        const sourceTargetIds = Array.isArray(pipeline.input_target_ids) ? pipeline.input_target_ids : [];
+        const resolvedSourceTargets =
+          sourceTargetIds.length > 0
+            ? sourceTargets.filter((target) => sourceTargetIds.includes(target.id))
+            : sourceTargets.filter((target) =>
+                pipeline.input_inject_keys.includes(target.camera_name || `Camera ${target.camera_id}`)
+              );
+
+        resolvedSourceTargets.forEach((sourceTarget, sourceIndex) => {
+          destinationTargets.forEach((destinationTarget, destinationIndex) => {
+            if (
+              sourceTarget.id === destinationTarget.id &&
+              pipeline.input_from_step_id === step.id
+            ) {
+              return;
+            }
+
+            const connectionId = `pipeline-${step.id}-${pipeline.input_from_step_id}-${sourceTarget.id}-${destinationTarget.id}-${pipelineIndex}-${sourceIndex}-${destinationIndex}`;
+            if (seenConnectionIds.has(connectionId)) {
+              return;
+            }
+            seenConnectionIds.add(connectionId);
+
+            next.push({
+              id: connectionId,
+              fromKey: buildCameraAnchorKey(pipeline.input_from_step_id, sourceTarget.id),
+              toKey: buildCameraAnchorKey(step.id, destinationTarget.id),
+              variant: "knowledge",
+              layout: pipeline.input_from_step_id === step.id ? "same-step" : "cross-step",
+            });
+          });
+        });
+      });
+    });
+
+    return next;
+  }, [steps, stepTargetsByStepId]);
+
   // Filter jobs based on search query
   const filteredJobs = jobs.filter((job) => {
     if (!searchQuery) return true;
@@ -2346,6 +2564,76 @@ export default function JobsPage() {
     const endMatch = job.end_at && formatDateTime(job.end_at).toLowerCase().includes(query);
     return nameMatch || startMatch || endMatch;
   });
+  const jobsBoardCards: JobsBoardCardData[] = filteredJobs.map((job) => {
+    const jobTimeRange = getJobListTimeRange(job);
+    const displayStatus = getDisplayStatus(job);
+    const { humanText } = parseScheduleFromDescription(job.description || "");
+
+    return {
+      id: job.id,
+      name: job.name,
+      description: humanText || job.description || "",
+      statusLabel: getDisplayStatusLabel(job),
+      statusClassName: getStatusColor(displayStatus),
+      isLive: displayStatus === "running",
+      scheduleLabel: getJobScheduleBadge(job),
+      startLabel: jobTimeRange.start,
+      endLabel: jobTimeRange.end,
+      stepCount: Number(job.step_count) > 0 ? Number(job.step_count) : 0,
+      targetCount: Number(job.target_count) > 0 ? Number(job.target_count) : 0,
+      isStarting: startingJobIds.has(job.id),
+      isStopping: displayStatus === "stopping" || stoppingJobIds.has(job.id),
+      canStart: canStartJobFromList(job),
+      canStop: displayStatus === "running" || displayStatus === "stopping",
+    };
+  });
+  const handleOpenJobById = (jobId: number) => {
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    if (job) {
+      void handleOpenJob(job);
+    }
+  };
+  const handleStartJobById = (jobId: number) => {
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    if (job) {
+      void handleStartJobFromRow(job);
+    }
+  };
+  const handleStopJobById = (jobId: number) => {
+    const job = jobs.find((candidate) => candidate.id === jobId);
+    if (job) {
+      void handleStopJobFromRow(job);
+    }
+  };
+  const openNewStepComposer = useCallback(() => {
+    setShowNewStepForm(true);
+    setNewStep({
+      name: "",
+      step_order: steps.length + 1,
+      timeout_seconds: 300,
+    });
+  }, [steps.length]);
+  const modernJobsTabs = (
+    <JobsTabs
+      activeView={jobsViewMode === "steps" && !selectedJob ? "list" : jobsViewMode}
+      stepsEnabled={!!selectedJob}
+      onSelectList={() => {
+        if (selectedJob) {
+          resetSelectedJobView();
+          return;
+        }
+        setJobsRouteState("list");
+      }}
+      onSelectCreate={() => {
+        setJobsRouteState("create");
+      }}
+      onSelectSteps={() => {
+        if (selectedJob) {
+          setJobsRouteState("steps", selectedJob.id);
+        }
+      }}
+    />
+  );
   const newStepTimeoutParts = timeoutSecondsToHourMinuteParts(newStep.timeout_seconds);
 
   if (loading) {
@@ -2355,6 +2643,520 @@ export default function JobsPage() {
         <div className="flex items-center justify-center h-full">
           <div className="text-gray-400">{t("common.loading")}</div>
         </div>
+      </Layout>
+    );
+  }
+
+  if (useModernJobsLayout) {
+    if (selectedJob && jobsViewMode === "steps") {
+      const { humanText } = parseScheduleFromDescription(selectedJob.description || "");
+      const selectedJobScheduleBadge = getJobScheduleBadge(selectedJob);
+      const selectedJobTimeRange = getJobListTimeRange(selectedJob);
+      const selectedJobDisplayStatus = getDisplayStatus(selectedJob);
+      const isSelectedJobStarting = startingJobIds.has(selectedJob.id);
+      const isSelectedJobStopping =
+        selectedJobDisplayStatus === "stopping" || stoppingJobIds.has(selectedJob.id);
+      const canStopSelectedJob =
+        selectedJobDisplayStatus === "running" || selectedJobDisplayStatus === "stopping";
+      const canStartSelectedJob = canStartJobFromList(selectedJob);
+      const selectedJobTargetCount = Math.max(
+        Number(selectedJob.target_count) > 0 ? Number(selectedJob.target_count) : 0,
+        Object.values(stepTargetsByStepId).reduce((sum, currentTargets) => sum + currentTargets.length, 0)
+      );
+
+      return (
+        <Layout>
+          {toast && (
+            <Toast
+              message={toast.message}
+              type={toast.type}
+              onClose={() => setToast(null)}
+            />
+          )}
+          <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />
+          <ConfirmDialog
+            isOpen={confirmDeleteStep.isOpen}
+            title="Delete Step"
+            message="Are you sure you want to delete this step? This action cannot be undone."
+            confirmLabel="Delete"
+            cancelLabel="Cancel"
+            variant="danger"
+            onConfirm={() => {
+              const stepId = confirmDeleteStep.stepId;
+              setConfirmDeleteStep({ isOpen: false, stepId: null });
+              if (stepId) {
+                deleteStepById(stepId);
+              }
+            }}
+            onCancel={() => setConfirmDeleteStep({ isOpen: false, stepId: null })}
+          />
+          <JobFlowView
+            title={selectedJob.name}
+            description={humanText}
+            scheduleLabel={
+              !editingJob
+                ? selectedJobTimeRange.start
+                  ? `${t("jobs.nextRunLabel", { defaultValue: "Next" })}: ${selectedJobTimeRange.start}`
+                  : null
+                : null
+            }
+            statusLabel={getDisplayStatusLabel(selectedJob)}
+            statusClassName={getStatusColor(selectedJobDisplayStatus)}
+            onBack={resetSelectedJobView}
+            flowContainerRef={flowContainerRef}
+            anchorElements={cameraAnchorElements}
+            knowledgeConnections={knowledgeConnections}
+            flowDensity={flowDensity}
+            onChangeFlowDensity={setFlowDensity}
+            tabs={modernJobsTabs}
+            headerActions={
+              <>
+                {!editingJob && (
+                  <button
+                    onClick={() => setEditingJob(true)}
+                    className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-gray-800 bg-gray-950/60 text-gray-200 transition-colors hover:border-gray-700 hover:bg-gray-800/80"
+                    title={t("jobs.editSchedule")}
+                  >
+                    <Edit2 className="h-4 w-4" />
+                  </button>
+                )}
+                {selectedJob.status === "draft" && (
+                  <button
+                    onClick={handleScheduleJob}
+                    className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-gray-800 bg-gray-950/60 text-gray-200 transition-colors hover:border-gray-700 hover:bg-gray-800/80"
+                    title={t("jobs.schedule")}
+                  >
+                    <Calendar className="h-4 w-4" />
+                  </button>
+                )}
+                {canStopSelectedJob ? (
+                  <button
+                    onClick={() => void handleStopJobFromRow(selectedJob)}
+                    disabled={isSelectedJobStopping}
+                    className={`inline-flex items-center gap-2 rounded-2xl px-4 py-2.5 text-sm font-semibold transition-colors ${
+                      isSelectedJobStopping
+                        ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                        : "bg-red-500/12 text-red-300 hover:bg-red-500/18"
+                    }`}
+                  >
+                    <StopCircle className="h-4 w-4" />
+                    {t("dashboard.stop")}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => void handleStartJobFromRow(selectedJob)}
+                    disabled={!canStartSelectedJob || isSelectedJobStarting}
+                    className={`inline-flex items-center gap-2 rounded-2xl px-4 py-2.5 text-sm font-semibold transition-colors ${
+                      !canStartSelectedJob || isSelectedJobStarting
+                        ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                        : "bg-emerald-600 text-white hover:bg-emerald-500"
+                    }`}
+                  >
+                    <Play className="h-4 w-4" />
+                    {isSelectedJobStarting
+                      ? t("jobs.starting", { defaultValue: "Starting" })
+                      : t("dashboard.start")}
+                  </button>
+                )}
+              </>
+            }
+            metaRow={
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="inline-flex items-center gap-2 rounded-full border border-gray-800 bg-gray-950/60 px-3 py-1.5 text-xs text-gray-200">
+                  <Clock className="h-3.5 w-3.5 text-gray-500" />
+                  <span className="font-medium">
+                    {selectedJobTimeRange.start
+                      ? `${t("jobs.nextRunLabel", { defaultValue: "Next" })}: ${selectedJobTimeRange.start}`
+                      : selectedJobScheduleBadge || t("jobs.notScheduled", { defaultValue: "Not scheduled" })}
+                  </span>
+                </div>
+                <div className="inline-flex items-center gap-2 rounded-full border border-gray-800 bg-gray-950/60 px-3 py-1.5 text-xs text-gray-200">
+                  <LayoutGrid className="h-3.5 w-3.5 text-gray-500" />
+                  <span className="font-medium">
+                    {steps.length} {steps.length === 1 ? "Step" : "Steps"}
+                  </span>
+                </div>
+                <div className="inline-flex items-center gap-2 rounded-full border border-gray-800 bg-gray-950/60 px-3 py-1.5 text-xs text-gray-200">
+                  <Camera className="h-3.5 w-3.5 text-gray-500" />
+                  <span className="font-medium">
+                    {selectedJobTargetCount} {selectedJobTargetCount === 1 ? "Camera" : "Cameras"}
+                  </span>
+                </div>
+              </div>
+            }
+            editPanel={
+              editingJob ? (
+                <div className="rounded-[28px] border border-gray-800/80 bg-gray-950/55 p-5">
+                  <h3 className="mb-4 text-lg font-semibold text-gray-100">{t("jobs.editSchedule")}</h3>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="mb-2 block text-sm font-medium text-gray-300">
+                        {t("jobs.jobName", { defaultValue: "Job name" })}
+                      </label>
+                      <input
+                        type="text"
+                        value={editJobForm.name}
+                        onChange={(e) =>
+                          setEditJobForm({ ...editJobForm, name: e.target.value })
+                        }
+                        className="w-full rounded-lg border border-gray-600 bg-gray-700 px-4 py-2 text-gray-200 focus:border-blue-500 focus:outline-none"
+                        placeholder={t("jobs.jobNamePlaceholder", { defaultValue: "Enter job name" })}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-2 block text-sm font-medium text-gray-300">
+                        {t("jobs.scheduleMode")}
+                      </label>
+                      <div className="flex gap-4">
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <input
+                            type="radio"
+                            name="editScheduleMode"
+                            value="one-time"
+                            checked={editScheduleMode === "one-time"}
+                            onChange={() => setEditScheduleMode("one-time")}
+                            className="h-4 w-4 text-blue-600 focus:ring-blue-500"
+                          />
+                          <span className="text-gray-300">{t("jobs.oneTime")}</span>
+                        </label>
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <input
+                            type="radio"
+                            name="editScheduleMode"
+                            value="recurring"
+                            checked={editScheduleMode === "recurring"}
+                            onChange={() => setEditScheduleMode("recurring")}
+                            className="h-4 w-4 text-blue-600 focus:ring-blue-500"
+                          />
+                          <span className="text-gray-300">{t("jobs.recurringWeekly")}</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {editScheduleMode === "one-time" && (
+                      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                        <div>
+                          <label className="mb-2 block text-sm font-medium text-gray-300">
+                            {t("jobs.startTime")}
+                          </label>
+                          <input
+                            type="datetime-local"
+                            value={editJobForm.start_at}
+                            onChange={(e) =>
+                              setEditJobForm({ ...editJobForm, start_at: e.target.value })
+                            }
+                            className="w-full rounded-lg border border-gray-600 bg-gray-700 px-4 py-2 text-gray-200 focus:border-blue-500 focus:outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="mb-2 block text-sm font-medium text-gray-300">
+                            {t("jobs.endTime")}
+                          </label>
+                          <input
+                            type="datetime-local"
+                            value={editJobForm.end_at}
+                            onChange={(e) =>
+                              setEditJobForm({ ...editJobForm, end_at: e.target.value })
+                            }
+                            className="w-full rounded-lg border border-gray-600 bg-gray-700 px-4 py-2 text-gray-200 focus:border-blue-500 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {editScheduleMode === "recurring" && (
+                      <div>
+                        <label className="mb-3 block text-sm font-medium text-gray-300">
+                          {t("jobs.scheduleConfiguration")}
+                        </label>
+                        <ScheduleBuilder
+                          mode={editRecurringMode}
+                          scheduleDays={editScheduleDays}
+                          onModeChange={(mode) => {
+                            setEditRecurringMode(mode);
+                            setEditScheduleDays(getDefaultScheduleDays(mode));
+                          }}
+                          onScheduleDaysChange={setEditScheduleDays}
+                          activeFrom={editActiveFrom}
+                          activeUntil={editActiveUntil}
+                          onActiveFromChange={setEditActiveFrom}
+                          onActiveUntilChange={setEditActiveUntil}
+                        />
+                      </div>
+                    )}
+
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleUpdateJobSchedule}
+                        className="rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-700"
+                      >
+                        <Save className="mr-2 inline h-4 w-4" />
+                        Save Schedule
+                      </button>
+                      <button
+                        onClick={() => setEditingJob(false)}
+                        className="rounded-lg bg-gray-700 px-4 py-2 text-gray-200 transition-colors hover:bg-gray-600"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : null
+            }
+            newStepForm={
+              showNewStepForm ? (
+                <div className={`border border-dashed border-violet-400/35 bg-violet-500/[0.06] shadow-[0_20px_70px_-60px_rgba(139,92,246,1)] ${
+                  flowDensity === "compact" ? "rounded-[22px] p-3.5" : "rounded-[26px] p-4"
+                }`}>
+                  <div className={`flex items-start gap-3 ${flowDensity === "compact" ? "mb-3" : "mb-4"}`}>
+                    <div className={`inline-flex items-center justify-center rounded-xl border border-violet-400/30 bg-violet-500/15 text-violet-100 ${
+                      flowDensity === "compact" ? "h-9 min-w-9" : "h-10 min-w-10"
+                    }`}>
+                      <Plus className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <h3 className={`${flowDensity === "compact" ? "text-base" : "text-lg"} font-semibold text-white`}>{t("jobs.addStep")}</h3>
+                      <p className={`mt-1 text-violet-100/75 ${flowDensity === "compact" ? "text-[11px]" : "text-xs"}`}>
+                        {t("jobs.newStepHint", {
+                          defaultValue: "Crie o proximo step do fluxo e defina o tempo maximo de execucao.",
+                        })}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                        {t("jobs.stepName")}
+                      </label>
+                      <input
+                        type="text"
+                        value={newStep.name}
+                        onChange={(e) =>
+                          setNewStep({ ...newStep, name: e.target.value })
+                        }
+                        className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                        placeholder="Step name"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                      <div>
+                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                          {t("jobs.stepOrder")}
+                        </label>
+                        <input
+                          type="number"
+                          value={newStep.step_order}
+                          onChange={(e) =>
+                            setNewStep({
+                              ...newStep,
+                              step_order: parseInt(e.target.value, 10),
+                            })
+                          }
+                          className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                          min="1"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                          Max time to run step
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="relative">
+                            <input
+                              type="number"
+                              value={newStepTimeoutParts.hours}
+                              onChange={(e) => {
+                                const hours = parseNonNegativeIntegerInput(e.target.value);
+                                setNewStep({
+                                  ...newStep,
+                                  timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                                    hours,
+                                    newStepTimeoutParts.minutes
+                                  ),
+                                });
+                              }}
+                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                              min="0"
+                            />
+                            <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
+                              h
+                            </span>
+                          </div>
+                          <div className="relative">
+                            <input
+                              type="number"
+                              value={newStepTimeoutParts.minutes}
+                              onChange={(e) => {
+                                const minutes = Math.min(59, parseNonNegativeIntegerInput(e.target.value));
+                                setNewStep({
+                                  ...newStep,
+                                  timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                                    newStepTimeoutParts.hours,
+                                    minutes
+                                  ),
+                                });
+                              }}
+                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                              min="0"
+                              max="59"
+                            />
+                            <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
+                              m
+                            </span>
+                          </div>
+                        </div>
+                        {selectedJobMaxTimeoutSeconds !== null && (
+                          <p className="mt-1.5 text-[11px] text-violet-100/60">
+                            Max for this job: {formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds)}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      onClick={handleAddStep}
+                      className="inline-flex items-center gap-2 rounded-xl bg-violet-500 px-3.5 py-2 text-sm font-semibold text-white transition-colors hover:bg-violet-400"
+                    >
+                      <Save className="h-4 w-4" />
+                      Save Step
+                    </button>
+                    <button
+                      onClick={() => setShowNewStepForm(false)}
+                      className="inline-flex items-center rounded-xl border border-gray-700 bg-gray-950/70 px-3.5 py-2 text-sm font-medium text-gray-200 transition-colors hover:border-gray-600 hover:bg-gray-900"
+                    >
+                      {t("jobs.cancel")}
+                    </button>
+                  </div>
+                </div>
+              ) : null
+            }
+            addStepCard={
+              !showNewStepForm ? (
+                <button
+                  type="button"
+                  onClick={openNewStepComposer}
+                  className={`flex w-full flex-col items-center justify-center border border-dashed border-violet-400/45 bg-violet-500/[0.05] text-center text-violet-100 transition-all hover:border-violet-300/70 hover:bg-violet-500/[0.08] ${
+                    flowDensity === "compact"
+                      ? "min-h-[180px] rounded-[20px] px-4"
+                      : "min-h-[220px] rounded-[24px] px-5"
+                  }`}
+                >
+                  <div className={`flex items-center justify-center rounded-[16px] border border-violet-400/35 bg-violet-500/15 ${
+                    flowDensity === "compact" ? "h-10 w-10" : "h-12 w-12"
+                  }`}>
+                    <Plus className={flowDensity === "compact" ? "h-5 w-5" : "h-6 w-6"} />
+                  </div>
+                  <div className={`mt-3 font-semibold ${flowDensity === "compact" ? "text-base" : "text-lg"}`}>{t("jobs.addStep")}</div>
+                  <div className={`mt-2 max-w-[16rem] text-violet-100/70 ${flowDensity === "compact" ? "text-[12px] leading-5" : "text-sm leading-6"}`}>
+                    {t("jobs.addStepCardHint", {
+                      defaultValue: "Adicione um novo step ao pipeline e conecte cameras, regras e compartilhamento de conhecimento.",
+                    })}
+                  </div>
+                </button>
+              ) : null
+            }
+            emptyState={
+              !showNewStepForm ? (
+                <div className="rounded-[28px] border border-dashed border-gray-800 bg-gray-950/35 px-6 py-14 text-center text-gray-500">
+                  No steps yet. Add your first step to begin.
+                </div>
+              ) : null
+            }
+          >
+            {steps.map((step) => (
+              <StepCard
+                key={step.id}
+                step={step}
+                steps={steps}
+                density={flowDensity}
+                expanded={expandedSteps.has(step.id)}
+                onToggle={() => toggleStep(step.id)}
+                cameras={cameras}
+                scheduleDays={selectedJob.schedule_days || []}
+                jobMaxTimeoutSeconds={selectedJobMaxTimeoutSeconds}
+                onStepUpdated={() => fetchSteps(selectedJob.id)}
+                onShowToast={(message, type) => setToast({ message, type })}
+                onRequestDeleteStep={(stepId) => setConfirmDeleteStep({ isOpen: true, stepId })}
+                onTargetsLoaded={handleStepTargetsLoaded}
+                onRegisterCameraAnchor={registerCameraAnchor}
+              />
+            ))}
+          </JobFlowView>
+        </Layout>
+      );
+    }
+
+    if (jobsViewMode === "create") {
+      return (
+        <Layout>
+          {toast && (
+            <Toast
+              message={toast.message}
+              type={toast.type}
+              onClose={() => setToast(null)}
+            />
+          )}
+          <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />
+          <JobCreateView
+            tabs={modernJobsTabs}
+            name={newJob.name}
+            description={newJob.description}
+            timezone={globalTimezone}
+            scheduleVisible={isCreateScheduleVisible}
+            scheduleMode={recurringMode}
+            scheduleDays={scheduleDays}
+            activeFrom={activeFrom}
+            activeUntil={activeUntil}
+            onBack={() => setJobsRouteState("list")}
+            onClose={() => setJobsRouteState("list")}
+            onSubmit={handleCreateJob}
+            onNameChange={(value) => setNewJob({ ...newJob, name: value })}
+            onDescriptionChange={(value) => setNewJob({ ...newJob, description: value })}
+            onScheduleVisibilityChange={setIsCreateScheduleVisible}
+            onModeChange={setRecurringMode}
+            onScheduleDaysChange={setScheduleDays}
+            onActiveFromChange={setActiveFrom}
+            onActiveUntilChange={setActiveUntil}
+          />
+        </Layout>
+      );
+    }
+
+    return (
+      <Layout>
+        {toast && (
+          <Toast
+            message={toast.message}
+            type={toast.type}
+            onClose={() => setToast(null)}
+          />
+        )}
+        <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />
+        <ConfirmDialog
+          isOpen={confirmDelete.isOpen}
+          title={t("jobs.deleteJobTitle")}
+          message={t("jobs.deleteJobMessage")}
+          confirmLabel={t("jobs.delete")}
+          cancelLabel={t("jobs.cancel")}
+          variant="danger"
+          onConfirm={confirmDeleteJob}
+          onCancel={() => setConfirmDelete({ isOpen: false, jobId: null })}
+        />
+        <JobsBoardView
+          jobsCount={jobs.length}
+          timezone={globalTimezone}
+          searchQuery={searchQuery}
+          cards={jobsBoardCards}
+          tabs={modernJobsTabs}
+          onSearchChange={setSearchQuery}
+          onNewJob={() => setJobsRouteState("create")}
+          onOpenJob={handleOpenJobById}
+          onStartJob={handleStartJobById}
+          onStopJob={handleStopJobById}
+          onDeleteJob={handleDeleteJob}
+        />
       </Layout>
     );
   }
@@ -2438,13 +3240,7 @@ export default function JobsPage() {
                   </button>
                 )}
                 <button
-                  onClick={() => {
-                    setSelectedJobSearchParam(null);
-                    setSelectedJob(null);
-                    setSteps([]);
-                    setExpandedSteps(new Set());
-                    setEditingJob(false);
-                  }}
+                  onClick={resetSelectedJobView}
                   className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-lg transition-colors"
                 >
                   {t("jobs.back")}
@@ -3019,6 +3815,7 @@ export default function JobsPage() {
 interface StepCardProps {
   step: Step;
   steps: Step[];
+  density?: FlowDensity;
   expanded: boolean;
   onToggle: () => void;
   cameras: Camera[];
@@ -3027,11 +3824,14 @@ interface StepCardProps {
   onStepUpdated: () => void;
   onShowToast: (message: string, type: "success" | "error" | "warning" | "info") => void;
   onRequestDeleteStep: (stepId: number) => void;
+  onTargetsLoaded?: (stepId: number, targets: Target[]) => void;
+  onRegisterCameraAnchor?: (stepId: number, targetId: number, node: HTMLDivElement | null) => void;
 }
 
 function StepCard({
   step,
   steps,
+  density = "normal",
   expanded,
   onToggle,
   cameras,
@@ -3040,6 +3840,8 @@ function StepCard({
   onStepUpdated,
   onShowToast,
   onRequestDeleteStep,
+  onTargetsLoaded = () => undefined,
+  onRegisterCameraAnchor = () => undefined,
 }: StepCardProps) {
   const { t, i18n } = useTranslation();
   const stepLocale = (i18n.resolvedLanguage || i18n.language || "en").replace("_", "-");
@@ -3070,12 +3872,12 @@ function StepCard({
   const [showPipelineForm, setShowPipelineForm] = useState(false);
   const [showStartConditionForm, setShowStartConditionForm] = useState(false);
   const [showAlertForm, setShowAlertForm] = useState(false);
+  const [editStepName, setEditStepName] = useState(step.name);
   const [editTimeoutSeconds, setEditTimeoutSeconds] = useState(
     normalizeTimeoutForHourMinuteUi(step.timeout_seconds)
   );
   const [isEditingTimeout, setIsEditingTimeout] = useState(false);
   const [agentPriorities, setAgentPriorities] = useState<Record<number, AgentPriority>>({});
-  const [savingPriorities, setSavingPriorities] = useState<Set<number>>(new Set());
   const [agentInferenceModels, setAgentInferenceModels] = useState<Record<number, AgentInferenceModel>>({});
   const [agentRunEvery, setAgentRunEvery] = useState<Record<number, AgentRunEverySeconds>>({});
   const [agentOnlyCaptureOnMotion, setAgentOnlyCaptureOnMotion] = useState<Record<number, boolean>>({});
@@ -3083,6 +3885,8 @@ function StepCard({
   const [clonePickerTargetId, setClonePickerTargetId] = useState<number | null>(null);
   const [cloneSourceByTarget, setCloneSourceByTarget] = useState<Record<number, number>>({});
   const [cloningTargets, setCloningTargets] = useState<Set<number>>(new Set());
+  const [expandedTargetId, setExpandedTargetId] = useState<number | null>(null);
+  const [showAllTargets, setShowAllTargets] = useState(false);
   const [confirmCloneAgent, setConfirmCloneAgent] = useState<{
     isOpen: boolean;
     targetId: number | null;
@@ -3095,9 +3899,6 @@ function StepCard({
   const agentFormRef = useRef<HTMLDivElement | null>(null);
   const [highlightAgentForm, setHighlightAgentForm] = useState(false);
   const agentFormHighlightTimerRef = useRef<number | null>(null);
-  const [highlightAgentCreationTargetId, setHighlightAgentCreationTargetId] = useState<number | null>(null);
-  const agentCreationHighlightTimerRef = useRef<number | null>(null);
-  const hasShownAgentCreationHighlightRef = useRef(false);
 
   const handleModelApiKeyRequired = (errorPayload: unknown): boolean => {
     if (isOpenAiKeyRequiredError(errorPayload)) {
@@ -3420,12 +4221,14 @@ function StepCard({
   });
 
   const [startConditionForm, setStartConditionForm] = useState({
-    mode: "sequential" as "sequential" | "positive" | "negative" | "custom" | "time",
+    mode: "sequential" as "sequential" | "positive" | "negative" | "custom" | "time" | "elapsed",
     step_id: "",
     answer_key: "",
     target_key: "",
     custom_type: "positive" as "positive" | "negative",
     time: "",
+    elapsed_hours: 0,
+    elapsed_minutes: 0,
     on_fail: "skip" as "skip" | "fail",
   });
 
@@ -3469,21 +4272,21 @@ function StepCard({
   }, [clonePickerTargetId, targets]);
 
   useEffect(() => {
-    if (highlightAgentCreationTargetId === null) return;
-    const stillExists = targets.some((target) => target.id === highlightAgentCreationTargetId);
+    if (expandedTargetId === null) return;
+    const stillExists = targets.some((target) => target.id === expandedTargetId);
     if (!stillExists) {
-      setHighlightAgentCreationTargetId(null);
+      setExpandedTargetId(null);
     }
-  }, [highlightAgentCreationTargetId, targets]);
+  }, [expandedTargetId, targets]);
 
   useEffect(() => {
-    hasShownAgentCreationHighlightRef.current = false;
-    setHighlightAgentCreationTargetId(null);
-    if (agentCreationHighlightTimerRef.current) {
-      window.clearTimeout(agentCreationHighlightTimerRef.current);
-      agentCreationHighlightTimerRef.current = null;
-    }
+    setExpandedTargetId(null);
+    setShowAllTargets(false);
   }, [step.id]);
+
+  useEffect(() => {
+    setEditStepName(step.name || "");
+  }, [step.id, step.name]);
 
   useEffect(() => {
     setEditTimeoutSeconds(normalizeTimeoutForHourMinuteUi(step.timeout_seconds));
@@ -3523,12 +4326,14 @@ function StepCard({
         target_key: "",
         custom_type: "positive",
         time: "",
+        elapsed_hours: 0,
+        elapsed_minutes: 0,
         on_fail: "skip",
       });
       return;
     }
 
-    // Parse "start:positive:<key>", "start:negative:<key>", or "start:time:<HH:MM>"
+    // Parse "start:positive:<key>", "start:negative:<key>", "start:time:<HH:MM>", or "start:elapsed:<seconds>"
     const parts = conditionStr.split(":");
     if (parts.length < 3) {
       setStartConditionForm({
@@ -3538,12 +4343,14 @@ function StepCard({
         target_key: "",
         custom_type: "positive",
         time: "",
+        elapsed_hours: 0,
+        elapsed_minutes: 0,
         on_fail: "skip",
       });
       return;
     }
 
-    const mode = parts[1] as "positive" | "negative" | "time" | "custom";
+    const mode = parts[1] as "positive" | "negative" | "time" | "custom" | "elapsed";
     const remainingParts = parts.slice(2); // All parts after mode
 
     if (mode === "custom") {
@@ -3557,6 +4364,8 @@ function StepCard({
         target_key: targetKey,
         custom_type: "positive",
         time: "",
+        elapsed_hours: 0,
+        elapsed_minutes: 0,
         on_fail: step.on_missing_input === "fail" ? "fail" : "skip",
       });
       return;
@@ -3576,6 +4385,8 @@ function StepCard({
         target_key: targetKey,
         custom_type: mode,
         time: "",
+        elapsed_hours: 0,
+        elapsed_minutes: 0,
         on_fail: step.on_missing_input === "fail" ? "fail" : "skip",
       });
     } else if (mode === "time") {
@@ -3586,6 +4397,22 @@ function StepCard({
         target_key: "",
         custom_type: "positive",
         time: remainingParts.join(":"),
+        elapsed_hours: 0,
+        elapsed_minutes: 0,
+        on_fail: "skip",
+      });
+    } else if (mode === "elapsed") {
+      const parsedSeconds = Math.max(0, parseInt(remainingParts[0] || "0", 10) || 0);
+      const elapsedParts = durationSecondsToHourMinuteParts(parsedSeconds);
+      setStartConditionForm({
+        mode: "elapsed",
+        step_id: "",
+        answer_key: "",
+        target_key: "",
+        custom_type: "positive",
+        time: "",
+        elapsed_hours: elapsedParts.hours,
+        elapsed_minutes: elapsedParts.minutes,
         on_fail: "skip",
       });
     }
@@ -3601,6 +4428,38 @@ function StepCard({
       }
     }
   }, [pipelineForm.pipelines, pipelineTargetsByStepId]);
+
+  useEffect(() => {
+    setPipelineForm((prev) => {
+      let changed = false;
+      const nextRows = prev.pipelines.map((row) => {
+        if (row.input_target_ids.length > 0 || !row.input_from_step_id || row.input_inject_keys.length === 0) {
+          return row;
+        }
+
+        const sourceTargets =
+          String(row.input_from_step_id) === String(step.id)
+            ? targets
+            : pipelineTargetsByStepId[String(row.input_from_step_id)] || [];
+        if (sourceTargets.length === 0) return row;
+
+        const resolvedIds = sourceTargets
+          .filter((target) =>
+            row.input_inject_keys.includes(target.camera_name || `Camera ${target.camera_id}`)
+          )
+          .map((target) => String(target.id));
+
+        if (resolvedIds.length === 0) return row;
+        changed = true;
+        return {
+          ...row,
+          input_target_ids: resolvedIds,
+        };
+      });
+
+      return changed ? { ...prev, pipelines: nextRows } : prev;
+    });
+  }, [pipelineTargetsByStepId, step.id, targets]);
 
   useEffect(() => {
     if (startConditionForm.step_id) {
@@ -4418,7 +5277,9 @@ function StepCard({
 
       if (targetsRes.ok) {
         const data = await targetsRes.json();
-        setTargets(data.targets || []);
+        const nextTargets = Array.isArray(data?.targets) ? data.targets : [];
+        setTargets(nextTargets);
+        onTargetsLoaded(step.id, nextTargets);
       }
       if (agentsRes.ok) {
         const data = await agentsRes.json();
@@ -4545,6 +5406,8 @@ function StepCard({
   };
 
   const handleAddTarget = async (cameraId: number) => {
+    setExpandedTargetId(null);
+    setClonePickerTargetId(null);
     try {
       const response = await fetch(`/api/job-steps/${step.id}/targets`, {
         method: "POST",
@@ -4553,13 +5416,11 @@ function StepCard({
       });
 
       if (response.ok) {
-        const data = await response.json().catch(() => ({}));
-        const createdTargetId = Number(data?.target?.id);
+        await response.json().catch(() => ({}));
         await fetchStepData();
+        setExpandedTargetId(null);
+        setClonePickerTargetId(null);
         setShowTargetSelect(false);
-        if (Number.isInteger(createdTargetId) && createdTargetId > 0) {
-          triggerAgentCreationHighlight(createdTargetId);
-        }
       }
     } catch (error) {
       console.error("Failed to add target:", error);
@@ -4815,66 +5676,6 @@ function StepCard({
     setAgentForm(buildEmptyAgentForm());
   };
 
-  const handlePriorityChange = async (
-    target: Target,
-    targetAgent: Agent | undefined,
-    newPriority: AgentPriority
-  ) => {
-    const previousPriority =
-      agentPriorities[target.id] || targetAgent?.priority_level || "MEDIUM";
-
-    setAgentPriorities((prev) => ({ ...prev, [target.id]: newPriority }));
-
-    if (!targetAgent) {
-      return;
-    }
-
-    setSavingPriorities((prev) => new Set(prev).add(target.id));
-    try {
-      const promptFields = getPromptFieldsFromAgent(targetAgent);
-      const promptPayload = buildPromptPayload(promptFields);
-      const analysisRegions = getAnalysisRegionsFromAgent(targetAgent);
-
-      const response = await fetch(`/api/job-steps/${step.id}/agents`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          buildAgentUpsertRequestBody({
-            source: {
-              ...targetAgent,
-              priority_level: newPriority,
-            },
-            cameraId: targetAgent.camera_id ?? target.camera_id,
-            promptPayload,
-            analysisRegions,
-          })
-        ),
-      });
-
-      if (response.ok) {
-        await fetchStepData();
-      } else {
-        const error = await response.json().catch(() => null);
-        if (handleModelApiKeyRequired(error)) {
-          setAgentPriorities((prev) => ({ ...prev, [target.id]: previousPriority }));
-          return;
-        }
-        onShowToast(error?.message || error?.error || "Failed to update priority", "error");
-        setAgentPriorities((prev) => ({ ...prev, [target.id]: previousPriority }));
-      }
-    } catch (error) {
-      console.error("Failed to update priority:", error);
-      onShowToast("Failed to update priority", "error");
-      setAgentPriorities((prev) => ({ ...prev, [target.id]: previousPriority }));
-    } finally {
-      setSavingPriorities((prev) => {
-        const next = new Set(prev);
-        next.delete(target.id);
-        return next;
-      });
-    }
-  };
-
   const handleOnlyCaptureOnMotionChange = async (
     target: Target,
     targetAgent: Agent | undefined,
@@ -5048,6 +5849,7 @@ function StepCard({
     id: `pipeline-${step.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     input_from_step_id: "",
     input_inject_keys: [],
+    input_target_ids: [],
     target_camera_id: "",
   });
 
@@ -5075,18 +5877,62 @@ function StepCard({
     });
   };
 
+  const persistPipelines = async (
+    pipelines: StepPipelineConfig[],
+    onMissingInput: string,
+    successMessage: string
+  ) => {
+    const response = await fetch(`/api/job-steps/${step.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pipelines,
+        on_missing_input: onMissingInput || "skip",
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => null);
+      throw new Error(error?.message || error?.error || "Failed to save pipeline");
+    }
+
+    await onStepUpdated();
+    onShowToast(successMessage, "success");
+  };
+
   const handleSavePipeline = async () => {
     try {
       const pipelines = pipelineForm.pipelines
         .filter((p) => p.input_from_step_id)
         .map((p) => {
+          const inputFromStepId = parseInt(p.input_from_step_id, 10);
+          const sourceTargets =
+            String(inputFromStepId) === String(step.id)
+              ? targets
+              : pipelineTargetsByStepId[String(inputFromStepId)] || [];
+          const selectedTargetIds = Array.from(
+            new Set(
+              (Array.isArray(p.input_target_ids) ? p.input_target_ids : [])
+                .map((value) => parseInt(value, 10))
+                .filter((value) => Number.isInteger(value) && value > 0)
+            )
+          );
+          const injectKeysFromTargetIds = selectedTargetIds
+            .map((targetId) => {
+              const sourceTarget = sourceTargets.find((target) => target.id === targetId);
+              return sourceTarget?.camera_name || (sourceTarget ? `Camera ${sourceTarget.camera_id}` : "");
+            })
+            .filter((value) => value);
           const targetId = p.target_camera_id ? parseInt(p.target_camera_id, 10) : null;
           const targetName = targetId
             ? targets.find((t) => t.camera_id === targetId)?.camera_name || null
             : null;
           return {
-            input_from_step_id: parseInt(p.input_from_step_id, 10),
-            input_inject_keys: normalizePipelineKeys(p.input_inject_keys),
+            input_from_step_id: inputFromStepId,
+            input_inject_keys: normalizePipelineKeys(
+              injectKeysFromTargetIds.length > 0 ? injectKeysFromTargetIds : p.input_inject_keys
+            ),
+            input_target_ids: selectedTargetIds,
             target_camera_id: Number.isFinite(targetId as any) ? targetId : null,
             target_camera_name: targetName,
           };
@@ -5107,31 +5953,55 @@ function StepCard({
           return;
         }
       }
-
-      const response = await fetch(`/api/job-steps/${step.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          pipelines,
-          on_missing_input: pipelineForm.on_missing_input || "skip",
-        }),
-      });
-
-      if (response.ok) {
-        await onStepUpdated();
-        setShowPipelineForm(false);
-        onShowToast("Pipeline saved successfully", "success");
-      } else {
-        const error = await response.json();
-        onShowToast(error.message || error.error || "Failed to save pipeline", "error");
-      }
+      await persistPipelines(
+        pipelines,
+        pipelineForm.on_missing_input || "skip",
+        "Knowledge sharing saved successfully"
+      );
+      setShowPipelineForm(false);
     } catch (error) {
       console.error("Failed to save pipeline:", error);
-      onShowToast("Failed to save pipeline", "error");
+      onShowToast(
+        error instanceof Error && error.message ? error.message : "Failed to save pipeline",
+        "error"
+      );
+    }
+  };
+
+  const handleRemoveKnowledgeSharing = async (pipelineIndex: number) => {
+    try {
+      const nextPipelines = stepPipelines
+        .filter((_, index) => index !== pipelineIndex)
+        .map((pipeline) => ({
+          input_from_step_id: pipeline.input_from_step_id,
+          input_inject_keys: normalizePipelineKeys(pipeline.input_inject_keys || []),
+          input_target_ids: Array.isArray(pipeline.input_target_ids)
+            ? pipeline.input_target_ids
+            : [],
+          target_camera_id: pipeline.target_camera_id ?? null,
+          target_camera_name: pipeline.target_camera_name ?? null,
+        }));
+
+      await persistPipelines(
+        nextPipelines,
+        pipelineForm.on_missing_input || step.on_missing_input || "skip",
+        "Knowledge sharing removed"
+      );
+    } catch (error) {
+      console.error("Failed to remove knowledge sharing:", error);
+      onShowToast(
+        error instanceof Error && error.message ? error.message : "Failed to remove knowledge sharing",
+        "error"
+      );
     }
   };
 
   const handleSaveStepSettings = async () => {
+    const trimmedStepName = String(editStepName || "").trim();
+    if (!trimmedStepName) {
+      onShowToast(t("jobs.validation.stepNameRequired", { defaultValue: "Step name is required" }), "error");
+      return;
+    }
     const timeoutValue = Math.round(Number(editTimeoutSeconds));
     if (!Number.isFinite(timeoutValue) || timeoutValue < MIN_STEP_TIMEOUT_SECONDS) {
       onShowToast(`Timeout must be at least ${MIN_STEP_TIMEOUT_SECONDS / 60} minutes`, "error");
@@ -5153,6 +6023,7 @@ function StepCard({
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          name: trimmedStepName,
           timeout_seconds: timeoutValue,
         }),
       });
@@ -5160,14 +6031,14 @@ function StepCard({
       if (response.ok) {
         await onStepUpdated();
         setIsEditingTimeout(false);
-        onShowToast("Step timeout updated successfully", "success");
+        onShowToast("Step updated successfully", "success");
       } else {
         const error = await response.json();
-        onShowToast(error.message || error.error || "Failed to update step timeout", "error");
+        onShowToast(error.message || error.error || "Failed to update step", "error");
       }
     } catch (error) {
-      console.error("Failed to update step timeout:", error);
-      onShowToast("Failed to update step timeout", "error");
+      console.error("Failed to update step:", error);
+      onShowToast("Failed to update step", "error");
     }
   };
 
@@ -5228,6 +6099,18 @@ function StepCard({
         }
         start_condition_from_step_id = null;
         start_condition = `start:time:${startConditionForm.time}`;
+        on_missing_input = "skip";
+      } else if (startConditionForm.mode === "elapsed") {
+        const elapsedSeconds = hourMinutePartsToDurationSeconds(
+          startConditionForm.elapsed_hours,
+          startConditionForm.elapsed_minutes
+        );
+        if (elapsedSeconds <= 0) {
+          onShowToast("Elapsed time must be greater than zero", "error");
+          return;
+        }
+        start_condition_from_step_id = null;
+        start_condition = `start:elapsed:${elapsedSeconds}`;
         on_missing_input = "skip";
       }
 
@@ -5348,33 +6231,11 @@ function StepCard({
     }
   };
 
-  const triggerAgentCreationHighlight = (targetId: number) => {
-    if (!Number.isInteger(targetId) || targetId <= 0) return;
-    if (hasShownAgentCreationHighlightRef.current) return;
-    hasShownAgentCreationHighlightRef.current = true;
-    if (agentCreationHighlightTimerRef.current) {
-      window.clearTimeout(agentCreationHighlightTimerRef.current);
-      agentCreationHighlightTimerRef.current = null;
-    }
-    setHighlightAgentCreationTargetId(null);
-    requestAnimationFrame(() => setHighlightAgentCreationTargetId(targetId));
-    agentCreationHighlightTimerRef.current = window.setTimeout(() => {
-      setHighlightAgentCreationTargetId((current) =>
-        current === targetId ? null : current
-      );
-      agentCreationHighlightTimerRef.current = null;
-    }, 5200);
-  };
-
   useEffect(() => {
     return () => {
       if (agentFormHighlightTimerRef.current) {
         window.clearTimeout(agentFormHighlightTimerRef.current);
         agentFormHighlightTimerRef.current = null;
-      }
-      if (agentCreationHighlightTimerRef.current) {
-        window.clearTimeout(agentCreationHighlightTimerRef.current);
-        agentCreationHighlightTimerRef.current = null;
       }
     };
   }, []);
@@ -6498,172 +7359,368 @@ function StepCard({
   const previousSteps = steps.filter((s) => s.step_order < step.step_order);
   const pipelineSourceSteps = steps.filter((s) => s.step_order <= step.step_order);
   const stepPipelines = parsePipelinesFromStep(step);
+  const startCondition = step.start_condition || "";
+  const startConditionFromStepId = step.start_condition_from_step_id;
+  const legacyInjectKey = step.input_inject_key || "";
+  const legacyFromStepId = step.input_from_step_id;
+  const conditionStr = startCondition || (legacyInjectKey.startsWith("start:") ? legacyInjectKey : "");
+  const fromStepId = startConditionFromStepId || (legacyInjectKey.startsWith("start:") ? legacyFromStepId : null);
+  const startConditionSummary = (() => {
+    if (!conditionStr || !conditionStr.startsWith("start:")) {
+      return step.step_order === 1 ? t("jobs.sequentialJobStart") : t("jobs.sequentialAfterPreviousStep");
+    }
+
+    const parts = conditionStr.split(":");
+    if (parts.length < 3) {
+      return step.step_order === 1 ? t("jobs.sequentialJobStart") : t("jobs.sequentialAfterPreviousStep");
+    }
+
+    const mode = parts[1];
+    const value = parts.slice(2).join(":");
+
+    if (mode === "custom") {
+      const answerKey = parts[2] || "";
+      const targetKey = parts[3] || "";
+      const sourceStep = steps.find((s) => s.id === fromStepId);
+      const stepLabel = sourceStep
+        ? `Step #${sourceStep.step_order}: ${sourceStep.name}`
+        : `Step #${fromStepId}`;
+      const targetSuffix = targetKey ? ` ${t("jobs.onTarget")} ${targetKey}` : "";
+      return t("jobs.whenKeyForStep", { stepLabel, answerKey, targetSuffix });
+    }
+
+    if (mode === "positive" || mode === "negative") {
+      const sourceStep = steps.find((s) => s.id === fromStepId);
+      const stepLabel = sourceStep
+        ? `Step #${sourceStep.step_order}: ${sourceStep.name}`
+        : `Step #${fromStepId}`;
+
+      if (value === "result" || value.startsWith("result:")) {
+        return t("jobs.whenResultIs", { stepLabel, mode });
+      }
+
+      const keyPart = value.split(":")[0];
+      return t("jobs.whenKeyIs", { stepLabel, keyPart, mode });
+    }
+
+    if (mode === "time") {
+      return t("jobs.atTimeWithinSchedule", { value });
+    }
+
+    if (mode === "elapsed") {
+      const elapsedSeconds = Math.max(0, parseInt(value || "0", 10) || 0);
+      return t("jobs.afterElapsedFromJobStart", {
+        value: formatDurationHuman(elapsedSeconds),
+      });
+    }
+
+    return step.step_order === 1 ? t("jobs.sequentialJobStart") : t("jobs.sequentialAfterPreviousStep");
+  })();
+  const hasExplicitStartCondition = !!conditionStr && conditionStr.startsWith("start:");
   const editTimeoutParts = timeoutSecondsToHourMinuteParts(editTimeoutSeconds);
 
   const resetEditingTimeout = () => {
     setIsEditingTimeout(false);
+    setEditStepName(step.name || "");
     setEditTimeoutSeconds(normalizeTimeoutForHourMinuteUi(step.timeout_seconds));
+  };
+
+  const openStepSettingsEditor = () => {
+    setEditStepName(step.name || "");
+    setEditTimeoutSeconds(normalizeTimeoutForHourMinuteUi(step.timeout_seconds));
+    setIsEditingTimeout(true);
   };
 
   const handleDeleteStep = () => {
     onRequestDeleteStep(step.id);
   };
 
-  return (
-    <div className="border border-gray-800 rounded-lg overflow-hidden">
-      {/* Step Header */}
-      <div className="w-full flex items-center justify-between p-4 bg-gray-800/50">
+  const targetAnchorRefCallbacksRef = useRef<Record<number, (node: HTMLDivElement | null) => void>>({});
+
+  const getTargetAnchorRef = (targetId: number) => {
+    if (!targetAnchorRefCallbacksRef.current[targetId]) {
+      targetAnchorRefCallbacksRef.current[targetId] = (node: HTMLDivElement | null) => {
+        onRegisterCameraAnchor(step.id, targetId, node);
+      };
+    }
+    return targetAnchorRefCallbacksRef.current[targetId];
+  };
+
+  const forceAllTargetsVisible = showTargetSelect || isTargetMultiSelect;
+  const visibleTargets =
+    forceAllTargetsVisible || showAllTargets ? targets : targets.slice(0, 3);
+  const hiddenTargetsCount = Math.max(0, targets.length - visibleTargets.length);
+  const isCompactFlow = density === "compact";
+  const stepActionBaseClass =
+    `inline-flex items-center justify-center gap-2 rounded-full border font-medium transition-colors ${
+      isCompactFlow ? "h-8 px-2 text-[11px]" : "h-10 px-3 text-[13px]"
+    }`;
+  const stepActionIdleClass = "border-gray-700 bg-gray-900 text-gray-200 hover:bg-gray-800";
+  const stepActionActiveClass = "border-blue-400/30 bg-blue-500/12 text-blue-100 hover:bg-blue-500/18";
+  const openStartConditionEditor = () => {
+    parseStartCondition();
+    setShowStartConditionForm(true);
+  };
+  const openKnowledgeSharingEditor = () => {
+    setPipelineForm({
+      pipelines: buildPipelineFormRows(stepPipelines, step.id),
+      on_missing_input: step.on_missing_input || "skip",
+    });
+    setShowPipelineForm(true);
+  };
+
+  const stepToolbar = (
+    <div className={`grid grid-cols-2 ${isCompactFlow ? "gap-1.5" : "gap-2"}`}>
+      <button
+        type="button"
+        onClick={() => {
+          if (step.step_order === 1) return;
+          if (showStartConditionForm) {
+            setShowStartConditionForm(false);
+            return;
+          }
+          openStartConditionEditor();
+        }}
+        disabled={step.step_order === 1}
+        className={`${stepActionBaseClass} ${
+          step.step_order === 1
+            ? "cursor-not-allowed border-gray-800 bg-gray-900/60 text-gray-600"
+            : showStartConditionForm
+            ? stepActionActiveClass
+            : stepActionIdleClass
+        }`}
+      >
+        <Sparkles className="h-4 w-4" />
+        {t("jobs.startCondition")}
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          if (showPipelineForm) {
+            setShowPipelineForm(false);
+            return;
+          }
+          openKnowledgeSharingEditor();
+        }}
+        className={`${stepActionBaseClass} ${
+          showPipelineForm
+            ? stepActionActiveClass
+            : stepActionIdleClass
+        }`}
+      >
+        <Repeat className="h-4 w-4" />
+        {t("jobs.knowledgeSharing", { defaultValue: "Compartilhamento de conhecimento" })}
+      </button>
+      <button
+        type="button"
+        onClick={() => setShowAlertForm((current) => !current)}
+        disabled={!isReady}
+        className={`${stepActionBaseClass} ${
+          !isReady
+            ? "cursor-not-allowed border-gray-800 bg-gray-900/60 text-gray-600"
+            : showAlertForm
+            ? stepActionActiveClass
+            : stepActionIdleClass
+        }`}
+      >
+        <AlertCircle className="h-4 w-4" />
+        {t("jobs.addAlert")}
+      </button>
+      <div className="col-span-2">
         <button
-          onClick={onToggle}
-          className="flex-1 flex items-center gap-3 hover:bg-gray-800/50 -m-4 p-4 rounded-lg transition-colors"
+          type="button"
+          onClick={() => {
+            if (isTargetMultiSelect && selectedTargetIds.size >= 2) {
+              openGroupModal();
+              return;
+            }
+            toggleTargetMultiSelect();
+          }}
+          className={`${stepActionBaseClass} w-full ${
+            isTargetMultiSelect
+              ? "border-purple-400/30 bg-purple-500/12 text-purple-100 hover:bg-purple-500/18"
+              : stepActionIdleClass
+          }`}
         >
-          <div className="flex items-center gap-3">
-            {expanded ? (
-              <ChevronDown className="w-5 h-5 text-gray-400" />
-            ) : (
-              <ChevronRight className="w-5 h-5 text-gray-400" />
-            )}
-            <div className="flex items-center gap-3">
-              <span className="text-sm font-medium text-gray-500">
-                #{step.step_order}
-              </span>
-              <h4 className="font-semibold text-gray-200">{step.name}</h4>
-              {isReady ? (
-                <Check className="w-4 h-4 text-green-400" />
-              ) : (
-                <AlertCircle className="w-4 h-4 text-yellow-400" />
-              )}
-            </div>
-          </div>
-          <div
-            className="flex items-center gap-2 text-sm text-gray-400"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <Clock className="w-4 h-4" />
-            {isEditingTimeout ? (
-              <div className="flex items-center gap-1.5">
-                <div className="relative">
-                  <input
-                    type="number"
-                    value={editTimeoutParts.hours}
-                    onChange={(e) =>
-                      setEditTimeoutSeconds(
-                        hourMinutePartsToTimeoutSeconds(
-                          parseNonNegativeIntegerInput(e.target.value),
-                          editTimeoutParts.minutes
-                        )
-                      )
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleSaveStepSettings();
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        resetEditingTimeout();
-                      }
-                    }}
-                    className="w-14 px-2 py-1 pr-5 bg-gray-700 border border-gray-600 rounded text-gray-200 text-xs focus:outline-none focus:border-blue-500"
-                    min="0"
-                  />
-                  <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
-                    h
-                  </span>
-                </div>
-                <div className="relative">
-                  <input
-                    type="number"
-                    value={editTimeoutParts.minutes}
-                    onChange={(e) =>
-                      setEditTimeoutSeconds(
-                        hourMinutePartsToTimeoutSeconds(
-                          editTimeoutParts.hours,
-                          Math.min(59, parseNonNegativeIntegerInput(e.target.value))
-                        )
-                      )
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleSaveStepSettings();
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        resetEditingTimeout();
-                      }
-                    }}
-                    className="w-14 px-2 py-1 pr-5 bg-gray-700 border border-gray-600 rounded text-gray-200 text-xs focus:outline-none focus:border-blue-500"
-                    min="0"
-                    max="59"
-                  />
-                  <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
-                    m
-                  </span>
-                </div>
-                <button
-                  onClick={handleSaveStepSettings}
-                  className="text-blue-400 hover:text-blue-300"
-                  title="Save timeout"
-                >
-                  <Save className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={resetEditingTimeout}
-                  className="text-gray-500 hover:text-gray-300"
-                  title="Cancel"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  setIsEditingTimeout(true);
-                  setEditTimeoutSeconds(normalizeTimeoutForHourMinuteUi(step.timeout_seconds));
-                }}
-                className="text-gray-300 hover:text-blue-300"
-                title="Edit timeout"
-              >
-                {formatStepTimeoutHuman(step.timeout_seconds)}
-              </button>
-            )}
-          </div>
-        </button>
-        <button
-          onClick={handleDeleteStep}
-          className="ml-2 p-2 text-gray-400 hover:text-red-400 hover:bg-gray-800 rounded transition-colors"
-          title="Delete step"
-        >
-          <Trash2 className="w-4 h-4" />
+          <LayoutGrid className="h-4 w-4" />
+          {t("jobs.groupCameras", { defaultValue: "Group cameras" })}
         </button>
       </div>
+    </div>
+  );
 
-      {/* Step Details */}
-      {expanded && (
-        <div className="p-4 space-y-4 bg-gray-900/30">
+  const timeoutSlot = (
+    <div className={`flex items-center gap-2 text-gray-400 ${isCompactFlow ? "text-[13px]" : "text-sm"}`} onClick={(e) => e.stopPropagation()}>
+      <Clock className="h-4 w-4" />
+      {isEditingTimeout ? (
+        <div className="flex items-center gap-1.5">
+          <div className="relative">
+            <input
+              type="number"
+              value={editTimeoutParts.hours}
+              onChange={(e) =>
+                setEditTimeoutSeconds(
+                  hourMinutePartsToTimeoutSeconds(
+                    parseNonNegativeIntegerInput(e.target.value),
+                    editTimeoutParts.minutes
+                  )
+                )
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleSaveStepSettings();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  resetEditingTimeout();
+                }
+              }}
+              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-violet-400 focus:outline-none"
+              min="0"
+            />
+            <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
+              h
+            </span>
+          </div>
+          <div className="relative">
+            <input
+              type="number"
+              value={editTimeoutParts.minutes}
+              onChange={(e) =>
+                setEditTimeoutSeconds(
+                  hourMinutePartsToTimeoutSeconds(
+                    editTimeoutParts.hours,
+                    Math.min(59, parseNonNegativeIntegerInput(e.target.value))
+                  )
+                )
+              }
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleSaveStepSettings();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  resetEditingTimeout();
+                }
+              }}
+              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-violet-400 focus:outline-none"
+              min="0"
+              max="59"
+            />
+            <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
+              m
+            </span>
+          </div>
+          <button
+            onClick={handleSaveStepSettings}
+            className="text-violet-400 hover:text-violet-300"
+            title="Save timeout"
+          >
+            <Save className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={resetEditingTimeout}
+            className="text-gray-500 hover:text-gray-300"
+            title="Cancel"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={openStepSettingsEditor}
+          className="text-gray-300 hover:text-violet-300"
+          title="Edit step settings"
+        >
+          {formatStepTimeoutHuman(step.timeout_seconds)}
+        </button>
+      )}
+    </div>
+  );
+
+  const stepNameContent = isEditingTimeout ? (
+    <input
+      type="text"
+      value={editStepName}
+      onChange={(e) => setEditStepName(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          handleSaveStepSettings();
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          resetEditingTimeout();
+        }
+      }}
+      className="w-full min-w-0 rounded-lg border border-violet-400/40 bg-gray-950/85 px-2.5 py-1.5 text-sm font-semibold text-gray-100 focus:border-violet-400 focus:outline-none"
+      placeholder={t("jobs.stepName", { defaultValue: "Step name" })}
+      autoFocus
+    />
+  ) : (
+    step.name
+  );
+
+  const inspectedTarget =
+    expandedTargetId !== null ? targets.find((target) => target.id === expandedTargetId) || null : null;
+  const inspectedTargetAgent = inspectedTarget
+    ? agents.find((agent) => agent.is_active === 1 && agent.camera_id === inspectedTarget.camera_id)
+    : undefined;
+  const inspectedEffectiveAgent = inspectedTargetAgent || defaultAgent;
+  const inspectedCaptureOnMotion = inspectedTarget
+    ? agentOnlyCaptureOnMotion[inspectedTarget.id] ??
+      normalizeAgentOnlyCaptureOnMotion(inspectedTargetAgent?.only_capture_on_motion)
+    : false;
+  const inspectedCloneCandidates =
+    inspectedTarget ? cloneCandidatesByTargetId[inspectedTarget.id] || [] : [];
+  const inspectedCloneSourceFromState =
+    inspectedTarget ? cloneSourceByTarget[inspectedTarget.id] : undefined;
+  const inspectedCloneSourceCameraId = inspectedCloneCandidates.some(
+    (candidate) => candidate.cameraId === inspectedCloneSourceFromState
+  )
+    ? inspectedCloneSourceFromState
+    : inspectedCloneCandidates[0]?.cameraId ?? null;
+  const inspectedIsCloning =
+    inspectedTarget ? cloningTargets.has(inspectedTarget.id) : false;
+  const inspectedInputType = inspectedTarget
+    ? normalizeTargetInputType(
+        targetInputTypes[inspectedTarget.id] ?? inspectedTarget.input_type
+      )
+    : "video";
+  const inspectedCanToggleCaptureMode = !!inspectedTargetAgent;
+
+  return (
+    <StepFlowCard
+      stepOrder={step.step_order}
+      stepName={stepNameContent}
+      density={density}
+      expanded={expanded}
+      isReady={isReady}
+      timeoutSlot={timeoutSlot}
+      toolbar={stepToolbar}
+      onToggle={onToggle}
+      onEdit={openStepSettingsEditor}
+      onDelete={handleDeleteStep}
+    >
+      <div className={isCompactFlow ? "space-y-2.5" : "space-y-3"}>
           {/* Targets Section */}
-          <div className="border border-gray-800 rounded-lg p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h5 className="font-medium text-gray-300">{t("jobs.targets")}</h5>
-              <button
-                onClick={() => setShowTargetSelect(!showTargetSelect)}
-                className={`inline-flex items-center gap-2 px-4 py-2 rounded-full border text-sm font-semibold transition-all ${
-                  showTargetSelect
-                    ? "bg-gray-800 border-gray-700 text-gray-200 hover:bg-gray-700"
-                    : "bg-gradient-to-r from-blue-500 to-cyan-500 border-blue-300/30 text-white shadow-lg shadow-blue-500/30 hover:from-blue-400 hover:to-cyan-400 hover:shadow-blue-500/45"
-                }`}
-              >
-                {showTargetSelect ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-                {showTargetSelect ? t("jobs.cancel") : t("jobs.addTarget")}
-              </button>
+          <div className={`rounded-[20px] border border-gray-800/80 bg-gray-950/55 ${isCompactFlow ? "p-3" : "p-3.5"}`}>
+            <div className={`flex items-center justify-between ${isCompactFlow ? "mb-2.5" : "mb-3"}`}>
+              <h5 className={`${isCompactFlow ? "text-[13px]" : "text-sm"} font-medium text-gray-300`}>{t("jobs.targets")}</h5>
+              <span className="text-xs uppercase tracking-[0.22em] text-gray-500">
+                {targets.length}
+              </span>
             </div>
-            <div className="flex flex-wrap gap-2 mb-3">
+            {isTargetMultiSelect ? (
+            <div className="mb-3 flex flex-wrap gap-2">
               <button
                 type="button"
                 onClick={toggleTargetMultiSelect}
-                className={`flex items-center gap-2 px-4 py-2 rounded-full border text-sm transition-colors ${
+                className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
                   isTargetMultiSelect
                     ? "bg-blue-500/20 border-blue-400/40 text-blue-200"
                     : "bg-gray-800/70 border-gray-700 text-gray-200 hover:bg-gray-800"
@@ -6679,7 +7736,7 @@ function StepCard({
                   type="button"
                   onClick={openGroupModal}
                   disabled={selectedTargetIds.size < 2 || savingInferenceGroups}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-full border text-sm transition-colors ${
+                  className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
                     selectedTargetIds.size < 2 || savingInferenceGroups
                       ? "bg-blue-500/10 border-blue-400/20 text-blue-200/50 cursor-not-allowed"
                       : "bg-blue-600/60 border-blue-400/60 text-blue-100 hover:bg-blue-600/80"
@@ -6692,7 +7749,7 @@ function StepCard({
               <button
                 type="button"
                 onClick={handleSelectAllTargets}
-                className="flex items-center gap-2 px-4 py-2 rounded-full border text-sm bg-gray-800/70 border-gray-700 text-gray-200 hover:bg-gray-800 transition-colors"
+                className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
                 disabled={targets.length === 0}
               >
                 <span className="w-4 h-4 rounded border border-current flex items-center justify-center">
@@ -6703,23 +7760,24 @@ function StepCard({
               <button
                 type="button"
                 onClick={handleClearTargetSelection}
-                className="flex items-center gap-2 px-4 py-2 rounded-full border text-sm bg-gray-800/70 border-gray-700 text-gray-200 hover:bg-gray-800 transition-colors"
+                className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
                 disabled={selectedTargetIds.size === 0}
               >
                 <X className="w-4 h-4" />
                 {t("jobs.clear")}
               </button>
             </div>
+            ) : null}
 
             {showTargetSelect && availableCameras.length > 0 && (
-              <div className="mb-3 p-3 bg-gray-800/50 rounded border border-gray-700">
-                <p className="text-xs text-gray-400 mb-2">{t("jobs.selectCamera")}:</p>
+              <div className="mb-3 rounded-2xl border border-gray-800/80 bg-gray-900/80 p-3">
+                <p className="mb-2 text-[11px] uppercase tracking-[0.18em] text-gray-500">{t("jobs.selectCamera")}:</p>
                 <div className="flex flex-wrap gap-2">
                   {availableCameras.map((camera) => (
                     <button
                       key={camera.id}
                       onClick={() => handleAddTarget(camera.id)}
-                      className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-sm transition-colors"
+                      className="rounded-full border border-gray-700 bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700"
                     >
                       {camera.name}
                     </button>
@@ -6729,11 +7787,48 @@ function StepCard({
             )}
 
             {targets.length === 0 ? (
-              <p className="text-sm text-gray-500">{t("jobs.noTargets")}</p>
-            ) : (
               <div className="space-y-3">
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                  {targets.map((target) => {
+                <p className="text-xs text-gray-500">{t("jobs.noTargets")}</p>
+                <button
+                  type="button"
+                  onClick={() => setShowTargetSelect((current) => !current)}
+                  disabled={availableCameras.length === 0}
+                  className={`w-full rounded-[16px] border border-dashed px-3 py-3 text-sm font-medium transition-colors ${
+                    availableCameras.length === 0
+                      ? "cursor-not-allowed border-gray-800 bg-gray-900/50 text-gray-600"
+                      : showTargetSelect
+                      ? "border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+                      : "border-gray-700 bg-gray-900/70 text-gray-300 hover:border-gray-600 hover:bg-gray-800"
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-2">
+                    {showTargetSelect ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                    {showTargetSelect ? t("jobs.cancel") : t("jobs.addTarget")}
+                  </span>
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-gray-500">
+                    {visibleTargets.length} / {targets.length} {targets.length === 1 ? "camera" : "cameras"}
+                  </span>
+                  {targets.length > 3 && !forceAllTargetsVisible ? (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllTargets((current) => !current)}
+                      className="rounded-full border border-gray-800 bg-gray-900/70 px-2.5 py-1 text-[11px] text-gray-300 transition-colors hover:border-gray-700 hover:bg-gray-800"
+                    >
+                      {showAllTargets
+                        ? t("jobs.showFewerCameras", { defaultValue: "Show fewer" })
+                        : t("jobs.showMoreCameras", {
+                            defaultValue: `Show ${hiddenTargetsCount} more`,
+                          })}
+                    </button>
+                  ) : null}
+                </div>
+                <div className="grid grid-cols-1 gap-2">
+                  {visibleTargets.map((target) => {
                   const targetAgent = agents.find(
                     (a) => a.is_active === 1 && a.camera_id === target.camera_id
                   );
@@ -6743,305 +7838,138 @@ function StepCard({
                   );
                   const isGrouped = !!activeGroupForTarget;
                   const normalizedEffectiveAgentKey = String(effectiveAgent?.agent_key || "").trim();
-                  const normalizedGroupAgentKey = String(activeGroupForTarget?.agentKey || "").trim();
-                  const groupSourceTargetId = activeGroupForTarget?.source_target_id ?? null;
-                  const isAgentMismatch =
-                    !!activeGroupForTarget &&
-                    !!effectiveAgent &&
-                    (groupSourceTargetId !== null
-                      ? groupSourceTargetId !== target.id
-                      : normalizedEffectiveAgentKey !== normalizedGroupAgentKey);
-                  const priorityValue =
-                    agentPriorities[target.id] ||
-                    targetAgent?.priority_level ||
-                    "MEDIUM";
-                  const captureOnMotionOnlyValue =
-                    agentOnlyCaptureOnMotion[target.id] ??
-                    normalizeAgentOnlyCaptureOnMotion(targetAgent?.only_capture_on_motion);
-                  const canToggleCaptureMode = !!targetAgent;
-                  const cloneCandidates = cloneCandidatesByTargetId[target.id] || [];
-                  const selectedCloneSourceFromState = cloneSourceByTarget[target.id];
-                  const selectedCloneSourceCameraId = cloneCandidates.some(
-                    (candidate) => candidate.cameraId === selectedCloneSourceFromState
-                  )
-                    ? selectedCloneSourceFromState
-                    : cloneCandidates[0]?.cameraId ?? null;
-                  const isCloningAgent = cloningTargets.has(target.id);
-                  const shouldHighlightAgentCreationArea =
-                    highlightAgentCreationTargetId === target.id;
-                  const priorityClasses = {
-                    CRITIC: "bg-red-500/20 text-red-200 border-red-500/40",
-                    HIGH: "bg-orange-500/20 text-orange-200 border-orange-500/40",
-                    MEDIUM: "bg-yellow-500/20 text-yellow-200 border-yellow-500/40",
-                    LOW: "bg-green-500/20 text-green-200 border-green-500/40",
-                  } as const;
+                  const agentSummaryText = effectiveAgent
+                    ? targetAgent
+                      ? normalizedEffectiveAgentKey
+                      : `${t("jobs.usingDefault")}: ${normalizedEffectiveAgentKey}`
+                    : t("jobs.notConfigured");
+                  const agentSummaryClass = effectiveAgent
+                    ? targetAgent
+                      ? "text-green-400"
+                      : "text-yellow-400"
+                    : "text-red-400";
+                  const targetSetupLabel = effectiveAgent
+                    ? t("jobs.readyShort", { defaultValue: "OK" })
+                    : t("jobs.setupShort", { defaultValue: "Setup" });
+                  const targetSetupClass = effectiveAgent
+                    ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200"
+                    : "border-amber-400/25 bg-amber-500/12 text-amber-200";
 
                   return (
-                    <div
+                    <CameraTargetCard
                       key={target.id}
-                      className="bg-gradient-to-b from-gray-900/60 to-gray-900/30 border border-gray-700/60 rounded-2xl p-4 shadow-inner relative"
-                    >
-                      {isTargetMultiSelect && (
-                        <button
-                          type="button"
-                          onClick={() => toggleTargetSelection(target.id)}
-                          disabled={isGrouped}
-                          className={`absolute top-3 right-3 w-5 h-5 rounded-[4px] border flex items-center justify-center shadow-sm ${
-                            selectedTargetIds.has(target.id)
-                              ? "bg-blue-500 border-blue-400 text-white"
-                              : "bg-gray-800/90 border-white/70 text-transparent"
-                          } ${isGrouped ? "opacity-40 cursor-not-allowed" : ""}`}
-                          title={
-                            isGrouped
-                              ? t("jobs.alreadyGrouped")
-                              : selectedTargetIds.has(target.id)
-                              ? t("jobs.deselect")
-                              : t("jobs.select")
-                          }
-                        >
-                          {selectedTargetIds.has(target.id) && <Check className="w-3 h-3" />}
-                        </button>
-                      )}
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-3">
-                          <div className="w-10 h-10 rounded-xl bg-blue-500/20 text-blue-300 flex items-center justify-center">
-                            <Camera className="w-5 h-5" />
-                          </div>
-                          <div>
-                            <p className="text-sm font-semibold text-gray-100">
-                              {target.camera_name || `Camera ${target.camera_id}`}
-                            </p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
+                      density={density}
+                      anchorRef={getTargetAnchorRef(target.id)}
+                      title={target.camera_name || `Camera ${target.camera_id}`}
+                      subtitle={
+                        <span className={`truncate text-[11px] ${agentSummaryClass}`}>
+                          {isGrouped
+                            ? activeGroupForTarget?.name || agentSummaryText
+                            : agentSummaryText}
+                        </span>
+                      }
+                      thumbnailUrl={null}
+                      badges={
+                        <>
+                          <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${targetSetupClass}`}>
+                            {targetSetupLabel}
+                          </span>
+                          {isGrouped ? (
+                            <span className="inline-flex rounded-full border border-purple-400/30 bg-purple-500/18 px-2 py-0.5 text-[10px] font-medium text-purple-100">
+                              {t("jobs.inferenceGroups")}
+                            </span>
+                          ) : null}
+                        </>
+                      }
+                      topRight={
+                        <div className="flex items-center gap-1.5">
                           <button
-                            onClick={() => handleRemoveTarget(target.id)}
-                            className={`text-gray-500 hover:text-red-400 ${isTargetMultiSelect ? "opacity-0 pointer-events-none" : ""}`}
-                            title={t("jobs.removeCamera")}
+                            type="button"
+                            onClick={() =>
+                              openAgentEditorForTarget(
+                                target,
+                                targetAgent,
+                                (agentPriorities[target.id] ||
+                                  targetAgent?.priority_level ||
+                                  "MEDIUM") as AgentPriority
+                              )
+                            }
+                            className={`inline-flex items-center justify-center rounded-xl border border-gray-800 bg-gray-950/60 text-gray-400 transition-colors hover:border-gray-700 hover:bg-gray-900 hover:text-gray-200 ${
+                              density === "compact" ? "h-7 w-7" : "h-8 w-8"
+                            }`}
+                            title={t("jobs.openAgentEditor", { defaultValue: "Open agent editor" })}
                           >
-                            <X className="w-4 h-4" />
+                            <SlidersHorizontal className={density === "compact" ? "h-3.5 w-3.5" : "h-4 w-4"} />
                           </button>
-                        </div>
-                      </div>
-
-                      <div className="mt-4 border-t border-gray-800/70 pt-4 space-y-4">
-                        <div
-                          className={`rounded-xl px-2 py-2 -mx-2 transition-all duration-500 ${
-                            shouldHighlightAgentCreationArea
-                              ? "border border-blue-400/70 bg-blue-500/10 ring-2 ring-blue-400/45 shadow-[0_0_0_3px_rgba(59,130,246,0.18)]"
-                              : "border border-transparent"
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-3">
-                            <div
-                              className={`text-[11px] uppercase tracking-widest ${
-                                shouldHighlightAgentCreationArea
-                                  ? "text-blue-300"
-                                  : "text-gray-400"
-                              }`}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setClonePickerTargetId(null);
+                              setExpandedTargetId((current) =>
+                                current === target.id ? null : target.id
+                              );
+                            }}
+                            className={`inline-flex items-center justify-center rounded-xl border transition-colors ${
+                              expandedTargetId === target.id
+                                ? "border-violet-400/45 bg-violet-500/12 text-violet-100"
+                                : "border-gray-800 bg-gray-950/60 text-gray-400 hover:border-gray-700 hover:bg-gray-900 hover:text-gray-200"
+                            } ${density === "compact" ? "h-7 w-7" : "h-8 w-8"}`}
+                            title={t("jobs.openCameraSettings", {
+                              defaultValue: "Open camera settings",
+                            })}
+                          >
+                            <Settings className={density === "compact" ? "h-3.5 w-3.5" : "h-4 w-4"} />
+                          </button>
+                          {isTargetMultiSelect ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleTargetSelection(target.id)}
+                              disabled={isGrouped}
+                              className={`flex h-8 w-8 items-center justify-center rounded-xl border shadow-sm ${
+                                selectedTargetIds.has(target.id)
+                                  ? "border-blue-400 bg-blue-500 text-white"
+                                  : "border-white/20 bg-black/30 text-transparent"
+                              } ${isGrouped ? "cursor-not-allowed opacity-40" : ""}`}
+                              title={
+                                isGrouped
+                                  ? t("jobs.alreadyGrouped")
+                                  : selectedTargetIds.has(target.id)
+                                  ? t("jobs.deselect")
+                                  : t("jobs.select")
+                              }
                             >
-                              {t("jobs.aiAgent")}
-                            </div>
-                          </div>
-                          <div className="mt-2 flex items-center justify-between gap-3">
-                            <div className="text-sm">
-                              {effectiveAgent ? (
-                                targetAgent ? (
-                                  <span
-                                    className={`text-green-400 ${
-                                      isAgentMismatch
-                                        ? "line-through decoration-red-400/70 decoration-2"
-                                        : ""
-                                    }`}
-                                  >
-                                    {normalizedEffectiveAgentKey}
-                                  </span>
-                                ) : (
-                                  <span
-                                    className={`text-yellow-400 ${
-                                      isAgentMismatch
-                                        ? "line-through decoration-red-400/70 decoration-2"
-                                        : ""
-                                    }`}
-                                  >
-                                    {t("jobs.usingDefault")}: {normalizedEffectiveAgentKey}
-                                  </span>
-                                )
-                              ) : (
-                                <span className="text-red-400">{t("jobs.notConfigured")}</span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (cloneCandidates.length === 0) {
-                                    onShowToast(
-                                      t("jobs.noConfiguredAgentInOtherTargets"),
-                                      "info"
-                                    );
-                                    return;
-                                  }
-
-                                  if (cloneCandidates.length === 1) {
-                                      requestCloneAgentFromCamera(target, cloneCandidates[0].cameraId);
-                                      return;
-                                  }
-
-                                  setClonePickerTargetId((current) =>
-                                    current === target.id ? null : target.id
-                                  );
-                                  setCloneSourceByTarget((prev) => {
-                                    const currentSource = prev[target.id];
-                                    if (
-                                      currentSource &&
-                                      cloneCandidates.some(
-                                        (candidate) => candidate.cameraId === currentSource
-                                      )
-                                    ) {
-                                      return prev;
-                                    }
-                                    return {
-                                      ...prev,
-                                      [target.id]: cloneCandidates[0].cameraId,
-                                    };
-                                  });
-                                }}
-                                disabled={isCloningAgent}
-                                className={`p-1.5 rounded border border-gray-700 text-gray-300 transition-colors ${
-                                  isCloningAgent
-                                    ? "opacity-60 cursor-wait"
-                                    : "hover:bg-gray-700 hover:text-gray-100"
-                                } ${
-                                  shouldHighlightAgentCreationArea
-                                    ? "border-blue-400/70 text-blue-100 bg-blue-500/20 hover:bg-blue-500/30"
-                                    : ""
-                                }`}
-                                title={
-                                  cloneCandidates.length <= 1
-                                    ? "Clone agent from another camera"
-                                    : "Choose source camera to clone from"
-                                }
-                              >
-                                <Copy className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                onClick={() =>
-                                  openAgentEditorForTarget(
-                                    target,
-                                    targetAgent,
-                                    priorityValue
-                                  )
-                                }
-                                className={`text-xs px-2 py-1 rounded transition-colors ${
-                                  shouldHighlightAgentCreationArea
-                                    ? "bg-blue-600 hover:bg-blue-500 text-white shadow-[0_0_0_1px_rgba(96,165,250,0.75)]"
-                                    : "bg-gray-700 hover:bg-gray-600 text-gray-200"
-                                }`}
-                              >
-                                {targetAgent ? "Change" : "Add"}
-                              </button>
-                            </div>
-                          </div>
-                          {clonePickerTargetId === target.id && cloneCandidates.length > 1 && (
-                            <div className="mt-2 flex items-center justify-end gap-2">
-                              <select
-                                value={selectedCloneSourceCameraId ?? ""}
-                                onChange={(e) =>
-                                  setCloneSourceByTarget((prev) => ({
-                                    ...prev,
-                                    [target.id]: Number(e.target.value),
-                                  }))
-                                }
-                                className="text-[11px] px-2 py-1 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 max-w-[230px]"
-                              >
-                                {cloneCandidates.map((candidate) => (
-                                  <option key={`${target.id}-${candidate.cameraId}`} value={candidate.cameraId}>
-                                    {candidate.cameraName} - {candidate.agent.agent_key}
-                                  </option>
-                                ))}
-                              </select>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (selectedCloneSourceCameraId == null) return;
-                                  requestCloneAgentFromCamera(target, selectedCloneSourceCameraId);
-                                }}
-                                disabled={isCloningAgent || selectedCloneSourceCameraId == null}
-                                className={`text-xs px-2 py-1 rounded border border-gray-700 ${
-                                  isCloningAgent || selectedCloneSourceCameraId == null
-                                    ? "bg-gray-800 text-gray-500 cursor-not-allowed"
-                                    : "bg-gray-700 hover:bg-gray-600 text-gray-200"
-                                }`}
-                              >
-                                {t("jobs.clone")}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setClonePickerTargetId(null)}
-                                className="p-1.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-700 hover:text-gray-100 transition-colors"
-                                title={t("jobs.closeClonePicker")}
-                              >
-                                <X className="w-3 h-3" />
-                              </button>
-                            </div>
+                              {selectedTargetIds.has(target.id) ? <Check className="h-3.5 w-3.5" /> : null}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveTarget(target.id)}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-white/10 bg-black/35 text-white/80 transition-colors hover:border-red-400/40 hover:text-red-200"
+                              title={t("jobs.removeCamera")}
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
                           )}
                         </div>
-
-                        <div>
-                          <div className="text-[11px] uppercase tracking-widest text-gray-400">{t("jobs.priority")}</div>
-                          <div className="mt-2">
-                            <select
-                              value={priorityValue}
-                              onChange={(e) =>
-                                handlePriorityChange(
-                                  target,
-                                  targetAgent,
-                                  e.target.value as AgentPriority
-                                )
-                              }
-                              disabled={savingPriorities.has(target.id)}
-                              className={`text-[11px] px-2 py-1 rounded border bg-gray-900 text-gray-100 ${priorityClasses[priorityValue]} focus:outline-none ${
-                                savingPriorities.has(target.id) ? "opacity-60 cursor-wait" : ""
-                              }`}
-                            >
-                              <option value="CRITIC" style={{ backgroundColor: "#1A1A1A", color: "#D4D4D4" }}>CRITIC</option>
-                              <option value="HIGH" style={{ backgroundColor: "#1A1A1A", color: "#D4D4D4" }}>HIGH</option>
-                              <option value="MEDIUM" style={{ backgroundColor: "#1A1A1A", color: "#D4D4D4" }}>MEDIUM</option>
-                              <option value="LOW" style={{ backgroundColor: "#1A1A1A", color: "#D4D4D4" }}>LOW</option>
-                            </select>
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-[11px] uppercase tracking-widest text-gray-400">{t("jobs.captureMode")}</div>
-                          <label
-                            className={`mt-2 inline-flex items-center gap-2 text-[11px] ${
-                              canToggleCaptureMode ? "text-gray-200" : "text-gray-500"
-                            }`}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={captureOnMotionOnlyValue}
-                              onChange={(e) =>
-                                handleOnlyCaptureOnMotionChange(
-                                  target,
-                                  targetAgent,
-                                  e.target.checked
-                                )
-                              }
-                              disabled={
-                                !canToggleCaptureMode || savingOnlyCaptureOnMotion.has(target.id)
-                              }
-                              className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-blue-500 disabled:opacity-50"
-                            />
-                            <span>{t("jobs.onlyCaptureMotion")}</span>
-                          </label>
-                        </div>
-                            </div>
-                          </div>
+                      }
+                    />
                   );
                 })}
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setShowTargetSelect((current) => !current)}
+                  className={`w-full rounded-[16px] border border-dashed px-3 py-3 text-sm font-medium transition-colors ${
+                    showTargetSelect
+                      ? "border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+                      : "border-gray-700 bg-gray-900/70 text-gray-300 hover:border-gray-600 hover:bg-gray-800"
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-2">
+                    {showTargetSelect ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                    {showTargetSelect ? t("jobs.cancel") : t("jobs.addTarget")}
+                  </span>
+                </button>
                 {defaultAgent && (
                   <div className="mt-2 p-2 bg-blue-900/20 rounded border border-blue-800">
                     <p className="text-xs text-blue-400">
@@ -7295,7 +8223,8 @@ function StepCard({
                   onConfirm={confirmCloneAgentFromCamera}
                   onCancel={closeCloneAgentConfirmDialog}
                 />
-                {showPromptEditor && (
+                {showPromptEditor &&
+                  createPortal(
                   <div className="fixed inset-0 z-[70] flex items-center justify-center px-4 py-6">
                     <button
                       type="button"
@@ -7304,7 +8233,7 @@ function StepCard({
                       aria-label={t("jobs.promptEditor.closePromptEditorAria")}
                     />
                     <div
-                      className="relative h-[90vh] max-h-[1050px] w-[min(88vw,1320px)] max-w-[88vw] bg-gray-800 text-gray-100 rounded-md shadow-2xl border border-gray-700 overflow-hidden flex flex-col"
+                      className="relative h-[92vh] max-h-[1100px] w-[min(96vw,1560px)] max-w-[1560px] rounded-2xl border border-gray-700 bg-gray-800 text-gray-100 shadow-2xl overflow-hidden flex flex-col"
                     >
                       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
                         <div>
@@ -7392,8 +8321,8 @@ function StepCard({
                           </button>
                         </div>
                       </div>
-                      <div className="px-8 py-6 min-h-0 overflow-hidden">
-                        <div className="h-full grid grid-cols-1 xl:grid-cols-2 gap-6">
+                      <div className="min-h-0 overflow-hidden px-5 py-5 md:px-7 md:py-6">
+                        <div className="grid h-full min-h-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(460px,0.95fr)_minmax(560px,1.05fr)]">
                           <div className="relative order-2 xl:order-2 min-h-0 overflow-hidden rounded-xl border border-gray-600/80 bg-gray-900/50 shadow-lg shadow-black/30">
                             <div
                               className={`h-full ${
@@ -8669,7 +9598,8 @@ function StepCard({
                         </div>
                       )}
                     </div>
-                  </div>
+                  </div>,
+                  document.body
                 )}
               </div>
             )}
@@ -8862,21 +9792,14 @@ function StepCard({
           )}
 
           {/* Start Condition Section */}
-          <div className="border border-gray-800 rounded-lg p-4">
+          {showStartConditionForm || (step.step_order > 1 && hasExplicitStartCondition) ? (
+          <div className="rounded-[20px] border border-gray-800/80 bg-gray-950/55 p-3.5">
             <div className="flex items-center justify-between mb-3">
-              <h5 className="font-medium text-gray-300">{t("jobs.startCondition")}</h5>
-              {step.step_order !== 1 && (
-                <button
-                  onClick={() => setShowStartConditionForm(!showStartConditionForm)}
-                  className="text-sm text-blue-400 hover:text-blue-300"
-                >
-                  {showStartConditionForm ? "Cancel" : <Edit2 className="w-3.5 h-3.5 inline" />}
-                </button>
-              )}
+              <h5 className="text-sm font-medium text-gray-300">{t("jobs.startCondition")}</h5>
             </div>
 
             {step.step_order === 1 ? (
-              <p className="text-sm text-gray-400">{t("jobs.sequentialJobStart")}</p>
+              <p className="text-xs text-gray-400">{t("jobs.sequentialJobStart")}</p>
             ) : showStartConditionForm ? (
               <div className="space-y-3">
                 <div>
@@ -8898,6 +9821,7 @@ function StepCard({
                     */}
                     <option value="custom">{t("jobs.customAnswerBased")}</option>
                     <option value="time">{t("jobs.timeBased")}</option>
+                    <option value="elapsed">{t("jobs.elapsedTime")}</option>
                   </select>
                 </div>
 
@@ -9009,6 +9933,53 @@ function StepCard({
                   </div>
                 )}
 
+                {startConditionForm.mode === "elapsed" && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">
+                          {t("jobs.hours")}
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={startConditionForm.elapsed_hours}
+                          onChange={(e) =>
+                            setStartConditionForm({
+                              ...startConditionForm,
+                              elapsed_hours: parseNonNegativeIntegerInput(e.target.value),
+                            })
+                          }
+                          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">
+                          {t("jobs.minutes")}
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={59}
+                          step={1}
+                          value={startConditionForm.elapsed_minutes}
+                          onChange={(e) =>
+                            setStartConditionForm({
+                              ...startConditionForm,
+                              elapsed_minutes: Math.min(59, parseNonNegativeIntegerInput(e.target.value)),
+                            })
+                          }
+                          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t("jobs.stepWillStartAfterElapsedTime")}
+                    </p>
+                  </div>
+                )}
+
                 <div className="flex gap-2">
                   <button
                     onClick={handleSaveStartCondition}
@@ -9025,76 +9996,32 @@ function StepCard({
                 </div>
               </div>
             ) : (
-              <div className="text-sm text-gray-400">
-                {(() => {
-                  // Check new columns first, then fall back to legacy format
-                  const startCondition = step.start_condition || "";
-                  const startConditionFromStepId = step.start_condition_from_step_id;
-                  
-                  // Legacy fallback
-                  const legacyInjectKey = step.input_inject_key || "";
-                  const legacyFromStepId = step.input_from_step_id;
-                  
-                  const conditionStr = startCondition || (legacyInjectKey.startsWith("start:") ? legacyInjectKey : "");
-                  const fromStepId = startConditionFromStepId || (legacyInjectKey.startsWith("start:") ? legacyFromStepId : null);
-                  
-                  if (!conditionStr || !conditionStr.startsWith("start:")) {
-                    return t("jobs.sequentialAfterPreviousStep");
-                  }
-
-                  const parts = conditionStr.split(":");
-                  if (parts.length < 3) {
-                    return t("jobs.sequentialAfterPreviousStep");
-                  }
-
-                  const mode = parts[1];
-                  const value = parts.slice(2).join(":");
-
-                  if (mode === "custom") {
-                    const answerKey = parts[2] || "";
-                    const targetKey = parts[3] || "";
-                    const sourceStep = steps.find((s) => s.id === fromStepId);
-                    const stepLabel = sourceStep
-                      ? `Step #${sourceStep.step_order}: ${sourceStep.name}`
-                      : `Step #${fromStepId}`;
-                    const targetSuffix = targetKey ? ` ${t("jobs.onTarget")} ${targetKey}` : "";
-                    return t("jobs.whenKeyForStep", { stepLabel, answerKey, targetSuffix });
-                  }
-
-                  if (mode === "positive" || mode === "negative") {
-                    const sourceStep = steps.find((s) => s.id === fromStepId);
-                    const stepLabel = sourceStep
-                      ? `Step #${sourceStep.step_order}: ${sourceStep.name}`
-                      : `Step #${fromStepId}`;
-                    
-                    // Check if using default "result" key or custom key
-                    if (value === "result" || value.startsWith("result:")) {
-                      return t("jobs.whenResultIs", { stepLabel, mode });
-                    } else {
-                      // Extract just the key part (before any target suffix)
-                      const keyPart = value.split(":")[0];
-                      return t("jobs.whenKeyIs", { stepLabel, keyPart, mode });
-                    }
-                  } else if (mode === "time") {
-                    return t("jobs.atTimeWithinSchedule", { value });
-                  }
-
-                  return t("jobs.sequentialAfterPreviousStep");
-                })()}
+              <div className="rounded-2xl border border-gray-800/80 bg-gray-900/75 p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1 text-xs text-gray-400">
+                    {startConditionSummary}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={openStartConditionEditor}
+                    className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-gray-800 bg-gray-950/70 text-gray-500 transition-colors hover:border-blue-500/30 hover:bg-blue-500/10 hover:text-blue-200"
+                    title={t("jobs.edit", { defaultValue: "Edit" })}
+                  >
+                    <Edit2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
             )}
           </div>
+          ) : null}
 
           {/* Pipeline Section */}
-          <div className="border border-gray-800 rounded-lg p-4">
+          {showPipelineForm || stepPipelines.length > 0 ? (
+          <div className="rounded-[20px] border border-gray-800/80 bg-gray-950/55 p-3.5">
             <div className="flex items-center justify-between mb-3">
-              <h5 className="font-medium text-gray-300">{t("jobs.pipelineChooseFromPreviousStep")}</h5>
-              <button
-                onClick={() => setShowPipelineForm(!showPipelineForm)}
-                className="text-sm text-blue-400 hover:text-blue-300"
-              >
-                {showPipelineForm ? t("jobs.cancel") : <Edit2 className="w-3.5 h-3.5 inline" />}
-              </button>
+              <h5 className="text-sm font-medium text-gray-300">
+                {t("jobs.knowledgeSharing", { defaultValue: "Knowledge sharing" })}
+              </h5>
             </div>
 
             {showPipelineForm ? (
@@ -9106,7 +10033,7 @@ function StepCard({
                       : pipelineTargetsByStepId[String(row.input_from_step_id)] || []
                     : [];
                   return (
-                    <div key={row.id} className="border border-gray-800 rounded-md p-3 space-y-3">
+                    <div key={row.id} className="space-y-3 rounded-2xl border border-gray-800/80 bg-gray-900/75 p-3">
                       <div className="flex items-center justify-between">
                         <div className="text-xs text-gray-400">{t("jobs.pipelineRow", { index: idx + 1 })}</div>
                         {pipelineForm.pipelines.length > 1 && (
@@ -9128,6 +10055,7 @@ function StepCard({
                             updatePipelineRow(row.id, {
                               input_from_step_id: e.target.value,
                               input_inject_keys: [],
+                              input_target_ids: [],
                               target_camera_id: "",
                             })
                           }
@@ -9148,10 +10076,19 @@ function StepCard({
                           </label>
                           <select
                             multiple
-                            value={row.input_inject_keys}
+                            value={row.input_target_ids}
                             onChange={(e) => {
-                              const selected = Array.from(e.target.selectedOptions).map((o) => o.value);
-                              updatePipelineRow(row.id, { input_inject_keys: selected });
+                              const selectedTargetIds = Array.from(e.target.selectedOptions).map((o) => o.value);
+                              const selectedTargetLabels = selectedTargetIds
+                                .map((value) => {
+                                  const match = targetsForStep.find((target) => String(target.id) === value);
+                                  return match?.camera_name || (match ? `Camera ${match.camera_id}` : "");
+                                })
+                                .filter((value) => value);
+                              updatePipelineRow(row.id, {
+                                input_target_ids: selectedTargetIds,
+                                input_inject_keys: selectedTargetLabels,
+                              });
                             }}
                             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
                           >
@@ -9161,10 +10098,11 @@ function StepCard({
                               </option>
                             )}
                             {targetsForStep.map((target) => {
-                              const value = target.camera_name || `Camera ${target.camera_id}`;
+                              const value = String(target.id);
+                              const label = target.camera_name || `Camera ${target.camera_id}`;
                               return (
                                 <option key={target.id} value={value}>
-                                  {value}
+                                  {label}
                                 </option>
                               );
                             })}
@@ -9243,7 +10181,7 @@ function StepCard({
                 </div>
               </div>
             ) : stepPipelines.length > 0 ? (
-              <div className="space-y-2 text-sm text-gray-400">
+              <div className="space-y-2 text-xs text-gray-400">
                 {stepPipelines.map((p, idx) => {
                   const sourceStep = steps.find((s) => s.id === p.input_from_step_id);
                   const label = sourceStep
@@ -9260,44 +10198,64 @@ function StepCard({
                     ? p.target_camera_name
                     : t("jobs.none");
                   return (
-                    <div key={`${p.input_from_step_id}-${idx}`} className="border border-gray-800 rounded-md p-2">
-                      <div>
-                        <span className="text-gray-500">{t("jobs.inputFromStep")}:</span> {label}
-                      </div>
-                      <div>
-                        <span className="text-gray-500">{t("jobs.inputFromTarget")}:</span> {p.input_inject_keys.join(", ")}
-                      </div>
-                      <div>
-                        <span className="text-gray-500">{t("jobs.outputToTarget")}:</span> {targetLabel}
+                    <div
+                      key={`${p.input_from_step_id}-${idx}`}
+                      className="rounded-2xl border border-gray-800/80 bg-gray-900/75 p-3"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1 space-y-1.5">
+                          <div>
+                            <span className="text-gray-500">{t("jobs.inputFromStep")}:</span> {label}
+                          </div>
+                          <div>
+                            <span className="text-gray-500">{t("jobs.inputFromTarget")}:</span>{" "}
+                            {p.input_inject_keys.join(", ")}
+                          </div>
+                          <div>
+                            <span className="text-gray-500">{t("jobs.outputToTarget")}:</span> {targetLabel}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={openKnowledgeSharingEditor}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-800 bg-gray-950/70 text-gray-500 transition-colors hover:border-blue-500/30 hover:bg-blue-500/10 hover:text-blue-200"
+                            title={t("jobs.edit", { defaultValue: "Edit" })}
+                          >
+                            <Edit2 className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveKnowledgeSharing(idx)}
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-gray-800 bg-gray-950/70 text-gray-500 transition-colors hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-300"
+                            title={t("jobs.remove")}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
                 })}
               </div>
             ) : (
-              <p className="text-sm text-gray-500">{t("jobs.noPipelineConfigured")}</p>
+              <p className="text-xs text-gray-500">{t("jobs.noPipelineConfigured")}</p>
             )}
           </div>
+          ) : null}
 
           {/* Alerts Section */}
-          <div className="border border-gray-800 rounded-lg p-4">
+          {showAlertForm || alerts.length > 0 ? (
+          <div className="rounded-[20px] border border-gray-800/80 bg-gray-950/55 p-3.5">
             <div className="flex items-center justify-between mb-3">
-              <h5 className="font-medium text-gray-300">{t("jobs.alerts")}</h5>
-              <button
-                onClick={() => setShowAlertForm(!showAlertForm)}
-                className={`text-sm ${
-                  isReady
-                    ? "text-blue-400 hover:text-blue-300"
-                    : "text-gray-600 cursor-not-allowed"
-                }`}
-                disabled={!isReady}
-              >
-                {showAlertForm ? t("jobs.cancel") : t("jobs.addAlert")}
-              </button>
+              <h5 className="text-sm font-medium text-gray-300">{t("jobs.alerts")}</h5>
+              <span className="text-xs uppercase tracking-[0.22em] text-gray-500">
+                {alerts.length}
+              </span>
             </div>
 
             {!isReady ? (
-              <p className="text-sm text-gray-500">
+              <p className="text-xs text-gray-500">
                 {t("jobs.validation.stepNotReady")}
               </p>
             ) : showAlertForm ? (
@@ -9382,7 +10340,7 @@ function StepCard({
                 </div>
               </div>
             ) : alerts.length === 0 ? (
-              <p className="text-sm text-gray-500">{t("jobs.noAlerts")}</p>
+              <p className="text-xs text-gray-500">{t("jobs.noAlerts")}</p>
             ) : (
               <div className="space-y-2">
                 {alerts.map((alert) => {
@@ -9424,9 +10382,214 @@ function StepCard({
               </div>
             )}
           </div>
-        </div>
-      )}
-    </div>
+          ) : null}
+
+          {inspectedTarget ? (
+            <div className="fixed inset-0 z-[65] flex items-center justify-center px-4 py-6">
+              <button
+                type="button"
+                className="absolute inset-0 bg-black/55 backdrop-blur-sm"
+                onClick={() => setExpandedTargetId(null)}
+                aria-label={t("jobs.closeCameraConfig", { defaultValue: "Close camera config" })}
+              />
+              <div className="relative z-10 w-full max-w-[640px] max-h-[calc(100vh-32px)] overflow-y-auto rounded-[28px] border border-gray-800/80 bg-gray-900 shadow-[0_40px_120px_-64px_rgba(0,0,0,1)]">
+                <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-gray-800/80 bg-gray-900/95 px-5 py-4 backdrop-blur">
+                  <div className="min-w-0">
+                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                      {t("jobs.cameraSettings", { defaultValue: "Camera settings" })}
+                    </div>
+                    <h4 className="mt-2 truncate text-xl font-semibold text-gray-100">
+                      {inspectedTarget.camera_name || `Camera ${inspectedTarget.camera_id}`}
+                    </h4>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${inspectedEffectiveAgent ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200" : "border-amber-400/25 bg-amber-500/12 text-amber-200"}`}>
+                        {inspectedEffectiveAgent
+                          ? t("jobs.readyShort", { defaultValue: "OK" })
+                          : t("jobs.setupShort", { defaultValue: "Setup" })}
+                      </span>
+                      <span className="inline-flex rounded-full border border-gray-800 bg-gray-950/70 px-2.5 py-1 text-[11px] text-gray-300">
+                        {inspectedInputType === "image" ? t("jobs.image") : t("jobs.video")}
+                      </span>
+                    </div>
+                    <p className="mt-3 text-sm text-gray-400">
+                      {t("jobs.cameraSettingsHint", {
+                        defaultValue:
+                          "Adjust capture mode and clone an agent from another camera in this step.",
+                      })}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedTargetId(null)}
+                    className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-gray-800 bg-gray-950/70 text-gray-400 transition-colors hover:border-gray-700 hover:text-gray-100"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+
+                <div className="space-y-4 px-5 py-5">
+                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/55 p-4">
+                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                      {t("jobs.aiAgent")}
+                    </div>
+                    <div className="mt-2 text-sm leading-6">
+                      {inspectedEffectiveAgent ? (
+                        <span className={inspectedTargetAgent ? "text-green-400" : "text-yellow-400"}>
+                          {inspectedTargetAgent
+                            ? inspectedTargetAgent.agent_key
+                            : `${t("jobs.usingDefault")}: ${inspectedEffectiveAgent.agent_key}`}
+                        </span>
+                      ) : (
+                        <span className="text-red-400">{t("jobs.notConfigured")}</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
+                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                      {t("jobs.captureMode")}
+                    </div>
+                    <p className="mt-1 text-sm text-gray-400">
+                      {inspectedCanToggleCaptureMode
+                        ? t("jobs.captureModeDescription", {
+                            defaultValue: "Choose when this camera should capture frames for the agent.",
+                          })
+                        : t("jobs.captureModeRequiresAgent", {
+                            defaultValue: "Configure an agent first to change capture mode.",
+                          })}
+                    </p>
+                    <label
+                      className={`mt-3 flex items-start gap-3 rounded-2xl border border-gray-800 bg-gray-950/70 px-4 py-3 text-sm ${
+                        inspectedCanToggleCaptureMode ? "text-gray-200" : "text-gray-500"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={inspectedCaptureOnMotion}
+                        onChange={(e) =>
+                          handleOnlyCaptureOnMotionChange(
+                            inspectedTarget,
+                            inspectedTargetAgent,
+                            e.target.checked
+                          )
+                        }
+                        disabled={!inspectedCanToggleCaptureMode || savingOnlyCaptureOnMotion.has(inspectedTarget.id)}
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-blue-500 disabled:opacity-50"
+                      />
+                      <span className="leading-6">{t("jobs.onlyCaptureMotion")}</span>
+                    </label>
+                  </div>
+
+                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                          {t("jobs.clone")}
+                        </div>
+                        <div className="mt-1 text-sm leading-6 text-gray-400">
+                          {inspectedCloneCandidates.length > 0
+                            ? t("jobs.cloneConfiguredAgentsHint", {
+                                defaultValue: "Copy an agent from another camera in this step.",
+                              })
+                            : t("jobs.noConfiguredAgentInOtherTargets")}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (inspectedCloneCandidates.length === 0) {
+                            onShowToast(t("jobs.noConfiguredAgentInOtherTargets"), "info");
+                            return;
+                          }
+
+                          if (inspectedCloneCandidates.length === 1) {
+                            requestCloneAgentFromCamera(inspectedTarget, inspectedCloneCandidates[0].cameraId);
+                            return;
+                          }
+
+                          setClonePickerTargetId((current) =>
+                            current === inspectedTarget.id ? null : inspectedTarget.id
+                          );
+                          setCloneSourceByTarget((prev) => {
+                            const currentSource = prev[inspectedTarget.id];
+                            if (
+                              currentSource &&
+                              inspectedCloneCandidates.some(
+                                (candidate) => candidate.cameraId === currentSource
+                              )
+                            ) {
+                              return prev;
+                            }
+                            return {
+                              ...prev,
+                              [inspectedTarget.id]: inspectedCloneCandidates[0].cameraId,
+                            };
+                          });
+                        }}
+                        disabled={inspectedIsCloning}
+                        className={`inline-flex items-center justify-center gap-2 rounded-full px-3 py-2 text-xs font-medium transition-colors ${
+                          inspectedIsCloning
+                            ? "cursor-wait bg-gray-800 text-gray-500"
+                            : "bg-gray-700 text-gray-100 hover:bg-gray-600"
+                        }`}
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                        {t("jobs.clone")}
+                      </button>
+                    </div>
+
+                    {clonePickerTargetId === inspectedTarget.id && inspectedCloneCandidates.length > 1 ? (
+                      <div className="mt-4 space-y-3 rounded-2xl border border-gray-800/80 bg-gray-950/80 p-3">
+                        <select
+                          value={inspectedCloneSourceCameraId ?? ""}
+                          onChange={(e) =>
+                            setCloneSourceByTarget((prev) => ({
+                              ...prev,
+                              [inspectedTarget.id]: Number(e.target.value),
+                            }))
+                          }
+                          className="w-full rounded-2xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                        >
+                          {inspectedCloneCandidates.map((candidate) => (
+                            <option key={`${inspectedTarget.id}-${candidate.cameraId}`} value={candidate.cameraId}>
+                              {candidate.cameraName} - {candidate.agent.agent_key}
+                            </option>
+                          ))}
+                        </select>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (inspectedCloneSourceCameraId == null) return;
+                              requestCloneAgentFromCamera(inspectedTarget, inspectedCloneSourceCameraId);
+                            }}
+                            disabled={inspectedIsCloning || inspectedCloneSourceCameraId == null}
+                            className={`rounded-full border border-gray-700 px-3 py-2 text-xs ${
+                              inspectedIsCloning || inspectedCloneSourceCameraId == null
+                                ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                                : "bg-gray-700 text-gray-200 hover:bg-gray-600"
+                            }`}
+                          >
+                            {t("jobs.clone")}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setClonePickerTargetId(null)}
+                            className="rounded-full border border-gray-700 p-2 text-gray-300 transition-colors hover:bg-gray-700 hover:text-gray-100"
+                            title={t("jobs.closeClonePicker")}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+      </div>
+    </StepFlowCard>
   );
 }
 

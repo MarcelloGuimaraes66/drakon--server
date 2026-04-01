@@ -27341,9 +27341,48 @@ app.get("/api/jobs", anyAuthMiddleware, async (c) => {
     .bind(user.id)
     .all();
 
+  const jobRows = Array.isArray(results) ? results : [];
+  const jobIds = jobRows
+    .map((row: any) => Number(row?.id))
+    .filter((value: number) => Number.isInteger(value) && value > 0);
+
+  const stepCountMap: Record<number, number> = {};
+  const targetCountMap: Record<number, number> = {};
+
+  if (jobIds.length > 0) {
+    const placeholders = jobIds.map(() => "?").join(",");
+
+    const { results: stepCounts } = await c.env.DB.prepare(
+      `SELECT job_id, COUNT(*) AS step_count
+       FROM job_steps
+       WHERE job_id IN (${placeholders})
+       GROUP BY job_id`
+    )
+      .bind(...jobIds)
+      .all();
+
+    const { results: targetCounts } = await c.env.DB.prepare(
+      `SELECT js.job_id, COUNT(*) AS target_count
+       FROM job_steps js
+       JOIN job_step_targets jst ON jst.step_id = js.id
+       WHERE js.job_id IN (${placeholders})
+       GROUP BY js.job_id`
+    )
+      .bind(...jobIds)
+      .all();
+
+    for (const row of stepCounts || []) {
+      stepCountMap[Number((row as any).job_id)] = Number((row as any).step_count) || 0;
+    }
+
+    for (const row of targetCounts || []) {
+      targetCountMap[Number((row as any).job_id)] = Number((row as any).target_count) || 0;
+    }
+  }
+
   // Attach schedule data for recurring jobs (weekly/monthly/yearly)
   const jobsWithSchedules = await Promise.all(
-    (results || []).map(async (job: any) => {
+    jobRows.map(async (job: any) => {
       const isRecurring = ["weekly", "monthly", "yearly"].includes(job.schedule_mode);
       
       if (isRecurring) {
@@ -27390,12 +27429,18 @@ app.get("/api/jobs", anyAuthMiddleware, async (c) => {
 
         return {
           ...job,
+          step_count: stepCountMap[job.id] || 0,
+          target_count: targetCountMap[job.id] || 0,
           schedule_days: scheduleDays,
           schedule_summary: scheduleSummary,
         };
       }
       
-      return job;
+      return {
+        ...job,
+        step_count: stepCountMap[job.id] || 0,
+        target_count: targetCountMap[job.id] || 0,
+      };
     })
   );
 
@@ -29413,6 +29458,7 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
     pipelines?: Array<{
       input_from_step_id: number;
       input_inject_keys: string[];
+      input_target_ids?: number[];
       target_camera_id?: number | null;
       target_camera_name?: string | null;
     }> | null;
@@ -29461,6 +29507,7 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
   let normalizedPipelines: Array<{
     input_from_step_id: number;
     input_inject_keys: string[];
+    input_target_ids?: number[];
     target_camera_id?: number | null;
     target_camera_name?: string | null;
   }> | null = null;
@@ -29483,6 +29530,16 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
         if (keys.length === 0) {
           return c.json({ error: "Each pipeline must include at least one input key" }, 400);
         }
+        const inputTargetIdsRaw = Array.isArray((p as any)?.input_target_ids)
+          ? (p as any).input_target_ids
+          : [];
+        const inputTargetIds: number[] = Array.from(
+          new Set(
+            inputTargetIdsRaw
+              .map((value: unknown) => Number(value))
+              .filter((value: number) => Number.isInteger(value) && value > 0)
+          )
+        );
         const targetCameraIdRaw = (p as any)?.target_camera_id;
         const targetCameraId = targetCameraIdRaw === null || targetCameraIdRaw === undefined || targetCameraIdRaw === ""
           ? null
@@ -29496,6 +29553,7 @@ app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {
         normalizedPipelines.push({
           input_from_step_id: fromStepId,
           input_inject_keys: keys,
+          input_target_ids: inputTargetIds,
           target_camera_id: targetCameraId,
           target_camera_name: targetCameraName || null,
         });

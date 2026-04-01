@@ -1736,7 +1736,7 @@ async function buildJobStartPayload(
         const fromStepId = step.start_condition_from_step_id ?? null;
         
         // Parse start_condition string to determine mode
-        // Format examples: "start:positive:result:XYZ", "start:time:13:56"
+        // Format examples: "start:positive:result:XYZ", "start:time:13:56", "start:elapsed:900"
         if (conditionStr.startsWith("start:")) {
           const parts = conditionStr.split(":");
           const modeType = parts[1] || "sequential";
@@ -1758,6 +1758,18 @@ async function buildJobStartPayload(
               pattern: null,
               time_offset_sec: offsetSeconds,
               time_hhmm: timeStr || null,
+            };
+          } else if (modeType === "elapsed") {
+            const offsetSeconds = Math.max(0, parseInt(parts[2] || "0", 10) || 0);
+            start_condition = {
+              mode: "time",
+              from_step_id: null,
+              camera_id: null,
+              extract: null,
+              pattern: null,
+              time_offset_sec: offsetSeconds,
+              time_hhmm: null,
+              time_origin: "job_start",
             };
           } else if (modeType === "custom") {
             const answerKey = parts[2] || "result";
@@ -1817,6 +1829,18 @@ async function buildJobStartPayload(
             time_offset_sec: offsetSeconds,
             time_hhmm: timeStr || null,
           };
+        } else if (modeType === "elapsed") {
+          const offsetSeconds = Math.max(0, parseInt(parts[2] || "0", 10) || 0);
+          start_condition = {
+            mode: "time",
+            from_step_id: null,
+            camera_id: null,
+            extract: null,
+            pattern: null,
+            time_offset_sec: offsetSeconds,
+            time_hhmm: null,
+            time_origin: "job_start",
+          };
         } else {
           start_condition = {
             mode: modeType,
@@ -1860,12 +1884,28 @@ async function buildJobStartPayload(
                                       typeof step.input_inject_key === "string" && 
                                       step.input_inject_key.startsWith("start:");
 
-      // Build map from targets (camera_name -> camera_id)
+      // Build maps from targets so knowledge-sharing links can resolve by name or stable target id.
       const cameraNameToId = new Map<string, number>();
+      const pipelineTargetIdToCameraId = new Map<number, number>();
+      const pipelineTargetIdToInjectKey = new Map<number, string>();
       for (const t of targets || []) {
         const target = t as any;
         if (target.camera_name && target.camera_id) {
           cameraNameToId.set(target.camera_name, target.camera_id);
+        }
+        const targetId = Number(target?.id);
+        const cameraId = Number(target?.camera_id);
+        const injectKey =
+          typeof target?.camera_name === "string" && target.camera_name.trim().length > 0
+            ? target.camera_name.trim()
+            : Number.isInteger(cameraId) && cameraId > 0
+            ? `Camera ${cameraId}`
+            : "";
+        if (Number.isInteger(targetId) && targetId > 0 && Number.isInteger(cameraId) && cameraId > 0) {
+          pipelineTargetIdToCameraId.set(targetId, cameraId);
+          if (injectKey) {
+            pipelineTargetIdToInjectKey.set(targetId, injectKey);
+          }
         }
       }
 
@@ -1886,7 +1926,12 @@ async function buildJobStartPayload(
         return null;
       };
 
-      const parsePipelinesFromInputKey = (): Array<{ input_from_step_id: number; input_inject_keys: string[]; target_camera_id?: number | null }> => {
+      const parsePipelinesFromInputKey = (): Array<{
+        input_from_step_id: number;
+        input_inject_keys: string[];
+        input_target_ids?: number[];
+        target_camera_id?: number | null;
+      }> => {
         if (!step.input_inject_key || typeof step.input_inject_key !== "string") return [];
         const raw = step.input_inject_key.trim();
         if (!raw || raw.startsWith("start:")) return [];
@@ -1908,6 +1953,15 @@ async function buildJobStartPayload(
                 .map((k: any) => (k == null ? "" : String(k)).trim())
                 .filter((k: string) => k.length > 0);
               if (!cleaned.length) return null;
+              const inputTargetIds = Array.isArray(p?.input_target_ids)
+                ? Array.from(
+                    new Set(
+                      p.input_target_ids
+                        .map((value: any) => Number(value))
+                        .filter((value: number) => Number.isInteger(value) && value > 0)
+                    )
+                  )
+                : [];
               const targetCameraIdRaw = p?.target_camera_id;
               const targetCameraId = targetCameraIdRaw === null || targetCameraIdRaw === undefined || targetCameraIdRaw === ""
                 ? null
@@ -1915,10 +1969,16 @@ async function buildJobStartPayload(
               return {
                 input_from_step_id: fromStepId,
                 input_inject_keys: Array.from(new Set(cleaned)),
+                input_target_ids: inputTargetIds,
                 target_camera_id: Number.isFinite(targetCameraId) ? targetCameraId : null,
               };
             })
-            .filter(Boolean) as Array<{ input_from_step_id: number; input_inject_keys: string[]; target_camera_id?: number | null }>;
+            .filter(Boolean) as Array<{
+              input_from_step_id: number;
+              input_inject_keys: string[];
+              input_target_ids?: number[];
+              target_camera_id?: number | null;
+            }>;
           return normalized;
         } catch {
           return [];
@@ -1931,12 +1991,26 @@ async function buildJobStartPayload(
         if (parsedPipelines.length > 0) {
           for (const p of parsedPipelines) {
             const inputs = [];
-            for (const key of p.input_inject_keys) {
-              const cameraId = await resolveCameraIdForKey(key);
-              if (cameraId == null) {
-                console.log(`[JOB SCHEDULER] Warning: Could not resolve camera_id for inject_key "${key}" in step ${step.id}`);
+            const explicitTargetIds = Array.isArray((p as any).input_target_ids)
+              ? (p as any).input_target_ids
+              : [];
+            if (explicitTargetIds.length > 0) {
+              for (const targetId of explicitTargetIds) {
+                const cameraId = pipelineTargetIdToCameraId.get(targetId) ?? null;
+                const injectKey = pipelineTargetIdToInjectKey.get(targetId) || `target:${targetId}`;
+                if (cameraId == null) {
+                  console.log(`[JOB SCHEDULER] Warning: Could not resolve camera_id for input_target_id "${targetId}" in step ${step.id}`);
+                }
+                inputs.push({ input_inject_key: injectKey, camera_id: cameraId });
               }
-              inputs.push({ input_inject_key: key, camera_id: cameraId });
+            } else {
+              for (const key of p.input_inject_keys) {
+                const cameraId = await resolveCameraIdForKey(key);
+                if (cameraId == null) {
+                  console.log(`[JOB SCHEDULER] Warning: Could not resolve camera_id for inject_key "${key}" in step ${step.id}`);
+                }
+                inputs.push({ input_inject_key: key, camera_id: cameraId });
+              }
             }
             pipelines.push({
               input_from_step_id: p.input_from_step_id,
