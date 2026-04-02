@@ -92,6 +92,7 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "If the user is asking about billing, subscriptions, tokens, pairing, settings, API keys, tutorial, or how the app works, do not choose video_search unless they explicitly ask to inspect footage.\n"
         << "Use explain_app for tutorial, billing, pairing, API keys, or setup questions.\n"
         << "If the user asks how to create, configure, register, connect, troubleshoot, or use cameras, jobs, steps, or camera agents, choose explain_app.\n"
+        << "Treat pipeline, start condition, validator steps, chained step outputs, and multi-camera workflow orchestration as explain_app topics.\n"
         << "Treat scan network, camera import from Excel/CSV/JSON/TSV/plain text, webcam registration, RTSP/IP registration, retention, CEP address autofill, and allow public access as camera setup topics under explain_app.\n"
         << "Treat tutorial-style questions such as 'how do I create an agent?', 'where do I create an agent?', or 'como eu crio um agente?' as explain_app, not as create_camera_agent.\n"
         << "When the user asks generically about creating an agent, explain both AI Agents and the step-level agent editor inside Jobs.\n"

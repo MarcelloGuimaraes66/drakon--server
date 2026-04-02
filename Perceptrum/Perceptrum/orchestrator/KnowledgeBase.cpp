@@ -462,6 +462,25 @@ void KnowledgeBase::loadDocuments_()
                 "agente na etapa", "agente na tarefa"
             },
         },
+        {
+            "job_orchestration",
+            "Job Orchestration",
+            "job_orchestration.md",
+            {
+                "job orchestration", "workflow orchestration", "orchestration",
+                "pipeline", "pipelines", "start condition", "start conditions",
+                "start_condition", "multi-step", "multistep", "multi camera",
+                "multicamera", "cross camera", "validator", "validators",
+                "validation step", "step validator", "final validator",
+                "shared output", "shared context", "previous step",
+                "previous steps", "conditional branch", "branching",
+                "correlation", "cross-check", "reconciliation",
+                "orquestracao", "orquestracao de jobs", "pipeline entre steps",
+                "steps encadeados", "validador", "validador final",
+                "multicamera", "passar resposta", "resposta de um step no outro",
+                "conectar steps", "ligar steps", "reconciliacao", "correlacao"
+            },
+        },
     };
 
     const auto directories = buildKnowledgeDirectoryCandidates_();

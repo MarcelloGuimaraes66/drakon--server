@@ -85,6 +85,14 @@ bool hasStepReference_(const std::string& normalized)
     });
 }
 
+bool hasJobReference_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "job", "jobs", "workflow", "workflows", "task", "tasks",
+        "tarefa", "tarefas", "fluxo", "fluxos"
+    });
+}
+
 bool hasAgentConfigurationCue_(const std::string& normalized)
 {
     return containsAny_(normalized, {
@@ -93,6 +101,26 @@ bool hasAgentConfigurationCue_(const std::string& normalized)
         "poligonos", "target", "targets", "face target", "face targets",
         "negative condition", "negative conditions", "negative reference",
         "negative image", "negative images"
+    });
+}
+
+bool hasJobOrchestrationCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "pipeline", "pipelines", "start condition", "start conditions",
+        "start_condition", "elapsed", "validator", "validators",
+        "validation step", "step validator", "final step", "step final",
+        "workflow orchestration", "job orchestration", "orchestration",
+        "multi-step", "multistep", "multi camera", "multicamera",
+        "cross camera", "shared output", "shared context",
+        "previous step", "previous steps", "conditional branch",
+        "branching", "route validation", "cross-check", "correlation",
+        "reconciliation", "pipeline_inputs", "on missing input",
+        "orquestracao", "orquestracao de jobs", "steps encadeados",
+        "validador", "validador final", "multicamera",
+        "passar resposta", "resposta de um step no outro",
+        "conectar steps", "ligar steps", "encadear", "encadeado",
+        "reconciliacao", "correlacao"
     });
 }
 
@@ -151,6 +179,15 @@ std::string chooseTopic_(
             "cadastrar webcam", "registrar webcam"
         })) {
         return "camera_creation";
+    }
+    if (hasJobOrchestrationCue_(normalized) ||
+        ((hasJobReference_(normalized) || hasStepReference_(normalized)) &&
+         containsAny_(normalized, {
+             "connect", "link", "chain", "connect steps", "link steps",
+             "conectar", "ligar", "encadear", "output", "input",
+             "resposta", "answer", "validator", "validador"
+         }))) {
+        return "job_orchestration";
     }
     if ((hasStepReference_(normalized) && (hasAgentReference_(normalized) || hasAgentConfigurationCue_(normalized))) ||
         containsAny_(normalized, {
@@ -270,6 +307,21 @@ std::string fallbackDocumentAnswer_(
             << "### Practical example\n\n"
             << "- A daily 10:00 PM job can review entry cameras.\n"
             << "- Another hourly job can search for queues, masks, or intrusions.";
+    }
+    else if (topic == "job_orchestration") {
+        out
+            << "## Job orchestration\n\n"
+            << "- Use Jobs / Steps when the workflow must coordinate multiple cameras, multiple stages, timing rules, or final validation.\n"
+            << "- Separate collector steps from decision steps.\n"
+            << "- Use Start Condition to control when each step begins.\n"
+            << "- Use Pipeline to inject previous answers into later steps.\n"
+            << "- Keep upstream answers deterministic so downstream validators can parse them.\n"
+            << "- Place the final alert on the step that owns the final business rule.\n\n"
+            << "### Typical patterns\n\n"
+            << "- Parallel collectors plus final validator.\n"
+            << "- Sequential route validation.\n"
+            << "- Conditional investigation triggered by a previous step.\n"
+            << "- Many-to-one consolidation from multiple steps into one final decision.";
     }
     else if (topic == "job_steps") {
         out
