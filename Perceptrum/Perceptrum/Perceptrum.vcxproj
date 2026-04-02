@@ -274,6 +274,9 @@
       DestinationFiles="@(KnowledgeContent->'$(TargetDir)orchestrator\knowledge\%(RecursiveDir)%(Filename)%(Extension)')"
       SkipUnchangedFiles="true" />
   </Target>
+  <Target Name="CopyMsvcRuntime" AfterTargets="Build" Condition="'$(UseDebugLibraries)'!='true'">
+    <Exec Command='powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\scripts\copy-msvc-runtime.ps1" -TargetDir "$(TargetDir)." -PlatformName "$(Platform)" -VCToolsRedistDir "$(VCToolsRedistDir)"' />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

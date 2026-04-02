@@ -21,7 +21,9 @@ Observacao sobre a etapa de cameras no tutorial guiado:
 - A Etapa 2 usa a pagina **Cameras** como exemplo principal.
 - As mesmas acoes tambem existem em **AI Agents**.
 - O fluxo guiado primeiro destaca **Scan Network**, **Import Cameras** e **Register Camera**.
-- Depois ele explica a aba **IP / RTSP**, muda para **Webcam**, preenche webcam index `0` e o nome `tutorial webcam`, salva e segue para a Etapa 3.
+- Depois ele explica a aba **IP / RTSP**, muda para **Webcam**, tenta detectar uma webcam que esteja respondendo nesta maquina e preenche o nome `tutorial webcam`.
+- Se nenhuma webcam responder, o tutorial pede para conectar uma webcam e tentar de novo, ou permite prosseguir mesmo assim para chegar ate a Etapa 3.
+- Se o usuario optar por prosseguir sem webcam, a camera do tutorial ainda e criada, mas a inferencia nao e iniciada automaticamente no final.
 - A Etapa 3 abre a pagina **Algorithms** da camera do tutorial, cria um custom AI agent chamado `thumbs up detector`, explica o **Enhance Prompt with AI** e salva o agente nessa camera.
 
 Se um pedido precisar do estado atual da conta, o chat pode usar `read_state`. Se precisar de explicacao de produto, pode usar `explain_app`.

@@ -104,6 +104,7 @@ export type PersistedOnboardingState = {
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
   tutorialAgentId: number | null;
+  tutorialProceedWithoutWebcam: boolean;
 };
 
 const ONBOARDING_STORAGE_VERSION = 1;
@@ -115,6 +116,7 @@ const DEFAULT_PERSISTED_STATE: PersistedOnboardingState = {
   selectedProvider: null,
   tutorialCameraId: null,
   tutorialAgentId: null,
+  tutorialProceedWithoutWebcam: false,
 };
 
 function isValidStepId(value: unknown): value is OnboardingStepId {
@@ -217,6 +219,10 @@ export function readOnboardingState(): PersistedOnboardingState {
       selectedProvider: isValidProvider(parsed.selectedProvider) ? parsed.selectedProvider : null,
       tutorialCameraId: normalizePersistedCameraId(parsed.tutorialCameraId),
       tutorialAgentId: normalizePersistedCameraId(parsed.tutorialAgentId),
+      tutorialProceedWithoutWebcam:
+        typeof parsed.tutorialProceedWithoutWebcam === "boolean"
+          ? parsed.tutorialProceedWithoutWebcam
+          : DEFAULT_PERSISTED_STATE.tutorialProceedWithoutWebcam,
     };
   } catch {
     return DEFAULT_PERSISTED_STATE;

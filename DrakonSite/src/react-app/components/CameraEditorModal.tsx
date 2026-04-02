@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp, Eye, EyeOff, X } from "lucide-react";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { normalizeCountryCode } from "@/shared/brazilStates";
+import type { CameraFindShare } from "@/shared/types";
 
 const CAMERA_LABEL_OPTIONS = [
   { value: "kitchen", label: "Kitchen" },
@@ -104,6 +105,29 @@ type AddressLookupResponse = {
   message: string | null;
 };
 
+function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Partial<CameraFindShare> & Record<string, unknown>;
+  const id = Number(row.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+
+  return {
+    id,
+    owner_public_id: typeof row.owner_public_id === "string" ? row.owner_public_id : "",
+    invitee_public_id: typeof row.invitee_public_id === "string" ? row.invitee_public_id : "",
+    owner_local_camera_id: Number(row.owner_local_camera_id || 0),
+    camera_name: typeof row.camera_name === "string" ? row.camera_name : "",
+    city: typeof row.city === "string" ? row.city : null,
+    state_code: typeof row.state_code === "string" ? row.state_code : null,
+    country_code: typeof row.country_code === "string" ? row.country_code : "BR",
+    status: typeof row.status === "string" ? row.status : "pending",
+    created_at: typeof row.created_at === "string" ? row.created_at : "",
+    accepted_at: typeof row.accepted_at === "string" ? row.accepted_at : null,
+    revoked_at: typeof row.revoked_at === "string" ? row.revoked_at : null,
+    updated_at: typeof row.updated_at === "string" ? row.updated_at : "",
+  };
+}
+
 export type CameraEditorCamera = {
   id: number;
   name: string;
@@ -144,7 +168,117 @@ type CameraEditorModalProps = {
   onSaved?: (result?: CameraEditorSavedResult) => Promise<void> | void;
 };
 
+type TutorialWebcamProbeStatus = "idle" | "probing" | "ready" | "missing" | "unknown";
+
+type TutorialWebcamProbeResult = {
+  status: TutorialWebcamProbeStatus;
+  preferredIndex: number | null;
+  attemptedIndices: number[];
+  respondingIndices: number[];
+  error: string | null;
+};
+
 const VALID_RETENTION_DAYS: RetentionDays[] = [1, 3, 7, 15, 30, 90, 180];
+const DEFAULT_TUTORIAL_WEBCAM_PROBE_INDICES = [0, 1, 2, 3, 4, 5] as const;
+const DEFAULT_TUTORIAL_WEBCAM_PROBE_RESULT: TutorialWebcamProbeResult = {
+  status: "idle",
+  preferredIndex: null,
+  attemptedIndices: [...DEFAULT_TUTORIAL_WEBCAM_PROBE_INDICES],
+  respondingIndices: [],
+  error: null,
+};
+
+function parseProbeIndices(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: number[] = [];
+  for (const entry of value) {
+    const numeric = Number(entry);
+    if (!Number.isInteger(numeric) || numeric < 0 || numeric > 5) {
+      continue;
+    }
+    if (!normalized.includes(numeric)) {
+      normalized.push(numeric);
+    }
+  }
+
+  return normalized;
+}
+
+function parseOptionalProbeIndex(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+async function requestTutorialWebcamProbe(): Promise<TutorialWebcamProbeResult> {
+  try {
+    const response = await fetch("/api/webcams/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ indices: [...DEFAULT_TUTORIAL_WEBCAM_PROBE_INDICES] }),
+    });
+
+    const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const attemptedIndices = (() => {
+      const parsed = parseProbeIndices(data.attempted_indices);
+      return parsed.length > 0 ? parsed : [...DEFAULT_TUTORIAL_WEBCAM_PROBE_INDICES];
+    })();
+    const respondingIndices = parseProbeIndices(data.responding_indices);
+    const preferredIndex = parseOptionalProbeIndex(data.preferred_index);
+    const rawStatus = typeof data.status === "string" ? data.status.trim().toLowerCase() : "";
+    const error =
+      typeof data.error === "string" && data.error.trim().length > 0 ? data.error.trim() : null;
+
+    if (!response.ok) {
+      return {
+        status: "unknown",
+        preferredIndex,
+        attemptedIndices,
+        respondingIndices,
+        error: error || "Unable to verify webcam availability on this machine.",
+      };
+    }
+
+    if (rawStatus === "ready") {
+      return {
+        status: "ready",
+        preferredIndex,
+        attemptedIndices,
+        respondingIndices,
+        error: null,
+      };
+    }
+
+    if (rawStatus === "missing") {
+      return {
+        status: "missing",
+        preferredIndex,
+        attemptedIndices,
+        respondingIndices,
+        error,
+      };
+    }
+
+    return {
+      status: "unknown",
+      preferredIndex,
+      attemptedIndices,
+      respondingIndices,
+      error,
+    };
+  } catch (error) {
+    return {
+      status: "unknown",
+      preferredIndex: null,
+      attemptedIndices: [...DEFAULT_TUTORIAL_WEBCAM_PROBE_INDICES],
+      respondingIndices: [],
+      error: getErrorMessage(error, "Unable to verify webcam availability on this machine."),
+    };
+  }
+}
 
 function createEmptyWebcamForm(country = ""): WebcamFormData {
   return {
@@ -546,7 +680,11 @@ export default function CameraEditorModal({
 }: CameraEditorModalProps) {
   const { t } = useTranslation();
   const { user } = useAuth();
-  const { currentStepId: onboardingStepId, isOpen: isOnboardingOpen } = useOnboarding();
+  const {
+    currentStepId: onboardingStepId,
+    isOpen: isOnboardingOpen,
+    setTutorialProceedWithoutWebcam,
+  } = useOnboarding();
   const userCountryCode = normalizeCountryCode(user?.country_code, null);
   const userCountryName = resolveCountryName(user?.country_code);
   const latestUserCountryNameRef = useRef(userCountryName);
@@ -568,9 +706,23 @@ export default function CameraEditorModal({
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [showPublicAccessModal, setShowPublicAccessModal] = useState(false);
+  const [shareLookupValue, setShareLookupValue] = useState("");
+  const [cameraShares, setCameraShares] = useState<CameraFindShare[]>([]);
+  const [loadingCameraShares, setLoadingCameraShares] = useState(false);
+  const [creatingCameraShare, setCreatingCameraShare] = useState(false);
+  const [revokingShareId, setRevokingShareId] = useState<number | null>(null);
+  const [shareError, setShareError] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
+  const [tutorialWebcamProbe, setTutorialWebcamProbe] = useState<TutorialWebcamProbeResult>(
+    DEFAULT_TUTORIAL_WEBCAM_PROBE_RESULT
+  );
+  const [showTutorialNoWebcamDialog, setShowTutorialNoWebcamDialog] = useState(false);
+  const [tutorialWebcamDecisionBusy, setTutorialWebcamDecisionBusy] = useState(false);
   const isEditing = !!camera;
+  const isTutorialWebcamOnboardingStep =
+    !isEditing &&
+    isOnboardingOpen &&
+    (onboardingStepId === "camera-webcam-form" || onboardingStepId === "camera-webcam-save");
 
   useEffect(() => {
     latestUserCountryNameRef.current = userCountryName;
@@ -579,6 +731,9 @@ export default function CameraEditorModal({
   useEffect(() => {
     if (!isOpen) {
       tutorialWebcamSeededRef.current = false;
+      setTutorialWebcamProbe(DEFAULT_TUTORIAL_WEBCAM_PROBE_RESULT);
+      setShowTutorialNoWebcamDialog(false);
+      setTutorialWebcamDecisionBusy(false);
       return;
     }
 
@@ -591,8 +746,16 @@ export default function CameraEditorModal({
     setAddressLookupState({ status: "idle", message: null });
     setIsAddressExpanded(false);
     setIsSubmitting(false);
-    setShowPublicAccessModal(false);
+    setShareLookupValue("");
+    setCameraShares([]);
+    setLoadingCameraShares(false);
+    setCreatingCameraShare(false);
+    setRevokingShareId(null);
+    setShareError(null);
     setShowPassword(false);
+    setTutorialWebcamProbe(DEFAULT_TUTORIAL_WEBCAM_PROBE_RESULT);
+    setShowTutorialNoWebcamDialog(false);
+    setTutorialWebcamDecisionBusy(false);
 
     if (camera) {
       const isWebcam = camera.connection_method === "WEBCAM" || camera.webcam_index != null;
@@ -602,6 +765,7 @@ export default function CameraEditorModal({
       setEditForm(buildEditForm(camera));
       setDescriptionLabel(label);
       setDescriptionText(text);
+      void loadCameraShares(camera.id);
       return;
     }
 
@@ -685,6 +849,18 @@ export default function CameraEditorModal({
   }, [activeTab, existingCameraNames, isEditing, isOnboardingOpen, isOpen, onboardingStepId, userCountryCode]);
 
   useEffect(() => {
+    if (!isOpen || !isTutorialWebcamOnboardingStep || activeTab !== "WEBCAM") {
+      return;
+    }
+
+    if (tutorialWebcamProbe.status !== "idle") {
+      return;
+    }
+
+    void runTutorialWebcamProbe({ autoApplyPreferredIndex: true });
+  }, [activeTab, isOpen, isTutorialWebcamOnboardingStep, tutorialWebcamProbe.status]);
+
+  useEffect(() => {
     if (!isOpen || !userCountryName) {
       return;
     }
@@ -709,6 +885,35 @@ export default function CameraEditorModal({
     activeTab === "IP_RTSP" && isSubtypeLockedForManufacturer(currentManufacturer);
   const webcamFields = formData && "webcam_index" in formData ? formData : null;
   const rtspFields = formData && "ip_address" in formData ? formData : null;
+
+  const runTutorialWebcamProbe = async (
+    options: {
+      autoApplyPreferredIndex?: boolean;
+    } = {}
+  ): Promise<TutorialWebcamProbeResult> => {
+    setTutorialWebcamProbe((current) => ({
+      ...current,
+      status: "probing",
+      error: null,
+    }));
+
+    const result = await requestTutorialWebcamProbe();
+
+    setTutorialWebcamProbe(result);
+    if (
+      options.autoApplyPreferredIndex &&
+      result.status === "ready" &&
+      typeof result.preferredIndex === "number"
+    ) {
+      setWebcamForm((current) =>
+        current.webcam_index === result.preferredIndex
+          ? current
+          : { ...current, webcam_index: result.preferredIndex }
+      );
+    }
+
+    return result;
+  };
 
   const handleTabChange = (tab: CameraConnectionTab) => {
     addressLookupRequestIdRef.current += 1;
@@ -916,28 +1121,199 @@ export default function CameraEditorModal({
     return () => window.clearTimeout(timeoutId);
   }, [activeTab, formData?.country, formData?.zip_code, isEditing, isOpen, userCountryCode]);
 
-  if (!isOpen) {
-    return null;
-  }
+  const loadCameraShares = async (cameraId: number) => {
+    setLoadingCameraShares(true);
+    setShareError(null);
+    try {
+      const response = await fetch(`/api/shared-find/outgoing?camera_id=${cameraId}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to load shared find invitations.");
+      }
+      setCameraShares(
+        Array.isArray(data?.shares)
+          ? data.shares
+              .map((row: unknown) => normalizeCameraFindShare(row))
+              .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
+          : []
+      );
+      if (
+        (!Array.isArray(data?.shares) || data.shares.length === 0) &&
+        typeof data?.sync_error === "string" &&
+        data.sync_error.trim()
+      ) {
+        setShareError(data.sync_error);
+      }
+    } catch (error) {
+      setShareError(error instanceof Error ? error.message : "Failed to load shared find invitations.");
+    } finally {
+      setLoadingCameraShares(false);
+    }
+  };
 
-  const handlePublicAccessToggle = (newValue: boolean) => {
-    const currentValue = Boolean(formData?.allowpublicaccess);
-
-    if (!currentValue && newValue) {
-      setShowPublicAccessModal(true);
+  const handleCreateCameraShare = async () => {
+    if (!camera) return;
+    const query = shareLookupValue.trim();
+    if (!query) {
+      setShareError("Enter a @handle or email to invite.");
       return;
     }
 
-    updateCurrentFormData({ allowpublicaccess: newValue });
+    setCreatingCameraShare(true);
+    setShareError(null);
+    try {
+      const response = await fetch(`/api/shared-find/cameras/${camera.id}/shares`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to create the shared find invitation.");
+      }
+      setShareLookupValue("");
+      await loadCameraShares(camera.id);
+    } catch (error) {
+      setShareError(
+        error instanceof Error ? error.message : "Failed to create the shared find invitation."
+      );
+    } finally {
+      setCreatingCameraShare(false);
+    }
   };
 
-  const confirmPublicAccess = () => {
-    updateCurrentFormData({ allowpublicaccess: true });
-    setShowPublicAccessModal(false);
+  const handleRevokeCameraShare = async (shareId: number) => {
+    if (!camera) return;
+    setRevokingShareId(shareId);
+    setShareError(null);
+    try {
+      const response = await fetch(`/api/shared-find/shares/${shareId}/revoke`, {
+        method: "POST",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to revoke the shared find invitation.");
+      }
+      await loadCameraShares(camera.id);
+    } catch (error) {
+      setShareError(
+        error instanceof Error ? error.message : "Failed to revoke the shared find invitation."
+      );
+    } finally {
+      setRevokingShareId(null);
+    }
   };
 
-  const cancelPublicAccess = () => {
-    setShowPublicAccessModal(false);
+  const submitNewCameraCreation = async (
+    options: {
+      tutorialProceedWithoutWebcam?: boolean;
+      overrideWebcamIndex?: number | null;
+    } = {}
+  ) => {
+    setIsSubmitting(true);
+
+    try {
+      let payload: Record<string, unknown>;
+
+      if (activeTab === "WEBCAM") {
+        payload = {
+          name: webcamForm.name,
+          connection_method: "WEBCAM",
+          webcam_index:
+            typeof options.overrideWebcamIndex === "number"
+              ? options.overrideWebcamIndex
+              : webcamForm.webcam_index,
+          store_frames: true,
+          retention_days: webcamForm.retention_days,
+          allowpublicaccess: webcamForm.allowpublicaccess,
+          street: webcamForm.street,
+          number: webcamForm.number,
+          city: webcamForm.city,
+          state: webcamForm.state,
+          zip_code: webcamForm.zip_code,
+          country: webcamForm.country,
+        };
+      } else {
+        payload = {
+          name: rtspForm.name,
+          ip_address: rtspForm.ip_address,
+          rtsp_port: normalizeOptionalField(rtspForm.rtsp_port),
+          manufacturer: normalizeOptionalField(rtspForm.manufacturer),
+          username: normalizeOptionalField(rtspForm.username),
+          password: normalizeOptionalField(rtspForm.password),
+          channel: normalizeOptionalField(rtspForm.channel),
+          subtype: isSubtypeLockedForManufacturer(rtspForm.manufacturer)
+            ? undefined
+            : normalizeOptionalField(rtspForm.subtype),
+          connection_method: rtspForm.connection_method,
+          store_frames: true,
+          retention_days: rtspForm.retention_days,
+          allowpublicaccess: rtspForm.allowpublicaccess,
+          street: rtspForm.street,
+          number: rtspForm.number,
+          city: rtspForm.city,
+          state: rtspForm.state,
+          zip_code: rtspForm.zip_code,
+          country: rtspForm.country,
+        };
+      }
+
+      const response = await fetch("/api/cameras", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseApiError(response, "Failed to create camera"));
+      }
+
+      const responseData = await response.json().catch(() => null);
+      if (activeTab === "WEBCAM" && isTutorialWebcamOnboardingStep) {
+        setTutorialProceedWithoutWebcam(Boolean(options.tutorialProceedWithoutWebcam));
+      }
+      await onSaved?.(
+        getSavedCameraResult(responseData, {
+          cameraName: typeof payload.name === "string" ? payload.name : null,
+          connectionMethod:
+            typeof payload.connection_method === "string" ? payload.connection_method : null,
+        })
+      );
+      onClose();
+    } catch (error) {
+      console.error("Failed to create camera:", error);
+      setSubmitError(getErrorMessage(error, "Failed to create camera. Please try again."));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRetryTutorialWebcamProbe = async (submitAfterReady = false) => {
+    setTutorialWebcamDecisionBusy(true);
+    try {
+      const probeResult = await runTutorialWebcamProbe({ autoApplyPreferredIndex: true });
+      if (probeResult.status === "ready") {
+        setShowTutorialNoWebcamDialog(false);
+        if (submitAfterReady) {
+          await submitNewCameraCreation({
+            tutorialProceedWithoutWebcam: false,
+            overrideWebcamIndex: probeResult.preferredIndex,
+          });
+        }
+      }
+    } finally {
+      setTutorialWebcamDecisionBusy(false);
+    }
+  };
+
+  const handleContinueWithoutTutorialWebcam = async () => {
+    setTutorialWebcamDecisionBusy(true);
+    try {
+      setShowTutorialNoWebcamDialog(false);
+      await submitNewCameraCreation({ tutorialProceedWithoutWebcam: true });
+    } finally {
+      setTutorialWebcamDecisionBusy(false);
+    }
   };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -1111,76 +1487,27 @@ export default function CameraEditorModal({
     }
 
     setAddressErrors({});
-    setIsSubmitting(true);
+    if (activeTab === "WEBCAM" && isTutorialWebcamOnboardingStep) {
+      const probeResult =
+        tutorialWebcamProbe.status === "ready" ||
+        tutorialWebcamProbe.status === "missing" ||
+        tutorialWebcamProbe.status === "unknown"
+          ? tutorialWebcamProbe
+          : await runTutorialWebcamProbe({ autoApplyPreferredIndex: true });
 
-    try {
-      let payload: Record<string, unknown>;
-
-      if (activeTab === "WEBCAM") {
-        payload = {
-          name: webcamForm.name,
-          connection_method: "WEBCAM",
-          webcam_index: webcamForm.webcam_index,
-          store_frames: true,
-          retention_days: webcamForm.retention_days,
-          allowpublicaccess: webcamForm.allowpublicaccess,
-          street: webcamForm.street,
-          number: webcamForm.number,
-          city: webcamForm.city,
-          state: webcamForm.state,
-          zip_code: webcamForm.zip_code,
-          country: webcamForm.country,
-        };
-      } else {
-        payload = {
-          name: rtspForm.name,
-          ip_address: rtspForm.ip_address,
-          rtsp_port: normalizeOptionalField(rtspForm.rtsp_port),
-          manufacturer: normalizeOptionalField(rtspForm.manufacturer),
-          username: normalizeOptionalField(rtspForm.username),
-          password: normalizeOptionalField(rtspForm.password),
-          channel: normalizeOptionalField(rtspForm.channel),
-          subtype: isSubtypeLockedForManufacturer(rtspForm.manufacturer)
-            ? undefined
-            : normalizeOptionalField(rtspForm.subtype),
-          connection_method: rtspForm.connection_method,
-          store_frames: true,
-          retention_days: rtspForm.retention_days,
-          allowpublicaccess: rtspForm.allowpublicaccess,
-          street: rtspForm.street,
-          number: rtspForm.number,
-          city: rtspForm.city,
-          state: rtspForm.state,
-          zip_code: rtspForm.zip_code,
-          country: rtspForm.country,
-        };
+      if (probeResult.status === "missing") {
+        setShowTutorialNoWebcamDialog(true);
+        return;
       }
 
-      const response = await fetch("/api/cameras", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+      await submitNewCameraCreation({
+        tutorialProceedWithoutWebcam: false,
+        overrideWebcamIndex: probeResult.preferredIndex,
       });
-
-      if (!response.ok) {
-        throw new Error(await parseApiError(response, "Failed to create camera"));
-      }
-
-      const responseData = await response.json().catch(() => null);
-      await onSaved?.(
-        getSavedCameraResult(responseData, {
-          cameraName: typeof payload.name === "string" ? payload.name : null,
-          connectionMethod:
-            typeof payload.connection_method === "string" ? payload.connection_method : null,
-        })
-      );
-      onClose();
-    } catch (error) {
-      console.error("Failed to create camera:", error);
-      setSubmitError(getErrorMessage(error, "Failed to create camera. Please try again."));
-    } finally {
-      setIsSubmitting(false);
+      return;
     }
+
+    await submitNewCameraCreation({ tutorialProceedWithoutWebcam: false });
   };
 
   const addressValidationCount = Object.keys(addressErrors).filter(
@@ -1202,6 +1529,44 @@ export default function CameraEditorModal({
         : addressLookupState.status === "success"
           ? "text-emerald-300"
           : "text-gray-400";
+  const tutorialWebcamProbeNotice =
+    isTutorialWebcamOnboardingStep && activeTab === "WEBCAM"
+      ? (() => {
+          switch (tutorialWebcamProbe.status) {
+            case "probing":
+              return {
+                className: "border-sky-400/20 bg-sky-500/10 text-sky-100",
+                message: t("tutorial.cameraWebcamProbe.probing"),
+              };
+            case "ready":
+              return {
+                className: "border-emerald-400/20 bg-emerald-500/10 text-emerald-100",
+                message: t("tutorial.cameraWebcamProbe.ready", {
+                  index:
+                    typeof tutorialWebcamProbe.preferredIndex === "number"
+                      ? tutorialWebcamProbe.preferredIndex
+                      : webcamFields?.webcam_index ?? 0,
+                }),
+              };
+            case "missing":
+              return {
+                className: "border-amber-400/20 bg-amber-500/10 text-amber-100",
+                message: t("tutorial.cameraWebcamProbe.missing"),
+              };
+            case "unknown":
+              return {
+                className: "border-white/10 bg-white/5 text-slate-200",
+                message: t("tutorial.cameraWebcamProbe.unknown"),
+              };
+            default:
+              return null;
+          }
+        })()
+      : null;
+
+  if (!isOpen) {
+    return null;
+  }
 
   return (
     <>
@@ -1270,6 +1635,13 @@ export default function CameraEditorModal({
                 className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6"
                 data-onboarding-target={ONBOARDING_TARGETS.cameraEditorWebcamForm}
               >
+                {tutorialWebcamProbeNotice ? (
+                  <div
+                    className={`md:col-span-2 rounded-lg border px-4 py-3 text-sm ${tutorialWebcamProbeNotice.className}`}
+                  >
+                    {tutorialWebcamProbeNotice.message}
+                  </div>
+                ) : null}
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium text-gray-300 mb-2">Camera Name *</label>
                   <input
@@ -1295,10 +1667,11 @@ export default function CameraEditorModal({
                     } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
                   >
                     <option value="">Select webcam index...</option>
-                    <option value="0">0</option>
-                    <option value="1">1</option>
-                    <option value="2">2</option>
-                    <option value="3">3</option>
+                    {[0, 1, 2, 3, 4, 5].map((index) => (
+                      <option key={index} value={index}>
+                        {index}
+                      </option>
+                    ))}
                   </select>
                   {addressErrors.webcam_index && (
                     <p className="text-red-400 text-xs mt-1">Webcam index is required</p>
@@ -1724,25 +2097,77 @@ export default function CameraEditorModal({
 
               <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-gray-800 pt-4">
                 <div className="md:col-span-2 flex flex-col gap-2">
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => handlePublicAccessToggle(!Boolean(formData?.allowpublicaccess))}
-                      className={`relative inline-flex items-center h-6 w-11 rounded-full transition-colors ${
-                        formData?.allowpublicaccess ? "bg-blue-500" : "bg-gray-600"
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-5 w-5 transform rounded-full bg-white border border-gray-300 transition-transform ${
-                          formData?.allowpublicaccess ? "translate-x-6" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                    <span className="text-sm font-medium text-gray-300">Allow Public Access</span>
+                  <div className="space-y-3 rounded-2xl border border-gray-800 bg-gray-950/50 p-4">
+                    <div>
+                      <p className="text-sm font-medium text-gray-200">Shared Drakon Find Access</p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Invite a Perceptrum user by @handle or email so they can use this camera in Drakon Find.
+                      </p>
+                    </div>
+
+                    {camera ? (
+                      <>
+                        <div className="flex flex-col gap-3 md:flex-row">
+                          <input
+                            type="text"
+                            value={shareLookupValue}
+                            onChange={(event) => setShareLookupValue(event.target.value)}
+                            placeholder="@nickname or email"
+                            className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void handleCreateCameraShare()}
+                            disabled={creatingCameraShare}
+                            className="rounded-lg bg-blue-500 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-gray-700"
+                          >
+                            {creatingCameraShare ? "Inviting..." : "Invite"}
+                          </button>
+                        </div>
+
+                        {shareError ? <p className="text-xs text-red-300">{shareError}</p> : null}
+
+                        <div className="space-y-2">
+                          {loadingCameraShares ? (
+                            <p className="text-xs text-gray-400">Loading invitations...</p>
+                          ) : cameraShares.length ? (
+                            cameraShares.map((share) => (
+                              <div
+                                key={share.id}
+                                className="flex flex-col gap-3 rounded-xl border border-gray-800 bg-gray-900/70 px-4 py-3 md:flex-row md:items-center md:justify-between"
+                              >
+                                <div>
+                                  <p className="text-sm text-gray-200 break-all">
+                                    Invitee: {share.invitee_public_id}
+                                  </p>
+                                  <p className="text-xs text-gray-400">
+                                    Status: {share.status}
+                                    {share.accepted_at ? ` • accepted ${share.accepted_at}` : ""}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleRevokeCameraShare(share.id)}
+                                  disabled={revokingShareId === share.id}
+                                  className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs font-medium text-red-100 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  {revokingShareId === share.id ? "Revoking..." : "Remove access"}
+                                </button>
+                              </div>
+                            ))
+                          ) : (
+                            <p className="text-xs text-gray-400">
+                              No shared Drakon Find invitations have been created for this camera yet.
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-xs text-gray-400">
+                        Save the camera first to invite authorized users for Drakon Find.
+                      </p>
+                    )}
                   </div>
-                  <p className="text-xs text-gray-500 ml-14">
-                    Enable authorized law enforcement access to this camera
-                  </p>
                 </div>
               </div>
             </div>
@@ -1790,41 +2215,59 @@ export default function CameraEditorModal({
         </div>
       </div>
 
-      {showPublicAccessModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-[60] p-4">
-          <div className="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
+      {showTutorialNoWebcamDialog ? (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-950 shadow-2xl">
             <div className="p-6">
-              <h2 className="text-xl font-bold text-gray-100 mb-4">
-                Enable public access for this camera?
-              </h2>
-              <p className="text-gray-300 mb-6">
-                By enabling <strong>Allow Public Access</strong>, you agree that authorized law
-                enforcement partners may access this camera's stream and recorded frames when legally
-                requested.
-                <br />
-                <br />
-                Only enable this if you understand and accept this responsibility.
+              <h3 className="text-lg font-semibold text-gray-100">
+                {t("tutorial.cameraWebcamProbe.modalTitle")}
+              </h3>
+              <p className="mt-3 text-sm leading-6 text-gray-300">
+                {t("tutorial.cameraWebcamProbe.modalDescription")}
               </p>
-              <div className="flex flex-col sm:flex-row gap-3">
+              {tutorialWebcamProbe.status === "missing" ? (
+                <p className="mt-3 text-sm text-amber-100">
+                  {t("tutorial.cameraWebcamProbe.missing")}
+                </p>
+              ) : null}
+              {tutorialWebcamProbe.status === "unknown" ? (
+                <p className="mt-3 text-sm text-slate-200">
+                  {t("tutorial.cameraWebcamProbe.unknown")}
+                </p>
+              ) : null}
+              <div className="mt-6 flex flex-col gap-3">
                 <button
                   type="button"
-                  onClick={cancelPublicAccess}
-                  className="flex-1 px-4 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg font-medium transition-colors"
+                  onClick={() => void handleRetryTutorialWebcamProbe(true)}
+                  disabled={tutorialWebcamDecisionBusy || isSubmitting}
+                  className="w-full rounded-lg bg-blue-500 px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-gray-700"
                 >
-                  Cancel
+                  {tutorialWebcamDecisionBusy && tutorialWebcamProbe.status === "probing"
+                    ? t("common.loading")
+                    : t("tutorial.cameraWebcamProbe.connectAndRetry")}
                 </button>
                 <button
                   type="button"
-                  onClick={confirmPublicAccess}
-                  className="flex-1 px-4 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors text-center"
+                  onClick={() => void handleContinueWithoutTutorialWebcam()}
+                  disabled={tutorialWebcamDecisionBusy || isSubmitting}
+                  className="w-full rounded-lg border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-100 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  I understand and agree
+                  {t("tutorial.cameraWebcamProbe.continueWithout")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowTutorialNoWebcamDialog(false)}
+                  disabled={tutorialWebcamDecisionBusy || isSubmitting}
+                  className="w-full rounded-lg px-4 py-3 text-sm font-medium text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {t("tutorial.cameraWebcamProbe.keepEditing")}
                 </button>
               </div>
             </div>
           </div>
         </div>
-      )}
+      ) : null}
+
     </>
   );
 }

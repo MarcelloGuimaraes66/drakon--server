@@ -3629,6 +3629,54 @@ namespace {
         return false;
     }
 
+    static bool probeLocalWebcamIndexResponding_(
+        int webcamIndex,
+        int maxWaitMs,
+        std::string& outError)
+    {
+        outError.clear();
+
+        if (webcamIndex < 0) {
+            outError = "invalid webcam index";
+            return false;
+        }
+
+        if (maxWaitMs < 400) {
+            maxWaitMs = 400;
+        }
+
+        cv::VideoCapture cap(webcamIndex, cv::CAP_DSHOW);
+        if (!cap.isOpened()) {
+            cap.open(webcamIndex, cv::CAP_ANY);
+        }
+        if (!cap.isOpened()) {
+            outError = "failed to open webcam index " + std::to_string(webcamIndex);
+            return false;
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        while (true) {
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started
+            ).count();
+            if (elapsedMs >= maxWaitMs) {
+                break;
+            }
+
+            cv::Mat frame;
+            if (cap.read(frame) && !frame.empty()) {
+                cap.release();
+                return true;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        }
+
+        cap.release();
+        outError = "webcam capture produced no valid frames";
+        return false;
+    }
+
     static bool captureStableRtspSnapshotPromptEnhance(
         const json& cameraPayload,
         int targetSecond,
@@ -5752,6 +5800,9 @@ void AgentCore::processCommand_(const json& cmd) {
         }
         else if (type == "stop_camera") {
             stopCamera_(cameraId);
+        }
+        else if (type == "probe_webcams") {
+            handleProbeWebcamsCommand_(commandId, payload);
         }
         else if (type == "job_start") {
             const int commandId = cmd.value("id", -1);
@@ -23032,6 +23083,74 @@ void AgentCore::postCommandResult_(
     }
     catch (...) {
         Logger::instance().logDebug("agent", "postCommandResult_ unknown exception");
+    }
+}
+
+void AgentCore::handleProbeWebcamsCommand_(int commandId, const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        return;
+    }
+
+    try {
+        std::vector<int> indices;
+        if (payload.is_object() && payload.contains("indices") && payload["indices"].is_array()) {
+            for (const auto& item : payload["indices"]) {
+                if (!item.is_number_integer()) continue;
+                const int webcamIndex = item.get<int>();
+                if (webcamIndex < 0 || webcamIndex > 5) continue;
+                if (std::find(indices.begin(), indices.end(), webcamIndex) == indices.end()) {
+                    indices.push_back(webcamIndex);
+                }
+            }
+        }
+
+        if (indices.empty()) {
+            indices = { 0, 1, 2, 3, 4, 5 };
+        }
+
+        nlohmann::json result;
+        result["attempted_indices"] = nlohmann::json::array();
+        result["responding_indices"] = nlohmann::json::array();
+        result["preferred_index"] = nullptr;
+        result["has_responsive_webcam"] = false;
+        nlohmann::json errors = nlohmann::json::array();
+
+        for (const int webcamIndex : indices) {
+            result["attempted_indices"].push_back(webcamIndex);
+
+            std::string probeError;
+            const bool responding = probeLocalWebcamIndexResponding_(webcamIndex, 1400, probeError);
+            if (responding) {
+                result["responding_indices"].push_back(webcamIndex);
+                result["preferred_index"] = webcamIndex;
+                result["has_responsive_webcam"] = true;
+                break;
+            }
+
+            if (!probeError.empty()) {
+                errors.push_back({
+                    { "index", webcamIndex },
+                    { "error", probeError }
+                });
+            }
+        }
+
+        if (!errors.empty()) {
+            result["errors"] = errors;
+        }
+
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        nlohmann::json errorPayload;
+        errorPayload["error"] = std::string("webcam probe failed: ") + e.what();
+        postCommandResult_(commandId, "failed", errorPayload);
+    }
+    catch (...) {
+        nlohmann::json errorPayload;
+        errorPayload["error"] = "webcam probe failed";
+        postCommandResult_(commandId, "failed", errorPayload);
     }
 }
 

@@ -216,13 +216,15 @@ export interface DrakonFindScopeStateSummary {
 export interface DrakonFindScopeCameraPreview {
   id: number;
   user_id: string;
+  share_id: number;
+  owner_local_camera_id: number;
   name: string;
   city?: string | null;
   state?: string | null;
   state_code?: string | null;
   country?: string | null;
   country_code?: string | null;
-  allowpublicaccess: number;
+  share_status: string;
 }
 
 export interface DrakonFindScopeResolution {
@@ -286,11 +288,14 @@ export interface DrakonFindHit {
   target_id: number;
   camera_id: number;
   camera_name?: string | null;
+  camera_street?: string | null;
+  camera_number?: string | null;
   camera_owner_user_id: string;
   client_id?: string | null;
   exe_id?: string | null;
   camera_city?: string | null;
   camera_state_code?: string | null;
+  camera_country_code?: string | null;
   summary: string;
   confidence: number;
   image_url?: string | null;
@@ -310,6 +315,29 @@ export interface DrakonFindAuditLog {
   message: string;
   metadata: Record<string, unknown>;
   created_at: string;
+}
+
+export interface SharedFindResolvedUser {
+  public_id: string;
+  email: string;
+  handle?: string | null;
+  display_label: string;
+}
+
+export interface CameraFindShare {
+  id: number;
+  owner_public_id: string;
+  invitee_public_id: string;
+  owner_local_camera_id: number;
+  camera_name: string;
+  city?: string | null;
+  state_code?: string | null;
+  country_code: string;
+  status: string;
+  created_at: string;
+  accepted_at?: string | null;
+  revoked_at?: string | null;
+  updated_at: string;
 }
 
 export interface Algorithm {

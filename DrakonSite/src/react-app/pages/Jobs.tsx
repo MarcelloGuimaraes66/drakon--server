@@ -1109,33 +1109,42 @@ const hourMinutePartsToTimeoutSeconds = (hours: number, minutes: number): number
   return Math.max(MIN_STEP_TIMEOUT_SECONDS, (safeHours * 60 + safeMinutes) * 60);
 };
 
-const durationSecondsToHourMinuteParts = (
+const durationSecondsToHourMinuteSecondParts = (
   durationSeconds: number
-): { hours: number; minutes: number } => {
+): { hours: number; minutes: number; seconds: number } => {
   const safeSeconds = Number.isFinite(durationSeconds) ? Math.max(0, Math.floor(durationSeconds)) : 0;
-  const totalMinutes = Math.floor(safeSeconds / 60);
   return {
-    hours: Math.floor(totalMinutes / 60),
-    minutes: totalMinutes % 60,
+    hours: Math.floor(safeSeconds / 3600),
+    minutes: Math.floor((safeSeconds % 3600) / 60),
+    seconds: safeSeconds % 60,
   };
 };
 
-const hourMinutePartsToDurationSeconds = (hours: number, minutes: number): number => {
+const hourMinuteSecondPartsToDurationSeconds = (
+  hours: number,
+  minutes: number,
+  seconds: number
+): number => {
   const safeHours = Number.isFinite(hours) ? Math.max(0, Math.floor(hours)) : 0;
   const safeMinutesRaw = Number.isFinite(minutes) ? Math.floor(minutes) : 0;
+  const safeSecondsRaw = Number.isFinite(seconds) ? Math.floor(seconds) : 0;
   const safeMinutes = Math.min(59, Math.max(0, safeMinutesRaw));
-  return (safeHours * 60 + safeMinutes) * 60;
+  const safeSeconds = Math.min(59, Math.max(0, safeSecondsRaw));
+  return safeHours * 3600 + safeMinutes * 60 + safeSeconds;
 };
 
 const formatDurationHuman = (durationSeconds: number): string => {
   const safeSeconds = Number.isFinite(durationSeconds) ? Math.max(0, Math.floor(durationSeconds)) : 0;
-  const totalMinutes = Math.floor(safeSeconds / 60);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+  const parts: string[] = [];
 
-  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
-  if (hours > 0) return `${hours}h`;
-  return `${minutes}m`;
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds}s`);
+
+  return parts.join(" ");
 };
 
 const parseNonNegativeIntegerInput = (value: string): number => {
@@ -4229,6 +4238,7 @@ function StepCard({
     time: "",
     elapsed_hours: 0,
     elapsed_minutes: 0,
+    elapsed_seconds: 0,
     on_fail: "skip" as "skip" | "fail",
   });
 
@@ -4328,6 +4338,7 @@ function StepCard({
         time: "",
         elapsed_hours: 0,
         elapsed_minutes: 0,
+        elapsed_seconds: 0,
         on_fail: "skip",
       });
       return;
@@ -4345,6 +4356,7 @@ function StepCard({
         time: "",
         elapsed_hours: 0,
         elapsed_minutes: 0,
+        elapsed_seconds: 0,
         on_fail: "skip",
       });
       return;
@@ -4366,6 +4378,7 @@ function StepCard({
         time: "",
         elapsed_hours: 0,
         elapsed_minutes: 0,
+        elapsed_seconds: 0,
         on_fail: step.on_missing_input === "fail" ? "fail" : "skip",
       });
       return;
@@ -4387,6 +4400,7 @@ function StepCard({
         time: "",
         elapsed_hours: 0,
         elapsed_minutes: 0,
+        elapsed_seconds: 0,
         on_fail: step.on_missing_input === "fail" ? "fail" : "skip",
       });
     } else if (mode === "time") {
@@ -4399,11 +4413,12 @@ function StepCard({
         time: remainingParts.join(":"),
         elapsed_hours: 0,
         elapsed_minutes: 0,
+        elapsed_seconds: 0,
         on_fail: "skip",
       });
     } else if (mode === "elapsed") {
       const parsedSeconds = Math.max(0, parseInt(remainingParts[0] || "0", 10) || 0);
-      const elapsedParts = durationSecondsToHourMinuteParts(parsedSeconds);
+      const elapsedParts = durationSecondsToHourMinuteSecondParts(parsedSeconds);
       setStartConditionForm({
         mode: "elapsed",
         step_id: "",
@@ -4413,6 +4428,7 @@ function StepCard({
         time: "",
         elapsed_hours: elapsedParts.hours,
         elapsed_minutes: elapsedParts.minutes,
+        elapsed_seconds: elapsedParts.seconds,
         on_fail: "skip",
       });
     }
@@ -6101,9 +6117,10 @@ function StepCard({
         start_condition = `start:time:${startConditionForm.time}`;
         on_missing_input = "skip";
       } else if (startConditionForm.mode === "elapsed") {
-        const elapsedSeconds = hourMinutePartsToDurationSeconds(
+        const elapsedSeconds = hourMinuteSecondPartsToDurationSeconds(
           startConditionForm.elapsed_hours,
-          startConditionForm.elapsed_minutes
+          startConditionForm.elapsed_minutes,
+          startConditionForm.elapsed_seconds
         );
         if (elapsedSeconds <= 0) {
           onShowToast("Elapsed time must be greater than zero", "error");
@@ -9935,7 +9952,7 @@ function StepCard({
 
                 {startConditionForm.mode === "elapsed" && (
                   <div className="space-y-3">
-                    <div className="grid grid-cols-2 gap-3">
+                    <div className="grid grid-cols-3 gap-3">
                       <div>
                         <label className="block text-xs text-gray-400 mb-1">
                           {t("jobs.hours")}
@@ -9968,6 +9985,25 @@ function StepCard({
                             setStartConditionForm({
                               ...startConditionForm,
                               elapsed_minutes: Math.min(59, parseNonNegativeIntegerInput(e.target.value)),
+                            })
+                          }
+                          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">
+                          {t("jobs.seconds")}
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={59}
+                          step={1}
+                          value={startConditionForm.elapsed_seconds}
+                          onChange={(e) =>
+                            setStartConditionForm({
+                              ...startConditionForm,
+                              elapsed_seconds: Math.min(59, parseNonNegativeIntegerInput(e.target.value)),
                             })
                           }
                           className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"

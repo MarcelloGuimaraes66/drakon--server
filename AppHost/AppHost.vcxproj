@@ -329,4 +329,8 @@
           SkipUnchangedFiles="true"
           Condition="'@(PerceptrumRuntimeTool)' != ''" />
   </Target>
+
+  <Target Name="CopyMsvcRuntime" AfterTargets="CopyPerceptrumRuntimeTools" Condition="'$(UseDebugLibraries)'!='true'">
+    <Exec Command='powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\Perceptrum\scripts\copy-msvc-runtime.ps1" -TargetDir "$(OutDir)." -PlatformName "$(Platform)" -VCToolsRedistDir "$(VCToolsRedistDir)"' />
+  </Target>
 </Project>

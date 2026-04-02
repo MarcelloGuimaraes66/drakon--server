@@ -37,6 +37,8 @@ tmp-dbs/
 tmp_nvidia_frames/
 tmp_video_review/
 tmp-video-frames/
+tmp_drakon_db_snapshot/
+tmp_runtime_backups/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

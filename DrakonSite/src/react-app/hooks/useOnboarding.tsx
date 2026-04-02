@@ -28,6 +28,7 @@ type OnboardingContextValue = {
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
   tutorialAgentId: number | null;
+  tutorialProceedWithoutWebcam: boolean;
   providerStatus: ProviderStatusMap;
   inlineMessage: string;
   startTutorial: () => void;
@@ -35,6 +36,7 @@ type OnboardingContextValue = {
   finishTutorial: () => void;
   completeCameraTutorial: (cameraId?: number | null) => void;
   completeAgentTutorial: (agentId?: number | null) => void;
+  setTutorialProceedWithoutWebcam: (value: boolean) => void;
   next: () => Promise<void>;
   back: () => void;
   chooseProvider: (provider: OnboardingProviderKind) => Promise<void>;
@@ -79,6 +81,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const [selectedProvider, setSelectedProvider] = useState<OnboardingProviderKind | null>(null);
   const [tutorialCameraId, setTutorialCameraId] = useState<number | null>(null);
   const [tutorialAgentId, setTutorialAgentId] = useState<number | null>(null);
+  const [tutorialProceedWithoutWebcam, setTutorialProceedWithoutWebcam] = useState(false);
   const [providerStatus, setProviderStatus] = useState<ProviderStatusMap>(DEFAULT_PROVIDER_STATUS);
   const [inlineMessage, setInlineMessage] = useState("");
 
@@ -96,6 +99,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setSelectedProvider(persisted.selectedProvider);
     setTutorialCameraId(persisted.tutorialCameraId);
     setTutorialAgentId(persisted.tutorialAgentId);
+    setTutorialProceedWithoutWebcam(persisted.tutorialProceedWithoutWebcam);
     if (persisted.status === "in_progress" && persisted.currentStepId) {
       setIsOpen(true);
     }
@@ -114,8 +118,17 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       selectedProvider,
       tutorialCameraId,
       tutorialAgentId,
+      tutorialProceedWithoutWebcam,
     });
-  }, [currentStepId, isHydrated, selectedProvider, status, tutorialAgentId, tutorialCameraId]);
+  }, [
+    currentStepId,
+    isHydrated,
+    selectedProvider,
+    status,
+    tutorialAgentId,
+    tutorialCameraId,
+    tutorialProceedWithoutWebcam,
+  ]);
 
   useEffect(() => {
     if (!isHydrated || isOpen || status !== "never_started" || isAuthOnlyRoute(location.pathname)) {
@@ -208,6 +221,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setSelectedProvider(null);
     setTutorialCameraId(null);
     setTutorialAgentId(null);
+    setTutorialProceedWithoutWebcam(false);
     moveToStep("welcome");
   }, [moveToStep]);
 
@@ -218,6 +232,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setSelectedProvider(null);
     setTutorialCameraId(null);
     setTutorialAgentId(null);
+    setTutorialProceedWithoutWebcam(false);
     setStatus((current) => (current === "completed" ? current : "dismissed"));
   }, []);
 
@@ -228,6 +243,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setSelectedProvider(null);
     setTutorialCameraId(null);
     setTutorialAgentId(null);
+    setTutorialProceedWithoutWebcam(false);
     setStatus("completed");
   }, []);
 
@@ -243,6 +259,10 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setTutorialAgentId((current) => normalizeCameraId(agentId) ?? current);
     moveToStep("agent-toggle");
   }, [moveToStep]);
+
+  const updateTutorialProceedWithoutWebcam = useCallback((value: boolean) => {
+    setTutorialProceedWithoutWebcam(value);
+  }, []);
 
   const chooseProvider = useCallback(
     async (provider: OnboardingProviderKind) => {
@@ -462,6 +482,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       selectedProvider,
       tutorialCameraId,
       tutorialAgentId,
+      tutorialProceedWithoutWebcam,
       providerStatus,
       inlineMessage,
       startTutorial,
@@ -469,6 +490,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       finishTutorial,
       completeCameraTutorial,
       completeAgentTutorial,
+      setTutorialProceedWithoutWebcam: updateTutorialProceedWithoutWebcam,
       next,
       back,
       chooseProvider,
@@ -497,6 +519,8 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       syncProviderStatus,
       tutorialAgentId,
       tutorialCameraId,
+      tutorialProceedWithoutWebcam,
+      updateTutorialProceedWithoutWebcam,
     ]
   );
 

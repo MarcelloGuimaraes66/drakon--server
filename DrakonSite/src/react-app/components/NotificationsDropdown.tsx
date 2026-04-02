@@ -9,6 +9,7 @@ import {
   CirclePlay,
   Cpu,
   Clock3,
+  Radar,
 } from "lucide-react";
 
 interface Notification {
@@ -91,6 +92,9 @@ export default function NotificationsDropdown({
     if (type === "agent_api_error") {
       return <Cpu className="w-5 h-5 text-rose-400" />;
     }
+    if (type === "shared_find_invitation") {
+      return <Radar className="w-5 h-5 text-amber-300" />;
+    }
     return <AlertCircle className="w-5 h-5 text-blue-400" />;
   };
 
@@ -100,6 +104,7 @@ export default function NotificationsDropdown({
     if (type === "job_staled" || type === "job_start_blocked") return "bg-amber-500/5";
     if (type === "job_started") return "bg-emerald-500/5";
     if (type === "agent_api_error") return "bg-rose-500/5";
+    if (type === "shared_find_invitation") return "bg-amber-500/5";
     return "";
   };
 
@@ -137,6 +142,12 @@ export default function NotificationsDropdown({
         className: "bg-rose-500/20 text-rose-300",
       };
     }
+    if (type === "shared_find_invitation") {
+      return {
+        label: "Find",
+        className: "bg-amber-500/20 text-amber-200",
+      };
+    }
     return null;
   };
 
@@ -156,6 +167,9 @@ export default function NotificationsDropdown({
     }
     if (notification.type === "agent_api_error") {
       return notification.camera_id ? "/ai-agents" : "/jobs";
+    }
+    if (notification.type === "shared_find_invitation") {
+      return "/drakon-find";
     }
     return null;
   };

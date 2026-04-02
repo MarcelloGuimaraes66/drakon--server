@@ -118,6 +118,7 @@ function getPreviewCardIcon(icon: TutorialPreviewCard["icon"]) {
 function getStepView(
   stepId: OnboardingStepId | null,
   provider: OnboardingProviderKind | null,
+  tutorialProceedWithoutWebcam: boolean,
   inlineMessage: string,
   t: TFunction
 ): StepView | null {
@@ -447,20 +448,28 @@ function getStepView(
     case "ai-agents-camera-start":
       return {
         title: t("tutorial.agentCameraStart.title"),
-        description: t("tutorial.agentCameraStart.description"),
+        description: tutorialProceedWithoutWebcam
+          ? t("tutorial.agentCameraStart.descriptionWithoutWebcam")
+          : t("tutorial.agentCameraStart.description"),
         stageLabel: t("tutorial.common.stageOfTotal", { current: 3, total: 3 }),
         stageProgress: t("tutorial.common.progressOfTotal", { current: 11, total: 11 }),
-        primaryLabel: t("tutorial.agentCameraStart.primary"),
+        primaryLabel: tutorialProceedWithoutWebcam
+          ? t("tutorial.common.continue")
+          : t("tutorial.agentCameraStart.primary"),
         showBack: true,
         accentClassName: "from-emerald-500/18 to-cyan-500/10 border-emerald-400/35 text-emerald-100",
       };
     case "complete":
       return {
         title: t("tutorial.complete.title"),
-        description: t("tutorial.complete.description"),
+        description: tutorialProceedWithoutWebcam
+          ? t("tutorial.complete.descriptionWithoutWebcam")
+          : t("tutorial.complete.description"),
         bullets: [
           t("tutorial.complete.bullet1"),
-          t("tutorial.complete.bullet2"),
+          tutorialProceedWithoutWebcam
+            ? t("tutorial.complete.bullet2WithoutWebcam")
+            : t("tutorial.complete.bullet2"),
         ],
         primaryLabel: t("tutorial.complete.primary"),
         showBack: true,
@@ -484,6 +493,7 @@ export default function TutorialOverlay() {
     selectedProvider,
     providerStatus,
     inlineMessage,
+    tutorialProceedWithoutWebcam,
     startTutorial,
     closeTutorial,
     finishTutorial,
@@ -503,8 +513,23 @@ export default function TutorialOverlay() {
     [currentStepId, selectedProvider]
   );
   const view = useMemo(
-    () => getStepView(currentStepId, selectedProvider, inlineMessage, t),
-    [currentStepId, i18n.language, i18n.resolvedLanguage, inlineMessage, selectedProvider, t]
+    () =>
+      getStepView(
+        currentStepId,
+        selectedProvider,
+        tutorialProceedWithoutWebcam,
+        inlineMessage,
+        t
+      ),
+    [
+      currentStepId,
+      i18n.language,
+      i18n.resolvedLanguage,
+      inlineMessage,
+      selectedProvider,
+      t,
+      tutorialProceedWithoutWebcam,
+    ]
   );
 
   useEffect(() => {
@@ -788,6 +813,11 @@ export default function TutorialOverlay() {
     }
 
     if (currentStepId === "ai-agents-camera-start") {
+      if (tutorialProceedWithoutWebcam) {
+        await next();
+        return;
+      }
+
       if (!targetId) {
         await next();
         return;

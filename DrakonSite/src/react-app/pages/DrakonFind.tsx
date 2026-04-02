@@ -6,6 +6,7 @@ import Layout from "@/react-app/components/Layout";
 import Toast from "@/react-app/components/Toast";
 import BrazilStateTileMap from "@/react-app/components/BrazilStateTileMap";
 import type {
+  CameraFindShare,
   DrakonFindAuditLog,
   DrakonFindHit,
   DrakonFindScopeResolution,
@@ -86,6 +87,8 @@ const SEARCH_MESSAGE_TRANSLATION_KEYS: Record<string, string> = {
     "drakonFind.runtime.wait.queuedBlockedClient",
   "Ainda existem cameras aguardando roteamento para um cliente elegivel.":
     "drakonFind.runtime.wait.queuedUnresolvedAssignment",
+  "Existem outras buscas ainda ativas ou finalizando. Esta busca aguardara na fila ate que uma vaga de despacho seja liberada.":
+    "drakonFind.runtime.wait.operatorQueueBusy",
 };
 
 const DRAKON_FIND_MAX_TARGET_IMAGES = 6;
@@ -170,6 +173,28 @@ function normalizeDrakonFindTargetImage(value: unknown): DrakonFindTargetImage |
   };
 }
 
+function normalizeCameraFindShare(value: unknown): CameraFindShare | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Partial<CameraFindShare> & Record<string, unknown>;
+  const id = Number(row.id || 0);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return {
+    id,
+    owner_public_id: typeof row.owner_public_id === "string" ? row.owner_public_id : "",
+    invitee_public_id: typeof row.invitee_public_id === "string" ? row.invitee_public_id : "",
+    owner_local_camera_id: Number(row.owner_local_camera_id || 0),
+    camera_name: typeof row.camera_name === "string" ? row.camera_name : "",
+    city: typeof row.city === "string" ? row.city : null,
+    state_code: typeof row.state_code === "string" ? row.state_code : null,
+    country_code: typeof row.country_code === "string" ? row.country_code : "BR",
+    status: typeof row.status === "string" ? row.status : "pending",
+    created_at: typeof row.created_at === "string" ? row.created_at : "",
+    accepted_at: typeof row.accepted_at === "string" ? row.accepted_at : null,
+    revoked_at: typeof row.revoked_at === "string" ? row.revoked_at : null,
+    updated_at: typeof row.updated_at === "string" ? row.updated_at : "",
+  };
+}
+
 function normalizeDrakonFindTarget(value: unknown): DrakonFindTarget | null {
   if (!value || typeof value !== "object") return null;
   const row = value as Partial<DrakonFindTarget> & Record<string, unknown>;
@@ -229,6 +254,26 @@ function formatConfidence(value?: number | null) {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return "--";
   return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}%`;
+}
+
+function normalizeMediaUrl(url?: string | null): string | undefined {
+  if (!url) return undefined;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  return window.location.origin + url;
+}
+
+function formatDrakonFindHitLocation(hit: DrakonFindHit, t: TFunction) {
+  const streetLine = [hit.camera_street, hit.camera_number].filter(Boolean).join(", ");
+  const localityLine = [hit.camera_city, hit.camera_state_code].filter(Boolean).join(", ");
+  const countryCode =
+    hit.camera_country_code && hit.camera_country_code.trim()
+      ? hit.camera_country_code.trim().toUpperCase()
+      : "";
+  const showCountryCode = Boolean(countryCode && countryCode !== "BR");
+  const parts = [streetLine, localityLine, showCountryCode ? countryCode : ""].filter(Boolean);
+  return parts.length > 0 ? parts.join(" • ") : t("drakonFind.hits.locationUnavailable");
 }
 
 function formatAssignedClientLabel(count: number, t: TFunction) {
@@ -347,7 +392,17 @@ function HitVideoModal({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
-  if (!hit?.video_url) return null;
+  const normalizedVideoUrl = normalizeMediaUrl(hit?.video_url);
+  const normalizedImageUrl = normalizeMediaUrl(hit?.image_url);
+  const [videoLoadFailed, setVideoLoadFailed] = useState(false);
+
+  useEffect(() => {
+    setVideoLoadFailed(false);
+  }, [hit?.id, normalizedVideoUrl, normalizedImageUrl]);
+
+  if (!hit || !normalizedVideoUrl) return null;
+
+  const locationLabel = formatDrakonFindHitLocation(hit, t);
 
   return (
     <div
@@ -367,20 +422,93 @@ function HitVideoModal({
         </button>
         <div className="mb-4 pr-12">
           <div className="text-lg font-semibold text-gray-100">{hit.camera_name || t("drakonFind.generic.unnamedCamera")}</div>
+          <div className="mt-2 inline-flex items-center gap-2 text-sm text-cyan-100/85">
+            <MapPin className="h-4 w-4" />
+            <span>{locationLabel}</span>
+          </div>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-300">{hit.summary}</p>
         </div>
         <div className="overflow-hidden rounded-[24px] border border-white/10 bg-black">
-          <video
-            src={hit.video_url}
-            poster={hit.image_url || undefined}
-            controls
-            autoPlay
-            preload="metadata"
-            playsInline
-            className="max-h-[72vh] w-full bg-black object-contain"
-          />
+          {videoLoadFailed ? (
+            normalizedImageUrl ? (
+              <img
+                src={normalizedImageUrl}
+                alt={hit.summary}
+                className="max-h-[72vh] w-full bg-black object-contain"
+              />
+            ) : (
+              <div className="flex min-h-[280px] items-center justify-center px-6 py-10 text-center text-sm text-gray-300">
+                {t("drakonFind.hits.videoUnavailable")}
+              </div>
+            )
+          ) : (
+            <video
+              src={normalizedVideoUrl}
+              poster={normalizedImageUrl || undefined}
+              controls
+              autoPlay
+              preload="metadata"
+              playsInline
+              className="max-h-[72vh] w-full bg-black object-contain"
+              onError={() => setVideoLoadFailed(true)}
+              onLoadedData={() => setVideoLoadFailed(false)}
+            />
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function HitMediaPreview({
+  hit,
+  onExpand,
+}: {
+  hit: DrakonFindHit;
+  onExpand: () => void;
+}) {
+  const { t } = useTranslation();
+  const normalizedVideoUrl = normalizeMediaUrl(hit.video_url);
+  const normalizedImageUrl = normalizeMediaUrl(hit.image_url);
+  const [videoLoadFailed, setVideoLoadFailed] = useState(false);
+
+  useEffect(() => {
+    setVideoLoadFailed(false);
+  }, [hit.id, normalizedVideoUrl, normalizedImageUrl]);
+
+  if (normalizedVideoUrl && !videoLoadFailed) {
+    return (
+      <div className="group relative flex h-full min-h-[140px] items-center justify-center overflow-hidden bg-black/95">
+        <video
+          src={normalizedVideoUrl}
+          poster={normalizedImageUrl || undefined}
+          preload="metadata"
+          playsInline
+          muted
+          className="pointer-events-none h-full w-full object-contain"
+          onError={() => setVideoLoadFailed(true)}
+        />
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-black/10 to-transparent opacity-0 transition duration-200 group-hover:opacity-100" />
+        <button
+          type="button"
+          onClick={onExpand}
+          className="absolute right-3 top-3 inline-flex items-center gap-2 rounded-2xl border border-cyan-400/20 bg-slate-950/78 px-3 py-2 text-xs font-semibold text-cyan-100 opacity-0 shadow-[0_16px_40px_rgba(2,12,27,0.55)] transition duration-200 group-hover:opacity-100 focus:opacity-100"
+        >
+          <Maximize2 className="h-3.5 w-3.5" />
+          {t("drakonFind.hits.expand")}
+        </button>
+      </div>
+    );
+  }
+
+  if (normalizedImageUrl) {
+    return <img src={normalizedImageUrl} alt={hit.summary} className="h-full w-full object-cover" />;
+  }
+
+  return (
+    <div className="flex h-full min-h-[140px] flex-col items-center justify-center gap-2 px-4 text-center text-gray-500">
+      <Eye className="h-6 w-6" />
+      {hit.video_url ? <span className="text-xs text-gray-400">{t("drakonFind.hits.videoUnavailable")}</span> : null}
     </div>
   );
 }
@@ -396,6 +524,8 @@ export default function DrakonFindPage() {
   const [searches, setSearches] = useState<DrakonFindSearch[]>([]);
   const [audit, setAudit] = useState<DrakonFindAuditLog[]>([]);
   const [hits, setHits] = useState<DrakonFindHit[]>([]);
+  const [incomingShares, setIncomingShares] = useState<CameraFindShare[]>([]);
+  const [sharedFindSyncError, setSharedFindSyncError] = useState<string | null>(null);
   const [scope, setScope] = useState<DrakonFindScopeResolution | null>(null);
   const [selectedTargetId, setSelectedTargetId] = useState<number | null>(null);
   const [selectedStates, setSelectedStates] = useState<string[]>([]);
@@ -403,6 +533,7 @@ export default function DrakonFindPage() {
   const [scopeLoading, setScopeLoading] = useState(false);
   const [savingTarget, setSavingTarget] = useState(false);
   const [creatingSearch, setCreatingSearch] = useState(false);
+  const [actingShareId, setActingShareId] = useState<number | null>(null);
   const [uploadingTargetId, setUploadingTargetId] = useState<number | null>(null);
   const [deletingTargetId, setDeletingTargetId] = useState<number | null>(null);
   const [deletingImageId, setDeletingImageId] = useState<number | null>(null);
@@ -490,64 +621,149 @@ export default function DrakonFindPage() {
     });
   };
 
-  const loadCollections = async (showLoading = false, preferredSelectedTargetId: number | null = null) => {
+  const loadCollections = async (
+    showLoading = false,
+    preferredSelectedTargetId: number | null = null,
+    options?: { suppressToast?: boolean }
+  ) => {
     if (showLoading) setLoading(true);
     try {
-      const [targetsRes, searchesRes, auditRes, hitsRes] = await Promise.all([
-        fetch("/api/drakon-find/targets", { cache: "no-store" }),
-        fetch("/api/drakon-find/searches", { cache: "no-store" }),
-        fetch("/api/drakon-find/audit?limit=40", { cache: "no-store" }),
-        fetch("/api/drakon-find/hits?limit=40", { cache: "no-store" }),
+      const [targetsResult, searchesResult, auditResult, hitsResult] = await Promise.allSettled([
+        fetch("/api/drakon-find/targets", { cache: "no-store" }).then(async (response) => ({
+          ok: response.ok,
+          data: await response.json().catch(() => ({})),
+        })),
+        fetch("/api/drakon-find/searches", { cache: "no-store" }).then(async (response) => ({
+          ok: response.ok,
+          data: await response.json().catch(() => ({})),
+        })),
+        fetch("/api/drakon-find/audit?limit=40", { cache: "no-store" }).then(async (response) => ({
+          ok: response.ok,
+          data: await response.json().catch(() => ({})),
+        })),
+        fetch("/api/drakon-find/hits?limit=40", { cache: "no-store" }).then(async (response) => ({
+          ok: response.ok,
+          data: await response.json().catch(() => ({})),
+        })),
       ]);
-      const [targetsData, searchesData, auditData, hitsData] = await Promise.all([
-        targetsRes.json(),
-        searchesRes.json(),
-        auditRes.json(),
-        hitsRes.json(),
-      ]);
-      if (!targetsRes.ok || !searchesRes.ok || !auditRes.ok || !hitsRes.ok) {
+
+      const endpointFailures: string[] = [];
+      const targetsData =
+        targetsResult.status === "fulfilled" && targetsResult.value.ok
+          ? targetsResult.value.data
+          : (endpointFailures.push("targets"), null);
+      const searchesData =
+        searchesResult.status === "fulfilled" && searchesResult.value.ok
+          ? searchesResult.value.data
+          : (endpointFailures.push("searches"), null);
+      const auditData =
+        auditResult.status === "fulfilled" && auditResult.value.ok
+          ? auditResult.value.data
+          : (endpointFailures.push("audit"), null);
+      const hitsData =
+        hitsResult.status === "fulfilled" && hitsResult.value.ok
+          ? hitsResult.value.data
+          : (endpointFailures.push("hits"), null);
+
+      if (endpointFailures.length === 4) {
         throw new Error(t("drakonFind.toast.panelLoadFailed"));
       }
+
       startTransition(() => {
         const nextTargets = Array.isArray(targetsData?.targets)
           ? targetsData.targets
               .map((target: unknown) => normalizeDrakonFindTarget(target))
               .filter((target: DrakonFindTarget | null): target is DrakonFindTarget => Boolean(target))
-          : [];
-        setTargets(nextTargets);
-        setSearches(Array.isArray(searchesData?.searches) ? searchesData.searches : []);
-        setAudit(Array.isArray(auditData?.audit) ? auditData.audit : []);
-        setHits(Array.isArray(hitsData?.hits) ? hitsData.hits : []);
-        setSelectedTargetId((current) => {
-          if (
-            Number.isInteger(preferredSelectedTargetId) &&
-            preferredSelectedTargetId !== null &&
-            nextTargets.some((row: DrakonFindTarget) => row.id === preferredSelectedTargetId)
-          ) {
-            return preferredSelectedTargetId;
-          }
-          return current && nextTargets.some((row: DrakonFindTarget) => row.id === current)
-            ? current
-            : nextTargets?.[0]?.id ?? null;
-        });
+          : null;
+        if (nextTargets) {
+          setTargets(nextTargets);
+          setSelectedTargetId((current) => {
+            if (
+              Number.isInteger(preferredSelectedTargetId) &&
+              preferredSelectedTargetId !== null &&
+              nextTargets.some((row: DrakonFindTarget) => row.id === preferredSelectedTargetId)
+            ) {
+              return preferredSelectedTargetId;
+            }
+            return current && nextTargets.some((row: DrakonFindTarget) => row.id === current)
+              ? current
+              : nextTargets?.[0]?.id ?? null;
+          });
+        }
+        if (Array.isArray(searchesData?.searches)) {
+          setSearches(searchesData.searches);
+        }
+        if (Array.isArray(auditData?.audit)) {
+          setAudit(auditData.audit);
+        }
+        if (Array.isArray(hitsData?.hits)) {
+          setHits(hitsData.hits);
+        }
       });
+
+      if (endpointFailures.length > 0) {
+        console.warn("[DRAKON FIND] partial collection refresh failure", {
+          endpoints: endpointFailures,
+        });
+        if (!options?.suppressToast && showLoading) {
+          setToast({
+            message: t("drakonFind.toast.panelLoadFailed"),
+            type: "warning",
+          });
+        }
+      }
     } catch (error) {
       console.error("[DRAKON FIND] load failed", error);
-      setToast({
-        message: error instanceof Error ? error.message : t("drakonFind.toast.loadFailed"),
-        type: "error",
-      });
+      if (!options?.suppressToast) {
+        setToast({
+          message: error instanceof Error ? error.message : t("drakonFind.toast.loadFailed"),
+          type: "error",
+        });
+      }
     } finally {
       if (showLoading) setLoading(false);
     }
   };
 
   useEffect(() => {
-    void loadCollections(true);
+    let cancelled = false;
+    const bootstrap = async () => {
+      try {
+        const response = await fetch("/api/shared-find/sync", { method: "POST" });
+        const data = await response.json().catch(() => ({}));
+        if (!cancelled) {
+          setSharedFindSyncError(
+            typeof data?.sync_error === "string" && data.sync_error.trim()
+              ? data.sync_error
+              : null
+          );
+          const nextIncoming = Array.isArray(data?.incoming)
+            ? data.incoming
+                .map((row: unknown) => normalizeCameraFindShare(row))
+                .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
+            : [];
+          setIncomingShares(
+            nextIncoming.filter((share: CameraFindShare) => share.status === "pending")
+          );
+        }
+      } catch (error) {
+        console.error("[SHARED FIND] sync failed", error);
+      }
+      if (!cancelled) {
+        await loadCollections(true);
+      }
+    };
+    void bootstrap();
+    return () => {
+      cancelled = true;
+    };
   }, [currentLanguage]);
 
   useEffect(() => {
-    const interval = window.setInterval(() => void loadCollections(false), 5000);
+    const interval = window.setInterval(
+      () => void loadCollections(false, null, { suppressToast: true }),
+      5000
+    );
     return () => window.clearInterval(interval);
   }, [currentLanguage]);
 
@@ -624,10 +840,57 @@ export default function DrakonFindPage() {
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.imageUploadFailed"));
       }
-      await loadCollections(false, targetId);
+      await loadCollections(false, targetId, { suppressToast: true });
     } finally {
       setUploadingTargetId(null);
       restoreScrollPosition();
+    }
+  };
+
+  const handleRespondToIncomingShare = async (shareId: number, action: "accept" | "deny") => {
+    setActingShareId(shareId);
+    try {
+      const response = await fetch(`/api/shared-find/shares/${shareId}/${action}`, {
+        method: "POST",
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || `Failed to ${action} the shared camera invitation.`);
+      }
+
+      const syncResponse = await fetch("/api/shared-find/sync", { method: "POST" });
+      const syncData = await syncResponse.json().catch(() => ({}));
+      setSharedFindSyncError(
+        typeof syncData?.sync_error === "string" && syncData.sync_error.trim()
+          ? syncData.sync_error
+          : null
+      );
+      const nextIncoming = Array.isArray(syncData?.incoming)
+        ? syncData.incoming
+            .map((row: unknown) => normalizeCameraFindShare(row))
+            .filter((row: CameraFindShare | null): row is CameraFindShare => Boolean(row))
+        : [];
+      setIncomingShares(
+        nextIncoming.filter((share: CameraFindShare) => share.status === "pending")
+      );
+      await loadCollections(false);
+      setToast({
+        message:
+          action === "accept"
+            ? "Shared camera accepted for Drakon Find."
+            : "Shared camera invitation denied.",
+        type: action === "accept" ? "success" : "info",
+      });
+    } catch (error) {
+      setToast({
+        message:
+          error instanceof Error
+            ? error.message
+            : `Failed to ${action} the shared camera invitation.`,
+        type: "error",
+      });
+    } finally {
+      setActingShareId(null);
     }
   };
 
@@ -712,7 +975,7 @@ export default function DrakonFindPage() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchCreateFailed"));
-      await loadCollections(false);
+      await loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.searchCreated"), type: "success" });
     } catch (error) {
       setToast({
@@ -730,7 +993,16 @@ export default function DrakonFindPage() {
       const response = await fetch(`/api/drakon-find/searches/${searchId}/cancel`, { method: "POST" });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchCancelFailed"));
-      await loadCollections(false);
+      const updatedSearch =
+        data?.search && typeof data.search === "object" ? (data.search as DrakonFindSearch) : null;
+      if (updatedSearch) {
+        startTransition(() => {
+          setSearches((current) =>
+            current.map((search) => (search.id === updatedSearch.id ? updatedSearch : search))
+          );
+        });
+      }
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.searchCancelled"), type: "info" });
     } catch (error) {
       setToast({
@@ -748,7 +1020,16 @@ export default function DrakonFindPage() {
       const response = await fetch(`/api/drakon-find/searches/${searchId}/retry`, { method: "POST" });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchRetryFailed"));
-      await loadCollections(false);
+      const updatedSearch =
+        data?.search && typeof data.search === "object" ? (data.search as DrakonFindSearch) : null;
+      if (updatedSearch) {
+        startTransition(() => {
+          setSearches((current) =>
+            current.map((search) => (search.id === updatedSearch.id ? updatedSearch : search))
+          );
+        });
+      }
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.searchRetried"), type: "success" });
     } catch (error) {
       setToast({
@@ -767,7 +1048,7 @@ export default function DrakonFindPage() {
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.searchDeleteFailed"));
       if (expandedHit?.search_id === searchId) setExpandedHit(null);
-      await loadCollections(false);
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.searchDeleted"), type: "info" });
     } catch (error) {
       setToast({
@@ -785,7 +1066,7 @@ export default function DrakonFindPage() {
       const response = await fetch(`/api/drakon-find/targets/${targetId}/images/${imageId}`, { method: "DELETE" });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.imageDeleteFailed"));
-      await loadCollections(false);
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.imageDeleted"), type: "info" });
     } catch (error) {
       setToast({
@@ -814,7 +1095,7 @@ export default function DrakonFindPage() {
       if (selectedTargetId === target.id) {
         setSelectedTargetNewFiles([]);
       }
-      await loadCollections(false);
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.targetDeleted"), type: "info" });
     } catch (error) {
       setToast({
@@ -838,7 +1119,7 @@ export default function DrakonFindPage() {
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || t("drakonFind.toast.hitDeleteFailed"));
       if (expandedHit?.id === hit.id) setExpandedHit(null);
-      await loadCollections(false);
+      void loadCollections(false, null, { suppressToast: true });
       setToast({ message: t("drakonFind.toast.hitDeleted"), type: "info" });
     } catch (error) {
       setToast({
@@ -891,6 +1172,63 @@ export default function DrakonFindPage() {
           <MetricCard icon={Eye} label={t("drakonFind.metrics.hitsLabel")} value={hits.length} subtext={t("drakonFind.metrics.hitsText")} />
           <MetricCard icon={Camera} label={t("drakonFind.metrics.scopeLabel")} value={effectiveEligibleCameraCount} subtext={t("drakonFind.metrics.scopeText")} />
         </section>
+
+        {sharedFindSyncError ? (
+          <section className="rounded-[24px] border border-amber-500/20 bg-amber-500/10 px-5 py-4">
+            <p className="text-sm font-semibold text-amber-100">Shared camera sync warning</p>
+            <p className="mt-1 text-sm text-amber-200/90">{sharedFindSyncError}</p>
+          </section>
+        ) : null}
+
+        {incomingShares.length ? (
+          <section className="rounded-[28px] border border-amber-500/20 bg-gradient-to-br from-amber-500/10 to-gray-950 p-6">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-gray-100">Pending Shared Camera Invitations</p>
+                <p className="text-sm text-gray-400">
+                  Accept a camera to make it available in your Drakon Find scope.
+                </p>
+              </div>
+              <div className="inline-flex items-center gap-2 rounded-full border border-amber-400/20 bg-amber-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-amber-200">
+                {incomingShares.length} pending
+              </div>
+            </div>
+            <div className="grid gap-3">
+              {incomingShares.map((share) => (
+                <div
+                  key={share.id}
+                  className="flex flex-col gap-4 rounded-[22px] border border-gray-800 bg-gray-950/70 p-4 md:flex-row md:items-center md:justify-between"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-gray-100">{share.camera_name || `Camera #${share.owner_local_camera_id}`}</p>
+                    <p className="mt-1 text-xs text-gray-400">
+                      {share.city ? `${share.city}${share.state_code ? `, ${share.state_code}` : ""}` : "Location unavailable"}
+                    </p>
+                    <p className="mt-1 text-xs text-gray-500 break-all">Owner: {share.owner_public_id}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={actingShareId === share.id}
+                      onClick={() => void handleRespondToIncomingShare(share.id, "deny")}
+                      className="rounded-xl border border-gray-700 bg-gray-900 px-4 py-2 text-sm text-gray-200 transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {actingShareId === share.id ? "Working..." : "Deny"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={actingShareId === share.id}
+                      onClick={() => void handleRespondToIncomingShare(share.id, "accept")}
+                      className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-gray-700"
+                    >
+                      {actingShareId === share.id ? "Working..." : "Accept for Find"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
 
         <section className="space-y-6">
           <div className="grid gap-6 xl:grid-cols-2 xl:items-start">
@@ -1018,7 +1356,7 @@ export default function DrakonFindPage() {
                   <p className="text-sm text-gray-400">{t("drakonFind.searchComposer.subtitle")}</p>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-gray-700 bg-gray-950/70 px-3 py-1.5 text-xs text-gray-300"><Search className="h-3.5 w-3.5 text-blue-300" />allowpublicaccess = 1</div>
+                  <div className="inline-flex items-center gap-2 rounded-full border border-gray-700 bg-gray-950/70 px-3 py-1.5 text-xs text-gray-300"><Search className="h-3.5 w-3.5 text-blue-300" />shared find access</div>
                   <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100"><Activity className="h-3.5 w-3.5 text-cyan-300" />{t("drakonFind.operations.videoWindow")}</div>
                 </div>
               </div>
@@ -1178,7 +1516,7 @@ export default function DrakonFindPage() {
                     const isActing = actingSearchId === search.id;
                     const isActive = ACTIVE_SEARCH_STATUSES.includes(search.status);
                     const canRetry = !isActive && search.pending_camera_count === 0;
-                    const canDelete = !isActive && search.pending_camera_count === 0;
+                    const canDelete = !isActive;
                     return (
                       <div key={search.id} className="rounded-[24px] border border-gray-800 bg-gray-950/55 p-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1209,18 +1547,15 @@ export default function DrakonFindPage() {
                   {hits.map((hit) => (
                     <div key={hit.id} className="overflow-hidden rounded-[22px] border border-gray-800 bg-gray-950/55">
                       <div className="grid gap-0 sm:grid-cols-[160px_minmax(0,1fr)]">
-                        <div className="min-h-[140px] bg-gray-900">{hit.video_url ? (
-                          <div className="group relative flex h-full min-h-[140px] items-center justify-center overflow-hidden bg-black/95">
-                            <video src={hit.video_url} poster={hit.image_url || undefined} preload="metadata" playsInline muted className="pointer-events-none h-full w-full object-contain" />
-                            <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-black/10 to-transparent opacity-0 transition duration-200 group-hover:opacity-100" />
-                            <button type="button" onClick={() => setExpandedHit(hit)} className="absolute right-3 top-3 inline-flex items-center gap-2 rounded-2xl border border-cyan-400/20 bg-slate-950/78 px-3 py-2 text-xs font-semibold text-cyan-100 opacity-0 shadow-[0_16px_40px_rgba(2,12,27,0.55)] transition duration-200 group-hover:opacity-100 focus:opacity-100">
-                              <Maximize2 className="h-3.5 w-3.5" />
-                              {t("drakonFind.hits.expand")}
-                            </button>
-                          </div>
-                        ) : hit.image_url ? <img src={hit.image_url} alt={hit.summary} className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-gray-600"><Eye className="h-6 w-6" /></div>}</div>
+                        <div className="min-h-[140px] bg-gray-900">
+                          <HitMediaPreview hit={hit} onExpand={() => setExpandedHit(hit)} />
+                        </div>
                         <div className="p-4">
                           <div className="text-sm font-semibold text-gray-100">{hit.camera_name || t("drakonFind.generic.unnamedCamera")}</div>
+                          <div className="mt-2 inline-flex items-center gap-2 text-xs text-cyan-100/80">
+                            <MapPin className="h-3.5 w-3.5" />
+                            <span>{formatDrakonFindHitLocation(hit, t)}</span>
+                          </div>
                           <p className="mt-2 text-sm leading-6 text-gray-300">{hit.summary}</p>
                           <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-400">
                             <span className="rounded-full border border-gray-700 bg-gray-900/80 px-2.5 py-1">{t("drakonFind.hits.searchChip", { id: hit.search_id })}</span>

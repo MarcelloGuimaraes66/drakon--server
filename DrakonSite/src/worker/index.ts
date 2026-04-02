@@ -52,6 +52,18 @@ import {
   type CentralIdentityGrantClaims,
 } from "./centralIdentity";
 import {
+  ensureSharedFindRelayClientConnected,
+  sendSharedFindRelayClientMessage,
+  type SharedFindRelayClientContext,
+} from "./sharedFindRelayClient";
+import {
+  cancelSharedFindRelayDispatchAckWait,
+  countSharedFindRelayConnections,
+  issueSharedFindRelaySession,
+  sendSharedFindRelayMessage,
+  waitForSharedFindRelayDispatchAck,
+} from "./sharedFindRelayState";
+import {
   getLocalSessionUserByToken,
   localUserGrantAllowsOfflineLogin,
   localUserRequiresCentralGrant,
@@ -1150,13 +1162,15 @@ type DrakonFindScopeStateSummary = {
 type DrakonFindScopeCameraPreview = {
   id: number;
   user_id: string;
+  share_id: number;
+  owner_local_camera_id: number;
   name: string;
   city: string | null;
   state: string | null;
   state_code: string | null;
   country: string | null;
   country_code: string | null;
-  allowpublicaccess: number;
+  share_status: string;
 };
 
 type ResolvedDrakonFindScope = {
@@ -1230,6 +1244,14 @@ type DrakonFindSearchRow = {
   id: number;
   user_id: string;
   target_id: number;
+  search_origin: string;
+  relay_request_id: string | null;
+  shared_operator_user_id: string | null;
+  shared_operator_search_id: number | null;
+  relay_model_name?: string | null;
+  relay_model_api_key?: string | null;
+  relay_model_provider?: string | null;
+  relay_model_fps?: number | null;
   target_name: string;
   target_entity_type: string;
   target_description: string;
@@ -1392,6 +1414,40 @@ function arrayBufferToBase64(value: ArrayBuffer): string {
     binary += String.fromCharCode(...chunk);
   }
   return btoa(binary);
+}
+
+async function loadDrakonFindRelayMediaDataUrl(
+  env: Env,
+  storageKey: unknown,
+  fallbackContentType: string
+): Promise<string | null> {
+  const normalizedKey = typeof storageKey === "string" ? storageKey.trim() : "";
+  if (!normalizedKey || !env.R2_BUCKET || typeof env.R2_BUCKET.get !== "function") {
+    return null;
+  }
+
+  try {
+    const object = await env.R2_BUCKET.get(normalizedKey);
+    if (!object) {
+      return null;
+    }
+
+    const arrayBuffer = await object.arrayBuffer();
+    if (!arrayBuffer.byteLength || arrayBuffer.byteLength > DRAKON_FIND_AGENT_MEDIA_MAX_BYTES) {
+      return null;
+    }
+
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    const contentType = headers.get("content-type")?.trim() || fallbackContentType;
+    return `data:${contentType};base64,${arrayBufferToBase64(arrayBuffer)}`;
+  } catch (error) {
+    console.error("[SHARED FIND RELAY] Failed to inline Drakon Find media", {
+      storageKey: normalizedKey,
+      error,
+    });
+    return null;
+  }
 }
 
 function buildDrakonFindTargetImageUrl(storageKey: string): string {
@@ -1986,6 +2042,7 @@ async function createDrakonFindAuditLog(
 
 async function resolveDrakonFindScope(
   db: D1Database,
+  userId: string,
   selectedStatesInput: unknown,
   countryCodeInput?: unknown
 ): Promise<ResolvedDrakonFindScope> {
@@ -2011,33 +2068,38 @@ async function resolveDrakonFindScope(
     .prepare(
       `SELECT
          id,
-         user_id,
-         name,
+         owner_public_id AS user_id,
+         share_id,
+         owner_local_camera_id,
+         camera_name AS name,
          city,
-         state,
+         state_code AS state,
          state_code,
-         country,
+         country_code AS country,
          country_code,
-         allowpublicaccess
-       FROM cameras
-       WHERE allowpublicaccess = 1
+         status AS share_status
+       FROM shared_find_cameras_cache
+       WHERE user_id = ?
+         AND status = 'accepted'
          AND COALESCE(NULLIF(TRIM(country_code), ''), 'BR') = ?
          AND state_code IN (${placeholders})
-       ORDER BY state_code ASC, city ASC, name ASC, id ASC`
+       ORDER BY state_code ASC, city ASC, camera_name ASC, id ASC`
     )
-    .bind(countryCode, ...selectedStates)
+    .bind(userId, countryCode, ...selectedStates)
     .all();
 
   const eligibleCameras: DrakonFindScopeCameraPreview[] = (results || []).map((row: any) => ({
     id: Number(row?.id || 0),
     user_id: String(row?.user_id || ""),
+    share_id: Number(row?.share_id || 0),
+    owner_local_camera_id: Number(row?.owner_local_camera_id || 0),
     name: String(row?.name || ""),
     city: typeof row?.city === "string" ? row.city : null,
     state: typeof row?.state === "string" ? row.state : null,
     state_code: typeof row?.state_code === "string" ? row.state_code : null,
     country: typeof row?.country === "string" ? row.country : null,
     country_code: typeof row?.country_code === "string" ? row.country_code : null,
-    allowpublicaccess: Number(row?.allowpublicaccess || 0),
+    share_status: String(row?.share_status || "accepted"),
   }));
 
   const stateCounts = new Map<string, number>();
@@ -2173,6 +2235,7 @@ async function fetchDrakonFindTargetsForUser(db: D1Database, userId: string) {
          ON s.target_id = t.id
         AND s.user_id = t.user_id
        WHERE t.user_id = ?
+         AND COALESCE(t.origin_type, 'local') <> 'shared_owner_runtime'
        GROUP BY t.id, t.user_id, t.entity_type, t.name, t.description, t.traits_json, t.created_at, t.updated_at
        ORDER BY t.updated_at DESC, t.id DESC`
     )
@@ -2223,6 +2286,7 @@ async function fetchDrakonFindSearchesForUser(db: D1Database, userId: string) {
        FROM drakon_find_searches s
        JOIN drakon_find_targets t ON t.id = s.target_id
        WHERE s.user_id = ?
+         AND COALESCE(s.search_origin, 'local') <> 'shared_owner_runtime'
        ORDER BY s.created_at DESC, s.id DESC`
     )
     .bind(userId)
@@ -2318,6 +2382,22 @@ async function fetchDrakonFindSearchesForUser(db: D1Database, userId: string) {
       id: searchId,
       user_id: String(row?.user_id || ""),
       target_id: Number(row?.target_id || 0),
+      search_origin: String((row as any)?.search_origin || "local"),
+      relay_request_id:
+        typeof (row as any)?.relay_request_id === "string" &&
+        String((row as any).relay_request_id).trim()
+          ? String((row as any).relay_request_id)
+          : null,
+      shared_operator_user_id:
+        typeof (row as any)?.shared_operator_user_id === "string" &&
+        String((row as any).shared_operator_user_id).trim()
+          ? String((row as any).shared_operator_user_id)
+          : null,
+      shared_operator_search_id:
+        Number.isInteger(Number((row as any)?.shared_operator_search_id)) &&
+        Number((row as any)?.shared_operator_search_id) > 0
+          ? Number((row as any)?.shared_operator_search_id)
+          : null,
       target_name: String(row?.target_name || ""),
       target_entity_type: String(row?.target_entity_type || ""),
       target_description: String(row?.target_description || ""),
@@ -2392,14 +2472,16 @@ async function fetchDrakonFindHitsForUser(
        s.target_id AS search_target_id,
        sc.camera_name AS scoped_camera_name,
        sc.city AS scoped_camera_city,
-       sc.state_code AS scoped_state_code
+       sc.state_code AS scoped_state_code,
+       sc.country_code AS scoped_country_code
      FROM drakon_find_hits h
      JOIN drakon_find_searches s ON s.id = h.search_id
      LEFT JOIN cameras c ON c.id = h.camera_id
      LEFT JOIN drakon_find_search_cameras sc
        ON sc.search_id = h.search_id
       AND sc.camera_id = h.camera_id
-     WHERE s.user_id = ?`,
+     WHERE s.user_id = ?
+       AND COALESCE(s.search_origin, 'local') <> 'shared_owner_runtime'`,
   ];
   const bindings: any[] = [userId];
 
@@ -2414,6 +2496,33 @@ async function fetchDrakonFindHitsForUser(
   const { results } = await db.prepare(queryParts.join(" ")).bind(...bindings).all();
   return (results || []).map((row: any) => {
     const details = parseJsonObject(row?.details_json);
+    const detailCameraName =
+      normalizeText((details as any)?.camera_name) ||
+      normalizeText((details as any)?.cameraName) ||
+      null;
+    const detailCameraStreet =
+      normalizeOptionalText((details as any)?.street) ??
+      normalizeOptionalText((details as any)?.camera_street) ??
+      normalizeOptionalText((details as any)?.cameraStreet);
+    const detailCameraNumber =
+      normalizeOptionalText((details as any)?.number) ??
+      normalizeOptionalText((details as any)?.camera_number) ??
+      normalizeOptionalText((details as any)?.cameraNumber);
+    const detailCameraCity =
+      normalizeOptionalText((details as any)?.city) ??
+      normalizeOptionalText((details as any)?.camera_city) ??
+      normalizeOptionalText((details as any)?.cameraCity);
+    const detailCameraStateCode =
+      normalizeOptionalText((details as any)?.state_code) ??
+      normalizeOptionalText((details as any)?.camera_state_code) ??
+      normalizeOptionalText((details as any)?.cameraStateCode);
+    const detailCameraCountryCode =
+      normalizeCountryCode(
+        (details as any)?.country_code ??
+          (details as any)?.camera_country_code ??
+          (details as any)?.cameraCountryCode,
+        null
+      ) || null;
     return {
       id: Number(row?.id || 0),
       search_id: Number(row?.search_id || 0),
@@ -2424,7 +2533,11 @@ async function fetchDrakonFindHitsForUser(
           ? String(row.camera_name_live)
           : typeof row?.scoped_camera_name === "string"
           ? String(row.scoped_camera_name)
+          : detailCameraName
+          ? detailCameraName
           : null,
+      camera_street: detailCameraStreet,
+      camera_number: detailCameraNumber,
       camera_owner_user_id: String(row?.camera_owner_user_id || ""),
       client_id:
         typeof row?.client_id === "string" && row.client_id.trim()
@@ -2433,9 +2546,15 @@ async function fetchDrakonFindHitsForUser(
       exe_id:
         typeof row?.exe_id === "string" && row.exe_id.trim() ? String(row.exe_id) : null,
       camera_city:
-        typeof row?.scoped_camera_city === "string" ? String(row.scoped_camera_city) : null,
+        typeof row?.scoped_camera_city === "string"
+          ? String(row.scoped_camera_city)
+          : detailCameraCity,
       camera_state_code:
-        typeof row?.scoped_state_code === "string" ? String(row.scoped_state_code) : null,
+        typeof row?.scoped_state_code === "string"
+          ? String(row.scoped_state_code)
+          : detailCameraStateCode,
+      camera_country_code:
+        normalizeCountryCode((row as any)?.scoped_country_code, null) || detailCameraCountryCode,
       summary: String(row?.summary || ""),
       confidence: toFiniteNumber(row?.confidence, 0),
       image_url:
@@ -2520,6 +2639,22 @@ async function fetchDrakonFindSearchForDispatch(db: D1Database, searchId: number
     id: Number((row as any)?.id || 0),
     user_id: String((row as any)?.user_id || ""),
     target_id: Number((row as any)?.target_id || 0),
+    search_origin: String((row as any)?.search_origin || "local"),
+    relay_request_id:
+      typeof (row as any)?.relay_request_id === "string" &&
+      String((row as any).relay_request_id).trim()
+        ? String((row as any).relay_request_id)
+        : null,
+    shared_operator_user_id:
+      typeof (row as any)?.shared_operator_user_id === "string" &&
+      String((row as any).shared_operator_user_id).trim()
+        ? String((row as any).shared_operator_user_id)
+        : null,
+    shared_operator_search_id:
+      Number.isInteger(Number((row as any)?.shared_operator_search_id)) &&
+      Number((row as any)?.shared_operator_search_id) > 0
+        ? Number((row as any)?.shared_operator_search_id)
+        : null,
     status: String((row as any)?.status || "queued"),
     runtime_mode:
       String((row as any)?.runtime_mode || DRAKON_FIND_RUNTIME_MODE) as DrakonFindRuntimeMode,
@@ -2548,6 +2683,22 @@ async function fetchDrakonFindSearchForDispatch(db: D1Database, searchId: number
     target_entity_type: String((row as any)?.target_entity_type || ""),
     target_description: String((row as any)?.target_description || ""),
     target_traits: parseStringArray((row as any)?.target_traits_json),
+    relay_model_name:
+      typeof (row as any)?.relay_model_name === "string" &&
+      String((row as any).relay_model_name).trim()
+        ? String((row as any).relay_model_name)
+        : null,
+    relay_model_api_key:
+      typeof (row as any)?.relay_model_api_key === "string" &&
+      String((row as any).relay_model_api_key).trim()
+        ? String((row as any).relay_model_api_key)
+        : null,
+    relay_model_provider:
+      typeof (row as any)?.relay_model_provider === "string" &&
+      String((row as any).relay_model_provider).trim()
+        ? String((row as any).relay_model_provider)
+        : null,
+    relay_model_fps: clampInteger((row as any)?.relay_model_fps),
     last_error:
       typeof (row as any)?.last_error === "string" ? String((row as any).last_error) : null,
     created_at: String((row as any)?.created_at || ""),
@@ -3028,6 +3179,10 @@ function buildDrakonFindDispatchWaitMessage(
     : "Ainda existem cameras aguardando roteamento para um cliente elegivel.";
 }
 
+function buildDrakonFindOperatorQueueWaitMessage() {
+  return "Existem outras buscas ainda ativas ou finalizando. Esta busca aguardara na fila ate que uma vaga de despacho seja liberada.";
+}
+
 async function refreshDrakonFindSearchRollups(db: D1Database, searchId: number) {
   if (!Number.isInteger(searchId) || searchId <= 0) return null;
 
@@ -3266,6 +3421,219 @@ async function reconcileDrakonFindSearchClientTerminalState(
   return clampInteger((result.meta as any)?.changes);
 }
 
+async function dispatchSharedOperatorDrakonFindSearch(
+  env: Env,
+  search: NonNullable<Awaited<ReturnType<typeof fetchDrakonFindSearchForDispatch>>>
+) {
+  const centralContext = await resolveCurrentUserCentralRelayContextById(env, search.user_id);
+  await ensureSharedFindRelayClientConnected({
+    env,
+    publicId: centralContext.publicId,
+    appUserId: centralContext.appUserId,
+    grantToken: centralContext.grantToken,
+    onMessage: async (context, message) => {
+      await handleSharedFindRelayInboundMessage(context, message);
+    },
+  });
+
+  const modelConfig = await chooseDrakonFindModelConfig(env.DB, search.user_id);
+  const referenceImages = await loadDrakonFindReferenceImagesForDispatch(env, search.target_id);
+  const { results } = await env.DB
+    .prepare(
+      `SELECT
+         camera_id,
+         share_id,
+         shared_owner_local_camera_id,
+         camera_owner_user_id,
+         camera_name,
+         city,
+         state_code,
+         country_code
+       FROM drakon_find_search_cameras
+       WHERE search_id = ?
+         AND dispatch_status = 'queued'
+       ORDER BY camera_owner_user_id ASC, camera_id ASC`
+    )
+    .bind(search.id)
+    .all();
+
+  const cameraRows = (results || [])
+    .map((row: any) => ({
+      operator_camera_id: clampInteger((row as any)?.camera_id),
+      share_id: clampInteger((row as any)?.share_id),
+      owner_local_camera_id: clampInteger((row as any)?.shared_owner_local_camera_id),
+      owner_public_id: normalizeText((row as any)?.camera_owner_user_id),
+      camera_name: normalizeText((row as any)?.camera_name),
+      city: normalizeOptionalText((row as any)?.city),
+      state_code: normalizeOptionalText((row as any)?.state_code),
+      country_code: normalizeCountryCode((row as any)?.country_code, null) || "BR",
+    }))
+    .filter(
+      (row: {
+        operator_camera_id: number;
+        share_id: number;
+        owner_local_camera_id: number;
+        owner_public_id: string;
+      }) =>
+        row.operator_camera_id > 0 &&
+        row.share_id > 0 &&
+        row.owner_local_camera_id > 0 &&
+        row.owner_public_id
+    );
+
+  if (cameraRows.length === 0) {
+    return { searchId: search.id, dispatched_command_count: 0, status: search.status };
+  }
+
+  const rootRequestId = search.relay_request_id || generateUUID();
+  if (!search.relay_request_id) {
+    await env.DB
+      .prepare(
+        `UPDATE drakon_find_searches
+         SET relay_request_id = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(rootRequestId, new Date().toISOString(), search.id)
+      .run();
+  }
+
+  const groupedByOwner = new Map<string, typeof cameraRows>();
+  for (const row of cameraRows) {
+    const bucket = groupedByOwner.get(row.owner_public_id) || [];
+    bucket.push(row);
+    groupedByOwner.set(row.owner_public_id, bucket);
+  }
+
+  const searchPrompt = buildDrakonFindSearchPrompt({
+    entity_type: search.target_entity_type,
+    name: search.target_name,
+    description: search.target_description,
+    traits: search.target_traits,
+  });
+  const now = new Date().toISOString();
+  let dispatchedCameraCount = 0;
+  let dispatchedOwnerCount = 0;
+  let lastError: string | null = null;
+
+  for (const [, rowsForOwner] of groupedByOwner.entries()) {
+    const remote = await callCentralIdentityAuthorizedEndpoint(env, "/api/find-relay/searches", {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {
+        request_id: rootRequestId,
+        operator_search_id: search.id,
+        duration_seconds: normalizeDrakonFindDurationSeconds(search.duration_seconds),
+        run_until: search.run_until,
+        selected_states: search.selected_states,
+        country_code: search.country_code,
+        scope_snapshot: search.scope_snapshot || {},
+        target: {
+          id: search.target_id,
+          entity_type: search.target_entity_type,
+          name: search.target_name,
+          description: search.target_description,
+          traits: search.target_traits,
+          search_prompt: searchPrompt,
+        },
+        reference_images: referenceImages.map((image) => ({
+          image_id: image.image_id,
+          image_url: image.image_url,
+          content_type: image.content_type,
+          data_url: image.data_url,
+        })),
+        camera_requests: rowsForOwner.map((row: any) => ({
+          share_id: row.share_id,
+          operator_camera_id: row.operator_camera_id,
+          owner_local_camera_id: row.owner_local_camera_id,
+          owner_public_id: row.owner_public_id,
+          camera_name: row.camera_name,
+          city: row.city,
+          state_code: row.state_code,
+          country_code: row.country_code,
+        })),
+        model_name: modelConfig.model_name,
+        model_api_key: modelConfig.model_api_key,
+        model_provider: modelConfig.provider,
+        model_fps: modelConfig.model_fps,
+      },
+    });
+
+    if (remote.response.ok) {
+      dispatchedOwnerCount += 1;
+      dispatchedCameraCount += rowsForOwner.length;
+      for (const cameraRow of rowsForOwner) {
+        await env.DB
+          .prepare(
+            `UPDATE drakon_find_search_cameras
+             SET dispatch_status = 'sent',
+                 last_error = NULL,
+                 updated_at = ?
+             WHERE search_id = ?
+               AND camera_id = ?`
+          )
+          .bind(now, search.id, cameraRow.operator_camera_id)
+          .run();
+      }
+      continue;
+    }
+
+    lastError = normalizeResponseErrorMessage(
+      remote.data,
+      "Failed to reach the owner runtime for this shared camera group."
+    );
+    for (const cameraRow of rowsForOwner) {
+      await env.DB
+        .prepare(
+          `UPDATE drakon_find_search_cameras
+           SET dispatch_status = 'failed',
+               last_error = ?,
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+           WHERE search_id = ?
+             AND camera_id = ?`
+        )
+        .bind(lastError, now, now, search.id, cameraRow.operator_camera_id)
+        .run();
+    }
+  }
+
+  const nextStatus = dispatchedCameraCount > 0 ? "dispatching" : "failed";
+  await env.DB
+    .prepare(
+      `UPDATE drakon_find_searches
+       SET status = ?,
+           dispatched_command_count = ?,
+           last_dispatch_at = CASE WHEN ? = 'dispatching' THEN ? ELSE last_dispatch_at END,
+           completed_at = CASE WHEN ? = 'failed' THEN COALESCE(completed_at, ?) ELSE completed_at END,
+           last_error = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      nextStatus,
+      dispatchedCameraCount,
+      nextStatus,
+      now,
+      nextStatus,
+      now,
+      nextStatus === "failed" ? lastError || "All shared owner runtimes were offline." : null,
+      now,
+      search.id
+    )
+    .run();
+
+  await refreshDrakonFindSearchRollups(env.DB, search.id);
+  await finalizeDrakonFindSearchIfTerminal(env.DB, search.id);
+
+  return {
+    searchId: search.id,
+    dispatched_command_count: dispatchedCameraCount,
+    dispatched_owner_count: dispatchedOwnerCount,
+    status: nextStatus,
+    error: nextStatus === "failed" ? lastError || "No shared owner runtime accepted the search." : null,
+  };
+}
+
 async function dispatchSingleDrakonFindSearch(env: Env, searchId: number) {
   const search = await fetchDrakonFindSearchForDispatch(env.DB, searchId);
   if (!search) {
@@ -3280,38 +3648,102 @@ async function dispatchSingleDrakonFindSearch(env: Env, searchId: number) {
     };
   }
 
+  if (search.search_origin === "shared_operator") {
+    try {
+      return await dispatchSharedOperatorDrakonFindSearch(env, search);
+    } catch (error) {
+      const now = new Date().toISOString();
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : "Failed to dispatch the shared Drakon Find search.";
+      await env.DB
+        .prepare(
+          `UPDATE drakon_find_searches
+           SET status = 'failed',
+               last_error = ?,
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(message, now, now, searchId)
+        .run();
+      await env.DB
+        .prepare(
+          `UPDATE drakon_find_search_cameras
+           SET dispatch_status = CASE
+                 WHEN dispatch_status IN ('queued', 'dispatching', 'sent') THEN 'failed'
+                 ELSE dispatch_status
+               END,
+               last_error = ?,
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+           WHERE search_id = ?`
+        )
+        .bind(message, now, now, searchId)
+        .run();
+      return { searchId, dispatched_command_count: 0, status: "failed", error: message };
+    }
+  }
+
   const now = new Date().toISOString();
   let modelConfig: Awaited<ReturnType<typeof chooseDrakonFindModelConfig>>;
-  try {
-    modelConfig = await chooseDrakonFindModelConfig(env.DB, search.user_id);
-  } catch (error) {
-    const message =
-      error instanceof Error && error.message
-        ? error.message
-        : "OpenAI API key is not configured in Settings.";
-    await env.DB
-      .prepare(
-        `UPDATE drakon_find_searches
-         SET status = 'failed',
-             last_error = ?,
-             completed_at = COALESCE(completed_at, ?),
-             updated_at = ?
-         WHERE id = ?`
-      )
-      .bind(message, now, now, searchId)
-      .run();
-    await createDrakonFindAuditLog(env.DB, {
-      actorUserId: search.user_id,
-      actionType: "search_dispatch_failed",
-      searchId,
-      targetId: search.target_id,
-      message: `Dispatch falhou para "${search.target_name}" por falta de configuracao do modelo.`,
-      metadata: {
-        error: message,
-        stage: "model_config",
-      },
-    });
-    return { searchId, dispatched_command_count: 0, status: "failed", error: message };
+  if (search.search_origin === "shared_owner_runtime") {
+    const relayModelApiKey = normalizeText(search.relay_model_api_key);
+    if (!relayModelApiKey) {
+      const message = "The shared operator model key is missing for this owner runtime request.";
+      await env.DB
+        .prepare(
+          `UPDATE drakon_find_searches
+           SET status = 'failed',
+               last_error = ?,
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(message, now, now, searchId)
+        .run();
+      return { searchId, dispatched_command_count: 0, status: "failed", error: message };
+    }
+
+    modelConfig = {
+      model_name: normalizeText(search.relay_model_name) || "gpt-5.1",
+      model_api_key: relayModelApiKey,
+      provider: "openai",
+      model_fps: Math.max(1, clampInteger(search.relay_model_fps, 6)),
+    };
+  } else {
+    try {
+      modelConfig = await chooseDrakonFindModelConfig(env.DB, search.user_id);
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message
+          ? error.message
+          : "OpenAI API key is not configured in Settings.";
+      await env.DB
+        .prepare(
+          `UPDATE drakon_find_searches
+           SET status = 'failed',
+               last_error = ?,
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(message, now, now, searchId)
+        .run();
+      await createDrakonFindAuditLog(env.DB, {
+        actorUserId: search.user_id,
+        actionType: "search_dispatch_failed",
+        searchId,
+        targetId: search.target_id,
+        message: `Dispatch falhou para "${search.target_name}" por falta de configuracao do modelo.`,
+        metadata: {
+          error: message,
+          stage: "model_config",
+        },
+      });
+      return { searchId, dispatched_command_count: 0, status: "failed", error: message };
+    }
   }
 
   const referenceImages = await loadDrakonFindReferenceImagesForDispatch(env, search.target_id);
@@ -3386,7 +3818,10 @@ async function dispatchSingleDrakonFindSearch(env: Env, searchId: number) {
     const payload = {
       search_id: search.id,
       target_id: search.target_id,
-      operator_user_id: search.user_id,
+      operator_user_id:
+        search.search_origin === "shared_owner_runtime" && search.shared_operator_user_id
+          ? search.shared_operator_user_id
+          : search.user_id,
       attempt_count: search.attempt_count,
       runtime_mode: search.runtime_mode,
       input_type: search.input_type || "video",
@@ -3588,6 +4023,16 @@ async function dispatchQueuedDrakonFindSearches(env: Env) {
         .first();
       const activeSearchCount = clampInteger((activeSearchRow as any)?.active_search_count);
       if (activeSearchCount >= DRAKON_FIND_MAX_ACTIVE_SEARCHES_PER_OPERATOR) {
+        await env.DB
+          .prepare(
+            `UPDATE drakon_find_searches
+             SET last_error = ?,
+                 updated_at = ?
+             WHERE id = ?
+               AND status = 'queued'`
+          )
+          .bind(buildDrakonFindOperatorQueueWaitMessage(), new Date().toISOString(), searchId)
+          .run();
         continue;
       }
     }
@@ -3637,6 +4082,62 @@ async function requestDrakonFindSearchCancellation(
     .run();
 
   await cancelQueuedDrakonFindSearchCameras(env.DB, searchId, now);
+
+  if (search.search_origin === "shared_operator") {
+    try {
+      const centralContext = await resolveCurrentUserCentralRelayContextById(env, search.user_id);
+      const { results: ownerRows } = await env.DB
+        .prepare(
+          `SELECT DISTINCT camera_owner_user_id
+           FROM drakon_find_search_cameras
+           WHERE search_id = ?
+             AND camera_owner_user_id IS NOT NULL
+             AND TRIM(camera_owner_user_id) <> ''`
+        )
+        .bind(searchId)
+        .all();
+
+      const ownerPublicIds = Array.from(
+        new Set(
+          (ownerRows || [])
+            .map((row: any) => normalizeText((row as any)?.camera_owner_user_id))
+            .filter(Boolean)
+        )
+      );
+
+      if (ownerPublicIds.length > 0) {
+        await callCentralIdentityAuthorizedEndpoint(
+          env,
+          `/api/find-relay/searches/${encodeURIComponent(String(searchId))}/cancel`,
+          {
+            method: "POST",
+            token: centralContext.grantToken,
+            body: {
+              request_id: search.relay_request_id || null,
+              owner_public_ids: ownerPublicIds,
+            },
+          }
+        );
+      }
+    } catch (error) {
+      console.error("[SHARED FIND] Failed to forward cancel request to the central relay:", error);
+    }
+
+    await createDrakonFindAuditLog(env.DB, {
+      actorUserId: userId,
+      actionType: "search_cancel_requested",
+      searchId,
+      targetId: search.target_id,
+      message: `Cancelamento solicitado para "${search.target_name}".`,
+      metadata: {
+        status_before: search.status,
+        shared_find: true,
+      },
+    });
+
+    await finalizeDrakonFindSearchIfTerminal(env.DB, searchId);
+    return { ok: true };
+  }
 
   const { results: clientRows } = await env.DB
     .prepare(
@@ -4108,12 +4609,48 @@ async function deleteDrakonFindSearch(env: Env, userId: string, searchId: number
     .bind(searchId)
     .first();
   const activeCameraCount = clampInteger((activeCameraRow as any)?.active_camera_count);
-  if (activeCameraCount > 0) {
-    return {
-      ok: false,
-      status: 409,
-      error: `Ainda existem ${activeCameraCount} camera(s) finalizando o ciclo anterior. Aguarde o encerramento completo antes de excluir.`,
-    };
+  if (activeCameraCount > 0 && search.search_origin === "shared_operator") {
+    try {
+      const centralContext = await resolveCurrentUserCentralRelayContextById(env, search.user_id);
+      const { results: ownerRows } = await env.DB
+        .prepare(
+          `SELECT DISTINCT camera_owner_user_id
+           FROM drakon_find_search_cameras
+           WHERE search_id = ?
+             AND camera_owner_user_id IS NOT NULL
+             AND TRIM(camera_owner_user_id) <> ''`
+        )
+        .bind(searchId)
+        .all();
+
+      const ownerPublicIds = Array.from(
+        new Set(
+          (ownerRows || [])
+            .map((row: any) => normalizeText((row as any)?.camera_owner_user_id))
+            .filter(Boolean)
+        )
+      );
+
+      if (ownerPublicIds.length > 0) {
+        await callCentralIdentityAuthorizedEndpoint(
+          env,
+          `/api/find-relay/searches/${encodeURIComponent(String(searchId))}/cancel`,
+          {
+            method: "POST",
+            token: centralContext.grantToken,
+            body: {
+              request_id: search.relay_request_id || null,
+              owner_public_ids: ownerPublicIds,
+            },
+          }
+        );
+      }
+    } catch (error) {
+      console.error("[SHARED FIND] Failed to forward delete-time cancel request to the central relay:", {
+        searchId,
+        error,
+      });
+    }
   }
 
   await deleteDrakonFindHitMediaFromStorage(env, searchId, "delete");
@@ -4146,6 +4683,7 @@ async function handleDrakonFindAgentEvent(
   if (!search) {
     return { recorded: false, reason: "search_not_found" };
   }
+  const isSharedOwnerRuntime = search.search_origin === "shared_owner_runtime";
 
   const targetId =
     Number((details as any)?.target_id || (details as any)?.targetId || search.target_id) ||
@@ -4353,7 +4891,12 @@ async function handleDrakonFindAgentEvent(
             : ""
           : "";
       const parsedVideo = parseDataUrl(videoDataUrl);
-      if (parsedVideo && hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH && options.cameraId) {
+      if (
+        !isSharedOwnerRuntime &&
+        parsedVideo &&
+        hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH &&
+        options.cameraId
+      ) {
         try {
           const bytes = base64ToUint8Array(parsedVideo.base64);
           videoKey = buildDrakonFindHitStorageKey(
@@ -4386,7 +4929,12 @@ async function handleDrakonFindAgentEvent(
             : ""
           : "";
       const parsedSnapshot = parseDataUrl(snapshotDataUrl);
-      if (parsedSnapshot && hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH && options.cameraId) {
+      if (
+        !isSharedOwnerRuntime &&
+        parsedSnapshot &&
+        hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH &&
+        options.cameraId
+      ) {
         try {
           const bytes = base64ToUint8Array(parsedSnapshot.base64);
           imageKey = buildDrakonFindHitStorageKey(
@@ -4418,7 +4966,7 @@ async function handleDrakonFindAgentEvent(
       delete (sanitizedDetails as any).snapshot_image_data_url;
       delete (sanitizedDetails as any).image_data_url;
 
-      if (hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH && options.cameraId) {
+      if (!isSharedOwnerRuntime && hitCount < DRAKON_FIND_MAX_HITS_PER_SEARCH && options.cameraId) {
         await env.DB
           .prepare(
             `INSERT INTO drakon_find_hits (
@@ -4466,17 +5014,19 @@ async function handleDrakonFindAgentEvent(
           )
           .run();
 
-        await createDrakonFindAuditLog(env.DB, {
-          actorUserId: search.user_id,
-          actionType: "search_hit_recorded",
-          searchId,
-          targetId,
-          message: `Match em camera #${options.cameraId} para "${search.target_name}".`,
-          metadata: {
-            camera_id: options.cameraId,
-            confidence,
-          },
-        });
+        if (!isSharedOwnerRuntime) {
+          await createDrakonFindAuditLog(env.DB, {
+            actorUserId: search.user_id,
+            actionType: "search_hit_recorded",
+            searchId,
+            targetId,
+            message: `Match em camera #${options.cameraId} para "${search.target_name}".`,
+            metadata: {
+              camera_id: options.cameraId,
+              confidence,
+            },
+          });
+        }
       }
 
       if (!["cancelled", "failed", "completed"].includes(currentStatus)) {
@@ -4543,18 +5093,20 @@ async function handleDrakonFindAgentEvent(
             ? safeMessage || "Busca falhou em um dos agentes"
             : null,
       });
-      await createDrakonFindAuditLog(env.DB, {
-        actorUserId: search.user_id,
-        actionType: "search_client_failed",
-        searchId,
-        targetId,
-        message: `Cliente ${options.clientId || "desconhecido"} reportou falha na busca "${search.target_name}".`,
-        metadata: {
-          client_id: options.clientId,
-          exe_id: options.exeId,
-          error: safeMessage,
-        },
-      });
+      if (!isSharedOwnerRuntime) {
+        await createDrakonFindAuditLog(env.DB, {
+          actorUserId: search.user_id,
+          actionType: "search_client_failed",
+          searchId,
+          targetId,
+          message: `Cliente ${options.clientId || "desconhecido"} reportou falha na busca "${search.target_name}".`,
+          metadata: {
+            client_id: options.clientId,
+            exe_id: options.exeId,
+            error: safeMessage,
+          },
+        });
+      }
       break;
     }
     case "drakon_find_search_cancelled": {
@@ -4572,17 +5124,19 @@ async function handleDrakonFindAgentEvent(
         cancelled_at: now,
         last_error: null,
       });
-      await createDrakonFindAuditLog(env.DB, {
-        actorUserId: search.user_id,
-        actionType: "search_client_cancelled",
-        searchId,
-        targetId,
-        message: `Cliente ${options.clientId || "desconhecido"} confirmou cancelamento da busca "${search.target_name}".`,
-        metadata: {
-          client_id: options.clientId,
-          exe_id: options.exeId,
-        },
-      });
+      if (!isSharedOwnerRuntime) {
+        await createDrakonFindAuditLog(env.DB, {
+          actorUserId: search.user_id,
+          actionType: "search_client_cancelled",
+          searchId,
+          targetId,
+          message: `Cliente ${options.clientId || "desconhecido"} confirmou cancelamento da busca "${search.target_name}".`,
+          metadata: {
+            client_id: options.clientId,
+            exe_id: options.exeId,
+          },
+        });
+      }
       break;
     }
     case "drakon_find_search_completed": {
@@ -4595,17 +5149,19 @@ async function handleDrakonFindAgentEvent(
         now,
         lastError: null,
       });
-      await createDrakonFindAuditLog(env.DB, {
-        actorUserId: search.user_id,
-        actionType: "search_client_completed",
-        searchId,
-        targetId,
-        message: `Cliente ${options.clientId || "desconhecido"} concluiu o lote da busca "${search.target_name}".`,
-        metadata: {
-          client_id: options.clientId,
-          exe_id: options.exeId,
-        },
-      });
+      if (!isSharedOwnerRuntime) {
+        await createDrakonFindAuditLog(env.DB, {
+          actorUserId: search.user_id,
+          actionType: "search_client_completed",
+          searchId,
+          targetId,
+          message: `Cliente ${options.clientId || "desconhecido"} concluiu o lote da busca "${search.target_name}".`,
+          metadata: {
+            client_id: options.clientId,
+            exe_id: options.exeId,
+          },
+        });
+      }
       break;
     }
     default: {
@@ -4614,6 +5170,14 @@ async function handleDrakonFindAgentEvent(
   }
 
   await finalizeDrakonFindSearchIfTerminal(env.DB, searchId);
+  if (isSharedOwnerRuntime) {
+    await relaySharedOwnerRuntimeEvent(env, search, {
+      eventType: options.eventType,
+      cameraId: options.cameraId,
+      details,
+      message: safeMessage,
+    });
+  }
   return { recorded: true, search_id: searchId };
 }
 
@@ -5818,9 +6382,94 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await db.prepare(
         isPgLike
           ? `
+        CREATE TABLE IF NOT EXISTS shared_find_cameras_cache (
+          id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          share_id INTEGER NOT NULL,
+          owner_public_id TEXT NOT NULL,
+          owner_local_camera_id INTEGER NOT NULL,
+          camera_name TEXT NOT NULL,
+          city TEXT,
+          state_code TEXT,
+          country_code TEXT NOT NULL DEFAULT 'BR',
+          status TEXT NOT NULL DEFAULT 'accepted',
+          accepted_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, share_id)
+        )
+      `
+          : `
+        CREATE TABLE IF NOT EXISTS shared_find_cameras_cache (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          share_id INTEGER NOT NULL,
+          owner_public_id TEXT NOT NULL,
+          owner_local_camera_id INTEGER NOT NULL,
+          camera_name TEXT NOT NULL,
+          city TEXT,
+          state_code TEXT,
+          country_code TEXT NOT NULL DEFAULT 'BR',
+          status TEXT NOT NULL DEFAULT 'accepted',
+          accepted_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, share_id)
+        )
+      `
+      ).run();
+
+      await db.prepare(
+        isPgLike
+          ? `
+        CREATE TABLE IF NOT EXISTS shared_find_invitations_cache (
+          id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          share_id INTEGER NOT NULL,
+          owner_public_id TEXT NOT NULL,
+          invitee_public_id TEXT NOT NULL,
+          owner_local_camera_id INTEGER NOT NULL,
+          camera_name TEXT NOT NULL,
+          city TEXT,
+          state_code TEXT,
+          country_code TEXT NOT NULL DEFAULT 'BR',
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT NOT NULL,
+          accepted_at TEXT,
+          revoked_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, direction, share_id)
+        )
+      `
+          : `
+        CREATE TABLE IF NOT EXISTS shared_find_invitations_cache (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          share_id INTEGER NOT NULL,
+          owner_public_id TEXT NOT NULL,
+          invitee_public_id TEXT NOT NULL,
+          owner_local_camera_id INTEGER NOT NULL,
+          camera_name TEXT NOT NULL,
+          city TEXT,
+          state_code TEXT,
+          country_code TEXT NOT NULL DEFAULT 'BR',
+          status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT NOT NULL,
+          accepted_at TEXT,
+          revoked_at TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE(user_id, direction, share_id)
+        )
+      `
+      ).run();
+
+      await db.prepare(
+        isPgLike
+          ? `
         CREATE TABLE IF NOT EXISTS drakon_find_targets (
           id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
           user_id TEXT NOT NULL,
+          origin_type TEXT NOT NULL DEFAULT 'local',
           entity_type TEXT NOT NULL,
           name TEXT NOT NULL,
           description TEXT NOT NULL DEFAULT '',
@@ -5833,6 +6482,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
         CREATE TABLE IF NOT EXISTS drakon_find_targets (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id TEXT NOT NULL,
+          origin_type TEXT NOT NULL DEFAULT 'local',
           entity_type TEXT NOT NULL,
           name TEXT NOT NULL,
           description TEXT NOT NULL DEFAULT '',
@@ -5878,6 +6528,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
           id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
           user_id TEXT NOT NULL,
           target_id INTEGER NOT NULL,
+          search_origin TEXT NOT NULL DEFAULT 'local',
+          relay_request_id TEXT,
+          shared_operator_user_id TEXT,
+          shared_operator_search_id INTEGER,
+          relay_model_name TEXT,
+          relay_model_api_key TEXT,
+          relay_model_provider TEXT,
+          relay_model_fps INTEGER,
           status TEXT NOT NULL DEFAULT 'queued',
           runtime_mode TEXT NOT NULL DEFAULT 'continuous_video_60s',
           input_type TEXT NOT NULL DEFAULT 'video',
@@ -5910,6 +6568,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id TEXT NOT NULL,
           target_id INTEGER NOT NULL,
+          search_origin TEXT NOT NULL DEFAULT 'local',
+          relay_request_id TEXT,
+          shared_operator_user_id TEXT,
+          shared_operator_search_id INTEGER,
+          relay_model_name TEXT,
+          relay_model_api_key TEXT,
+          relay_model_provider TEXT,
+          relay_model_fps INTEGER,
           status TEXT NOT NULL DEFAULT 'queued',
           runtime_mode TEXT NOT NULL DEFAULT 'continuous_video_60s',
           input_type TEXT NOT NULL DEFAULT 'video',
@@ -5946,6 +6612,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
           id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
           search_id INTEGER NOT NULL,
           camera_id INTEGER NOT NULL,
+          share_id INTEGER,
+          shared_owner_local_camera_id INTEGER,
+          relay_operator_camera_id INTEGER,
           camera_owner_user_id TEXT NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
@@ -5974,6 +6643,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           search_id INTEGER NOT NULL,
           camera_id INTEGER NOT NULL,
+          share_id INTEGER,
+          shared_owner_local_camera_id INTEGER,
+          relay_operator_camera_id INTEGER,
           camera_owner_user_id TEXT NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
@@ -6084,6 +6756,18 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON cameras(allowpublicaccess, country_code, state_code)
       `).run();
       await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_find_cameras_cache_user_scope
+        ON shared_find_cameras_cache(user_id, country_code, state_code, status)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_find_invitations_cache_user_direction_status
+        ON shared_find_invitations_cache(user_id, direction, status, updated_at)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_find_invitations_cache_user_camera
+        ON shared_find_invitations_cache(user_id, direction, owner_local_camera_id)
+      `).run();
+      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_drakon_find_targets_user_updated
         ON drakon_find_targets(user_id, updated_at)
       `).run();
@@ -6100,10 +6784,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON drakon_find_search_cameras(search_id)
       `).run();
       await db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_drakon_find_search_cameras_client_status
-        ON drakon_find_search_cameras(search_id, assigned_client_id, dispatch_status)
-      `).run();
-      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_drakon_find_hits_search_matched
         ON drakon_find_hits(search_id, matched_at)
       `).run();
@@ -6117,6 +6797,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       if (await tableExists("drakon_find_searches")) {
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN search_origin TEXT NOT NULL DEFAULT 'local'`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN relay_request_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN shared_operator_user_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN shared_operator_search_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN relay_model_name TEXT`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN relay_model_api_key TEXT`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN relay_model_provider TEXT`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN relay_model_fps INTEGER`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN runtime_mode TEXT NOT NULL DEFAULT 'continuous_video_60s'`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN input_type TEXT NOT NULL DEFAULT 'video'`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN window_seconds INTEGER NOT NULL DEFAULT 60`);
@@ -6130,9 +6818,16 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN last_event_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN last_dispatch_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_searches ADD COLUMN last_error TEXT`);
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_drakon_find_searches_origin_relay
+          ON drakon_find_searches(search_origin, relay_request_id)
+        `).run();
       }
 
       if (await tableExists("drakon_find_search_cameras")) {
+        await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN share_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN shared_owner_local_camera_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN relay_operator_camera_id INTEGER`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN assigned_client_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN assigned_exe_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN dispatch_status TEXT NOT NULL DEFAULT 'queued'`);
@@ -6144,11 +6839,40 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN completed_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN match_count INTEGER NOT NULL DEFAULT 0`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_search_cameras ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`);
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_drakon_find_search_cameras_share_id
+          ON drakon_find_search_cameras(share_id)
+        `).run();
+        await db.prepare(`
+          CREATE INDEX IF NOT EXISTS idx_drakon_find_search_cameras_client_status
+          ON drakon_find_search_cameras(search_id, assigned_client_id, dispatch_status)
+        `).run();
       }
 
       if (await tableExists("drakon_find_hits")) {
         await addColumnIfMissing(`ALTER TABLE drakon_find_hits ADD COLUMN video_key TEXT`);
         await addColumnIfMissing(`ALTER TABLE drakon_find_hits ADD COLUMN video_url TEXT`);
+      }
+
+      if (await tableExists("drakon_find_targets")) {
+        await addColumnIfMissing(`ALTER TABLE drakon_find_targets ADD COLUMN origin_type TEXT NOT NULL DEFAULT 'local'`);
+      }
+
+      if (await tableExists("shared_find_invitations_cache")) {
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN direction TEXT NOT NULL DEFAULT 'incoming'`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN share_id INTEGER NOT NULL DEFAULT 0`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_public_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN invitee_public_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_local_camera_id INTEGER NOT NULL DEFAULT 0`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN camera_name TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN city TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN state_code TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN country_code TEXT NOT NULL DEFAULT 'BR'`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN created_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN accepted_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN revoked_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN updated_at TEXT`);
       }
 
       if (await tableExists("commands")) {
@@ -7692,6 +8416,16 @@ function normalizeEmail(email: string): string {
   return email.toLowerCase().trim();
 }
 
+function normalizeText(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value).trim();
+}
+
 function isValidUserHandle(handle: string): boolean {
   return normalizeUserHandleInput(handle) !== null;
 }
@@ -7801,7 +8535,7 @@ async function callCentralIdentityAuthorizedEndpoint(
   env: Env,
   pathname: string,
   input: {
-    method?: "PATCH" | "POST" | "PUT";
+    method?: "DELETE" | "GET" | "PATCH" | "POST" | "PUT";
     token: string;
     body?: Record<string, unknown>;
   }
@@ -7822,6 +8556,1658 @@ async function callCentralIdentityAuthorizedEndpoint(
     response,
     data,
   };
+}
+
+type CentralUserRelayContext = {
+  appUserId: string;
+  publicId: string;
+  grantToken: string;
+};
+
+type SharedFindCacheRow = {
+  id: number;
+  share_id: number;
+  user_id: string;
+  owner_public_id: string;
+  owner_local_camera_id: number;
+  camera_name: string;
+  city: string | null;
+  state_code: string | null;
+  country_code: string;
+  status: string;
+  accepted_at: string | null;
+  updated_at: string;
+};
+
+type SharedFindInvitationDirection = "incoming" | "outgoing";
+
+type SharedFindInvitationCacheRow = {
+  id: number;
+  user_id: string;
+  direction: SharedFindInvitationDirection;
+  share_id: number;
+  owner_public_id: string;
+  invitee_public_id: string;
+  owner_local_camera_id: number;
+  camera_name: string;
+  city: string | null;
+  state_code: string | null;
+  country_code: string;
+  status: string;
+  created_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  updated_at: string;
+};
+
+type CentralCameraFindShareRow = {
+  id: number;
+  owner_public_id: string;
+  invitee_public_id: string;
+  owner_local_camera_id: number;
+  camera_name: string;
+  city: string | null;
+  state_code: string | null;
+  country_code: string;
+  status: string;
+  created_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  updated_at: string;
+};
+
+function normalizeOptionalText(value: unknown): string | null {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
+function normalizeSharedFindInvitationDirection(
+  value: unknown
+): SharedFindInvitationDirection {
+  return normalizeText(value) === "outgoing" ? "outgoing" : "incoming";
+}
+
+function isLikelyCentralPublicId(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value
+  );
+}
+
+async function resolveCurrentUserCentralRelayContext(
+  env: Env,
+  user: WorkerAuthenticatedUser
+): Promise<CentralUserRelayContext> {
+  const localIdentity = await findLocalUserIdentityCache(env.DB, {
+    email: user.email,
+    serverPublicId: user.id,
+  });
+  const publicId =
+    typeof (localIdentity as any)?.server_public_id === "string" &&
+    String((localIdentity as any).server_public_id).trim()
+      ? String((localIdentity as any).server_public_id).trim()
+      : isLikelyCentralPublicId(user.id)
+      ? user.id
+      : "";
+  const grantToken =
+    typeof (localIdentity as any)?.status_signature === "string"
+      ? String((localIdentity as any).status_signature).trim()
+      : "";
+
+  if (!publicId || !grantToken) {
+    throw new Error(
+      "This account is not linked to the central identity service yet. Please sign in again with a centrally linked account."
+    );
+  }
+
+  return {
+    appUserId: user.id,
+    publicId,
+    grantToken,
+  };
+}
+
+async function requireVerifiedCentralGrantUser(c: any) {
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  if (!isCentralIdentityServerConfigured(c.env)) {
+    return { error: c.json({ error: "Central identity server is not configured." }, 503) };
+  }
+
+  const authorizationHeader =
+    c.req.header("authorization") || c.req.header("Authorization") || "";
+  if (!authorizationHeader.startsWith("Bearer ")) {
+    return { error: c.json({ error: "Missing central relay authorization." }, 401) };
+  }
+
+  const grantToken = authorizationHeader.slice("Bearer ".length).trim();
+  if (!grantToken) {
+    return { error: c.json({ error: "Missing central relay authorization." }, 401) };
+  }
+
+  let verifiedGrant: Awaited<ReturnType<typeof verifyCentralIdentityGrant>> | null = null;
+  try {
+    verifiedGrant = await verifyCentralIdentityGrant(c.env, grantToken);
+  } catch (error) {
+    console.error("[SHARED FIND] Failed to verify central relay grant:", error);
+    return { error: c.json({ error: "Invalid or expired central identity grant." }, 401) };
+  }
+
+  if (!verifiedGrant || !verifiedGrant.claims.login_allowed) {
+    return { error: c.json({ error: "This account is not allowed to use shared find." }, 403) };
+  }
+
+  return {
+    claims: verifiedGrant.claims,
+    grantToken,
+  };
+}
+
+function normalizeCentralCameraFindShareRow(value: unknown): CentralCameraFindShareRow | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const id = clampInteger(row.id);
+  if (id <= 0) return null;
+  return {
+    id,
+    owner_public_id: normalizeText(row.owner_public_id),
+    invitee_public_id: normalizeText(row.invitee_public_id),
+    owner_local_camera_id: clampInteger(row.owner_local_camera_id),
+    camera_name: normalizeText(row.camera_name),
+    city: normalizeOptionalText(row.city),
+    state_code: normalizeOptionalText(row.state_code),
+    country_code: normalizeCountryCode(row.country_code, null) || "BR",
+    status: normalizeText(row.status) || "pending",
+    created_at: normalizeText(row.created_at),
+    accepted_at: normalizeOptionalText(row.accepted_at),
+    revoked_at: normalizeOptionalText(row.revoked_at),
+    updated_at: normalizeText(row.updated_at),
+  };
+}
+
+function normalizeSharedFindInvitationCacheRow(
+  value: unknown
+): SharedFindInvitationCacheRow | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const shareId = clampInteger(row.share_id);
+  if (shareId <= 0) return null;
+  return {
+    id: clampInteger(row.id),
+    user_id: normalizeText(row.user_id),
+    direction: normalizeSharedFindInvitationDirection(row.direction),
+    share_id: shareId,
+    owner_public_id: normalizeText(row.owner_public_id),
+    invitee_public_id: normalizeText(row.invitee_public_id),
+    owner_local_camera_id: clampInteger(row.owner_local_camera_id),
+    camera_name: normalizeText(row.camera_name),
+    city: normalizeOptionalText(row.city),
+    state_code: normalizeOptionalText(row.state_code),
+    country_code: normalizeCountryCode(row.country_code, null) || "BR",
+    status: normalizeText(row.status) || "pending",
+    created_at: normalizeText(row.created_at),
+    accepted_at: normalizeOptionalText(row.accepted_at),
+    revoked_at: normalizeOptionalText(row.revoked_at),
+    updated_at: normalizeText(row.updated_at),
+  };
+}
+
+function mapSharedFindInvitationCacheRowToShare(
+  row: SharedFindInvitationCacheRow
+): CentralCameraFindShareRow {
+  return {
+    id: row.share_id,
+    owner_public_id: row.owner_public_id,
+    invitee_public_id: row.invitee_public_id,
+    owner_local_camera_id: row.owner_local_camera_id,
+    camera_name: row.camera_name,
+    city: row.city,
+    state_code: row.state_code,
+    country_code: row.country_code,
+    status: row.status,
+    created_at: row.created_at,
+    accepted_at: row.accepted_at,
+    revoked_at: row.revoked_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function listSharedFindCameraCacheForUser(db: D1Database, userId: string) {
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM shared_find_cameras_cache
+       WHERE user_id = ?
+       ORDER BY state_code ASC, city ASC, camera_name ASC, share_id ASC`
+    )
+    .bind(userId)
+    .all();
+
+  return (results || []).map((row: any): SharedFindCacheRow => ({
+    id: clampInteger(row?.id),
+    share_id: clampInteger(row?.share_id),
+    user_id: normalizeText(row?.user_id),
+    owner_public_id: normalizeText(row?.owner_public_id),
+    owner_local_camera_id: clampInteger(row?.owner_local_camera_id),
+    camera_name: normalizeText(row?.camera_name),
+    city: normalizeOptionalText(row?.city),
+    state_code: normalizeOptionalText(row?.state_code),
+    country_code: normalizeCountryCode((row as any)?.country_code, null) || "BR",
+    status: normalizeText(row?.status) || "accepted",
+    accepted_at: normalizeOptionalText(row?.accepted_at),
+    updated_at: normalizeText(row?.updated_at),
+  }));
+}
+
+async function listSharedFindInvitationCacheForUser(
+  db: D1Database,
+  userId: string,
+  input?: {
+    direction?: SharedFindInvitationDirection;
+    ownerLocalCameraId?: number | null;
+  }
+) {
+  const bindings: unknown[] = [userId];
+  const clauses = [`user_id = ?`];
+
+  if (input?.direction) {
+    clauses.push(`direction = ?`);
+    bindings.push(input.direction);
+  }
+
+  const ownerLocalCameraId = clampInteger(input?.ownerLocalCameraId);
+  if (ownerLocalCameraId > 0) {
+    clauses.push(`owner_local_camera_id = ?`);
+    bindings.push(ownerLocalCameraId);
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM shared_find_invitations_cache
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY updated_at DESC, share_id DESC`
+    )
+    .bind(...bindings)
+    .all();
+
+  return (results || [])
+    .map((row: any) => normalizeSharedFindInvitationCacheRow(row))
+    .filter(
+      (row: SharedFindInvitationCacheRow | null): row is SharedFindInvitationCacheRow => Boolean(row)
+    );
+}
+
+async function replaceSharedFindCameraCacheForUser(
+  db: D1Database,
+  userId: string,
+  rows: CentralCameraFindShareRow[]
+) {
+  await db.prepare(`DELETE FROM shared_find_cameras_cache WHERE user_id = ?`).bind(userId).run();
+
+  const now = new Date().toISOString();
+  for (const row of rows) {
+    await db
+      .prepare(
+        `INSERT INTO shared_find_cameras_cache (
+           user_id,
+           share_id,
+           owner_public_id,
+           owner_local_camera_id,
+           camera_name,
+           city,
+           state_code,
+           country_code,
+           status,
+           accepted_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        userId,
+        row.id,
+        row.owner_public_id,
+        row.owner_local_camera_id,
+        row.camera_name,
+        row.city,
+        row.state_code,
+        row.country_code,
+        row.status || "accepted",
+        row.accepted_at,
+        row.updated_at || now
+      )
+      .run();
+  }
+}
+
+async function replaceSharedFindInvitationCacheForUser(
+  db: D1Database,
+  userId: string,
+  direction: SharedFindInvitationDirection,
+  rows: CentralCameraFindShareRow[]
+) {
+  await db
+    .prepare(`DELETE FROM shared_find_invitations_cache WHERE user_id = ? AND direction = ?`)
+    .bind(userId, direction)
+    .run();
+
+  const now = new Date().toISOString();
+  for (const row of rows) {
+    await db
+      .prepare(
+        `INSERT INTO shared_find_invitations_cache (
+           user_id,
+           direction,
+           share_id,
+           owner_public_id,
+           invitee_public_id,
+           owner_local_camera_id,
+           camera_name,
+           city,
+           state_code,
+           country_code,
+           status,
+           created_at,
+           accepted_at,
+           revoked_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        userId,
+        direction,
+        row.id,
+        row.owner_public_id,
+        row.invitee_public_id,
+        row.owner_local_camera_id,
+        row.camera_name,
+        row.city,
+        row.state_code,
+        row.country_code,
+        row.status || "pending",
+        row.created_at || now,
+        row.accepted_at,
+        row.revoked_at,
+        row.updated_at || now
+      )
+      .run();
+  }
+}
+
+async function syncSharedFindInvitationNotifications(
+  db: D1Database,
+  userId: string,
+  rows: CentralCameraFindShareRow[]
+) {
+  const pendingRows = rows.filter((row) => normalizeText(row.status) === "pending");
+  const { results } = await db
+    .prepare(
+      `SELECT id, event_id
+       FROM notifications
+       WHERE user_id = ?
+         AND type = 'shared_find_invitation'`
+    )
+    .bind(userId)
+    .all();
+
+  const existingByShareId = new Map<number, number>();
+  for (const row of results || []) {
+    const shareId = clampInteger((row as any)?.event_id);
+    const notificationId = clampInteger((row as any)?.id);
+    if (shareId > 0 && notificationId > 0) {
+      existingByShareId.set(shareId, notificationId);
+    }
+  }
+
+  const activeShareIds = new Set(pendingRows.map((row) => row.id));
+  const staleNotificationIds = Array.from(existingByShareId.entries())
+    .filter(([shareId]) => !activeShareIds.has(shareId))
+    .map(([, notificationId]) => notificationId);
+  if (staleNotificationIds.length) {
+    const placeholders = staleNotificationIds.map(() => "?").join(", ");
+    await db
+      .prepare(
+        `DELETE FROM notifications
+         WHERE user_id = ?
+           AND type = 'shared_find_invitation'
+           AND id IN (${placeholders})`
+      )
+      .bind(userId, ...staleNotificationIds)
+      .run();
+  }
+
+  for (const row of pendingRows) {
+    const cameraLabel = row.camera_name || `Camera #${row.owner_local_camera_id}`;
+    const message = `${cameraLabel} is waiting for your approval in Drakon Find.`;
+    const existingNotificationId = existingByShareId.get(row.id);
+    if (existingNotificationId) {
+      await db
+        .prepare(
+          `UPDATE notifications
+           SET title = ?,
+               message = ?,
+               created_at = ?
+           WHERE id = ?
+             AND user_id = ?`
+        )
+        .bind(
+          "Shared Drakon Find invitation",
+          message,
+          row.updated_at || row.created_at || new Date().toISOString(),
+          existingNotificationId,
+          userId
+        )
+        .run();
+      continue;
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO notifications (
+           user_id,
+           camera_id,
+           type,
+           title,
+           message,
+           image_key,
+           video_key,
+           media_type,
+           event_id,
+           created_at,
+           is_read
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`
+      )
+      .bind(
+        userId,
+        null,
+        "shared_find_invitation",
+        "Shared Drakon Find invitation",
+        message,
+        null,
+        null,
+        "image",
+        row.id,
+        row.updated_at || row.created_at || new Date().toISOString()
+      )
+      .run();
+  }
+}
+
+async function loadSharedFindCachedStateForUser(db: D1Database, userId: string) {
+  const [incomingRows, outgoingRows, cameras] = await Promise.all([
+    listSharedFindInvitationCacheForUser(db, userId, { direction: "incoming" }),
+    listSharedFindInvitationCacheForUser(db, userId, { direction: "outgoing" }),
+    listSharedFindCameraCacheForUser(db, userId),
+  ]);
+
+  const available = cameras.map((row: SharedFindCacheRow) => ({
+    id: row.share_id,
+    owner_public_id: row.owner_public_id,
+    invitee_public_id: "",
+    owner_local_camera_id: row.owner_local_camera_id,
+    camera_name: row.camera_name,
+    city: row.city,
+    state_code: row.state_code,
+    country_code: row.country_code,
+    status: row.status,
+    created_at: row.accepted_at || row.updated_at,
+    accepted_at: row.accepted_at,
+    revoked_at: null,
+    updated_at: row.updated_at,
+  }));
+
+  return {
+    incoming: incomingRows.map(mapSharedFindInvitationCacheRowToShare),
+    outgoing: outgoingRows.map(mapSharedFindInvitationCacheRowToShare),
+    available,
+    cameras,
+  };
+}
+
+async function fetchCentralSharedFindRows(
+  env: Env,
+  token: string,
+  path: string
+): Promise<CentralCameraFindShareRow[]> {
+  const { response, data } = await callCentralIdentityAuthorizedEndpoint(env, path, {
+    method: "GET",
+    token,
+  });
+  if (!response.ok) {
+    throw new Error(
+      normalizeResponseErrorMessage(data, "Failed to load shared Drakon Find camera references.")
+    );
+  }
+
+  const rows = Array.isArray(data?.shares)
+    ? data.shares
+    : Array.isArray(data?.cameras)
+    ? data.cameras
+    : [];
+
+  return rows
+    .map((row: any) => normalizeCentralCameraFindShareRow(row))
+    .filter((row: CentralCameraFindShareRow | null): row is CentralCameraFindShareRow => Boolean(row));
+}
+
+async function syncSharedFindCameraCacheForUser(env: Env, user: WorkerAuthenticatedUser) {
+  const cached = await loadSharedFindCachedStateForUser(env.DB, user.id);
+  if (!isCentralIdentityClientConfigured(env)) {
+    return {
+      ...cached,
+      sync_error: "Central identity server is not configured.",
+    };
+  }
+
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContext(env, user);
+    const [incoming, outgoing, available] = await Promise.all([
+      fetchCentralSharedFindRows(env, centralContext.grantToken, "/api/find-shares/incoming"),
+      fetchCentralSharedFindRows(env, centralContext.grantToken, "/api/find-shares/outgoing"),
+      fetchCentralSharedFindRows(env, centralContext.grantToken, "/api/find-shares/available-cameras"),
+    ]);
+
+    await replaceSharedFindInvitationCacheForUser(env.DB, user.id, "incoming", incoming);
+    await replaceSharedFindInvitationCacheForUser(env.DB, user.id, "outgoing", outgoing);
+    await replaceSharedFindCameraCacheForUser(
+      env.DB,
+      user.id,
+      available.filter((row) => row.status === "accepted")
+    );
+    await syncSharedFindInvitationNotifications(env.DB, user.id, incoming);
+
+    const nextCached = await loadSharedFindCachedStateForUser(env.DB, user.id);
+    return {
+      ...nextCached,
+      sync_error: null as string | null,
+    };
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message
+        ? error.message
+        : "Failed to synchronize shared Drakon Find invitations.";
+    console.error("[SHARED FIND] sync failed", {
+      userId: user.id,
+      error,
+    });
+    return {
+      ...cached,
+      sync_error: message,
+    };
+  }
+}
+
+type SharedFindResolvedUser = {
+  public_id: string;
+  email: string;
+  handle: string | null;
+  display_label: string;
+};
+
+function normalizeSharedFindLookupQuery(value: unknown) {
+  const trimmed = normalizeText(value);
+  if (!trimmed) return "";
+  return trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
+}
+
+function buildSharedFindDisplayLabel(user: {
+  handle?: string | null | undefined;
+  email?: string | null | undefined;
+}) {
+  const handle = normalizeUserHandleInput(user.handle);
+  if (handle) return `@${handle}`;
+  const email = normalizeEmail(String(user.email || ""));
+  return email || "";
+}
+
+async function resolveCentralFindShareUserByQuery(
+  db: D1Database,
+  rawQuery: unknown
+): Promise<SharedFindResolvedUser | null> {
+  const normalizedQuery = normalizeSharedFindLookupQuery(rawQuery);
+  if (!normalizedQuery || normalizedQuery.length < 3) {
+    return null;
+  }
+
+  const isEmailQuery = normalizedQuery.includes("@") && isValidEmail(normalizedQuery);
+  const normalizedHandle = normalizeUserHandleInput(normalizedQuery);
+
+  let row: any | null = null;
+  if (normalizedHandle) {
+    row =
+      (await db
+        .prepare(`SELECT public_id, email, handle FROM server_users WHERE LOWER(handle) = LOWER(?) LIMIT 1`)
+        .bind(normalizedHandle)
+        .first()) || null;
+  }
+
+  if (!row && isEmailQuery) {
+    row =
+      (await db
+        .prepare(`SELECT public_id, email, handle FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
+        .bind(normalizeEmail(normalizedQuery))
+        .first()) || null;
+  }
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    public_id: normalizeText((row as any)?.public_id),
+    email: normalizeEmail(String((row as any)?.email || "")),
+    handle: normalizeUserHandleInput((row as any)?.handle),
+    display_label: buildSharedFindDisplayLabel(row as any),
+  };
+}
+
+async function getCentralCameraFindShareById(db: D1Database, shareId: number) {
+  if (!Number.isInteger(shareId) || shareId <= 0) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(`SELECT * FROM camera_find_shares WHERE id = ? LIMIT 1`)
+    .bind(shareId)
+    .first();
+
+  return normalizeCentralCameraFindShareRow(row);
+}
+
+async function listCentralCameraFindShares(
+  db: D1Database,
+  input: {
+    role: "incoming" | "outgoing";
+    publicId: string;
+    ownerLocalCameraId?: number | null;
+  }
+) {
+  const publicId = normalizeText(input.publicId);
+  if (!publicId) return [] as CentralCameraFindShareRow[];
+
+  const bindings: any[] = [publicId];
+  const clauses =
+    input.role === "incoming"
+      ? [`invitee_public_id = ?`]
+      : [`owner_public_id = ?`];
+
+  const ownerLocalCameraId = clampInteger(input.ownerLocalCameraId);
+  if (ownerLocalCameraId > 0) {
+    clauses.push(`owner_local_camera_id = ?`);
+    bindings.push(ownerLocalCameraId);
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM camera_find_shares
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY updated_at DESC, id DESC`
+    )
+    .bind(...bindings)
+    .all();
+
+  return (results || [])
+    .map((row: any) => normalizeCentralCameraFindShareRow(row))
+    .filter((row: CentralCameraFindShareRow | null): row is CentralCameraFindShareRow => Boolean(row));
+}
+
+async function listCentralAvailableCameraFindShares(db: D1Database, inviteePublicId: string) {
+  const publicId = normalizeText(inviteePublicId);
+  if (!publicId) return [] as CentralCameraFindShareRow[];
+
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM camera_find_shares
+       WHERE invitee_public_id = ?
+         AND status = 'accepted'
+       ORDER BY state_code ASC, city ASC, camera_name ASC, id ASC`
+    )
+    .bind(publicId)
+    .all();
+
+  return (results || [])
+    .map((row: any) => normalizeCentralCameraFindShareRow(row))
+    .filter((row: CentralCameraFindShareRow | null): row is CentralCameraFindShareRow => Boolean(row));
+}
+
+async function createOrUpdateCentralCameraFindShare(
+  db: D1Database,
+  input: {
+    ownerPublicId: string;
+    inviteePublicId: string;
+    ownerLocalCameraId: number;
+    cameraName: string;
+    city?: string | null;
+    stateCode?: string | null;
+    countryCode?: string | null;
+  }
+) {
+  const ownerPublicId = normalizeText(input.ownerPublicId);
+  const inviteePublicId = normalizeText(input.inviteePublicId);
+  const ownerLocalCameraId = clampInteger(input.ownerLocalCameraId);
+  if (!ownerPublicId || !inviteePublicId || ownerLocalCameraId <= 0) {
+    throw new Error("A valid owner, invitee, and camera reference are required.");
+  }
+  if (ownerPublicId === inviteePublicId) {
+    throw new Error("You cannot share a camera with the same account.");
+  }
+
+  const now = new Date().toISOString();
+  const existing = await db
+    .prepare(
+      `SELECT *
+       FROM camera_find_shares
+       WHERE owner_public_id = ?
+         AND invitee_public_id = ?
+         AND owner_local_camera_id = ?
+       LIMIT 1`
+    )
+    .bind(ownerPublicId, inviteePublicId, ownerLocalCameraId)
+    .first();
+
+  const cameraName = normalizeText(input.cameraName) || `Camera ${ownerLocalCameraId}`;
+  const city = normalizeOptionalText(input.city);
+  const stateCode = normalizeOptionalText(input.stateCode)?.toUpperCase() || null;
+  const countryCode = normalizeCountryCode(input.countryCode, null) || "BR";
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE camera_find_shares
+         SET camera_name = ?,
+             city = ?,
+             state_code = ?,
+             country_code = ?,
+             status = 'pending',
+             accepted_at = NULL,
+             revoked_at = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(cameraName, city, stateCode, countryCode, now, Number((existing as any)?.id || 0))
+      .run();
+
+    return getCentralCameraFindShareById(db, Number((existing as any)?.id || 0));
+  }
+
+  const inserted = await db
+    .prepare(
+      `INSERT INTO camera_find_shares (
+         owner_public_id,
+         invitee_public_id,
+         owner_local_camera_id,
+         camera_name,
+         city,
+         state_code,
+         country_code,
+         status,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+    )
+    .bind(
+      ownerPublicId,
+      inviteePublicId,
+      ownerLocalCameraId,
+      cameraName,
+      city,
+      stateCode,
+      countryCode,
+      now,
+      now
+    )
+    .run();
+
+  return getCentralCameraFindShareById(db, Number(inserted.meta.last_row_id || 0));
+}
+
+async function transitionCentralCameraFindShareStatus(
+  db: D1Database,
+  input: {
+    shareId: number;
+    actorPublicId: string;
+    nextStatus: "accepted" | "denied" | "revoked";
+  }
+) {
+  const share = await getCentralCameraFindShareById(db, input.shareId);
+  if (!share) {
+    return { error: "Shared camera invitation not found.", status: 404, share: null };
+  }
+
+  const actorPublicId = normalizeText(input.actorPublicId);
+  const nextStatus = input.nextStatus;
+  const isInviteeAction = nextStatus === "accepted" || nextStatus === "denied";
+  const expectedActor = isInviteeAction ? share.invitee_public_id : share.owner_public_id;
+  if (!actorPublicId || actorPublicId !== expectedActor) {
+    return { error: "You are not allowed to update this shared camera.", status: 403, share };
+  }
+
+  const now = new Date().toISOString();
+  const acceptedAt = nextStatus === "accepted" ? now : null;
+  const revokedAt = nextStatus === "revoked" ? now : null;
+
+  await db
+    .prepare(
+      `UPDATE camera_find_shares
+       SET status = ?,
+           accepted_at = ?,
+           revoked_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(nextStatus, acceptedAt, revokedAt, now, share.id)
+    .run();
+
+  return {
+    error: null,
+    status: 200,
+    share: await getCentralCameraFindShareById(db, share.id),
+  };
+}
+
+async function resolveCurrentUserCentralRelayContextById(
+  env: Env,
+  appUserId: string
+): Promise<CentralUserRelayContext> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    throw new Error("A valid app user id is required.");
+  }
+
+  const localIdentity =
+    (await findLocalUserIdentityCache(env.DB, {
+      serverPublicId: normalizedAppUserId,
+    })) ||
+    (await env.DB
+      .prepare(
+        `SELECT lu.*
+         FROM local_users lu
+         JOIN app_users au ON LOWER(au.email) = LOWER(lu.email)
+         WHERE au.id = ?
+         LIMIT 1`
+      )
+      .bind(normalizedAppUserId)
+      .first());
+
+  const publicId =
+    typeof (localIdentity as any)?.server_public_id === "string" &&
+    String((localIdentity as any).server_public_id).trim()
+      ? String((localIdentity as any).server_public_id).trim()
+      : isLikelyCentralPublicId(normalizedAppUserId)
+      ? normalizedAppUserId
+      : "";
+  const grantToken =
+    typeof (localIdentity as any)?.status_signature === "string"
+      ? String((localIdentity as any).status_signature).trim()
+      : "";
+
+  if (!publicId || !grantToken) {
+    throw new Error("This account is not linked to the central identity service yet.");
+  }
+
+  return {
+    appUserId: normalizedAppUserId,
+    publicId,
+    grantToken,
+  };
+}
+
+async function maybeEnsureSharedFindRelayForUser(
+  env: Env,
+  user: WorkerAuthenticatedUser | { id: string; email?: string | null }
+) {
+  if (!isCentralIdentityClientConfigured(env)) {
+    return null;
+  }
+
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContextById(env, user.id);
+    await ensureSharedFindRelayClientConnected({
+      env,
+      publicId: centralContext.publicId,
+      appUserId: centralContext.appUserId,
+      grantToken: centralContext.grantToken,
+      onMessage: async (context, message) => {
+        await handleSharedFindRelayInboundMessage(context, message);
+      },
+    });
+    return centralContext;
+  } catch {
+    return null;
+  }
+}
+
+function getSharedFindRelayBackgroundLogState() {
+  const globalKey = "__sharedFindRelayBackgroundLogState";
+  const root = globalThis as any;
+  if (!root[globalKey]) {
+    root[globalKey] = new Map<string, number>();
+  }
+  return root[globalKey] as Map<string, number>;
+}
+
+function shouldLogSharedFindRelayBackgroundFailure(key: string, nowMs = Date.now()) {
+  const state = getSharedFindRelayBackgroundLogState();
+  const lastLoggedAt = Number(state.get(key) || 0);
+  if (lastLoggedAt > 0 && nowMs - lastLoggedAt < 5 * 60_000) {
+    return false;
+  }
+  state.set(key, nowMs);
+  return true;
+}
+
+async function ensureSharedFindRelayForBackgroundUser(
+  env: Env,
+  user: WorkerAuthenticatedUser | { id: string; email?: string | null },
+  source: string
+) {
+  const result = await maybeEnsureSharedFindRelayForUser(env, user);
+  if (result) {
+    return result;
+  }
+
+  const userId = normalizeText(user.id);
+  if (userId && shouldLogSharedFindRelayBackgroundFailure(`${source}:${userId}`)) {
+    console.warn("[SHARED FIND RELAY] Background relay is unavailable for runtime user", {
+      source,
+      userId,
+    });
+  }
+  return null;
+}
+
+async function appendSharedFindTargetImages(
+  env: Env,
+  userId: string,
+  targetId: number,
+  referenceImages: Array<Record<string, unknown>>
+) {
+  const now = new Date().toISOString();
+  for (const image of referenceImages.slice(0, DRAKON_FIND_MAX_TARGET_IMAGES)) {
+    const dataUrl =
+      typeof image.data_url === "string"
+        ? image.data_url
+        : typeof image.dataUrl === "string"
+        ? image.dataUrl
+        : "";
+    const parsed = parseDataUrl(dataUrl);
+    if (!parsed) continue;
+
+    const storageKey = buildDrakonFindTargetImageStorageKey(
+      userId,
+      targetId,
+      parsed.contentType || "image/jpeg"
+    );
+    await env.R2_BUCKET.put(storageKey, base64ToUint8Array(parsed.base64), {
+      httpMetadata: { contentType: parsed.contentType || "image/jpeg" },
+    });
+
+    await env.DB
+      .prepare(
+        `INSERT INTO drakon_find_target_images (
+           target_id,
+           storage_key,
+           image_url,
+           content_type,
+           created_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        targetId,
+        storageKey,
+        buildDrakonFindTargetImageUrl(storageKey),
+        parsed.contentType || "image/jpeg",
+        now,
+        now
+      )
+      .run();
+  }
+}
+
+async function createSharedOwnerRuntimeSearch(
+  env: Env,
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const operatorPublicId = normalizeText(message.operator_public_id);
+  const operatorSearchId = clampInteger(message.operator_search_id);
+  const relayRequestId = normalizeText(message.request_id) || generateUUID();
+  const durationSeconds = normalizeDrakonFindDurationSeconds(message.duration_seconds);
+  const runUntil =
+    normalizeText(message.run_until) ||
+    new Date(Date.now() + durationSeconds * 1000).toISOString();
+  const targetPayload =
+    message.target && typeof message.target === "object" && !Array.isArray(message.target)
+      ? (message.target as Record<string, unknown>)
+      : {};
+  const referenceImages = Array.isArray(message.reference_images)
+    ? (message.reference_images as Array<Record<string, unknown>>)
+    : [];
+  const cameraRequests = Array.isArray(message.camera_requests)
+    ? (message.camera_requests as Array<Record<string, unknown>>)
+    : [];
+
+  if (!operatorPublicId || operatorSearchId <= 0 || cameraRequests.length === 0) {
+    throw new Error("Invalid shared find start payload.");
+  }
+
+  const requestedCameraIds = cameraRequests
+    .map((camera) => clampInteger(camera.owner_local_camera_id))
+    .filter((cameraId) => cameraId > 0);
+  const uniqueCameraIds = Array.from(new Set(requestedCameraIds));
+  if (uniqueCameraIds.length === 0) {
+    throw new Error("No valid owner cameras were provided for the shared find request.");
+  }
+
+  const placeholders = uniqueCameraIds.map(() => "?").join(", ");
+  const { results: cameraRows } = await env.DB
+    .prepare(
+      `SELECT id, user_id, name, city, state_code, country_code
+       FROM cameras
+       WHERE user_id = ?
+         AND id IN (${placeholders})`
+    )
+    .bind(context.appUserId, ...uniqueCameraIds)
+    .all();
+
+  const cameraById = new Map<number, any>();
+  for (const row of cameraRows || []) {
+    const cameraId = clampInteger((row as any)?.id);
+    if (cameraId > 0) {
+      cameraById.set(cameraId, row);
+    }
+  }
+
+  if (cameraById.size !== uniqueCameraIds.length) {
+    throw new Error("One or more shared cameras are no longer available on the owner runtime.");
+  }
+
+  const now = new Date().toISOString();
+  const targetName = normalizeDrakonFindText(targetPayload.name, 120) || "Shared Find Target";
+  const targetDescription = normalizeDrakonFindText(targetPayload.description, 2000) || targetName;
+  const targetEntityType = normalizeDrakonFindText(targetPayload.entity_type, 40) || "person";
+  const targetTraits = normalizeDrakonFindTraits(targetPayload.traits);
+
+  const insertedTarget = await env.DB
+    .prepare(
+      `INSERT INTO drakon_find_targets (
+         user_id,
+         origin_type,
+         entity_type,
+         name,
+         description,
+         traits_json,
+         created_at,
+         updated_at
+       )
+       VALUES (?, 'shared_owner_runtime', ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      context.appUserId,
+      targetEntityType,
+      targetName,
+      targetDescription,
+      JSON.stringify(targetTraits),
+      now,
+      now
+    )
+    .run();
+
+  const targetId = clampInteger(insertedTarget.meta.last_row_id);
+  if (targetId <= 0) {
+    throw new Error("Failed to create the hidden shared find target on the owner runtime.");
+  }
+
+  await appendSharedFindTargetImages(env, context.appUserId, targetId, referenceImages);
+
+  const insertedSearch = await env.DB
+    .prepare(
+      `INSERT INTO drakon_find_searches (
+         user_id,
+         target_id,
+         status,
+         search_origin,
+         relay_request_id,
+         shared_operator_user_id,
+         shared_operator_search_id,
+         runtime_mode,
+         input_type,
+         window_seconds,
+         duration_seconds,
+         run_until,
+         country_code,
+         selected_states_json,
+         scope_snapshot_json,
+         eligible_camera_count,
+         eligible_owner_count,
+         relay_model_name,
+         relay_model_api_key,
+         relay_model_provider,
+         relay_model_fps,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'queued', 'shared_owner_runtime', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      context.appUserId,
+      targetId,
+      relayRequestId,
+      operatorPublicId,
+      operatorSearchId,
+      DRAKON_FIND_RUNTIME_MODE,
+      "video",
+      DRAKON_FIND_WINDOW_SECONDS,
+      durationSeconds,
+      runUntil,
+      normalizeCountryCode(message.country_code, null) || "BR",
+      JSON.stringify(normalizeBrazilStateSelection(parseStringArray(message.selected_states))),
+      JSON.stringify(parseJsonObject(message.scope_snapshot) || {}),
+      cameraRequests.length,
+      1,
+      normalizeOptionalText(message.model_name),
+      normalizeOptionalText(message.model_api_key),
+      normalizeOptionalText(message.model_provider),
+      Math.max(0, clampInteger(message.model_fps)),
+      now,
+      now
+    )
+    .run();
+
+  const hiddenSearchId = clampInteger(insertedSearch.meta.last_row_id);
+  if (hiddenSearchId <= 0) {
+    throw new Error("Failed to create the hidden shared find search on the owner runtime.");
+  }
+
+  for (const cameraRequest of cameraRequests) {
+    const ownerLocalCameraId = clampInteger(cameraRequest.owner_local_camera_id);
+    const operatorCameraId = clampInteger(cameraRequest.operator_camera_id);
+    const shareId = clampInteger(cameraRequest.share_id);
+    const cameraRow = cameraById.get(ownerLocalCameraId);
+    if (!cameraRow || operatorCameraId <= 0 || shareId <= 0) {
+      continue;
+    }
+
+    await env.DB
+      .prepare(
+        `INSERT INTO drakon_find_search_cameras (
+           search_id,
+           camera_id,
+           share_id,
+           shared_owner_local_camera_id,
+           relay_operator_camera_id,
+           camera_owner_user_id,
+           camera_name,
+           city,
+           state_code,
+           country_code,
+           is_public_access,
+           created_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+      )
+      .bind(
+        hiddenSearchId,
+        ownerLocalCameraId,
+        shareId,
+        ownerLocalCameraId,
+        operatorCameraId,
+        String((cameraRow as any)?.user_id || context.appUserId),
+        normalizeText(cameraRequest.camera_name) || String((cameraRow as any)?.name || ""),
+        normalizeOptionalText(cameraRequest.city) ?? normalizeOptionalText((cameraRow as any)?.city),
+        normalizeOptionalText(cameraRequest.state_code) ??
+          normalizeOptionalText((cameraRow as any)?.state_code),
+        normalizeCountryCode(cameraRequest.country_code, null) ||
+          normalizeCountryCode((cameraRow as any)?.country_code, null) ||
+          "BR",
+        now,
+        now
+      )
+      .run();
+  }
+
+  return {
+    hiddenSearchId,
+    targetId,
+  };
+}
+
+async function relaySharedOwnerRuntimeEvent(
+  env: Env,
+  search: Awaited<ReturnType<typeof fetchDrakonFindSearchForDispatch>>,
+  options: {
+    eventType: string;
+    cameraId: number | null;
+    details: Record<string, unknown>;
+    message: string;
+  }
+) {
+  if (
+    !search ||
+    search.search_origin !== "shared_owner_runtime" ||
+    !search.shared_operator_user_id ||
+    !search.shared_operator_search_id
+  ) {
+    return;
+  }
+
+  let operatorCameraId =
+    Number((options.details as any)?.relay_operator_camera_id || (options.details as any)?.operator_camera_id || 0) ||
+    0;
+  let shareId = Number((options.details as any)?.share_id || 0) || 0;
+  let ownerLocalCameraId = options.cameraId && options.cameraId > 0 ? options.cameraId : 0;
+  let scopedCameraRow: any = null;
+
+  if (options.cameraId && options.cameraId > 0) {
+    scopedCameraRow = await env.DB
+      .prepare(
+        `SELECT relay_operator_camera_id, share_id, shared_owner_local_camera_id, camera_name, city, state_code, country_code
+         FROM drakon_find_search_cameras
+         WHERE search_id = ? AND camera_id = ?
+         LIMIT 1`
+      )
+      .bind(search.id, options.cameraId)
+      .first();
+    operatorCameraId =
+      clampInteger((scopedCameraRow as any)?.relay_operator_camera_id) || operatorCameraId;
+    shareId = clampInteger((scopedCameraRow as any)?.share_id) || shareId;
+    ownerLocalCameraId =
+      clampInteger((scopedCameraRow as any)?.shared_owner_local_camera_id) || ownerLocalCameraId;
+  }
+
+  const ownerCameraRow =
+    ownerLocalCameraId > 0
+      ? await env.DB
+          .prepare(
+            `SELECT name, street, number, city, state_code, country_code
+             FROM cameras
+             WHERE user_id = ? AND id = ?
+             LIMIT 1`
+          )
+          .bind(search.user_id, ownerLocalCameraId)
+          .first()
+      : null;
+
+  const relayDetails = {
+    ...options.details,
+    search_id: search.shared_operator_search_id,
+    operator_search_id: search.shared_operator_search_id,
+    operator_camera_id: operatorCameraId || null,
+    camera_id: operatorCameraId || null,
+    share_id: shareId || null,
+    owner_local_camera_id: ownerLocalCameraId || null,
+  };
+
+  const resolvedCameraName =
+    normalizeText((relayDetails as any).camera_name) ||
+    normalizeText((scopedCameraRow as any)?.camera_name) ||
+    normalizeText((ownerCameraRow as any)?.name);
+  if (resolvedCameraName) {
+    (relayDetails as any).camera_name = resolvedCameraName;
+  }
+
+  const resolvedStreet =
+    normalizeOptionalText((relayDetails as any).street) ??
+    normalizeOptionalText((relayDetails as any).camera_street) ??
+    normalizeOptionalText((ownerCameraRow as any)?.street);
+  if (resolvedStreet) {
+    (relayDetails as any).street = resolvedStreet;
+  }
+
+  const resolvedNumber =
+    normalizeOptionalText((relayDetails as any).number) ??
+    normalizeOptionalText((relayDetails as any).camera_number) ??
+    normalizeOptionalText((ownerCameraRow as any)?.number);
+  if (resolvedNumber) {
+    (relayDetails as any).number = resolvedNumber;
+  }
+
+  const resolvedCity =
+    normalizeOptionalText((relayDetails as any).city) ??
+    normalizeOptionalText((scopedCameraRow as any)?.city) ??
+    normalizeOptionalText((ownerCameraRow as any)?.city);
+  if (resolvedCity) {
+    (relayDetails as any).city = resolvedCity;
+  }
+
+  const resolvedStateCode =
+    normalizeOptionalText((relayDetails as any).state_code) ??
+    normalizeOptionalText((scopedCameraRow as any)?.state_code) ??
+    normalizeOptionalText((ownerCameraRow as any)?.state_code);
+  if (resolvedStateCode) {
+    (relayDetails as any).state_code = resolvedStateCode;
+  }
+
+  const resolvedCountryCode =
+    normalizeCountryCode(
+      (relayDetails as any).country_code ??
+        (scopedCameraRow as any)?.country_code ??
+        (ownerCameraRow as any)?.country_code,
+      null
+    ) || null;
+  if (resolvedCountryCode) {
+    (relayDetails as any).country_code = resolvedCountryCode;
+  }
+
+  // The owner runtime uses a hidden local target id that has no meaning on the
+  // operator database. If we relay it back as-is, the operator may try to
+  // insert hits against a non-existent target row and crash on the FK.
+  if (Object.prototype.hasOwnProperty.call(relayDetails, "target_id")) {
+    (relayDetails as any).owner_hidden_target_id = (relayDetails as any).target_id;
+    delete (relayDetails as any).target_id;
+  }
+  if (Object.prototype.hasOwnProperty.call(relayDetails, "targetId")) {
+    (relayDetails as any).owner_hidden_target_id =
+      (relayDetails as any).owner_hidden_target_id ?? (relayDetails as any).targetId;
+    delete (relayDetails as any).targetId;
+  }
+
+  const alreadyHasInlineVideo =
+    typeof (relayDetails as any).video_mp4_base64 === "string" ||
+    typeof (relayDetails as any).video_data_url === "string" ||
+    typeof (relayDetails as any).videoDataUrl === "string";
+  if (!alreadyHasInlineVideo) {
+    const inlineVideoDataUrl = await loadDrakonFindRelayMediaDataUrl(
+      env,
+      (relayDetails as any).video_key,
+      "video/mp4"
+    );
+    if (inlineVideoDataUrl) {
+      (relayDetails as any).video_mp4_base64 = inlineVideoDataUrl;
+    }
+  }
+  if (
+    typeof (relayDetails as any).video_mp4_base64 === "string" ||
+    typeof (relayDetails as any).video_data_url === "string" ||
+    typeof (relayDetails as any).videoDataUrl === "string"
+  ) {
+    delete (relayDetails as any).video_key;
+    delete (relayDetails as any).video_url;
+  }
+
+  const alreadyHasInlineImage =
+    typeof (relayDetails as any).snapshot_image_data_url === "string" ||
+    typeof (relayDetails as any).image_data_url === "string" ||
+    typeof (relayDetails as any).imageDataUrl === "string";
+  if (!alreadyHasInlineImage) {
+    const inlineImageDataUrl = await loadDrakonFindRelayMediaDataUrl(
+      env,
+      (relayDetails as any).image_key,
+      "image/jpeg"
+    );
+    if (inlineImageDataUrl) {
+      (relayDetails as any).snapshot_image_data_url = inlineImageDataUrl;
+    }
+  }
+  if (
+    typeof (relayDetails as any).snapshot_image_data_url === "string" ||
+    typeof (relayDetails as any).image_data_url === "string" ||
+    typeof (relayDetails as any).imageDataUrl === "string"
+  ) {
+    delete (relayDetails as any).image_key;
+    delete (relayDetails as any).image_url;
+  }
+
+  delete (relayDetails as any).clip_url;
+
+  const ownerCentralContext = await resolveCurrentUserCentralRelayContextById(env, search.user_id);
+  (relayDetails as any).camera_owner_user_id = ownerCentralContext.publicId;
+  sendSharedFindRelayClientMessage(ownerCentralContext.publicId, {
+    type: options.eventType,
+    operator_public_id: search.shared_operator_user_id,
+    operator_search_id: search.shared_operator_search_id,
+    operator_camera_id: operatorCameraId || null,
+    request_id: search.relay_request_id || null,
+    message: options.message,
+    details: relayDetails,
+  });
+}
+
+async function handleSharedFindRelayInboundMessage(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const type = normalizeText(message.type);
+  if (!type || type === "relay_ready" || type === "pong") {
+    return;
+  }
+
+  if (type === "search_start") {
+    try {
+      const created = await createSharedOwnerRuntimeSearch(context.env, context, message);
+      const dispatchResult = await dispatchSingleDrakonFindSearch(
+        context.env,
+        created.hiddenSearchId
+      );
+      const hiddenSearch = await fetchDrakonFindSearchForDispatch(
+        context.env.DB,
+        created.hiddenSearchId
+      );
+      const dispatchStatus = normalizeText(
+        (dispatchResult as Record<string, unknown> | null)?.status ||
+          hiddenSearch?.status ||
+          ""
+      ).toLowerCase();
+      const dispatchError =
+        normalizeText((dispatchResult as Record<string, unknown> | null)?.error) ||
+        normalizeText(hiddenSearch?.last_error);
+      const acceptedDispatch =
+        dispatchStatus === "dispatching" || dispatchStatus === "running";
+
+      if (!acceptedDispatch) {
+        const errorMessage =
+          dispatchError ||
+          (dispatchStatus === "queued"
+            ? "The owner runtime accepted the shared Drakon Find request but could not route it to an eligible local client."
+            : dispatchStatus
+              ? `The owner runtime returned status "${dispatchStatus}" before the shared Drakon Find could go live.`
+              : "The owner runtime did not reach a live dispatch state for the shared Drakon Find request.");
+        const now = new Date().toISOString();
+        await context.env.DB
+          .prepare(
+            `UPDATE drakon_find_searches
+             SET status = 'failed',
+                 last_error = ?,
+                 completed_at = COALESCE(completed_at, ?),
+                 updated_at = ?
+             WHERE id = ?
+               AND user_id = ?`
+          )
+          .bind(errorMessage, now, now, created.hiddenSearchId, context.appUserId)
+          .run();
+        await context.env.DB
+          .prepare(
+            `UPDATE drakon_find_search_cameras
+             SET dispatch_status = CASE
+                   WHEN dispatch_status IN ('queued', 'dispatching', 'sent', 'running') THEN 'failed'
+                   ELSE dispatch_status
+                 END,
+                 last_error = ?,
+                 completed_at = COALESCE(completed_at, ?),
+                 updated_at = ?
+             WHERE search_id = ?`
+          )
+          .bind(errorMessage, now, now, created.hiddenSearchId)
+          .run();
+        await finalizeDrakonFindSearchIfTerminal(context.env.DB, created.hiddenSearchId);
+        sendSharedFindRelayClientMessage(context.publicId, {
+          type: "search_error",
+          operator_public_id: normalizeText(message.operator_public_id),
+          operator_search_id: clampInteger(message.operator_search_id),
+          request_id: normalizeText(message.request_id),
+          error: errorMessage,
+        });
+        return;
+      }
+
+      sendSharedFindRelayClientMessage(context.publicId, {
+        type: "search_ack",
+        operator_public_id: normalizeText(message.operator_public_id),
+        operator_search_id: clampInteger(message.operator_search_id),
+        request_id: normalizeText(message.request_id),
+        hidden_search_id: created.hiddenSearchId,
+        accepted: true,
+      });
+    } catch (error) {
+      sendSharedFindRelayClientMessage(context.publicId, {
+        type: "search_error",
+        operator_public_id: normalizeText(message.operator_public_id),
+        operator_search_id: clampInteger(message.operator_search_id),
+        request_id: normalizeText(message.request_id),
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to start the shared Drakon Find search on the owner runtime.",
+      });
+    }
+    return;
+  }
+
+  if (type === "search_cancel") {
+    const operatorPublicId = normalizeText(message.operator_public_id);
+    const operatorSearchId = clampInteger(message.operator_search_id);
+    if (!operatorPublicId || operatorSearchId <= 0) {
+      return;
+    }
+
+    const { results } = await context.env.DB
+      .prepare(
+        `SELECT id
+         FROM drakon_find_searches
+         WHERE search_origin = 'shared_owner_runtime'
+           AND user_id = ?
+           AND shared_operator_user_id = ?
+           AND shared_operator_search_id = ?`
+      )
+      .bind(context.appUserId, operatorPublicId, operatorSearchId)
+      .all();
+
+    for (const row of results || []) {
+      const hiddenSearchId = clampInteger((row as any)?.id);
+      if (hiddenSearchId <= 0) continue;
+      await requestDrakonFindSearchCancellation(context.env, context.appUserId, hiddenSearchId);
+    }
+    return;
+  }
+
+  if (type === "search_ack") {
+    const operatorSearchId = clampInteger(message.operator_search_id);
+    if (operatorSearchId <= 0) return;
+    const now = new Date().toISOString();
+    await context.env.DB
+      .prepare(
+        `UPDATE drakon_find_searches
+         SET status = CASE
+               WHEN status IN ('queued', 'dispatching') THEN 'dispatching'
+               ELSE status
+             END,
+             last_error = NULL,
+             updated_at = ?
+         WHERE id = ?
+           AND user_id = ?`
+      )
+      .bind(now, operatorSearchId, context.appUserId)
+      .run();
+    return;
+  }
+
+  if (type === "search_error") {
+    const operatorSearchId = clampInteger(message.operator_search_id);
+    if (operatorSearchId <= 0) return;
+    const errorMessage =
+      normalizeText(message.error) || "The shared Drakon Find request failed on the owner runtime.";
+    const now = new Date().toISOString();
+    await context.env.DB
+      .prepare(
+        `UPDATE drakon_find_searches
+         SET status = 'failed',
+             last_error = ?,
+             completed_at = COALESCE(completed_at, ?),
+             updated_at = ?
+         WHERE id = ?
+           AND user_id = ?`
+      )
+      .bind(errorMessage, now, now, operatorSearchId, context.appUserId)
+      .run();
+    await context.env.DB
+      .prepare(
+        `UPDATE drakon_find_search_cameras
+         SET dispatch_status = CASE
+               WHEN dispatch_status IN ('queued', 'dispatching', 'sent', 'running') THEN 'failed'
+               ELSE dispatch_status
+             END,
+             last_error = ?,
+             completed_at = COALESCE(completed_at, ?),
+             updated_at = ?
+         WHERE search_id = ?`
+      )
+      .bind(errorMessage, now, now, operatorSearchId)
+      .run();
+    return;
+  }
+
+  if (type.startsWith("drakon_find_")) {
+    const operatorSearchId = clampInteger(message.operator_search_id);
+    const operatorCameraId = clampInteger(message.operator_camera_id);
+    if (operatorSearchId <= 0) {
+      return;
+    }
+
+    const details =
+      message.details && typeof message.details === "object" && !Array.isArray(message.details)
+        ? ({ ...(message.details as Record<string, unknown>) } as Record<string, unknown>)
+        : {};
+    details.search_id = operatorSearchId;
+    if (operatorCameraId > 0) {
+      details.camera_id = operatorCameraId;
+      details.operator_camera_id = operatorCameraId;
+    }
+
+    try {
+      await handleDrakonFindAgentEvent(context.env, {
+        eventType: type,
+        clientId: `relay:${normalizeText(message.sender_public_id) || "owner"}`,
+        exeId: "relay",
+        cameraId: operatorCameraId > 0 ? operatorCameraId : null,
+        message: normalizeText(message.message),
+        details,
+        receivedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error("[SHARED FIND RELAY] Failed to materialize inbound Drakon Find event", {
+        operatorSearchId,
+        operatorCameraId,
+        type,
+        error,
+      });
+      const now = new Date().toISOString();
+      await context.env.DB
+        .prepare(
+          `UPDATE drakon_find_searches
+           SET last_error = ?,
+               updated_at = ?
+           WHERE id = ?
+             AND user_id = ?`
+        )
+        .bind(
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to process the shared Drakon Find relay event.",
+          now,
+          operatorSearchId,
+          context.appUserId
+        )
+        .run();
+    }
+  }
 }
 
 function normalizeDatabaseErrorMessage(error: unknown): string {
@@ -9645,6 +12031,582 @@ app.patch("/api/identity/handle", async (c) => {
   });
 });
 
+app.post("/api/find-share-users/resolve", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      query?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  if (!resolved) {
+    return c.json({ error: "No user matched the provided handle or email." }, 404);
+  }
+  if (resolved.public_id === verified.claims.public_id) {
+    return c.json({ error: "You cannot invite the same account." }, 409);
+  }
+
+  return c.json({
+    user: {
+      public_id: resolved.public_id,
+      email: resolved.email,
+      handle: resolved.handle,
+      display_label: resolved.display_label,
+    },
+  });
+});
+
+app.post("/api/find-shares", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      invitee_public_id?: string;
+      query?: string;
+      owner_local_camera_id?: number;
+      camera_name?: string;
+      city?: string;
+      state_code?: string;
+      country_code?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const inviteePublicId = normalizeText(body.invitee_public_id);
+  const resolvedInvitee = inviteePublicId
+    ? {
+        public_id: inviteePublicId,
+      }
+    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  if (!resolvedInvitee?.public_id) {
+    return c.json({ error: "No user matched the provided handle or email." }, 404);
+  }
+
+  try {
+    const share = await createOrUpdateCentralCameraFindShare(c.env.DB, {
+      ownerPublicId: verified.claims.public_id,
+      inviteePublicId: resolvedInvitee.public_id,
+      ownerLocalCameraId: clampInteger(body.owner_local_camera_id),
+      cameraName: normalizeText(body.camera_name),
+      city: normalizeOptionalText(body.city),
+      stateCode: normalizeOptionalText(body.state_code),
+      countryCode: normalizeCountryCode(body.country_code, null) || "BR",
+    });
+    if (!share) {
+      return c.json({ error: "Failed to create the shared camera invitation." }, 500);
+    }
+    return c.json({ share }, 201);
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message
+        ? error.message
+        : "Failed to create the shared camera invitation.";
+    return c.json({ error: message }, 400);
+  }
+});
+
+app.get("/api/find-shares/incoming", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const shares = await listCentralCameraFindShares(c.env.DB, {
+    role: "incoming",
+    publicId: verified.claims.public_id,
+  });
+  return c.json({ shares });
+});
+
+app.get("/api/find-shares/outgoing", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const ownerLocalCameraId = clampInteger(c.req.query("camera_id"));
+  const shares = await listCentralCameraFindShares(c.env.DB, {
+    role: "outgoing",
+    publicId: verified.claims.public_id,
+    ownerLocalCameraId: ownerLocalCameraId > 0 ? ownerLocalCameraId : null,
+  });
+  return c.json({ shares });
+});
+
+app.get("/api/find-shares/available-cameras", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const cameras = await listCentralAvailableCameraFindShares(
+    c.env.DB,
+    verified.claims.public_id
+  );
+  return c.json({ cameras });
+});
+
+app.post("/api/find-shares/:shareId/accept", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralCameraFindShareStatus(c.env.DB, {
+    shareId: clampInteger(c.req.param("shareId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "accepted",
+  });
+  if (!result.share) {
+    return c.json({ error: result.error || "Shared camera invitation not found." }, result.status as any);
+  }
+  return c.json({ share: result.share });
+});
+
+app.post("/api/find-shares/:shareId/deny", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralCameraFindShareStatus(c.env.DB, {
+    shareId: clampInteger(c.req.param("shareId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "denied",
+  });
+  if (!result.share) {
+    return c.json({ error: result.error || "Shared camera invitation not found." }, result.status as any);
+  }
+  return c.json({ share: result.share });
+});
+
+app.post("/api/find-shares/:shareId/revoke", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralCameraFindShareStatus(c.env.DB, {
+    shareId: clampInteger(c.req.param("shareId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "revoked",
+  });
+  if (!result.share) {
+    return c.json({ error: result.error || "Shared camera invitation not found." }, result.status as any);
+  }
+  return c.json({ share: result.share });
+});
+
+app.post("/api/find-relay/session", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const session = issueSharedFindRelaySession(verified.claims.public_id, 120_000);
+  const requestUrl = new URL(c.req.url);
+  const forwardedProto = normalizeText(c.req.header("x-forwarded-proto"))
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const forwardedHost = normalizeText(c.req.header("x-forwarded-host"))
+    .split(",")[0]
+    .trim();
+  const host = forwardedHost || normalizeText(c.req.header("host")) || requestUrl.host;
+  const forwardedPrefixRaw = normalizeText(c.req.header("x-forwarded-prefix"))
+    .split(",")[0]
+    .trim();
+  const forwardedPrefix = forwardedPrefixRaw
+    ? `/${forwardedPrefixRaw.replace(/^\/+|\/+$/g, "")}`
+    : "";
+  const wsProtocol =
+    forwardedProto === "https" || requestUrl.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = new URL(`${wsProtocol}//${host}`);
+  wsUrl.pathname = `${forwardedPrefix}/ws/find-relay`.replace(/\/{2,}/g, "/");
+  wsUrl.searchParams.set("token", session.token);
+
+  return c.json({
+    success: true,
+    token: session.token,
+    public_id: session.public_id,
+    expires_at: session.expires_at,
+    ws_url: wsUrl.toString(),
+  });
+});
+
+app.post("/api/find-relay/searches", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      request_id?: string;
+      operator_search_id?: number;
+      target?: Record<string, unknown>;
+      reference_images?: Array<Record<string, unknown>>;
+      camera_requests?: Array<Record<string, unknown>>;
+      duration_seconds?: number;
+      run_until?: string;
+      selected_states?: string[];
+      country_code?: string;
+      scope_snapshot?: Record<string, unknown>;
+      model_name?: string;
+      model_api_key?: string;
+      model_provider?: string;
+      model_fps?: number;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const operatorSearchId = clampInteger(body.operator_search_id);
+  const cameraRequests = Array.isArray(body.camera_requests) ? body.camera_requests : [];
+  if (operatorSearchId <= 0 || cameraRequests.length === 0) {
+    return c.json({ error: "operator_search_id and camera_requests are required." }, 400);
+  }
+
+  const normalizedCameraRequests: Array<Record<string, unknown>> = [];
+  let ownerPublicId = "";
+  for (const cameraRequest of cameraRequests) {
+    const shareId = clampInteger((cameraRequest as any)?.share_id);
+    const share = await getCentralCameraFindShareById(c.env.DB, shareId);
+    if (!share) {
+      return c.json({ error: `Shared camera #${shareId} was not found.` }, 404);
+    }
+    if (share.invitee_public_id !== verified.claims.public_id || share.status !== "accepted") {
+      return c.json({ error: `Shared camera #${shareId} is not available for this account.` }, 403);
+    }
+    if (!ownerPublicId) {
+      ownerPublicId = share.owner_public_id;
+    }
+    if (share.owner_public_id !== ownerPublicId) {
+      return c.json({ error: "Each relay dispatch must target a single owner runtime." }, 400);
+    }
+
+    normalizedCameraRequests.push({
+      share_id: share.id,
+      operator_camera_id: clampInteger((cameraRequest as any)?.operator_camera_id),
+      owner_public_id: share.owner_public_id,
+      owner_local_camera_id: share.owner_local_camera_id,
+      camera_name: share.camera_name,
+      city: share.city,
+      state_code: share.state_code,
+      country_code: share.country_code,
+    });
+  }
+
+  if (!ownerPublicId || countSharedFindRelayConnections(ownerPublicId) <= 0) {
+    return c.json({ error: "The owner runtime is offline for this shared camera set." }, 409);
+  }
+
+  const requestId = normalizeText(body.request_id) || generateUUID();
+  const ackPromise = waitForSharedFindRelayDispatchAck({
+    ownerPublicId,
+    operatorPublicId: verified.claims.public_id,
+    operatorSearchId,
+    requestId,
+  });
+  const forwarded = sendSharedFindRelayMessage(ownerPublicId, {
+    type: "search_start",
+    request_id: requestId,
+    operator_public_id: verified.claims.public_id,
+    operator_search_id: operatorSearchId,
+    duration_seconds: normalizeDrakonFindDurationSeconds(body.duration_seconds),
+    run_until: normalizeText(body.run_until),
+    selected_states: normalizeBrazilStateSelection(body.selected_states || []),
+    country_code: normalizeCountryCode(body.country_code, null) || "BR",
+    scope_snapshot: parseJsonObject(body.scope_snapshot) || {},
+    target:
+      body.target && typeof body.target === "object" && !Array.isArray(body.target)
+        ? body.target
+        : {},
+    reference_images: Array.isArray(body.reference_images) ? body.reference_images : [],
+    camera_requests: normalizedCameraRequests,
+    model_name: normalizeOptionalText(body.model_name),
+    model_api_key: normalizeOptionalText(body.model_api_key),
+    model_provider: normalizeOptionalText(body.model_provider),
+    model_fps: Math.max(0, clampInteger(body.model_fps)),
+  });
+
+  if (forwarded <= 0) {
+    cancelSharedFindRelayDispatchAckWait({
+      ownerPublicId,
+      operatorPublicId: verified.claims.public_id,
+      operatorSearchId,
+      requestId,
+    });
+    return c.json({ error: "Failed to forward the shared Drakon Find request to the owner runtime." }, 409);
+  }
+
+  const ackResult = await ackPromise;
+  if (!ackResult.ok) {
+    return c.json(
+      {
+        error:
+          ackResult.error ||
+          "The owner runtime did not acknowledge the shared Drakon Find dispatch.",
+      },
+      409
+    );
+  }
+
+  return c.json({
+    success: true,
+    request_id: requestId,
+    owner_public_id: ownerPublicId,
+    forwarded,
+  });
+});
+
+app.post("/api/find-relay/searches/:operatorSearchId/cancel", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const operatorSearchId = clampInteger(c.req.param("operatorSearchId"));
+  if (operatorSearchId <= 0) {
+    return c.json({ error: "Invalid operator search id." }, 400);
+  }
+
+  const body =
+    (await c.req
+    .json<{
+      owner_public_ids?: string[];
+      request_id?: string;
+    }>()
+    .catch(() => null)) || {};
+
+  const ownerPublicIds = Array.from(
+    new Set(
+      Array.isArray(body.owner_public_ids)
+        ? body.owner_public_ids
+            .map((value: string) => normalizeText(value))
+            .filter(Boolean)
+        : []
+    )
+  );
+  if (ownerPublicIds.length === 0) {
+    return c.json({ error: "owner_public_ids is required." }, 400);
+  }
+
+  let forwarded = 0;
+  for (const ownerPublicId of ownerPublicIds) {
+    forwarded += sendSharedFindRelayMessage(ownerPublicId, {
+      type: "search_cancel",
+      request_id: normalizeText(body.request_id) || null,
+      operator_public_id: verified.claims.public_id,
+      operator_search_id: operatorSearchId,
+    });
+  }
+
+  return c.json({
+    success: true,
+    operator_search_id: operatorSearchId,
+    forwarded,
+  });
+});
+
+app.post("/api/shared-find/users/resolve", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      query?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    "/api/find-share-users/resolve",
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {
+        query: body.query,
+      },
+    }
+  );
+
+  return c.json(
+    remote.data || {
+      error: "Unable to resolve the requested shared camera user.",
+    },
+    (remote.response.status || 502) as any
+  );
+});
+
+app.get("/api/shared-find/incoming", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const synced = await syncSharedFindCameraCacheForUser(c.env, user);
+  return c.json({
+    shares: synced.incoming,
+    sync_error: synced.sync_error,
+  });
+});
+
+app.get("/api/shared-find/outgoing", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameraId = clampInteger(c.req.query("camera_id"));
+  const synced = await syncSharedFindCameraCacheForUser(c.env, user);
+  const shares =
+    cameraId > 0
+      ? synced.outgoing.filter(
+          (share: CentralCameraFindShareRow) => share.owner_local_camera_id === cameraId
+        )
+      : synced.outgoing;
+  return c.json({
+    shares,
+    sync_error: synced.sync_error,
+  });
+});
+
+app.post("/api/shared-find/sync", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  await maybeEnsureSharedFindRelayForUser(c.env, user);
+  const synced = await syncSharedFindCameraCacheForUser(c.env, user);
+  return c.json({
+    incoming: synced.incoming,
+    outgoing: synced.outgoing,
+    available: synced.available,
+    cameras: synced.cameras,
+    sync_error: synced.sync_error,
+  });
+});
+
+app.get("/api/shared-find/cameras", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameras = await listSharedFindCameraCacheForUser(c.env.DB, user.id);
+  return c.json({ cameras });
+});
+
+app.post("/api/shared-find/cameras/:cameraId/shares", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const cameraId = clampInteger(c.req.param("cameraId"));
+  if (cameraId <= 0) {
+    return c.json({ error: "Invalid camera id." }, 400);
+  }
+
+  const body = await c.req
+    .json<{
+      query?: string;
+      invitee_public_id?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const cameraRow = await c.env.DB
+    .prepare(
+      `SELECT id, user_id, name, city, state_code, country_code
+       FROM cameras
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`
+    )
+    .bind(cameraId, user.id)
+    .first();
+  if (!cameraRow) {
+    return c.json({ error: "Camera not found." }, 404);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/find-shares", {
+    method: "POST",
+    token: centralContext.grantToken,
+    body: {
+      query: body.query,
+      invitee_public_id: normalizeText(body.invitee_public_id),
+      owner_local_camera_id: cameraId,
+      camera_name: normalizeText((cameraRow as any)?.name),
+      city: normalizeOptionalText((cameraRow as any)?.city),
+      state_code: normalizeOptionalText((cameraRow as any)?.state_code),
+      country_code: normalizeCountryCode((cameraRow as any)?.country_code, null) || "BR",
+    },
+  });
+
+  if (remote.response.ok) {
+    await syncSharedFindCameraCacheForUser(c.env, user);
+  }
+
+  return c.json(
+    remote.data || { error: "Failed to create the shared camera invitation." },
+    (remote.response.status || 502) as any
+  );
+});
+
+app.post("/api/shared-find/shares/:shareId/accept", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/accept`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  if (remote.response.ok) {
+    await syncSharedFindCameraCacheForUser(c.env, user);
+    await maybeEnsureSharedFindRelayForUser(c.env, user);
+  }
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post("/api/shared-find/shares/:shareId/deny", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/deny`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  if (remote.response.ok) {
+    await syncSharedFindCameraCacheForUser(c.env, user);
+  }
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post("/api/shared-find/shares/:shareId/revoke", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/find-shares/${encodeURIComponent(String(clampInteger(c.req.param("shareId"))))}/revoke`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  if (remote.response.ok) {
+    await syncSharedFindCameraCacheForUser(c.env, user);
+  }
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
 // Local auth endpoints
 app.post("/api/auth/local/signup", async (c) => {
   // Ensure schema is initialized
@@ -10052,6 +13014,10 @@ app.get("/api/auth/me", async (c) => {
       const user = await getGoogleSessionUser(c.env.DB, googleCookie);
 
       if (user) {
+        void maybeEnsureSharedFindRelayForUser(c.env, {
+          id: user.id,
+          email: user.email,
+        }).catch(() => {});
         console.log("[auth/me] -> google (canonical ID:", user.id, ")");
         return c.json({
           isAuthenticated: true,
@@ -10089,6 +13055,10 @@ app.get("/api/auth/me", async (c) => {
         locale: sessionData.locale || null,
       });
       const profile = await getAppUserProfile(c.env.DB, appUserId);
+      void maybeEnsureSharedFindRelayForUser(c.env, {
+        id: appUserId,
+        email: sessionData.email,
+      }).catch(() => {});
       console.log("[auth/me] -> local");
       return c.json({
         isAuthenticated: true,
@@ -14319,6 +17289,218 @@ async function enqueueStartCameraCommand(
   }
 }
 
+const DEFAULT_WEBCAM_PROBE_INDICES = [0, 1, 2, 3, 4, 5] as const;
+
+function collectWebcamProbeIndices(value: unknown): number[] {
+  const source = Array.isArray(value) ? value : [];
+  const normalized: number[] = [];
+
+  for (const entry of source) {
+    const numeric = Number(entry);
+    if (!Number.isInteger(numeric) || numeric < 0 || numeric > 5) {
+      continue;
+    }
+    if (!normalized.includes(numeric)) {
+      normalized.push(numeric);
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeWebcamProbeIndices(value: unknown): number[] {
+  const normalized = collectWebcamProbeIndices(value);
+  return normalized.length > 0 ? normalized : [...DEFAULT_WEBCAM_PROBE_INDICES];
+}
+
+function parseOptionalNonNegativeInteger(value: unknown): number | null {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function delayMs(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+async function waitForCommandTerminalResult(
+  db: D1Database,
+  userId: string,
+  commandId: number,
+  timeoutMs = 8000,
+  pollIntervalMs = 400
+): Promise<{
+  status: "completed" | "failed";
+  envelope: Record<string, unknown>;
+} | null> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const row = await db
+      .prepare(
+        `SELECT status, result
+         FROM commands
+         WHERE id = ? AND user_id = ?
+         LIMIT 1`
+      )
+      .bind(commandId, userId)
+      .first();
+
+    const status =
+      typeof (row as any)?.status === "string" ? String((row as any).status).trim().toLowerCase() : "";
+    if (status === "completed" || status === "failed") {
+      return {
+        status,
+        envelope: parseJsonObject((row as any)?.result),
+      };
+    }
+
+    await delayMs(pollIntervalMs);
+  }
+
+  return null;
+}
+
+async function enqueueWebcamProbeCommand(
+  env: Env,
+  userId: string,
+  requestedIndices: unknown
+): Promise<{
+  success: boolean;
+  probeStatus?: "ready" | "missing";
+  preferredIndex?: number | null;
+  respondingIndices?: number[];
+  attemptedIndices?: number[];
+  error?: string;
+}> {
+  const attemptedIndices = normalizeWebcamProbeIndices(requestedIndices);
+  const pairing = await env.DB.prepare(
+    `SELECT client_id, exe_id
+     FROM exe_pairings
+     WHERE user_id = ? AND status = 'connected'
+     ORDER BY COALESCE(last_seen_at, created_at) DESC
+     LIMIT 1`
+  )
+    .bind(userId)
+    .first();
+
+  if (!pairing) {
+    return {
+      success: false,
+      attemptedIndices,
+      error: "No EXE connected",
+    };
+  }
+
+  const clientId =
+    typeof (pairing as any)?.client_id === "string" && String((pairing as any).client_id).trim()
+      ? String((pairing as any).client_id).trim()
+      : null;
+  const exeId =
+    typeof (pairing as any)?.exe_id === "string" && String((pairing as any).exe_id).trim()
+      ? String((pairing as any).exe_id).trim()
+      : null;
+
+  if (!clientId) {
+    return {
+      success: false,
+      attemptedIndices,
+      error: "Connected EXE is missing a client id",
+    };
+  }
+
+  const now = new Date().toISOString();
+  const insertResult = await env.DB.prepare(
+    `INSERT INTO commands (
+       user_id,
+       camera_id,
+       command_type,
+       payload,
+       status,
+       created_at,
+       updated_at,
+       target_client_id,
+       target_exe_id
+     )
+     VALUES (?, NULL, 'probe_webcams', ?, 'pending', ?, ?, ?, ?)`
+  )
+    .bind(
+      userId,
+      JSON.stringify({ indices: attemptedIndices }),
+      now,
+      now,
+      clientId,
+      exeId
+    )
+    .run();
+
+  const commandId = Number(insertResult.meta.last_row_id || 0);
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return {
+      success: false,
+      attemptedIndices,
+      error: "Failed to enqueue webcam probe command",
+    };
+  }
+
+  const terminalResult = await waitForCommandTerminalResult(env.DB, userId, commandId);
+  if (!terminalResult) {
+    const timeoutAt = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE commands
+       SET status = 'failed', result = ?, updated_at = ?
+       WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
+    )
+      .bind(
+        JSON.stringify({
+          status: "failed",
+          result: null,
+          error: "webcam probe timed out",
+          reported_at: timeoutAt,
+        }),
+        timeoutAt,
+        commandId,
+        userId
+      )
+      .run();
+
+    return {
+      success: false,
+      attemptedIndices,
+      error: "Webcam probe timed out",
+    };
+  }
+
+  if (terminalResult.status === "failed") {
+    const commandError =
+      typeof terminalResult.envelope.error === "string" && terminalResult.envelope.error.trim()
+        ? terminalResult.envelope.error.trim()
+        : "Webcam probe failed";
+
+    return {
+      success: false,
+      attemptedIndices,
+      error: commandError,
+    };
+  }
+
+  const resultObject = parseJsonObject(terminalResult.envelope.result);
+  const respondingIndices = collectWebcamProbeIndices(resultObject.responding_indices);
+  const preferredIndex = parseOptionalNonNegativeInteger(resultObject.preferred_index);
+
+  return {
+    success: true,
+    probeStatus: respondingIndices.length > 0 ? "ready" : "missing",
+    preferredIndex,
+    respondingIndices,
+    attemptedIndices: (() => {
+      const normalizedAttempted = collectWebcamProbeIndices(resultObject.attempted_indices);
+      return normalizedAttempted.length > 0 ? normalizedAttempted : attemptedIndices;
+    })(),
+  };
+}
+
 async function enqueueUpdateAlgorithmsIfCameraRunning(
   db: D1Database,
   userId: string,
@@ -14407,6 +17589,31 @@ app.post("/api/cameras/:cameraId/start", anyAuthMiddleware, async (c) => {
   });
 });
 
+app.post("/api/webcams/probe", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const body = await c.req.json().catch(() => ({}));
+  const attemptedIndices = normalizeWebcamProbeIndices((body as Record<string, unknown>)?.indices);
+  const result = await enqueueWebcamProbeCommand(c.env, user.id, attemptedIndices);
+
+  if (!result.success) {
+    return c.json({
+      status: "unavailable",
+      preferred_index: null,
+      responding_indices: [],
+      attempted_indices: result.attemptedIndices ?? attemptedIndices,
+      error: result.error || "Unable to probe webcams on this machine.",
+    });
+  }
+
+  return c.json({
+    status: result.probeStatus,
+    preferred_index: result.preferredIndex ?? null,
+    responding_indices: result.respondingIndices ?? [],
+    attempted_indices: result.attemptedIndices ?? attemptedIndices,
+    error: null,
+  });
+});
+
 // EXE bootstrap endpoint - enqueue start_camera commands for all cameras marked as running
 app.post("/api/agent/bootstrap-cameras", async (c) => {
   const url = new URL(c.req.url);
@@ -14440,6 +17647,7 @@ app.post("/api/agent/bootstrap-cameras", async (c) => {
   const userId = (pairing as any).user_id;
 
   console.log(`[BOOTSTRAP] Starting camera bootstrap for user ${userId}`);
+  await ensureSharedFindRelayForBackgroundUser(c.env, { id: String(userId || "") }, "agent_bootstrap");
 
   // Get all cameras that should be running
   const { results: cameras } = await c.env.DB.prepare(
@@ -17970,10 +21178,12 @@ app.post(
     const disabled = requireDrakonFindEnabled(c);
     if (disabled) return disabled;
 
+    const user = c.get("user")!;
     const data = c.req.valid("json");
     try {
       const scope = await resolveDrakonFindScope(
         c.env.DB,
+        user.id,
         data.selected_states,
         data.country_code
       );
@@ -18076,6 +21286,10 @@ app.post(
     }
 
     try {
+      if (!isCentralIdentityClientConfigured(c.env)) {
+        return c.json({ error: "Central identity server is not configured." }, 503);
+      }
+
       try {
         await chooseDrakonFindModelConfig(c.env.DB, user.id);
       } catch (error) {
@@ -18086,6 +21300,7 @@ app.post(
 
       const scope = await resolveDrakonFindScope(
         c.env.DB,
+        user.id,
         data.selected_states,
         data.country_code
       );
@@ -18102,7 +21317,7 @@ app.post(
         return c.json(
           {
             error:
-              "No public-access cameras remain after applying the selected Drakon Find filters",
+              "No shared cameras remain after applying the selected Drakon Find filters",
           },
           409
         );
@@ -18110,6 +21325,7 @@ app.post(
 
       const { eligible_cameras: eligibleCameras, ...scopeSnapshot } = filteredScope;
       const now = new Date().toISOString();
+      const relayRequestId = generateUUID();
       const durationSeconds = normalizeDrakonFindDurationSeconds(data.duration_seconds);
       const runUntil = new Date(Date.now() + durationSeconds * 1000).toISOString();
 
@@ -18119,6 +21335,8 @@ app.post(
              user_id,
              target_id,
              status,
+             search_origin,
+             relay_request_id,
              runtime_mode,
              input_type,
              window_seconds,
@@ -18132,11 +21350,12 @@ app.post(
              created_at,
              updated_at
            )
-           VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           VALUES (?, ?, 'queued', 'shared_operator', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
            user.id,
            data.target_id,
+           relayRequestId,
            DRAKON_FIND_RUNTIME_MODE,
            "video",
            DRAKON_FIND_WINDOW_SECONDS,
@@ -18163,6 +21382,8 @@ app.post(
             `INSERT INTO drakon_find_search_cameras (
                search_id,
                camera_id,
+               share_id,
+               shared_owner_local_camera_id,
                camera_owner_user_id,
                camera_name,
                city,
@@ -18172,18 +21393,19 @@ app.post(
                created_at,
                updated_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
              ON CONFLICT(search_id, camera_id) DO NOTHING`
           )
           .bind(
             searchId,
             camera.id,
+            camera.share_id,
+            camera.owner_local_camera_id,
             camera.user_id,
             camera.name,
             camera.city,
             camera.state_code,
             camera.country_code,
-            camera.allowpublicaccess ? 1 : 0,
             now,
             now
           )
@@ -22150,9 +25372,13 @@ app.post("/api/agent/drakon-find-hit-media", async (c) => {
   const pairingExeId = String((pairing as any)?.exe_id || "");
   const assignment = await c.env.DB
     .prepare(
-      `SELECT s.user_id AS operator_user_id,
+      `SELECT s.user_id AS search_user_id,
+              s.search_origin,
+              s.shared_operator_user_id,
+              s.shared_operator_search_id,
               sc.assigned_client_id,
-              sc.assigned_exe_id
+              sc.assigned_exe_id,
+              sc.relay_operator_camera_id
        FROM drakon_find_searches s
        JOIN drakon_find_search_cameras sc
          ON sc.search_id = s.id
@@ -22198,11 +25424,27 @@ app.post("/api/agent/drakon-find-hit-media", async (c) => {
       ? contentTypeHeader
       : fallbackContentType;
 
-  const operatorUserId = String((assignment as any)?.operator_user_id || "").trim();
+  const searchUserId = String((assignment as any)?.search_user_id || "").trim();
+  const searchOrigin = String((assignment as any)?.search_origin || "local").trim();
+  const sharedOperatorUserId = String((assignment as any)?.shared_operator_user_id || "").trim();
+  const sharedOperatorSearchId = clampInteger((assignment as any)?.shared_operator_search_id);
+  const relayOperatorCameraId = clampInteger((assignment as any)?.relay_operator_camera_id);
+
+  const storageUserId =
+    searchOrigin === "shared_owner_runtime" ? sharedOperatorUserId || searchUserId : searchUserId;
+  const storageSearchId =
+    searchOrigin === "shared_owner_runtime" ? sharedOperatorSearchId || searchId : searchId;
+  const storageCameraId =
+    searchOrigin === "shared_owner_runtime" ? relayOperatorCameraId || cameraId : cameraId;
+
+  if (!storageUserId || storageSearchId <= 0 || storageCameraId <= 0) {
+    return c.json({ error: "Drakon Find media upload is missing operator relay context" }, 409);
+  }
+
   const storageKey = buildDrakonFindHitStorageKey(
-    operatorUserId,
-    searchId,
-    cameraId,
+    storageUserId,
+    storageSearchId,
+    storageCameraId,
     contentType
   );
 
@@ -22224,6 +25466,9 @@ app.post("/api/agent/drakon-find-hit-media", async (c) => {
     camera_id: cameraId,
     attempt_count: attemptCount,
     time_in_video: timeInVideo || null,
+    relay_passthrough: searchOrigin === "shared_owner_runtime",
+    operator_search_id: searchOrigin === "shared_owner_runtime" ? storageSearchId : null,
+    operator_camera_id: searchOrigin === "shared_owner_runtime" ? storageCameraId : null,
   });
 });
 
@@ -31813,6 +35058,11 @@ app.post("/api/scheduler/tick", async (c) => {
         exeTokenHash: exeBearerTokenHash,
         timezoneInput: exeTimezoneHeader,
       });
+      await ensureSharedFindRelayForBackgroundUser(
+        c.env,
+        { id: String(exeBearerUserId || "") },
+        "scheduler_tick"
+      );
     }
 
     // runJobSchedulerTick already handles:

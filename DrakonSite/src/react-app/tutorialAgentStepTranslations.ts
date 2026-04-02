@@ -7,10 +7,14 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.complete.title": "Tutorial completed",
     "tutorial.complete.description":
       "Your tutorial camera and the thumbs up detector are now configured and turned on.",
+    "tutorial.complete.descriptionWithoutWebcam":
+      "Your tutorial camera and agent were created, but inference was not started automatically because you chose to continue without a responding webcam on this machine.",
     "tutorial.complete.bullet1":
       "The custom agent stays available in Algorithms, where you can enable or pause it anytime.",
     "tutorial.complete.bullet2":
       "The camera is also running in AI Agents, so you can test the full flow right away.",
+    "tutorial.complete.bullet2WithoutWebcam":
+      "When a webcam is connected and responding, use the start button in AI Agents to start the camera manually.",
     "tutorial.complete.visualCaption":
       "Stand in front of the tutorial camera and make a thumbs up gesture to verify the detector.",
     "tutorial.agentIntro.title": "Stage 3: Build an AI agent",
@@ -55,7 +59,23 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentCameraStart.title": "Start the tutorial camera",
     "tutorial.agentCameraStart.description":
       "We are back in AI Agents. This button starts or stops the camera service itself. Start it now so the thumbs up detector can receive frames from the tutorial webcam.",
+    "tutorial.agentCameraStart.descriptionWithoutWebcam":
+      "We are back in AI Agents. Because you chose to continue without a responding webcam, we will only highlight the start button here. The camera will not be started automatically in this step.",
     "tutorial.agentCameraStart.primary": "Start tutorial camera",
+    "tutorial.cameraWebcamProbe.probing":
+      "Checking whether a webcam is responding on this machine...",
+    "tutorial.cameraWebcamProbe.ready":
+      "A responding webcam was found on this machine. The tutorial will use webcam index {{index}}.",
+    "tutorial.cameraWebcamProbe.missing":
+      "No responding webcam was detected on this machine. Connect one to continue correctly, or continue anyway to reach Stage 3.",
+    "tutorial.cameraWebcamProbe.unknown":
+      "We could not confirm webcam availability on this machine. If the desktop EXE is offline, you can still continue manually.",
+    "tutorial.cameraWebcamProbe.modalTitle": "Connect a webcam now?",
+    "tutorial.cameraWebcamProbe.modalDescription":
+      "To finish this tutorial step the intended way, connect a webcam and try again. If you prefer, you can continue without a webcam, create the camera anyway, and keep going to agent creation.",
+    "tutorial.cameraWebcamProbe.connectAndRetry": "Connect and try again",
+    "tutorial.cameraWebcamProbe.continueWithout": "Continue without webcam",
+    "tutorial.cameraWebcamProbe.keepEditing": "Keep editing",
     "tutorial.agentPreset.name": "thumbs up detector",
     "tutorial.agentPreset.promptCore":
       "Recognize any person making a thumbs up gesture with their hand.",
@@ -70,10 +90,14 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.complete.title": "Tutorial completado",
     "tutorial.complete.description":
       "La camara del tutorial y el detector de pulgar arriba ya quedaron configurados y encendidos.",
+    "tutorial.complete.descriptionWithoutWebcam":
+      "La camara y el agente del tutorial fueron creados, pero la inferencia no se inicio automaticamente porque elegiste continuar sin una webcam que respondiera en esta maquina.",
     "tutorial.complete.bullet1":
       "El custom agent queda disponible en Algorithms, donde puedes activarlo o pausarlo cuando quieras.",
     "tutorial.complete.bullet2":
       "La camara tambien esta corriendo en AI Agents, asi que puedes probar el flujo completo ahora mismo.",
+    "tutorial.complete.bullet2WithoutWebcam":
+      "Cuando conectes una webcam que responda, puedes usar el boton de inicio en AI Agents para arrancar la camara manualmente.",
     "tutorial.complete.visualCaption":
       "Ponte frente a la camara del tutorial y haz la senal de pulgar arriba para verificar el detector.",
     "tutorial.agentIntro.title": "Etapa 3: Crear un agente de IA",
@@ -118,7 +142,23 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentCameraStart.title": "Iniciar la camara del tutorial",
     "tutorial.agentCameraStart.description":
       "Ya volvimos a AI Agents. Este boton inicia o detiene el servicio de la camara. Iniciala ahora para que el detector de pulgar arriba reciba frames de la tutorial webcam.",
+    "tutorial.agentCameraStart.descriptionWithoutWebcam":
+      "Ya volvimos a AI Agents. Como elegiste continuar sin una webcam que responda, aqui solo vamos a resaltar el boton de inicio. La camara no se iniciara automaticamente en este paso.",
     "tutorial.agentCameraStart.primary": "Iniciar camara del tutorial",
+    "tutorial.cameraWebcamProbe.probing":
+      "Verificando si hay una webcam respondiendo en esta maquina...",
+    "tutorial.cameraWebcamProbe.ready":
+      "Se encontro una webcam respondiendo en esta maquina. El tutorial usara el indice {{index}}.",
+    "tutorial.cameraWebcamProbe.missing":
+      "No se detecto ninguna webcam respondiendo en esta maquina. Conecta una para continuar correctamente o sigue de todos modos para llegar a la Etapa 3.",
+    "tutorial.cameraWebcamProbe.unknown":
+      "No pudimos confirmar la disponibilidad de una webcam en esta maquina. Si el EXE desktop esta offline, aun puedes continuar manualmente.",
+    "tutorial.cameraWebcamProbe.modalTitle": "Quieres conectar una webcam ahora?",
+    "tutorial.cameraWebcamProbe.modalDescription":
+      "Para completar esta etapa del tutorial como fue pensada, conecta una webcam y vuelve a intentarlo. Si prefieres, puedes continuar sin webcam, crear la camara igual y seguir hasta la creacion del agente.",
+    "tutorial.cameraWebcamProbe.connectAndRetry": "Conectar y volver a intentar",
+    "tutorial.cameraWebcamProbe.continueWithout": "Seguir sin webcam",
+    "tutorial.cameraWebcamProbe.keepEditing": "Seguir editando",
     "tutorial.agentPreset.name": "detector de pulgar arriba",
     "tutorial.agentPreset.promptCore":
       "Reconoce a cualquier persona haciendo la senal de pulgar arriba con la mano.",
@@ -133,10 +173,14 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.complete.title": "Tutorial concluido",
     "tutorial.complete.description":
       "A camera do tutorial e o detector de afirmativo agora estao configurados e ligados.",
+    "tutorial.complete.descriptionWithoutWebcam":
+      "A camera e o agente do tutorial foram criados, mas a inferencia nao foi iniciada automaticamente porque voce escolheu continuar sem uma webcam respondendo nesta maquina.",
     "tutorial.complete.bullet1":
       "O custom agent continua disponivel em Algorithms, onde voce pode ligar ou pausar esse agente quando quiser.",
     "tutorial.complete.bullet2":
       "A camera tambem esta rodando em AI Agents, entao voce ja pode testar o fluxo completo.",
+    "tutorial.complete.bullet2WithoutWebcam":
+      "Quando uma webcam estiver conectada e respondendo, voce pode usar o botao de start em AI Agents para iniciar a camera manualmente.",
     "tutorial.complete.visualCaption":
       "Fique na frente da camera do tutorial e faca o sinal de afirmativo com a mao para verificar a deteccao.",
     "tutorial.agentIntro.title": "Etapa 3: Criar um agente de IA",
@@ -181,7 +225,23 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentCameraStart.title": "Iniciar a camera do tutorial",
     "tutorial.agentCameraStart.description":
       "Agora estamos de volta em AI Agents. Este botao inicia ou para o servico da camera. Inicie agora para que o detector de afirmativo receba frames da tutorial webcam.",
+    "tutorial.agentCameraStart.descriptionWithoutWebcam":
+      "Agora estamos de volta em AI Agents. Como voce escolheu continuar sem uma webcam respondendo, vamos apenas destacar o botao de start aqui. A camera nao sera iniciada automaticamente nesta etapa.",
     "tutorial.agentCameraStart.primary": "Iniciar camera do tutorial",
+    "tutorial.cameraWebcamProbe.probing":
+      "Verificando se existe uma webcam respondendo nesta maquina...",
+    "tutorial.cameraWebcamProbe.ready":
+      "Encontramos uma webcam respondendo nesta maquina. O tutorial vai usar o indice {{index}}.",
+    "tutorial.cameraWebcamProbe.missing":
+      "Nenhuma webcam respondeu nesta maquina. Conecte uma webcam para continuar corretamente ou prossiga assim mesmo para seguir ate a Etapa 3.",
+    "tutorial.cameraWebcamProbe.unknown":
+      "Nao foi possivel confirmar se existe webcam respondendo nesta maquina. Se o EXE desktop estiver offline, voce ainda pode continuar manualmente.",
+    "tutorial.cameraWebcamProbe.modalTitle": "Conectar uma webcam agora?",
+    "tutorial.cameraWebcamProbe.modalDescription":
+      "Para concluir esta etapa do tutorial do jeito correto, conecte uma webcam e tente novamente. Se preferir, voce pode continuar sem webcam, criar a camera mesmo assim e seguir para a criacao dos agentes.",
+    "tutorial.cameraWebcamProbe.connectAndRetry": "Conectar e tentar de novo",
+    "tutorial.cameraWebcamProbe.continueWithout": "Prosseguir sem webcam",
+    "tutorial.cameraWebcamProbe.keepEditing": "Continuar editando",
     "tutorial.agentPreset.name": "detector de afirmativo",
     "tutorial.agentPreset.promptCore":
       "Reconheca qualquer pessoa fazendo o sinal de afirmativo com a mao.",
@@ -196,10 +256,14 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.complete.title": "Tutoriel termine",
     "tutorial.complete.description":
       "La camera du tutoriel et le detecteur de pouce leve sont maintenant configures et allumes.",
+    "tutorial.complete.descriptionWithoutWebcam":
+      "La camera et l agent du tutoriel ont ete crees, mais l inference n a pas ete demarree automatiquement car vous avez choisi de continuer sans webcam repondant sur cette machine.",
     "tutorial.complete.bullet1":
       "Le custom agent reste disponible dans Algorithms, ou vous pouvez l activer ou le mettre en pause a tout moment.",
     "tutorial.complete.bullet2":
       "La camera fonctionne aussi dans AI Agents, vous pouvez donc tester tout le flux immediatement.",
+    "tutorial.complete.bullet2WithoutWebcam":
+      "Quand une webcam sera connectee et repondra, vous pourrez utiliser le bouton de demarrage dans AI Agents pour lancer la camera manuellement.",
     "tutorial.complete.visualCaption":
       "Placez-vous devant la camera du tutoriel et faites un geste de pouce leve pour verifier la detection.",
     "tutorial.agentIntro.title": "Etape 3 : Creer un agent IA",
@@ -244,7 +308,23 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentCameraStart.title": "Demarrer la camera du tutoriel",
     "tutorial.agentCameraStart.description":
       "Nous sommes de retour dans AI Agents. Ce bouton demarre ou arrete le service de la camera. Demarrez-la maintenant pour que le detecteur de pouce leve recoive des images de la tutorial webcam.",
+    "tutorial.agentCameraStart.descriptionWithoutWebcam":
+      "Nous sommes de retour dans AI Agents. Comme vous avez choisi de continuer sans webcam repondant, nous allons seulement mettre en evidence le bouton de demarrage ici. La camera ne sera pas demarree automatiquement a cette etape.",
     "tutorial.agentCameraStart.primary": "Demarrer la camera du tutoriel",
+    "tutorial.cameraWebcamProbe.probing":
+      "Verification d une webcam qui repond sur cette machine...",
+    "tutorial.cameraWebcamProbe.ready":
+      "Une webcam repondante a ete trouvee sur cette machine. Le tutoriel utilisera l index {{index}}.",
+    "tutorial.cameraWebcamProbe.missing":
+      "Aucune webcam repondante n a ete detectee sur cette machine. Connectez-en une pour continuer correctement ou continuez quand meme pour atteindre l Etape 3.",
+    "tutorial.cameraWebcamProbe.unknown":
+      "Nous n avons pas pu confirmer la disponibilite d une webcam sur cette machine. Si l EXE desktop est hors ligne, vous pouvez quand meme continuer manuellement.",
+    "tutorial.cameraWebcamProbe.modalTitle": "Connecter une webcam maintenant ?",
+    "tutorial.cameraWebcamProbe.modalDescription":
+      "Pour terminer cette etape du tutoriel comme prevu, connectez une webcam et reessayez. Si vous preferez, vous pouvez continuer sans webcam, creer la camera quand meme et poursuivre jusqu a la creation de l agent.",
+    "tutorial.cameraWebcamProbe.connectAndRetry": "Connecter et reessayer",
+    "tutorial.cameraWebcamProbe.continueWithout": "Continuer sans webcam",
+    "tutorial.cameraWebcamProbe.keepEditing": "Continuer a modifier",
     "tutorial.agentPreset.name": "detecteur de pouce leve",
     "tutorial.agentPreset.promptCore":
       "Reconnaissez toute personne faisant un geste de pouce leve avec la main.",
