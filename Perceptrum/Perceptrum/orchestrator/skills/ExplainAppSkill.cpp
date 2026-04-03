@@ -3,9 +3,14 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
+#include "../../core/AgentCore.h"
+#include "../ChatModelConfig.h"
+#include "../HttpUtils.h"
 #include "../KnowledgeBase.h"
+#include "../OperationTaskState.h"
 #include "../ProgressUtils.h"
 #include "../PromptBuilder.h"
 
@@ -19,6 +24,23 @@ std::string lowerAsciiCopy_(std::string value)
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+std::string trimCopy_(std::string value)
+{
+    auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+nlohmann::json defaultTaskState_()
+{
+    return defaultOperationTaskState();
 }
 
 bool containsAny_(const std::string& haystack, const std::vector<std::string>& needles)
@@ -53,7 +75,12 @@ bool hasCameraOnboardingCue_(const std::string& normalized)
         "camera tsv", "camera excel", "camera plain text", "import csv",
         "import json", "import tsv", "import excel", "import plain text",
         "manufacturer", "fabricante", "channel", "subtype", "retention",
-        "retencao", "retenção", "allow public access", "public access",
+        "retencao", "retenção", "collaborator", "collaborators",
+        "share with collaborators", "collaborator sharing", "invite collaborator",
+        "invite collaborators", "colaborador", "colaboradores", "collaborateurs",
+        "compartilhar com colaboradores", "compartilhamento com colaboradores",
+        "compartir con colaboradores", "uso compartido con colaboradores",
+        "partage avec des collaborateurs", "partager avec des collaborateurs",
         "cep", "zip code", "postal code"
     });
 }
@@ -149,83 +176,369 @@ const KnowledgeBase& knowledgeBase_()
     return base;
 }
 
-std::string chooseTopic_(
-    const std::string& query,
-    const std::vector<KnowledgeSnippet>& snippets)
+nlohmann::json loadConversationContext_(
+    AgentCore& agent,
+    const nlohmann::json& payload)
 {
-    const std::string normalized = lowerAsciiCopy_(query);
-    if (containsAny_(normalized, {
-            "billing", "payment", "payments", "subscription", "tokens",
-            "pagamento", "assinatura", "cartao"
-        })) {
-        return "billing";
+    nlohmann::json fallback = {
+        { "compact_context", nlohmann::json::object() },
+        { "task_state", defaultTaskState_() },
+        { "recent_turns", nlohmann::json::array() },
+    };
+
+    if (!payload.is_object()) {
+        return fallback;
     }
-    if (containsAny_(normalized, {
-            "pair", "pairing", "parear", "emparelhar", "codigo", "exe"
-        })) {
-        return "pairing";
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        return fallback;
     }
-    if (containsAny_(normalized, {
-            "api key", "api keys", "openai", "z.ai", "glm", "chave", "chaves", "settings"
-        })) {
-        return "api_keys";
+
+    const int beforeMessageId = payload.value("context_before_message_id", 0);
+    std::ostringstream url;
+    url
+        << agent.getBackendBaseUrl()
+        << "/api/agent/chat-context?client_id=" << agent.getClientId()
+        << "&chat_session_id=" << chatSessionId;
+    if (beforeMessageId > 0) {
+        url << "&before_message_id=" << beforeMessageId;
     }
-    if ((hasCameraCreationVerb_(normalized) && hasCameraReference_(normalized)) ||
-        (hasCameraReference_(normalized) && hasCameraOnboardingCue_(normalized)) ||
-        containsAny_(normalized, {
-            "create camera", "add camera", "new camera", "register camera", "camera setup",
-            "criar camera", "adicionar camera", "nova camera", "cadastrar camera", "configurar camera",
-            "scan network", "camera import", "import cameras", "register webcam",
-            "cadastrar webcam", "registrar webcam"
-        })) {
-        return "camera_creation";
+
+    const HttpResponse response = getUrl(
+        url.str(),
+        agent.getExeToken(),
+        {},
+        3500);
+    if (!response.ok()) {
+        return fallback;
     }
-    if (hasJobOrchestrationCue_(normalized) ||
-        ((hasJobReference_(normalized) || hasStepReference_(normalized)) &&
-         containsAny_(normalized, {
-             "connect", "link", "chain", "connect steps", "link steps",
-             "conectar", "ligar", "encadear", "output", "input",
-             "resposta", "answer", "validator", "validador"
-         }))) {
-        return "job_orchestration";
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        return fallback;
     }
-    if ((hasStepReference_(normalized) && (hasAgentReference_(normalized) || hasAgentConfigurationCue_(normalized))) ||
-        containsAny_(normalized, {
-            "step agent", "agent in step", "agente do step", "agente na etapa", "agente na tarefa"
-        })) {
-        return "job_steps";
+    return parsed;
+}
+
+void configureExplainModelClient_(LocalLlmClient& llm, const nlohmann::json& payload)
+{
+    const LocalLlmClient::Config config = buildChatModelClientConfigFromPayload(payload, false);
+    if (config.enabled) {
+        llm.setRequestOverride(config);
     }
-    if ((hasAgentReference_(normalized) &&
-         (hasAgentCreationVerb_(normalized) || hasAgentConfigurationCue_(normalized))) ||
-        containsAny_(normalized, {
-            "camera agent", "camera agents", "agent on camera", "create agent", "custom agent",
-            "agente na camera", "agentes na camera", "criar agente", "agente custom",
-            "ai agent", "ai agents"
-        })) {
-        return "camera_agents";
+}
+
+std::string extractJsonObject_(const std::string& content)
+{
+    const std::size_t firstBrace = content.find('{');
+    const std::size_t lastBrace = content.rfind('}');
+    if (firstBrace == std::string::npos || lastBrace == std::string::npos || lastBrace < firstBrace) {
+        return "";
     }
-    if (containsAny_(normalized, {
-            "step", "steps", "job step", "workflow step", "step agent",
-            "etapa", "etapas", "passo do job", "step do job", "agente do step"
-        })) {
-        return "job_steps";
+    return content.substr(firstBrace, lastBrace - firstBrace + 1);
+}
+
+const std::vector<std::string>& supportedKnowledgeTopics_()
+{
+    static const std::vector<std::string> topics = {
+        "app_overview",
+        "tutorial",
+        "billing",
+        "pairing",
+        "api_keys",
+        "camera_creation",
+        "camera_agents",
+        "jobs",
+        "job_steps",
+        "job_orchestration",
+    };
+    return topics;
+}
+
+std::string sanitizeKnowledgeTopic_(std::string topic)
+{
+    topic = lowerAsciiCopy_(trimCopy_(std::move(topic)));
+    const auto& topics = supportedKnowledgeTopics_();
+    return std::find(topics.begin(), topics.end(), topic) != topics.end()
+        ? topic
+        : std::string();
+}
+
+void appendTopicHint_(std::vector<std::string>& topics, const std::string& topic)
+{
+    const std::string sanitized = sanitizeKnowledgeTopic_(topic);
+    if (sanitized.empty()) {
+        return;
     }
-    if (containsAny_(normalized, {
-            "job", "jobs", "task", "tasks", "tarefa", "tarefas",
-            "create job", "job creation", "workflow", "schedule", "scheduled workflow",
-            "criar job", "criar tarefa", "agendamento"
-        })) {
-        return "jobs";
+    if (std::find(topics.begin(), topics.end(), sanitized) != topics.end()) {
+        return;
     }
-    if (containsAny_(normalized, {
-            "tutorial", "how to", "how do i", "como usar", "primeiros passos"
-        })) {
-        return "tutorial";
+    topics.push_back(sanitized);
+}
+
+std::vector<std::string> collectSelectionTopicHints_(const SkillSelection& selection)
+{
+    std::vector<std::string> topics;
+    if (selection.arguments.is_object() &&
+        selection.arguments.contains("topic") &&
+        selection.arguments["topic"].is_string()) {
+        appendTopicHint_(topics, selection.arguments["topic"].get<std::string>());
     }
-    if (!snippets.empty()) {
-        return snippets.front().topic;
+    for (const auto& topic : selection.supportingTopics) {
+        appendTopicHint_(topics, topic);
     }
-    return "app_overview";
+    if (selection.arguments.is_object() &&
+        selection.arguments.contains("supporting_topics") &&
+        selection.arguments["supporting_topics"].is_array()) {
+        for (const auto& topic : selection.arguments["supporting_topics"]) {
+            if (!topic.is_string()) {
+                continue;
+            }
+            appendTopicHint_(topics, topic.get<std::string>());
+        }
+    }
+    return topics;
+}
+
+nlohmann::json buildKnowledgePlan_(
+    const LocalLlmClient& llm,
+    const std::string& query,
+    const nlohmann::json& conversationContext,
+    const SkillSelection& selection,
+    const std::vector<KnowledgeSnippet>& searchMatches)
+{
+    const std::vector<std::string> topicHints = collectSelectionTopicHints_(selection);
+    std::string fallbackPrimary =
+        !topicHints.empty()
+            ? topicHints.front()
+            : (!searchMatches.empty()
+                ? sanitizeKnowledgeTopic_(searchMatches.front().topic)
+                : std::string("app_overview"));
+    if (fallbackPrimary.empty()) {
+        fallbackPrimary = "app_overview";
+    }
+
+    nlohmann::json fallback = nlohmann::json::object({
+        { "primary_topic", fallbackPrimary },
+        { "supporting_topics", nlohmann::json::array() },
+    });
+    for (std::size_t index = 1; index < topicHints.size(); ++index) {
+        fallback["supporting_topics"].push_back(topicHints[index]);
+    }
+
+    if (!llm.isConfigured()) {
+        return fallback;
+    }
+
+    nlohmann::json searchPayload = nlohmann::json::array();
+    for (const auto& match : searchMatches) {
+        searchPayload.push_back({
+            { "topic", match.topic },
+            { "title", match.title },
+            { "locale", match.locale },
+            { "excerpt", match.excerpt },
+            { "score", match.score },
+        });
+    }
+
+    nlohmann::json promptPayload = {
+        { "user_message", query },
+        { "router_mode", selection.mode },
+        { "router_entity", selection.entity },
+        { "router_intent", selection.intent },
+        { "router_topic_hints", topicHints },
+        { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "conversation_task_state", conversationContext.value("task_state", defaultTaskState_()) },
+        { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
+        { "search_matches", searchPayload },
+        { "available_topics", supportedKnowledgeTopics_() },
+    };
+
+    const std::string systemPrompt =
+        "/no_think\n"
+        "You choose grounded knowledge topics for the Drakon app assistant.\n"
+        "Use meaning, not keywords, to pick the best knowledge topics.\n"
+        "Return JSON only.\n"
+        "Pick exactly one primary_topic from available_topics.\n"
+        "supporting_topics may include up to 3 additional topics from available_topics.\n"
+        "Prefer router_topic_hints when they already fit the user's goal.\n"
+        "Use conversation context only to resolve follow-up references.\n"
+        "If the user is asking for practical product help, keep the plan grounded in the app docs.\n"
+        "Return this schema: {\"primary_topic\":\"camera_creation\",\"supporting_topics\":[\"camera_agents\"]}";
+
+    const auto outcome = llm.completeText(
+        "planExplainKnowledge",
+        systemPrompt,
+        promptPayload.dump(2),
+        0.1,
+        320,
+        16000,
+        1,
+        true);
+    if (!outcome.ok) {
+        return fallback;
+    }
+
+    const std::string jsonObject = extractJsonObject_(trimCopy_(outcome.content));
+    const nlohmann::json parsed = nlohmann::json::parse(
+        jsonObject.empty() ? outcome.content : jsonObject,
+        nullptr,
+        false);
+    if (!parsed.is_object()) {
+        return fallback;
+    }
+
+    nlohmann::json plan = fallback;
+    if (parsed.contains("primary_topic") && parsed["primary_topic"].is_string()) {
+        const std::string topic = sanitizeKnowledgeTopic_(parsed["primary_topic"].get<std::string>());
+        if (!topic.empty()) {
+            plan["primary_topic"] = topic;
+        }
+    }
+
+    if (parsed.contains("supporting_topics") && parsed["supporting_topics"].is_array()) {
+        std::vector<std::string> supportingTopics;
+        for (const auto& item : parsed["supporting_topics"]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            appendTopicHint_(supportingTopics, item.get<std::string>());
+            if (supportingTopics.size() >= 3) {
+                break;
+            }
+        }
+        plan["supporting_topics"] = supportingTopics;
+    }
+
+    return plan;
+}
+
+std::vector<KnowledgeSnippet> collectGroundedDocumentsForPlan_(
+    const std::string& query,
+    const std::string& primaryTopic,
+    const std::vector<std::string>& supportingTopics,
+    const std::vector<KnowledgeSnippet>& searchMatches,
+    const std::string& knowledgeLanguage)
+{
+    const auto& knowledge = knowledgeBase_();
+    std::vector<KnowledgeSnippet> documents;
+    std::unordered_set<std::string> seenTopics;
+
+    auto appendDocument = [&](KnowledgeSnippet snippet) {
+        if (snippet.topic.empty() || snippet.content.empty()) {
+            return;
+        }
+        if (!seenTopics.insert(snippet.topic).second) {
+            return;
+        }
+        documents.push_back(std::move(snippet));
+    };
+
+    if (!primaryTopic.empty()) {
+        appendDocument(knowledge.topicDocument(primaryTopic, knowledgeLanguage));
+    }
+
+    for (const auto& topic : supportingTopics) {
+        appendDocument(knowledge.topicDocument(topic, knowledgeLanguage));
+        if (documents.size() >= 5) {
+            return documents;
+        }
+    }
+
+    const auto fallbackMatches =
+        searchMatches.empty()
+            ? knowledge.search(query, knowledgeLanguage, 6)
+            : searchMatches;
+    for (const auto& match : fallbackMatches) {
+        KnowledgeSnippet document = knowledge.topicDocument(match.topic, knowledgeLanguage);
+        if (document.content.empty()) {
+            document = match;
+        }
+        appendDocument(std::move(document));
+        if (documents.size() >= 5) {
+            break;
+        }
+    }
+
+    return documents;
+}
+
+std::string buildGroundedAnswer_(
+    const LocalLlmClient& llm,
+    const nlohmann::json& payload,
+    const nlohmann::json& conversationContext,
+    const SkillSelection& selection,
+    const std::string& topic,
+    const std::vector<std::string>& supportingTopics,
+    const std::vector<KnowledgeSnippet>& documents)
+{
+    if (!llm.isConfigured() || documents.empty()) {
+        return "";
+    }
+
+    const std::string userMessage =
+        payload.is_object() ? payload.value("query", std::string()) : std::string();
+    const std::string replyLanguage = normalizeAssistantLanguageTag(
+        selection.replyLanguage.empty()
+            ? (payload.is_object() ? payload.value("app_language", std::string("en")) : std::string("en"))
+            : selection.replyLanguage);
+    const std::string appLanguage =
+        payload.is_object() ? normalizeAssistantLanguageTag(payload.value("app_language", std::string("en"))) : "en";
+
+    const std::string systemPrompt =
+        "/no_think\n"
+        "You are the grounded product assistant for the Drakon app.\n"
+        "Answer the user using only the provided knowledge_documents and the chat-session context.\n"
+        "Synthesize multiple documents when useful instead of copying a single source.\n"
+        "Use recent_turns, compact_context, and conversation_task_state only to resolve references or follow-up context.\n"
+        "If the user asks how to do something, give practical steps in the app.\n"
+        "If there are multiple valid paths in the docs, compare them briefly and recommend the most likely path.\n"
+        "If the docs do not fully answer the question, say what is clear and then ask one short clarifying question only if it is truly needed.\n"
+        "Do not invent UI labels, buttons, flows, settings, or capabilities that are not supported by the knowledge_documents.\n"
+        "Do not mention source files, internal tools, payloads, or implementation details.\n"
+        "Write the final answer directly in reply_language.\n"
+        "Output only the final Markdown answer.\n";
+
+    nlohmann::json docsPayload = nlohmann::json::array();
+    for (const auto& document : documents) {
+        docsPayload.push_back({
+            { "topic", document.topic },
+            { "title", document.title },
+            { "locale", document.locale },
+            { "locale_fallback", document.localeFallback },
+            { "source_path", document.sourcePath.string() },
+            { "content", document.content },
+        });
+    }
+
+    nlohmann::json promptPayload = {
+        { "user_message", userMessage },
+        { "selected_topic", topic },
+        { "supporting_topics", supportingTopics },
+        { "reply_language", replyLanguage },
+        { "knowledge_language", knowledgeLanguage_(selection) },
+        { "app_language", appLanguage },
+        { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "conversation_task_state", conversationContext.value("task_state", defaultTaskState_()) },
+        { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
+        { "knowledge_documents", docsPayload },
+    };
+
+    const auto outcome = llm.completeText(
+        "groundedExplainApp",
+        systemPrompt,
+        promptPayload.dump(2),
+        0.2,
+        1400,
+        20000,
+        1,
+        false);
+    if (!outcome.ok) {
+        return "";
+    }
+
+    return trimCopy_(outcome.content);
 }
 
 std::string firstNonEmptyExcerpt_(const std::vector<KnowledgeSnippet>& snippets)
@@ -279,7 +592,7 @@ std::string fallbackDocumentAnswer_(
             << "- Manual registration lets the user choose RTSP/IP camera or Webcam.\n"
             << "- RTSP/IP uses fields such as name, IP, port, manufacturer, username, password, channel, and subtype.\n"
             << "- Webcam usually only needs name and webcam index, plus the shared fields.\n"
-            << "- Both flows include address, retention, and allow public access.\n\n"
+            << "- Both flows include address, retention, and collaborator sharing.\n\n"
             << "### Practical example\n\n"
             << "1. Open AI Agents or Cameras.\n"
             << "2. Use Scan Network if the device is already on the network.\n"
@@ -390,6 +703,13 @@ SkillRunResult ExplainAppSkill::execute(
         payload.is_object() ? payload.value("query", std::string()) : std::string();
     const std::string progressLanguage = progressLanguage_(selection, payload);
     const std::string knowledgeLanguage = knowledgeLanguage_(selection);
+    const std::string replyLanguage = normalizeAssistantLanguageTag(
+        selection.replyLanguage.empty()
+            ? (payload.is_object() ? payload.value("app_language", std::string("en")) : std::string("en"))
+            : selection.replyLanguage);
+    const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
+    LocalLlmClient llm;
+    configureExplainModelClient_(llm, payload);
 
     postChatProgress(
         agent,
@@ -398,17 +718,39 @@ SkillRunResult ExplainAppSkill::execute(
     pauseForProgressVisibility();
 
     const auto& knowledge = knowledgeBase_();
-    const auto snippets = knowledge.search(query, knowledgeLanguage, 3);
-
-    std::string topic;
-    if (selection.arguments.is_object() &&
-        selection.arguments.contains("topic") &&
-        selection.arguments["topic"].is_string()) {
-        topic = selection.arguments["topic"].get<std::string>();
-    }
+    const auto searchMatches = knowledge.search(query, knowledgeLanguage, 6);
+    const nlohmann::json knowledgePlan = buildKnowledgePlan_(
+        llm,
+        query,
+        conversationContext,
+        selection,
+        searchMatches);
+    std::string topic =
+        knowledgePlan.contains("primary_topic") && knowledgePlan["primary_topic"].is_string()
+            ? sanitizeKnowledgeTopic_(knowledgePlan["primary_topic"].get<std::string>())
+            : std::string();
     if (topic.empty()) {
-        topic = chooseTopic_(query, snippets);
+        topic = "app_overview";
     }
+    std::vector<std::string> supportingTopics;
+    if (knowledgePlan.contains("supporting_topics") &&
+        knowledgePlan["supporting_topics"].is_array()) {
+        for (const auto& item : knowledgePlan["supporting_topics"]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            appendTopicHint_(supportingTopics, item.get<std::string>());
+            if (supportingTopics.size() >= 3) {
+                break;
+            }
+        }
+    }
+    const std::vector<KnowledgeSnippet> documents = collectGroundedDocumentsForPlan_(
+        query,
+        topic,
+        supportingTopics,
+        searchMatches,
+        knowledgeLanguage);
 
     postChatProgress(
         agent,
@@ -416,32 +758,57 @@ SkillRunResult ExplainAppSkill::execute(
         makeProgressUpdate(progressLanguage, "explain_app", "drafting", 3, 3, 4));
     pauseForProgressVisibility();
 
-    const KnowledgeSnippet document = knowledge.topicDocument(topic, knowledgeLanguage);
-    if (!document.content.empty()) {
-        result.answer = document.content;
+    const KnowledgeSnippet primaryDocument = knowledge.topicDocument(topic, knowledgeLanguage);
+    const KnowledgeSnippet resolvedDocument =
+        !primaryDocument.content.empty()
+            ? primaryDocument
+            : (!documents.empty() ? documents.front() : KnowledgeSnippet{});
+    bool usedGroundedAnswer = false;
+    result.answer = buildGroundedAnswer_(
+        llm,
+        payload,
+        conversationContext,
+        selection,
+        topic,
+        supportingTopics,
+        documents);
+    if (!result.answer.empty()) {
+        usedGroundedAnswer = true;
+        result.metadata["skip_polish"] = true;
+        result.metadata["grounded"] = true;
+    }
+    else if (!primaryDocument.content.empty()) {
+        result.answer = primaryDocument.content;
+        result.metadata["grounded"] = true;
+    }
+    else if (!documents.empty()) {
+        result.answer = documents.front().content;
+        result.metadata["grounded"] = true;
     }
     else {
-        result.answer = fallbackDocumentAnswer_(topic, snippets);
+        result.answer = fallbackDocumentAnswer_(topic, searchMatches);
+        result.metadata["grounded"] = false;
     }
 
     result.metadata["topic"] = topic;
-    result.metadata["reply_language"] = selection.replyLanguage.empty()
-        ? nlohmann::json(nullptr)
-        : nlohmann::json(selection.replyLanguage);
-    result.metadata["answer_language"] = document.content.empty()
-        ? std::string("en")
-        : document.locale;
-    result.metadata["knowledge_language"] = document.locale.empty()
+    result.metadata["supporting_topics"] = supportingTopics;
+    result.metadata["reply_language"] = replyLanguage;
+    result.metadata["answer_language"] = usedGroundedAnswer
+        ? replyLanguage
+        : (resolvedDocument.content.empty() ? std::string("en") : resolvedDocument.locale);
+    result.metadata["knowledge_language"] = resolvedDocument.locale.empty()
         ? knowledgeLanguage
-        : document.locale;
-    result.metadata["knowledge_language_fallback"] = document.content.empty()
+        : resolvedDocument.locale;
+    result.metadata["knowledge_language_fallback"] = resolvedDocument.content.empty()
         ? (knowledgeLanguage != "en")
-        : document.localeFallback;
-    result.metadata["skip_polish"] = !selection.replyLanguage.empty() &&
-        !document.content.empty() &&
-        document.locale == selection.replyLanguage;
+        : resolvedDocument.localeFallback;
+    if (!result.metadata.contains("skip_polish")) {
+        result.metadata["skip_polish"] = !selection.replyLanguage.empty() &&
+            !resolvedDocument.content.empty() &&
+            resolvedDocument.locale == selection.replyLanguage;
+    }
     result.metadata["knowledge_matches"] = nlohmann::json::array();
-    for (const auto& snippet : snippets) {
+    const auto appendKnowledgeMatch = [&](const KnowledgeSnippet& snippet) {
         result.metadata["knowledge_matches"].push_back({
             { "topic", snippet.topic },
             { "title", snippet.title },
@@ -451,6 +818,16 @@ SkillRunResult ExplainAppSkill::execute(
             { "score", snippet.score },
             { "source_path", snippet.sourcePath.string() },
         });
+    };
+    if (!documents.empty()) {
+        for (const auto& snippet : documents) {
+            appendKnowledgeMatch(snippet);
+        }
+    }
+    else {
+        for (const auto& snippet : searchMatches) {
+            appendKnowledgeMatch(snippet);
+        }
     }
 
     postChatProgress(

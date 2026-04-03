@@ -8,7 +8,6 @@ import {
   Camera,
   CheckCircle,
   XCircle,
-  Filter,
   ShieldAlert,
   ChevronDown,
   ChevronUp,
@@ -29,11 +28,20 @@ interface Detection {
   event_id: number | null;
 }
 
+type EventFilter = "all" | "detection" | "error" | "status_change";
+
+const EVENT_FILTER_OPTIONS: Array<{ id: EventFilter; label: string }> = [
+  { id: "all", label: "All Events" },
+  { id: "detection", label: "Detections" },
+  { id: "error", label: "Errors" },
+  { id: "status_change", label: "Status Changes" },
+];
+
 export default function Events() {
   const [searchParams] = useSearchParams();
   const [events, setEvents] = useState<Event[]>([]);
   const [detections, setDetections] = useState<Detection[]>([]);
-  const [filter, setFilter] = useState("all");
+  const [filter, setFilter] = useState<EventFilter>("all");
   const [highlightedId, setHighlightedId] = useState<number | null>(null);
   const [expandedDetectionId, setExpandedDetectionId] = useState<number | null>(null);
   const [sharingId, setSharingId] = useState<number | null>(null);
@@ -230,7 +238,7 @@ export default function Events() {
 
   return (
     <Layout>
-      <div className="max-w-6xl mx-auto">
+      <div className="space-y-5">
         {/* Toast */}
         {toast && (
           <div className="fixed top-20 right-4 z-50 animate-slide-in">
@@ -247,38 +255,35 @@ export default function Events() {
         )}
 
         {/* Header */}
-        <div className="mb-6 md:mb-8">
-          <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">
-            Logs & Events
-          </h1>
-          <p className="text-sm md:text-base text-gray-400">
-            Monitor system activity and detections
-          </p>
-        </div>
-
-        {/* Filters */}
-        <div className="mb-6 flex flex-col md:flex-row md:items-center gap-3">
-          <Filter className="w-5 h-5 text-gray-400 hidden md:block" />
-          <div className="flex flex-wrap gap-2">
-            {["all", "detection", "error", "status_change"].map((type) => (
-              <button
-                key={type}
-                onClick={() => setFilter(type)}
-                className={`px-3 md:px-4 py-2 rounded-lg text-xs md:text-sm font-medium transition-all min-h-[44px] md:min-h-0 ${
-                  filter === type
-                    ? "bg-blue-500 text-white shadow-lg shadow-blue-500/30"
-                    : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-                }`}
-              >
-                {type === "all"
-                  ? "All Events"
-                  : type
-                      .split("_")
-                      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-                      .join(" ")}
-              </button>
-            ))}
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)] xl:items-start">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-bold text-gray-100">Logs & Events</h1>
+            <p className="mt-1.5 text-sm text-gray-400">Monitor system activity and detections</p>
           </div>
+          <div className="w-full overflow-x-auto xl:w-auto xl:justify-self-center">
+            <div className="inline-flex min-w-max items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] p-1 shadow-[0_20px_60px_-52px_rgba(0,0,0,0.95)] backdrop-blur-sm">
+              {EVENT_FILTER_OPTIONS.map((option) => {
+                const isActive = filter === option.id;
+
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => setFilter(option.id)}
+                    className={`whitespace-nowrap rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition-all duration-200 ${
+                      isActive
+                        ? "bg-blue-600 text-white shadow-[0_16px_40px_-20px_rgba(37,99,235,0.95)]"
+                        : "text-gray-300 hover:bg-white/5 hover:text-white"
+                    }`}
+                    aria-pressed={isActive}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="hidden xl:block" />
         </div>
 
         {/* Events/Detections list */}

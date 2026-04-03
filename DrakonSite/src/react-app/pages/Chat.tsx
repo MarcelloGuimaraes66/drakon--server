@@ -5,6 +5,7 @@ import Layout from "@/react-app/components/Layout";
 import ChatInput from "@/react-app/components/ChatInput";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
@@ -16,6 +17,7 @@ import { brand, getBrandStorageKey } from "@/shared/brand";
 import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lucide-react";
 import {
   extractHitMediaFromMessage,
+  extractCameraRegistrationDraftFromMessage,
   extractChatProgressFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
@@ -26,23 +28,11 @@ import {
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 type ChatModelTier = "ultra" | "ultra_plus" | "light" | "core";
-type ChatRunningResolution = 640 | 1024;
-type ChatHeaderDropdown = "fps" | "resolution" | "model" | null;
+type ChatHeaderDropdown = "model" | null;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
-const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
+const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
-
-const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
-  ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  ultra_plus: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-};
-
-const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
-  tier === "ultra" || tier === "ultra_plus" || tier === "light";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
@@ -53,35 +43,6 @@ function normalizeChatModelTier(value: string | null | undefined): ChatModelTier
   if (normalized === "core") return "core";
   if (normalized === "light") return "light";
   return "ultra";
-}
-
-function normalizeChatRunningResolution(
-  value: unknown,
-  fallback: ChatRunningResolution = DEFAULT_CHAT_CORE_RUNNING_RESOLUTION
-): ChatRunningResolution {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const rounded = Math.round(value);
-    if (rounded === 640 || rounded === 1024) return rounded;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number.parseInt(value.trim(), 10);
-    if (parsed === 640 || parsed === 1024) return parsed;
-  }
-  return fallback;
-}
-
-function normalizeChatModelFps(value: unknown, fallback = DEFAULT_ULTRA_VIDEO_MODEL_FPS): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const rounded = Math.round(value);
-    return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, rounded));
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number.parseInt(value.trim(), 10);
-    if (Number.isFinite(parsed)) {
-      return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
-    }
-  }
-  return normalizeChatModelFps(fallback, DEFAULT_ULTRA_VIDEO_MODEL_FPS);
 }
 
 export default function Chat() {
@@ -110,10 +71,6 @@ export default function Chat() {
     publicUrl: string;
   }>>(new Map());
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
-  const [modelFps, setModelFps] = useState<number>(DEFAULT_ULTRA_VIDEO_MODEL_FPS);
-  const [runningResolution, setRunningResolution] = useState<ChatRunningResolution>(
-    DEFAULT_CHAT_CORE_RUNNING_RESOLUTION
-  );
   const [toast, setToast] = useState<{
     message: string;
     type: "success" | "error" | "warning" | "info";
@@ -137,17 +94,9 @@ export default function Chat() {
     const normalizedTier = normalizeChatModelTier(saved);
     setModelTier(normalizedTier);
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
-    const savedResolution = localStorage.getItem(getBrandStorageKey("globalRunningResolution"));
-    const normalizedResolution = normalizeChatRunningResolution(savedResolution);
-    setRunningResolution(normalizedResolution);
-    localStorage.setItem(getBrandStorageKey("globalRunningResolution"), String(normalizedResolution));
-    const savedModelFps = localStorage.getItem(getBrandStorageKey("globalUltraModelFps"));
-    const normalizedModelFps = normalizeChatModelFps(savedModelFps);
-    setModelFps(normalizedModelFps);
-    localStorage.setItem(getBrandStorageKey("globalUltraModelFps"), String(normalizedModelFps));
   }, []);
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, cancelMessage } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, cancelMessage } = usePerceptrumChatSession({
     sessionId: activeSessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -447,8 +396,8 @@ export default function Chat() {
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
       modelTier,
-      modelFps: supportsAdjustableVideoFps(modelTier) ? modelFps : MODEL_FPS_BY_TIER[modelTier],
-      runningResolution: modelTier === "core" ? runningResolution : null,
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+      runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
     });
 
     await fetchSessions({ preferredSessionId: targetSessionId });
@@ -490,20 +439,6 @@ export default function Chat() {
         type: "info",
       });
     }
-  };
-
-  const handleModelFpsChange = (value: string) => {
-    const next = normalizeChatModelFps(value, modelFps);
-    setModelFps(next);
-    localStorage.setItem(getBrandStorageKey("globalUltraModelFps"), String(next));
-    setOpenHeaderDropdown(null);
-  };
-
-  const handleRunningResolutionChange = (value: string | number) => {
-    const next = normalizeChatRunningResolution(value, runningResolution);
-    setRunningResolution(next);
-    localStorage.setItem(getBrandStorageKey("globalRunningResolution"), String(next));
-    setOpenHeaderDropdown(null);
   };
 
   const modelLabels: Record<ChatModelTier, string> = {
@@ -622,6 +557,7 @@ export default function Chat() {
     }
 
     const hitMedia = extractHitMediaFromMessage(message);
+    const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
 
     return (
@@ -631,6 +567,21 @@ export default function Chat() {
         hitMedia={hitMedia}
         cameraLabel={cameraLabel}
         variant="chat-page"
+        supplementalContent={
+          cameraRegistrationDraft ? (
+            <ChatCameraRegistrationCard
+              messageId={message.id}
+              metadata={cameraRegistrationDraft}
+              onSubmit={(sourceMessageId, draft) =>
+                submitCameraRegistration({
+                  sessionIdOverride: activeSessionId,
+                  sourceMessageId,
+                  draft,
+                })
+              }
+            />
+          ) : null
+        }
       />
     );
   };
@@ -786,83 +737,6 @@ export default function Chat() {
                 <div className="relative flex flex-wrap items-center justify-end gap-2">
                   {openHeaderDropdown && (
                     <div className="fixed inset-0 z-40" onClick={() => setOpenHeaderDropdown(null)} />
-                  )}
-                  {supportsAdjustableVideoFps(modelTier) && (
-                    <div className="relative z-50">
-                      <button
-                        onClick={() =>
-                          setOpenHeaderDropdown((current) => (current === "fps" ? null : "fps"))
-                        }
-                        className="flex items-center gap-2 rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:bg-white/[0.08]"
-                      >
-                        <span className="hidden text-gray-400 sm:inline">Video FPS</span>
-                        <span className="text-blue-300">{modelFps}</span>
-                        <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                      </button>
-
-                      {openHeaderDropdown === "fps" && (
-                        <div className="absolute right-0 top-full z-50 mt-2 w-48 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
-                          {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
-                            const fps = index + 1;
-                            return (
-                              <button
-                                key={fps}
-                                onClick={() => handleModelFpsChange(String(fps))}
-                                className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
-                              >
-                                <div className="flex items-center justify-between">
-                                  <span className="font-medium">{`Video FPS: ${fps}`}</span>
-                                  {modelFps === fps && <span className="text-blue-300">&#10003;</span>}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {modelTier === "core" && (
-                    <div className="relative z-50">
-                      <button
-                        onClick={() =>
-                          setOpenHeaderDropdown((current) => (current === "resolution" ? null : "resolution"))
-                        }
-                        className="flex items-center gap-2 rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:bg-white/[0.08]"
-                      >
-                        <span className="hidden text-gray-400 sm:inline">{t("jobs.runningResolution")}</span>
-                        <span className="text-blue-300">
-                          {runningResolution === 640
-                            ? t("jobs.runningResolutionOption.640")
-                            : t("jobs.runningResolutionOption.1024")}
-                        </span>
-                        <svg className="h-4 w-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                      </button>
-
-                      {openHeaderDropdown === "resolution" && (
-                        <div className="absolute right-0 top-full z-50 mt-2 w-56 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#1f2230]/96 shadow-2xl backdrop-blur-xl">
-                          {[640, 1024].map((resolution) => (
-                            <button
-                              key={resolution}
-                              onClick={() => handleRunningResolutionChange(resolution)}
-                              className="w-full px-4 py-3 text-left text-sm text-gray-100 transition-colors hover:bg-white/[0.06]"
-                            >
-                              <div className="flex items-center justify-between">
-                                <span className="font-medium">
-                                  {resolution === 640
-                                    ? t("jobs.runningResolutionOption.640")
-                                    : t("jobs.runningResolutionOption.1024")}
-                                </span>
-                                {runningResolution === resolution && <span className="text-blue-300">&#10003;</span>}
-                              </div>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
                   )}
                   <button
                     onClick={() => {

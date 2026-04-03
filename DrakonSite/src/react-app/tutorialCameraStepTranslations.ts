@@ -33,12 +33,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "Address starts with ZIP code / CEP",
     "tutorial.cameraAddress.description":
       "Enter the ZIP code or CEP first. The app can auto-fill street, city, and state, so the number is usually the main field left to confirm.",
-    "tutorial.cameraStorage.title": "Retention and public access",
+    "tutorial.cameraStorage.title": "Retention and collaborator sharing",
     "tutorial.cameraStorage.description":
-      "Retention controls how long captured frames stay on disk. Allow Public Access is only for cameras that may be shared with authorized law enforcement when a legal search is needed.",
+      "Retention controls how long captured frames stay on disk. Collaborator sharing lets you invite specific Perceptrum users by @handle or email so they can use this camera in Drakon Find.",
     "tutorial.cameraWebcam.title": "Now switch to Webcam",
     "tutorial.cameraWebcam.description":
-      "Webcam shares the same address, retention, and public-access settings, but it only needs a camera name and a webcam index. For this example we already filled index 0 and a tutorial webcam name.",
+      "Webcam shares the same address, retention, and collaborator-sharing settings, but it only needs a camera name and a webcam index. For this example we already filled index 0 and a tutorial webcam name.",
     "tutorial.cameraWebcamSave.title": "Create the tutorial webcam",
     "tutorial.cameraWebcamSave.description":
       "We will save this example webcam now so the tutorial can continue to Stage 3. You can edit or remove it later in Cameras or AI Agents.",
@@ -80,12 +80,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "La direccion empieza con ZIP code / CEP",
     "tutorial.cameraAddress.description":
       "Ingresa primero el ZIP code o CEP. La app puede completar calle, ciudad y estado automaticamente, por lo que el numero suele ser el principal campo que queda por confirmar.",
-    "tutorial.cameraStorage.title": "Retencion y acceso publico",
+    "tutorial.cameraStorage.title": "Retencion y uso compartido con colaboradores",
     "tutorial.cameraStorage.description":
-      "La retencion controla cuanto tiempo permanecen en disco los frames capturados. Allow Public Access solo debe activarse para camaras que puedan compartirse con fuerzas de seguridad autorizadas cuando exista una busqueda legal.",
+      "La retencion controla cuanto tiempo permanecen en disco los frames capturados. Compartir con colaboradores te permite invitar a usuarios especificos de Perceptrum por @handle o email para que usen esta camara en Drakon Find.",
     "tutorial.cameraWebcam.title": "Ahora cambiamos a Webcam",
     "tutorial.cameraWebcam.description":
-      "Webcam comparte la misma direccion, retencion y acceso publico, pero solo necesita un nombre y un webcam index. Para este ejemplo ya completamos el index 0 y un nombre de webcam del tutorial.",
+      "Webcam comparte la misma direccion, la misma retencion y el mismo uso compartido con colaboradores, pero solo necesita un nombre y un webcam index. Para este ejemplo ya completamos el index 0 y un nombre de webcam del tutorial.",
     "tutorial.cameraWebcamSave.title": "Crear la webcam del tutorial",
     "tutorial.cameraWebcamSave.description":
       "Ahora guardaremos esta webcam de ejemplo para que el tutorial pueda continuar a la Etapa 3. Puedes editarla o eliminarla despues desde Cameras o AI Agents.",
@@ -127,12 +127,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "O endereco comeca pelo ZIP code / CEP",
     "tutorial.cameraAddress.description":
       "Informe primeiro o ZIP code ou CEP. O app pode preencher rua, cidade e estado automaticamente, entao o numero costuma ser o principal campo que sobra para confirmar.",
-    "tutorial.cameraStorage.title": "Retencao e acesso publico",
+    "tutorial.cameraStorage.title": "Retencao e compartilhamento com colaboradores",
     "tutorial.cameraStorage.description":
-      "Retencao controla por quanto tempo os frames capturados ficam no disco. Allow Public Access so deve ser usado em cameras que possam ser compartilhadas com autoridades autorizadas quando houver uma busca legal.",
+      "Retencao controla por quanto tempo os frames capturados ficam no disco. O compartilhamento com colaboradores permite convidar usuarios especificos do Perceptrum por @handle ou email para usarem essa camera no Drakon Find.",
     "tutorial.cameraWebcam.title": "Agora vamos para Webcam",
     "tutorial.cameraWebcam.description":
-      "Webcam usa o mesmo endereco, retencao e acesso publico, mas precisa apenas do nome da camera e do webcam index. Para este exemplo ja preenchemos o index 0 e um nome de tutorial webcam.",
+      "Webcam usa o mesmo endereco, a mesma retencao e o mesmo compartilhamento com colaboradores, mas precisa apenas do nome da camera e do webcam index. Para este exemplo ja preenchemos o index 0 e um nome de tutorial webcam.",
     "tutorial.cameraWebcamSave.title": "Criar a webcam do tutorial",
     "tutorial.cameraWebcamSave.description":
       "Vamos salvar essa webcam de exemplo agora para que o tutorial possa seguir para a Etapa 3. Voce pode editar ou remover essa camera depois em Cameras ou AI Agents.",
@@ -174,12 +174,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "L adresse commence par ZIP code / CEP",
     "tutorial.cameraAddress.description":
       "Saisissez d abord le ZIP code ou le CEP. L app peut remplir automatiquement la rue, la ville et l etat, donc le numero est souvent le principal champ qu il reste a confirmer.",
-    "tutorial.cameraStorage.title": "Retention et acces public",
+    "tutorial.cameraStorage.title": "Retention et partage avec des collaborateurs",
     "tutorial.cameraStorage.description":
-      "La retention controle combien de temps les frames capturees restent sur le disque. Allow Public Access ne doit etre active que pour les cameras qui peuvent etre partagees avec les autorites autorisees lorsqu une recherche legale est necessaire.",
+      "La retention controle combien de temps les frames capturees restent sur le disque. Le partage avec des collaborateurs vous permet d inviter des utilisateurs Perceptrum precis par @handle ou e-mail afin qu ils puissent utiliser cette camera dans Drakon Find.",
     "tutorial.cameraWebcam.title": "Passons maintenant a Webcam",
     "tutorial.cameraWebcam.description":
-      "Webcam partage la meme adresse, la meme retention et le meme acces public, mais elle n a besoin que d un nom de camera et d un webcam index. Pour cet exemple, nous avons deja rempli l index 0 et un nom de webcam de tutoriel.",
+      "Webcam partage la meme adresse, la meme retention et le meme partage avec des collaborateurs, mais elle n a besoin que d un nom de camera et d un webcam index. Pour cet exemple, nous avons deja rempli l index 0 et un nom de webcam de tutoriel.",
     "tutorial.cameraWebcamSave.title": "Creer la webcam du tutoriel",
     "tutorial.cameraWebcamSave.description":
       "Nous allons enregistrer cette webcam d exemple pour que le tutoriel puisse continuer vers l Etape 3. Vous pourrez la modifier ou la supprimer plus tard dans Cameras ou AI Agents.",
@@ -216,12 +216,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "地址从 ZIP code / CEP 开始",
     "tutorial.cameraAddress.description":
       "先填写 ZIP code 或 CEP。应用可以自动补全街道、城市和州，所以通常剩下需要确认的主要字段就是门牌号。",
-    "tutorial.cameraStorage.title": "保留时长与公共访问",
+    "tutorial.cameraStorage.title": "保留时长与协作者共享",
     "tutorial.cameraStorage.description":
-      "保留时长决定捕获帧在磁盘上保存多久。Allow Public Access 只适用于在合法搜索场景下可与授权执法机构共享的摄像头。",
+      "保留时长决定捕获帧在磁盘上保存多久。协作者共享可让你通过 @handle 或邮箱邀请特定的 Perceptrum 用户在 Drakon Find 中使用这台摄像头。",
     "tutorial.cameraWebcam.title": "现在切换到 Webcam",
     "tutorial.cameraWebcam.description":
-      "Webcam 共享相同的地址、保留时长和公共访问设置，但只需要摄像头名称和 webcam index。这个示例里我们已经填好了 index 0 和一个教程 webcam 名称。",
+      "Webcam 共享相同的地址、保留时长与协作者共享设置，但只需要摄像头名称和 webcam index。这个示例里我们已经填好了 index 0 和一个教程 webcam 名称。",
     "tutorial.cameraWebcamSave.title": "创建教程 Webcam",
     "tutorial.cameraWebcamSave.description":
       "现在我们会保存这个示例 Webcam，让教程继续到第 3 步。之后你可以在 Cameras 或 AI Agents 中编辑或删除它。",
@@ -263,12 +263,12 @@ export const tutorialCameraStepTranslations: Record<string, Record<string, strin
     "tutorial.cameraAddress.title": "يبدأ العنوان بـ ZIP code / CEP",
     "tutorial.cameraAddress.description":
       "ادخل ZIP code او CEP اولا. يمكن للتطبيق تعبئة الشارع والمدينة والولاية تلقائيا، لذلك يكون رقم العنوان عادة هو الحقل الرئيسي المتبقي للتأكيد.",
-    "tutorial.cameraStorage.title": "الاحتفاظ والوصول العام",
+    "tutorial.cameraStorage.title": "الاحتفاظ ومشاركة المتعاونين",
     "tutorial.cameraStorage.description":
-      "تحدد مدة الاحتفاظ المدة التي تبقى فيها اللقطات المخزنة على القرص. ويجب استخدام Allow Public Access فقط للكاميرات التي يمكن مشاركتها مع جهات إنفاذ القانون المخولة عند وجود بحث قانوني.",
+      "تحدد مدة الاحتفاظ المدة التي تبقى فيها اللقطات المخزنة على القرص. تتيح مشاركة المتعاونين دعوة مستخدمين محددين في Perceptrum بواسطة @handle او البريد الالكتروني ليتمكنوا من استخدام هذه الكاميرا داخل Drakon Find.",
     "tutorial.cameraWebcam.title": "الآن ننتقل إلى Webcam",
     "tutorial.cameraWebcam.description":
-      "يشترك Webcam في العنوان والاحتفاظ والوصول العام، لكنه يحتاج فقط إلى اسم الكاميرا و webcam index. في هذا المثال قمنا بالفعل بتعبئة index 0 واسم webcam خاص بالتutorial.",
+      "يشترك Webcam في العنوان والاحتفاظ ومشاركة المتعاونين، لكنه يحتاج فقط إلى اسم الكاميرا و webcam index. في هذا المثال قمنا بالفعل بتعبئة index 0 واسم webcam خاص بالتجربة التعليمية.",
     "tutorial.cameraWebcamSave.title": "إنشاء Webcam التعليمية",
     "tutorial.cameraWebcamSave.description":
       "سنحفظ Webcam المثال الآن حتى يتمكن البرنامج التعليمي من الانتقال إلى المرحلة 3. ويمكنك تعديلها او حذفها لاحقا من Cameras او AI Agents.",

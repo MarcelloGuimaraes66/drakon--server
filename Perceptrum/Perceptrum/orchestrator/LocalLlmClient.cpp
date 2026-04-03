@@ -222,6 +222,205 @@ std::string structuredJsonFromOutcome_(
     return jsonObject;
 }
 
+std::string trimLowerCopy_(std::string value)
+{
+    value = trimCopy(std::move(value));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+void parseStringArrayField_(
+    const nlohmann::json& source,
+    const char* key,
+    std::vector<std::string>& destination)
+{
+    if (!source.contains(key) || !source[key].is_array()) {
+        return;
+    }
+
+    for (const auto& item : source[key]) {
+        if (!item.is_string()) {
+            continue;
+        }
+        const std::string value = trimCopy(item.get<std::string>());
+        if (!value.empty()) {
+            destination.push_back(value);
+        }
+        if (destination.size() >= 16) {
+            break;
+        }
+    }
+}
+
+bool parseBoolField_(const nlohmann::json& source, const char* key, bool fallbackValue)
+{
+    if (!source.contains(key)) {
+        return fallbackValue;
+    }
+    try {
+        if (source[key].is_boolean()) {
+            return source[key].get<bool>();
+        }
+        if (source[key].is_number_integer()) {
+            return source[key].get<int>() != 0;
+        }
+        if (source[key].is_string()) {
+            const std::string normalized = trimLowerCopy_(source[key].get<std::string>());
+            if (normalized == "true" || normalized == "1" || normalized == "yes") {
+                return true;
+            }
+            if (normalized == "false" || normalized == "0" || normalized == "no") {
+                return false;
+            }
+        }
+    }
+    catch (...) {
+    }
+    return fallbackValue;
+}
+
+bool populateSkillSelectionFromStructured_(
+    const nlohmann::json& structured,
+    SkillSelection& selection,
+    const std::string& logPreview,
+    const std::string& parseErrorSource)
+{
+    if (!structured.is_object() ||
+        !structured.contains("selected_skill") ||
+        !structured["selected_skill"].is_string()) {
+        Logger::instance().logDebugNoEscalation(
+            "agent",
+            "LocalLlmClient::chooseSkill parse_error=missing_selected_skill " +
+                parseErrorSource + "=" + truncateForLog_(logPreview));
+        return false;
+    }
+
+    selection.selectedSkill = trimCopy(structured["selected_skill"].get<std::string>());
+    if (selection.selectedSkill.empty()) {
+        Logger::instance().logDebugNoEscalation(
+            "agent",
+            "LocalLlmClient::chooseSkill parse_error=empty_selected_skill " +
+                parseErrorSource + "=" + truncateForLog_(logPreview));
+        return false;
+    }
+
+    if (structured.contains("confidence")) {
+        try {
+            selection.confidence = clampConfidence_(structured["confidence"].get<double>());
+        }
+        catch (...) {
+            selection.confidence = 0.0;
+        }
+    }
+
+    if (structured.contains("reason") && structured["reason"].is_string()) {
+        selection.reason = structured["reason"].get<std::string>();
+    }
+    if (structured.contains("reply_preview") && structured["reply_preview"].is_string()) {
+        selection.replyPreview = structured["reply_preview"].get<std::string>();
+    }
+    if (structured.contains("reply_language") && structured["reply_language"].is_string()) {
+        selection.replyLanguage =
+            normalizeReplyLanguageTag(structured["reply_language"].get<std::string>());
+    }
+    if (structured.contains("reply_language_confidence")) {
+        try {
+            selection.replyLanguageConfidence =
+                clampConfidence_(structured["reply_language_confidence"].get<double>());
+        }
+        catch (...) {
+            selection.replyLanguageConfidence = 0.0;
+        }
+    }
+    if (structured.contains("knowledge_language") && structured["knowledge_language"].is_string()) {
+        selection.knowledgeLanguage =
+            normalizeAssistantLanguageTag(structured["knowledge_language"].get<std::string>());
+    }
+    if (structured.contains("knowledge_fallback")) {
+        selection.knowledgeLanguageFallback =
+            parseBoolField_(structured, "knowledge_fallback", true);
+    }
+
+    if (structured.contains("mode") && structured["mode"].is_string()) {
+        selection.mode = trimLowerCopy_(structured["mode"].get<std::string>());
+    }
+    if (structured.contains("entity") && structured["entity"].is_string()) {
+        selection.entity = trimLowerCopy_(structured["entity"].get<std::string>());
+    }
+    if (structured.contains("intent") && structured["intent"].is_string()) {
+        selection.intent = trimLowerCopy_(structured["intent"].get<std::string>());
+    }
+    selection.continueActiveTask =
+        parseBoolField_(structured, "continue_active_task", false);
+    selection.groundingRequired =
+        parseBoolField_(structured, "grounding_required", false);
+    if (structured.contains("operation_type") && structured["operation_type"].is_string()) {
+        selection.operationType = trimCopy(structured["operation_type"].get<std::string>());
+    }
+    if (structured.contains("operation_phase") && structured["operation_phase"].is_string()) {
+        selection.operationPhase = trimCopy(structured["operation_phase"].get<std::string>());
+    }
+
+    if (structured.contains("arguments") && structured["arguments"].is_object()) {
+        selection.arguments = structured["arguments"];
+
+        if (selection.arguments.contains("draft_patch") &&
+            selection.arguments["draft_patch"].is_object()) {
+            selection.draftPatch = selection.arguments["draft_patch"];
+        }
+        if (selection.arguments.contains("task_goal") &&
+            selection.arguments["task_goal"].is_string()) {
+            selection.taskGoal = selection.arguments["task_goal"].get<std::string>();
+        }
+        if (selection.operationType.empty() &&
+            selection.arguments.contains("operation_type") &&
+            selection.arguments["operation_type"].is_string()) {
+            selection.operationType = selection.arguments["operation_type"].get<std::string>();
+        }
+        if (selection.operationPhase.empty() &&
+            selection.arguments.contains("operation_phase") &&
+            selection.arguments["operation_phase"].is_string()) {
+            selection.operationPhase = selection.arguments["operation_phase"].get<std::string>();
+        }
+
+        parseStringArrayField_(
+            selection.arguments,
+            "missing_fields_guess",
+            selection.missingFieldsGuess);
+        parseStringArrayField_(
+            selection.arguments,
+            "supporting_topics",
+            selection.supportingTopics);
+    }
+
+    if (structured.contains("draft_patch") && structured["draft_patch"].is_object()) {
+        selection.draftPatch = structured["draft_patch"];
+    }
+    if (selection.taskGoal.empty() &&
+        structured.contains("task_goal") &&
+        structured["task_goal"].is_string()) {
+        selection.taskGoal = structured["task_goal"].get<std::string>();
+    }
+    if (selection.operationType.empty() &&
+        structured.contains("operation_type") &&
+        structured["operation_type"].is_string()) {
+        selection.operationType = structured["operation_type"].get<std::string>();
+    }
+    if (selection.operationPhase.empty() &&
+        structured.contains("operation_phase") &&
+        structured["operation_phase"].is_string()) {
+        selection.operationPhase = structured["operation_phase"].get<std::string>();
+    }
+
+    parseStringArrayField_(structured, "missing_fields_guess", selection.missingFieldsGuess);
+    parseStringArrayField_(structured, "supporting_topics", selection.supportingTopics);
+
+    selection.fromModel = true;
+    return true;
+}
+
 } // namespace
 
 LocalLlmClient::LocalLlmClient()
@@ -284,14 +483,35 @@ LocalLlmClient::LocalLlmClient()
 
 bool LocalLlmClient::isConfigured() const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return !endpointOverride_.empty() || config_.enabled;
+    const Config configSnapshot = effectiveConfigSnapshot_();
+    return configSnapshot.enabled && !trimCopy(configSnapshot.baseUrl).empty();
 }
 
 bool LocalLlmClient::hasStoredConfiguration() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_.enabled;
+}
+
+void LocalLlmClient::setRequestOverride(const Config& config)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    requestOverride_ = config;
+    requestOverride_.baseUrl = normalizeChatCompletionsUrl_(trimCopy(requestOverride_.baseUrl));
+    requestOverride_.apiKey = trimCopy(requestOverride_.apiKey);
+    requestOverride_.model = trimCopy(requestOverride_.model);
+    requestOverride_.enabled =
+        !requestOverride_.baseUrl.empty() &&
+        !requestOverride_.apiKey.empty() &&
+        !requestOverride_.model.empty();
+    requestOverrideActive_ = true;
+}
+
+void LocalLlmClient::clearRequestOverride()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    requestOverride_ = Config{};
+    requestOverrideActive_ = false;
 }
 
 void LocalLlmClient::setEndpointOverride(const std::string& baseUrl)
@@ -308,13 +528,26 @@ void LocalLlmClient::clearEndpointOverride()
     config_.enabled = !config_.baseUrl.empty();
 }
 
-std::string LocalLlmClient::effectiveBaseUrl_() const
+LocalLlmClient::Config LocalLlmClient::effectiveConfigSnapshot_() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!endpointOverride_.empty()) {
-        return endpointOverride_;
+    Config configSnapshot = config_;
+    if (requestOverrideActive_) {
+        configSnapshot.baseUrl = requestOverride_.baseUrl;
+        configSnapshot.apiKey = requestOverride_.apiKey;
+        configSnapshot.model = requestOverride_.model;
+        configSnapshot.enabled = requestOverride_.enabled;
     }
-    return config_.baseUrl;
+    else if (!endpointOverride_.empty()) {
+        configSnapshot.baseUrl = endpointOverride_;
+        configSnapshot.enabled = !configSnapshot.baseUrl.empty();
+    }
+    return configSnapshot;
+}
+
+std::string LocalLlmClient::effectiveBaseUrl_() const
+{
+    return effectiveConfigSnapshot_().baseUrl;
 }
 
 LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
@@ -325,13 +558,8 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
 {
     CompletionOutcome outcome;
 
-    Config configSnapshot;
-    std::string baseUrl;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-        baseUrl = endpointOverride_.empty() ? config_.baseUrl : endpointOverride_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
+    const std::string baseUrl = configSnapshot.baseUrl;
     if (baseUrl.empty()) {
         outcome.error = "missing_base_url";
         return outcome;
@@ -439,11 +667,7 @@ std::string LocalLlmClient::detectReplyLanguage(
         return "";
     }
 
-    Config configSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
 
     nlohmann::json body = {
         { "model", configSnapshot.model },
@@ -500,12 +724,11 @@ std::string LocalLlmClient::detectReplyLanguage(
 
         const std::string language =
             normalizeAssistantLanguageTag(structured["reply_language"].get<std::string>());
-        if (language != "en" && confidence < 0.35) {
+        if (!language.empty() && confidence < 0.35) {
             Logger::instance().logDebugNoEscalation(
                 "agent",
-                "LocalLlmClient::detectReplyLanguage low_confidence_fallback language=" +
+                "LocalLlmClient::detectReplyLanguage low_confidence_keep language=" +
                     language + " confidence=" + std::to_string(confidence));
-            return "en";
         }
 
         return language;
@@ -543,12 +766,11 @@ std::string LocalLlmClient::detectReplyLanguage(
 
     const std::string language =
         normalizeAssistantLanguageTag(structured["reply_language"].get<std::string>());
-    if (language != "en" && confidence < 0.35) {
+    if (!language.empty() && confidence < 0.35) {
         Logger::instance().logDebugNoEscalation(
             "agent",
-            "LocalLlmClient::detectReplyLanguage low_confidence_fallback language=" +
+            "LocalLlmClient::detectReplyLanguage low_confidence_keep language=" +
                 language + " confidence=" + std::to_string(confidence));
-        return "en";
     }
 
     return language;
@@ -564,11 +786,7 @@ SkillSelection LocalLlmClient::chooseSkill(
         return selection;
     }
 
-    Config configSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
 
     nlohmann::json body = {
         { "model", configSnapshot.model },
@@ -583,7 +801,7 @@ SkillSelection LocalLlmClient::chooseSkill(
             },
         }) },
         { "temperature", 0.1 },
-        { "max_tokens", 220 },
+        { "max_tokens", 340 },
         { "response_format", {
             { "type", "json_object" }
         } },
@@ -601,69 +819,13 @@ SkillSelection LocalLlmClient::chooseSkill(
         }
 
         const nlohmann::json structured = nlohmann::json::parse(fallbackContent, nullptr, false);
-        if (!structured.is_object() ||
-            !structured.contains("selected_skill") ||
-            !structured["selected_skill"].is_string()) {
-            Logger::instance().logDebugNoEscalation(
-                "agent",
-                "LocalLlmClient::chooseSkill parse_error=missing_selected_skill reasoning_preview=" +
-                truncateForLog_(fallbackContent));
-            return selection;
+        if (!populateSkillSelectionFromStructured_(
+                structured,
+                selection,
+                fallbackContent,
+                "reasoning_preview")) {
+            return SkillSelection{};
         }
-
-        selection.selectedSkill = trimCopy(structured["selected_skill"].get<std::string>());
-        if (selection.selectedSkill.empty()) {
-            Logger::instance().logDebugNoEscalation(
-                "agent",
-                "LocalLlmClient::chooseSkill parse_error=empty_selected_skill reasoning_preview=" +
-                truncateForLog_(fallbackContent));
-            return selection;
-        }
-
-        if (structured.contains("confidence")) {
-            try {
-                selection.confidence = clampConfidence_(structured["confidence"].get<double>());
-            }
-            catch (...) {
-                selection.confidence = 0.0;
-            }
-        }
-
-        if (structured.contains("reason") && structured["reason"].is_string()) {
-            selection.reason = structured["reason"].get<std::string>();
-        }
-        if (structured.contains("reply_preview") && structured["reply_preview"].is_string()) {
-            selection.replyPreview = structured["reply_preview"].get<std::string>();
-        }
-        if (structured.contains("reply_language") && structured["reply_language"].is_string()) {
-            selection.replyLanguage =
-                normalizeReplyLanguageTag(structured["reply_language"].get<std::string>());
-        }
-        if (structured.contains("reply_language_confidence")) {
-            try {
-                selection.replyLanguageConfidence =
-                    clampConfidence_(structured["reply_language_confidence"].get<double>());
-            }
-            catch (...) {
-                selection.replyLanguageConfidence = 0.0;
-            }
-        }
-        if (structured.contains("knowledge_language") && structured["knowledge_language"].is_string()) {
-            selection.knowledgeLanguage =
-                normalizeAssistantLanguageTag(structured["knowledge_language"].get<std::string>());
-        }
-        if (structured.contains("knowledge_fallback")) {
-            try {
-                selection.knowledgeLanguageFallback = structured["knowledge_fallback"].get<bool>();
-            }
-            catch (...) {
-                selection.knowledgeLanguageFallback = true;
-            }
-        }
-        if (structured.contains("arguments") && structured["arguments"].is_object()) {
-            selection.arguments = structured["arguments"];
-        }
-        selection.fromModel = true;
         return selection;
     }
 
@@ -677,69 +839,13 @@ SkillSelection LocalLlmClient::chooseSkill(
     }
 
     const nlohmann::json structured = nlohmann::json::parse(jsonObject, nullptr, false);
-    if (!structured.is_object() ||
-        !structured.contains("selected_skill") ||
-        !structured["selected_skill"].is_string()) {
-        Logger::instance().logDebugNoEscalation(
-            "agent",
-            "LocalLlmClient::chooseSkill parse_error=missing_selected_skill content_preview=" +
-            truncateForLog_(outcome.content));
-        return selection;
+    if (!populateSkillSelectionFromStructured_(
+            structured,
+            selection,
+            outcome.content,
+            "content_preview")) {
+        return SkillSelection{};
     }
-
-    selection.selectedSkill = trimCopy(structured["selected_skill"].get<std::string>());
-    if (selection.selectedSkill.empty()) {
-        Logger::instance().logDebugNoEscalation(
-            "agent",
-            "LocalLlmClient::chooseSkill parse_error=empty_selected_skill content_preview=" +
-            truncateForLog_(outcome.content));
-        return selection;
-    }
-
-    if (structured.contains("confidence")) {
-        try {
-            selection.confidence = clampConfidence_(structured["confidence"].get<double>());
-        }
-        catch (...) {
-            selection.confidence = 0.0;
-        }
-    }
-
-    if (structured.contains("reason") && structured["reason"].is_string()) {
-        selection.reason = structured["reason"].get<std::string>();
-    }
-    if (structured.contains("reply_preview") && structured["reply_preview"].is_string()) {
-        selection.replyPreview = structured["reply_preview"].get<std::string>();
-    }
-    if (structured.contains("reply_language") && structured["reply_language"].is_string()) {
-        selection.replyLanguage =
-            normalizeReplyLanguageTag(structured["reply_language"].get<std::string>());
-    }
-    if (structured.contains("reply_language_confidence")) {
-        try {
-            selection.replyLanguageConfidence =
-                clampConfidence_(structured["reply_language_confidence"].get<double>());
-        }
-        catch (...) {
-            selection.replyLanguageConfidence = 0.0;
-        }
-    }
-    if (structured.contains("knowledge_language") && structured["knowledge_language"].is_string()) {
-        selection.knowledgeLanguage =
-            normalizeAssistantLanguageTag(structured["knowledge_language"].get<std::string>());
-    }
-    if (structured.contains("knowledge_fallback")) {
-        try {
-            selection.knowledgeLanguageFallback = structured["knowledge_fallback"].get<bool>();
-        }
-        catch (...) {
-            selection.knowledgeLanguageFallback = true;
-        }
-    }
-    if (structured.contains("arguments") && structured["arguments"].is_object()) {
-        selection.arguments = structured["arguments"];
-    }
-    selection.fromModel = true;
     return selection;
 }
 
@@ -756,11 +862,7 @@ std::string LocalLlmClient::polishAnswer(
         return "";
     }
 
-    Config configSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
 
     nlohmann::json body = {
         { "model", configSnapshot.model },
@@ -809,11 +911,7 @@ std::string LocalLlmClient::answerDirectly(
         return "";
     }
 
-    Config configSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
 
     nlohmann::json body = {
         { "model", configSnapshot.model },
@@ -908,11 +1006,7 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::completeText(
         return outcome;
     }
 
-    Config configSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        configSnapshot = config_;
-    }
+    const Config configSnapshot = effectiveConfigSnapshot_();
 
     const std::string effectiveModel = trimCopy(modelName).empty()
         ? configSnapshot.model

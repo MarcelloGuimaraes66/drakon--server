@@ -7,6 +7,8 @@
 #include <utility>
 
 #include "ConfigUtils.h"
+#include "KnowledgeBase.h"
+#include "OperationTaskState.h"
 #include "ProgressUtils.h"
 #include "PromptBuilder.h"
 #include "../core/AgentCore.h"
@@ -62,9 +64,10 @@ bool isInstructionalIntent_(const std::string& normalized)
 bool hasCameraCreationVerb_(const std::string& normalized)
 {
     return containsAny_(normalized, {
-        "create", "criar", "crio", "add", "adicionar", "adiciono",
-        "register", "registrar", "cadastrar", "setup", "configurar",
-        "configuro", "new camera", "nova camera"
+        "create", "criar", "crio", "crie", "add", "adicionar", "adiciono", "adicione",
+        "register", "registrar", "registre", "cadastrar", "cadastre", "setup", "configurar",
+        "configuro", "configure", "new camera", "nova camera", "crea", "registra", "agrega",
+        "configurez", "creez", "cree", "ajoute", "ajoutez", "enregistrez", "enregistre"
     });
 }
 
@@ -83,7 +86,12 @@ bool hasCameraOnboardingCue_(const std::string& normalized)
         "camera tsv", "camera excel", "camera plain text", "import csv",
         "import json", "import tsv", "import excel", "import plain text",
         "manufacturer", "fabricante", "channel", "subtype", "retention",
-        "retencao", "retenção", "allow public access", "public access",
+        "retencao", "retenção", "collaborator", "collaborators",
+        "share with collaborators", "collaborator sharing", "invite collaborator",
+        "invite collaborators", "colaborador", "colaboradores", "collaborateurs",
+        "compartilhar com colaboradores", "compartilhamento com colaboradores",
+        "compartir con colaboradores", "uso compartido con colaboradores",
+        "partage avec des collaborateurs", "partager avec des collaborateurs",
         "cep", "zip code", "postal code"
     });
 }
@@ -91,9 +99,20 @@ bool hasCameraOnboardingCue_(const std::string& normalized)
 bool hasAgentCreationVerb_(const std::string& normalized)
 {
     return containsAny_(normalized, {
-        "create", "criar", "crio", "add", "adicionar", "adiciono",
-        "setup", "configurar", "configuro", "new agent", "novo agente",
-        "new ai agent", "novo ai agent"
+        "create", "criar", "crio", "crie", "add", "adicionar", "adiciono", "adicione",
+        "setup", "configurar", "configuro", "configure", "new agent", "novo agente",
+        "new ai agent", "novo ai agent", "crea", "agrega", "configura",
+        "configurez", "creez", "cree", "ajoute", "ajoutez"
+    });
+}
+
+bool hasJobCreationVerb_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "create", "criar", "crio", "crie", "add", "adicionar", "adiciono", "adicione",
+        "setup", "configurar", "configuro", "configure", "schedule", "agendar", "agende",
+        "montar", "monte", "new job", "novo job", "new task", "nova tarefa",
+        "crea", "agrega", "configura", "programa", "configurez", "creez", "cree", "ajoute", "ajoutez"
     });
 }
 
@@ -201,6 +220,15 @@ bool isCameraOnboardingHelpRequest_(const std::string& normalized)
         });
 }
 
+bool isExplicitCameraCreationActionRequest_(const std::string& normalized)
+{
+    return hasCameraCreationVerb_(normalized) &&
+        hasCameraReference_(normalized) &&
+        !isInstructionalIntent_(normalized) &&
+        !isCameraSetupHelpRequest_(normalized) &&
+        !isCameraOnboardingHelpRequest_(normalized);
+}
+
 bool isJobCreationHelpRequest_(const std::string& normalized)
 {
     return isInstructionalIntent_(normalized) && containsAny_(normalized, {
@@ -215,6 +243,16 @@ bool isCameraAgentHelpRequest_(const std::string& normalized)
         (isInstructionalIntent_(normalized) || hasAgentConfigurationCue_(normalized));
 }
 
+bool isExplicitJobCreationActionRequest_(const std::string& normalized)
+{
+    return hasJobCreationVerb_(normalized) &&
+        containsAny_(normalized, {
+            "job", "jobs", "workflow", "workflows", "task", "tasks", "tarefa", "tarefas"
+        }) &&
+        !isInstructionalIntent_(normalized) &&
+        !isCameraAgentHelpRequest_(normalized);
+}
+
 bool isCameraAgentCreationHelpRequest_(const std::string& normalized)
 {
     return isCameraAgentHelpRequest_(normalized) &&
@@ -222,6 +260,14 @@ bool isCameraAgentCreationHelpRequest_(const std::string& normalized)
             "create agent", "criar agente", "camera agent", "agente na camera",
             "custom agent", "agente custom", "novo agente", "agent on camera"
         }));
+}
+
+bool isExplicitCameraAgentCreationActionRequest_(const std::string& normalized)
+{
+    return hasAgentCreationVerb_(normalized) &&
+        hasAgentReference_(normalized) &&
+        !isInstructionalIntent_(normalized) &&
+        !hasAgentConfigurationCue_(normalized);
 }
 
 std::string agentHelpTopicForQuery_(const std::string& normalized)
@@ -244,6 +290,45 @@ int progressStepCountForSkill_(const std::string& skillName)
 SkillSelection rewriteInstructionalSelection_(SkillSelection selection, const std::string& userMessage)
 {
     const std::string normalized = lowerAsciiCopy_(userMessage);
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "explain_app" ||
+         selection.selectedSkill == "read_state") &&
+        isExplicitCameraCreationActionRequest_(normalized)) {
+        selection.selectedSkill = "create_camera";
+        selection.confidence = std::max(selection.confidence, 0.99);
+        selection.reason = "explicit_camera_creation_action_request";
+        selection.replyPreview = "Vou criar a camera.";
+        selection.arguments = nlohmann::json::object();
+        return selection;
+    }
+
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "explain_app" ||
+         selection.selectedSkill == "read_state") &&
+        isExplicitJobCreationActionRequest_(normalized)) {
+        selection.selectedSkill = "create_job";
+        selection.confidence = std::max(selection.confidence, 0.99);
+        selection.reason = "explicit_job_creation_action_request";
+        selection.replyPreview = "Vou criar o job.";
+        selection.arguments = nlohmann::json::object();
+        return selection;
+    }
+
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "explain_app" ||
+         selection.selectedSkill == "read_state") &&
+        isExplicitCameraAgentCreationActionRequest_(normalized)) {
+        selection.selectedSkill = "create_camera_agent";
+        selection.confidence = std::max(selection.confidence, 0.99);
+        selection.reason = "explicit_camera_agent_creation_action_request";
+        selection.replyPreview = "Vou criar o agente.";
+        selection.arguments = nlohmann::json::object();
+        return selection;
+    }
+
     if ((selection.selectedSkill == "video_search" ||
          selection.selectedSkill == "general_answer" ||
          selection.selectedSkill == "create_camera") &&
@@ -324,6 +409,26 @@ std::string appLanguageFromPayload_(const nlohmann::json& payload)
     return normalizeAssistantLanguageTag(payload["app_language"].get<std::string>());
 }
 
+std::string queryLanguageFromPayload_(const nlohmann::json& payload)
+{
+    if (!payload.is_object() ||
+        !payload.contains("query_language") ||
+        !payload["query_language"].is_string()) {
+        return "";
+    }
+    return normalizeReplyLanguageTag(payload["query_language"].get<std::string>());
+}
+
+std::string queryLanguageSourceFromPayload_(const nlohmann::json& payload)
+{
+    if (!payload.is_object() ||
+        !payload.contains("query_language_source") ||
+        !payload["query_language_source"].is_string()) {
+        return "";
+    }
+    return lowerAsciiCopy_(trimCopy_(payload["query_language_source"].get<std::string>()));
+}
+
 std::string defaultKnowledgeLanguageForReply_(const std::string& replyLanguage)
 {
     const std::string normalizedReply = normalizeReplyLanguageTag(replyLanguage);
@@ -335,6 +440,13 @@ std::string defaultKnowledgeLanguageForReply_(const std::string& replyLanguage)
         return knowledgeLanguage;
     }
     return "en";
+}
+
+std::string normalizeSemanticToken_(std::string value)
+{
+    value = lowerAsciiCopy_(trimCopy_(std::move(value)));
+    std::replace(value.begin(), value.end(), ' ', '_');
+    return value;
 }
 
 SkillSelection finalizeSelectionLanguages_(SkillSelection selection)
@@ -364,6 +476,155 @@ SkillSelection finalizeSelectionLanguages_(SkillSelection selection)
     if (selection.knowledgeLanguage.empty()) {
         selection.knowledgeLanguage = "en";
         selection.knowledgeLanguageFallback = true;
+    }
+
+    return selection;
+}
+
+bool hasUploadedMedia_(const nlohmann::json& payload)
+{
+    const bool hasPayloadObject = payload.is_object();
+    const bool hasUploadedImage =
+        hasPayloadObject &&
+        payload.contains("uploaded_image_base64") &&
+        payload["uploaded_image_base64"].is_string() &&
+        !payload["uploaded_image_base64"].get<std::string>().empty();
+    const bool hasUploadedVideo =
+        hasPayloadObject &&
+        payload.contains("uploaded_video_url") &&
+        payload["uploaded_video_url"].is_string() &&
+        !payload["uploaded_video_url"].get<std::string>().empty();
+    return hasUploadedImage || hasUploadedVideo;
+}
+
+std::string skillFromSemanticSelection_(
+    const SkillSelection& selection,
+    const nlohmann::json& conversationContext)
+{
+    if (selection.continueActiveTask) {
+        const std::string activeTask = activeOperationTaskType(conversationContext);
+        if (!activeTask.empty()) {
+            return activeTask;
+        }
+    }
+
+    const std::string operationType = trimCopy_(selection.operationType);
+    if (!operationType.empty()) {
+        return operationType;
+    }
+
+    const std::string mode = normalizeSemanticToken_(selection.mode);
+    const std::string entity = normalizeSemanticToken_(selection.entity);
+    const std::string intent = normalizeSemanticToken_(selection.intent);
+
+    if (entity == "video" || intent == "inspect") {
+        return "video_search";
+    }
+    if (entity == "state" || mode == "read" || intent == "read") {
+        return "read_state";
+    }
+    if (entity == "camera" && (mode == "operate" || intent == "create" || intent == "continue")) {
+        return "create_camera";
+    }
+    if (entity == "camera_agent" && (mode == "operate" || intent == "create" || intent == "continue")) {
+        return "create_camera_agent";
+    }
+    if (entity == "job" && (mode == "operate" || intent == "create" || intent == "continue")) {
+        return "create_job";
+    }
+    if (entity == "app_help" || mode == "answer" || intent == "explain" || selection.groundingRequired) {
+        return "explain_app";
+    }
+    return "";
+}
+
+SkillSelection applySemanticSelectionPlan_(
+    SkillSelection selection,
+    const nlohmann::json& payload,
+    const nlohmann::json& conversationContext)
+{
+    selection.mode = normalizeSemanticToken_(selection.mode);
+    selection.entity = normalizeSemanticToken_(selection.entity);
+    selection.intent = normalizeSemanticToken_(selection.intent);
+    selection.operationType = normalizeSemanticToken_(selection.operationType);
+    selection.operationPhase = normalizeSemanticToken_(selection.operationPhase);
+
+    if (hasUploadedMedia_(payload)) {
+        selection.selectedSkill = "video_search";
+        selection.mode = "operate";
+        selection.entity = "video";
+        if (selection.intent.empty()) {
+            selection.intent = "inspect";
+        }
+        selection.operationType.clear();
+        selection.groundingRequired = false;
+        if (selection.confidence < 1.0) {
+            selection.confidence = 1.0;
+        }
+        if (selection.reason.empty()) {
+            selection.reason = "uploaded_media_requires_video_search";
+        }
+        return selection;
+    }
+
+    std::string semanticSkill = skillFromSemanticSelection_(selection, conversationContext);
+    if ((selection.selectedSkill.empty() || selection.selectedSkill == "general_answer") &&
+        !semanticSkill.empty()) {
+        selection.selectedSkill = semanticSkill;
+    }
+
+    if (selection.selectedSkill == "general_answer" &&
+        selection.continueActiveTask) {
+        const std::string activeTask = activeOperationTaskType(conversationContext);
+        if (!activeTask.empty()) {
+            selection.selectedSkill = activeTask;
+        }
+    }
+
+    if (selection.selectedSkill == "general_answer" && selection.groundingRequired) {
+        selection.selectedSkill = "explain_app";
+    }
+
+    if (selection.operationType.empty() &&
+        (selection.selectedSkill == "create_camera" ||
+         selection.selectedSkill == "create_camera_agent" ||
+         selection.selectedSkill == "create_job")) {
+        selection.operationType = selection.selectedSkill;
+    }
+
+    if (selection.intent.empty()) {
+        if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "create_camera_agent" ||
+            selection.selectedSkill == "create_job") {
+            selection.intent = selection.continueActiveTask ? "continue" : "create";
+        }
+        else if (selection.selectedSkill == "explain_app") {
+            selection.intent = "explain";
+        }
+        else if (selection.selectedSkill == "read_state") {
+            selection.intent = "read";
+        }
+        else if (selection.selectedSkill == "video_search") {
+            selection.intent = "inspect";
+        }
+        else {
+            selection.intent = "unknown";
+        }
+    }
+
+    if (selection.mode.empty()) {
+        if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "create_camera_agent" ||
+            selection.selectedSkill == "create_job" ||
+            selection.selectedSkill == "video_search") {
+            selection.mode = "operate";
+        }
+        else if (selection.selectedSkill == "read_state") {
+            selection.mode = "read";
+        }
+        else if (selection.selectedSkill == "explain_app") {
+            selection.mode = "answer";
+        }
     }
 
     return selection;
@@ -406,6 +667,10 @@ std::string progressLanguageFromSelection_(
 {
     if (!selection.replyLanguage.empty()) {
         return normalizeAssistantLanguageTag(selection.replyLanguage);
+    }
+    const std::string queryLanguage = queryLanguageFromPayload_(payload);
+    if (!queryLanguage.empty()) {
+        return normalizeAssistantLanguageTag(queryLanguage);
     }
     return appLanguageFromPayload_(payload);
 }
@@ -552,7 +817,99 @@ nlohmann::json normalizeConversationContextForPrompt_(nlohmann::json conversatio
         conversationContext.value("compact_context", nlohmann::json::object()));
     conversationContext["recent_turns"] = normalizeRecentTurnsForPrompt_(
         conversationContext.value("recent_turns", nlohmann::json::array()));
+    if (!conversationContext.contains("task_state") || !conversationContext["task_state"].is_object()) {
+        conversationContext["task_state"] = defaultOperationTaskState();
+    }
+    else {
+        conversationContext["task_state"] = normalizeOperationTaskState(
+            conversationContext["task_state"]);
+    }
     return conversationContext;
+}
+
+std::string activeTaskTypeForContext_(const nlohmann::json& conversationContext)
+{
+    return activeOperationTaskType(conversationContext);
+}
+
+std::string activeTaskLanguageForContext_(const nlohmann::json& conversationContext)
+{
+    return activeOperationTaskLanguage(conversationContext);
+}
+
+bool isLikelyShortTaskContinuation_(const std::string& userMessage)
+{
+    const std::string trimmed = trimCopy_(userMessage);
+    if (trimmed.empty() || trimmed.size() > 180) {
+        return false;
+    }
+
+    if (trimmed.find('?') != std::string::npos) {
+        return false;
+    }
+
+    const std::size_t tokenCount = static_cast<std::size_t>(std::count_if(
+        trimmed.begin(),
+        trimmed.end(),
+        [](char ch) { return std::isspace(static_cast<unsigned char>(ch)) != 0; })) + 1;
+    if (tokenCount > 24 &&
+        trimmed.find(':') == std::string::npos &&
+        trimmed.find(',') == std::string::npos &&
+        trimmed.find(';') == std::string::npos) {
+        return false;
+    }
+
+    return true;
+}
+
+SkillSelection applyReplyLanguageHints_(
+    SkillSelection selection,
+    const nlohmann::json& payload,
+    const std::string& userMessage,
+    const nlohmann::json& conversationContext)
+{
+    const std::string queryLanguage = queryLanguageFromPayload_(payload);
+    const std::string queryLanguageSource = queryLanguageSourceFromPayload_(payload);
+    if (!queryLanguage.empty() && queryLanguageSource == "detected") {
+        selection.replyLanguage = queryLanguage;
+        selection.replyLanguageConfidence = 1.0;
+        if (selection.knowledgeLanguage.empty() ||
+            selection.knowledgeLanguage == "en" ||
+            selection.knowledgeLanguageFallback) {
+            selection.knowledgeLanguage = queryLanguage;
+            selection.knowledgeLanguageFallback = false;
+        }
+        return selection;
+    }
+
+    if (!activeTaskTypeForContext_(conversationContext).empty() &&
+        isLikelyShortTaskContinuation_(userMessage)) {
+        const std::string taskLanguage = activeTaskLanguageForContext_(conversationContext);
+        if (!taskLanguage.empty()) {
+            selection.replyLanguage = taskLanguage;
+            selection.replyLanguageConfidence = 1.0;
+            if (selection.knowledgeLanguage.empty()) {
+                selection.knowledgeLanguage = taskLanguage;
+                selection.knowledgeLanguageFallback = false;
+            }
+        }
+    }
+
+    return selection;
+}
+
+const KnowledgeBase& knowledgeBase_()
+{
+    static const KnowledgeBase base;
+    return base;
+}
+
+bool shouldPreferGroundedExplainApp_(
+    const std::string& userMessage,
+    const nlohmann::json& payload)
+{
+    const std::string appLanguage = appLanguageFromPayload_(payload);
+    return !knowledgeBase_().search(userMessage, appLanguage, 2).empty();
 }
 
 } // namespace
@@ -566,30 +923,26 @@ ChatV2Orchestrator::ChatV2Orchestrator()
 
 void ChatV2Orchestrator::start()
 {
-    const bool ready = runtimeManager_.ensureReady();
-    if (ready) {
-        llm_.setEndpointOverride(runtimeManager_.baseUrl());
-        Logger::instance().logDebug(
-            "agent",
-            "ChatV2Orchestrator::start: local LLM ready at " + runtimeManager_.baseUrl()
-        );
-        return;
-    }
-
-    llm_.clearEndpointOverride();
-    const std::string lastError = runtimeManager_.lastError();
-    if (!lastError.empty()) {
-        Logger::instance().logDebug(
-            "agent",
-            "ChatV2Orchestrator::start: local LLM not ready, fallback may be used. reason=" + lastError
-        );
-    }
+    Logger::instance().logDebug(
+        "agent",
+        "ChatV2Orchestrator::start: orchestrator model will follow the chat model selected in the frontend"
+    );
 }
 
 void ChatV2Orchestrator::stop()
 {
-    llm_.clearEndpointOverride();
-    runtimeManager_.stop();
+}
+
+void ChatV2Orchestrator::configureLlmForPayload_(
+    LocalLlmClient& llm,
+    const nlohmann::json& payload,
+    bool useRouterModel) const
+{
+    const LocalLlmClient::Config requestConfig =
+        buildChatModelClientConfigFromPayload(payload, useRouterModel);
+    if (requestConfig.enabled) {
+        llm.setRequestOverride(requestConfig);
+    }
 }
 
 void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& payload)
@@ -607,19 +960,16 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         return;
     }
 
-    const bool llmReady = runtimeManager_.ensureReady();
-    if (llmReady) {
-        llm_.setEndpointOverride(runtimeManager_.baseUrl());
-    }
-    else {
-        llm_.clearEndpointOverride();
-    }
+    LocalLlmClient llm;
+    configureLlmForPayload_(llm, payload, false);
+    const bool llmReady = llm.isConfigured();
 
     nlohmann::json conversationContext = loadConversationContext_(agent, payload);
-    conversationContext = compactConversationContextIfNeeded_(agent, payload, std::move(conversationContext));
+    conversationContext = compactConversationContextIfNeeded_(llm, agent, payload, std::move(conversationContext));
 
-    const bool allowHeuristicFallback = !runtimeManager_.requiresLlm();
+    const bool allowHeuristicFallback = true;
     const SkillSelection selection = chooseSkill_(
+        llm,
         payload,
         userMessage,
         allowHeuristicFallback,
@@ -629,7 +979,7 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         SkillSelection unavailableSelection;
         unavailableSelection.selectedSkill = "unavailable";
         unavailableSelection.confidence = 0.0;
-        unavailableSelection.reason = runtimeManager_.lastError();
+        unavailableSelection.reason = llmReady ? std::string() : "missing_chat_model_credentials";
         unavailableSelection.replyPreview = "Local assistant unavailable.";
         recordRoutingTelemetry_(agent, payload, unavailableSelection, "actual", "orchestrator_query");
 
@@ -680,7 +1030,7 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         SkillRunResult result;
         result.status = SkillExecutionStatus::Completed;
         result.skillName = "general_answer";
-        result.answer = buildGeneralAnswer_(payload, selection, userMessage, conversationContext);
+        result.answer = buildGeneralAnswer_(llm, payload, selection, userMessage, conversationContext);
         if (result.answer.empty()) {
             result.answer = buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
         }
@@ -746,7 +1096,11 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         result.answer = sanitizeUserFacingAnswer_(result.answer);
     }
     else {
-        result.answer = polishAndSanitizeAnswer_(payload, selection, result.answer, conversationContext);
+        result.answer = polishAndSanitizeAnswer_(llm, payload, selection, result.answer, conversationContext);
+    }
+    if (result.metadata.is_object() && result.metadata.contains("task_state")) {
+        conversationContext["task_state"] = result.metadata["task_state"];
+        persistConversationContext_(agent, payload, conversationContext);
     }
     finalizeAsChatMessage_(agent, payload, selection, result);
 }
@@ -768,16 +1122,12 @@ void ChatV2Orchestrator::handleShadowQuery(
         return;
     }
 
-    const bool llmReady = runtimeManager_.ensureReady();
-    if (llmReady) {
-        llm_.setEndpointOverride(runtimeManager_.baseUrl());
-    }
-    else {
-        llm_.clearEndpointOverride();
-    }
+    LocalLlmClient llm;
+    configureLlmForPayload_(llm, payload, false);
 
-    const bool allowHeuristicFallback = !runtimeManager_.requiresLlm();
+    const bool allowHeuristicFallback = true;
     SkillSelection selection = chooseSkill_(
+        llm,
         payload,
         userMessage,
         allowHeuristicFallback,
@@ -785,7 +1135,7 @@ void ChatV2Orchestrator::handleShadowQuery(
     if (selection.selectedSkill.empty()) {
         selection.selectedSkill = "unavailable";
         selection.confidence = 0.0;
-        selection.reason = runtimeManager_.lastError();
+        selection.reason = llm.isConfigured() ? std::string() : "missing_chat_model_credentials";
         selection.replyPreview = buildLlmUnavailableAnswer_();
     }
 
@@ -808,6 +1158,10 @@ nlohmann::json ChatV2Orchestrator::loadConversationContext_(
 {
     nlohmann::json fallback = {
         { "compact_context", defaultCompactConversationContext_() },
+        { "task_state", nlohmann::json::object({
+            { "active_task", nullptr },
+            { "recent_tasks", nlohmann::json::array() },
+        }) },
         { "recent_turns", nlohmann::json::array() },
         { "last_compacted_message_id", 0 },
         { "recent_token_estimate", 0 },
@@ -854,6 +1208,12 @@ nlohmann::json ChatV2Orchestrator::loadConversationContext_(
 
     fallback["compact_context"] = normalizeCompactConversationContext_(
         parsed.value("compact_context", nlohmann::json::object()));
+    fallback["task_state"] = parsed.value(
+        "task_state",
+        nlohmann::json::object({
+            { "active_task", nullptr },
+            { "recent_tasks", nlohmann::json::array() },
+        }));
     fallback["recent_turns"] = parsed.value("recent_turns", nlohmann::json::array());
     fallback["last_compacted_message_id"] = parsed.value("last_compacted_message_id", 0);
     fallback["recent_token_estimate"] = parsed.value("recent_token_estimate", 0);
@@ -861,6 +1221,7 @@ nlohmann::json ChatV2Orchestrator::loadConversationContext_(
 }
 
 nlohmann::json ChatV2Orchestrator::compactConversationContextIfNeeded_(
+    const LocalLlmClient& llm,
     AgentCore& agent,
     const nlohmann::json& payload,
     nlohmann::json conversationContext) const
@@ -889,7 +1250,7 @@ nlohmann::json ChatV2Orchestrator::compactConversationContextIfNeeded_(
         return conversationContext;
     }
 
-    if (!llm_.isConfigured()) {
+    if (!llm.isConfigured()) {
         return conversationContext;
     }
 
@@ -913,7 +1274,7 @@ nlohmann::json ChatV2Orchestrator::compactConversationContextIfNeeded_(
     }
 
     const std::string appLanguage = appLanguageFromPayload_(payload);
-    nlohmann::json compactedContext = llm_.compactConversationContext(
+    nlohmann::json compactedContext = llm.compactConversationContext(
         compactContext,
         turnsToCompact,
         appLanguage);
@@ -969,6 +1330,15 @@ bool ChatV2Orchestrator::persistConversationContext_(
         { "chat_session_id", chatSessionId },
         { "compact_context", normalizeCompactConversationContext_(
             conversationContext.value("compact_context", nlohmann::json::object())) },
+        {
+            "task_state",
+            conversationContext.value(
+                "task_state",
+                nlohmann::json::object({
+                    { "active_task", nullptr },
+                    { "recent_tasks", nlohmann::json::array() },
+                }))
+        },
         { "last_compacted_message_id", conversationContext.value("last_compacted_message_id", 0) },
         { "token_estimate", conversationContext.value("recent_token_estimate", 0) },
     };
@@ -985,6 +1355,7 @@ bool ChatV2Orchestrator::persistConversationContext_(
 }
 
 SkillSelection ChatV2Orchestrator::chooseSkill_(
+    const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const std::string& userMessage,
     bool allowHeuristicFallback,
@@ -992,16 +1363,32 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
 {
     const bool hasPayloadObject = payload.is_object();
     const std::string appLanguage = appLanguageFromPayload_(payload);
-    const SkillSelection heuristic = chooseHeuristicSkill_(payload, userMessage);
+    const std::string queryLanguageSource = queryLanguageSourceFromPayload_(payload);
+    const SkillSelection heuristic = chooseHeuristicSkill_(payload, userMessage, conversationContext);
     const nlohmann::json promptConversationContext =
         normalizeConversationContextForPrompt_(conversationContext);
 
-    if (llm_.isConfigured()) {
+    if (llm.isConfigured()) {
         nlohmann::json requestContext = {
             { "chat_session_id", hasPayloadObject ? payload.value("chat_session_id", -1) : -1 },
             { "app_language", appLanguage },
+            { "query_language", queryLanguageFromPayload_(payload) },
+            { "query_language_source", queryLanguageSourceFromPayload_(payload) },
             { "ui_languages", nlohmann::json::array({ "en", "es", "pt", "fr", "zh", "ar" }) },
             { "knowledge_fallback_language", "en" },
+            { "registered_skills", payload.is_object() ? payload.value("registered_skills", nlohmann::json::array()) : nlohmann::json::array() },
+            { "knowledge_topics", nlohmann::json::array({
+                "app_overview",
+                "tutorial",
+                "billing",
+                "pairing",
+                "api_keys",
+                "camera_creation",
+                "camera_agents",
+                "jobs",
+                "job_steps",
+                "job_orchestration"
+            }) },
             {
                 "uploaded_image_present",
                 hasPayloadObject &&
@@ -1019,24 +1406,46 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             { "model_tier", hasPayloadObject ? payload.value("model_tier", std::string()) : std::string() },
             { "video_search_allowed", hasPayloadObject ? payload.value("video_search_allowed", true) : true },
             { "conversation_compact_context", promptConversationContext.value("compact_context", nlohmann::json::object()) },
+            { "conversation_task_state", promptConversationContext.value("task_state", nlohmann::json::object()) },
             { "recent_turns", promptConversationContext.value("recent_turns", nlohmann::json::array()) },
         };
 
-        SkillSelection selection = llm_.chooseSkill(
+        SkillSelection selection = llm.chooseSkill(
             userMessage,
             requestContext,
             registry_.definitions());
-        selection = rewriteInstructionalSelection_(selection, userMessage);
-        if (shouldDetectReplyLanguageForSelection_(selection)) {
-            const std::string detectedReplyLanguage = llm_.detectReplyLanguage(
+        selection = applySemanticSelectionPlan_(std::move(selection), payload, conversationContext);
+        selection = applyReplyLanguageHints_(selection, payload, userMessage, conversationContext);
+        if (queryLanguageSource != "detected" ||
+            shouldDetectReplyLanguageForSelection_(selection)) {
+            const std::string detectedReplyLanguage = llm.detectReplyLanguage(
                 userMessage,
                 appLanguage);
             if (!detectedReplyLanguage.empty()) {
                 selection.replyLanguage = detectedReplyLanguage;
+                selection.replyLanguageConfidence =
+                    (std::max)(selection.replyLanguageConfidence, 0.95);
             }
         }
+        selection = applyReplyLanguageHints_(selection, payload, userMessage, conversationContext);
         selection = finalizeSelectionLanguages_(std::move(selection));
+        selection = applySemanticSelectionPlan_(std::move(selection), payload, conversationContext);
+        if (!selection.selectedSkill.empty() &&
+            selection.selectedSkill != "general_answer" &&
+            !registry_.hasSkill(selection.selectedSkill)) {
+            const std::string semanticSkill = skillFromSemanticSelection_(selection, conversationContext);
+            if (!semanticSkill.empty() && registry_.hasSkill(semanticSkill)) {
+                selection.selectedSkill = semanticSkill;
+            }
+        }
         if (selection.selectedSkill == "general_answer") {
+            if (selection.groundingRequired || shouldPreferGroundedExplainApp_(userMessage, payload)) {
+                selection.selectedSkill = "explain_app";
+                selection.confidence = (std::max)(selection.confidence, 0.75);
+                if (selection.reason.empty()) {
+                    selection.reason = "prefer_grounded_app_help";
+                }
+            }
             return selection;
         }
         if (!selection.selectedSkill.empty() && registry_.hasSkill(selection.selectedSkill)) {
@@ -1049,157 +1458,82 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
     }
 
     if (!heuristic.selectedSkill.empty()) {
-        SkillSelection rewritten = rewriteInstructionalSelection_(heuristic, userMessage);
-        if (llm_.isConfigured() && shouldDetectReplyLanguageForSelection_(rewritten)) {
-            const std::string detectedReplyLanguage = llm_.detectReplyLanguage(
+        SkillSelection rewritten = applySemanticSelectionPlan_(heuristic, payload, conversationContext);
+        rewritten = applyReplyLanguageHints_(rewritten, payload, userMessage, conversationContext);
+        if (llm.isConfigured() &&
+            (queryLanguageSource != "detected" ||
+             shouldDetectReplyLanguageForSelection_(rewritten))) {
+            const std::string detectedReplyLanguage = llm.detectReplyLanguage(
                 userMessage,
                 appLanguage);
             if (!detectedReplyLanguage.empty()) {
                 rewritten.replyLanguage = detectedReplyLanguage;
+                rewritten.replyLanguageConfidence =
+                    (std::max)(rewritten.replyLanguageConfidence, 0.95);
             }
         }
-        return finalizeSelectionLanguages_(std::move(rewritten));
+        rewritten = applyReplyLanguageHints_(rewritten, payload, userMessage, conversationContext);
+        rewritten = finalizeSelectionLanguages_(std::move(rewritten));
+        rewritten = applySemanticSelectionPlan_(std::move(rewritten), payload, conversationContext);
+        return rewritten;
     }
 
     SkillSelection fallback;
-    fallback.selectedSkill = llm_.isConfigured() ? "general_answer" : "explain_app";
+    fallback.selectedSkill = llm.isConfigured() ? "general_answer" : "explain_app";
     fallback.confidence = 0.10;
     fallback.reason = "default_fallback";
-    fallback.replyPreview = llm_.isConfigured()
+    fallback.replyPreview = llm.isConfigured()
         ? "Vou responder diretamente."
         : "Vou responder usando a skill de ajuda do aplicativo.";
-    if (llm_.isConfigured() && shouldDetectReplyLanguageForSelection_(fallback)) {
-        fallback.replyLanguage = llm_.detectReplyLanguage(
+    fallback = applySemanticSelectionPlan_(std::move(fallback), payload, conversationContext);
+    fallback = applyReplyLanguageHints_(fallback, payload, userMessage, conversationContext);
+    if (llm.isConfigured() &&
+        (queryLanguageSource != "detected" ||
+         shouldDetectReplyLanguageForSelection_(fallback))) {
+        fallback.replyLanguage = llm.detectReplyLanguage(
             userMessage,
             appLanguage);
+        if (!fallback.replyLanguage.empty()) {
+            fallback.replyLanguageConfidence =
+                (std::max)(fallback.replyLanguageConfidence, 0.95);
+        }
+    }
+    fallback = applyReplyLanguageHints_(fallback, payload, userMessage, conversationContext);
+    fallback = applySemanticSelectionPlan_(std::move(fallback), payload, conversationContext);
+    if (fallback.selectedSkill == "general_answer" &&
+        shouldPreferGroundedExplainApp_(userMessage, payload)) {
+        fallback.selectedSkill = "explain_app";
+        fallback.confidence = 0.7;
+        fallback.reason = "prefer_grounded_app_help";
+        fallback.replyPreview = "Vou responder com base no conhecimento do aplicativo.";
     }
     return finalizeSelectionLanguages_(fallback);
 }
 
 SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
     const nlohmann::json& payload,
-    const std::string& userMessage) const
+    const std::string& userMessage,
+    const nlohmann::json& conversationContext) const
 {
     SkillSelection selection;
-    const std::string normalized = lowerAsciiCopy_(userMessage);
-    const bool hasPayloadObject = payload.is_object();
-    const bool hasUploadedImage =
-        hasPayloadObject &&
-        payload.contains("uploaded_image_base64") &&
-        payload["uploaded_image_base64"].is_string() &&
-        !payload["uploaded_image_base64"].get<std::string>().empty();
-    const bool hasUploadedVideo =
-        hasPayloadObject &&
-        payload.contains("uploaded_video_url") &&
-        payload["uploaded_video_url"].is_string() &&
-        !payload["uploaded_video_url"].get<std::string>().empty();
-
-    if (hasUploadedImage || hasUploadedVideo) {
+    if (hasUploadedMedia_(payload)) {
         selection.selectedSkill = "video_search";
         selection.confidence = 1.0;
         selection.reason = "uploaded_media_requires_video_search";
         selection.replyPreview = "Vou analisar a midia enviada usando a pipeline atual de busca em video.";
+        selection.mode = "operate";
+        selection.entity = "video";
+        selection.intent = "inspect";
         return selection;
     }
 
-    if ((hasCameraCreationVerb_(normalized) && hasCameraReference_(normalized)) ||
-        isCameraOnboardingHelpRequest_(normalized) ||
-        containsAny_(normalized, { "connect camera" })) {
-        if (isCameraSetupHelpRequest_(normalized) || isCameraOnboardingHelpRequest_(normalized)) {
-            selection.selectedSkill = "explain_app";
-            selection.confidence = 0.99;
-            selection.reason = "camera_setup_help_request";
-            selection.replyPreview = "Vou explicar como configurar a camera.";
-            selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
-            return selection;
-        }
-        if (isCameraCreationHelpRequest_(normalized)) {
-            selection.selectedSkill = "explain_app";
-            selection.confidence = 0.99;
-            selection.reason = "camera_creation_help_request";
-            selection.replyPreview = "Vou explicar como cadastrar uma camera.";
-            selection.arguments = nlohmann::json::object({ { "topic", "camera_creation" } });
-            return selection;
-        }
-        selection.selectedSkill = "create_camera";
-        selection.confidence = 0.98;
-        selection.reason = "explicit_camera_creation_request";
-        selection.replyPreview = "Vou preparar a criacao da camera.";
-        return selection;
-    }
-
-    if (!isCameraAgentHelpRequest_(normalized) && containsAny_(normalized, {
-        "create job", "criar job", "novo job", "schedule job", "agendar job", "montar job",
-        "job recorrente", "workflow", "agendamento", "cronograma"
-    })) {
-        if (isJobCreationHelpRequest_(normalized)) {
-            selection.selectedSkill = "explain_app";
-            selection.confidence = 0.99;
-            selection.reason = "job_creation_help_request";
-            selection.replyPreview = "Vou explicar como criar um job.";
-            selection.arguments = nlohmann::json::object({ { "topic", "jobs" } });
-            return selection;
-        }
-        selection.selectedSkill = "create_job";
-        selection.confidence = 0.98;
-        selection.reason = "explicit_job_creation_request";
-        selection.replyPreview = "Vou preparar a criacao do job.";
-        return selection;
-    }
-
-    if ((hasAgentCreationVerb_(normalized) && hasAgentReference_(normalized)) ||
-        isCameraAgentHelpRequest_(normalized) ||
-        containsAny_(normalized, {
-            "create agent", "criar agente", "camera agent", "agente na camera", "algoritmo na camera",
-            "custom agent", "agente custom", "novo agente", "ai agent", "ai agents"
-        })) {
-        if (isCameraAgentHelpRequest_(normalized)) {
-            selection.selectedSkill = "explain_app";
-            selection.confidence = 0.99;
-            selection.reason = isCameraAgentCreationHelpRequest_(normalized)
-                ? "camera_agent_creation_help_request"
-                : "camera_agent_help_request";
-            selection.replyPreview = "Vou explicar como configurar um agente.";
-            selection.arguments = nlohmann::json::object({ { "topic", agentHelpTopicForQuery_(normalized) } });
-            return selection;
-        }
-        selection.selectedSkill = "create_camera_agent";
-        selection.confidence = 0.98;
-        selection.reason = "explicit_camera_agent_creation_request";
-        selection.replyPreview = "Vou preparar a criacao do agente na camera.";
-        return selection;
-    }
-
-    if (containsAny_(normalized, {
-        "list cameras", "listar cameras", "show cameras", "status das cameras", "read state",
-        "estado atual", "listar jobs", "listar agentes", "current jobs", "saldo", "configs",
-        "email", "e-mail", "account", "profile", "conta", "perfil"
-    })) {
-        selection.selectedSkill = "read_state";
-        selection.confidence = 0.95;
-        selection.reason = "explicit_state_read_request";
-        selection.replyPreview = "Vou consultar o estado atual do aplicativo.";
-        return selection;
-    }
-
-    if (containsAny_(normalized, {
-        "billing", "tokens", "payment", "stripe", "pairing", "api key", "api keys",
-        "openai key", "z.ai", "glm", "tutorial", "how do i", "how to", "como usar",
-        "como funciona", "pair", "parear", "emparelhar", "chave api", "configurar",
-        "site", "app", "painel", "dashboard", "settings", "configuracoes"
-    })) {
-        selection.selectedSkill = "explain_app";
-        selection.confidence = 0.95;
-        selection.reason = "explicit_help_request";
-        selection.replyPreview = "Vou responder usando a skill de ajuda do aplicativo.";
-        return selection;
-    }
-
-    if (isVideoObservationRequest_(normalized)) {
-        selection.selectedSkill = "video_search";
-        selection.confidence = 0.97;
-        selection.reason = "camera_or_footage_search_intent";
-        selection.replyPreview = "Vou acionar a skill de video_search.";
+    const std::string activeTaskType = activeTaskTypeForContext_(conversationContext);
+    if (!activeTaskType.empty() && isLikelyShortTaskContinuation_(userMessage)) {
+        selection.selectedSkill = activeTaskType;
+        selection.confidence = 0.9;
+        selection.reason = "active_task_continuation_fallback";
+        selection.replyPreview = "Vou continuar a operacao atual.";
+        selection.continueActiveTask = true;
         return selection;
     }
 
@@ -1283,6 +1617,7 @@ std::string ChatV2Orchestrator::buildComingSoonAnswer_(
 }
 
 std::string ChatV2Orchestrator::buildGeneralAnswer_(
+    const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const SkillSelection& selection,
     const std::string& userMessage,
@@ -1292,11 +1627,11 @@ std::string ChatV2Orchestrator::buildGeneralAnswer_(
     const std::string fallbackLanguage =
         selection.replyLanguage.empty() ? appLanguage : selection.replyLanguage;
 
-    if (!llm_.isConfigured()) {
+    if (!llm.isConfigured()) {
         return buildCapabilityUnavailableAnswer_(fallbackLanguage);
     }
 
-    const std::string answer = llm_.answerDirectly(
+    const std::string answer = llm.answerDirectly(
         userMessage,
         normalizeConversationContextForPrompt_(conversationContext),
         selection.replyLanguage,
@@ -1311,6 +1646,7 @@ std::string ChatV2Orchestrator::buildGeneralAnswer_(
 }
 
 std::string ChatV2Orchestrator::polishAndSanitizeAnswer_(
+    const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const SkillSelection& selection,
     const std::string& draftAnswer,
@@ -1323,8 +1659,8 @@ std::string ChatV2Orchestrator::polishAndSanitizeAnswer_(
 
     const std::string userMessage =
         payload.is_object() ? payload.value("query", std::string()) : std::string();
-    if (llm_.isConfigured()) {
-        const std::string polished = llm_.polishAnswer(
+    if (llm.isConfigured()) {
+        const std::string polished = llm.polishAnswer(
             userMessage,
             draftAnswer,
             normalizeConversationContextForPrompt_(conversationContext),
@@ -1402,13 +1738,33 @@ void ChatV2Orchestrator::recordRoutingTelemetry_(
         },
         { "registered_skills", payload.is_object() ? payload.value("registered_skills", nlohmann::json::array()) : nlohmann::json::array() },
         { "shadow_enabled", shadowModeEnabled_ },
-        { "llm_required", runtimeManager_.requiresLlm() },
-        { "llm_endpoint_configured", llm_.isConfigured() },
+        { "llm_required", true },
+        {
+            "llm_endpoint_configured",
+            buildChatModelClientConfigFromPayload(payload, false).enabled
+        },
         { "reply_language", selection.replyLanguage.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.replyLanguage) },
         { "reply_language_confidence", selection.replyLanguageConfidence },
         { "knowledge_language", selection.knowledgeLanguage },
         { "knowledge_language_fallback", selection.knowledgeLanguageFallback },
+        { "semantic_mode", selection.mode.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.mode) },
+        { "semantic_entity", selection.entity.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.entity) },
+        { "semantic_intent", selection.intent.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.intent) },
+        { "continue_active_task", selection.continueActiveTask },
+        { "grounding_required", selection.groundingRequired },
+        { "operation_type", selection.operationType.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.operationType) },
+        { "operation_phase", selection.operationPhase.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.operationPhase) },
+        { "task_goal", selection.taskGoal.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.taskGoal) },
     };
+    if (!selection.draftPatch.is_null() && !selection.draftPatch.empty()) {
+        metadata["draft_patch"] = selection.draftPatch;
+    }
+    if (!selection.missingFieldsGuess.empty()) {
+        metadata["missing_fields_guess"] = selection.missingFieldsGuess;
+    }
+    if (!selection.supportingTopics.empty()) {
+        metadata["supporting_topics"] = selection.supportingTopics;
+    }
     if (!selection.arguments.is_null() && !selection.arguments.empty()) {
         metadata["arguments"] = selection.arguments;
     }
@@ -1479,6 +1835,11 @@ bool ChatV2Orchestrator::finalizeAsChatMessage_(
         { "model_output_tokens", 0 },
         { "model_total_tokens", 0 },
     };
+    if (result.metadata.is_object() &&
+        result.metadata.contains("message_metadata") &&
+        result.metadata["message_metadata"].is_object()) {
+        routerResult["message_metadata"] = result.metadata["message_metadata"];
+    }
 
     const std::string url =
         agent.getBackendBaseUrl() + "/api/agent/chat-router-result?client_id=" + agent.getClientId();

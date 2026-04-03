@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ChatMessage } from "@/shared/types";
 import { brand } from "@/shared/brand";
+import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
 import {
   emitOpenAiKeyRequiredPrompt,
   emitZAiKeyRequiredPrompt,
@@ -162,6 +163,12 @@ interface SendMessageOptions {
 
 interface CancelMessageOptions {
   reason?: "manual" | "offline" | "stale";
+}
+
+interface SubmitCameraRegistrationOptions {
+  sessionIdOverride?: number | null;
+  sourceMessageId: number;
+  draft: Record<string, unknown>;
 }
 
 export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSessionConfig) {
@@ -543,7 +550,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
 
         if (response.status === 402) {
           setError(
-            (data as any).error ||
+            sanitizeAiApiErrorText((data as any).error) ||
               (brand.features.billingEnabled
                 ? "You're out of AI tokens. Go to Billing to add more."
                 : "You're out of AI tokens.")
@@ -554,19 +561,23 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
 
         if (isOpenAiKeyRequiredError(data)) {
           emitOpenAiKeyRequiredPrompt();
-          setError((data as any).message || "OpenAI API key is required in Settings.");
+          setError(
+            sanitizeAiApiErrorText((data as any).message) || "OpenAI API key is required in Settings."
+          );
           setIsLoading(false);
           return;
         }
         if (isZAiKeyRequiredError(data)) {
           emitZAiKeyRequiredPrompt();
-          setError((data as any).message || "Z.ai API key is required in Settings.");
+          setError(
+            sanitizeAiApiErrorText((data as any).message) || "Z.ai API key is required in Settings."
+          );
           setIsLoading(false);
           return;
         }
 
         if (!response.ok) {
-          throw new Error((data as any)?.error || "Failed to send message");
+          throw new Error(sanitizeAiApiErrorText((data as any)?.error) || "Failed to send message");
         }
 
         const warningMessage =
@@ -582,6 +593,54 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         setError("Failed to send message. Please try again.");
         setWarning(null);
         setIsLoading(false);
+      }
+    },
+    [sessionId, upsertMessages]
+  );
+
+  const submitCameraRegistration = useCallback(
+    async ({
+      sessionIdOverride,
+      sourceMessageId,
+      draft,
+    }: SubmitCameraRegistrationOptions) => {
+      const targetSessionId = sessionIdOverride ?? sessionId;
+      if (!targetSessionId || !sourceMessageId) return;
+
+      setError(null);
+      setWarning(null);
+
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${targetSessionId}/camera-registration/confirm`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              source_message_id: sourceMessageId,
+              draft,
+            }),
+          }
+        );
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          if (Array.isArray((data as any)?.messages)) {
+            upsertMessages((data as any).messages);
+          }
+          const errorText =
+            typeof (data as any)?.error === "string"
+              ? (data as any).error
+              : "Failed to register camera";
+          throw new Error(errorText);
+        }
+
+        if (Array.isArray((data as any)?.messages)) {
+          upsertMessages((data as any).messages);
+        }
+      } catch (err) {
+        console.error("Failed to submit camera registration:", err);
+        throw err;
       }
     },
     [sessionId, upsertMessages]
@@ -650,6 +709,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     warning,
     pendingExecutionState,
     sendMessage,
+    submitCameraRegistration,
     cancelMessage,
     clearError,
     clearWarning,

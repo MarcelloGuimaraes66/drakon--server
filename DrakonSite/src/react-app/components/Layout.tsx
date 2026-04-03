@@ -1,4 +1,4 @@
-import { ReactNode, useState, useEffect, useMemo, useRef } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 import { useAuth } from "@getmocha/users-service/react";
 import { useTranslation } from "react-i18next";
@@ -8,6 +8,7 @@ import QuickChatOverlay from "@/react-app/components/QuickChatOverlay";
 import MinimizedChatTabs from "@/react-app/components/MinimizedChatTabs";
 import LanguageSelector from "@/react-app/components/LanguageSelector";
 import BrandLogo from "@/react-app/components/BrandLogo";
+import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import SystemActivityModal from "@/react-app/components/SystemActivityModal";
 import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
@@ -36,6 +37,7 @@ import {
   Sun,
   Radar,
   Sparkles,
+  type LucideIcon,
 } from "lucide-react";
 
 interface LayoutProps {
@@ -47,11 +49,50 @@ type BreadcrumbItem = {
   href?: string;
 };
 
+type SidebarNavItem = {
+  name: string;
+  href: string;
+  icon: LucideIcon;
+  description: string;
+  badgeCount?: number;
+};
+
+type SidebarNavGroup = {
+  id: "primary" | "system";
+  label: string;
+  items: SidebarNavItem[];
+};
+
+type SidebarHoverHint = {
+  name: string;
+  description: string;
+  top: number;
+  left: number;
+};
+
 const CHAT_AUTO_COLLAPSE_DELAY_MS = 260;
 const CHAT_AUTO_EXPAND_DELAY_MS = 1000;
+const SIDEBAR_DESCRIPTION_HOVER_DELAY_MS = 2000;
+
+function getSidebarSectionLabels(language: string) {
+  if (language.startsWith("pt") || language.startsWith("es")) {
+    return { primary: "Principal", system: "Sistema" };
+  }
+
+  if (language.startsWith("fr")) {
+    return { primary: "Principal", system: "Systeme" };
+  }
+
+  return { primary: "Primary", system: "System" };
+}
+
+function formatSidebarBadgeCount(count?: number) {
+  if (!count || count < 1) return null;
+  return count > 99 ? "99+" : String(count);
+}
 
 export default function Layout({ children }: LayoutProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { user, logout } = useAuth();
   const { startTutorial, status: onboardingStatus } = useOnboarding();
   const { theme, setTheme } = useTheme();
@@ -73,20 +114,78 @@ export default function Layout({ children }: LayoutProps) {
   const [isSystemActivityOpen, setIsSystemActivityOpen] = useState(false);
   const [showOpenAiKeyPrompt, setShowOpenAiKeyPrompt] = useState(false);
   const [showZAiKeyPrompt, setShowZAiKeyPrompt] = useState(false);
+  const [sidebarHoverHint, setSidebarHoverHint] = useState<SidebarHoverHint | null>(null);
   const previousPathnameRef = useRef("");
   const collapseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearCueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expandTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sidebarHoverHintTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousUnreadCountRef = useRef(0);
   const notificationsContainerRef = useRef<HTMLDivElement>(null);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
   const isSidebarCollapsed = isDesktop && (isSidebarCollapsedDesktop || isChatAutoCollapsedDesktop);
+  const currentBrandId = brand.id.toLowerCase();
+  const isPerceptrumBrand = currentBrandId === "perceptrum";
+  const isDrakonBrand = currentBrandId === "drakon";
   const billingEnabled = brand.features.billingEnabled;
   const drakonFindEnabled = brand.features.drakonFindEnabled;
   const collapsedBrandIconClassName =
-    brand.id.toLowerCase() === "perceptrum"
+    isPerceptrumBrand
       ? "h-10 w-14 object-contain"
       : "h-8 w-8 object-contain rounded-md";
+  const expandedSidebarWidthClass = "md:w-[17.5rem]";
+  const collapsedSidebarWidthClass = "md:w-[5rem]";
+  const mobileSidebarWidthClass = "w-[min(17.5rem,88vw)]";
+  const sidebarScrollToneClass = isDrakonBrand
+    ? "sidebar-nav-scroll-neutral"
+    : "sidebar-nav-scroll-accent";
+  const sidebarEdgeLineClass = isDrakonBrand
+    ? "bg-gradient-to-b from-transparent via-white/12 to-transparent"
+    : "bg-gradient-to-b from-transparent via-blue-400/45 to-transparent";
+  const sidebarEdgeGlowClass = isDrakonBrand
+    ? "-right-4 w-8 bg-black/70 blur-[38px]"
+    : "-right-3 w-6 bg-blue-500/15 blur-2xl";
+  const sidebarActiveCardClass = isDrakonBrand
+    ? "border-white/8 bg-[#111112] shadow-[0_24px_40px_-36px_rgba(0,0,0,0.98)]"
+    : "border-blue-400/20 bg-gray-800/90 shadow-[0_20px_40px_-30px_rgba(74,149,255,0.9)]";
+  const sidebarIdleCardClass = isDrakonBrand
+    ? "border-transparent bg-gray-900/15 hover:border-white/8 hover:bg-[#171718]"
+    : "border-transparent bg-gray-900/20 hover:border-white/10 hover:bg-gray-800/70";
+  const sidebarActiveOverlayClass = isDrakonBrand
+    ? "opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(255,255,255,0.05),transparent_56%),linear-gradient(135deg,rgba(255,255,255,0.025),transparent_72%)]"
+    : "opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(100,121,160,0.36),transparent_56%),linear-gradient(135deg,rgba(74,149,255,0.12),transparent_72%)]";
+  const sidebarHoverOverlayClass = isDrakonBrand
+    ? "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(255,255,255,0.04),transparent_60%)]"
+    : "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(74,149,255,0.12),transparent_60%)]";
+  const sidebarActiveRailClass = isDrakonBrand
+    ? "w-[3px] bg-gradient-to-b from-white/75 via-white/45 to-white/20 opacity-100 shadow-[0_0_16px_rgba(255,255,255,0.14)]"
+    : "w-[3px] bg-gradient-to-b from-blue-200 via-blue-400 to-purple-300 opacity-100 shadow-[0_0_20px_rgba(74,149,255,0.7)]";
+  const sidebarIdleRailClass = "w-px bg-white/10 opacity-0 group-hover:opacity-100";
+  const sidebarActiveIconClass = isDrakonBrand
+    ? "border-white/8 bg-[#18181a] text-gray-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+    : "border-white/10 bg-white/10 text-gray-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]";
+  const sidebarIdleIconClass = isDrakonBrand
+    ? "border-white/8 bg-[#141416] text-gray-400 group-hover:border-white/12 group-hover:bg-[#1b1b1d] group-hover:text-gray-200"
+    : "border-white/10 bg-gray-800/60 text-gray-400 group-hover:border-white/15 group-hover:bg-gray-800/80 group-hover:text-gray-200";
+  const sidebarActiveIconOverlayClass = isDrakonBrand
+    ? "opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.06),transparent_62%)]"
+    : "opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.12),transparent_58%)]";
+  const sidebarHoverIconOverlayClass = isDrakonBrand
+    ? "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.04),transparent_62%)]"
+    : "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.08),transparent_58%)]";
+  const sidebarActiveDescriptionClass = isDrakonBrand ? "text-gray-500" : "text-blue-100/70";
+  const sidebarActiveDotClass = isDrakonBrand
+    ? "bg-white/45 shadow-[0_0_12px_rgba(255,255,255,0.12)]"
+    : "bg-blue-300/70 shadow-[0_0_14px_rgba(147,197,253,0.65)]";
+  const sidebarTooltipToneClass = isDrakonBrand
+    ? "border-white/10 bg-[#111112]/96 text-gray-200 shadow-[0_18px_34px_-20px_rgba(0,0,0,0.95)]"
+    : "border-blue-400/18 bg-[#16192a]/96 text-blue-50 shadow-[0_18px_34px_-20px_rgba(52,97,255,0.5)]";
+  const sidebarTooltipTitleClass = isDrakonBrand ? "text-gray-500" : "text-blue-200/70";
+  const sidebarTooltipBodyClass = isDrakonBrand ? "text-gray-200" : "text-blue-50/95";
+  const sidebarSectionLabels = useMemo(
+    () => getSidebarSectionLabels((i18n.resolvedLanguage || i18n.language || "en").toLowerCase()),
+    [i18n.language, i18n.resolvedLanguage]
+  );
   
   // Use unified dashboard summary hook
   const { cameras, dashboard, unreadCount, tokenUsageMonth } = useDashboardSummary();
@@ -95,7 +194,17 @@ export default function Layout({ children }: LayoutProps) {
   // Auto-close drawer on route change
   useEffect(() => {
     setIsSidebarOpen(false);
+    setSidebarHoverHint(null);
   }, [location.pathname]);
+
+  useEffect(() => {
+    return () => {
+      if (sidebarHoverHintTimeoutRef.current) {
+        clearTimeout(sidebarHoverHintTimeoutRef.current);
+        sidebarHoverHintTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -190,24 +299,15 @@ export default function Layout({ children }: LayoutProps) {
       setIsNotificationsOpen(false);
     };
 
-    const handleClickOutside = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (!target) return;
-      if (notificationsContainerRef.current?.contains(target)) return;
-      closeNotifications();
-    };
-
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         closeNotifications();
       }
     };
 
-    document.addEventListener("mousedown", handleClickOutside);
     document.addEventListener("keydown", handleEscape);
 
     return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
       document.removeEventListener("keydown", handleEscape);
     };
   }, [isNotificationsOpen]);
@@ -247,8 +347,8 @@ export default function Layout({ children }: LayoutProps) {
           ? await zAiResponse.json().catch(() => ({}))
           : {};
         if (cancelled) return;
-        setShowOpenAiKeyPrompt(!Boolean(openAiData?.has_key));
-        setShowZAiKeyPrompt(!Boolean(zAiData?.has_key));
+        setShowOpenAiKeyPrompt(!openAiData?.has_key);
+        setShowZAiKeyPrompt(!zAiData?.has_key);
       } catch {
         // Ignore transient errors; this check should never block UI.
       }
@@ -336,20 +436,143 @@ export default function Layout({ children }: LayoutProps) {
   };
 
   const handleNavigationClick = () => {
+    if (sidebarHoverHintTimeoutRef.current) {
+      clearTimeout(sidebarHoverHintTimeoutRef.current);
+      sidebarHoverHintTimeoutRef.current = null;
+    }
+    setSidebarHoverHint(null);
     setIsSidebarOpen(false);
   };
 
-  const navigation = [
-    { name: t("nav.dashboard"), href: "/dashboard", icon: LayoutDashboard },
-    { name: t("nav.aiAgents"), href: "/ai-agents", icon: Bot },
-    ...(drakonFindEnabled ? [{ name: "Drakon Find", href: "/drakon-find", icon: Radar }] : []),
-    { name: t("nav.jobs"), href: "/jobs", icon: Briefcase },
-    { name: t("nav.aiAssistant"), href: "/chat", icon: MessageSquare },
-    { name: t("nav.cameras"), href: "/cameras", icon: Camera },
-    { name: t("nav.logsEvents"), href: "/events", icon: FileText },
-    ...(billingEnabled ? [{ name: t("nav.billing"), href: "/billing", icon: CreditCard }] : []),
-    { name: t("nav.settings"), href: "/settings", icon: Settings },
-  ];
+  const hideSidebarHoverHint = () => {
+    if (sidebarHoverHintTimeoutRef.current) {
+      clearTimeout(sidebarHoverHintTimeoutRef.current);
+      sidebarHoverHintTimeoutRef.current = null;
+    }
+    setSidebarHoverHint(null);
+  };
+
+  const handleSidebarItemMouseEnter = (target: HTMLAnchorElement, item: SidebarNavItem) => {
+    if (typeof window === "undefined" || !item.description) return;
+
+    hideSidebarHoverHint();
+
+    sidebarHoverHintTimeoutRef.current = setTimeout(() => {
+      const rect = target.getBoundingClientRect();
+      const tooltipWidth = 252;
+      const maxLeft = window.innerWidth - tooltipWidth - 16;
+      const left = Math.max(12, Math.min(rect.right + 14, maxLeft));
+      const top = Math.max(54, Math.min(rect.top + rect.height / 2, window.innerHeight - 54));
+
+      setSidebarHoverHint({
+        name: item.name,
+        description: item.description,
+        top,
+        left,
+      });
+      sidebarHoverHintTimeoutRef.current = null;
+    }, SIDEBAR_DESCRIPTION_HOVER_DELAY_MS);
+  };
+
+  const unreadAlertsBadgeCount = unreadCount > 0 ? unreadCount : undefined;
+  const runningJobsBadgeCount =
+    (dashboard?.stats?.jobs_running ?? dashboard?.jobs?.runningJobs?.length ?? 0) > 0
+      ? dashboard?.stats?.jobs_running ?? dashboard?.jobs?.runningJobs?.length ?? 0
+      : undefined;
+  const navigationGroups = useMemo<SidebarNavGroup[]>(
+    () => {
+      const primaryItems: SidebarNavItem[] = [
+        {
+          name: t("nav.dashboard"),
+          href: "/dashboard",
+          icon: LayoutDashboard,
+          description: t("dashboard.pageSubtitle", { defaultValue: t("dashboard.subtitle") }),
+          badgeCount: unreadAlertsBadgeCount,
+        },
+        {
+          name: t("nav.aiAgents"),
+          href: "/ai-agents",
+          icon: Bot,
+          description: t("aiAgents.subtitle"),
+        },
+        {
+          name: "Hub",
+          href: "/hub",
+          icon: Sparkles,
+          description: "Reusable agents and task templates",
+        },
+        ...(drakonFindEnabled
+          ? [
+              {
+                name: "Drakon Find",
+                href: "/drakon-find",
+                icon: Radar,
+                description: t("drakonFind.operations.subtitle", {
+                  defaultValue: "Status, clients, and hits per search.",
+                }),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        {
+          name: t("nav.jobs"),
+          href: "/jobs",
+          icon: Briefcase,
+          description: t("jobs.subtitle"),
+          badgeCount: runningJobsBadgeCount,
+        },
+        {
+          name: t("nav.aiAssistant"),
+          href: "/chat",
+          icon: MessageSquare,
+          description: t("quickChat.subtitle", { defaultValue: t("chat.subtitle") }),
+        },
+      ];
+      const systemItems: SidebarNavItem[] = [
+        {
+          name: t("nav.cameras"),
+          href: "/cameras",
+          icon: Camera,
+          description: t("cameras.subtitle"),
+        },
+        {
+          name: t("nav.logsEvents"),
+          href: "/events",
+          icon: FileText,
+          description: t("events.subtitle"),
+        },
+        ...(billingEnabled
+          ? [
+              {
+                name: t("nav.billing"),
+                href: "/billing",
+                icon: CreditCard,
+                description: t("billing.subtitle"),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        {
+          name: t("nav.settings"),
+          href: "/settings",
+          icon: Settings,
+          description: t("settings.subtitle"),
+        },
+      ];
+
+      return [
+        { id: "primary", label: sidebarSectionLabels.primary, items: primaryItems },
+        { id: "system", label: sidebarSectionLabels.system, items: systemItems },
+      ];
+    },
+    [
+      billingEnabled,
+      drakonFindEnabled,
+      runningJobsBadgeCount,
+      sidebarSectionLabels.primary,
+      sidebarSectionLabels.system,
+      t,
+      unreadAlertsBadgeCount,
+    ]
+  );
 
   const isActive = (href: string) => {
     if (href === "/ai-agents" && location.pathname.startsWith("/algorithms/")) {
@@ -379,6 +602,14 @@ export default function Layout({ children }: LayoutProps) {
       pushItem(t("nav.dashboard"), "/dashboard");
     } else if (pathname.startsWith("/ai-agents")) {
       pushItem(t("nav.aiAgents"), "/ai-agents");
+    } else if (pathname.startsWith("/hub")) {
+      pushItem("Hub", "/hub");
+      const hubType = searchParams.get("type");
+      if (hubType === "task") {
+        pushItem("Tasks");
+      } else if (hubType === "agent") {
+        pushItem("Agents");
+      }
     } else if (drakonFindEnabled && pathname.startsWith("/drakon-find")) {
       pushItem("Drakon Find", "/drakon-find");
     } else if (pathname.startsWith("/cameras")) {
@@ -461,58 +692,159 @@ export default function Layout({ children }: LayoutProps) {
       <aside
         className={`${
           isSidebarOpen ? "translate-x-0" : "-translate-x-full"
-        } md:translate-x-0 fixed md:relative z-50 md:z-auto w-4/5 ${
-          isSidebarCollapsed ? "md:w-20" : "md:w-64"
-        } bg-gray-900 border-r border-gray-800 transition-[transform,width] duration-300 h-screen flex-shrink-0 overflow-y-auto`}
+        } md:translate-x-0 fixed md:relative z-50 md:z-auto ${mobileSidebarWidthClass} ${
+          isSidebarCollapsed ? collapsedSidebarWidthClass : expandedSidebarWidthClass
+        } bg-gray-900 border-r border-gray-800 transition-[transform,width] duration-300 h-screen flex-shrink-0 overflow-hidden`}
       >
-        <div className="min-h-full flex flex-col">
-          {/* Logo */}
-          <div
-            className={`h-16 flex items-center border-b border-gray-800 flex-shrink-0 ${
-              isSidebarCollapsed ? "justify-center px-2" : "px-6"
-            }`}
-          >
-            {isSidebarCollapsed ? (
-              <BrandLogo
-                variant="icon"
-                theme={theme}
-                iconClassName={collapsedBrandIconClassName}
-              />
-            ) : (
-              <BrandLogo
-                variant="full"
-                theme={theme}
-                className="flex items-center gap-3"
-                imageClassName="h-10 -ml-2"
-                iconClassName="h-10 w-10 object-contain rounded-md"
-                textClassName="text-xl font-semibold tracking-wide text-gray-100"
-              />
-            )}
-          </div>
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="pointer-events-none absolute inset-0 overflow-hidden">
+              {!isSidebarCollapsed ? (
+                <ChatPlexusBackground
+                  motion="rise"
+                  className="opacity-[0.7] [mask-image:linear-gradient(180deg,transparent_0%,black_9%,black_92%,transparent_100%)]"
+                />
+              ) : null}
+              <div className={`absolute inset-y-12 right-0 w-px ${sidebarEdgeLineClass}`} />
+              <div className={`absolute inset-y-16 ${sidebarEdgeGlowClass}`} />
+            </div>
 
-          {/* Navigation */}
-          <nav className={`${isSidebarCollapsed ? "px-2" : "px-4"} py-6 space-y-1 md:flex-1`}>
-            {navigation.map((item) => {
-              const Icon = item.icon;
-              const active = isActive(item.href);
-              return (
-                <Link
-                  key={item.name}
-                  to={item.href}
-                  onClick={handleNavigationClick}
-                  title={isSidebarCollapsed ? item.name : undefined}
-                  className={`flex items-center px-4 py-3 rounded-lg transition-all ${
-                    active
-                      ? "bg-blue-500/10 text-blue-400 shadow-lg shadow-blue-500/20"
-                      : "text-gray-400 hover:bg-gray-800 hover:text-gray-200"
-                  } ${isSidebarCollapsed ? "justify-center" : ""}`}
-                >
-                  <Icon className={`w-5 h-5 ${isSidebarCollapsed ? "" : "mr-3"}`} />
-                  {!isSidebarCollapsed && <span className="font-medium">{item.name}</span>}
-                </Link>
-              );
-            })}
-          </nav>
+            {/* Logo */}
+            <div
+              className={`relative h-16 flex items-center border-b border-gray-800/60 flex-shrink-0 ${
+                isSidebarCollapsed ? "justify-center px-2" : "px-6"
+              }`}
+            >
+              {isSidebarCollapsed ? (
+                <BrandLogo
+                  variant="icon"
+                  theme={theme}
+                  iconClassName={collapsedBrandIconClassName}
+                />
+              ) : (
+                <BrandLogo
+                  variant="full"
+                  theme={theme}
+                  className="flex items-center gap-3"
+                  imageClassName="h-10 -ml-2"
+                  iconClassName="h-10 w-10 object-contain rounded-md"
+                  textClassName="text-xl font-semibold tracking-wide text-gray-100"
+                />
+              )}
+            </div>
+
+            {/* Navigation */}
+            <nav
+              className={`sidebar-nav-scroll ${sidebarScrollToneClass} relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain ${
+                isSidebarCollapsed ? "px-2 py-4" : "px-4 py-5 pr-2"
+              }`}
+              onScroll={hideSidebarHoverHint}
+            >
+              <div className={`${isSidebarCollapsed ? "space-y-2" : "space-y-5"}`}>
+                {navigationGroups.map((group, groupIndex) => (
+                  <section key={group.id} className="space-y-2.5">
+                    {!isSidebarCollapsed ? (
+                      <div className="px-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.28em] text-gray-600">
+                          {group.label}
+                        </p>
+                      </div>
+                    ) : null}
+                    <div className={`${isSidebarCollapsed ? "space-y-2" : "space-y-2.5"}`}>
+                      {group.items.map((item) => {
+                        const Icon = item.icon;
+                        const active = isActive(item.href);
+                        const badgeLabel = formatSidebarBadgeCount(item.badgeCount);
+
+                        return (
+                          <Link
+                            key={item.href}
+                            to={item.href}
+                            onClick={handleNavigationClick}
+                            aria-label={item.name}
+                            onMouseEnter={(event) => handleSidebarItemMouseEnter(event.currentTarget, item)}
+                            onMouseLeave={hideSidebarHoverHint}
+                            className={`group relative flex items-center overflow-hidden rounded-[18px] border transition-all duration-300 ${
+                              isSidebarCollapsed ? "justify-center px-2 py-3" : "gap-3 px-3 py-3.5"
+                            } ${
+                              active ? sidebarActiveCardClass : sidebarIdleCardClass
+                            }`}
+                          >
+                            {!isSidebarCollapsed ? (
+                              <span
+                                className={`pointer-events-none absolute inset-0 transition-opacity duration-300 ${
+                                  active ? sidebarActiveOverlayClass : sidebarHoverOverlayClass
+                                }`}
+                              />
+                            ) : null}
+                            <span
+                              className={`pointer-events-none absolute inset-y-3 left-0 rounded-r-full transition-all duration-300 ${
+                                active ? sidebarActiveRailClass : sidebarIdleRailClass
+                              }`}
+                            />
+                            <div
+                              className={`relative flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border transition-all duration-300 ${
+                                active ? sidebarActiveIconClass : sidebarIdleIconClass
+                              }`}
+                            >
+                              <Icon className="h-5 w-5" />
+                              <span
+                                className={`pointer-events-none absolute inset-0 rounded-2xl transition-opacity duration-300 ${
+                                  active
+                                    ? sidebarActiveIconOverlayClass
+                                    : sidebarHoverIconOverlayClass
+                                }`}
+                              />
+                            </div>
+                            {!isSidebarCollapsed ? (
+                              <>
+                                <div className="relative min-w-0 flex-1">
+                                  <div
+                                    className={`truncate text-[15px] font-semibold ${
+                                      active ? "text-white" : "text-gray-200 group-hover:text-white"
+                                    }`}
+                                  >
+                                    {item.name}
+                                  </div>
+                                  <div
+                                    className={`mt-1 line-clamp-1 text-[11px] leading-4 ${
+                                      active
+                                        ? sidebarActiveDescriptionClass
+                                        : "text-gray-500 group-hover:text-gray-400"
+                                    }`}
+                                  >
+                                    {item.description}
+                                  </div>
+                                </div>
+                                {badgeLabel ? (
+                                  <span className="relative ml-2 inline-flex min-w-7 shrink-0 items-center justify-center rounded-full border border-orange-400/25 bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white shadow-[0_12px_20px_-12px_rgba(249,115,22,0.95)]">
+                                    {badgeLabel}
+                                  </span>
+                                ) : (
+                                  <span
+                                    className={`relative h-2 w-2 rounded-full transition-all duration-300 ${
+                                      active
+                                        ? sidebarActiveDotClass
+                                        : "bg-gray-700 group-hover:bg-gray-500"
+                                    }`}
+                                  />
+                                )}
+                              </>
+                            ) : null}
+                          </Link>
+                        );
+                      })}
+                    </div>
+                    {!isSidebarCollapsed && groupIndex < navigationGroups.length - 1 ? (
+                      <div className="px-2 pt-1">
+                        <div className="h-px bg-gradient-to-r from-white/0 via-white/10 to-white/0" />
+                      </div>
+                    ) : null}
+                  </section>
+                ))}
+              </div>
+            </nav>
+          </div>
 
           {/* User section */}
           <div
@@ -590,6 +922,20 @@ export default function Layout({ children }: LayoutProps) {
           </div>
         </div>
       </aside>
+
+      {sidebarHoverHint ? (
+        <div
+          className={`pointer-events-none fixed z-[70] hidden w-[252px] -translate-y-1/2 rounded-2xl border px-3.5 py-3 backdrop-blur-xl md:block ${sidebarTooltipToneClass}`}
+          style={{ top: sidebarHoverHint.top, left: sidebarHoverHint.left }}
+        >
+          <div className={`text-[10px] font-semibold uppercase tracking-[0.22em] ${sidebarTooltipTitleClass}`}>
+            {sidebarHoverHint.name}
+          </div>
+          <p className={`mt-2 text-sm leading-5 ${sidebarTooltipBodyClass}`}>
+            {sidebarHoverHint.description}
+          </p>
+        </div>
+      ) : null}
 
       {/* Main content */}
       <div className="flex-1 min-h-0 flex flex-col min-w-0">
@@ -722,6 +1068,7 @@ export default function Layout({ children }: LayoutProps) {
               <NotificationsDropdown
                 isOpen={isNotificationsOpen}
                 onClose={handleNotificationsClose}
+                anchorRef={notificationsContainerRef}
               />
             </div>
           </div>

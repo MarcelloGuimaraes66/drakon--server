@@ -112,7 +112,7 @@ export default function JobFlowView({
                 type="button"
                 onClick={() => onChangeFlowDensity("normal")}
                 className={`rounded-full px-3 py-1.5 font-medium transition-colors ${
-                  !isCompact ? "bg-violet-500 text-white" : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                  !isCompact ? "bg-blue-600 text-white" : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
                 }`}
               >
                 {t("jobs.normalDensity", { defaultValue: "Normal" })}
@@ -121,7 +121,7 @@ export default function JobFlowView({
                 type="button"
                 onClick={() => onChangeFlowDensity("compact")}
                 className={`rounded-full px-3 py-1.5 font-medium transition-colors ${
-                  isCompact ? "bg-violet-500 text-white" : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                  isCompact ? "bg-blue-600 text-white" : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
                 }`}
               >
                 {t("jobs.compactDensity", { defaultValue: "Compact" })}

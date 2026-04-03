@@ -56,7 +56,7 @@ export default function JobsTabs({
             disabled={tab.disabled}
             className={`rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition-all duration-200 ${
               isActive
-                ? "bg-violet-500 text-white shadow-[0_16px_40px_-20px_rgba(139,92,246,0.95)]"
+                ? "bg-blue-600 text-white shadow-[0_16px_40px_-20px_rgba(37,99,235,0.95)]"
                 : tab.disabled
                 ? "cursor-not-allowed text-gray-600"
                 : "text-gray-300 hover:bg-white/5 hover:text-white"

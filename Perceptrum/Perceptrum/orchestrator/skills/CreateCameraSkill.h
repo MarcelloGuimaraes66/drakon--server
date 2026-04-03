@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../LocalLlmClient.h"
 #include "../SkillTypes.h"
 
 namespace chatv2 {

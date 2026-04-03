@@ -4,6 +4,7 @@ import { useQuickChat } from "@/react-app/hooks/useQuickChat";
 import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
@@ -12,28 +13,17 @@ import { brand, getBrandStorageKey } from "@/shared/brand";
 import { X, Bot, User, ExternalLink, Minus, AlertCircle } from "lucide-react";
 import {
   extractChatProgressFromMessage,
+  extractCameraRegistrationDraftFromMessage,
   extractHitMediaFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 type ChatModelTier = "ultra" | "ultra_plus" | "light" | "core";
-type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
-const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
+const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED = true;
-
-const MODEL_FPS_BY_TIER: Record<ChatModelTier, number> = {
-  ultra: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  ultra_plus: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  light: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-  core: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-};
-
-const supportsAdjustableVideoFps = (tier: ChatModelTier): boolean =>
-  tier === "ultra" || tier === "ultra_plus" || tier === "light";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
@@ -44,35 +34,6 @@ function normalizeChatModelTier(value: string | null | undefined): ChatModelTier
   if (normalized === "core") return "core";
   if (normalized === "light") return "light";
   return "ultra";
-}
-
-function normalizeChatRunningResolution(
-  value: unknown,
-  fallback: ChatRunningResolution = DEFAULT_CHAT_CORE_RUNNING_RESOLUTION
-): ChatRunningResolution {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const rounded = Math.round(value);
-    if (rounded === 640 || rounded === 1024) return rounded;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number.parseInt(value.trim(), 10);
-    if (parsed === 640 || parsed === 1024) return parsed;
-  }
-  return fallback;
-}
-
-function normalizeChatModelFps(value: unknown, fallback = DEFAULT_ULTRA_VIDEO_MODEL_FPS): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const rounded = Math.round(value);
-    return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, rounded));
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number.parseInt(value.trim(), 10);
-    if (Number.isFinite(parsed)) {
-      return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
-    }
-  }
-  return normalizeChatModelFps(fallback, DEFAULT_ULTRA_VIDEO_MODEL_FPS);
 }
 
 function QuickThinkingDots() {
@@ -100,7 +61,6 @@ export default function QuickChatOverlay() {
     sizeBytes: number;
   } | null>(null);
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
-  const [modelFps, setModelFps] = useState<number>(DEFAULT_ULTRA_VIDEO_MODEL_FPS);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
@@ -111,7 +71,7 @@ export default function QuickChatOverlay() {
     core: "Core",
   };
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
     sessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -141,9 +101,6 @@ export default function QuickChatOverlay() {
     const savedTier = localStorage.getItem(getBrandStorageKey("globalModelTier"));
     const normalizedTier = normalizeChatModelTier(savedTier);
     setModelTier(normalizedTier);
-    const savedModelFps = localStorage.getItem(getBrandStorageKey("globalUltraModelFps"));
-    const normalizedModelFps = normalizeChatModelFps(savedModelFps);
-    setModelFps(normalizedModelFps);
   }, [isOpen]);
 
   useEffect(() => {
@@ -246,18 +203,14 @@ export default function QuickChatOverlay() {
     // Enable auto-scroll when user sends a message
     setShouldAutoScroll(true);
 
-    // Get global model tier from localStorage
-    const savedResolution = localStorage.getItem(getBrandStorageKey("globalRunningResolution"));
-    const runningResolution = normalizeChatRunningResolution(savedResolution);
-
     await sendMessage({
       sessionIdOverride: targetSessionId,
       content: userMessage,
       uploadedImageBase64: imageBase64,
       uploadedVideoId: videoId,
       modelTier: modelTier,
-      modelFps: supportsAdjustableVideoFps(modelTier) ? modelFps : MODEL_FPS_BY_TIER[modelTier],
-      runningResolution: modelTier === "core" ? runningResolution : null,
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+      runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
     });
   };
 
@@ -317,6 +270,7 @@ export default function QuickChatOverlay() {
     // Assistant message (router_ack, final, etc.) - show all messages when is_pending === 0
     // Extract hit media (images and videos) using shared utility
     const hitMedia = extractHitMediaFromMessage(message);
+    const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
 
     return (
       <AssistantMessage
@@ -325,6 +279,21 @@ export default function QuickChatOverlay() {
         hitMedia={hitMedia}
         cameraLabel={message.camera_ids ? `Camera #${message.camera_ids}` : null}
         variant="chat-page"
+        supplementalContent={
+          cameraRegistrationDraft ? (
+            <ChatCameraRegistrationCard
+              messageId={message.id}
+              metadata={cameraRegistrationDraft}
+              onSubmit={(sourceMessageId, draft) =>
+                submitCameraRegistration({
+                  sessionIdOverride: sessionId,
+                  sourceMessageId,
+                  draft,
+                })
+              }
+            />
+          ) : null
+        }
       />
     );
   };
@@ -352,27 +321,6 @@ export default function QuickChatOverlay() {
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2">
-              {supportsAdjustableVideoFps(modelTier) && (
-                <select
-                  value={modelFps}
-                  onChange={(e) => {
-                    const next = normalizeChatModelFps(e.target.value, modelFps);
-                    setModelFps(next);
-                    localStorage.setItem(getBrandStorageKey("globalUltraModelFps"), String(next));
-                  }}
-                  className="rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:bg-white/[0.08]"
-                  title="Video FPS"
-                >
-                  {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
-                    const fps = index + 1;
-                    return (
-                      <option key={fps} value={fps}>
-                        {`Video FPS: ${fps}`}
-                      </option>
-                    );
-                  })}
-                </select>
-              )}
               <div className="rounded-2xl border border-white/[0.08] bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-gray-100">
                 <span className="mr-2 text-gray-400">Model</span>
                 <span className="text-blue-300">{modelLabels[modelTier]}</span>

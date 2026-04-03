@@ -55,7 +55,7 @@ export default function StepFlowCard({
               }
             }}
           >
-            <div className={`inline-flex items-center justify-center border border-violet-400/30 bg-violet-500/15 font-semibold text-violet-100 ${
+            <div className={`inline-flex items-center justify-center border border-blue-400/30 bg-blue-500/15 font-semibold text-blue-100 ${
               isCompact ? "h-9 min-w-9 rounded-[10px] text-[12px]" : "h-11 min-w-11 rounded-[14px] text-sm"
             }`}>
               {stepOrder}

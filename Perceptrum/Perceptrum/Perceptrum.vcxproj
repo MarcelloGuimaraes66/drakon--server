@@ -197,11 +197,13 @@
     <ClInclude Include="jobs\JobTypes.h" />
     <ClInclude Include="logging\Logging.h" />
     <ClInclude Include="orchestrator\ChatV2Orchestrator.h" />
+    <ClInclude Include="orchestrator\ChatModelConfig.h" />
     <ClInclude Include="orchestrator\ConfigUtils.h" />
     <ClInclude Include="orchestrator\HttpUtils.h" />
     <ClInclude Include="orchestrator\KnowledgeBase.h" />
     <ClInclude Include="orchestrator\LocalLlmClient.h" />
     <ClInclude Include="orchestrator\LocalLlmRuntimeManager.h" />
+    <ClInclude Include="orchestrator\OperationTaskState.h" />
     <ClInclude Include="orchestrator\PromptBuilder.h" />
     <ClInclude Include="orchestrator\SkillRegistry.h" />
     <ClInclude Include="orchestrator\SkillTypes.h" />
@@ -233,11 +235,13 @@
     <ClCompile Include="jobs\JobRuntime.cpp" />
     <ClCompile Include="logging\Logging.cpp" />
     <ClCompile Include="orchestrator\ChatV2Orchestrator.cpp" />
+    <ClCompile Include="orchestrator\ChatModelConfig.cpp" />
     <ClCompile Include="orchestrator\ConfigUtils.cpp" />
     <ClCompile Include="orchestrator\HttpUtils.cpp" />
     <ClCompile Include="orchestrator\KnowledgeBase.cpp" />
     <ClCompile Include="orchestrator\LocalLlmClient.cpp" />
     <ClCompile Include="orchestrator\LocalLlmRuntimeManager.cpp" />
+    <ClCompile Include="orchestrator\OperationTaskState.cpp" />
     <ClCompile Include="orchestrator\PromptBuilder.cpp" />
     <ClCompile Include="orchestrator\SkillRegistry.cpp" />
     <ClCompile Include="orchestrator\skills\CreateCameraAgentSkill.cpp" />

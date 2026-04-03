@@ -1,4 +1,5 @@
 import { X, AlertCircle, CheckCircle2 } from "lucide-react";
+import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
 
 interface Toast {
   id: number;
@@ -88,6 +89,8 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
           : hasStructuredOfflineFailure && toast.failurePhase === "runtime"
           ? toast.title || "Camera Connection Lost"
           : "Camera Offline";
+        const safeToastTitle = sanitizeAiApiErrorText(toastTitle);
+        const safeToastMessage = sanitizeAiApiErrorText(toast.message);
 
         return (
           <div
@@ -105,11 +108,11 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
 
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-semibold text-gray-100 mb-1">
-                  {toastTitle}
+                  {safeToastTitle}
                 </h4>
                 <p className="text-sm text-gray-300 mb-2">
                   {isJobStaledToast || isJobStartBlockedToast || isJobStartedToast || isAgentApiErrorToast ? (
-                    <>{toast.message}</>
+                    <>{safeToastMessage}</>
                   ) : isOnlineToast ? (
                     <>
                       <span className="font-medium text-white">{cameraLabel}</span> is back online.
@@ -171,14 +174,14 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
                     ) : null
                   ) : (
                     <p className="text-xs text-gray-400">
-                      {toast.message}
+                      {safeToastMessage}
                     </p>
                   )
                 )}
 
                 {isCameraStartedToast && toast.message ? (
                   <p className="text-xs text-gray-400">
-                    {toast.message}
+                    {safeToastMessage}
                   </p>
                 ) : null}
               </div>

@@ -1,11 +1,12 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import Toast from "@/react-app/components/Toast";
 import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
+import HubPublishModal from "@/react-app/components/hub/HubPublishModal";
 import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
 import ScheduleBuilder from "@/react-app/components/ScheduleBuilder";
 import JobsBoardView, { type JobsBoardCardData } from "@/react-app/components/jobs/JobsBoardView";
@@ -841,7 +842,9 @@ interface Target {
   id: number;
   step_id: number;
   camera_id: number;
-  camera_name?: string;
+  camera_name?: string | null;
+  slot_key?: string | null;
+  slot_label?: string | null;
   input_type?: string | null;
 }
 
@@ -856,6 +859,32 @@ const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
 const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_2x2";
+
+const isAssignedTarget = (target: Pick<Target, "camera_id"> | null | undefined): boolean => {
+  const cameraId = Number(target?.camera_id);
+  return Number.isInteger(cameraId) && cameraId > 0;
+};
+
+const getTargetDisplayName = (target: Partial<Target> | null | undefined): string => {
+  const cameraName =
+    typeof target?.camera_name === "string" && target.camera_name.trim().length > 0
+      ? target.camera_name.trim()
+      : "";
+  if (cameraName) return cameraName;
+
+  const slotLabel =
+    typeof target?.slot_label === "string" && target.slot_label.trim().length > 0
+      ? target.slot_label.trim()
+      : "";
+  if (slotLabel) return slotLabel;
+
+  const cameraId = Number(target?.camera_id);
+  if (Number.isInteger(cameraId) && cameraId > 0) {
+    return `Camera ${cameraId}`;
+  }
+
+  return "Unassigned camera slot";
+};
 
 interface InferenceGroup {
   id: string;
@@ -1333,6 +1362,7 @@ const getNegativeReferenceImageCount = (
 
 export default function JobsPage() {
   const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const jobsViewMode = useMemo(() => getJobsViewModeFromParams(searchParams), [searchParams]);
   const useModernJobsLayout = useMemo(() => searchParams.get("layout") !== "legacy", [searchParams]);
@@ -1376,6 +1406,8 @@ export default function JobsPage() {
   const [startingJobIds, setStartingJobIds] = useState<Set<number>>(new Set());
   const [stoppingJobIds, setStoppingJobIds] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
+  const [showHubPublishModal, setShowHubPublishModal] = useState(false);
+  const [publishingJobToHub, setPublishingJobToHub] = useState(false);
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(cameras);
   const [confirmDelete, setConfirmDelete] = useState<{ isOpen: boolean; jobId: number | null }>({
     isOpen: false,
@@ -1496,6 +1528,43 @@ export default function JobsPage() {
     setShowNewStepForm(false);
     setCameraAnchorElements({});
   }, [setJobsRouteState]);
+
+  const openHubTaskCreator = useCallback(() => {
+    navigate(`/hub?type=task&returnTo=${encodeURIComponent("/jobs")}`);
+  }, [navigate]);
+
+  const publishSelectedJobToHub = useCallback(
+    async (payload: {
+      title: string;
+      summary: string;
+      description: string;
+      tags: string[];
+    }) => {
+      if (!selectedJob) return;
+      setPublishingJobToHub(true);
+      try {
+        const response = await fetch(`/api/hub/tasks/publish-from-job/${selectedJob.id}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data?.error || "Failed to publish task to Hub");
+        }
+        setShowHubPublishModal(false);
+        setToast({ message: "Task published to Hub.", type: "success" });
+      } catch (error: any) {
+        setToast({
+          message: String(error?.message || error || "Failed to publish task to Hub"),
+          type: "error",
+        });
+      } finally {
+        setPublishingJobToHub(false);
+      }
+    },
+    [selectedJob]
+  );
 
   useEffect(() => {
     fetchJobs();
@@ -2147,7 +2216,8 @@ export default function JobsPage() {
           // Check if each target has an agent OR if there's a default agent as fallback
           const defaultAgent = agents.find((a: Agent) => a.is_active === 1 && a.camera_id === null);
           const allTargetsHaveAgents = targets.every((t: Target) =>
-            agents.some((a: Agent) => a.is_active === 1 && a.camera_id === t.camera_id) || !!defaultAgent
+            isAssignedTarget(t) &&
+            (agents.some((a: Agent) => a.is_active === 1 && a.camera_id === t.camera_id) || !!defaultAgent)
           );
 
           if (targets.length === 0 || !allTargetsHaveAgents) {
@@ -2184,7 +2254,7 @@ export default function JobsPage() {
       case "paused":
         return "bg-yellow-500/20 text-yellow-400";
       case "completed":
-        return "bg-purple-500/20 text-purple-400";
+        return "bg-blue-500/20 text-blue-400";
       case "failed":
         return "bg-red-500/20 text-red-400";
       case "staled":
@@ -2720,6 +2790,13 @@ export default function JobsPage() {
             tabs={modernJobsTabs}
             headerActions={
               <>
+                <button
+                  onClick={() => setShowHubPublishModal(true)}
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-orange-500/30 bg-orange-500/10 text-orange-100 transition-colors hover:bg-orange-500/15"
+                  title="Publish to Hub"
+                >
+                  <Sparkles className="h-4 w-4" />
+                </button>
                 {!editingJob && (
                   <button
                     onClick={() => setEditingJob(true)}
@@ -2915,18 +2992,18 @@ export default function JobsPage() {
             }
             newStepForm={
               showNewStepForm ? (
-                <div className={`border border-dashed border-violet-400/35 bg-violet-500/[0.06] shadow-[0_20px_70px_-60px_rgba(139,92,246,1)] ${
+                <div className={`border border-dashed border-blue-400/35 bg-blue-500/[0.06] shadow-[0_20px_70px_-60px_rgba(37,99,235,1)] ${
                   flowDensity === "compact" ? "rounded-[22px] p-3.5" : "rounded-[26px] p-4"
                 }`}>
                   <div className={`flex items-start gap-3 ${flowDensity === "compact" ? "mb-3" : "mb-4"}`}>
-                    <div className={`inline-flex items-center justify-center rounded-xl border border-violet-400/30 bg-violet-500/15 text-violet-100 ${
+                    <div className={`inline-flex items-center justify-center rounded-xl border border-blue-400/30 bg-blue-500/15 text-blue-100 ${
                       flowDensity === "compact" ? "h-9 min-w-9" : "h-10 min-w-10"
                     }`}>
                       <Plus className="h-4 w-4" />
                     </div>
                     <div>
                       <h3 className={`${flowDensity === "compact" ? "text-base" : "text-lg"} font-semibold text-white`}>{t("jobs.addStep")}</h3>
-                      <p className={`mt-1 text-violet-100/75 ${flowDensity === "compact" ? "text-[11px]" : "text-xs"}`}>
+                      <p className={`mt-1 text-blue-100/75 ${flowDensity === "compact" ? "text-[11px]" : "text-xs"}`}>
                         {t("jobs.newStepHint", {
                           defaultValue: "Crie o proximo step do fluxo e defina o tempo maximo de execucao.",
                         })}
@@ -2935,7 +3012,7 @@ export default function JobsPage() {
                   </div>
                   <div className="space-y-4">
                     <div>
-                      <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                      <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-blue-100/70">
                         {t("jobs.stepName")}
                       </label>
                       <input
@@ -2944,13 +3021,13 @@ export default function JobsPage() {
                         onChange={(e) =>
                           setNewStep({ ...newStep, name: e.target.value })
                         }
-                        className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                        className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
                         placeholder="Step name"
                       />
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                       <div>
-                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-blue-100/70">
                           {t("jobs.stepOrder")}
                         </label>
                         <input
@@ -2962,12 +3039,12 @@ export default function JobsPage() {
                               step_order: parseInt(e.target.value, 10),
                             })
                           }
-                          className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                          className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
                           min="1"
                         />
                       </div>
                       <div>
-                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-violet-100/70">
+                        <label className="mb-1.5 block text-xs uppercase tracking-[0.22em] text-blue-100/70">
                           Max time to run step
                         </label>
                         <div className="grid grid-cols-2 gap-2">
@@ -2985,7 +3062,7 @@ export default function JobsPage() {
                                   ),
                                 });
                               }}
-                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
                               min="0"
                             />
                             <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
@@ -3006,7 +3083,7 @@ export default function JobsPage() {
                                   ),
                                 });
                               }}
-                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-violet-400 focus:outline-none"
+                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
                               min="0"
                               max="59"
                             />
@@ -3016,7 +3093,7 @@ export default function JobsPage() {
                           </div>
                         </div>
                         {selectedJobMaxTimeoutSeconds !== null && (
-                          <p className="mt-1.5 text-[11px] text-violet-100/60">
+                          <p className="mt-1.5 text-[11px] text-blue-100/60">
                             Max for this job: {formatStepTimeoutHuman(selectedJobMaxTimeoutSeconds)}
                           </p>
                         )}
@@ -3026,7 +3103,7 @@ export default function JobsPage() {
                   <div className="mt-4 flex flex-wrap gap-2">
                     <button
                       onClick={handleAddStep}
-                      className="inline-flex items-center gap-2 rounded-xl bg-violet-500 px-3.5 py-2 text-sm font-semibold text-white transition-colors hover:bg-violet-400"
+                      className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
                     >
                       <Save className="h-4 w-4" />
                       Save Step
@@ -3046,19 +3123,19 @@ export default function JobsPage() {
                 <button
                   type="button"
                   onClick={openNewStepComposer}
-                  className={`flex w-full flex-col items-center justify-center border border-dashed border-violet-400/45 bg-violet-500/[0.05] text-center text-violet-100 transition-all hover:border-violet-300/70 hover:bg-violet-500/[0.08] ${
+                  className={`flex w-full flex-col items-center justify-center border border-dashed border-blue-400/45 bg-blue-500/[0.05] text-center text-blue-100 transition-all hover:border-blue-300/70 hover:bg-blue-500/[0.08] ${
                     flowDensity === "compact"
                       ? "min-h-[180px] rounded-[20px] px-4"
                       : "min-h-[220px] rounded-[24px] px-5"
                   }`}
                 >
-                  <div className={`flex items-center justify-center rounded-[16px] border border-violet-400/35 bg-violet-500/15 ${
+                  <div className={`flex items-center justify-center rounded-[16px] border border-blue-400/35 bg-blue-500/15 ${
                     flowDensity === "compact" ? "h-10 w-10" : "h-12 w-12"
                   }`}>
                     <Plus className={flowDensity === "compact" ? "h-5 w-5" : "h-6 w-6"} />
                   </div>
                   <div className={`mt-3 font-semibold ${flowDensity === "compact" ? "text-base" : "text-lg"}`}>{t("jobs.addStep")}</div>
-                  <div className={`mt-2 max-w-[16rem] text-violet-100/70 ${flowDensity === "compact" ? "text-[12px] leading-5" : "text-sm leading-6"}`}>
+                  <div className={`mt-2 max-w-[16rem] text-blue-100/70 ${flowDensity === "compact" ? "text-[12px] leading-5" : "text-sm leading-6"}`}>
                     {t("jobs.addStepCardHint", {
                       defaultValue: "Adicione um novo step ao pipeline e conecte cameras, regras e compartilhamento de conhecimento.",
                     })}
@@ -3093,6 +3170,20 @@ export default function JobsPage() {
               />
             ))}
           </JobFlowView>
+          <HubPublishModal
+            isOpen={showHubPublishModal}
+            title="Publish Task to Hub"
+            itemLabel="task"
+            defaultTitle={selectedJob.name || "Job"}
+            defaultSummary={selectedJob.description || selectedJob.name || "Reusable task template"}
+            defaultDescription={selectedJob.description || ""}
+            submitting={publishingJobToHub}
+            onClose={() => {
+              if (publishingJobToHub) return;
+              setShowHubPublishModal(false);
+            }}
+            onSubmit={publishSelectedJobToHub}
+          />
         </Layout>
       );
     }
@@ -3153,19 +3244,31 @@ export default function JobsPage() {
           onConfirm={confirmDeleteJob}
           onCancel={() => setConfirmDelete({ isOpen: false, jobId: null })}
         />
-        <JobsBoardView
-          jobsCount={jobs.length}
-          timezone={globalTimezone}
-          searchQuery={searchQuery}
-          cards={jobsBoardCards}
-          tabs={modernJobsTabs}
-          onSearchChange={setSearchQuery}
-          onNewJob={() => setJobsRouteState("create")}
-          onOpenJob={handleOpenJobById}
-          onStartJob={handleStartJobById}
-          onStopJob={handleStopJobById}
-          onDeleteJob={handleDeleteJob}
-        />
+        <div className="space-y-4">
+          <JobsBoardView
+            jobsCount={jobs.length}
+            timezone={globalTimezone}
+            searchQuery={searchQuery}
+            cards={jobsBoardCards}
+            tabs={modernJobsTabs}
+            secondaryAction={
+              <button
+                type="button"
+                onClick={openHubTaskCreator}
+                className="inline-flex items-center justify-center gap-2 rounded-2xl border border-orange-500/30 bg-orange-500/10 px-4 py-2.5 text-sm font-semibold text-orange-100 transition-colors hover:bg-orange-500/15"
+              >
+                <Sparkles className="h-4 w-4" />
+                Create from Hub
+              </button>
+            }
+            onSearchChange={setSearchQuery}
+            onNewJob={() => setJobsRouteState("create")}
+            onOpenJob={handleOpenJobById}
+            onStartJob={handleStartJobById}
+            onStopJob={handleStopJobById}
+            onDeleteJob={handleDeleteJob}
+          />
+        </div>
       </Layout>
     );
   }
@@ -3853,6 +3956,7 @@ function StepCard({
   onRegisterCameraAnchor = () => undefined,
 }: StepCardProps) {
   const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
   const stepLocale = (i18n.resolvedLanguage || i18n.language || "en").replace("_", "-");
   const localizedOptionalSuffix = extractOptionalSuffix(
     t("jobs.promptEditor.targetFacesOptionalLabel", {
@@ -3895,6 +3999,8 @@ function StepCard({
   const [cloneSourceByTarget, setCloneSourceByTarget] = useState<Record<number, number>>({});
   const [cloningTargets, setCloningTargets] = useState<Set<number>>(new Set());
   const [expandedTargetId, setExpandedTargetId] = useState<number | null>(null);
+  const [targetCameraDraft, setTargetCameraDraft] = useState("");
+  const [assigningTargetIds, setAssigningTargetIds] = useState<Set<number>>(new Set());
   const [showAllTargets, setShowAllTargets] = useState(false);
   const [confirmCloneAgent, setConfirmCloneAgent] = useState<{
     isOpen: boolean;
@@ -4287,6 +4393,19 @@ function StepCard({
     if (!stillExists) {
       setExpandedTargetId(null);
     }
+  }, [expandedTargetId, targets]);
+
+  useEffect(() => {
+    if (expandedTargetId === null) {
+      setTargetCameraDraft("");
+      return;
+    }
+    const currentTarget = targets.find((target) => target.id === expandedTargetId) || null;
+    if (!currentTarget || !isAssignedTarget(currentTarget)) {
+      setTargetCameraDraft("");
+      return;
+    }
+    setTargetCameraDraft(String(currentTarget.camera_id));
   }, [expandedTargetId, targets]);
 
   useEffect(() => {
@@ -5440,6 +5559,38 @@ function StepCard({
       }
     } catch (error) {
       console.error("Failed to add target:", error);
+    }
+  };
+
+  const handleAssignTargetCamera = async (target: Target, cameraId: number) => {
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      onShowToast("Select a valid camera first.", "warning");
+      return;
+    }
+
+    setAssigningTargetIds((prev) => new Set(prev).add(target.id));
+    try {
+      const response = await fetch(`/api/job-steps/${step.id}/targets/${target.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ camera_id: cameraId }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to assign camera");
+      }
+      await fetchStepData();
+      setTargetCameraDraft(String(cameraId));
+      onShowToast("Camera assigned to this slot.", "success");
+    } catch (error) {
+      console.error("Failed to assign camera:", error);
+      onShowToast(error instanceof Error ? error.message : "Failed to assign camera", "error");
+    } finally {
+      setAssigningTargetIds((prev) => {
+        const next = new Set(prev);
+        next.delete(target.id);
+        return next;
+      });
     }
   };
 
@@ -7264,7 +7415,8 @@ function StepCard({
   // Check if each target has an assigned active agent (or fallback default exists)
   const defaultAgent = agents.find((a) => a.is_active === 1 && a.camera_id === null);
   const perCameraReady = targets.every((t) =>
-    agents.some((a) => a.is_active === 1 && a.camera_id === t.camera_id) || !!defaultAgent
+    isAssignedTarget(t) &&
+    (agents.some((a) => a.is_active === 1 && a.camera_id === t.camera_id) || !!defaultAgent)
   );
   const isReady = hasTargets && perCameraReady;
 
@@ -7555,7 +7707,7 @@ function StepCard({
           }}
           className={`${stepActionBaseClass} w-full ${
             isTargetMultiSelect
-              ? "border-purple-400/30 bg-purple-500/12 text-purple-100 hover:bg-purple-500/18"
+              ? "border-blue-400/30 bg-blue-500/12 text-blue-100 hover:bg-blue-500/18"
               : stepActionIdleClass
           }`}
         >
@@ -7593,7 +7745,7 @@ function StepCard({
                   resetEditingTimeout();
                 }
               }}
-              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-violet-400 focus:outline-none"
+              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-blue-500 focus:outline-none"
               min="0"
             />
             <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
@@ -7622,7 +7774,7 @@ function StepCard({
                   resetEditingTimeout();
                 }
               }}
-              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-violet-400 focus:outline-none"
+              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-blue-500 focus:outline-none"
               min="0"
               max="59"
             />
@@ -7632,7 +7784,7 @@ function StepCard({
           </div>
           <button
             onClick={handleSaveStepSettings}
-            className="text-violet-400 hover:text-violet-300"
+            className="text-blue-400 hover:text-blue-300"
             title="Save timeout"
           >
             <Save className="h-3.5 w-3.5" />
@@ -7649,7 +7801,7 @@ function StepCard({
         <button
           type="button"
           onClick={openStepSettingsEditor}
-          className="text-gray-300 hover:text-violet-300"
+          className="text-gray-300 hover:text-blue-300"
           title="Edit step settings"
         >
           {formatStepTimeoutHuman(step.timeout_seconds)}
@@ -7674,7 +7826,7 @@ function StepCard({
           resetEditingTimeout();
         }
       }}
-      className="w-full min-w-0 rounded-lg border border-violet-400/40 bg-gray-950/85 px-2.5 py-1.5 text-sm font-semibold text-gray-100 focus:border-violet-400 focus:outline-none"
+      className="w-full min-w-0 rounded-lg border border-blue-400/40 bg-gray-950/85 px-2.5 py-1.5 text-sm font-semibold text-gray-100 focus:border-blue-500 focus:outline-none"
       placeholder={t("jobs.stepName", { defaultValue: "Step name" })}
       autoFocus
     />
@@ -7684,6 +7836,7 @@ function StepCard({
 
   const inspectedTarget =
     expandedTargetId !== null ? targets.find((target) => target.id === expandedTargetId) || null : null;
+  const inspectedTargetAssigned = isAssignedTarget(inspectedTarget);
   const inspectedTargetAgent = inspectedTarget
     ? agents.find((agent) => agent.is_active === 1 && agent.camera_id === inspectedTarget.camera_id)
     : undefined;
@@ -7703,6 +7856,13 @@ function StepCard({
     : inspectedCloneCandidates[0]?.cameraId ?? null;
   const inspectedIsCloning =
     inspectedTarget ? cloningTargets.has(inspectedTarget.id) : false;
+  const inspectedAvailableCameras = inspectedTarget
+    ? cameras.filter(
+        (camera) =>
+          camera.id === inspectedTarget.camera_id ||
+          !targets.some((target) => target.id !== inspectedTarget.id && target.camera_id === camera.id)
+      )
+    : [];
   const inspectedInputType = inspectedTarget
     ? normalizeTargetInputType(
         targetInputTypes[inspectedTarget.id] ?? inspectedTarget.input_type
@@ -7846,6 +8006,7 @@ function StepCard({
                 </div>
                 <div className="grid grid-cols-1 gap-2">
                   {visibleTargets.map((target) => {
+                  const targetAssigned = isAssignedTarget(target);
                   const targetAgent = agents.find(
                     (a) => a.is_active === 1 && a.camera_id === target.camera_id
                   );
@@ -7865,10 +8026,10 @@ function StepCard({
                       ? "text-green-400"
                       : "text-yellow-400"
                     : "text-red-400";
-                  const targetSetupLabel = effectiveAgent
+                  const targetSetupLabel = targetAssigned && effectiveAgent
                     ? t("jobs.readyShort", { defaultValue: "OK" })
                     : t("jobs.setupShort", { defaultValue: "Setup" });
-                  const targetSetupClass = effectiveAgent
+                  const targetSetupClass = targetAssigned && effectiveAgent
                     ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200"
                     : "border-amber-400/25 bg-amber-500/12 text-amber-200";
 
@@ -7877,7 +8038,7 @@ function StepCard({
                       key={target.id}
                       density={density}
                       anchorRef={getTargetAnchorRef(target.id)}
-                      title={target.camera_name || `Camera ${target.camera_id}`}
+                      title={getTargetDisplayName(target)}
                       subtitle={
                         <span className={`truncate text-[11px] ${agentSummaryClass}`}>
                           {isGrouped
@@ -7892,7 +8053,7 @@ function StepCard({
                             {targetSetupLabel}
                           </span>
                           {isGrouped ? (
-                            <span className="inline-flex rounded-full border border-purple-400/30 bg-purple-500/18 px-2 py-0.5 text-[10px] font-medium text-purple-100">
+                            <span className="inline-flex rounded-full border border-blue-400/30 bg-blue-500/18 px-2 py-0.5 text-[10px] font-medium text-blue-100">
                               {t("jobs.inferenceGroups")}
                             </span>
                           ) : null}
@@ -7928,7 +8089,7 @@ function StepCard({
                             }}
                             className={`inline-flex items-center justify-center rounded-xl border transition-colors ${
                               expandedTargetId === target.id
-                                ? "border-violet-400/45 bg-violet-500/12 text-violet-100"
+                                ? "border-blue-400/45 bg-blue-500/12 text-blue-100"
                                 : "border-gray-800 bg-gray-950/60 text-gray-400 hover:border-gray-700 hover:bg-gray-900 hover:text-gray-200"
                             } ${density === "compact" ? "h-7 w-7" : "h-8 w-8"}`}
                             title={t("jobs.openCameraSettings", {
@@ -7997,9 +8158,9 @@ function StepCard({
                 {inferenceGroups.length > 0 && (
                   <div className="mt-6">
                     <div className="flex items-center gap-2 text-sm font-semibold text-gray-200">
-                      <Users className="w-4 h-4 text-purple-300" />
+                      <Users className="w-4 h-4 text-blue-300" />
                       <span>{t("jobs.inferenceGroups")}</span>
-                      <span className="ml-1 text-xs px-2 py-0.5 rounded-full bg-purple-600/30 text-purple-100 border border-purple-400/30">
+                      <span className="ml-1 text-xs px-2 py-0.5 rounded-full border border-blue-400/30 bg-blue-600/30 text-blue-100">
                         {inferenceGroups.length}
                       </span>
                     </div>
@@ -8007,16 +8168,16 @@ function StepCard({
                       {inferenceGroups.map((group) => (
                         <div
                           key={group.id}
-                          className="bg-purple-600/15 border border-purple-500/30 rounded-xl p-4"
+                          className="rounded-xl border border-blue-500/30 bg-blue-600/15 p-4"
                         >
                           <div className="flex items-center justify-between">
-                            <div className="text-sm font-medium text-purple-100">
+                            <div className="text-sm font-medium text-blue-100">
                               {group.name}
                             </div>
                             <div className="flex items-center gap-2">
                               <button
                                 type="button"
-                                className="p-1 rounded-md text-purple-200 hover:text-white hover:bg-purple-500/30 transition-colors"
+                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
                                 title={t("jobs.editGroup")}
                                 onClick={() => {
                                   const inferredSourceTargetId =
@@ -8045,7 +8206,7 @@ function StepCard({
                               <button
                                 type="button"
                                 onClick={() => handleRemoveGroup(group.id)}
-                                className="p-1 rounded-md text-purple-200 hover:text-white hover:bg-purple-500/30 transition-colors"
+                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
                                 title={t("jobs.deleteGroup")}
                               >
                                 <Trash2 className="w-4 h-4" />
@@ -8059,21 +8220,21 @@ function StepCard({
                               return (
                                 <span
                                   key={targetId}
-                                  className="px-2.5 py-1 rounded-full bg-purple-900/40 text-purple-100 border border-purple-400/20 text-xs"
+                                  className="rounded-full border border-blue-400/20 bg-blue-900/40 px-2.5 py-1 text-xs text-blue-100"
                                 >
                                   {target.camera_name || `Camera ${target.camera_id}`}
                                 </span>
                               );
                             })}
                           </div>
-                          <div className="mt-3 text-[11px] uppercase tracking-widest text-purple-200">
+                          <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
                             {t("jobs.unifiedAgent")}
                           </div>
-                          <div className="text-sm text-purple-100">{group.agentKey}</div>
-                          <div className="mt-2 text-[11px] uppercase tracking-widest text-purple-200">
+                          <div className="text-sm text-blue-100">{group.agentKey}</div>
+                          <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
                             {t("jobs.inputType")}
                           </div>
-                          <div className="text-sm text-purple-100">
+                          <div className="text-sm text-blue-100">
                             {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
                           </div>
                         </div>
@@ -10435,11 +10596,11 @@ function StepCard({
                       {t("jobs.cameraSettings", { defaultValue: "Camera settings" })}
                     </div>
                     <h4 className="mt-2 truncate text-xl font-semibold text-gray-100">
-                      {inspectedTarget.camera_name || `Camera ${inspectedTarget.camera_id}`}
+                      {getTargetDisplayName(inspectedTarget)}
                     </h4>
                     <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${inspectedEffectiveAgent ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200" : "border-amber-400/25 bg-amber-500/12 text-amber-200"}`}>
-                        {inspectedEffectiveAgent
+                      <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${inspectedTargetAssigned && inspectedEffectiveAgent ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200" : "border-amber-400/25 bg-amber-500/12 text-amber-200"}`}>
+                        {inspectedTargetAssigned && inspectedEffectiveAgent
                           ? t("jobs.readyShort", { defaultValue: "OK" })
                           : t("jobs.setupShort", { defaultValue: "Setup" })}
                       </span>
@@ -10450,7 +10611,7 @@ function StepCard({
                     <p className="mt-3 text-sm text-gray-400">
                       {t("jobs.cameraSettingsHint", {
                         defaultValue:
-                          "Adjust capture mode and clone an agent from another camera in this step.",
+                          "Adjust the assigned camera, capture mode, and clone an agent from another camera in this step.",
                       })}
                     </p>
                   </div>
@@ -10464,6 +10625,53 @@ function StepCard({
                 </div>
 
                 <div className="space-y-4 px-5 py-5">
+                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
+                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                      {t("jobs.targetCamera", { defaultValue: "Target camera" })}
+                    </div>
+                    <p className="mt-1 text-sm text-gray-400">
+                      {inspectedTargetAssigned
+                        ? "You can switch this slot to another camera that is not already used in the same step."
+                        : "This slot was imported from the Hub without a camera. Pick one when you are ready."}
+                    </p>
+                    <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                      <select
+                        value={targetCameraDraft}
+                        onChange={(e) => setTargetCameraDraft(e.target.value)}
+                        className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                      >
+                        <option value="">{t("jobs.selectTargetCamera", { defaultValue: "Select target camera" })}</option>
+                        {inspectedAvailableCameras.map((camera) => (
+                          <option key={`${inspectedTarget.id}-${camera.id}`} value={camera.id}>
+                            {camera.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={
+                          assigningTargetIds.has(inspectedTarget.id) ||
+                          !targetCameraDraft ||
+                          Number(targetCameraDraft) === inspectedTarget.camera_id
+                        }
+                        onClick={() => void handleAssignTargetCamera(inspectedTarget, Number(targetCameraDraft))}
+                        className={`inline-flex items-center justify-center rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
+                          assigningTargetIds.has(inspectedTarget.id) ||
+                          !targetCameraDraft ||
+                          Number(targetCameraDraft) === inspectedTarget.camera_id
+                            ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                            : "bg-blue-600 text-white hover:bg-blue-500"
+                        }`}
+                      >
+                        {assigningTargetIds.has(inspectedTarget.id)
+                          ? "Saving..."
+                          : inspectedTargetAssigned
+                          ? "Update Camera"
+                          : "Assign Camera"}
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/55 p-4">
                     <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
                       {t("jobs.aiAgent")}
@@ -10571,6 +10779,23 @@ function StepCard({
                       >
                         <Copy className="h-3.5 w-3.5" />
                         {t("jobs.clone")}
+                      </button>
+                    </div>
+
+                    <div className="mt-3 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          navigate(
+                            `/hub?type=agent&installTarget=step&stepId=${step.id}&cameraId=${inspectedTarget.camera_id}&returnTo=${encodeURIComponent(
+                              `/jobs?job=${step.job_id}`
+                            )}`
+                          )
+                        }
+                        className="inline-flex items-center justify-center gap-2 rounded-full bg-orange-500/10 px-3 py-2 text-xs font-medium text-orange-100 transition-colors hover:bg-orange-500/15"
+                      >
+                        <Sparkles className="h-3.5 w-3.5" />
+                        Use Hub Agent
                       </button>
                     </div>
 

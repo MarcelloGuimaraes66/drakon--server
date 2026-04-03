@@ -106,11 +106,13 @@
     <ClInclude Include="..\Perceptrum\jobs\JobTypes.h" />
     <ClInclude Include="..\Perceptrum\logging\Logging.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\ChatV2Orchestrator.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\ChatModelConfig.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\ConfigUtils.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\HttpUtils.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\KnowledgeBase.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\LocalLlmClient.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\OperationTaskState.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\PromptBuilder.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\SkillRegistry.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\SkillTypes.h" />
@@ -138,11 +140,13 @@
     <ClCompile Include="..\Perceptrum\jobs\JobRuntime.cpp" />
     <ClCompile Include="..\Perceptrum\logging\Logging.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\ChatV2Orchestrator.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\ChatModelConfig.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\ConfigUtils.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\HttpUtils.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\KnowledgeBase.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\LocalLlmClient.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\OperationTaskState.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\PromptBuilder.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\SkillRegistry.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.cpp" />

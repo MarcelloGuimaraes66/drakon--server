@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 type ChatPlexusBackgroundProps = {
   className?: string;
+  motion?: "ambient" | "rise";
 };
 
 type Particle = {
@@ -41,14 +42,16 @@ function mixChannel(start: number, end: number, amount: number): number {
   return Math.round(start + (end - start) * amount);
 }
 
-function createParticle(width: number, height: number): Particle {
+function createParticle(width: number, height: number, motion: "ambient" | "rise"): Particle {
+  const isRising = motion === "rise";
+
   return {
     x: Math.random() * width,
-    y: Math.random() * height,
+    y: isRising ? Math.random() * (height + 160) - 80 : Math.random() * height,
     z: Math.random(),
-    vx: (Math.random() - 0.5) * 0.34,
-    vy: (Math.random() - 0.5) * 0.24,
-    vz: (Math.random() - 0.5) * 0.008,
+    vx: isRising ? (Math.random() - 0.5) * 0.22 : (Math.random() - 0.5) * 0.34,
+    vy: isRising ? -(0.42 + Math.random() * 0.62) : (Math.random() - 0.5) * 0.24,
+    vz: (Math.random() - 0.5) * (isRising ? 0.006 : 0.008),
     radius: 0.85 + Math.random() * 1.45,
     hueMix: Math.random(),
     twinkleOffset: Math.random() * Math.PI * 2,
@@ -61,6 +64,7 @@ function createParticle(width: number, height: number): Particle {
 
 export default function ChatPlexusBackground({
   className = "",
+  motion = "ambient",
 }: ChatPlexusBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -70,6 +74,7 @@ export default function ChatPlexusBackground({
 
     const context = canvas.getContext("2d");
     if (!context) return;
+    const isRising = motion === "rise";
 
     const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
     const pointer = {
@@ -96,8 +101,12 @@ export default function ChatPlexusBackground({
       canvas.height = Math.round(height * dpr);
       context.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-      const particleCount = clamp(Math.round((width * height) / 42000), MIN_PARTICLES, MAX_PARTICLES);
-      particles = Array.from({ length: particleCount }, () => createParticle(width, height));
+      const particleCount = clamp(
+        Math.round((width * height) / (isRising ? 32000 : 42000)),
+        isRising ? 22 : MIN_PARTICLES,
+        isRising ? 38 : MAX_PARTICLES,
+      );
+      particles = Array.from({ length: particleCount }, () => createParticle(width, height, motion));
     };
 
     const draw = (timestamp: number) => {
@@ -109,36 +118,40 @@ export default function ChatPlexusBackground({
 
       context.clearRect(0, 0, width, height);
 
-      const connectionDistance = width < 768 ? 120 : 150;
+      const connectionDistance = isRising ? (width < 768 ? 108 : 126) : width < 768 ? 120 : 150;
       const connectionDistanceSq = connectionDistance * connectionDistance;
-      const edgePadding = 80;
+      const edgePadding = isRising ? 96 : 80;
 
       const renderedParticles = particles.map((particle) => {
         if (!reducedMotion) {
+          const velocityX = isRising
+            ? particle.vx + Math.sin(timestamp * 0.00024 + particle.driftSeedX) * 0.14
+            : particle.vx + Math.sin(timestamp * 0.00018 + particle.driftSeedX) * 0.18;
+          const velocityY = isRising
+            ? particle.vy + Math.cos(timestamp * 0.00019 + particle.driftSeedY) * 0.12
+            : particle.vy + Math.cos(timestamp * 0.00015 + particle.driftSeedY) * 0.14;
+          const velocityZ =
+            particle.vz +
+            Math.sin(timestamp * (isRising ? 0.00014 : 0.00011) + particle.driftSeedZ) *
+              (isRising ? 0.0028 : 0.0035);
+
           particle.x = wrap(
-            particle.x +
-              (particle.vx + Math.sin(timestamp * 0.00018 + particle.driftSeedX) * 0.18) * frameDelta,
+            particle.x + velocityX * frameDelta,
             -edgePadding,
             width + edgePadding,
           );
           particle.y = wrap(
-            particle.y +
-              (particle.vy + Math.cos(timestamp * 0.00015 + particle.driftSeedY) * 0.14) * frameDelta,
+            particle.y + velocityY * frameDelta,
             -edgePadding,
             height + edgePadding,
           );
-          particle.z = wrap(
-            particle.z +
-              (particle.vz + Math.sin(timestamp * 0.00011 + particle.driftSeedZ) * 0.0035) * frameDelta,
-            0,
-            1,
-          );
+          particle.z = wrap(particle.z + velocityZ * frameDelta, 0, 1);
         }
 
         const depthScale = 0.68 + particle.z * 0.86;
         const pulse = 0.65 + (Math.sin(timestamp * 0.0012 * particle.twinkleSpeed + particle.twinkleOffset) + 1) * 0.175;
-        const parallaxX = pointer.currentX * (0.18 + particle.z * 0.55);
-        const parallaxY = pointer.currentY * (0.18 + particle.z * 0.55);
+        const parallaxX = pointer.currentX * (isRising ? 0.12 + particle.z * 0.36 : 0.18 + particle.z * 0.55);
+        const parallaxY = pointer.currentY * (isRising ? 0.08 + particle.z * 0.24 : 0.18 + particle.z * 0.55);
         const x = particle.x + parallaxX;
         const y = particle.y + parallaxY;
         const alpha = (0.12 + particle.z * 0.22) * pulse;
@@ -174,7 +187,7 @@ export default function ChatPlexusBackground({
 
           const distance = Math.sqrt(distanceSq);
           const intensity = 1 - distance / connectionDistance;
-          const alpha = intensity * (0.025 + (1 - depthGap) * 0.05);
+          const alpha = intensity * (isRising ? 0.03 + (1 - depthGap) * 0.058 : 0.025 + (1 - depthGap) * 0.05);
           if (alpha <= 0.008) continue;
 
           const blend = (source.particle.hueMix + target.particle.hueMix) / 2;
@@ -237,8 +250,8 @@ export default function ChatPlexusBackground({
 
       const normalizedX = (event.clientX - bounds.left) / bounds.width - 0.5;
       const normalizedY = (event.clientY - bounds.top) / bounds.height - 0.5;
-      pointer.targetX = normalizedX * 26;
-      pointer.targetY = normalizedY * 22;
+      pointer.targetX = normalizedX * (isRising ? 16 : 26);
+      pointer.targetY = normalizedY * (isRising ? 12 : 22);
     };
 
     const handlePointerLeave = () => {
@@ -271,7 +284,7 @@ export default function ChatPlexusBackground({
       window.removeEventListener("resize", resize);
       mediaQuery.removeEventListener("change", handleReducedMotionChange);
     };
-  }, []);
+  }, [motion]);
 
   return (
     <div

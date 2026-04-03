@@ -5,6 +5,7 @@ import Layout from "@/react-app/components/Layout";
 import CameraCustomAgentEditorModal, {
   CameraCustomAgentRow,
 } from "@/react-app/components/CameraCustomAgentEditorModal";
+import HubPublishModal from "@/react-app/components/hub/HubPublishModal";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import {
@@ -12,7 +13,7 @@ import {
   isOpenAiKeyRequiredError,
 } from "@/react-app/utils/openAiKeyGuard";
 import { Algorithm, ReIDTarget } from "@/shared/types";
-import { ArrowLeft, Cpu, Plus, Trash2, MapPin, X, Pencil, Upload, AlertCircle } from "lucide-react";
+import { ArrowLeft, Cpu, Plus, Trash2, MapPin, X, Pencil, Upload, AlertCircle, Sparkles } from "lucide-react";
 
 // Algorithm state structure - keyed by algorithm_type
 type AlgorithmState = {
@@ -128,6 +129,8 @@ export default function Algorithms() {
     newImagePreview: string | null;
   } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [publishingCustomAgent, setPublishingCustomAgent] = useState<CustomAlgorithm | null>(null);
+  const [publishingToHub, setPublishingToHub] = useState(false);
 
   // Toast helper function
   const showToast = (title: string, description: string, variant: "default" | "destructive" = "default") => {
@@ -140,6 +143,44 @@ export default function Algorithms() {
 
   const dismissToast = (id: number) => {
     setToasts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const openHubAgentBrowser = () => {
+    navigate(
+      `/hub?type=agent&installTarget=camera&cameraId=${cameraId}&returnTo=${encodeURIComponent(
+        `/algorithms/${cameraId}`
+      )}`
+    );
+  };
+
+  const publishCustomAgentToHub = async (payload: {
+    title: string;
+    summary: string;
+    description: string;
+    tags: string[];
+  }) => {
+    if (!publishingCustomAgent) return;
+    setPublishingToHub(true);
+    try {
+      const response = await fetch(
+        `/api/hub/agents/publish-from-camera/${publishingCustomAgent.id}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to publish agent to Hub");
+      }
+      setPublishingCustomAgent(null);
+      showToast("Hub publish complete", "The agent was uploaded to the Hub.");
+    } catch (error: any) {
+      showToast("Hub publish failed", String(error?.message || error), "destructive");
+    } finally {
+      setPublishingToHub(false);
+    }
   };
 
   // Define all built-in algorithms with metadata
@@ -1008,7 +1049,7 @@ export default function Algorithms() {
         </div>
 
         {/* Create Custom AI Agent button */}
-        <div className="mb-6">
+        <div className="mb-6 grid gap-3 md:grid-cols-2">
           <button
             onClick={openCreateCustomEditor}
             data-onboarding-target={ONBOARDING_TARGETS.algorithmsCreateCustom}
@@ -1016,6 +1057,13 @@ export default function Algorithms() {
           >
             <Plus className="w-5 h-5" />
             Create Custom AI Agent
+          </button>
+          <button
+            onClick={openHubAgentBrowser}
+            className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl border border-orange-500/30 bg-orange-500/10 text-orange-200 font-medium transition-all hover:bg-orange-500/15"
+          >
+            <Sparkles className="w-5 h-5" />
+            Browse Hub Agents
           </button>
         </div>
 
@@ -1174,6 +1222,13 @@ export default function Algorithms() {
                     </div>
 
                     <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setPublishingCustomAgent(custom)}
+                        className="p-2 text-orange-300 hover:bg-orange-500/10 rounded-lg transition-colors"
+                        title="Publish to Hub"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                      </button>
                       <button
                         onClick={() => openEditCustomEditor(custom)}
                         className="p-2 text-purple-400 hover:bg-purple-500/10 rounded-lg transition-colors"
@@ -1734,6 +1789,25 @@ export default function Algorithms() {
           onClose={closeCustomEditor}
           onSaved={handleCustomEditorSaved}
           showToast={showToast}
+        />
+
+        <HubPublishModal
+          isOpen={!!publishingCustomAgent}
+          title="Publish Agent to Hub"
+          itemLabel="agent"
+          defaultTitle={publishingCustomAgent?.display_name || "Custom Agent"}
+          defaultSummary={
+            publishingCustomAgent?.alert_condition ||
+            publishingCustomAgent?.prompt_template ||
+            "Reusable custom agent"
+          }
+          defaultDescription={publishingCustomAgent?.prompt_template || ""}
+          submitting={publishingToHub}
+          onClose={() => {
+            if (publishingToHub) return;
+            setPublishingCustomAgent(null);
+          }}
+          onSubmit={publishCustomAgentToHub}
         />
 
         {/* Back to AI Agents button */}

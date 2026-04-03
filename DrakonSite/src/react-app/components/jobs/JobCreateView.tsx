@@ -100,7 +100,7 @@ export default function JobCreateView({
               value={name}
               onChange={(event) => onNameChange(event.target.value)}
               placeholder={t("jobs.jobNamePlaceholder")}
-              className="w-full rounded-[20px] border border-gray-800 bg-gray-950/75 px-4 py-3 text-xl text-gray-100 placeholder:text-gray-500 focus:border-violet-400 focus:outline-none"
+              className="w-full rounded-[20px] border border-gray-800 bg-gray-950/75 px-4 py-3 text-xl text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
             />
           </div>
 
@@ -113,7 +113,7 @@ export default function JobCreateView({
               onChange={(event) => onDescriptionChange(event.target.value)}
               placeholder={t("jobs.descriptionPlaceholder")}
               rows={4}
-              className="w-full rounded-[20px] border border-gray-800 bg-gray-950/75 px-4 py-3 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:border-violet-400 focus:outline-none"
+              className="w-full rounded-[20px] border border-gray-800 bg-gray-950/75 px-4 py-3 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
             />
           </div>
 
@@ -130,7 +130,7 @@ export default function JobCreateView({
               <button
                 type="button"
                 onClick={() => onScheduleVisibilityChange(!scheduleVisible)}
-                className="inline-flex items-center gap-2 rounded-full border border-violet-400/30 bg-violet-500/10 px-3 py-2 text-sm font-medium text-violet-100 transition-colors hover:bg-violet-500/15"
+                className="inline-flex items-center gap-2 rounded-full border border-blue-400/30 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-100 transition-colors hover:bg-blue-500/15"
               >
                 {scheduleVisible ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
                 {scheduleVisible
@@ -164,11 +164,11 @@ export default function JobCreateView({
             </div>
           </div>
 
-          <div className="rounded-[20px] border border-violet-400/15 bg-violet-500/[0.05] px-4 py-3.5">
-            <div className="text-xs uppercase tracking-[0.22em] text-violet-100/60">
+          <div className="rounded-[20px] border border-blue-400/15 bg-blue-500/[0.05] px-4 py-3.5">
+            <div className="text-xs uppercase tracking-[0.22em] text-blue-100/60">
               {t("jobs.timezoneGlobal")}
             </div>
-            <div className="mt-2 font-mono text-sm text-violet-100">{timezone}</div>
+            <div className="mt-2 font-mono text-sm text-blue-100">{timezone}</div>
           </div>
         </div>
 
@@ -183,7 +183,7 @@ export default function JobCreateView({
           <button
             type="button"
             onClick={onSubmit}
-            className="inline-flex items-center gap-2 rounded-xl bg-violet-500 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-violet-400"
+            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
           >
             <Plus className="h-4 w-4" />
             {t("jobs.createJob")}

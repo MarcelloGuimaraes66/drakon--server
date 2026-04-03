@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { X, AlertCircle, CheckCircle, Info, AlertTriangle } from "lucide-react";
+import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
 
 interface ToastProps {
   message: string;
@@ -31,13 +32,14 @@ export default function Toast({ message, type = "info", onClose, duration = 5000
   };
 
   const Icon = icons[type];
+  const safeMessage = sanitizeAiApiErrorText(message);
 
   return (
     <div
       className={`fixed bottom-6 right-6 z-[140] flex items-center gap-3 px-4 py-3 rounded-lg border ${colors[type]} backdrop-blur-sm shadow-lg animate-slide-up max-w-md`}
     >
       <Icon className="w-5 h-5 flex-shrink-0" />
-      <p className="text-sm text-gray-200 flex-1">{message}</p>
+      <p className="text-sm text-gray-200 flex-1">{safeMessage}</p>
       <button
         onClick={onClose}
         className="text-gray-400 hover:text-gray-200 transition-colors"

@@ -6,6 +6,8 @@ import {
   normalizeFaceIdImage,
 } from "@/react-app/utils/faceIdImage";
 
+const CHAT_INPUT_MAX_HEIGHT_PX = 180;
+
 interface UploadedVideo {
   id: number;
   publicUrl: string;
@@ -50,11 +52,22 @@ export default function ChatInput({
 }: ChatInputProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isUploadingVideo, setIsUploadingVideo] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
   const isChatPageVariant = variant === "chat-page";
+
+  const syncTextareaHeight = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "0px";
+    const nextHeight = Math.min(textarea.scrollHeight, CHAT_INPUT_MAX_HEIGHT_PX);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > CHAT_INPUT_MAX_HEIGHT_PX ? "auto" : "hidden";
+  };
 
   useEffect(() => {
     if (!showDropdown) return;
@@ -68,6 +81,19 @@ export default function ChatInput({
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [showDropdown]);
+
+  useEffect(() => {
+    syncTextareaHeight();
+  }, [value]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      syncTextareaHeight();
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -84,6 +110,18 @@ export default function ChatInput({
 
     if ((!value.trim() && !uploadedImage && !uploadedVideo) || disabled) return;
     onSend();
+  };
+
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    onChange(e.target.value);
+    syncTextareaHeight();
+  };
+
+  const handleTextKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+
+    e.preventDefault();
+    handleActionClick();
   };
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -262,7 +300,7 @@ export default function ChatInput({
           </div>
         )}
 
-        <div className="relative flex items-center gap-2">
+        <div className="relative flex items-end gap-2">
           <input
             ref={fileInputRef}
             type="file"
@@ -336,16 +374,19 @@ export default function ChatInput({
             )}
           </div>
 
-          <input
-            type="text"
+          <textarea
+            ref={textareaRef}
             value={value}
-            onChange={(e) => onChange(e.target.value)}
+            onChange={handleTextChange}
+            onKeyDown={handleTextKeyDown}
             placeholder={placeholder}
+            rows={1}
             className={
               isChatPageVariant
-                ? "min-h-[48px] flex-1 rounded-2xl border border-white/[0.08] bg-[#171b26]/90 px-4 py-3 text-sm text-gray-100 transition-all placeholder:text-gray-500 focus:border-blue-400/30 focus:outline-none focus:ring-2 focus:ring-blue-400/60 md:text-base"
-                : "min-h-[44px] flex-1 rounded-xl border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-gray-100 transition-all placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 md:px-4 md:text-base"
+                ? "min-h-[48px] flex-1 resize-none rounded-2xl border border-white/[0.08] bg-[#171b26]/90 px-4 py-3 text-sm leading-6 text-gray-100 transition-all placeholder:text-gray-500 focus:border-blue-400/30 focus:outline-none focus:ring-2 focus:ring-blue-400/60 md:text-base"
+                : "min-h-[44px] flex-1 resize-none rounded-xl border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm leading-6 text-gray-100 transition-all placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 md:px-4 md:text-base"
             }
+            style={{ maxHeight: `${CHAT_INPUT_MAX_HEIGHT_PX}px` }}
             disabled={disabled || isProcessing}
           />
 

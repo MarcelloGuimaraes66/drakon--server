@@ -135,6 +135,119 @@
   animation: chat-thinking-dot 1.15s infinite ease-in-out;
 }
 
+.sidebar-nav-scroll {
+  scrollbar-width: thin;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar {
+  width: 3px;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 9999px;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+  background: transparent;
+  border: 0;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar-button:single-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.sidebar-nav-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.sidebar-nav-scroll-accent {
+  scrollbar-color: rgba(78, 86, 112, 0.9) transparent;
+}
+
+.sidebar-nav-scroll-accent::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
+  border: 0;
+  background: linear-gradient(180deg, rgba(88, 96, 124, 0.96), rgba(62, 68, 88, 0.92));
+  box-shadow: 0 0 4px rgba(12, 16, 28, 0.16);
+}
+
+.sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(103, 111, 140, 0.98), rgba(71, 79, 102, 0.94));
+}
+
+.sidebar-nav-scroll-neutral {
+  scrollbar-color: rgba(125, 126, 138, 0.82) rgba(255, 255, 255, 0.03);
+}
+
+.sidebar-nav-scroll-neutral::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
+  border: 0;
+  background: linear-gradient(180deg, rgba(116, 118, 128, 0.94), rgba(86, 88, 98, 0.88));
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.22);
+}
+
+.sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(134, 136, 146, 0.98), rgba(96, 98, 108, 0.92));
+}
+
+@supports selector(::-webkit-scrollbar) {
+  .sidebar-nav-scroll {
+    scrollbar-width: auto;
+  }
+}
+
+.light .sidebar-nav-scroll-accent {
+  scrollbar-color: rgba(103, 112, 140, 0.72) transparent;
+}
+
+.light .sidebar-nav-scroll-accent::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
+  border: 0;
+  background: linear-gradient(180deg, rgba(123, 132, 160, 0.94), rgba(94, 101, 124, 0.88));
+  box-shadow: 0 0 4px rgba(15, 23, 42, 0.08);
+}
+
+.light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(138, 146, 173, 0.96), rgba(106, 114, 136, 0.9));
+}
+
+.light .sidebar-nav-scroll-neutral {
+  scrollbar-color: rgba(113, 116, 128, 0.72) rgba(148, 163, 184, 0.1);
+}
+
+.light .sidebar-nav-scroll-neutral::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
+  border: 0;
+  background: linear-gradient(180deg, rgba(125, 130, 144, 0.92), rgba(96, 101, 114, 0.84));
+  box-shadow: 0 0 6px rgba(15, 23, 42, 0.08);
+}
+
+.light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(137, 142, 156, 0.96), rgba(108, 113, 126, 0.88));
+}
+
 :root {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }

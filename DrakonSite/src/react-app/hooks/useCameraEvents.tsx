@@ -3,6 +3,7 @@ import { pollingManager } from "@/react-app/lib/PollingManager";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
 import { normalizeCameraConnectionFailedEvent, type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
 import { emitOpenAiKeyRequiredPrompt } from "@/react-app/utils/openAiKeyGuard";
+import { formatAiApiErrorDisplay } from "@/shared/aiApiErrorDisplay";
 
 interface CameraEvent {
   id: number;
@@ -439,25 +440,13 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             }
           }
 
-          const source = String(details?.source ?? "").toLowerCase();
-          const model = String(details?.model ?? "").trim();
-          const apiMessage = String(details?.api_error_message ?? "").trim();
-          const rawError = String(details?.raw_error ?? "").trim();
-          const sourceLabel = source.includes("chat")
-            ? "Chat"
-            : source.includes("job_or_camera")
-            ? "Jobs / AI Agents"
-            : source.includes("group") || source.includes("job")
-            ? "Jobs"
-            : source.includes("camera")
-            ? "AI Agents"
-            : "Inference";
-          const title = model ? `AI API Error (${sourceLabel} - ${model})` : `AI API Error (${sourceLabel})`;
-          const fallbackMessage = apiMessage || rawError || "OpenAI API request failed during inference.";
-          const message =
-            typeof event.message === "string" && event.message.trim()
-              ? event.message.trim()
-              : fallbackMessage;
+          const formattedApiError = formatAiApiErrorDisplay({
+            source: details?.source,
+            model: details?.model,
+            message: event.message,
+            apiErrorMessage: details?.api_error_message,
+            rawError: details?.raw_error,
+          });
           const cameraName =
             typeof event.camera_id === "number"
               ? camerasRef.current.find((row) => row.id === event.camera_id)?.name
@@ -471,8 +460,8 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
               id: event.id,
               cameraId: event.camera_id,
               cameraName,
-              message,
-              title,
+              message: formattedApiError.message,
+              title: formattedApiError.title,
               type: "agent_api_error",
             },
           ]);

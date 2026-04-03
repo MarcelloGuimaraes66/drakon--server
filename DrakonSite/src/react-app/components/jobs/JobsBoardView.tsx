@@ -37,6 +37,7 @@ interface JobsBoardViewProps {
   searchQuery: string;
   cards: JobsBoardCardData[];
   tabs?: ReactNode;
+  secondaryAction?: ReactNode;
   onSearchChange: (value: string) => void;
   onNewJob: () => void;
   onOpenJob: (jobId: number) => void;
@@ -51,6 +52,7 @@ export default function JobsBoardView({
   searchQuery,
   cards,
   tabs,
+  secondaryAction,
   onSearchChange,
   onNewJob,
   onOpenJob,
@@ -76,25 +78,30 @@ export default function JobsBoardView({
           </p>
         </div>
         {tabs ? <div className="xl:justify-self-center">{tabs}</div> : <div className="hidden xl:block" />}
-        <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end">
-          <label className="relative block min-w-[260px]">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+        <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end xl:self-start">
+          <label className="relative flex min-h-[44px] min-w-[260px] items-center">
+            <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+              <Search className="h-4 w-4 text-gray-500" />
+            </span>
             <input
               type="text"
               value={searchQuery}
               onChange={(event) => onSearchChange(event.target.value)}
               placeholder={t("jobs.searchJobs")}
-              className="w-full rounded-xl border border-gray-800 bg-gray-900/80 py-2.5 pl-10 pr-4 text-sm text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
+              className="h-11 w-full rounded-xl border border-gray-800 bg-gray-900/80 py-2.5 pl-10 pr-4 text-sm text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
             />
           </label>
-          <button
-            type="button"
-            onClick={onNewJob}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-violet-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-violet-400"
-          >
-            <Plus className="h-4 w-4" />
-            {t("jobs.newJob")}
-          </button>
+          <div className="flex flex-col gap-3 sm:min-w-[210px]">
+            <button
+              type="button"
+              onClick={onNewJob}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
+            >
+              <Plus className="h-4 w-4" />
+              {t("jobs.newJob")}
+            </button>
+            {secondaryAction}
+          </div>
         </div>
       </div>
 
@@ -107,7 +114,7 @@ export default function JobsBoardView({
             <button
               type="button"
               onClick={onNewJob}
-              className="mt-5 inline-flex items-center gap-2 rounded-2xl border border-violet-400/35 bg-violet-500/10 px-4 py-2 text-sm font-medium text-violet-100 transition-colors hover:bg-violet-500/15"
+              className="mt-5 inline-flex items-center gap-2 rounded-2xl border border-blue-400/35 bg-blue-500/10 px-4 py-2 text-sm font-medium text-blue-100 transition-colors hover:bg-blue-500/15"
             >
               <Plus className="h-4 w-4" />
               {t("jobs.createJob")}

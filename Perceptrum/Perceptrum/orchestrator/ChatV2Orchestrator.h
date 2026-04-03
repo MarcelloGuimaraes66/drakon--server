@@ -4,8 +4,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "ChatModelConfig.h"
 #include "LocalLlmClient.h"
-#include "LocalLlmRuntimeManager.h"
 #include "SkillRegistry.h"
 
 class AgentCore;
@@ -25,18 +25,25 @@ public:
         const std::string& actualCommandType);
 
 private:
+    void configureLlmForPayload_(
+        LocalLlmClient& llm,
+        const nlohmann::json& payload,
+        bool useRouterModel) const;
     SkillSelection chooseSkill_(
+        const LocalLlmClient& llm,
         const nlohmann::json& payload,
         const std::string& userMessage,
         bool allowHeuristicFallback,
         const nlohmann::json& conversationContext) const;
     SkillSelection chooseHeuristicSkill_(
         const nlohmann::json& payload,
-        const std::string& userMessage) const;
+        const std::string& userMessage,
+        const nlohmann::json& conversationContext) const;
     nlohmann::json loadConversationContext_(
         AgentCore& agent,
         const nlohmann::json& payload) const;
     nlohmann::json compactConversationContextIfNeeded_(
+        const LocalLlmClient& llm,
         AgentCore& agent,
         const nlohmann::json& payload,
         nlohmann::json conversationContext) const;
@@ -60,11 +67,13 @@ private:
         const std::string& languageHint,
         const std::string& capabilityLabel) const;
     std::string buildGeneralAnswer_(
+        const LocalLlmClient& llm,
         const nlohmann::json& payload,
         const SkillSelection& selection,
         const std::string& userMessage,
         const nlohmann::json& conversationContext) const;
     std::string polishAndSanitizeAnswer_(
+        const LocalLlmClient& llm,
         const nlohmann::json& payload,
         const SkillSelection& selection,
         const std::string& draftAnswer,
@@ -72,8 +81,6 @@ private:
     std::string sanitizeUserFacingAnswer_(const std::string& answer) const;
     std::string buildLlmUnavailableAnswer_() const;
 
-    LocalLlmRuntimeManager runtimeManager_;
-    LocalLlmClient llm_;
     SkillRegistry registry_;
     bool shadowModeEnabled_ = true;
 };

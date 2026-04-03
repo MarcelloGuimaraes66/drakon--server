@@ -31,6 +31,17 @@ struct SkillSelection {
     double replyLanguageConfidence = 0.0;
     std::string knowledgeLanguage = "en";
     bool knowledgeLanguageFallback = true;
+    std::string mode;
+    std::string entity;
+    std::string intent;
+    bool continueActiveTask = false;
+    bool groundingRequired = false;
+    std::string operationType;
+    std::string operationPhase;
+    std::string taskGoal;
+    nlohmann::json draftPatch = nlohmann::json::object();
+    std::vector<std::string> missingFieldsGuess;
+    std::vector<std::string> supportingTopics;
     nlohmann::json arguments = nlohmann::json::object();
     bool fromModel = false;
 };

@@ -15,7 +15,7 @@ public:
     struct Config {
         std::string baseUrl;
         std::string apiKey;
-        std::string model = "Qwen3-4B-Instruct-2507";
+        std::string model = "gpt-5-mini";
         long timeoutMs = 12000;
         long routingTimeoutMs = 18000;
         long languageTimeoutMs = 8000;
@@ -43,6 +43,8 @@ public:
     bool isConfigured() const;
     const Config& config() const { return config_; }
     bool hasStoredConfiguration() const;
+    void setRequestOverride(const Config& config);
+    void clearRequestOverride();
     void setEndpointOverride(const std::string& baseUrl);
     void clearEndpointOverride();
 
@@ -84,6 +86,7 @@ public:
         const std::string& modelName = std::string()) const;
 
 private:
+    Config effectiveConfigSnapshot_() const;
     std::string effectiveBaseUrl_() const;
     CompletionOutcome requestCompletion_(
         const std::string& operation,
@@ -93,6 +96,8 @@ private:
 
     mutable std::mutex mutex_;
     Config config_;
+    Config requestOverride_;
+    bool requestOverrideActive_ = false;
     std::string endpointOverride_;
 };
 

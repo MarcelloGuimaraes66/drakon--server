@@ -24,6 +24,16 @@ export interface HitMediaItem {
   key?: string;
 }
 
+export interface CameraRegistrationDraftMessageMetadata {
+  type: "camera_registration_draft";
+  status: "awaiting_confirmation" | "registered";
+  language?: string;
+  draft: Record<string, unknown>;
+  target_client_id?: string | null;
+  created_camera_id?: number | null;
+  created_camera_name?: string | null;
+}
+
 const TEMPORAL_ENGINE_SUFFIX_PATTERN =
   /(?:<br\s*\/?>|\r?\n|\s)*Temporal engine:\s*[\s\S]*$/i;
 
@@ -440,6 +450,51 @@ export function extractChatProgressFromMessage(message: ChatMessage): ChatProgre
   }
 
   return progress;
+}
+
+export function extractCameraRegistrationDraftFromMessage(
+  message: ChatMessage
+): CameraRegistrationDraftMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_registration_draft") {
+    return null;
+  }
+
+  if (!parsed.draft || typeof parsed.draft !== "object" || Array.isArray(parsed.draft)) {
+    return null;
+  }
+
+  const createdCameraId = Number(parsed.created_camera_id);
+
+  return {
+    type: "camera_registration_draft",
+    status: parsed.status === "registered" ? "registered" : "awaiting_confirmation",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    draft: parsed.draft as Record<string, unknown>,
+    target_client_id:
+      typeof parsed.target_client_id === "string" ? parsed.target_client_id : undefined,
+    created_camera_id:
+      Number.isInteger(createdCameraId) && createdCameraId > 0 ? createdCameraId : undefined,
+    created_camera_name:
+      typeof parsed.created_camera_name === "string" ? parsed.created_camera_name : undefined,
+  };
 }
 
 /**

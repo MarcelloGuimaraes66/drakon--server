@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { CSSProperties, RefObject, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate } from "react-router";
 import {
   X,
@@ -11,6 +12,7 @@ import {
   Clock3,
   Radar,
 } from "lucide-react";
+import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
 
 interface Notification {
   id: number;
@@ -29,15 +31,18 @@ interface Notification {
 interface NotificationsDropdownProps {
   isOpen: boolean;
   onClose: () => void;
+  anchorRef: RefObject<HTMLElement | null>;
 }
 
 export default function NotificationsDropdown({
   isOpen,
   onClose,
+  anchorRef,
 }: NotificationsDropdownProps) {
   const navigate = useNavigate();
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [panelStyle, setPanelStyle] = useState<CSSProperties>({});
 
   useEffect(() => {
     if (isOpen) {
@@ -45,6 +50,45 @@ export default function NotificationsDropdown({
       markAsRead();
     }
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || typeof window === "undefined") return;
+
+    const updatePosition = () => {
+      const anchor = anchorRef.current;
+      const viewportPadding = 16;
+      const verticalOffset = 12;
+
+      if (!anchor) {
+        setPanelStyle({
+          top: 80,
+          right: viewportPadding,
+          maxHeight: Math.max(240, window.innerHeight - 96),
+        });
+        return;
+      }
+
+      const rect = anchor.getBoundingClientRect();
+      const top = Math.max(viewportPadding, Math.round(rect.bottom + verticalOffset));
+      const right = Math.max(viewportPadding, Math.round(window.innerWidth - rect.right));
+      const maxHeight = Math.max(240, Math.round(window.innerHeight - top - viewportPadding));
+
+      setPanelStyle({
+        top,
+        right,
+        maxHeight,
+      });
+    };
+
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [anchorRef, isOpen]);
 
   const fetchNotifications = async () => {
     setIsLoading(true);
@@ -210,18 +254,21 @@ export default function NotificationsDropdown({
     }
   };
 
-  if (!isOpen) return null;
+  if (!isOpen || typeof document === "undefined") return null;
 
-  return (
+  return createPortal(
     <>
       {/* Backdrop */}
       <div
-        className="fixed inset-0 z-40"
+        className="fixed inset-0 z-[100]"
         onClick={onClose}
       />
 
       {/* Dropdown panel */}
-      <div className="absolute right-0 top-14 w-96 max-w-[calc(100vw-2rem)] bg-gray-900 border border-gray-800 rounded-xl shadow-2xl z-50 max-h-[calc(100vh-5rem)] flex flex-col">
+      <div
+        className="fixed z-[101] flex w-96 max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-gray-800 bg-gray-900 shadow-2xl"
+        style={panelStyle}
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-800">
           <h3 className="text-lg font-semibold text-gray-100">Notifications</h3>
@@ -250,6 +297,10 @@ export default function NotificationsDropdown({
                 const badge = getNotificationBadge(notification.type);
                 const target = getNotificationTarget(notification);
                 const isClickable = !!target;
+                const displayTitle = sanitizeAiApiErrorText(notification.title);
+                const displayMessage = notification.message
+                  ? sanitizeAiApiErrorText(notification.message)
+                  : null;
 
                 return (
                 <div
@@ -314,7 +365,7 @@ export default function NotificationsDropdown({
                     <div className="flex-1 min-w-0">
                       <div className="flex items-start justify-between gap-2 mb-1">
                         <h4 className="text-sm font-semibold text-gray-100">
-                          {notification.title}
+                          {displayTitle}
                         </h4>
                         {badge && (
                           <span
@@ -325,9 +376,9 @@ export default function NotificationsDropdown({
                         )}
                       </div>
 
-                      {notification.message ? (
+                      {displayMessage ? (
                         <p className="text-sm text-gray-300 mb-1">
-                          {notification.message}
+                          {displayMessage}
                         </p>
                       ) : null}
 
@@ -346,5 +397,7 @@ export default function NotificationsDropdown({
         </div>
       </div>
     </>
+    ,
+    document.body
   );
 }

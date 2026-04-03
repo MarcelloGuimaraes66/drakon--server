@@ -2,6 +2,7 @@ import { Bot, Camera } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import type { ReactNode } from "react";
 import HitMediaAlbum from "@/react-app/components/HitMediaAlbum";
 import {
   formatAssistantMessageContent,
@@ -20,6 +21,7 @@ interface AssistantMessageProps {
   cameraLabel?: string | null;
   compact?: boolean;
   variant?: "default" | "chat-page";
+  supplementalContent?: ReactNode;
 }
 
 function assistantMarkdownComponents(compact: boolean) {
@@ -152,6 +154,7 @@ export default function AssistantMessage({
   cameraLabel = null,
   compact = false,
   variant = "default",
+  supplementalContent = null,
 }: AssistantMessageProps) {
   const markdown = formatAssistantMessageContent(content);
   const suppressCameraFooter = shouldSuppressAssistantCameraFooter(content);
@@ -194,6 +197,8 @@ export default function AssistantMessage({
           </div>
 
           {hitMedia.length > 0 && <HitMediaAlbum items={hitMedia} />}
+
+          {supplementalContent}
 
           {cameraLabel && !suppressCameraFooter ? (
             <div className="border-t border-gray-700/50 pt-3">

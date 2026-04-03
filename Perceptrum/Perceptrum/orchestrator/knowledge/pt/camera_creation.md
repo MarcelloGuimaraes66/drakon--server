@@ -72,10 +72,10 @@ Depois dos campos de conexao, o formulario continua com o endereco da camera.
 - **Retencao** define por quanto tempo os frames gerados por aquela camera ficam armazenados em disco.
 - Isso controla o historico disponivel para revisao e busca posterior.
 
-## Allow Public Access
+## Compartilhamento com colaboradores
 
-- **Allow Public Access** e uma opcao para cameras que podem ser compartilhadas com autoridades autorizadas quando houver necessidade legal de buscas por veiculos ou fugitivos.
-- Explique isso como uma escolha deliberada de politica e privacidade, nao como uma obrigacao padrao.
+- **Compartilhamento com colaboradores** permite compartilhar a camera com usuarios especificos do Perceptrum convidados por `@handle` ou email para usarem a camera no Drakon Find.
+- Explique isso como um compartilhamento intencional com colaboradores, nao como exposicao publica.
 
 ## Fluxo da webcam
 
@@ -86,7 +86,7 @@ A webcam continua usando os campos compartilhados:
 - **Nome da camera**
 - **Endereco**
 - **Retencao**
-- **Allow Public Access**
+- **Compartilhamento com colaboradores**
 
 O campo especifico da webcam e:
 
@@ -109,7 +109,7 @@ Tanto **IP / RTSP** quanto **Webcam** compartilham:
 - nome da camera
 - endereco
 - retencao
-- politica de acesso publico
+- compartilhamento com colaboradores
 
 A diferenca principal e que **IP / RTSP** precisa dos campos de transporte e fabricante, enquanto **Webcam** normalmente precisa so do indice da webcam.
 
@@ -134,7 +134,7 @@ Quando o usuario perguntar sobre a etapa de camera do tutorial:
   - subtype
   - endereco
   - retencao
-  - public access
+  - compartilhamento com colaboradores
 - Depois da explicacao da parte RTSP/IP, o tutorial muda automaticamente para **Webcam**.
 - Nesse exemplo guiado, o tutorial preenche:
   - webcam index `0`

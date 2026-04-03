@@ -302,6 +302,16 @@ std::vector<KnowledgeSnippet> KnowledgeBase::search(
                 continue;
             }
 
+            const bool alreadyIncluded = std::any_of(
+                results.begin(),
+                results.end(),
+                [&](const KnowledgeSnippet& existing) {
+                    return existing.topic == document.topic;
+                });
+            if (alreadyIncluded) {
+                continue;
+            }
+
             double score = 0.0;
             score += scoreText_(document.title, tokens) * 2.5;
             score += scoreText_(document.content, tokens);
@@ -327,7 +337,7 @@ std::vector<KnowledgeSnippet> KnowledgeBase::search(
     };
 
     appendMatches(targetLocale, false);
-    if (results.empty() && targetLocale != "en") {
+    if (results.size() < maxResults && targetLocale != "en") {
         appendMatches("en", true);
     }
 
@@ -426,7 +436,13 @@ void KnowledgeBase::loadDocuments_()
                 "camera setup", "scan network", "camera import", "import cameras",
                 "webcam", "rtsp", "nvr", "dvr", "csv", "excel", "json",
                 "tsv", "plain text", "retention", "retencao", "retenção",
-                "allow public access", "public access", "cep", "zip code",
+                "collaborator", "collaborators", "collaborator sharing",
+                "share with collaborators", "share camera", "camera sharing",
+                "invite collaborator", "invite collaborators", "colaborador",
+                "colaboradores", "collaborateurs", "compartilhar com colaboradores",
+                "compartilhamento com colaboradores", "compartir con colaboradores",
+                "uso compartido con colaboradores", "partage avec des collaborateurs",
+                "partager avec des collaborateurs", "cep", "zip code",
                 "postal code", "criar camera", "adicionar camera",
                 "cadastrar camera", "configurar camera"
             },

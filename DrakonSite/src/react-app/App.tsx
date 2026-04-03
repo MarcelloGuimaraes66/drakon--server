@@ -17,6 +17,7 @@ import EventsPage from "@/react-app/pages/Events";
 import BillingPage from "@/react-app/pages/Billing";
 import SettingsPage from "@/react-app/pages/Settings";
 import DrakonFindPage from "@/react-app/pages/DrakonFind";
+import HubPage from "@/react-app/pages/Hub";
 import { brand } from "@/shared/brand";
 import { Loader2 } from "lucide-react";
 
@@ -91,6 +92,14 @@ function AppRoutes() {
         element={
           <ProtectedRoute>
             <JobsPage />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/hub"
+        element={
+          <ProtectedRoute>
+            <HubPage />
           </ProtectedRoute>
         }
       />

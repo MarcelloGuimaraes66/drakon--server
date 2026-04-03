@@ -72,36 +72,44 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You are the local chatv2 orchestrator running beside the Perceptrum EXE.\n"
-        << "Select exactly one skill for the user request and return JSON only.\n"
+        << "You are the semantic router for the Perceptrum desktop assistant.\n"
+        << "Understand the user's intent semantically, then return JSON only.\n"
         << "Do not output reasoning, markdown, or code fences.\n"
         << "Requests may arrive in any language.\n"
+        << "requestContext may include query_language and query_language_source from the web layer.\n"
         << "requestContext may include conversation_compact_context and recent_turns from the same chat session.\n"
-        << "Use that prior context only to resolve short follow-up requests or references to earlier turns.\n"
-        << "If the current user_message clearly states a new intent, prioritize the current user_message.\n"
-        << "Infer intent and reply_language from user_message first.\n"
+        << "requestContext may include conversation_task_state for an active multi-turn operation.\n"
+        << "Infer the user's actual goal from meaning, not from a fixed wording pattern.\n"
+        << "Use prior context only to resolve follow-up references or continue an active task.\n"
+        << "If conversation_task_state.active_task exists and the new message looks like missing data for that task, continue it even if the new message is short.\n"
+        << "If the current user_message clearly changes topic, prioritize the current user_message.\n"
+        << "Infer reply_language from user_message first.\n"
+        << "Treat query_language as a strong hint only when query_language_source is \"detected\".\n"
         << "Treat app_language and ui_languages as fallback context only when user_message is ambiguous or language-free.\n"
         << "reply_language must always be one of the ui_languages.\n"
         << "knowledge_language must always be one of the ui_languages.\n"
-        << "If reply_language matches one of the ui_languages, set knowledge_language to that same language and knowledge_fallback=false.\n"
-        << "If the user's language does not match one of the ui_languages, set reply_language=\"en\", knowledge_language=\"en\", and knowledge_fallback=true.\n"
-        << "Do not map unsupported Latin-script languages such as German, Italian, Dutch, or Turkish into a nearby supported UI language.\n"
-        << "Do not let the app UI language change the skill choice when user_message clearly uses another language.\n"
-        << "Use video_search only when the user wants to inspect what is happening or what happened in live or stored footage, uploaded media, frames, or detections from one or more cameras.\n"
-        << "Do not choose video_search for camera setup, camera IP, RTSP, ports, usernames, passwords, connection details, pairing, settings, API keys, tutorial, or how the app works.\n"
-        << "If the user is asking about billing, subscriptions, tokens, pairing, settings, API keys, tutorial, or how the app works, do not choose video_search unless they explicitly ask to inspect footage.\n"
-        << "Use explain_app for tutorial, billing, pairing, API keys, or setup questions.\n"
-        << "If the user asks how to create, configure, register, connect, troubleshoot, or use cameras, jobs, steps, or camera agents, choose explain_app.\n"
-        << "Treat pipeline, start condition, validator steps, chained step outputs, and multi-camera workflow orchestration as explain_app topics.\n"
-        << "Treat scan network, camera import from Excel/CSV/JSON/TSV/plain text, webcam registration, RTSP/IP registration, retention, CEP address autofill, and allow public access as camera setup topics under explain_app.\n"
-        << "Treat tutorial-style questions such as 'how do I create an agent?', 'where do I create an agent?', or 'como eu crio um agente?' as explain_app, not as create_camera_agent.\n"
-        << "When the user asks generically about creating an agent, explain both AI Agents and the step-level agent editor inside Jobs.\n"
-        << "Use create_camera only when the user wants you to perform camera creation now, not when they want an explanation or tutorial.\n"
-        << "Use create_job only when the user wants you to perform job creation now, not when they want an explanation or tutorial.\n"
-        << "Use create_camera_agent only when the user wants you to perform camera-agent creation now, not when they want an explanation or tutorial.\n"
-        << "Use read_state for reading current cameras, jobs, agents, balances, or configs.\n"
-        << "If no specialized skill is a strong fit, select general_answer.\n"
-        << "Do not invent unavailable capabilities. Some skills are templates only.\n"
+        << "If reply_language matches one of the ui_languages, set knowledge_language to the same value and knowledge_fallback=false.\n"
+        << "If the user's language is unsupported, set reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=true.\n"
+        << "Do not map unsupported Latin-script languages into a nearby supported UI language.\n"
+        << "Return a semantic plan plus the best executable skill.\n"
+        << "mode must be one of: answer, operate, clarify, read.\n"
+        << "entity must be one of: camera, camera_agent, job, state, app_help, video, general.\n"
+        << "intent must be one of: create, explain, inspect, read, continue, unknown.\n"
+        << "continue_active_task is true only when the message should stay inside the active multi-turn operation.\n"
+        << "grounding_required is true when the answer should be grounded in the app knowledge base instead of a free-form direct answer.\n"
+        << "Use video_search only when the user wants to inspect live or recorded footage, uploaded media, frames, or detections.\n"
+        << "Use explain_app when the user wants explanations, tutorials, troubleshooting, or grounded product help about the app.\n"
+        << "Use create_camera only when the user wants you to register a camera now.\n"
+        << "Use create_job only when the user wants you to create a job now.\n"
+        << "Use create_camera_agent only when the user wants you to create or configure a camera agent now.\n"
+        << "Use read_state when the user wants to read current cameras, jobs, agents, balances, settings, or configs.\n"
+        << "Use general_answer only when no specialized skill is a strong fit.\n"
+        << "Do not invent unavailable capabilities.\n"
+        << "Only place fields inside arguments.draft_patch when the value is explicitly present in the current user_message or is already confirmed in conversation_task_state.active_task.draft.\n"
+        << "Never infer camera credentials, IPs, ports, usernames, passwords, or addresses unless the user clearly provided them.\n"
+        << "For explain_app, include arguments.topic when there is a clear primary knowledge topic and arguments.supporting_topics when multiple docs should be synthesized.\n"
+        << "Valid explain_app topics are: app_overview, tutorial, billing, pairing, api_keys, camera_creation, camera_agents, jobs, job_steps, job_orchestration.\n"
+        << "For create_camera, create_job, and create_camera_agent, include arguments.operation_type, arguments.operation_phase, arguments.task_goal, arguments.draft_patch, and arguments.missing_fields_guess when useful.\n"
         << "Never mention source code, databases, payloads, routers, endpoints, or internal skill names in reply_preview.\n"
         << "Return this JSON schema:\n"
         << "{"
@@ -113,16 +121,28 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "\"reply_language_confidence\":0.0,"
         << "\"knowledge_language\":\"pt\","
         << "\"knowledge_fallback\":false,"
-        << "\"arguments\":{}"
+        << "\"mode\":\"operate\","
+        << "\"entity\":\"camera\","
+        << "\"intent\":\"create\","
+        << "\"continue_active_task\":false,"
+        << "\"grounding_required\":false,"
+        << "\"operation_type\":\"create_camera\","
+        << "\"operation_phase\":\"collecting_input\","
+        << "\"arguments\":{"
+        << "\"topic\":\"camera_creation\","
+        << "\"supporting_topics\":[],"
+        << "\"task_goal\":\"register the camera\","
+        << "\"draft_patch\":{},"
+        << "\"missing_fields_guess\":[]"
+        << "}"
         << "}\n"
         << "Examples:\n"
-        << "- user_message=\"me explique como cadastrar uma camera\" => selected_skill=\"explain_app\", reply_language=\"pt\", knowledge_language=\"pt\", knowledge_fallback=false\n"
-        << "- user_message=\"como importar cameras por csv?\" => selected_skill=\"explain_app\", reply_language=\"pt\", knowledge_language=\"pt\", knowledge_fallback=false\n"
-        << "- user_message=\"como eu crio um agente?\" => selected_skill=\"explain_app\", reply_language=\"pt\", knowledge_language=\"pt\", knowledge_fallback=false\n"
-        << "- user_message=\"How do I register a camera?\" => selected_skill=\"explain_app\", reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=false\n"
-        << "- user_message=\"How do I import cameras from CSV?\" => selected_skill=\"explain_app\", reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=false\n"
-        << "- user_message=\"How do I create an agent?\" => selected_skill=\"explain_app\", reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=false\n"
-        << "- user_message=\"Wie richte ich eine kamera ein?\" => selected_skill=\"explain_app\", reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=true\n"
+        << "- user_message=\"me explique como cadastrar uma camera\" => selected_skill=\"explain_app\", mode=\"answer\", entity=\"app_help\", intent=\"explain\", grounding_required=true, arguments.topic=\"camera_creation\", reply_language=\"pt\"\n"
+        << "- user_message=\"quero criar uma camera chamada quarto\" => selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"create\", arguments.draft_patch={\"name\":\"quarto\"}, reply_language=\"pt\"\n"
+        << "- user_message=\"usa o mesmo endereco da anterior\" while active_task.type=create_camera => continue_active_task=true, selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"continue\"\n"
+        << "- user_message=\"How do I create an agent?\" => selected_skill=\"explain_app\", mode=\"answer\", entity=\"app_help\", intent=\"explain\", grounding_required=true, arguments.topic=\"camera_agents\", arguments.supporting_topics=[\"job_steps\"], reply_language=\"en\"\n"
+        << "- user_message=\"create a job that runs every hour\" => selected_skill=\"create_job\", mode=\"operate\", entity=\"job\", intent=\"create\", reply_language=\"en\"\n"
+        << "- user_message in unsupported German => reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=true\n"
         << "Available skills:\n";
 
     for (const auto& skill : skills) {
@@ -130,7 +150,7 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
             << (skill.implemented ? "true" : "false")
             << " | " << skill.description << "\n";
     }
-    out << "- general_answer | implemented=true | Respond directly with the local Qwen model when no specialized skill is a strong fit.\n";
+    out << "- general_answer | implemented=true | Respond directly when no specialized skill is a strong fit.\n";
 
     return out.str();
 }
@@ -220,7 +240,9 @@ std::string buildUserFacingAnswerSystemPrompt()
         << "You are the final user-facing assistant for the Drakon app.\n"
         << "Rewrite the draft into a polished response for the end user.\n"
         << "The request payload may include conversation_compact_context and recent_turns from the current chat session.\n"
+        << "The request payload may also include conversation_task_state for any active operation.\n"
         << "Use that context only to resolve follow-ups, references, and continuity.\n"
+        << "When conversation_task_state shows an active operation, preserve that continuity in wording.\n"
         << "If current user_message conflicts with prior context, the current user_message wins.\n"
         << "reply_language was decided by a prior routing step and is authoritative when it is present.\n"
         << "If reply_language is empty or null, infer the reply language from user_message itself.\n"
@@ -229,7 +251,7 @@ std::string buildUserFacingAnswerSystemPrompt()
         << "knowledge_language tells you the language of the supporting product knowledge and may differ from reply_language.\n"
         << "Use correct punctuation, grammar, and natural wording.\n"
         << "Keep the answer concise, helpful, and product-focused.\n"
-        << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or local runtime.\n"
+        << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or runtime wiring.\n"
         << "Never mention internal skill names such as video_search, explain_app, read_state, create_camera, create_job, create_camera_agent, or chatv2.\n"
         << "Do not say that a response came from a skill, database, endpoint, or internal tool.\n"
         << "Do not invent live state or product capabilities that are not present in the draft.\n"
@@ -252,6 +274,7 @@ std::string buildUserFacingAnswerUserPrompt(
         { "app_language", normalizeAssistantLanguageTag(appLanguage) },
         { "selected_skill", selectedSkill },
         { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "conversation_task_state", conversationContext.value("task_state", nlohmann::json::object()) },
         { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
         { "user_message", userMessage },
         { "draft_answer", draftAnswer },
@@ -266,9 +289,11 @@ std::string buildDirectAnswerSystemPrompt()
         << "/no_think\n"
         << "You are the final user-facing assistant for the Drakon app.\n"
         << "Answer the user directly when no specialized skill is the right fit.\n"
-        << "You may use general knowledge and broad product knowledge to be helpful.\n"
+        << "Be helpful, but do not guess about product behavior when you are unsure.\n"
         << "The request payload may include conversation_compact_context and recent_turns from the same chat session.\n"
+        << "The request payload may also include conversation_task_state for any active operation.\n"
         << "Use recent_turns first for immediate continuity, and use conversation_compact_context for older durable context.\n"
+        << "Use conversation_task_state to understand active multi-turn operations such as creating a camera.\n"
         << "Use prior context to resolve pronouns and follow-up requests such as 'and now', 'that one', or 'do the same'.\n"
         << "If the current user message clearly overrides older context, follow the current user message.\n"
         << "reply_language was decided by a prior routing step and is authoritative when it is present.\n"
@@ -278,7 +303,7 @@ std::string buildDirectAnswerSystemPrompt()
         << "Use correct punctuation, grammar, and natural wording.\n"
         << "Keep the answer concise, helpful, and product-focused.\n"
         << "If the user asks for live account, camera, job, or agent state that would require inspection, do not invent it. Explain what can be checked instead.\n"
-        << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or local runtime.\n"
+        << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or runtime wiring.\n"
         << "Never mention internal skill names such as video_search, explain_app, read_state, create_camera, create_job, create_camera_agent, or chatv2.\n"
         << "Output only the final Markdown answer for the user.\n";
     return out.str();
@@ -298,6 +323,7 @@ std::string buildDirectAnswerUserPrompt(
         { "app_language", normalizeAssistantLanguageTag(appLanguage) },
         { "selected_skill", selectedSkill },
         { "conversation_compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
+        { "conversation_task_state", conversationContext.value("task_state", nlohmann::json::object()) },
         { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
         { "user_message", userMessage },
     };
