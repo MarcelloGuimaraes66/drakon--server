@@ -1,6 +1,6 @@
 # Visão Geral do App
 
-O Drakon conecta o EXE local ao painel web para que câmeras, agentes, jobs e chat trabalhem juntos.
+O app conecta o EXE local ao painel web para que câmeras, agentes, jobs e chat trabalhem juntos.
 
 ## Como as partes se encaixam
 

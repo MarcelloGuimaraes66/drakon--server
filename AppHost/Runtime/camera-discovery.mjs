@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { buildCameraDiscoverySummary } from "../../DrakonSite/src/shared/cameraDiscovery.ts";
 
 const WS_DISCOVERY_HOST = "239.255.255.250";
 const WS_DISCOVERY_PORT = 3702;
@@ -43,6 +44,28 @@ const DEVICE_KIND_PATTERNS = [
       /\bcamera\b|\bipc\b|ipcam|network video|networkvideotransmitter|networkvideosource|onvif|rtsp|mibo/i,
   },
 ];
+
+const VENDOR_DEVICE_KIND_PATTERNS = {
+  hikvision: [
+    { label: "NVR", pattern: /\b(?:i?ds[-\s]?)?(?:76|77|96)\d{2}[a-z0-9-]*\b|\bnvr\b/i },
+    { label: "DVR", pattern: /\b(?:i?ds[-\s]?)?(?:71|72|73|90)\d{2}[a-z0-9-]*\b|\bdvr\b|\bxvr\b|turbo\s*hd/i },
+    {
+      label: "CAMERA",
+      pattern: /\b(?:i?ds[-\s]?)?2[a-z0-9-]*\b|\b2cd\b|\b2de\b|\b2df\b|\b2se\b|\b2td\b/i,
+    },
+    { label: "RECORDER", pattern: /\b(?:i?ds[-\s]?)?7[a-z0-9-]*\b/i },
+  ],
+  intelbras: [
+    { label: "NVR", pattern: /\bnvd[a-z0-9-]*\b|\bnvr\b/i },
+    { label: "DVR", pattern: /\bmhdx[a-z0-9-]*\b|\bxvr\b|\bdvr\b/i },
+    { label: "CAMERA", pattern: /\bvip[a-z0-9-]*\b|\bvhd[a-z0-9-]*\b|\bmibo[a-z0-9-]*\b/i },
+  ],
+  dahua: [
+    { label: "NVR", pattern: /\bnvr[a-z0-9-]*\b/i },
+    { label: "DVR", pattern: /\bxvr[a-z0-9-]*\b|\bdvr\b/i },
+    { label: "CAMERA", pattern: /\bipc[a-z0-9-]*\b|\bhfw[a-z0-9-]*\b|\bhdw[a-z0-9-]*\b|\bsd[a-z0-9-]*\b/i },
+  ],
+};
 
 const STRONG_CAMERA_KEYWORDS =
   /\bonvif\b|\brtsp\b|\bnvr\b|\bdvr\b|\bipc\b|ipcam|network video|networkvideotransmitter|networkvideosource|mibo|intelbras|hikvision|dahua|imou|axis|wisenet|unifi/i;
@@ -839,6 +862,31 @@ function detectDeviceKind(...sources) {
   return "";
 }
 
+function detectVendorSpecificDeviceKind(manufacturerGuess, ...sources) {
+  const normalizedManufacturer = String(manufacturerGuess || "")
+    .trim()
+    .toLowerCase();
+  const patterns = VENDOR_DEVICE_KIND_PATTERNS[normalizedManufacturer];
+  if (!patterns) {
+    return "";
+  }
+
+  const haystack = sources
+    .filter((value) => typeof value === "string" && value.trim())
+    .join(" ");
+  if (!haystack) {
+    return "";
+  }
+
+  for (const { label, pattern } of patterns) {
+    if (pattern.test(haystack)) {
+      return label;
+    }
+  }
+
+  return "";
+}
+
 function looksLikeGenericManufacturerKindName(value, kindLabel) {
   const normalized = String(value || "").trim();
   if (!normalized) {
@@ -1553,6 +1601,22 @@ function hasSecondaryRecorderChannel(devices) {
   });
 }
 
+function inferConfirmedRecorderKind(currentKind, manufacturerGuess, ...sources) {
+  const normalizedKind = normalizeDeviceKind(currentKind);
+  if (isRecorderKind(normalizedKind)) {
+    return normalizedKind;
+  }
+
+  const vendorSpecificKind = normalizeDeviceKind(
+    detectVendorSpecificDeviceKind(manufacturerGuess, ...sources)
+  );
+  if (isRecorderKind(vendorSpecificKind)) {
+    return vendorSpecificKind;
+  }
+
+  return "RECORDER";
+}
+
 function inferRecorderLikeKind(
   currentKind,
   manufacturerGuess,
@@ -1560,42 +1624,44 @@ function inferRecorderLikeKind(
   onvifXaddrs,
   friendlyName,
   modelGuess,
-  ip = ""
+  ip = "",
+  evidenceStrings = []
 ) {
   const normalizedKind = normalizeDeviceKind(currentKind);
   if (isRecorderKind(normalizedKind)) {
     return normalizedKind;
   }
 
-  if (!hasRecorderControlPort(openPorts)) {
-    return normalizedKind;
+  const vendorSpecificKind = normalizeDeviceKind(
+    detectVendorSpecificDeviceKind(
+      manufacturerGuess,
+      friendlyName,
+      modelGuess,
+      ...evidenceStrings
+    )
+  );
+  if (isRecorderKind(vendorSpecificKind)) {
+    return vendorSpecificKind;
   }
 
-  if (!isRecorderChannelFamilyManufacturer(manufacturerGuess)) {
-    return normalizedKind;
+  if (vendorSpecificKind === "CAMERA") {
+    return normalizedKind === "UNKNOWN" ? "CAMERA" : normalizedKind;
   }
 
-  const hasOnvif = Array.isArray(onvifXaddrs) && onvifXaddrs.length > 0;
   const genericName =
-    looksLikeGenericCameraName(friendlyName, ip) || looksLikeGenericRecorderName(friendlyName, ip);
+    looksLikeGenericCameraName(friendlyName, ip) ||
+    looksLikeGenericRecorderName(friendlyName, ip);
   const hasModelHint = Boolean(String(modelGuess || "").trim());
-  const hasStrongRecorderPort = openPorts.includes(8000) || openPorts.includes(5544);
-  let heuristicScore = 0;
+  const hasOnvif = Array.isArray(onvifXaddrs) && onvifXaddrs.length > 0;
+  const hasStrongRecorderSignal =
+    hasRecorderControlPort(openPorts) &&
+    isRecorderChannelFamilyManufacturer(manufacturerGuess) &&
+    !hasOnvif &&
+    genericName &&
+    !hasModelHint &&
+    openPorts.includes(5544);
 
-  if (!hasOnvif) {
-    heuristicScore += 1;
-  }
-  if (genericName) {
-    heuristicScore += 1;
-  }
-  if (!hasModelHint) {
-    heuristicScore += 1;
-  }
-  if (hasStrongRecorderPort) {
-    heuristicScore += 1;
-  }
-
-  if (heuristicScore >= 2) {
+  if (hasStrongRecorderSignal) {
     return "RECORDER";
   }
 
@@ -1889,7 +1955,9 @@ async function scanActiveHost(ip) {
 
   const evidenceStrings = collectProbeStrings(httpProbes, rtspProbe, openPorts);
   const manufacturerGuess = detectManufacturer(...evidenceStrings);
-  const detectedDeviceKind = normalizeDeviceKind(
+  const realmGuess = uniqueStrings(httpProbes.map((probe) => extractAuthRealm(probe.www_authenticate)))[0] || "";
+  const titleGuess = uniqueStrings(httpProbes.map((probe) => probe.title))[0] || "";
+  const detectedDeviceKind = choosePreferredDeviceKind(
     detectDeviceKind(
       ...httpProbes.flatMap((probe) => [
         probe.server,
@@ -1898,10 +1966,15 @@ async function scanActiveHost(ip) {
       ]),
       rtspProbe?.status_line || "",
       rtspProbe?.banner || ""
+    ),
+    detectVendorSpecificDeviceKind(
+      manufacturerGuess,
+      titleGuess,
+      realmGuess,
+      rtspProbe?.status_line || "",
+      rtspProbe?.banner || ""
     )
   );
-  const realmGuess = uniqueStrings(httpProbes.map((probe) => extractAuthRealm(probe.www_authenticate)))[0] || "";
-  const titleGuess = uniqueStrings(httpProbes.map((probe) => probe.title))[0] || "";
   const modelGuess =
     sanitizeModelGuess(titleGuess) ||
     sanitizeModelGuess(realmGuess) ||
@@ -1920,7 +1993,8 @@ async function scanActiveHost(ip) {
     onvifXaddrs,
     preKindFriendlyName,
     modelGuess,
-    ip
+    ip,
+    [titleGuess, realmGuess, rtspProbe?.status_line || "", rtspProbe?.banner || ""]
   );
   if (
     !looksLikeCameraFromActiveProbe(
@@ -2011,12 +2085,32 @@ async function scanActiveHost(ip) {
     return [baseDevice];
   }
 
+  const recorderKind = inferConfirmedRecorderKind(
+    baseDevice.device_kind_guess,
+    baseDevice.manufacturer_guess,
+    baseDevice.model_guess,
+    baseDevice.friendly_name,
+    strategyMatch?.strategy?.manufacturer_label || ""
+  );
+  const recorderBaseDevice = {
+    ...baseDevice,
+    device_kind_guess: recorderKind,
+  };
+
   return [
     {
-      ...baseDevice,
-      friendly_name: buildRecorderFriendlyName(baseDevice),
+      ...recorderBaseDevice,
+      friendly_name: buildRecorderFriendlyName(recorderBaseDevice),
     },
-    ...channelDevices,
+    ...channelDevices.map((device) => ({
+      ...device,
+      friendly_name: buildRecorderChannelFriendlyName(
+        recorderBaseDevice,
+        device.channel_label,
+        device.channel_guess,
+        device.subtype_guess
+      ),
+    })),
   ];
 }
 
@@ -2113,11 +2207,20 @@ async function enrichCandidate(candidate) {
       httpProbe?.title || "",
       httpProbe?.body_snippet || ""
     ) || "";
-  const deviceKind = normalizeDeviceKind(
+  const deviceKind = choosePreferredDeviceKind(
     detectDeviceKind(
       candidate.scopes.join(" "),
       candidate.xaddrs.join(" "),
       candidate.types.join(" "),
+      httpProbe?.server || "",
+      httpProbe?.www_authenticate || "",
+      httpProbe?.title || "",
+      httpProbe?.body_snippet || ""
+    ),
+    detectVendorSpecificDeviceKind(
+      manufacturerGuess,
+      scopeName,
+      scopeHardware,
       httpProbe?.server || "",
       httpProbe?.www_authenticate || "",
       httpProbe?.title || "",
@@ -2380,5 +2483,6 @@ export async function discoverCameraDevices(options = {}) {
     elapsed_ms: Date.now() - startedAt,
     timeout_ms: timeoutMs,
     devices: enrichedDevices,
+    summary: buildCameraDiscoverySummary(enrichedDevices),
   };
 }

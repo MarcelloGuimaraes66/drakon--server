@@ -212,6 +212,7 @@
     <ClInclude Include="orchestrator\skills\CreateJobSkill.h" />
     <ClInclude Include="orchestrator\skills\ExplainAppSkill.h" />
     <ClInclude Include="orchestrator\skills\ReadStateSkill.h" />
+    <ClInclude Include="orchestrator\skills\ScanNetworkSkill.h" />
     <ClInclude Include="orchestrator\skills\VideoSearchSkill.h" />
     <ClInclude Include="runtime\BrandingRuntime.h" />
     <ClInclude Include="Perceptrum.h" />
@@ -249,6 +250,7 @@
     <ClCompile Include="orchestrator\skills\CreateJobSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ExplainAppSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ReadStateSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\ScanNetworkSkill.cpp" />
     <ClCompile Include="orchestrator\skills\VideoSearchSkill.cpp" />
     <ClCompile Include="runtime\BrandingRuntime.cpp" />
     <ClCompile Include="Perceptrum.cpp" />

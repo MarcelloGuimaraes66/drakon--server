@@ -20,6 +20,7 @@ struct OperationTaskDescriptor {
     std::vector<std::string> missingFields;
     std::vector<std::string> collectedFields;
     nlohmann::json draft = nlohmann::json::object();
+    nlohmann::json fieldSources = nlohmann::json::object();
     nlohmann::json uiContract = nlohmann::json::object();
 };
 

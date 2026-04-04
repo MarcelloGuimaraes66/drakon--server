@@ -6,7 +6,7 @@ Ce sujet doit aider un autre chat a proposer plusieurs conceptions valides de jo
 
 ## Ce que le produit peut faire
 
-Les jobs dans Perceptrum ne se limitent pas a une analyse isolee par camera.
+Les jobs du produit ne se limitent pas a une analyse isolee par camera.
 
 Le produit peut :
 

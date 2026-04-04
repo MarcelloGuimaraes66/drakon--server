@@ -78,11 +78,21 @@ export default function HubPage() {
   const fetchItems = async (options?: { syncFirst?: boolean }) => {
     setLoading(true);
     setError(null);
+    let syncErrorMessage: string | null = null;
     try {
       if (options?.syncFirst) {
         setSyncing(true);
-        await fetch(`/api/hub/cache/sync?type=${tab}`, { method: "POST" }).catch(() => null);
-        setSyncing(false);
+        try {
+          const syncResponse = await fetch(`/api/hub/cache/sync?type=${tab}`, { method: "POST" });
+          const syncData = await syncResponse.json().catch(() => ({}));
+          if (!syncResponse.ok) {
+            syncErrorMessage = String(syncData?.error || "Failed to synchronize Hub cache.");
+          }
+        } catch {
+          syncErrorMessage = "Failed to synchronize Hub cache.";
+        } finally {
+          setSyncing(false);
+        }
       }
       const query = new URLSearchParams();
       query.set("type", tab);
@@ -93,6 +103,9 @@ export default function HubPage() {
         throw new Error(data?.error || "Failed to load Hub items.");
       }
       setItems(Array.isArray(data?.items) ? data.items : []);
+      if (syncErrorMessage) {
+        setError(syncErrorMessage);
+      }
     } catch (err: any) {
       setError(String(err?.message || err || "Failed to load Hub items."));
     } finally {

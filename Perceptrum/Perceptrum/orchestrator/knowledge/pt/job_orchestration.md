@@ -2,7 +2,7 @@
 
 Use este guia quando a pergunta nao for apenas "como criar um job", mas sim "como desenhar um workflow analitico com varios steps, varias cameras, dependencia temporal, reuso de resposta e validacao final".
 
-Este documento nao descreve um caso unico. Ele existe para orientar outro chat a propor varias alternativas de jobs com base nos recursos reais do Perceptrum + DrakonSite.
+Este documento nao descreve um caso unico. Ele existe para orientar outro chat a propor varias alternativas de jobs com base nos recursos reais do produto.
 
 ## Capacidade do produto
 

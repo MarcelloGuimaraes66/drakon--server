@@ -1,4 +1,5 @@
 import { ChatMessage } from "@/shared/types";
+import type { CameraDiscoverySummary } from "@/shared/cameraDiscovery";
 
 export interface ChatProgressInfo {
   skill?: string;
@@ -32,6 +33,15 @@ export interface CameraRegistrationDraftMessageMetadata {
   target_client_id?: string | null;
   created_camera_id?: number | null;
   created_camera_name?: string | null;
+}
+
+export interface CameraNetworkScanMessageMetadata {
+  type: "camera_network_scan";
+  status: "completed";
+  language?: string;
+  elapsed_ms?: number;
+  timeout_ms?: number;
+  summary: CameraDiscoverySummary;
 }
 
 const TEMPORAL_ENGINE_SUFFIX_PATTERN =
@@ -494,6 +504,48 @@ export function extractCameraRegistrationDraftFromMessage(
       Number.isInteger(createdCameraId) && createdCameraId > 0 ? createdCameraId : undefined,
     created_camera_name:
       typeof parsed.created_camera_name === "string" ? parsed.created_camera_name : undefined,
+  };
+}
+
+export function extractCameraNetworkScanFromMessage(
+  message: ChatMessage
+): CameraNetworkScanMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_network_scan") {
+    return null;
+  }
+
+  if (!parsed.summary || typeof parsed.summary !== "object" || Array.isArray(parsed.summary)) {
+    return null;
+  }
+
+  const elapsedMs = Number(parsed.elapsed_ms);
+  const timeoutMs = Number(parsed.timeout_ms);
+
+  return {
+    type: "camera_network_scan",
+    status: "completed",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    elapsed_ms: Number.isFinite(elapsedMs) ? elapsedMs : undefined,
+    timeout_ms: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+    summary: parsed.summary as CameraDiscoverySummary,
   };
 }
 

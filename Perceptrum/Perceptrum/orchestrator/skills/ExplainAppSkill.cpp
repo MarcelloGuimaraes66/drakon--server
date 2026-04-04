@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../../core/AgentCore.h"
+#include "../../generated/Branding.h"
 #include "../ChatModelConfig.h"
 #include "../HttpUtils.h"
 #include "../KnowledgeBase.h"
@@ -41,6 +42,11 @@ std::string trimCopy_(std::string value)
 nlohmann::json defaultTaskState_()
 {
     return defaultOperationTaskState();
+}
+
+std::string activeBrandName_()
+{
+    return AppBrand::kDisplayName;
 }
 
 bool containsAny_(const std::string& haystack, const std::vector<std::string>& needles)
@@ -355,17 +361,18 @@ nlohmann::json buildKnowledgePlan_(
         { "available_topics", supportedKnowledgeTopics_() },
     };
 
+    const std::string brandName = activeBrandName_();
     const std::string systemPrompt =
-        "/no_think\n"
-        "You choose grounded knowledge topics for the Drakon app assistant.\n"
-        "Use meaning, not keywords, to pick the best knowledge topics.\n"
-        "Return JSON only.\n"
-        "Pick exactly one primary_topic from available_topics.\n"
-        "supporting_topics may include up to 3 additional topics from available_topics.\n"
-        "Prefer router_topic_hints when they already fit the user's goal.\n"
-        "Use conversation context only to resolve follow-up references.\n"
-        "If the user is asking for practical product help, keep the plan grounded in the app docs.\n"
-        "Return this schema: {\"primary_topic\":\"camera_creation\",\"supporting_topics\":[\"camera_agents\"]}";
+        std::string("/no_think\n")
+        + "You choose grounded knowledge topics for the " + brandName + " assistant.\n"
+        + "Use meaning, not keywords, to pick the best knowledge topics.\n"
+        + "Return JSON only.\n"
+        + "Pick exactly one primary_topic from available_topics.\n"
+        + "supporting_topics may include up to 3 additional topics from available_topics.\n"
+        + "Prefer router_topic_hints when they already fit the user's goal.\n"
+        + "Use conversation context only to resolve follow-up references.\n"
+        + "If the user is asking for practical product help, keep the plan grounded in the app docs.\n"
+        + "Return this schema: {\"primary_topic\":\"camera_creation\",\"supporting_topics\":[\"camera_agents\"]}";
 
     const auto outcome = llm.completeText(
         "planExplainKnowledge",
@@ -486,19 +493,22 @@ std::string buildGroundedAnswer_(
     const std::string appLanguage =
         payload.is_object() ? normalizeAssistantLanguageTag(payload.value("app_language", std::string("en"))) : "en";
 
+    const std::string brandName = activeBrandName_();
     const std::string systemPrompt =
-        "/no_think\n"
-        "You are the grounded product assistant for the Drakon app.\n"
-        "Answer the user using only the provided knowledge_documents and the chat-session context.\n"
-        "Synthesize multiple documents when useful instead of copying a single source.\n"
-        "Use recent_turns, compact_context, and conversation_task_state only to resolve references or follow-up context.\n"
-        "If the user asks how to do something, give practical steps in the app.\n"
-        "If there are multiple valid paths in the docs, compare them briefly and recommend the most likely path.\n"
-        "If the docs do not fully answer the question, say what is clear and then ask one short clarifying question only if it is truly needed.\n"
-        "Do not invent UI labels, buttons, flows, settings, or capabilities that are not supported by the knowledge_documents.\n"
-        "Do not mention source files, internal tools, payloads, or implementation details.\n"
-        "Write the final answer directly in reply_language.\n"
-        "Output only the final Markdown answer.\n";
+        std::string("/no_think\n")
+        + "You are the grounded product assistant for " + brandName + ".\n"
+        + "Answer the user using only the provided knowledge_documents and the chat-session context.\n"
+        + "Synthesize multiple documents when useful instead of copying a single source.\n"
+        + "Use recent_turns, compact_context, and conversation_task_state only to resolve references or follow-up context.\n"
+        + "If the user asks how to do something, give practical steps in the app.\n"
+        + "If there are multiple valid paths in the docs, compare them briefly and recommend the most likely path.\n"
+        + "If the docs do not fully answer the question, say what is clear and then ask one short clarifying question only if it is truly needed.\n"
+        + "If you need to name the product, use \"" + brandName + "\" only.\n"
+        + "Never mention other product or brand names.\n"
+        + "Do not invent UI labels, buttons, flows, settings, or capabilities that are not supported by the knowledge_documents.\n"
+        + "Do not mention source files, internal tools, payloads, or implementation details.\n"
+        + "Write the final answer directly in reply_language.\n"
+        + "Output only the final Markdown answer.\n";
 
     nlohmann::json docsPayload = nlohmann::json::array();
     for (const auto& document : documents) {

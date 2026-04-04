@@ -9,7 +9,13 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import type { DiscoveredCameraDevice } from "@/shared/cameraDiscovery";
+import {
+  buildCameraDiscoveryGroups,
+  formatCameraDiscoveryChannelHint,
+  formatCameraDiscoveryDeviceTitle,
+  type CameraDiscoveryGroup,
+  type DiscoveredCameraDevice,
+} from "@/shared/cameraDiscovery";
 import {
   scanNetworkForCameras,
   type CameraDiscoveryImportRequest,
@@ -23,17 +29,9 @@ type CameraDiscoveryModalProps = {
 
 type DiscoveryStage = "idle" | "scanning" | "ready" | "error";
 
-type DiscoveryGroup = {
-  key: string;
-  root: DiscoveredCameraDevice;
-  parent: DiscoveredCameraDevice | null;
-  children: DiscoveredCameraDevice[];
-  importableDevices: DiscoveredCameraDevice[];
-};
-
 type PreviewEntry = {
   device: DiscoveredCameraDevice;
-  group: DiscoveryGroup;
+  group: CameraDiscoveryGroup;
   isGroupRoot: boolean;
 };
 
@@ -44,25 +42,6 @@ type SelectionCheckboxProps = {
   onChange: (event: ChangeEvent<HTMLInputElement>) => void;
 };
 
-function isRecorderDeviceKind(value: unknown) {
-  const normalized = String(value || "").trim().toUpperCase();
-  return normalized === "DVR" || normalized === "NVR" || normalized === "RECORDER";
-}
-
-function looksLikeGenericManufacturerKindName(
-  value: string,
-  manufacturer: string,
-  kindLabel: string
-) {
-  const normalized = String(value || "").trim();
-  const normalizedManufacturer = String(manufacturer || "").trim();
-  if (!normalized || !normalizedManufacturer) {
-    return false;
-  }
-
-  return normalized.toLowerCase() === `${normalizedManufacturer} ${kindLabel}`.toLowerCase();
-}
-
 function formatConfidence(value: number) {
   const normalized = Number.isFinite(value) ? Math.round(value * 100) : 0;
   return `${normalized}% confidence`;
@@ -72,24 +51,6 @@ function formatProtocols(device: DiscoveredCameraDevice) {
   return Array.isArray(device.discovery_protocols) && device.discovery_protocols.length > 0
     ? device.discovery_protocols.join(" / ")
     : "WS discovery";
-}
-
-function looksLikeGenericCameraName(device: DiscoveredCameraDevice) {
-  const normalizedName = String(device.friendly_name || "").trim();
-  const manufacturer = String(device.manufacturer_guess || "").trim();
-  if (!normalizedName) {
-    return true;
-  }
-
-  if (normalizedName.toLowerCase() === `camera ${device.ip}`.toLowerCase()) {
-    return true;
-  }
-
-  if (looksLikeGenericManufacturerKindName(normalizedName, manufacturer, "camera")) {
-    return true;
-  }
-
-  return /^camera\s+\d+\.\d+\.\d+\.\d+$/i.test(normalizedName);
 }
 
 function formatModel(
@@ -134,125 +95,6 @@ function formatDeviceKind(
   return kind;
 }
 
-function formatChannelHint(device: DiscoveredCameraDevice) {
-  const channelLabel = String(device.channel_label || "").trim();
-  const channelGuess = String(device.channel_guess || "").trim();
-
-  if (channelLabel && channelGuess && channelGuess !== channelLabel) {
-    return `${channelLabel} (${channelGuess})`;
-  }
-
-  return channelLabel || channelGuess;
-}
-
-function formatDeviceTitle(
-  device: DiscoveredCameraDevice,
-  options?: { recorderGroup?: boolean }
-) {
-  const friendlyName = String(device.friendly_name || "").trim();
-  const manufacturer = String(device.manufacturer_guess || "").trim();
-  if (friendlyName && !(options?.recorderGroup && looksLikeGenericCameraName(device))) {
-    return friendlyName;
-  }
-
-  if (options?.recorderGroup || isRecorderDeviceKind(device.device_kind_guess)) {
-    return manufacturer ? `${manufacturer} Recorder` : `Recorder ${device.ip}`;
-  }
-
-  return friendlyName || `Camera ${device.ip}`;
-}
-
-function channelSortValue(device: DiscoveredCameraDevice) {
-  const rawChannel = String(device.channel_guess || "").trim();
-  if (!rawChannel) {
-    return 0;
-  }
-
-  const numericValue = Number.parseInt(rawChannel, 10);
-  if (!Number.isInteger(numericValue)) {
-    return Number.MAX_SAFE_INTEGER;
-  }
-
-  if (rawChannel.length >= 3 && rawChannel.endsWith("01")) {
-    return Math.floor(numericValue / 100);
-  }
-
-  return numericValue;
-}
-
-function sortChannels(left: DiscoveredCameraDevice, right: DiscoveredCameraDevice) {
-  const channelDiff = channelSortValue(left) - channelSortValue(right);
-  if (channelDiff !== 0) {
-    return channelDiff;
-  }
-
-  return String(left.friendly_name || "").localeCompare(String(right.friendly_name || ""), undefined, {
-    numeric: true,
-  });
-}
-
-function shouldRenderRecorderGroup(
-  parent: DiscoveredCameraDevice | null,
-  children: DiscoveredCameraDevice[]
-) {
-  if (children.length === 0) {
-    return false;
-  }
-
-  const parentKind = String(parent?.device_kind_guess || "").trim().toUpperCase();
-  if (isRecorderDeviceKind(parentKind)) {
-    return true;
-  }
-
-  return children.some((device) => channelSortValue(device) > 1);
-}
-
-function createSyntheticRecorderGroup(
-  children: DiscoveredCameraDevice[],
-  ip: string
-): DiscoveredCameraDevice {
-  const representative = children[0];
-  const manufacturer = String(representative?.manufacturer_guess || "").trim();
-
-  return {
-    ...representative,
-    id: `synthetic-recorder:${ip}`,
-    friendly_name: manufacturer ? `${manufacturer} Recorder` : `Recorder ${ip}`,
-    channel_guess: null,
-    subtype_guess: null,
-    channel_label: null,
-    device_kind_guess: isRecorderDeviceKind(representative.device_kind_guess)
-      ? representative.device_kind_guess
-      : "RECORDER",
-  };
-}
-
-function groupDiscoveredDevices(devices: DiscoveredCameraDevice[]): DiscoveryGroup[] {
-  const groupedByIp = new Map<string, DiscoveredCameraDevice[]>();
-
-  for (const device of devices) {
-    const ip = String(device.ip || "").trim() || device.id;
-    const group = groupedByIp.get(ip) || [];
-    group.push(device);
-    groupedByIp.set(ip, group);
-  }
-
-  return Array.from(groupedByIp.entries()).map(([ip, group]) => {
-    const parent = group.find((device) => !String(device.channel_guess || "").trim()) || null;
-    const children = group
-      .filter((device) => String(device.channel_guess || "").trim())
-      .sort(sortChannels);
-
-    if (children.length === 0 || !shouldRenderRecorderGroup(parent, children)) {
-      const root = parent || group[0];
-      return { key: ip, root, parent, children: [], importableDevices: [root] };
-    }
-
-    const root = parent || createSyntheticRecorderGroup(children, ip);
-    return { key: ip, root, parent, children, importableDevices: children };
-  });
-}
-
 function SelectionCheckbox({
   checked,
   indeterminate = false,
@@ -295,7 +137,7 @@ export default function CameraDiscoveryModal({
   const [isImporting, setIsImporting] = useState(false);
   const [sharedUsername, setSharedUsername] = useState("");
   const [sharedPassword, setSharedPassword] = useState("");
-  const groupedDevices = useMemo(() => groupDiscoveredDevices(devices), [devices]);
+  const groupedDevices = useMemo(() => buildCameraDiscoveryGroups(devices), [devices]);
   const importableDevices = useMemo(
     () => groupedDevices.flatMap((group) => group.importableDevices),
     [groupedDevices]
@@ -339,7 +181,9 @@ export default function CameraDiscoveryModal({
             Boolean(previewEntry?.isGroupRoot) && previewGroup.children.length > 0,
         })
       : "";
-  const previewChannelHint = previewDevice ? formatChannelHint(previewDevice) : "";
+  const previewChannelHint = previewDevice
+    ? formatCameraDiscoveryChannelHint(previewDevice)
+    : "";
 
   const performScan = async () => {
     setStage("scanning");
@@ -352,7 +196,7 @@ export default function CameraDiscoveryModal({
 
     try {
       const payload = await scanNetworkForCameras();
-      const nextGroups = groupDiscoveredDevices(payload.devices);
+      const nextGroups = buildCameraDiscoveryGroups(payload.devices);
       const nextImportableIds = nextGroups.flatMap((group) =>
         group.importableDevices.map((device) => device.id)
       );
@@ -390,7 +234,7 @@ export default function CameraDiscoveryModal({
     void performScan();
   }, [isOpen]);
 
-  const handleGroupToggle = (group: DiscoveryGroup, checked: boolean) => {
+  const handleGroupToggle = (group: CameraDiscoveryGroup, checked: boolean) => {
     setImportError(null);
     setSelectedIds((current) => {
       const next = new Set(current);
@@ -590,7 +434,7 @@ export default function CameraDiscoveryModal({
                             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                               <div className="min-w-0">
                                 <p className="truncate text-sm font-semibold text-gray-100">
-                                  {formatDeviceTitle(group.root, {
+                                  {formatCameraDiscoveryDeviceTitle(group.root, {
                                     recorderGroup: isRecorderGroup,
                                   })}
                                 </p>
@@ -630,7 +474,7 @@ export default function CameraDiscoveryModal({
                             <SelectionCheckbox
                               checked={groupChecked}
                               indeterminate={groupPartiallyChecked}
-                              label={`Select ${formatDeviceTitle(group.root, {
+                              label={`Select ${formatCameraDiscoveryDeviceTitle(group.root, {
                                 recorderGroup: isRecorderGroup,
                               })}`}
                               onChange={(event) =>
@@ -646,7 +490,7 @@ export default function CameraDiscoveryModal({
                               {group.children.map((child) => {
                                 const childSelected = selectedIds.has(child.id);
                                 const childPreviewed = previewId === child.id;
-                                const channelHint = formatChannelHint(child);
+                                const channelHint = formatCameraDiscoveryChannelHint(child);
 
                                 return (
                                   <div
@@ -666,7 +510,7 @@ export default function CameraDiscoveryModal({
                                         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                                           <div className="min-w-0">
                                             <p className="truncate text-sm font-medium text-gray-100">
-                                              {formatDeviceTitle(child)}
+                                              {formatCameraDiscoveryDeviceTitle(child)}
                                             </p>
                                             <p className="mt-1 text-xs text-gray-400">
                                               {child.ip}
@@ -701,7 +545,7 @@ export default function CameraDiscoveryModal({
                                       <div className="flex items-start pt-1">
                                         <SelectionCheckbox
                                           checked={childSelected}
-                                          label={`Select ${formatDeviceTitle(child)}`}
+                                          label={`Select ${formatCameraDiscoveryDeviceTitle(child)}`}
                                           onChange={(event) =>
                                             handleDeviceToggle(child, event.target.checked)
                                           }
@@ -745,7 +589,7 @@ export default function CameraDiscoveryModal({
                             key={device.id}
                             className="truncate rounded-xl border border-white/5 bg-white/[0.03] px-3 py-2 text-xs text-gray-300"
                           >
-                            {formatDeviceTitle(device)}
+                            {formatCameraDiscoveryDeviceTitle(device)}
                           </p>
                         ))}
                         {selectedDevices.length > 6 && (
@@ -766,7 +610,7 @@ export default function CameraDiscoveryModal({
                             : "Suggested camera"}
                         </p>
                         <p className="mt-2 text-base font-semibold text-gray-100">
-                          {formatDeviceTitle(previewDevice, {
+                          {formatCameraDiscoveryDeviceTitle(previewDevice, {
                             recorderGroup:
                               Boolean(previewEntry?.isGroupRoot) &&
                               previewGroup.children.length > 0,

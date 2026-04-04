@@ -1,6 +1,6 @@
 # Resumen de la App
 
-Drakon conecta el EXE local con el panel web para que cámaras, agentes, jobs y chat trabajen juntos.
+La app conecta el EXE local con el panel web para que camaras, agentes, jobs y chat trabajen juntos.
 
 ## Cómo encaja cada parte
 

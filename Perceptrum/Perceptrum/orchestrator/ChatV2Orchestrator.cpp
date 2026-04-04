@@ -282,6 +282,7 @@ int progressStepCountForSkill_(const std::string& skillName)
 {
     if (skillName == "video_search") return 5;
     if (skillName == "explain_app") return 4;
+    if (skillName == "scan_network") return 3;
     if (skillName == "read_state") return 3;
     if (skillName == "general_answer") return 2;
     return 1;
@@ -538,6 +539,43 @@ std::string skillFromSemanticSelection_(
     return "";
 }
 
+bool shouldSemanticSkillOverrideSelected_(
+    const SkillSelection& selection,
+    const std::string& semanticSkill)
+{
+    if (semanticSkill.empty()) {
+        return false;
+    }
+
+    if (selection.selectedSkill.empty() || selection.selectedSkill == "general_answer") {
+        return true;
+    }
+
+    if (selection.selectedSkill == semanticSkill) {
+        return false;
+    }
+
+    const bool semanticOperation =
+        selection.continueActiveTask ||
+        selection.mode == "operate" ||
+        selection.mode == "read" ||
+        selection.intent == "create" ||
+        selection.intent == "continue" ||
+        selection.intent == "inspect" ||
+        selection.intent == "read";
+
+    if (!semanticOperation) {
+        return false;
+    }
+
+    return semanticSkill == "create_camera" ||
+        semanticSkill == "create_camera_agent" ||
+        semanticSkill == "create_job" ||
+        semanticSkill == "scan_network" ||
+        semanticSkill == "read_state" ||
+        semanticSkill == "video_search";
+}
+
 SkillSelection applySemanticSelectionPlan_(
     SkillSelection selection,
     const nlohmann::json& payload,
@@ -568,9 +606,12 @@ SkillSelection applySemanticSelectionPlan_(
     }
 
     std::string semanticSkill = skillFromSemanticSelection_(selection, conversationContext);
-    if ((selection.selectedSkill.empty() || selection.selectedSkill == "general_answer") &&
-        !semanticSkill.empty()) {
+    const std::string originalSelectedSkill = selection.selectedSkill;
+    if (shouldSemanticSkillOverrideSelected_(selection, semanticSkill)) {
         selection.selectedSkill = semanticSkill;
+        if (selection.reason.empty() || originalSelectedSkill != semanticSkill) {
+            selection.reason = "semantic_plan_override";
+        }
     }
 
     if (selection.selectedSkill == "general_answer" &&
@@ -588,7 +629,8 @@ SkillSelection applySemanticSelectionPlan_(
     if (selection.operationType.empty() &&
         (selection.selectedSkill == "create_camera" ||
          selection.selectedSkill == "create_camera_agent" ||
-         selection.selectedSkill == "create_job")) {
+         selection.selectedSkill == "create_job" ||
+         selection.selectedSkill == "scan_network")) {
         selection.operationType = selection.selectedSkill;
     }
 
@@ -597,6 +639,9 @@ SkillSelection applySemanticSelectionPlan_(
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job") {
             selection.intent = selection.continueActiveTask ? "continue" : "create";
+        }
+        else if (selection.selectedSkill == "scan_network") {
+            selection.intent = "inspect";
         }
         else if (selection.selectedSkill == "explain_app") {
             selection.intent = "explain";
@@ -616,6 +661,7 @@ SkillSelection applySemanticSelectionPlan_(
         if (selection.selectedSkill == "create_camera" ||
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job" ||
+            selection.selectedSkill == "scan_network" ||
             selection.selectedSkill == "video_search") {
             selection.mode = "operate";
         }
@@ -1688,7 +1734,7 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
         sanitized.end());
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
-        { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },
     };

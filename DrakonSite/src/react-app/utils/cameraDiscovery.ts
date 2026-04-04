@@ -1,8 +1,12 @@
 import type { CameraEditorDraft } from "@/react-app/components/CameraEditorModal";
 import type {
-  CameraDiscoveryDeviceKind,
+  CameraDiscoverySummary,
   CameraDiscoveryResponse,
   DiscoveredCameraDevice,
+} from "@/shared/cameraDiscovery";
+import {
+  buildCameraDiscoverySummary,
+  normalizeCameraDiscoveryDeviceKind,
 } from "@/shared/cameraDiscovery";
 
 export type CameraDiscoveryImportRequest = {
@@ -47,25 +51,6 @@ function normalizeConnectionMethod(device: DiscoveredCameraDevice): "RTSP" | "HT
   }
 
   return "RTSP";
-}
-
-function normalizeDeviceKind(
-  value: unknown
-): CameraDiscoveryDeviceKind {
-  const normalized = String(value || "")
-    .trim()
-    .toUpperCase();
-
-  if (
-    normalized === "CAMERA" ||
-    normalized === "DVR" ||
-    normalized === "NVR" ||
-    normalized === "RECORDER"
-  ) {
-    return normalized;
-  }
-
-  return "UNKNOWN";
 }
 
 function normalizeDiscoveredDevice(device: unknown): DiscoveredCameraDevice {
@@ -119,11 +104,97 @@ function normalizeDiscoveredDevice(device: unknown): DiscoveredCameraDevice {
       typeof record.confidence === "number" && Number.isFinite(record.confidence)
         ? record.confidence
         : 0,
-    device_kind_guess: normalizeDeviceKind(record.device_kind_guess),
+    device_kind_guess: normalizeCameraDiscoveryDeviceKind(record.device_kind_guess),
     channel_label:
       typeof record.channel_label === "string" && record.channel_label.trim()
         ? record.channel_label
         : null,
+  };
+}
+
+function normalizeSummary(
+  value: unknown,
+  devices: DiscoveredCameraDevice[]
+): CameraDiscoverySummary {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return buildCameraDiscoverySummary(devices);
+  }
+
+  const record = value as Record<string, unknown>;
+  const stats =
+    record.stats && typeof record.stats === "object" && !Array.isArray(record.stats)
+      ? (record.stats as Record<string, unknown>)
+      : {};
+
+  const toInt = (input: unknown, fallback = 0) => {
+    if (typeof input === "number" && Number.isFinite(input)) {
+      return Math.max(0, Math.trunc(input));
+    }
+    return fallback;
+  };
+
+  const normalizeStandaloneItem = (item: unknown) => {
+    const standalone =
+      item && typeof item === "object" && !Array.isArray(item)
+        ? (item as Record<string, unknown>)
+        : {};
+
+    return {
+      id: typeof standalone.id === "string" ? standalone.id : crypto.randomUUID(),
+      ip: typeof standalone.ip === "string" ? standalone.ip : "",
+      title: typeof standalone.title === "string" ? standalone.title : "",
+      kind: normalizeCameraDiscoveryDeviceKind(standalone.kind),
+      manufacturer_guess:
+        typeof standalone.manufacturer_guess === "string" ? standalone.manufacturer_guess : "",
+      model_guess: typeof standalone.model_guess === "string" ? standalone.model_guess : "",
+    };
+  };
+
+  const normalizeRecorderGroup = (item: unknown) => {
+    const group =
+      item && typeof item === "object" && !Array.isArray(item)
+        ? (item as Record<string, unknown>)
+        : {};
+
+    return {
+      key: typeof group.key === "string" ? group.key : crypto.randomUUID(),
+      ip: typeof group.ip === "string" ? group.ip : "",
+      title: typeof group.title === "string" ? group.title : "",
+      kind: normalizeCameraDiscoveryDeviceKind(group.kind),
+      manufacturer_guess:
+        typeof group.manufacturer_guess === "string" ? group.manufacturer_guess : "",
+      model_guess: typeof group.model_guess === "string" ? group.model_guess : "",
+      detected_channel_camera_count: toInt(group.detected_channel_camera_count),
+      detected_channels: Array.isArray(group.detected_channels)
+        ? group.detected_channels.filter((entry): entry is string => typeof entry === "string")
+        : [],
+      detected_channel_labels: Array.isArray(group.detected_channel_labels)
+        ? group.detected_channel_labels.filter(
+            (entry): entry is string => typeof entry === "string"
+          )
+        : [],
+    };
+  };
+
+  return {
+    stats: {
+      total_device_count: toInt(stats.total_device_count, devices.length),
+      total_importable_camera_count: toInt(stats.total_importable_camera_count, devices.length),
+      recorder_count: toInt(stats.recorder_count),
+      recorder_group_count: toInt(stats.recorder_group_count),
+      recorder_channel_camera_count: toInt(stats.recorder_channel_camera_count),
+      standalone_camera_count: toInt(stats.standalone_camera_count),
+      standalone_recorder_count: toInt(stats.standalone_recorder_count),
+    },
+    recorder_groups: Array.isArray(record.recorder_groups)
+      ? record.recorder_groups.map(normalizeRecorderGroup)
+      : [],
+    standalone_cameras: Array.isArray(record.standalone_cameras)
+      ? record.standalone_cameras.map(normalizeStandaloneItem)
+      : [],
+    standalone_recorders: Array.isArray(record.standalone_recorders)
+      ? record.standalone_recorders.map(normalizeStandaloneItem)
+      : [],
   };
 }
 
@@ -206,13 +277,16 @@ export async function scanNetworkForCameras(
   }
 
   const payload = (await response.json()) as CameraDiscoveryResponse;
+  const devices = Array.isArray(payload.devices)
+    ? payload.devices.map((device) => normalizeDiscoveredDevice(device))
+    : [];
+
   return {
     elapsed_ms:
       typeof payload.elapsed_ms === "number" ? payload.elapsed_ms : timeoutMs,
     timeout_ms: typeof payload.timeout_ms === "number" ? payload.timeout_ms : timeoutMs,
-    devices: Array.isArray(payload.devices)
-      ? payload.devices.map((device) => normalizeDiscoveredDevice(device))
-      : [],
+    devices,
+    summary: normalizeSummary(payload.summary, devices),
   };
 }
 

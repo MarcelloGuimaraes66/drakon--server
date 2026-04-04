@@ -357,18 +357,28 @@ function Invoke-BuildStep {
 
     $binItems | Copy-Item -Destination $BrandMetadata.ArtifactStageRoot -Recurse -Force
 
+    $sourceKnowledgeRoot = Join-Path $workspaceRoot "Perceptrum\Perceptrum\orchestrator\knowledge"
     $nativeKnowledgeRoot = Join-Path $workspaceRoot "Perceptrum\x64\$Configuration\orchestrator\knowledge"
     $artifactKnowledgeRoot = Join-Path $BrandMetadata.ArtifactStageRoot "orchestrator\knowledge"
     $binKnowledgeRoot = Join-Path $binOutputRoot "orchestrator\knowledge"
+    $knowledgeCopyRoot = $sourceKnowledgeRoot
 
-    Copy-DirectoryContents -Source $nativeKnowledgeRoot -Destination $artifactKnowledgeRoot
+    if (-not (Test-Path $knowledgeCopyRoot)) {
+        $knowledgeCopyRoot = $nativeKnowledgeRoot
+    }
+
+    if (-not (Test-Path $knowledgeCopyRoot)) {
+        throw "Knowledge root not found. Checked '$sourceKnowledgeRoot' and '$nativeKnowledgeRoot'."
+    }
+
+    Copy-DirectoryContents -Source $knowledgeCopyRoot -Destination $artifactKnowledgeRoot
 
     $artifactRuntimePath = Join-Path $BrandMetadata.ArtifactStageRoot "runtime"
     if (Test-Path $artifactRuntimePath) {
         Copy-Item -Path $artifactRuntimePath -Destination $binOutputRoot -Recurse -Force
     }
 
-    Copy-DirectoryContents -Source $nativeKnowledgeRoot -Destination $binKnowledgeRoot
+    Copy-DirectoryContents -Source $knowledgeCopyRoot -Destination $binKnowledgeRoot
 
     foreach ($name in @("brand.config.json", "brand.txt")) {
         $sourcePath = Join-Path $BrandMetadata.ArtifactStageRoot $name

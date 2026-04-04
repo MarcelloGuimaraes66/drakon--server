@@ -1765,12 +1765,57 @@ export default function CameraCustomAgentEditorModal({
         />
 
         <div className="relative h-[90vh] max-h-[1050px] w-[min(88vw,1320px)] max-w-[88vw] bg-gray-800 text-gray-100 rounded-md shadow-2xl border border-gray-700 overflow-hidden flex flex-col">
-          <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
-            <div>
+          <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-gray-700">
+            <div className="min-w-0">
               <h4 className="text-lg font-semibold leading-tight">Agent Editor</h4>
               <p className="text-xs text-gray-400 mt-1">Define the full agent context.</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {canLoadSavedAgentTemplate ? (
+                <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                  <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                    Load
+                  </span>
+                  <select
+                    value={selectedTemplateAgentId}
+                    onChange={(e) => setSelectedTemplateAgentId(e.target.value)}
+                    disabled={templateAgentsLoading || saving || enhancingPrompt}
+                    title={
+                      templateAgentsError ||
+                      "Load one of your saved agents. Negative reference images need to be re-uploaded after the first save."
+                    }
+                    className="w-[200px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    <option value="">
+                      {templateAgentsLoading
+                        ? "Loading saved agents..."
+                        : templateAgentsError
+                        ? "Failed to load agents"
+                        : templateAgents.length === 0
+                        ? "No saved agents"
+                        : "Saved agents"}
+                    </option>
+                    {templateAgents.map((agent) => (
+                      <option key={`saved-agent-${agent.id}`} value={agent.id}>
+                        {`${agent.display_name} - ${agent.camera_name}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void onLoadTemplateAgent()}
+                    disabled={!selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt}
+                    title="Load this saved agent into the current draft"
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                      !selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt
+                        ? "cursor-not-allowed bg-gray-700 text-gray-500"
+                        : "bg-blue-600 text-white hover:bg-blue-500"
+                    }`}
+                  >
+                    {templateAgentsLoading ? "..." : "Use"}
+                  </button>
+                </div>
+              ) : null}
               <div
                 className="flex items-center gap-2"
                 data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorModel}
@@ -2290,77 +2335,6 @@ export default function CameraCustomAgentEditorModal({
                     enhancingPrompt ? "overflow-y-hidden" : "overflow-y-auto"
                   } pr-2 pl-4 space-y-5 p-5`}
                 >
-                {canLoadSavedAgentTemplate ? (
-                  <div className="rounded-xl border border-gray-700 bg-gray-800/60 p-4 space-y-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <h5 className="text-sm font-semibold text-gray-100">
-                          Load One of Your Agents
-                        </h5>
-                        <p className="mt-1 text-xs leading-5 text-gray-400">
-                          Prefill this new draft with any custom agent you already saved on your
-                          account.
-                        </p>
-                      </div>
-                      {templateAgents.length > 0 ? (
-                        <span className="rounded-full border border-gray-600 bg-gray-900 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-gray-300">
-                          {templateAgents.length} saved
-                        </span>
-                      ) : null}
-                    </div>
-
-                    <div className="flex flex-col gap-2 lg:flex-row">
-                      <select
-                        value={selectedTemplateAgentId}
-                        onChange={(e) => setSelectedTemplateAgentId(e.target.value)}
-                        disabled={templateAgentsLoading || saving || enhancingPrompt}
-                        className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        <option value="">Select one of your saved agents</option>
-                        {templateAgents.map((agent) => (
-                          <option key={`saved-agent-${agent.id}`} value={agent.id}>
-                            {`${agent.display_name} - ${agent.camera_name}`}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        onClick={() => void onLoadTemplateAgent()}
-                        disabled={!selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt}
-                        className={`shrink-0 rounded px-3 py-2 text-sm font-medium transition-colors ${
-                          !selectedTemplateAgent || templateAgentsLoading || saving || enhancingPrompt
-                            ? "cursor-not-allowed bg-gray-700 text-gray-500"
-                            : "bg-blue-600 text-white hover:bg-blue-500"
-                        }`}
-                      >
-                        {templateAgentsLoading ? "Loading..." : "Load Into Draft"}
-                      </button>
-                    </div>
-
-                    {selectedTemplateAgent ? (
-                      <p className="text-[11px] text-gray-500">
-                        Source camera: {selectedTemplateAgent.camera_name}
-                      </p>
-                    ) : null}
-
-                    {templateAgentsError ? (
-                      <p className="text-xs text-rose-300">{templateAgentsError}</p>
-                    ) : null}
-                    {!templateAgentsLoading &&
-                    !templateAgentsError &&
-                    templateAgents.length === 0 ? (
-                      <p className="text-xs text-gray-500">
-                        No saved custom agents yet.
-                      </p>
-                    ) : null}
-
-                    <p className="text-[11px] leading-5 text-gray-500">
-                      Prompt, polygons, execution settings and face targets are copied. Negative
-                      reference images are not copied into a new draft and can be re-uploaded after
-                      the first save.
-                    </p>
-                  </div>
-                ) : null}
                 <div
                   className="space-y-5"
                   data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorExecution}

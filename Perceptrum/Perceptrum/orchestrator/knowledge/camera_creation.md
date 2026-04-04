@@ -74,7 +74,7 @@ After the connection fields, the form continues with the camera address.
 
 ## Collaborator Sharing
 
-- **Collaborator Sharing** lets the user share the camera with specific Perceptrum users invited by `@handle` or email so they can use it in Drakon Find.
+- **Collaborator Sharing** lets the user share the camera with specific collaborators invited by `@handle` or email so they can access the same camera from their own account.
 - Explain this as intentional sharing with collaborators, not as public exposure.
 
 ## Webcam flow

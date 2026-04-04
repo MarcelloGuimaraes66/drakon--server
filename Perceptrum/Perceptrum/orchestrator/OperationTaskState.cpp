@@ -123,6 +123,10 @@ nlohmann::json buildOperationTaskRecord_(const OperationTaskDescriptor& descript
         task["draft"] = descriptor.draft;
     }
 
+    if (descriptor.fieldSources.is_object() && !descriptor.fieldSources.empty()) {
+        task["field_sources"] = descriptor.fieldSources;
+    }
+
     if (descriptor.uiContract.is_object() && !descriptor.uiContract.empty()) {
         task["ui_contract"] = descriptor.uiContract;
     }

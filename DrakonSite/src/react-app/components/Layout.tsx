@@ -177,6 +177,9 @@ export default function Layout({ children }: LayoutProps) {
   const sidebarActiveDotClass = isDrakonBrand
     ? "bg-white/45 shadow-[0_0_12px_rgba(255,255,255,0.12)]"
     : "bg-blue-300/70 shadow-[0_0_14px_rgba(147,197,253,0.65)]";
+  const sidebarBadgeToneClass = isDrakonBrand
+    ? "border-blue-400/25 bg-blue-500/90 shadow-[0_12px_20px_-12px_rgba(59,130,246,0.85)]"
+    : "border-blue-300/30 bg-blue-500 shadow-[0_12px_20px_-12px_rgba(59,130,246,0.95)]";
   const sidebarTooltipToneClass = isDrakonBrand
     ? "border-white/10 bg-[#111112]/96 text-gray-200 shadow-[0_18px_34px_-20px_rgba(0,0,0,0.95)]"
     : "border-blue-400/18 bg-[#16192a]/96 text-blue-50 shadow-[0_18px_34px_-20px_rgba(52,97,255,0.5)]";
@@ -817,7 +820,9 @@ export default function Layout({ children }: LayoutProps) {
                                   </div>
                                 </div>
                                 {badgeLabel ? (
-                                  <span className="relative ml-2 inline-flex min-w-7 shrink-0 items-center justify-center rounded-full border border-orange-400/25 bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white shadow-[0_12px_20px_-12px_rgba(249,115,22,0.95)]">
+                                  <span
+                                    className={`relative ml-2 inline-flex min-w-7 shrink-0 items-center justify-center rounded-full border px-2 py-1 text-[10px] font-semibold text-white ${sidebarBadgeToneClass}`}
+                                  >
                                     {badgeLabel}
                                   </span>
                                 ) : (

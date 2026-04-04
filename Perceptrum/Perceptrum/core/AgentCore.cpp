@@ -6031,16 +6031,32 @@ void AgentCore::processCommand_(const json& cmd) {
             updateCameraAlgorithms_(cameraId, payload);
         }
         else if (type == "chat_query") {
-            // Run chat routing in a background thread so we don't block workerLoop_
             nlohmann::json chatPayload = payload.is_object() ? payload : nlohmann::json::object();
             chatPayload["command_id"] = commandId;
+            chatPayload["chat_mode"] = "v2";
             const int chatSessionId =
                 chatPayload.is_object() ? chatPayload.value("chat_session_id", -1) : -1;
+
+            if (chatSessionId <= 0) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "processCommand_: rejecting deprecated chat_query without chat_session_id; command_id=" +
+                    std::to_string(commandId)
+                );
+                if (commandId > 0) {
+                    nlohmann::json err;
+                    err["error"] = "Legacy chat_query command is no longer supported. Use orchestrator_query/chatv2.";
+                    err["deprecated_command_type"] = "chat_query";
+                    postCommandResult_(commandId, "failed", err);
+                }
+                return;
+            }
+
             auto chatTaskState = registerChatTask_(chatSessionId);
 
             std::thread([this, chatPayload, chatTaskState]() {
                 try {
-                    handleChatQuery_(chatPayload);
+                    handleOrchestratorQuery_(chatPayload);
                 }
                 catch (const std::exception& e) {
                     const int chatSessionId =
@@ -6049,7 +6065,7 @@ void AgentCore::processCommand_(const json& cmd) {
                         "agent",
                         "chat",
                         "AgentCore::processCommand_::chatQueryThread",
-                        "chat_query",
+                        "orchestrator_query",
                         {
                             { "chat_session_id", chatSessionId }
                         },
@@ -6063,7 +6079,7 @@ void AgentCore::processCommand_(const json& cmd) {
                         "agent",
                         "chat",
                         "AgentCore::processCommand_::chatQueryThread",
-                        "chat_query",
+                        "orchestrator_query",
                         {
                             { "chat_session_id", chatSessionId }
                         }

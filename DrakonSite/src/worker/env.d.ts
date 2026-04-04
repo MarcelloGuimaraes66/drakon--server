@@ -23,6 +23,7 @@ declare global {
     CENTRAL_AUTH_PUBLIC_KEY?: string;
     CENTRAL_AUTH_PRIVATE_KEY?: string;
     CENTRAL_AUTH_GRANT_TTL_HOURS?: string;
+    CENTRAL_AUTH_DEVICE_SESSION_TTL_DAYS?: string;
     CENTRAL_AUTH_KEY_ID?: string;
   }
 

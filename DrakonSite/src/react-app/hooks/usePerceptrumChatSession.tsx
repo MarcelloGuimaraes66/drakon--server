@@ -34,6 +34,7 @@ export type PendingExecutionState =
 
 type ChatModelTier = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 const FIXED_CHAT_MODEL_TIER: ChatModelTier = "ultra";
+const CHAT_MODE = "v2";
 type ChatRunningResolution = 640 | 1024;
 const DEFAULT_CORE_RUNNING_RESOLUTION: ChatRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
@@ -541,6 +542,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
             camera_id,
             uploaded_image_base64: uploadedImageBase64 || null,
             uploaded_video_id: uploadedVideoId || null,
+            chat_mode: CHAT_MODE,
             model_tier: normalizedModelTier,
             model_fps: normalizedModelFps,
             running_resolution: normalizedRunningResolution,

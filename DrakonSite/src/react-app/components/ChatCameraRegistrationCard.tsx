@@ -22,6 +22,7 @@ type CameraRegistrationFormData = {
   country: string;
   retention_days: 1 | 3 | 7 | 15 | 30 | 90 | 180;
   allowpublicaccess: boolean;
+  shared_find_invitee_query: string;
 };
 
 type AddressLookupResponse = {
@@ -126,6 +127,7 @@ function normalizeFormDraft(draft: Record<string, unknown>): CameraRegistrationF
     country: toNonEmptyString(draft.country),
     retention_days: normalizeRetentionDays(draft.retention_days),
     allowpublicaccess: toBoolean(draft.allowpublicaccess),
+    shared_find_invitee_query: toNonEmptyString(draft.shared_find_invitee_query),
   };
 }
 
@@ -133,10 +135,16 @@ function buildSubmitPayload(form: CameraRegistrationFormData): Record<string, un
   const payload: Record<string, unknown> = {
     ...form,
   };
+  const shareInviteeQuery = form.shared_find_invitee_query.trim();
   if (form.connection_method === "WEBCAM" && form.webcam_index !== null && form.webcam_index !== undefined) {
     payload.webcam_index = form.webcam_index;
   } else {
     delete payload.webcam_index;
+  }
+  if (shareInviteeQuery) {
+    payload.shared_find_invitee_query = shareInviteeQuery;
+  } else {
+    delete payload.shared_find_invitee_query;
   }
   return payload;
 }
@@ -216,6 +224,8 @@ function useCardCopy(languageInput?: string) {
         country: "Pais",
         retention: "Retencao",
         allowPublicAccess: "Compartilhar com colaboradores",
+        shareInviteeHint: "Informe o nome de usuario ou email que deve receber acesso a esta camera.",
+        shareInviteePlaceholder: "@usuario ou email",
       };
     }
     if (key === "es") {
@@ -248,6 +258,8 @@ function useCardCopy(languageInput?: string) {
         country: "Pais",
         retention: "Retencion",
         allowPublicAccess: "Compartir con colaboradores",
+        shareInviteeHint: "Indica el usuario o correo que debe recibir acceso a esta camara.",
+        shareInviteePlaceholder: "@usuario o correo",
       };
     }
     if (key === "fr") {
@@ -280,6 +292,8 @@ function useCardCopy(languageInput?: string) {
         country: "Pays",
         retention: "Retention",
         allowPublicAccess: "Partager avec des collaborateurs",
+        shareInviteeHint: "Indiquez le nom d'utilisateur ou l'email qui doit recevoir l'acces a cette camera.",
+        shareInviteePlaceholder: "@utilisateur ou email",
       };
     }
     return {
@@ -311,6 +325,8 @@ function useCardCopy(languageInput?: string) {
       country: "Country",
       retention: "Retention",
       allowPublicAccess: "Share with collaborators",
+      shareInviteeHint: "Enter the username or email that should receive access to this camera.",
+      shareInviteePlaceholder: "@username or email",
     };
   }, [key]);
 }
@@ -690,16 +706,19 @@ export default function ChatCameraRegistrationCard({
             </select>
           </label>
 
-          <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/20 px-3 py-3 text-sm text-slate-100">
+          <div className="md:col-span-2 space-y-3 rounded-2xl border border-white/10 bg-black/20 px-3 py-3">
+            <div>
+              <p className="text-sm font-medium text-slate-100">{copy.allowPublicAccess}</p>
+              <p className="mt-1 text-xs text-slate-300">{copy.shareInviteeHint}</p>
+            </div>
             <input
-              type="checkbox"
-              checked={form.allowpublicaccess}
+              value={form.shared_find_invitee_query}
               disabled={isRegistered}
-              onChange={(e) => setField("allowpublicaccess", e.target.checked)}
-              className="h-4 w-4 rounded border-white/20 bg-transparent"
+              onChange={(e) => setField("shared_find_invitee_query", e.target.value)}
+              placeholder={copy.shareInviteePlaceholder}
+              className={inputClass(false)}
             />
-            <span>{copy.allowPublicAccess}</span>
-          </label>
+          </div>
         </div>
 
         {submitError ? (

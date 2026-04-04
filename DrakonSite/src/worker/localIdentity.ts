@@ -155,22 +155,63 @@ async function mergeAppUserRowsForCanonicalId(
       normalizeText(newRow.timezone_updated_at) || normalizeText(oldRow.timezone_updated_at) || null,
     timezoneSource:
       normalizeText(newRow.timezone_source) || normalizeText(oldRow.timezone_source) || null,
+    centralPublicId:
+      normalizeText(newRow.central_public_id) || normalizeText(oldRow.central_public_id) || null,
+    centralGrantToken:
+      normalizeText(newRow.central_grant_token) || normalizeText(oldRow.central_grant_token) || null,
+    centralGrantExpiresAt:
+      normalizeText(newRow.central_grant_expires_at) ||
+      normalizeText(oldRow.central_grant_expires_at) ||
+      null,
+    centralDeviceSessionId:
+      normalizeText(newRow.central_device_session_id) ||
+      normalizeText(oldRow.central_device_session_id) ||
+      null,
+    centralDeviceSessionToken:
+      normalizeText(newRow.central_device_session_token) ||
+      normalizeText(oldRow.central_device_session_token) ||
+      null,
+    centralDeviceSessionExpiresAt:
+      normalizeText(newRow.central_device_session_expires_at) ||
+      normalizeText(oldRow.central_device_session_expires_at) ||
+      null,
+    centralLastRefreshAt:
+      normalizeText(newRow.central_last_refresh_at) ||
+      normalizeText(oldRow.central_last_refresh_at) ||
+      null,
+    centralLastGrantSyncAt:
+      normalizeText(newRow.central_last_grant_sync_at) ||
+      normalizeText(oldRow.central_last_grant_sync_at) ||
+      null,
+    centralAuthProvider:
+      normalizeText(newRow.central_auth_provider) ||
+      normalizeText(oldRow.central_auth_provider) ||
+      null,
     createdAt: normalizeText(newRow.created_at) || normalizeText(oldRow.created_at) || nowIso,
   };
 
   await db
     .prepare(
       `UPDATE app_users
-       SET email = ?,
-           auth_provider = ?,
-           country_code = ?,
-           locale = ?,
-           handle = ?,
-           timezone_iana = ?,
-           timezone_updated_at = ?,
-           timezone_source = ?,
-           created_at = ?,
-           updated_at = ?
+        SET email = ?,
+            auth_provider = ?,
+            country_code = ?,
+            locale = ?,
+            handle = ?,
+            timezone_iana = ?,
+            timezone_updated_at = ?,
+            timezone_source = ?,
+            central_public_id = ?,
+            central_grant_token = ?,
+            central_grant_expires_at = ?,
+            central_device_session_id = ?,
+            central_device_session_token = ?,
+            central_device_session_expires_at = ?,
+            central_last_refresh_at = ?,
+            central_last_grant_sync_at = ?,
+            central_auth_provider = ?,
+            created_at = ?,
+            updated_at = ?
        WHERE id = ?`
     )
     .bind(
@@ -182,6 +223,15 @@ async function mergeAppUserRowsForCanonicalId(
       merged.timezoneIana,
       merged.timezoneUpdatedAt,
       merged.timezoneSource,
+      merged.centralPublicId,
+      merged.centralGrantToken,
+      merged.centralGrantExpiresAt,
+      merged.centralDeviceSessionId,
+      merged.centralDeviceSessionToken,
+      merged.centralDeviceSessionExpiresAt,
+      merged.centralLastRefreshAt,
+      merged.centralLastGrantSyncAt,
+      merged.centralAuthProvider,
       merged.createdAt,
       nowIso,
       newUserId

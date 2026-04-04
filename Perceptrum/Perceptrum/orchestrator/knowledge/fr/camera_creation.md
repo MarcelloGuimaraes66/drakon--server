@@ -74,7 +74,7 @@ Apres les champs de connexion, le formulaire continue avec l'adresse de la camer
 
 ## Partage avec des collaborateurs
 
-- **Partage avec des collaborateurs** permet de partager la camera avec des utilisateurs Perceptrum precis invites par `@handle` ou e-mail afin qu ils puissent utiliser la camera dans Drakon Find.
+- **Partage avec des collaborateurs** permet de partager la camera avec des collaborateurs precis invites par `@handle` ou e-mail afin qu ils puissent acceder a cette meme camera depuis leur propre compte.
 - Expliquez cela comme un partage intentionnel avec des collaborateurs, pas comme une exposition publique.
 
 ## Flux webcam

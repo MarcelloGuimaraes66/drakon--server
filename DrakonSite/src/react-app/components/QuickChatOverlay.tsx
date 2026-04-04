@@ -5,7 +5,9 @@ import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSes
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
+import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
+import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import { ChatMessage } from "@/shared/types";
@@ -13,6 +15,7 @@ import { brand, getBrandStorageKey } from "@/shared/brand";
 import { X, Bot, User, ExternalLink, Minus, AlertCircle } from "lucide-react";
 import {
   extractChatProgressFromMessage,
+  extractCameraNetworkScanFromMessage,
   extractCameraRegistrationDraftFromMessage,
   extractHitMediaFromMessage,
   formatMessageContent,
@@ -243,22 +246,31 @@ export default function QuickChatOverlay() {
 
     if (message.role === "user") {
       const userMsg = message as any;
+      const formattedUserContent = formatMessageContent(message.content);
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
-          <div className="max-w-[85%] min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)]">
-            {userMsg.uploaded_image_base64 && (
-              <img
-                src={userMsg.uploaded_image_base64}
-                alt="Uploaded"
-                className="mb-3 max-h-32 rounded-2xl shadow-md"
+          <div className="flex min-w-0 flex-1 justify-end">
+            <div className="group relative max-w-[85%] min-w-0">
+              <div className="min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)]">
+                {userMsg.uploaded_image_base64 && (
+                  <img
+                    src={userMsg.uploaded_image_base64}
+                    alt="Uploaded"
+                    className="mb-3 max-h-32 rounded-2xl shadow-md"
+                  />
+                )}
+                <p
+                  className="text-sm leading-relaxed whitespace-pre-wrap break-words"
+                  style={{ overflowWrap: "anywhere" }}
+                >
+                  {formattedUserContent}
+                </p>
+              </div>
+              <MessageCopyButton
+                text={formattedUserContent}
+                className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
               />
-            )}
-            <p
-              className="text-sm leading-relaxed whitespace-pre-wrap break-words"
-              style={{ overflowWrap: "anywhere" }}
-            >
-              {formatMessageContent(message.content)}
-            </p>
+            </div>
           </div>
           <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500">
             <User className="h-4 w-4 text-white" />
@@ -271,6 +283,7 @@ export default function QuickChatOverlay() {
     // Extract hit media (images and videos) using shared utility
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
+    const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
 
     return (
       <AssistantMessage
@@ -292,6 +305,8 @@ export default function QuickChatOverlay() {
                 })
               }
             />
+          ) : cameraNetworkScan ? (
+            <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
           ) : null
         }
       />

@@ -5,6 +5,7 @@
 #include "skills/CreateJobSkill.h"
 #include "skills/ExplainAppSkill.h"
 #include "skills/ReadStateSkill.h"
+#include "skills/ScanNetworkSkill.h"
 #include "skills/VideoSearchSkill.h"
 
 namespace chatv2 {
@@ -17,6 +18,7 @@ SkillRegistry::SkillRegistry()
     registerSkill(std::make_unique<CreateJobSkill>());
     registerSkill(std::make_unique<CreateCameraAgentSkill>());
     registerSkill(std::make_unique<ReadStateSkill>());
+    registerSkill(std::make_unique<ScanNetworkSkill>());
 }
 
 bool SkillRegistry::hasSkill(const std::string& skillName) const

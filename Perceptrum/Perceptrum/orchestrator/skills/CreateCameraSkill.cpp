@@ -85,6 +85,201 @@ nlohmann::json defaultTaskState_()
     return defaultOperationTaskState();
 }
 
+const std::vector<std::string>& cameraFieldNames_()
+{
+    static const std::vector<std::string> fields = {
+        "name",
+        "connection_method",
+        "ip_address",
+        "rtsp_port",
+        "manufacturer",
+        "username",
+        "password",
+        "channel",
+        "subtype",
+        "description",
+        "street",
+        "number",
+        "city",
+        "state",
+        "zip_code",
+        "country",
+        "retention_days",
+        "webcam_index",
+        "allowpublicaccess",
+    };
+    return fields;
+}
+
+bool isKnownCameraField_(const std::string& field)
+{
+    const auto& fields = cameraFieldNames_();
+    return std::find(fields.begin(), fields.end(), field) != fields.end();
+}
+
+std::string normalizeCameraFieldSource_(std::string value)
+{
+    value = lowerAsciiCopy_(trimCopy_(std::move(value)));
+    if (value == "explicit_user" ||
+        value == "implied_user" ||
+        value == "address_lookup" ||
+        value == "system_default") {
+        return value;
+    }
+    return "";
+}
+
+nlohmann::json normalizeCameraFieldSources_(const nlohmann::json& fieldSources)
+{
+    nlohmann::json normalized = nlohmann::json::object();
+    if (!fieldSources.is_object()) {
+        return normalized;
+    }
+
+    for (auto it = fieldSources.begin(); it != fieldSources.end(); ++it) {
+        if (!it.value().is_string() || !isKnownCameraField_(it.key())) {
+            continue;
+        }
+        const std::string source = normalizeCameraFieldSource_(it.value().get<std::string>());
+        if (!source.empty()) {
+            normalized[it.key()] = source;
+        }
+    }
+    return normalized;
+}
+
+std::string cameraFieldSource_(
+    const nlohmann::json& fieldSources,
+    const std::string& field)
+{
+    if (!fieldSources.is_object() ||
+        !fieldSources.contains(field) ||
+        !fieldSources[field].is_string()) {
+        return "";
+    }
+    return normalizeCameraFieldSource_(fieldSources[field].get<std::string>());
+}
+
+void setCameraFieldSource_(
+    nlohmann::json& fieldSources,
+    const std::string& field,
+    const std::string& source)
+{
+    const std::string normalizedSource = normalizeCameraFieldSource_(source);
+    if (!isKnownCameraField_(field) || normalizedSource.empty()) {
+        return;
+    }
+    if (!fieldSources.is_object()) {
+        fieldSources = nlohmann::json::object();
+    }
+    fieldSources[field] = normalizedSource;
+}
+
+void eraseCameraFieldSource_(
+    nlohmann::json& fieldSources,
+    const std::string& field)
+{
+    if (fieldSources.is_object()) {
+        fieldSources.erase(field);
+    }
+}
+
+void eraseFieldFromPatchAndSources_(
+    nlohmann::json& patch,
+    nlohmann::json& fieldSources,
+    const std::string& field)
+{
+    if (patch.is_object()) {
+        patch.erase(field);
+    }
+    eraseCameraFieldSource_(fieldSources, field);
+}
+
+nlohmann::json buildFieldSourcesForPatch_(
+    const nlohmann::json& patch,
+    const std::string& source)
+{
+    nlohmann::json fieldSources = nlohmann::json::object();
+    if (!patch.is_object()) {
+        return fieldSources;
+    }
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        setCameraFieldSource_(fieldSources, it.key(), source);
+    }
+    return fieldSources;
+}
+
+nlohmann::json buildCameraPatchEnvelope_(
+    const nlohmann::json& patch,
+    const nlohmann::json& fieldSources)
+{
+    const nlohmann::json normalizedPatch =
+        patch.is_object() ? patch : nlohmann::json::object();
+    nlohmann::json normalizedSources = normalizeCameraFieldSources_(fieldSources);
+    for (auto it = normalizedSources.begin(); it != normalizedSources.end();) {
+        if (!normalizedPatch.contains(it.key())) {
+            it = normalizedSources.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    return nlohmann::json::object({
+        { "camera_patch", normalizedPatch },
+        { "field_sources", normalizedSources },
+    });
+}
+
+nlohmann::json extractionCameraPatch_(const nlohmann::json& extraction)
+{
+    if (!extraction.is_object() ||
+        !extraction.contains("camera_patch") ||
+        !extraction["camera_patch"].is_object()) {
+        return nlohmann::json::object();
+    }
+    return extraction["camera_patch"];
+}
+
+nlohmann::json extractionFieldSources_(const nlohmann::json& extraction)
+{
+    if (!extraction.is_object()) {
+        return nlohmann::json::object();
+    }
+    return normalizeCameraFieldSources_(extraction.value("field_sources", nlohmann::json::object()));
+}
+
+void mergeCameraPatchIntoDraft_(
+    nlohmann::json& draft,
+    nlohmann::json& fieldSources,
+    const nlohmann::json& patch,
+    const nlohmann::json& patchSources,
+    const std::string& fallbackSource = "")
+{
+    if (!draft.is_object()) {
+        draft = nlohmann::json::object();
+    }
+    if (!patch.is_object()) {
+        return;
+    }
+
+    const nlohmann::json normalizedSources = normalizeCameraFieldSources_(patchSources);
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        draft[it.key()] = it.value();
+        const std::string source =
+            cameraFieldSource_(normalizedSources, it.key()).empty()
+                ? fallbackSource
+                : cameraFieldSource_(normalizedSources, it.key());
+        if (!source.empty()) {
+            setCameraFieldSource_(fieldSources, it.key(), source);
+        }
+    }
+}
+
+bool isUserProvidedFieldSource_(const std::string& source)
+{
+    return source == "explicit_user" || source == "implied_user";
+}
+
 nlohmann::json taskStateFromConversation_(const nlohmann::json& conversationContext)
 {
     return taskStateFromConversationContext(conversationContext);
@@ -271,6 +466,27 @@ std::vector<std::string> computeMissingFields_(const nlohmann::json& camera)
     return missing;
 }
 
+nlohmann::json assumedRtspPortPatch_(const nlohmann::json& camera)
+{
+    if (normalizeConnectionMethod_(camera) != "WEBCAM" &&
+        !hasCameraValue_(camera, "rtsp_port")) {
+        return nlohmann::json::object({
+            { "rtsp_port", "554" },
+        });
+    }
+    return nlohmann::json::object();
+}
+
+nlohmann::json applyAssumedRtspPort_(const nlohmann::json& camera)
+{
+    nlohmann::json normalized = camera.is_object() ? camera : nlohmann::json::object();
+    const nlohmann::json patch = assumedRtspPortPatch_(normalized);
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        normalized[it.key()] = it.value();
+    }
+    return normalized;
+}
+
 bool regexCaptureGroup_(
     const std::string& input,
     const std::regex& pattern,
@@ -369,10 +585,18 @@ bool isHostCandidate_(const std::string& value)
     return std::regex_match(trimmed, kHostPattern);
 }
 
+std::vector<std::string> splitSegments_(const std::string& input);
+std::vector<std::string> splitTokens_(const std::string& input);
+
 bool isResidualHostCandidate_(const std::string& value)
 {
     const std::string trimmed = trimCopy_(value);
-    if (!isHostCandidate_(trimmed)) {
+    if (trimmed.empty() || trimmed.find(' ') != std::string::npos) {
+        return false;
+    }
+
+    static const std::regex kStructuredHostPattern(R"([A-Za-z0-9._:-]+)");
+    if (!std::regex_match(trimmed, kStructuredHostPattern)) {
         return false;
     }
 
@@ -390,6 +614,22 @@ bool isResidualHostCandidate_(const std::string& value)
         std::any_of(trimmed.begin(), trimmed.end(), [](unsigned char ch) {
             return std::isdigit(ch) != 0;
         });
+}
+
+bool isStandaloneHostReply_(const std::string& input)
+{
+    const std::string trimmed = collapseWhitespace_(input);
+    if (!isResidualHostCandidate_(trimmed)) {
+        return false;
+    }
+
+    const auto segments = splitSegments_(trimmed);
+    if (segments.size() != 1) {
+        return false;
+    }
+
+    const auto tokens = splitTokens_(trimmed);
+    return tokens.size() == 1;
 }
 
 bool isValidPortCandidate_(const std::string& value)
@@ -518,6 +758,238 @@ std::string findManufacturerInText_(const std::string& input)
     return "";
 }
 
+struct StructuredFieldBoundaryPattern_ {
+    const char* field;
+    std::regex pattern;
+};
+
+bool isAllowedConnectionMethodValue_(const std::string& value)
+{
+    const std::string normalized = upperAsciiCopy_(trimCopy_(value));
+    return normalized == "WEBCAM" ||
+        normalized == "RTSP" ||
+        normalized == "HTTP" ||
+        normalized == "ONVIF";
+}
+
+bool isAllowedRetentionValue_(const std::string& value)
+{
+    if (!isDigitsOnly_(value)) {
+        return false;
+    }
+
+    try {
+        const int retentionDays = std::stoi(trimCopy_(value));
+        return retentionDays == 1 ||
+            retentionDays == 3 ||
+            retentionDays == 7 ||
+            retentionDays == 15 ||
+            retentionDays == 30 ||
+            retentionDays == 90 ||
+            retentionDays == 180;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+bool isValidStructuredFieldBoundaryValue_(
+    const std::string& field,
+    const std::string& value)
+{
+    const std::string trimmed = trimCopy_(value);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    if (field == "ip_address") {
+        return isResidualHostCandidate_(trimmed);
+    }
+    if (field == "rtsp_port") {
+        return isValidPortCandidate_(trimmed);
+    }
+    if (field == "manufacturer") {
+        return !findManufacturerInText_(trimmed).empty();
+    }
+    if (field == "username" || field == "password") {
+        return trimmed.find(' ') == std::string::npos;
+    }
+    if (field == "zip_code") {
+        return isPostalCodeCandidate_(trimmed);
+    }
+    if (field == "number") {
+        return trimmed.find(' ') == std::string::npos;
+    }
+    if (field == "webcam_index") {
+        return isDigitsOnly_(trimmed);
+    }
+    if (field == "channel" || field == "subtype") {
+        return trimmed.size() <= 32 && trimmed.find_first_of("\r\n,;") == std::string::npos;
+    }
+    if (field == "connection_method") {
+        return isAllowedConnectionMethodValue_(trimmed);
+    }
+    if (field == "retention_days") {
+        return isAllowedRetentionValue_(trimmed);
+    }
+
+    return false;
+}
+
+const std::vector<StructuredFieldBoundaryPattern_>& structuredFieldBoundaryPatterns_()
+{
+    static const std::vector<StructuredFieldBoundaryPattern_> patterns = {
+        { "ip_address", std::regex(R"(\b(ip\s*address|ip|host|ip\s*or\s*host|ip\/host)\b\s*[:=]?\s*([A-Za-z0-9._:-]+))", std::regex::icase) },
+        { "rtsp_port", std::regex(R"(\b(rtsp\s*port|porta\s*rtsp|porta|puerto\s*rtsp|puerto|port)\b\s*[:=]?\s*(\d{1,5}))", std::regex::icase) },
+        { "manufacturer", std::regex(R"(\b(manufacturer|fabricante|fabricant)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "username", std::regex(R"(\b(username|user|usuario|utilisateur)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "password", std::regex(R"(\b(password|senha|contrasena|mot\s+de\s+passe)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "zip_code", std::regex(R"(\b(zip\s*code|zipcode|postal\s*code|cep|codigo\s*postal|code\s*postal)\b\s*[:=]?\s*([A-Za-z0-9 -]{4,16}))", std::regex::icase) },
+        { "number", std::regex(R"(\b(number|numero|num)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "webcam_index", std::regex(R"(\b(webcam\s*index|indice\s+da\s+webcam|indice\s+de\s+la\s+webcam|indice|index)\b\s*[:=]?\s*(\d+))", std::regex::icase) },
+        { "channel", std::regex(R"(\b(channel|canal)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "subtype", std::regex(R"(\b(subtype|subtipo)\b\s*[:=]?\s*([^\s,;]+))", std::regex::icase) },
+        { "connection_method", std::regex(R"(\b(connection\s*method|metodo\s+de\s+conexao|metodo\s+de\s+conexion|methode\s+de\s+connexion|method|metodo|methode)\b\s*[:=]?\s*(WEBCAM|RTSP|HTTP|ONVIF|webcam|rtsp|http|onvif))", std::regex::icase) },
+        { "retention_days", std::regex(R"(\b(retention\s*days|retention|retencao|retencion|retenzione)\b\s*[:=]?\s*(\d+))", std::regex::icase) },
+    };
+    return patterns;
+}
+
+const std::vector<std::string>& structuredBoundaryFieldsFor_(const std::string& field)
+{
+    static const std::vector<std::string> none = {};
+    static const std::vector<std::string> compactSlotFields = {
+        "ip_address",
+        "rtsp_port",
+        "manufacturer",
+        "username",
+        "password",
+        "zip_code",
+        "number",
+        "webcam_index",
+        "channel",
+        "subtype",
+        "connection_method",
+        "retention_days",
+    };
+    static const std::vector<std::string> manufacturerFields = {
+        "ip_address",
+        "rtsp_port",
+        "username",
+        "password",
+        "zip_code",
+        "number",
+        "channel",
+        "subtype",
+        "connection_method",
+        "retention_days",
+    };
+    static const std::vector<std::string> streetFields = {
+        "number",
+        "zip_code",
+    };
+
+    if (field == "name" || field == "description") {
+        return compactSlotFields;
+    }
+    if (field == "manufacturer") {
+        return manufacturerFields;
+    }
+    if (field == "street") {
+        return streetFields;
+    }
+    return none;
+}
+
+std::string trimStructuredFieldValue_(
+    const std::string& field,
+    std::string value)
+{
+    value = collapseWhitespace_(std::move(value));
+    if (value.empty()) {
+        return "";
+    }
+
+    const auto& boundaryFields = structuredBoundaryFieldsFor_(field);
+    if (boundaryFields.empty()) {
+        return value;
+    }
+
+    std::size_t boundaryPos = std::string::npos;
+    for (const auto& item : structuredFieldBoundaryPatterns_()) {
+        if (std::find(boundaryFields.begin(), boundaryFields.end(), item.field) == boundaryFields.end()) {
+            continue;
+        }
+
+        std::smatch match;
+        if (!std::regex_search(value, match, item.pattern) || match.size() < 3) {
+            continue;
+        }
+
+        const std::size_t pos = static_cast<std::size_t>(match.position());
+        if (pos == 0) {
+            continue;
+        }
+
+        const unsigned char before = static_cast<unsigned char>(value[pos - 1]);
+        if (std::isspace(before) == 0 &&
+            before != ',' &&
+            before != ';' &&
+            before != ':' &&
+            before != '(') {
+            continue;
+        }
+
+        const std::string nextValue = collapseWhitespace_(match[2].str());
+        if (!isValidStructuredFieldBoundaryValue_(item.field, nextValue)) {
+            continue;
+        }
+
+        if (boundaryPos == std::string::npos || pos < boundaryPos) {
+            boundaryPos = pos;
+        }
+    }
+
+    if (boundaryPos != std::string::npos) {
+        value = value.substr(0, boundaryPos);
+    }
+
+    return collapseWhitespace_(std::move(value));
+}
+
+nlohmann::json refineStructuredCameraPatch_(const nlohmann::json& patch)
+{
+    if (!patch.is_object()) {
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json refined = patch;
+    const std::vector<const char*> textFields = {
+        "name",
+        "manufacturer",
+        "description",
+        "street",
+        "city",
+        "state",
+        "country",
+    };
+
+    for (const auto* field : textFields) {
+        if (!refined.contains(field) || !refined[field].is_string()) {
+            continue;
+        }
+
+        const std::string normalized = trimStructuredFieldValue_(field, refined[field].get<std::string>());
+        if (normalized.empty()) {
+            refined.erase(field);
+            continue;
+        }
+        refined[field] = normalized;
+    }
+
+    return refined;
+}
+
 std::vector<std::string> activeMissingFields_(const nlohmann::json& conversationContext);
 
 bool hasExplicitHostEvidence_(const std::string& input)
@@ -530,9 +1002,18 @@ bool hasExplicitHostEvidence_(const std::string& input)
     if (std::regex_search(input, std::regex(R"(\b((?:\d{1,3}\.){3}\d{1,3})\b)"))) {
         return true;
     }
-    return std::regex_search(
-        input,
-        std::regex(R"((ip\s*address|ip|host|ip\s*or\s*host|ip\/host)\s*[:=]?\s*[A-Za-z0-9._:-]+)", std::regex::icase));
+
+    std::string labeledHost;
+    if (regexCaptureGroup_(
+            input,
+            std::regex(R"((ip\s*address|ip|host|ip\s*or\s*host|ip\/host)\s*[:=]?\s*([A-Za-z0-9._:-]+))", std::regex::icase),
+            2,
+            labeledHost) &&
+        isResidualHostCandidate_(labeledHost)) {
+        return true;
+    }
+
+    return isStandaloneHostReply_(input);
 }
 
 bool hasExplicitPortEvidence_(const std::string& input)
@@ -561,6 +1042,24 @@ bool hasExplicitPasswordEvidence_(const std::string& input)
         std::regex(R"((password|senha|contrasena|mot\s+de\s+passe)\s*[:=]?\s*[^\s,;]+)", std::regex::icase));
 }
 
+bool hasExplicitNameEvidence_(const std::string& input)
+{
+    return std::regex_search(
+        input,
+        std::regex(
+            R"((camera\s*name|name|nome\s+da\s+camera|nome\s+de\s+camera|nome|nombre\s+de\s+la\s+camara|nombre|nom\s+de\s+la\s+camera|nom|named|called|chamada|chamado)\s*[:=]?\s*[^\n,;]+)",
+            std::regex::icase));
+}
+
+bool hasExplicitWebcamIndexEvidence_(const std::string& input)
+{
+    return std::regex_search(
+        input,
+        std::regex(R"((webcam\s*index|indice\s+da\s+webcam|indice\s+de\s+la\s+webcam|indice|index)\s*[:=]?\s*\d+)", std::regex::icase));
+}
+
+bool isLikelyStandaloneCameraNameReply_(const std::string& userMessage);
+
 nlohmann::json sanitizeExtractedCameraDraft_(
     const nlohmann::json& draft,
     const std::string& userMessage,
@@ -568,34 +1067,66 @@ nlohmann::json sanitizeExtractedCameraDraft_(
     const nlohmann::json& conversationContext)
 {
     if (!draft.is_object()) {
-        return nlohmann::json::object();
+        return buildCameraPatchEnvelope_(
+            nlohmann::json::object(),
+            nlohmann::json::object());
     }
 
-    nlohmann::json sanitized = draft;
+    nlohmann::json sanitizedPatch = extractionCameraPatch_(draft);
+    nlohmann::json fieldSources = extractionFieldSources_(draft);
+    const std::vector<std::string> activeMissing = activeMissingFields_(conversationContext);
+    const auto fieldIsActivelyMissing = [&](const char* key) {
+        return std::find(activeMissing.begin(), activeMissing.end(), key) != activeMissing.end();
+    };
     const bool hasOngoingCollection =
-        !activeMissingFields_(conversationContext).empty() ||
+        !activeMissing.empty() ||
         hasAnyCameraFieldValue_(existingDraft);
-    if (hasOngoingCollection) {
-        return sanitized;
+
+    if (!hasExplicitNameEvidence_(userMessage)) {
+        const bool allowImplicitNameReply =
+            hasOngoingCollection &&
+            fieldIsActivelyMissing("name") &&
+            isLikelyStandaloneCameraNameReply_(userMessage);
+        if (!allowImplicitNameReply) {
+            eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "name");
+        }
     }
 
-    if (!hasExplicitHostEvidence_(userMessage)) {
-        sanitized.erase("ip_address");
+    const bool explicitHostEvidence = hasExplicitHostEvidence_(userMessage);
+    if (!explicitHostEvidence ||
+        (hasCameraValue_(sanitizedPatch, "ip_address") &&
+         !isResidualHostCandidate_(jsonStringField_(sanitizedPatch, "ip_address")))) {
+        eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "ip_address");
     }
-    if (!hasExplicitPortEvidence_(userMessage)) {
-        sanitized.erase("rtsp_port");
+    if (!hasExplicitPortEvidence_(userMessage) && !hasOngoingCollection) {
+        eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "rtsp_port");
     }
-    if (findManufacturerInText_(userMessage).empty()) {
-        sanitized.erase("manufacturer");
+    if (findManufacturerInText_(userMessage).empty() && !hasOngoingCollection) {
+        eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "manufacturer");
     }
-    if (!hasExplicitUsernameEvidence_(userMessage)) {
-        sanitized.erase("username");
+    if (!hasExplicitUsernameEvidence_(userMessage) && !hasOngoingCollection) {
+        eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "username");
     }
-    if (!hasExplicitPasswordEvidence_(userMessage)) {
-        sanitized.erase("password");
+    if (!hasExplicitPasswordEvidence_(userMessage) && !hasOngoingCollection) {
+        eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "password");
+    }
+    if (!hasExplicitWebcamIndexEvidence_(userMessage)) {
+        const bool allowImplicitWebcamIndexReply =
+            hasOngoingCollection &&
+            fieldIsActivelyMissing("webcam_index") &&
+            isDigitsOnly_(trimCopy_(userMessage));
+        if (!allowImplicitWebcamIndexReply) {
+            eraseFieldFromPatchAndSources_(sanitizedPatch, fieldSources, "webcam_index");
+        }
     }
 
-    return sanitized;
+    for (auto it = sanitizedPatch.begin(); it != sanitizedPatch.end(); ++it) {
+        if (cameraFieldSource_(fieldSources, it.key()).empty()) {
+            setCameraFieldSource_(fieldSources, it.key(), "implied_user");
+        }
+    }
+
+    return buildCameraPatchEnvelope_(sanitizedPatch, fieldSources);
 }
 
 std::vector<std::string> activeMissingFields_(const nlohmann::json& conversationContext)
@@ -641,6 +1172,55 @@ bool isStopwordToken_(const std::string& token)
     };
 
     return std::find(stopwords.begin(), stopwords.end(), normalized) != stopwords.end();
+}
+
+bool isGenericNameToken_(const std::string& token)
+{
+    const std::string normalized = lowerAsciiCopy_(trimCopy_(token));
+    if (normalized.empty()) {
+        return true;
+    }
+
+    static const std::vector<std::string> genericTokens = {
+        "a", "already", "an", "and", "as", "camera", "camara", "cameras", "camaras",
+        "com", "como", "da", "das", "data", "dados", "de", "do", "dos", "eu",
+        "for", "how", "i", "ja", "know", "me", "my", "os", "para", "preciso",
+        "quero", "rtsp", "sei", "sim", "so", "the", "this", "uma", "um", "user",
+        "vc", "voce", "vou", "webcam", "what", "yes"
+    };
+
+    return std::find(genericTokens.begin(), genericTokens.end(), normalized) != genericTokens.end();
+}
+
+bool isLikelyStandaloneCameraNameReply_(const std::string& userMessage)
+{
+    const std::string trimmed = collapseWhitespace_(userMessage);
+    if (trimmed.empty() || trimmed.size() > 64) {
+        return false;
+    }
+    if (isHostCandidate_(trimmed) || isDigitsOnly_(trimmed)) {
+        return false;
+    }
+
+    const auto segments = splitSegments_(trimmed);
+    if (segments.size() != 1) {
+        return false;
+    }
+
+    const auto tokens = splitTokens_(trimmed);
+    if (tokens.empty() || tokens.size() > 4) {
+        return false;
+    }
+
+    int meaningfulTokens = 0;
+    for (const auto& token : tokens) {
+        if (isGenericNameToken_(token) || isStopwordToken_(token)) {
+            continue;
+        }
+        ++meaningfulTokens;
+    }
+
+    return meaningfulTokens > 0;
 }
 
 bool applyCandidateToField_(
@@ -808,7 +1388,9 @@ nlohmann::json deterministicCameraDraft_(
 {
     const std::string trimmed = trimCopy_(userMessage);
     if (trimmed.empty()) {
-        return nlohmann::json::object();
+        return buildCameraPatchEnvelope_(
+            nlohmann::json::object(),
+            nlohmann::json::object());
     }
 
     nlohmann::json parsed = nlohmann::json::object();
@@ -889,7 +1471,7 @@ nlohmann::json deterministicCameraDraft_(
         const std::string host = captureField({
             { std::regex(R"((ip\s*address|ip|host|ip\s*or\s*host|ip\/host)\s*[:=]?\s*([A-Za-z0-9._:-]+))", std::regex::icase), 2 },
         });
-        if (!host.empty() && isHostCandidate_(host)) {
+        if (!host.empty() && isResidualHostCandidate_(host)) {
             parsed["ip_address"] = host;
         }
     }
@@ -1025,7 +1607,11 @@ nlohmann::json deterministicCameraDraft_(
         }
     }
 
-    if (!hasCameraValue_(parsed, "name")) {
+    const std::vector<std::string> activeMissing = activeMissingFields_(conversationContext);
+    const bool awaitingName =
+        std::find(activeMissing.begin(), activeMissing.end(), "name") != activeMissing.end();
+
+    if (!hasCameraValue_(parsed, "name") && awaitingName && isLikelyStandaloneCameraNameReply_(trimmed)) {
         for (const auto& segment : splitSegments_(trimmed)) {
             const std::string lowerSegment = lowerAsciiCopy_(segment);
             if (segment.empty() ||
@@ -1051,14 +1637,17 @@ nlohmann::json deterministicCameraDraft_(
                 std::regex(R"(\b(camera|cameras|camara|camaras|com|uma|um|nova|novo|para|mim)\b)", std::regex::icase),
                 " ");
             candidate = collapseWhitespace_(std::move(candidate));
-            if (!candidate.empty() && !isHostCandidate_(candidate) && !isDigitsOnly_(candidate)) {
+            if (!candidate.empty() &&
+                !isHostCandidate_(candidate) &&
+                !isDigitsOnly_(candidate) &&
+                isLikelyStandaloneCameraNameReply_(candidate)) {
                 parsed["name"] = candidate;
                 break;
             }
         }
     }
 
-    std::vector<std::string> missingFields = activeMissingFields_(conversationContext);
+    std::vector<std::string> missingFields = activeMissing;
     if (missingFields.empty()) {
         missingFields = computeMissingFields_(existingDraft);
     }
@@ -1081,7 +1670,7 @@ nlohmann::json deterministicCameraDraft_(
     }
 
     const bool allowResidualSlotFilling =
-        !activeMissingFields_(conversationContext).empty() ||
+        !activeMissing.empty() ||
         hasAnyCameraFieldValue_(existingDraft);
     if (allowResidualSlotFilling) {
         std::vector<std::string> residualCandidates = collectResidualCandidates_(trimmed, parsed);
@@ -1103,7 +1692,33 @@ nlohmann::json deterministicCameraDraft_(
         }
     }
 
-    return parsed;
+    const nlohmann::json patch =
+        normalizeCameraFields_(refineStructuredCameraPatch_(parsed), false);
+    nlohmann::json fieldSources = nlohmann::json::object();
+
+    if (hasCameraValue_(patch, "connection_method")) {
+        setCameraFieldSource_(fieldSources, "connection_method", "implied_user");
+    }
+    if (hasCameraValue_(patch, "name")) {
+        setCameraFieldSource_(
+            fieldSources,
+            "name",
+            (hasExplicitNameEvidence_(trimmed) ||
+             (awaitingName && isLikelyStandaloneCameraNameReply_(trimmed)))
+                ? "explicit_user"
+                : "implied_user");
+    }
+
+    for (const auto& field : cameraFieldNames_()) {
+        if (field == "connection_method" || field == "name") {
+            continue;
+        }
+        if (hasCameraValue_(patch, field.c_str())) {
+            setCameraFieldSource_(fieldSources, field, "explicit_user");
+        }
+    }
+
+    return buildCameraPatchEnvelope_(patch, fieldSources);
 }
 
 std::string labelForField_(const std::string& fieldName, const std::string& language)
@@ -1155,10 +1770,10 @@ std::string labelForField_(const std::string& fieldName, const std::string& lang
         return "street";
     }
     if (fieldName == "number") {
-        if (pt) return "numero";
-        if (es) return "numero";
-        if (fr) return "numero";
-        return "number";
+        if (pt) return "numero do endereco";
+        if (es) return "numero de la direccion";
+        if (fr) return "numero de l'adresse";
+        return "address number";
     }
     if (fieldName == "city") {
         if (pt) return "cidade";
@@ -1230,39 +1845,31 @@ std::string buildAddressFieldPrompt_(const std::vector<std::string>& missingFiel
     return "address (send a ZIP/postal code to auto-fill street, city, state, and country, or send the full address)";
 }
 
-std::string buildCollectedFieldsSummary_(const nlohmann::json& camera, const std::string& language)
+std::string buildCollectedFieldsSummary_(
+    const nlohmann::json& camera,
+    const nlohmann::json& fieldSources,
+    const std::string& language)
 {
+    if (!fieldSources.is_object() || fieldSources.empty()) {
+        return "";
+    }
+
     std::vector<std::string> labels;
     const std::vector<std::string> orderedFields = {
         "name",
         "ip_address",
-        "rtsp_port",
         "manufacturer",
         "username",
-        "webcam_index",
     };
 
     for (const auto& field : orderedFields) {
-        if (hasCameraValue_(camera, field.c_str())) {
-            if (field == "connection_method") {
-                const std::string method = normalizeConnectionMethod_(camera);
-                if (language == "pt") {
-                    labels.push_back("metodo " + method);
-                }
-                else if (language == "es") {
-                    labels.push_back("metodo " + method);
-                }
-                else if (language == "fr") {
-                    labels.push_back("methode " + method);
-                }
-                else {
-                    labels.push_back("method " + method);
-                }
-            }
-            else {
-                labels.push_back(labelForField_(field, language));
-            }
+        if (!hasCameraValue_(camera, field.c_str())) {
+            continue;
         }
+        if (!isUserProvidedFieldSource_(cameraFieldSource_(fieldSources, field))) {
+            continue;
+        }
+        labels.push_back(labelForField_(field, language));
     }
 
     if (labels.empty()) {
@@ -1295,6 +1902,7 @@ std::string buildCollectedFieldsSummary_(const nlohmann::json& camera, const std
 
 std::string buildMissingFieldsAnswer_(
     const nlohmann::json& camera,
+    const nlohmann::json& fieldSources,
     const std::vector<std::string>& missingFields,
     const std::string& language)
 {
@@ -1358,26 +1966,26 @@ std::string buildMissingFieldsAnswer_(
         out << "\n";
     }
 
-    const std::string collectedSummary = buildCollectedFieldsSummary_(camera, language);
+    const std::string collectedSummary = buildCollectedFieldsSummary_(camera, fieldSources, language);
     if (!collectedSummary.empty()) {
         out << "\n" << collectedSummary << "\n";
     }
 
     if (language == "pt") {
         out << "\nPode me responder tudo em uma unica mensagem, por exemplo:\n";
-        out << "nome: Recepcao; ip: 192.168.0.50; porta: 554; fabricante: Hikvision; usuario: admin; senha: 123456; cep: 01310100; numero: 100\n";
+        out << "nome Recepcao; ip 192.168.0.50; porta 554; fabricante Hikvision; usuario admin; senha 123456; cep 01310100; numero do endereco 100\n";
     }
     else if (language == "es") {
         out << "\nPuedes responderme todo en un solo mensaje, por ejemplo:\n";
-        out << "nombre: Recepcion; ip: 192.168.0.50; puerto: 554; fabricante: Hikvision; usuario: admin; contrasena: 123456; codigo postal: 28013; numero: 10\n";
+        out << "nombre Recepcion; ip 192.168.0.50; puerto 554; fabricante Hikvision; usuario admin; contrasena 123456; codigo postal 28013; numero de la direccion 10\n";
     }
     else if (language == "fr") {
         out << "\nVous pouvez tout m'envoyer en un seul message, par exemple :\n";
-        out << "nom: Reception; ip: 192.168.0.50; port: 554; fabricant: Hikvision; utilisateur: admin; mot de passe: 123456; code postal: 75001; numero: 10\n";
+        out << "nom Reception; ip 192.168.0.50; port 554; fabricant Hikvision; utilisateur admin; mot de passe 123456; code postal 75001; numero de l'adresse 10\n";
     }
     else {
         out << "\nYou can send everything in one message, for example:\n";
-        out << "name: Front Desk; ip: 192.168.0.50; port: 554; manufacturer: Hikvision; username: admin; password: 123456; zip code: 10001; number: 10\n";
+        out << "name Front Desk; ip 192.168.0.50; port 554; manufacturer Hikvision; username admin; password 123456; zip code 10001; address number 10\n";
     }
 
     return trimCopy_(out.str());
@@ -1566,9 +2174,39 @@ nlohmann::json lookupAddressDraftViaAgentEndpoint_(
     return normalized;
 }
 
+nlohmann::json confirmationDefaultsPatch_(const nlohmann::json& cameraDraft)
+{
+    nlohmann::json patch = assumedRtspPortPatch_(cameraDraft);
+    if (!hasCameraValue_(cameraDraft, "retention_days")) {
+        patch["retention_days"] = 1;
+    }
+    if (!hasCameraValue_(cameraDraft, "allowpublicaccess")) {
+        patch["allowpublicaccess"] = false;
+    }
+    return patch;
+}
+
+std::vector<std::string> fieldsWithSource_(
+    const nlohmann::json& fieldSources,
+    const std::string& source)
+{
+    std::vector<std::string> fields;
+    const std::string normalizedSource = normalizeCameraFieldSource_(source);
+    if (normalizedSource.empty() || !fieldSources.is_object()) {
+        return fields;
+    }
+
+    for (const auto& field : cameraFieldNames_()) {
+        if (cameraFieldSource_(fieldSources, field) == normalizedSource) {
+            fields.push_back(field);
+        }
+    }
+    return fields;
+}
+
 nlohmann::json defaultsForConfirmationDraft_(const nlohmann::json& cameraDraft)
 {
-    nlohmann::json normalized = normalizeCameraFields_(cameraDraft, true);
+    nlohmann::json normalized = applyAssumedRtspPort_(normalizeCameraFields_(cameraDraft, true));
     if (!normalized.contains("retention_days")) {
         normalized["retention_days"] = 1;
     }
@@ -1580,6 +2218,7 @@ nlohmann::json defaultsForConfirmationDraft_(const nlohmann::json& cameraDraft)
 
 nlohmann::json buildCameraRegistrationWidgetMetadata_(
     const nlohmann::json& cameraDraft,
+    const nlohmann::json& fieldSources,
     const std::string& language,
     const std::string& targetClientId)
 {
@@ -1588,6 +2227,9 @@ nlohmann::json buildCameraRegistrationWidgetMetadata_(
         { "status", "awaiting_confirmation" },
         { "language", normalizeAssistantLanguageTag(language) },
         { "draft", cameraDraft },
+        { "field_sources", normalizeCameraFieldSources_(fieldSources) },
+        { "defaulted_fields", fieldsWithSource_(fieldSources, "system_default") },
+        { "enriched_fields", fieldsWithSource_(fieldSources, "address_lookup") },
         { "target_client_id", targetClientId },
     });
 }
@@ -1661,7 +2303,7 @@ nlohmann::json extractCameraDraft_(
 
     const std::string systemPrompt =
         "/no_think\n"
-        "You extract camera-creation fields for the Drakon app.\n"
+        "You extract camera-creation fields for the app.\n"
         "Merge the current user message with recent_turns and compact_context from the same chat session.\n"
         "conversation_task_state may include an active create_camera draft from earlier turns.\n"
         "If conversation_task_state.active_task.type is create_camera, treat its draft and missing_fields as the current state unless the user clearly corrects a value.\n"
@@ -1672,8 +2314,12 @@ nlohmann::json extractCameraDraft_(
         "Only include values that were explicitly provided by the user or are strongly implied by the conversation.\n"
         "Do not invent credentials, IPs, ports, names, or camera details.\n"
         "Do not reuse ordinary conversational filler words as field values.\n"
-        "If the user mentions a webcam, USB camera, notebook camera, or integrated camera, use connection_method=\"WEBCAM\".\n"
-        "Otherwise default connection_method to \"RTSP\" unless the user clearly says HTTP or ONVIF.\n"
+        "Return a sparse camera_patch: only include fields that the user actually provided or that are strongly implied.\n"
+        "Never emit placeholder values, schema defaults, 0, false, or empty strings for omitted fields.\n"
+        "When multiple labeled fields appear in one line without commas or semicolons, split each value semantically at the next field label.\n"
+        "Do not let one field absorb later labeled fields.\n"
+        "If the user mentions a webcam, USB camera, notebook camera, or integrated camera, include connection_method=\"WEBCAM\".\n"
+        "If the user clearly says RTSP, HTTP, or ONVIF, include that connection_method.\n"
         "If the user provides an RTSP URL, parse host/IP, port, username, and password when present.\n"
         "The user may send a CEP, ZIP code, or postal code instead of a full address. Capture zip_code when present.\n"
         "If the user sends a free-form address, map it into street, number, city, state, zip_code, and country when possible.\n"
@@ -1681,30 +2327,24 @@ nlohmann::json extractCameraDraft_(
         "The UI may describe allowpublicaccess as collaborator sharing, shared access, or inviting collaborators. Map those requests to allowpublicaccess only when the user clearly wants to enable that option.\n"
         "retention_days must only be one of: 1, 3, 7, 15, 30, 90, 180. If the user gave another value, omit it.\n"
         "allowpublicaccess must be a boolean when present.\n"
-        "Return JSON only with this schema:\n"
+        "field_sources must only use these values: explicit_user, implied_user.\n"
+        "Use explicit_user when the user directly states or confirms the value.\n"
+        "Use implied_user only when the value is strongly implied from the user's message or immediate create_camera context.\n"
+        "field_sources keys must be a subset of camera_patch keys.\n"
+        "Return JSON only with this shape:\n"
         "{"
-        "\"camera\":{"
-        "\"name\":\"\","
-        "\"connection_method\":\"RTSP\","
-        "\"ip_address\":\"\","
-        "\"rtsp_port\":\"\","
-        "\"manufacturer\":\"\","
-        "\"username\":\"\","
-        "\"password\":\"\","
-        "\"channel\":\"\","
-        "\"subtype\":\"\","
-        "\"description\":\"\","
-        "\"street\":\"\","
-        "\"number\":\"\","
-        "\"city\":\"\","
-        "\"state\":\"\","
-        "\"zip_code\":\"\","
-        "\"country\":\"\","
-        "\"retention_days\":0,"
-        "\"webcam_index\":0,"
-        "\"allowpublicaccess\":false"
+        "\"camera_patch\":{"
+        "\"only_the_fields_the_user_actually_provided_or_strongly_implied\":\"value\""
+        "},"
+        "\"field_sources\":{"
+        "\"matching_field_name\":\"explicit_user\""
         "}"
-        "}\n";
+        "}\n"
+        "Valid camera_patch keys are: name, connection_method, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess.\n"
+        "camera_patch may be empty. Omit any field the user did not provide.\n"
+        "Example: user_message=\"cep 22793071 nome camera_quarto_2 ip 192.168.1.65 fabricante hikvision usuario admin senha 12345678\" => "
+        "{\"camera_patch\":{\"zip_code\":\"22793071\",\"name\":\"camera_quarto_2\",\"ip_address\":\"192.168.1.65\",\"manufacturer\":\"Hikvision\",\"username\":\"admin\",\"password\":\"12345678\"},"
+        "\"field_sources\":{\"zip_code\":\"explicit_user\",\"name\":\"explicit_user\",\"ip_address\":\"explicit_user\",\"manufacturer\":\"explicit_user\",\"username\":\"explicit_user\",\"password\":\"explicit_user\"}}\n";
 
     nlohmann::json promptPayload = {
         { "reply_language", replyLanguage },
@@ -1731,7 +2371,9 @@ nlohmann::json extractCameraDraft_(
 
     const nlohmann::json parsed = nlohmann::json::parse(outcome.content, nullptr, false);
     if (!parsed.is_object()) {
-        return nlohmann::json::object();
+        return buildCameraPatchEnvelope_(
+            nlohmann::json::object(),
+            nlohmann::json::object());
     }
     return parsed;
 }
@@ -1799,13 +2441,42 @@ nlohmann::json normalizeCameraFields_(
     return normalized;
 }
 
-nlohmann::json normalizeCameraDraft_(const nlohmann::json& extracted)
+nlohmann::json normalizeCameraExtractionResult_(const nlohmann::json& extracted)
 {
-    const nlohmann::json camera =
-        extracted.is_object() && extracted.contains("camera") && extracted["camera"].is_object()
-            ? extracted["camera"]
+    nlohmann::json rawPatch = nlohmann::json::object();
+    if (extracted.is_object() &&
+        extracted.contains("camera_patch") &&
+        extracted["camera_patch"].is_object()) {
+        rawPatch = extracted["camera_patch"];
+    }
+    else if (extracted.is_object() &&
+             extracted.contains("camera") &&
+             extracted["camera"].is_object()) {
+        rawPatch = extracted["camera"];
+    }
+
+    const nlohmann::json patch =
+        normalizeCameraFields_(refineStructuredCameraPatch_(rawPatch), false);
+    nlohmann::json fieldSources =
+        extracted.is_object()
+            ? normalizeCameraFieldSources_(extracted.value("field_sources", nlohmann::json::object()))
             : nlohmann::json::object();
-    return normalizeCameraFields_(camera, false);
+
+    for (auto it = fieldSources.begin(); it != fieldSources.end();) {
+        if (!patch.contains(it.key())) {
+            it = fieldSources.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        if (cameraFieldSource_(fieldSources, it.key()).empty()) {
+            setCameraFieldSource_(fieldSources, it.key(), "implied_user");
+        }
+    }
+
+    return buildCameraPatchEnvelope_(patch, fieldSources);
 }
 
 nlohmann::json activeCreateCameraDraft_(const nlohmann::json& conversationContext)
@@ -1823,6 +2494,36 @@ nlohmann::json activeCreateCameraDraft_(const nlohmann::json& conversationContex
     }
 
     return normalizeCameraFields_(activeTask["draft"], false);
+}
+
+nlohmann::json activeCreateCameraFieldSources_(const nlohmann::json& conversationContext)
+{
+    const nlohmann::json taskState = taskStateFromConversation_(conversationContext);
+    if (!taskState.contains("active_task") || !taskState["active_task"].is_object()) {
+        return nlohmann::json::object();
+    }
+
+    const auto& activeTask = taskState["active_task"];
+    if (jsonStringField_(activeTask, "type") != "create_camera") {
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json fieldSources =
+        activeTask.contains("field_sources")
+            ? normalizeCameraFieldSources_(activeTask["field_sources"])
+            : nlohmann::json::object();
+
+    if (!fieldSources.empty()) {
+        return fieldSources;
+    }
+
+    if (!activeTask.contains("draft") || !activeTask["draft"].is_object()) {
+        return nlohmann::json::object();
+    }
+
+    return buildFieldSourcesForPatch_(
+        normalizeCameraFields_(activeTask["draft"], false),
+        "implied_user");
 }
 
 nlohmann::json mergeCameraDrafts_(
@@ -1945,6 +2646,7 @@ std::string createCameraTaskGoal_(const nlohmann::json& cameraDraft)
 nlohmann::json buildTaskStateForCreateCameraCollection_(
     const nlohmann::json& conversationContext,
     const nlohmann::json& cameraDraft,
+    const nlohmann::json& fieldSources,
     const std::vector<std::string>& missingFields,
     const std::string& answerPreview,
     const std::string& language)
@@ -1964,6 +2666,7 @@ nlohmann::json buildTaskStateForCreateCameraCollection_(
             missingFields,
             collectedFields_(cameraDraft),
             cameraDraft,
+            normalizeCameraFieldSources_(fieldSources),
             nlohmann::json::object(),
         });
 }
@@ -1971,6 +2674,7 @@ nlohmann::json buildTaskStateForCreateCameraCollection_(
 nlohmann::json buildTaskStateForCreateCameraAwaitingConfirmation_(
     const nlohmann::json& conversationContext,
     const nlohmann::json& cameraDraft,
+    const nlohmann::json& fieldSources,
     const std::string& answerPreview,
     const std::string& language)
 {
@@ -1990,6 +2694,7 @@ nlohmann::json buildTaskStateForCreateCameraAwaitingConfirmation_(
             {},
             collectedFields_(cameraDraft),
             cameraDraft,
+            normalizeCameraFieldSources_(fieldSources),
             nlohmann::json::object({
                 { "type", "camera_registration_draft" },
                 { "status", "awaiting_confirmation" },
@@ -2001,6 +2706,7 @@ nlohmann::json buildTaskStateForCreateCameraAwaitingConfirmation_(
 nlohmann::json buildTaskStateForCreateCameraBlocked_(
     const nlohmann::json& conversationContext,
     const nlohmann::json& cameraDraft,
+    const nlohmann::json& fieldSources,
     const std::string& answerPreview,
     const std::string& language)
 {
@@ -2008,6 +2714,7 @@ nlohmann::json buildTaskStateForCreateCameraBlocked_(
     nlohmann::json taskState = buildTaskStateForCreateCameraCollection_(
         conversationContext,
         cameraDraft,
+        fieldSources,
         missingFields,
         answerPreview,
         language);
@@ -2021,6 +2728,7 @@ nlohmann::json buildTaskStateForCreateCameraBlocked_(
 nlohmann::json buildTaskStateForCreateCameraSuccess_(
     const nlohmann::json& conversationContext,
     const nlohmann::json& createdCamera,
+    const nlohmann::json& fieldSources,
     const std::string& language)
 {
     const nlohmann::json normalizedCreated = normalizeCameraFields_(createdCamera, true);
@@ -2039,6 +2747,7 @@ nlohmann::json buildTaskStateForCreateCameraSuccess_(
             {},
             collectedFields_(normalizedCreated),
             normalizedCreated,
+            normalizeCameraFieldSources_(fieldSources),
             nlohmann::json::object(),
         });
 }
@@ -2079,38 +2788,70 @@ SkillRunResult CreateCameraSkill::execute(
 
     const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
     const std::string replyLanguage = effectiveReplyLanguage_(selection, payload, conversationContext);
+    const std::string userMessage =
+        payload.is_object() ? payload.value("query", std::string()) : std::string();
     const nlohmann::json existingDraft = activeCreateCameraDraft_(conversationContext);
+    nlohmann::json cameraFieldSources = activeCreateCameraFieldSources_(conversationContext);
     const nlohmann::json routerDraftPatch =
-        normalizeCameraFields_(selection.draftPatch, false);
+        normalizeCameraFields_(refineStructuredCameraPatch_(selection.draftPatch), false);
     LocalLlmClient llm;
     configureActionModelClient_(llm, payload);
     const nlohmann::json extractedDraft =
         sanitizeExtractedCameraDraft_(
-            normalizeCameraDraft_(extractCameraDraft_(llm, payload, conversationContext, selection)),
-            payload.is_object() ? payload.value("query", std::string()) : std::string(),
+            normalizeCameraExtractionResult_(extractCameraDraft_(llm, payload, conversationContext, selection)),
+            userMessage,
             existingDraft,
             conversationContext);
     const nlohmann::json deterministicDraft =
-        normalizeCameraFields_(
-            deterministicCameraDraft_(
-                payload.is_object() ? payload.value("query", std::string()) : std::string(),
-                existingDraft,
-            conversationContext),
-            false);
-    nlohmann::json cameraDraft = mergeCameraDrafts_(existingDraft, routerDraftPatch);
-    cameraDraft = mergeCameraDrafts_(cameraDraft, extractedDraft);
-    cameraDraft = mergeCameraDrafts_(cameraDraft, deterministicDraft);
-    cameraDraft = mergeCameraDrafts_(
+        deterministicCameraDraft_(
+            userMessage,
+            existingDraft,
+            conversationContext);
+    nlohmann::json cameraDraft =
+        existingDraft.is_object() ? existingDraft : nlohmann::json::object();
+    mergeCameraPatchIntoDraft_(
         cameraDraft,
-        normalizeCameraFields_(lookupAddressDraftViaAgentEndpoint_(agent, payload, cameraDraft), false));
+        cameraFieldSources,
+        routerDraftPatch,
+        buildFieldSourcesForPatch_(routerDraftPatch, "implied_user"),
+        "implied_user");
+    mergeCameraPatchIntoDraft_(
+        cameraDraft,
+        cameraFieldSources,
+        extractionCameraPatch_(extractedDraft),
+        extractionFieldSources_(extractedDraft));
+    mergeCameraPatchIntoDraft_(
+        cameraDraft,
+        cameraFieldSources,
+        extractionCameraPatch_(deterministicDraft),
+        extractionFieldSources_(deterministicDraft));
+
+    const nlohmann::json addressPatch =
+        normalizeCameraFields_(lookupAddressDraftViaAgentEndpoint_(agent, payload, cameraDraft), false);
+    mergeCameraPatchIntoDraft_(
+        cameraDraft,
+        cameraFieldSources,
+        addressPatch,
+        buildFieldSourcesForPatch_(addressPatch, "address_lookup"),
+        "address_lookup");
+
+    const nlohmann::json assumedPortPatch = assumedRtspPortPatch_(cameraDraft);
+    mergeCameraPatchIntoDraft_(
+        cameraDraft,
+        cameraFieldSources,
+        assumedPortPatch,
+        buildFieldSourcesForPatch_(assumedPortPatch, "system_default"),
+        "system_default");
 
     const std::vector<std::string> missingFields = computeMissingFields_(cameraDraft);
     if (!missingFields.empty()) {
         result.status = SkillExecutionStatus::Completed;
-        result.answer = buildMissingFieldsAnswer_(cameraDraft, missingFields, replyLanguage);
+        result.answer = buildMissingFieldsAnswer_(cameraDraft, cameraFieldSources, missingFields, replyLanguage);
+        result.metadata["field_sources"] = normalizeCameraFieldSources_(cameraFieldSources);
         result.metadata["task_state"] = buildTaskStateForCreateCameraCollection_(
             conversationContext,
             cameraDraft,
+            cameraFieldSources,
             missingFields,
             result.answer,
             replyLanguage);
@@ -2118,15 +2859,26 @@ SkillRunResult CreateCameraSkill::execute(
     }
 
     result.status = SkillExecutionStatus::Completed;
-    const nlohmann::json confirmationDraft = defaultsForConfirmationDraft_(cameraDraft);
+    nlohmann::json confirmationDraft = defaultsForConfirmationDraft_(cameraDraft);
+    nlohmann::json confirmationFieldSources = cameraFieldSources;
+    const nlohmann::json confirmationDefaults = confirmationDefaultsPatch_(cameraDraft);
+    mergeCameraPatchIntoDraft_(
+        confirmationDraft,
+        confirmationFieldSources,
+        confirmationDefaults,
+        buildFieldSourcesForPatch_(confirmationDefaults, "system_default"),
+        "system_default");
     result.answer = buildConfirmationAnswer_(confirmationDraft, replyLanguage);
+    result.metadata["field_sources"] = normalizeCameraFieldSources_(confirmationFieldSources);
     result.metadata["message_metadata"] = buildCameraRegistrationWidgetMetadata_(
         confirmationDraft,
+        confirmationFieldSources,
         replyLanguage,
         agent.getClientId());
     result.metadata["task_state"] = buildTaskStateForCreateCameraAwaitingConfirmation_(
         conversationContext,
         confirmationDraft,
+        confirmationFieldSources,
         result.answer,
         replyLanguage);
     return result;

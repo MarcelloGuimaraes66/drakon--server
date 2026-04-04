@@ -7,6 +7,10 @@ import {
 } from "@/react-app/utils/faceIdImage";
 
 const CHAT_INPUT_MAX_HEIGHT_PX = 180;
+const CHAT_INPUT_BASE_HEIGHT_PX = {
+  default: 44,
+  "chat-page": 48,
+} as const;
 
 interface UploadedVideo {
   id: number;
@@ -58,15 +62,27 @@ export default function ChatInput({
   const [isUploadingVideo, setIsUploadingVideo] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
   const isChatPageVariant = variant === "chat-page";
+  const baseTextareaHeight = isChatPageVariant
+    ? CHAT_INPUT_BASE_HEIGHT_PX["chat-page"]
+    : CHAT_INPUT_BASE_HEIGHT_PX.default;
 
   const syncTextareaHeight = () => {
     const textarea = textareaRef.current;
     if (!textarea) return;
 
-    textarea.style.height = "0px";
-    const nextHeight = Math.min(textarea.scrollHeight, CHAT_INPUT_MAX_HEIGHT_PX);
+    textarea.style.height = `${baseTextareaHeight}px`;
+
+    if (!textarea.value.length) {
+      textarea.style.overflowY = "hidden";
+      return;
+    }
+
+    const nextHeight = Math.min(
+      Math.max(textarea.scrollHeight, baseTextareaHeight),
+      CHAT_INPUT_MAX_HEIGHT_PX,
+    );
     textarea.style.height = `${nextHeight}px`;
-    textarea.style.overflowY = textarea.scrollHeight > CHAT_INPUT_MAX_HEIGHT_PX ? "auto" : "hidden";
+    textarea.style.overflowY = textarea.scrollHeight > nextHeight ? "auto" : "hidden";
   };
 
   useEffect(() => {
@@ -84,7 +100,7 @@ export default function ChatInput({
 
   useEffect(() => {
     syncTextareaHeight();
-  }, [value]);
+  }, [baseTextareaHeight, value]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -383,8 +399,8 @@ export default function ChatInput({
             rows={1}
             className={
               isChatPageVariant
-                ? "min-h-[48px] flex-1 resize-none rounded-2xl border border-white/[0.08] bg-[#171b26]/90 px-4 py-3 text-sm leading-6 text-gray-100 transition-all placeholder:text-gray-500 focus:border-blue-400/30 focus:outline-none focus:ring-2 focus:ring-blue-400/60 md:text-base"
-                : "min-h-[44px] flex-1 resize-none rounded-xl border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm leading-6 text-gray-100 transition-all placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 md:px-4 md:text-base"
+                ? "h-[48px] flex-1 resize-none rounded-2xl border border-white/[0.08] bg-[#171b26]/90 px-4 py-3 text-sm leading-6 text-gray-100 transition-all placeholder:text-gray-500 focus:border-blue-400/30 focus:outline-none focus:ring-2 focus:ring-blue-400/60 md:text-base"
+                : "h-[44px] flex-1 resize-none rounded-xl border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm leading-6 text-gray-100 transition-all placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 md:px-4 md:text-base"
             }
             style={{ maxHeight: `${CHAT_INPUT_MAX_HEIGHT_PX}px` }}
             disabled={disabled || isProcessing}

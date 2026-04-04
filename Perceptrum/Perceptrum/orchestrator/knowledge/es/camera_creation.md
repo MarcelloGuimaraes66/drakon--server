@@ -74,7 +74,7 @@ Despues de los campos de conexion, el formulario continua con la direccion de la
 
 ## Uso compartido con colaboradores
 
-- **Uso compartido con colaboradores** permite compartir la camara con usuarios especificos de Perceptrum invitados por `@handle` o email para que usen la camara en Drakon Find.
+- **Uso compartido con colaboradores** permite compartir la camara con colaboradores especificos invitados por `@handle` o email para que accedan a esa misma camara desde su propia cuenta.
 - Explicalo como un uso compartido intencional con colaboradores, no como exposicion publica.
 
 ## Flujo de webcam

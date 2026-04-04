@@ -30,6 +30,105 @@ std::string normalizeChatCompletionsUrl_(std::string baseUrl)
     return baseUrl + suffix;
 }
 
+std::string normalizeResponsesUrl_(std::string baseUrl)
+{
+    baseUrl = trimCopy(std::move(baseUrl));
+    while (!baseUrl.empty() && baseUrl.back() == '/') {
+        baseUrl.pop_back();
+    }
+
+    const std::string responsesSuffix = "/v1/responses";
+    if (baseUrl.size() >= responsesSuffix.size() &&
+        baseUrl.compare(
+            baseUrl.size() - responsesSuffix.size(),
+            responsesSuffix.size(),
+            responsesSuffix) == 0) {
+        return baseUrl;
+    }
+
+    const std::string chatSuffix = "/v1/chat/completions";
+    if (baseUrl.size() >= chatSuffix.size() &&
+        baseUrl.compare(baseUrl.size() - chatSuffix.size(), chatSuffix.size(), chatSuffix) == 0) {
+        return baseUrl.substr(0, baseUrl.size() - chatSuffix.size()) + responsesSuffix;
+    }
+
+    return baseUrl + responsesSuffix;
+}
+
+std::string normalizeOpenAIModelName_(std::string modelName)
+{
+    modelName = trimCopy(std::move(modelName));
+    std::transform(modelName.begin(), modelName.end(), modelName.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return modelName;
+}
+
+bool isZAiCoreModelName_(const std::string& modelName)
+{
+    const std::string normalized = normalizeOpenAIModelName_(modelName);
+    return normalized == "glm-4.6v-flash" ||
+        normalized.rfind("glm-4.6v-flash-", 0) == 0;
+}
+
+bool shouldUseOpenAIResponsesTransportForModel_(const std::string& modelName)
+{
+    if (isZAiCoreModelName_(modelName)) {
+        return false;
+    }
+
+    const std::string normalized = normalizeOpenAIModelName_(modelName);
+    return normalized == "gpt-5.1" ||
+        normalized.rfind("gpt-5.1-", 0) == 0 ||
+        normalized == "gpt-5.4" ||
+        normalized.rfind("gpt-5.4-", 0) == 0 ||
+        normalized == "gpt-5.4-mini" ||
+        normalized.rfind("gpt-5.4-mini-", 0) == 0;
+}
+
+bool usesOpenAIMaxCompletionTokensField_(const std::string& modelName)
+{
+    return normalizeOpenAIModelName_(modelName).rfind("gpt-5", 0) == 0;
+}
+
+int extractRequestedOutputBudget_(const nlohmann::json& body)
+{
+    auto readBudget = [&](const char* key) -> int {
+        if (!body.contains(key)) return 0;
+        const auto& value = body[key];
+        if (value.is_number_integer()) return value.get<int>();
+        if (value.is_number()) return static_cast<int>(value.get<double>());
+        return 0;
+    };
+
+    int requestedOutputBudget = readBudget("max_output_tokens");
+    if (requestedOutputBudget <= 0) {
+        requestedOutputBudget = readBudget("max_completion_tokens");
+    }
+    if (requestedOutputBudget <= 0) {
+        requestedOutputBudget = readBudget("max_tokens");
+    }
+    return requestedOutputBudget;
+}
+
+void applyOpenAITokenLimitField_(nlohmann::json& body, const std::string& modelName)
+{
+    const int requestedOutputBudget = extractRequestedOutputBudget_(body);
+    if (requestedOutputBudget <= 0) {
+        return;
+    }
+
+    body.erase("max_output_tokens");
+    body.erase("max_completion_tokens");
+    body.erase("max_tokens");
+    if (usesOpenAIMaxCompletionTokensField_(modelName)) {
+        body["max_completion_tokens"] = requestedOutputBudget;
+    }
+    else {
+        body["max_tokens"] = requestedOutputBudget;
+    }
+}
+
 std::string extractJsonObject_(const std::string& content)
 {
     const std::size_t firstBrace = content.find('{');
@@ -109,40 +208,97 @@ const nlohmann::json* firstChoice_(const nlohmann::json& parsed)
 std::string extractMessageContent_(const nlohmann::json& parsed)
 {
     const nlohmann::json* choice = firstChoice_(parsed);
-    if (!choice ||
-        !choice->contains("message") ||
-        !(*choice)["message"].is_object() ||
-        !(*choice)["message"].contains("content")) {
+    if (choice &&
+        choice->contains("message") &&
+        (*choice)["message"].is_object() &&
+        (*choice)["message"].contains("content")) {
+        std::string content;
+        appendTextContent_((*choice)["message"]["content"], content);
+        return trimCopy(content);
+    }
+
+    if (!parsed.is_object() ||
+        !parsed.contains("output") ||
+        !parsed["output"].is_array()) {
         return "";
     }
 
     std::string content;
-    appendTextContent_((*choice)["message"]["content"], content);
+    for (const auto& item : parsed["output"]) {
+        if (!item.is_object() ||
+            item.value("type", std::string()) != "message" ||
+            !item.contains("content")) {
+            continue;
+        }
+        appendTextContent_(item["content"], content);
+    }
     return trimCopy(content);
 }
 
 std::string extractReasoningContent_(const nlohmann::json& parsed)
 {
     const nlohmann::json* choice = firstChoice_(parsed);
-    if (!choice ||
-        !choice->contains("message") ||
-        !(*choice)["message"].is_object() ||
-        !(*choice)["message"].contains("reasoning_content")) {
-        return "";
+    if (choice &&
+        choice->contains("message") &&
+        (*choice)["message"].is_object() &&
+        (*choice)["message"].contains("reasoning_content")) {
+        std::string content;
+        appendTextContent_((*choice)["message"]["reasoning_content"], content);
+        return trimCopy(content);
     }
 
     std::string content;
-    appendTextContent_((*choice)["message"]["reasoning_content"], content);
+    if (!parsed.is_object() ||
+        !parsed.contains("output") ||
+        !parsed["output"].is_array()) {
+        return "";
+    }
+
+    for (const auto& item : parsed["output"]) {
+        if (!item.is_object()) {
+            continue;
+        }
+        const std::string itemType = item.value("type", std::string());
+        if (itemType == "reasoning") {
+            if (item.contains("summary")) {
+                appendTextContent_(item["summary"], content);
+            }
+            else if (item.contains("content")) {
+                appendTextContent_(item["content"], content);
+            }
+        }
+    }
     return trimCopy(content);
 }
 
 std::string extractFinishReason_(const nlohmann::json& parsed)
 {
     const nlohmann::json* choice = firstChoice_(parsed);
-    if (!choice || !choice->contains("finish_reason") || !(*choice)["finish_reason"].is_string()) {
+    if (choice && choice->contains("finish_reason") && (*choice)["finish_reason"].is_string()) {
+        return (*choice)["finish_reason"].get<std::string>();
+    }
+
+    if (!parsed.is_object() || !parsed.contains("status") || !parsed["status"].is_string()) {
         return "";
     }
-    return (*choice)["finish_reason"].get<std::string>();
+
+    const std::string status = parsed["status"].get<std::string>();
+    if (status == "completed") {
+        return "stop";
+    }
+    if (status == "incomplete" &&
+        parsed.contains("incomplete_details") &&
+        parsed["incomplete_details"].is_object()) {
+        const std::string reason =
+            parsed["incomplete_details"].value("reason", std::string());
+        if (reason == "max_output_tokens") {
+            return "length";
+        }
+        if (reason == "content_filter") {
+            return "content_filter";
+        }
+    }
+    return "";
 }
 
 int parsePositiveInt_(
@@ -189,11 +345,160 @@ void logCompletionAttempt_(
     if (content.empty() && !reasoningContent.empty()) {
         out << " reasoning_only_preview=" << truncateForLog_(reasoningContent);
     }
-    if (content.empty() && response.ok()) {
+    if ((content.empty() || !response.ok()) && !response.body.empty()) {
         out << " raw_preview=" << truncateForLog_(response.body);
     }
 
     Logger::instance().logDebugNoEscalation("agent", out.str());
+}
+
+nlohmann::json convertOpenAIChatResponseFormatToResponsesTextFormat_(
+    const nlohmann::json& responseFormat)
+{
+    if (!responseFormat.is_object() || responseFormat.empty()) {
+        return nlohmann::json::object();
+    }
+
+    const std::string type = responseFormat.value("type", std::string());
+    if (type == "json_object" || type == "text") {
+        return nlohmann::json{ { "type", type } };
+    }
+    if (type != "json_schema") {
+        return nlohmann::json::object();
+    }
+
+    const nlohmann::json* schemaConfig = nullptr;
+    if (responseFormat.contains("json_schema") && responseFormat["json_schema"].is_object()) {
+        schemaConfig = &responseFormat["json_schema"];
+    }
+    else {
+        schemaConfig = &responseFormat;
+    }
+
+    nlohmann::json format = {
+        { "type", "json_schema" },
+        { "name", schemaConfig->value("name", std::string("response")) },
+        { "schema", schemaConfig->value("schema", nlohmann::json::object()) }
+    };
+    if (schemaConfig->contains("strict")) {
+        format["strict"] = (*schemaConfig)["strict"];
+    }
+    if (schemaConfig->contains("description")) {
+        format["description"] = (*schemaConfig)["description"];
+    }
+    return format;
+}
+
+bool tryConvertOpenAIChatMessageContentPartToResponsesInputPart_(
+    const nlohmann::json& part,
+    nlohmann::json& outPart)
+{
+    outPart = nlohmann::json::object();
+    if (part.is_string()) {
+        outPart = {
+            { "type", "input_text" },
+            { "text", part.get<std::string>() }
+        };
+        return true;
+    }
+    if (!part.is_object()) {
+        return false;
+    }
+
+    if (part.contains("text") && part["text"].is_string()) {
+        outPart = {
+            { "type", "input_text" },
+            { "text", part["text"].get<std::string>() }
+        };
+        return true;
+    }
+
+    if (part.contains("content")) {
+        const auto& content = part["content"];
+        if (content.is_string()) {
+            outPart = {
+                { "type", "input_text" },
+                { "text", content.get<std::string>() }
+            };
+            return true;
+        }
+    }
+
+    return false;
+}
+
+nlohmann::json convertOpenAIChatMessageToResponsesInputItem_(const nlohmann::json& message)
+{
+    nlohmann::json item = nlohmann::json::object();
+    if (!message.is_object()) {
+        return item;
+    }
+
+    item["role"] = message.value("role", std::string("user"));
+    if (!message.contains("content")) {
+        return item;
+    }
+
+    const auto& content = message["content"];
+    if (content.is_string()) {
+        item["content"] = content;
+        return item;
+    }
+    if (!content.is_array()) {
+        return item;
+    }
+
+    nlohmann::json convertedContent = nlohmann::json::array();
+    for (const auto& part : content) {
+        nlohmann::json convertedPart;
+        if (tryConvertOpenAIChatMessageContentPartToResponsesInputPart_(part, convertedPart)) {
+            convertedContent.push_back(std::move(convertedPart));
+        }
+    }
+    item["content"] = std::move(convertedContent);
+    return item;
+}
+
+nlohmann::json convertOpenAIChatCompletionsBodyToResponsesBody_(
+    const nlohmann::json& chatCompletionsBody)
+{
+    nlohmann::json responsesBody = nlohmann::json::object();
+    if (chatCompletionsBody.contains("model")) {
+        responsesBody["model"] = chatCompletionsBody["model"];
+    }
+
+    nlohmann::json input = nlohmann::json::array();
+    if (chatCompletionsBody.contains("messages") && chatCompletionsBody["messages"].is_array()) {
+        for (const auto& message : chatCompletionsBody["messages"]) {
+            input.push_back(convertOpenAIChatMessageToResponsesInputItem_(message));
+        }
+    }
+    responsesBody["input"] = std::move(input);
+
+    for (const char* key : { "temperature", "top_p", "service_tier", "store", "user", "metadata" }) {
+        if (chatCompletionsBody.contains(key)) {
+            responsesBody[key] = chatCompletionsBody[key];
+        }
+    }
+
+    const int requestedOutputBudget = extractRequestedOutputBudget_(chatCompletionsBody);
+    if (requestedOutputBudget > 0) {
+        responsesBody["max_output_tokens"] = requestedOutputBudget;
+    }
+
+    if (chatCompletionsBody.contains("response_format") &&
+        chatCompletionsBody["response_format"].is_object()) {
+        const nlohmann::json format =
+            convertOpenAIChatResponseFormatToResponsesTextFormat_(
+                chatCompletionsBody["response_format"]);
+        if (format.is_object() && !format.empty()) {
+            responsesBody["text"] = {
+                { "format", format }
+            };
+        }
+    }
+
+    return responsesBody;
 }
 
 std::string structuredJsonFromOutcome_(
@@ -287,23 +592,16 @@ bool populateSkillSelectionFromStructured_(
     const std::string& logPreview,
     const std::string& parseErrorSource)
 {
-    if (!structured.is_object() ||
-        !structured.contains("selected_skill") ||
-        !structured["selected_skill"].is_string()) {
+    if (!structured.is_object()) {
         Logger::instance().logDebugNoEscalation(
             "agent",
-            "LocalLlmClient::chooseSkill parse_error=missing_selected_skill " +
+            "LocalLlmClient::chooseSkill parse_error=structured_not_object " +
                 parseErrorSource + "=" + truncateForLog_(logPreview));
         return false;
     }
 
-    selection.selectedSkill = trimCopy(structured["selected_skill"].get<std::string>());
-    if (selection.selectedSkill.empty()) {
-        Logger::instance().logDebugNoEscalation(
-            "agent",
-            "LocalLlmClient::chooseSkill parse_error=empty_selected_skill " +
-                parseErrorSource + "=" + truncateForLog_(logPreview));
-        return false;
+    if (structured.contains("selected_skill") && structured["selected_skill"].is_string()) {
+        selection.selectedSkill = trimCopy(structured["selected_skill"].get<std::string>());
     }
 
     if (structured.contains("confidence")) {
@@ -416,6 +714,34 @@ bool populateSkillSelectionFromStructured_(
 
     parseStringArrayField_(structured, "missing_fields_guess", selection.missingFieldsGuess);
     parseStringArrayField_(structured, "supporting_topics", selection.supportingTopics);
+
+    const bool hasSemanticPlan =
+        !selection.selectedSkill.empty() ||
+        !selection.mode.empty() ||
+        !selection.entity.empty() ||
+        !selection.intent.empty() ||
+        selection.continueActiveTask ||
+        selection.groundingRequired ||
+        !trimCopy(selection.operationType).empty() ||
+        !trimCopy(selection.operationPhase).empty() ||
+        !trimCopy(selection.taskGoal).empty() ||
+        !selection.draftPatch.empty() ||
+        !selection.arguments.empty();
+
+    if (selection.selectedSkill.empty() && !hasSemanticPlan) {
+        Logger::instance().logDebugNoEscalation(
+            "agent",
+            "LocalLlmClient::chooseSkill parse_error=missing_selected_skill_and_semantic_plan " +
+                parseErrorSource + "=" + truncateForLog_(logPreview));
+        return false;
+    }
+
+    if (selection.selectedSkill.empty()) {
+        Logger::instance().logDebugNoEscalation(
+            "agent",
+            "LocalLlmClient::chooseSkill salvaging_semantic_plan_without_selected_skill " +
+                parseErrorSource + "=" + truncateForLog_(logPreview));
+    }
 
     selection.fromModel = true;
     return true;
@@ -565,6 +891,20 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
         return outcome;
     }
 
+    nlohmann::json requestBody = body;
+    const std::string modelName = requestBody.contains("model") && requestBody["model"].is_string()
+        ? trimCopy(requestBody["model"].get<std::string>())
+        : trimCopy(configSnapshot.model);
+    applyOpenAITokenLimitField_(requestBody, modelName);
+
+    const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
+    const std::string requestUrl = useResponsesTransport
+        ? normalizeResponsesUrl_(baseUrl)
+        : baseUrl;
+    const std::string requestBodyText = useResponsesTransport
+        ? convertOpenAIChatCompletionsBodyToResponsesBody_(requestBody).dump()
+        : requestBody.dump();
+
     const int attemptLimit = (std::max)(0, retries) + 1;
     for (int attempt = 1; attempt <= attemptLimit; ++attempt) {
         outcome.ok = false;
@@ -574,8 +914,8 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
         outcome.error.clear();
         const auto startedAt = std::chrono::steady_clock::now();
         const HttpResponse response = postJson(
-            baseUrl,
-            body.dump(),
+            requestUrl,
+            requestBodyText,
             configSnapshot.apiKey,
             {},
             timeoutMs);

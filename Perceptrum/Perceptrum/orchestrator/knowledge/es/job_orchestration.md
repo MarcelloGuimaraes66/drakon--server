@@ -6,7 +6,7 @@ Este tema debe ayudar a otro chat a proponer varios disenos validos de job en lu
 
 ## Lo que el producto puede hacer
 
-Los jobs en Perceptrum no se limitan a analisis aislados por camara.
+Los jobs en el producto no se limitan a analisis aislados por camara.
 
 El producto puede:
 

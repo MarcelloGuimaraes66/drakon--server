@@ -1,6 +1,6 @@
 # Vue d'ensemble de l'application
 
-Drakon relie l'EXE local au tableau de bord web pour faire fonctionner ensemble les caméras, agents, jobs et le chat.
+L application relie l EXE local au tableau de bord web pour faire fonctionner ensemble les cameras, agents, jobs et le chat.
 
 ## Comment les éléments s'assemblent
 

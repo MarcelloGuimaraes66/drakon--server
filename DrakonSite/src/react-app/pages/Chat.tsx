@@ -6,6 +6,8 @@ import ChatInput from "@/react-app/components/ChatInput";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
+import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
@@ -17,6 +19,7 @@ import { brand, getBrandStorageKey } from "@/shared/brand";
 import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lucide-react";
 import {
   extractHitMediaFromMessage,
+  extractCameraNetworkScanFromMessage,
   extractCameraRegistrationDraftFromMessage,
   extractChatProgressFromMessage,
   formatMessageContent,
@@ -473,6 +476,7 @@ export default function Chat() {
 
     if (message.role === "user") {
       const userMsg = message as any;
+      const formattedUserContent = formatMessageContent(message.content);
       let videoMetadata: { uploaded_video_id?: number; uploaded_video_url?: string } | null = null;
       try {
         if (userMsg.camera_selection_json) {
@@ -517,37 +521,45 @@ export default function Chat() {
 
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
-          <div className="w-full max-w-full min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)] md:max-w-[42rem] md:px-5">
-            {userMsg.uploaded_image_base64 && (
-              <img
-                src={userMsg.uploaded_image_base64}
-                alt="Uploaded"
-                className="mb-3 max-h-40 rounded-2xl shadow-md"
+          <div className="flex min-w-0 flex-1 justify-end">
+            <div className="group relative w-full max-w-full min-w-0 md:max-w-[42rem]">
+              <div className="w-full min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)] md:px-5">
+                {userMsg.uploaded_image_base64 && (
+                  <img
+                    src={userMsg.uploaded_image_base64}
+                    alt="Uploaded"
+                    className="mb-3 max-h-40 rounded-2xl shadow-md"
+                  />
+                )}
+                {videoUrl && (
+                  <a
+                    href={videoUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mb-3 flex cursor-pointer items-center gap-3 rounded-2xl border border-white/15 bg-white/10 px-3 py-2 transition-colors hover:bg-white/20"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Video className="h-5 w-5 flex-shrink-0" />
+                    <div className="min-w-0 flex-1 text-left">
+                      <p className="truncate text-sm font-medium">{videoFileName}</p>
+                      {videoFileSize && (
+                        <p className="text-xs opacity-75">{formatFileSize(videoFileSize)}</p>
+                      )}
+                    </div>
+                  </a>
+                )}
+                <p
+                  className="break-words whitespace-pre-wrap text-sm leading-relaxed"
+                  style={{ overflowWrap: "anywhere" }}
+                >
+                  {formattedUserContent}
+                </p>
+              </div>
+              <MessageCopyButton
+                text={formattedUserContent}
+                className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
               />
-            )}
-            {videoUrl && (
-              <a
-                href={videoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="mb-3 flex cursor-pointer items-center gap-3 rounded-2xl border border-white/15 bg-white/10 px-3 py-2 transition-colors hover:bg-white/20"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <Video className="h-5 w-5 flex-shrink-0" />
-                <div className="min-w-0 flex-1 text-left">
-                  <p className="truncate text-sm font-medium">{videoFileName}</p>
-                  {videoFileSize && (
-                    <p className="text-xs opacity-75">{formatFileSize(videoFileSize)}</p>
-                  )}
-                </div>
-              </a>
-            )}
-            <p
-              className="break-words whitespace-pre-wrap text-sm leading-relaxed"
-              style={{ overflowWrap: "anywhere" }}
-            >
-              {formatMessageContent(message.content)}
-            </p>
+            </div>
           </div>
           <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500">
             <User className="h-4 w-4 text-white md:h-5 md:w-5" />
@@ -558,6 +570,7 @@ export default function Chat() {
 
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
+    const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
 
     return (
@@ -580,6 +593,8 @@ export default function Chat() {
                 })
               }
             />
+          ) : cameraNetworkScan ? (
+            <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
           ) : null
         }
       />

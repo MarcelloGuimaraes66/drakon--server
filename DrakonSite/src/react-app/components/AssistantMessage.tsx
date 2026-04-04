@@ -4,6 +4,7 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import type { ReactNode } from "react";
 import HitMediaAlbum from "@/react-app/components/HitMediaAlbum";
+import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import {
   formatAssistantMessageContent,
   shouldSuppressAssistantCameraFooter,
@@ -165,7 +166,7 @@ export default function AssistantMessage({
     : "w-full max-w-full px-5 py-4 md:max-w-[50rem] md:px-7 md:py-5 xl:max-w-[54rem]";
 
   return (
-    <div className={`flex justify-start ${compact ? "gap-3" : "gap-4"}`}>
+    <div className={`flex items-start justify-start ${compact ? "gap-3" : "gap-4"}`}>
       <div
         className={`flex-shrink-0 rounded-xl flex items-center justify-center ${
           isChatPageVariant
@@ -178,36 +179,44 @@ export default function AssistantMessage({
         <Bot className={`${compact ? "w-4 h-4" : "w-4 h-4 md:w-5 md:h-5"} text-white`} />
       </div>
 
-      <div
-        className={[
-          bubbleClasses,
-          isChatPageVariant
-            ? "min-w-0 overflow-hidden rounded-[28px] border border-white/[0.08] bg-white/[0.035] text-gray-100 shadow-[0_24px_80px_-48px_rgba(0,0,0,0.9)] backdrop-blur-sm"
-            : "min-w-0 overflow-hidden rounded-[26px] border border-gray-700/60 bg-gradient-to-br from-gray-800/95 via-gray-800/90 to-gray-900/95 text-gray-100 shadow-[0_20px_60px_-24px_rgba(0,0,0,0.8)] backdrop-blur-sm",
-        ].join(" ")}
-      >
-        <div className={compact ? "space-y-3" : "space-y-5"}>
-          <div className={contentWidthClasses}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkBreaks]}
-              components={assistantMarkdownComponents(compact)}
-            >
-              {markdown}
-            </ReactMarkdown>
-          </div>
-
-          {hitMedia.length > 0 && <HitMediaAlbum items={hitMedia} />}
-
-          {supplementalContent}
-
-          {cameraLabel && !suppressCameraFooter ? (
-            <div className="border-t border-gray-700/50 pt-3">
-              <div className="flex items-center gap-2 text-xs text-gray-400">
-                <Camera className="w-3 h-3" />
-                {cameraLabel}
+      <div className="min-w-0 flex-1">
+        <div className="group relative min-w-0">
+          <div
+            className={[
+              bubbleClasses,
+              isChatPageVariant
+                ? "min-w-0 overflow-hidden rounded-[28px] border border-white/[0.08] bg-white/[0.035] text-gray-100 shadow-[0_24px_80px_-48px_rgba(0,0,0,0.9)] backdrop-blur-sm"
+                : "min-w-0 overflow-hidden rounded-[26px] border border-gray-700/60 bg-gradient-to-br from-gray-800/95 via-gray-800/90 to-gray-900/95 text-gray-100 shadow-[0_20px_60px_-24px_rgba(0,0,0,0.8)] backdrop-blur-sm",
+            ].join(" ")}
+          >
+            <div className={compact ? "space-y-3" : "space-y-5"}>
+              <div className={contentWidthClasses}>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm, remarkBreaks]}
+                  components={assistantMarkdownComponents(compact)}
+                >
+                  {markdown}
+                </ReactMarkdown>
               </div>
+
+              {hitMedia.length > 0 && <HitMediaAlbum items={hitMedia} />}
+
+              {supplementalContent}
+
+              {cameraLabel && !suppressCameraFooter ? (
+                <div className="border-t border-gray-700/50 pt-3">
+                  <div className="flex items-center gap-2 text-xs text-gray-400">
+                    <Camera className="w-3 h-3" />
+                    {cameraLabel}
+                  </div>
+                </div>
+              ) : null}
             </div>
-          ) : null}
+          </div>
+          <MessageCopyButton
+            text={markdown}
+            className={compact ? "absolute left-2 top-[calc(100%+0.375rem)] z-20" : "absolute left-3 top-[calc(100%+0.375rem)] z-20"}
+          />
         </div>
       </div>
     </div>

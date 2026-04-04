@@ -49,11 +49,14 @@ import {
 } from "./cameraImport";
 import {
   buildCentralIdentityEndpointUrl,
+  createCentralIdentityDeviceSession,
   ensureCentralIdentitySchema,
   isCentralIdentityClientConfigured,
   isCentralIdentityServerConfigured,
+  refreshCentralIdentityDeviceSession,
   signCentralIdentityGrant,
   verifyCentralIdentityGrant,
+  type CentralIdentityDeviceSessionEnvelope,
   type CentralIdentityGrantClaims,
 } from "./centralIdentity";
 import {
@@ -5484,6 +5487,15 @@ async function ensureSchema(db: D1Database): Promise<void> {
           timezone_iana TEXT NOT NULL DEFAULT 'UTC',
           timezone_updated_at TEXT,
           timezone_source TEXT,
+          central_public_id TEXT,
+          central_grant_token TEXT,
+          central_grant_expires_at TEXT,
+          central_device_session_id TEXT,
+          central_device_session_token TEXT,
+          central_device_session_expires_at TEXT,
+          central_last_refresh_at TEXT,
+          central_last_grant_sync_at TEXT,
+          central_auth_provider TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )
@@ -5496,6 +5508,20 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_iana TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_updated_at TEXT`);
       await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN timezone_source TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_public_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_grant_token TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_grant_expires_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_device_session_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_device_session_token TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_device_session_expires_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_last_refresh_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_last_grant_sync_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE app_users ADD COLUMN central_auth_provider TEXT`);
+
+      await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_central_public_id
+        ON app_users(central_public_id)
+      `).run();
 
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS oauth_identities (
@@ -8274,21 +8300,10 @@ function normalizeChatRunningResolution(
 }
 
 function isChatV2EnabledForRequest(
-  env: Env,
-  requestedMode: unknown
+  _env: Env,
+  _requestedMode: unknown
 ): boolean {
-  if (typeof requestedMode === "string") {
-    const normalized = requestedMode.trim().toLowerCase();
-    if (normalized === "v2" || normalized === "chatv2" || normalized === "orchestrator") {
-      return true;
-    }
-    if (normalized === "v1" || normalized === "legacy") {
-      return false;
-    }
-  }
-
-  const envValue = String(env.CHAT_V2_ENABLED || "").trim().toLowerCase();
-  return envValue === "1" || envValue === "true" || envValue === "yes" || envValue === "on";
+  return true;
 }
 
 function buildChatSessionTitleFromFirstMessage(content: string): string {
@@ -8523,6 +8538,22 @@ function normalizeChatCameraRegistrationMetadata(
   };
 }
 
+function readChatCameraRegistrationShareInviteeQuery(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { present: false, value: "" };
+  }
+
+  const source = value as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(source, "shared_find_invitee_query")) {
+    return { present: false, value: "" };
+  }
+
+  return {
+    present: true,
+    value: normalizeText(source.shared_find_invitee_query),
+  };
+}
+
 function normalizeCameraDraftForChatRegistration(
   value: unknown
 ): CameraInsertPayload | null {
@@ -8583,36 +8614,43 @@ function collectChatCameraDraftFields(data: Partial<CameraInsertPayload>): strin
 
 function buildChatCameraRegistrationSuccessMessage(
   languageInput: unknown,
-  camera: Partial<CameraInsertPayload>
+  camera: Partial<CameraInsertPayload>,
+  options?: {
+    sharedFindInviteeQuery?: string | null;
+    sharedFindInviteError?: string | null;
+  }
 ): string {
   const language = normalizeSupportedChatLanguage(languageInput, "en");
   const cameraName = normalizeOptionalCameraField(camera?.name) || "camera";
   const method = normalizeOptionalCameraField(camera?.connection_method) || "RTSP";
   const ipOrHost = normalizeOptionalCameraField(camera?.ip_address);
+  const sharedFindInviteeQuery = normalizeText(options?.sharedFindInviteeQuery);
+  const sharedFindInviteError = normalizeOptionalText(options?.sharedFindInviteError);
 
   if (language === "pt") {
-    return `Camera "${cameraName}" criada com sucesso.\nMetodo: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}\nSe quiser, agora eu posso te ajudar a iniciar essa camera ou criar um agente nela.`;
+    return `Camera "${cameraName}" criada com sucesso.\nMetodo: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}${sharedFindInviteeQuery ? sharedFindInviteError ? `\nA camera foi criada, mas nao consegui compartilhar com "${sharedFindInviteeQuery}": ${sharedFindInviteError}` : `\nConvite de compartilhamento enviado para "${sharedFindInviteeQuery}".` : ""}\nSe quiser, agora eu posso te ajudar a iniciar essa camera ou criar um agente nela.`;
   }
   if (language === "es") {
-    return `La camara "${cameraName}" fue creada correctamente.\nMetodo: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}\nSi quieres, ahora puedo ayudarte a iniciar esta camara o crear un agente en ella.`;
+    return `La camara "${cameraName}" fue creada correctamente.\nMetodo: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}${sharedFindInviteeQuery ? sharedFindInviteError ? `\nLa camara fue creada, pero no pude compartirla con "${sharedFindInviteeQuery}": ${sharedFindInviteError}` : `\nLa invitacion para compartir fue enviada a "${sharedFindInviteeQuery}".` : ""}\nSi quieres, ahora puedo ayudarte a iniciar esta camara o crear un agente en ella.`;
   }
   if (language === "fr") {
-    return `La camera "${cameraName}" a ete creee avec succes.\nMethode: ${method}${ipOrHost ? `\nIP/hote: ${ipOrHost}` : ""}\nSi vous voulez, je peux maintenant vous aider a demarrer cette camera ou a creer un agent dessus.`;
+    return `La camera "${cameraName}" a ete creee avec succes.\nMethode: ${method}${ipOrHost ? `\nIP/hote: ${ipOrHost}` : ""}${sharedFindInviteeQuery ? sharedFindInviteError ? `\nLa camera a ete creee, mais je n'ai pas pu la partager avec "${sharedFindInviteeQuery}" : ${sharedFindInviteError}` : `\nL'invitation de partage a ete envoyee a "${sharedFindInviteeQuery}".` : ""}\nSi vous voulez, je peux maintenant vous aider a demarrer cette camera ou a creer un agent dessus.`;
   }
-  return `Camera "${cameraName}" was created successfully.\nMethod: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}\nIf you want, I can now help you start this camera or create an agent on it.`;
+  return `Camera "${cameraName}" was created successfully.\nMethod: ${method}${ipOrHost ? `\nIP/host: ${ipOrHost}` : ""}${sharedFindInviteeQuery ? sharedFindInviteError ? `\nThe camera was created, but I could not share it with "${sharedFindInviteeQuery}": ${sharedFindInviteError}` : `\nA sharing invite was sent to "${sharedFindInviteeQuery}".` : ""}\nIf you want, I can now help you start this camera or create an agent on it.`;
 }
 
 function buildChatCameraRegisteredMetadata(
   metadata: ChatCameraRegistrationMetadata,
-  draft: Partial<CameraInsertPayload>,
-  createdCameraId: number
+  draft: Record<string, unknown>,
+  createdCameraId: number,
+  createdCameraName: string | null
 ): ChatCameraRegistrationMetadata {
   return {
     ...metadata,
     status: "registered",
-    draft: draft as Record<string, unknown>,
+    draft,
     created_camera_id: createdCameraId,
-    created_camera_name: normalizeOptionalCameraField(draft.name) || null,
+    created_camera_name: createdCameraName,
   };
 }
 
@@ -9077,6 +9115,26 @@ type VerifiedCentralIdentityGrant = {
   claims: CentralIdentityGrantClaims;
 };
 
+type CentralIdentityDeviceSessionPayload = {
+  id: string;
+  token: string;
+  expiresAt: string;
+};
+
+type AppUserCentralIdentityState = {
+  appUserId: string;
+  email: string | null;
+  authProvider: string;
+  publicId: string;
+  grantToken: string;
+  grantExpiresAt: string | null;
+  deviceSessionId: string | null;
+  deviceSessionToken: string | null;
+  deviceSessionExpiresAt: string | null;
+};
+
+const CENTRAL_GRANT_REFRESH_SKEW_MS = 15 * 60 * 1000;
+
 function normalizeOptionalLocale(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -9196,6 +9254,327 @@ async function callCentralIdentityAuthorizedEndpoint(
   };
 }
 
+function normalizeCentralIdentityDeviceSessionPayload(
+  value: unknown
+): CentralIdentityDeviceSessionPayload | null {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  if (!raw) {
+    return null;
+  }
+
+  const id = normalizeText(raw.id);
+  const token = normalizeText(raw.token);
+  const expiresAt = normalizeText(raw.expires_at ?? raw.expiresAt);
+  if (!id || !token || !expiresAt) {
+    return null;
+  }
+
+  return {
+    id,
+    token,
+    expiresAt,
+  };
+}
+
+function hasCentralIdentityExpiryAhead(
+  value: unknown,
+  minMsFromNow = 0,
+  nowMs: number = Date.now()
+): boolean {
+  const expiresAtMs = Date.parse(normalizeText(value));
+  if (!Number.isFinite(expiresAtMs)) {
+    return false;
+  }
+  return expiresAtMs - nowMs > minMsFromNow;
+}
+
+async function getAppUserCentralIdentityState(
+  db: D1Database,
+  appUserId: string
+): Promise<AppUserCentralIdentityState | null> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT
+         id,
+         email,
+         auth_provider,
+         central_auth_provider,
+         central_public_id,
+         central_grant_token,
+         central_grant_expires_at,
+         central_device_session_id,
+         central_device_session_token,
+         central_device_session_expires_at
+       FROM app_users
+       WHERE id = ?
+       LIMIT 1`
+    )
+    .bind(normalizedAppUserId)
+    .first();
+  if (!row) {
+    return null;
+  }
+
+  const publicId = normalizeText((row as any).central_public_id);
+  const grantToken = normalizeText((row as any).central_grant_token);
+  if (!publicId || !grantToken) {
+    return null;
+  }
+
+  return {
+    appUserId: normalizedAppUserId,
+    email: normalizeText((row as any).email) || null,
+    authProvider:
+      normalizeText((row as any).central_auth_provider) ||
+      normalizeText((row as any).auth_provider) ||
+      "local",
+    publicId,
+    grantToken,
+    grantExpiresAt: normalizeText((row as any).central_grant_expires_at) || null,
+    deviceSessionId: normalizeText((row as any).central_device_session_id) || null,
+    deviceSessionToken: normalizeText((row as any).central_device_session_token) || null,
+    deviceSessionExpiresAt:
+      normalizeText((row as any).central_device_session_expires_at) || null,
+  };
+}
+
+async function updateAppUserCentralIdentityState(
+  db: D1Database,
+  input: {
+    appUserId: string;
+    email?: string | null;
+    authProvider?: string | null;
+    verifiedGrant: VerifiedCentralIdentityGrant;
+    deviceSession?: CentralIdentityDeviceSessionPayload | null;
+    refreshedAt?: string | null;
+  }
+): Promise<void> {
+  const appUserId = normalizeText(input.appUserId);
+  if (!appUserId) {
+    throw new Error("A valid app user id is required to persist central identity state.");
+  }
+
+  const existing = await db
+    .prepare(
+      `SELECT
+         email,
+         auth_provider,
+         central_auth_provider,
+         central_device_session_id,
+         central_device_session_token,
+         central_device_session_expires_at
+       FROM app_users
+       WHERE id = ?
+       LIMIT 1`
+    )
+    .bind(appUserId)
+    .first();
+
+  const resolvedEmail =
+    normalizeText(input.email) ||
+    normalizeText((existing as any)?.email) ||
+    normalizeText(input.verifiedGrant.claims.email);
+  const resolvedAuthProvider =
+    normalizeText(input.authProvider) ||
+    normalizeText((existing as any)?.central_auth_provider) ||
+    normalizeText((existing as any)?.auth_provider) ||
+    "local";
+  const nowIso = normalizeText(input.refreshedAt) || new Date().toISOString();
+
+  await ensureAppUserRow(db, {
+    id: appUserId,
+    email: resolvedEmail,
+    auth_provider: resolvedAuthProvider,
+    country_code: null,
+    locale: null,
+  });
+
+  await db
+    .prepare(
+      `UPDATE app_users
+       SET central_public_id = ?,
+           central_grant_token = ?,
+           central_grant_expires_at = ?,
+           central_device_session_id = ?,
+           central_device_session_token = ?,
+           central_device_session_expires_at = ?,
+           central_last_refresh_at = ?,
+           central_last_grant_sync_at = ?,
+           central_auth_provider = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      input.verifiedGrant.claims.public_id,
+      input.verifiedGrant.token,
+      input.verifiedGrant.claims.grant_expires_at,
+      input.deviceSession?.id || normalizeText((existing as any)?.central_device_session_id) || null,
+      input.deviceSession?.token ||
+        normalizeText((existing as any)?.central_device_session_token) ||
+        null,
+      input.deviceSession?.expiresAt ||
+        normalizeText((existing as any)?.central_device_session_expires_at) ||
+        null,
+      nowIso,
+      nowIso,
+      resolvedAuthProvider,
+      nowIso,
+      appUserId
+    )
+    .run();
+}
+
+async function syncLegacyLocalUserGrantCacheFromGrant(
+  db: D1Database,
+  input: {
+    email?: string | null;
+    verifiedGrant: VerifiedCentralIdentityGrant;
+  }
+): Promise<void> {
+  const claims = input.verifiedGrant.claims;
+  const localIdentity = await findLocalUserIdentityCache(db, {
+    email: normalizeText(input.email) || null,
+    serverPublicId: claims.public_id,
+  });
+  if (!localIdentity) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE local_users
+       SET server_user_id_bigint = ?,
+           server_public_id = ?,
+           is_active = ?,
+           auth_version = ?,
+           grant_expires_at = ?,
+           last_server_sync_at = ?,
+           status_signature = ?,
+           identity_source = 'server',
+           pairing_client_id = COALESCE(NULLIF(TRIM(pairing_client_id), ''), 'local:' || CAST(id AS TEXT)),
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      claims.server_id || null,
+      claims.public_id,
+      claims.is_active ? 1 : 0,
+      claims.auth_version,
+      claims.grant_expires_at,
+      nowIso,
+      input.verifiedGrant.token,
+      nowIso,
+      (localIdentity as any).id
+    )
+    .run();
+}
+
+function buildCentralIdentityStateFromLegacyLocalIdentity(
+  localIdentity: Record<string, unknown>,
+  input: {
+    appUserId: string;
+    authProvider?: string | null;
+  }
+): AppUserCentralIdentityState | null {
+  const publicId = normalizeText(localIdentity.server_public_id);
+  const grantToken = normalizeText(localIdentity.status_signature);
+  if (!publicId || !grantToken) {
+    return null;
+  }
+
+  return {
+    appUserId: normalizeText(input.appUserId),
+    email: normalizeText(localIdentity.email) || null,
+    authProvider: normalizeText(input.authProvider) || "local",
+    publicId,
+    grantToken,
+    grantExpiresAt: normalizeText(localIdentity.grant_expires_at) || null,
+    deviceSessionId: null,
+    deviceSessionToken: null,
+    deviceSessionExpiresAt: null,
+  };
+}
+
+async function ensureFreshCentralRelayContext(
+  env: Env,
+  state: AppUserCentralIdentityState
+): Promise<CentralUserRelayContext> {
+  const nowMs = Date.now();
+  if (
+    state.grantToken &&
+    hasCentralIdentityExpiryAhead(state.grantExpiresAt, CENTRAL_GRANT_REFRESH_SKEW_MS, nowMs)
+  ) {
+    return {
+      appUserId: state.appUserId,
+      publicId: state.publicId,
+      grantToken: state.grantToken,
+    };
+  }
+
+  if (!isCentralIdentityClientConfigured(env)) {
+    throw new Error("Central identity server is not configured.");
+  }
+
+  if (!state.deviceSessionToken) {
+    throw new Error(
+      "This account requires a central identity refresh. Please sign in again with a centrally linked account."
+    );
+  }
+  if (!hasCentralIdentityExpiryAhead(state.deviceSessionExpiresAt, 0, nowMs)) {
+    throw new Error(
+      "This account requires a central identity refresh. Please sign in again with a centrally linked account."
+    );
+  }
+
+  const remote = await callCentralIdentityEndpoint(env, "/api/identity/refresh", {
+    device_token: state.deviceSessionToken,
+  });
+  if (!remote.response.ok || !remote.verifiedGrant) {
+    const status = remote.response.status || 502;
+    if (status === 401 || status === 403) {
+      throw new Error(
+        "This account requires a central identity refresh. Please sign in again with a centrally linked account."
+      );
+    }
+    throw new Error(
+      normalizeResponseErrorMessage(remote.data, "Failed to refresh the central identity session.")
+    );
+  }
+
+  await updateAppUserCentralIdentityState(env.DB, {
+    appUserId: state.appUserId,
+    email: normalizeText(remote.data?.user?.email) || state.email,
+    authProvider: state.authProvider,
+    verifiedGrant: remote.verifiedGrant,
+    deviceSession: normalizeCentralIdentityDeviceSessionPayload(remote.data?.device_session),
+  });
+  await syncLegacyLocalUserGrantCacheFromGrant(env.DB, {
+    email: normalizeText(remote.data?.user?.email) || state.email,
+    verifiedGrant: remote.verifiedGrant,
+  });
+  if (!remote.verifiedGrant.claims.login_allowed) {
+    throw new Error(
+      remote.verifiedGrant.claims.reason ||
+        "This account is not allowed to use the central identity service."
+    );
+  }
+
+  return {
+    appUserId: state.appUserId,
+    publicId: remote.verifiedGrant.claims.public_id,
+    grantToken: remote.verifiedGrant.token,
+  };
+}
+
 type CentralUserRelayContext = {
   appUserId: string;
   publicId: string;
@@ -9265,43 +9644,32 @@ function normalizeSharedFindInvitationDirection(
   return normalizeText(value) === "outgoing" ? "outgoing" : "incoming";
 }
 
-function isLikelyCentralPublicId(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    value
-  );
-}
-
 async function resolveCurrentUserCentralRelayContext(
   env: Env,
   user: WorkerAuthenticatedUser
 ): Promise<CentralUserRelayContext> {
+  const appUserState = await getAppUserCentralIdentityState(env.DB, user.id);
+  if (appUserState) {
+    return ensureFreshCentralRelayContext(env, appUserState);
+  }
+
   const localIdentity = await findLocalUserIdentityCache(env.DB, {
     email: user.email,
     serverPublicId: user.id,
   });
-  const publicId =
-    typeof (localIdentity as any)?.server_public_id === "string" &&
-    String((localIdentity as any).server_public_id).trim()
-      ? String((localIdentity as any).server_public_id).trim()
-      : isLikelyCentralPublicId(user.id)
-      ? user.id
-      : "";
-  const grantToken =
-    typeof (localIdentity as any)?.status_signature === "string"
-      ? String((localIdentity as any).status_signature).trim()
-      : "";
+  const legacyState =
+    localIdentity &&
+    buildCentralIdentityStateFromLegacyLocalIdentity(localIdentity as Record<string, unknown>, {
+      appUserId: user.id,
+      authProvider: user.auth_provider,
+    });
 
-  if (!publicId || !grantToken) {
+  if (!legacyState) {
     throw new Error(
       "This account is not linked to the central identity service yet. Please sign in again with a centrally linked account."
     );
   }
-
-  return {
-    appUserId: user.id,
-    publicId,
-    grantToken,
-  };
+  return ensureFreshCentralRelayContext(env, legacyState);
 }
 
 async function requireVerifiedCentralGrantUser(c: any) {
@@ -10057,6 +10425,15 @@ async function resolveCurrentUserCentralRelayContextById(
     throw new Error("A valid app user id is required.");
   }
 
+  const appUserState = await getAppUserCentralIdentityState(env.DB, normalizedAppUserId);
+  if (appUserState) {
+    return ensureFreshCentralRelayContext(env, appUserState);
+  }
+
+  const appUserRow = await env.DB
+    .prepare(`SELECT email, auth_provider FROM app_users WHERE id = ? LIMIT 1`)
+    .bind(normalizedAppUserId)
+    .first();
   const localIdentity =
     (await findLocalUserIdentityCache(env.DB, {
       serverPublicId: normalizedAppUserId,
@@ -10069,30 +10446,19 @@ async function resolveCurrentUserCentralRelayContextById(
          WHERE au.id = ?
          LIMIT 1`
       )
-      .bind(normalizedAppUserId)
-      .first());
+       .bind(normalizedAppUserId)
+       .first());
+  const legacyState =
+    localIdentity &&
+    buildCentralIdentityStateFromLegacyLocalIdentity(localIdentity as Record<string, unknown>, {
+      appUserId: normalizedAppUserId,
+      authProvider: normalizeText((appUserRow as any)?.auth_provider) || "local",
+    });
 
-  const publicId =
-    typeof (localIdentity as any)?.server_public_id === "string" &&
-    String((localIdentity as any).server_public_id).trim()
-      ? String((localIdentity as any).server_public_id).trim()
-      : isLikelyCentralPublicId(normalizedAppUserId)
-      ? normalizedAppUserId
-      : "";
-  const grantToken =
-    typeof (localIdentity as any)?.status_signature === "string"
-      ? String((localIdentity as any).status_signature).trim()
-      : "";
-
-  if (!publicId || !grantToken) {
+  if (!legacyState) {
     throw new Error("This account is not linked to the central identity service yet.");
   }
-
-  return {
-    appUserId: normalizedAppUserId,
-    publicId,
-    grantToken,
-  };
+  return ensureFreshCentralRelayContext(env, legacyState);
 }
 
 async function maybeEnsureSharedFindRelayForUser(
@@ -11113,6 +11479,7 @@ async function syncLocalIdentityCacheFromGrant(
     locale?: string | null;
     serverHandle?: string | null;
     verifiedGrant: VerifiedCentralIdentityGrant;
+    deviceSession?: CentralIdentityDeviceSessionPayload | null;
   }
 ): Promise<{
   localUserId: number;
@@ -11280,6 +11647,13 @@ async function syncLocalIdentityCacheFromGrant(
     handle: authoritativeHandle,
   });
   await updateAppUserHandle(db, canonicalUserId, authoritativeHandle);
+  await updateAppUserCentralIdentityState(db, {
+    appUserId: canonicalUserId,
+    email: normalizedEmail,
+    authProvider: "local",
+    verifiedGrant: input.verifiedGrant,
+    deviceSession: input.deviceSession || null,
+  });
 
   return {
     localUserId,
@@ -11390,6 +11764,9 @@ async function issueCentralIdentityGrantResponse(
     forceLogout?: boolean;
     reason?: string | null;
     countryCode?: string | null;
+    authProvider?: string | null;
+    deviceSession?: CentralIdentityDeviceSessionEnvelope | null;
+    createDeviceSession?: boolean;
   }
 ) {
   if (!serverUser) {
@@ -11398,7 +11775,17 @@ async function issueCentralIdentityGrantResponse(
 
   const resolvedServerUser = await ensureServerUserHandle(db, serverUser);
   const grant = await signCentralIdentityGrant(env, resolvedServerUser, options);
-  const authProvider = "local";
+  const authProvider = normalizeText(options?.authProvider) || "local";
+  const shouldCreateDeviceSession =
+    options?.createDeviceSession !== false && Boolean(grant.login_allowed);
+  const deviceSession =
+    options?.deviceSession ||
+    (shouldCreateDeviceSession
+      ? await createCentralIdentityDeviceSession(env, db, {
+          userPublicId: String(resolvedServerUser.public_id || ""),
+          authProvider,
+        })
+      : null);
   await ensureAppUserRow(db, {
     id: String(resolvedServerUser.public_id || ""),
     email: String(resolvedServerUser.email || ""),
@@ -11433,6 +11820,7 @@ async function issueCentralIdentityGrantResponse(
       updated_at: String(resolvedServerUser.updated_at || ""),
     },
     grant,
+    ...(deviceSession ? { device_session: deviceSession } : {}),
   };
 }
 
@@ -12436,6 +12824,68 @@ app.post("/api/identity/migrate-login", async (c) => {
   }
 });
 
+app.post("/api/identity/refresh", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  if (!isCentralIdentityServerConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const body =
+    (await c.req
+      .json<{
+        device_token?: string;
+        refresh_token?: string;
+      }>()
+      .catch(() => null)) || {};
+  const deviceToken =
+    normalizeText(body.device_token) || normalizeText(body.refresh_token);
+  if (!deviceToken) {
+    return c.json({ error: "Central identity device session token is required." }, 400);
+  }
+
+  try {
+    const refreshedSession = await refreshCentralIdentityDeviceSession(
+      c.env,
+      c.env.DB,
+      deviceToken
+    );
+    if (!refreshedSession) {
+      return c.json({ error: "Invalid or expired central identity device session." }, 401);
+    }
+
+    const serverUser = await getServerUserByPublicId(
+      c.env.DB,
+      refreshedSession.user_public_id
+    );
+    if (!serverUser) {
+      return c.json({ error: "Central identity user not found." }, 404);
+    }
+
+    const response = await issueCentralIdentityGrantResponse(c.env, c.env.DB, serverUser, {
+      ...(normalizeDbBoolean((serverUser as any).is_active, true)
+        ? {}
+        : {
+            forceLogout: true,
+            reason: "admin_disabled",
+          }),
+      countryCode: normalizeCountryCode((serverUser as any).country_code, null),
+      authProvider: refreshedSession.auth_provider || "local",
+      deviceSession: {
+        id: refreshedSession.id,
+        token: refreshedSession.token,
+        expires_at: refreshedSession.expires_at,
+      },
+      createDeviceSession: false,
+    });
+    return c.json(response, 200);
+  } catch (error) {
+    console.error("[IDENTITY] Refresh failed:", error);
+    return c.json({ error: "Central identity refresh failed" }, 500);
+  }
+});
+
 app.post("/api/identity/google-upsert", async (c) => {
   await ensureRuntimeSchema(c.env);
   await ensureCentralIdentitySchema(c.env.DB);
@@ -12538,38 +12988,22 @@ app.post("/api/identity/google-upsert", async (c) => {
     (resolvedServerUser as any).country_code,
     null
   );
-
-  await ensureAppUserRow(c.env.DB, {
-    id: String((resolvedServerUser as any).public_id || ""),
-    email: String((resolvedServerUser as any).email || ""),
-    auth_provider: "google",
-    country_code: resolvedCountryCode,
-    locale: null,
-    handle: String((resolvedServerUser as any).handle || ""),
-  });
-  await updateAppUserHandle(
+  const response = await issueCentralIdentityGrantResponse(
+    c.env,
     c.env.DB,
-    String((resolvedServerUser as any).public_id || ""),
-    String((resolvedServerUser as any).handle || "")
-  );
-
-  return c.json(
+    resolvedServerUser,
     {
-      success: true,
-      user: {
-        server_id: String((resolvedServerUser as any).id || ""),
-        public_id: String((resolvedServerUser as any).public_id || ""),
-        email: String((resolvedServerUser as any).email || ""),
-        handle: normalizeUserHandleInput((resolvedServerUser as any).handle),
-        country_code: resolvedCountryCode,
-        is_active: normalizeDbBoolean((resolvedServerUser as any).is_active, true),
-        auth_version: Number((resolvedServerUser as any).auth_version || 0),
-        created_at: String((resolvedServerUser as any).created_at || ""),
-        updated_at: String((resolvedServerUser as any).updated_at || ""),
-      },
-    },
-    statusCode as any
+      ...(normalizeDbBoolean((resolvedServerUser as any).is_active, true)
+        ? {}
+        : {
+            forceLogout: true,
+            reason: "admin_disabled",
+          }),
+      countryCode: resolvedCountryCode,
+      authProvider: "google",
+    }
   );
+  return c.json(response, statusCode as any);
 });
 
 app.patch("/api/identity/handle", async (c) => {
@@ -13148,11 +13582,63 @@ app.get("/api/shared-find/cameras", anyAuthMiddleware, async (c) => {
   return c.json({ cameras });
 });
 
+async function createSharedFindInvitationForOwnedCamera(
+  env: any,
+  user: any,
+  cameraRow: Record<string, unknown>,
+  body: {
+    query?: unknown;
+    invitee_public_id?: unknown;
+  }
+) {
+  if (!isCentralIdentityClientConfigured(env)) {
+    return {
+      ok: false,
+      status: 503,
+      data: { error: "Central identity server is not configured." } as Record<string, unknown>,
+    };
+  }
+
+  const cameraId = clampInteger(cameraRow.id);
+  if (cameraId <= 0) {
+    return {
+      ok: false,
+      status: 400,
+      data: { error: "Invalid camera id." } as Record<string, unknown>,
+    };
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(env, "/api/find-shares", {
+    method: "POST",
+    token: centralContext.grantToken,
+    body: {
+      query: body.query,
+      invitee_public_id: normalizeText(body.invitee_public_id),
+      owner_local_camera_id: cameraId,
+      camera_name: normalizeText(cameraRow.name),
+      city: normalizeOptionalText(cameraRow.city),
+      state_code: normalizeOptionalText(cameraRow.state_code),
+      country_code: normalizeCountryCode(cameraRow.country_code, null) || "BR",
+    },
+  });
+
+  if (remote.response.ok) {
+    await syncSharedFindCameraCacheForUser(env, user);
+  }
+
+  return {
+    ok: remote.response.ok,
+    status: remote.response.status || 502,
+    data:
+      (remote.data && typeof remote.data === "object"
+        ? (remote.data as Record<string, unknown>)
+        : { error: "Failed to create the shared camera invitation." }),
+  };
+}
+
 app.post("/api/shared-find/cameras/:cameraId/shares", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  if (!isCentralIdentityClientConfigured(c.env)) {
-    return c.json({ error: "Central identity server is not configured." }, 503);
-  }
 
   const cameraId = clampInteger(c.req.param("cameraId"));
   if (cameraId <= 0) {
@@ -13182,29 +13668,14 @@ app.post("/api/shared-find/cameras/:cameraId/shares", anyAuthMiddleware, async (
     return c.json({ error: "Camera not found." }, 404);
   }
 
-  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
-  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/find-shares", {
-    method: "POST",
-    token: centralContext.grantToken,
-    body: {
-      query: body.query,
-      invitee_public_id: normalizeText(body.invitee_public_id),
-      owner_local_camera_id: cameraId,
-      camera_name: normalizeText((cameraRow as any)?.name),
-      city: normalizeOptionalText((cameraRow as any)?.city),
-      state_code: normalizeOptionalText((cameraRow as any)?.state_code),
-      country_code: normalizeCountryCode((cameraRow as any)?.country_code, null) || "BR",
-    },
-  });
-
-  if (remote.response.ok) {
-    await syncSharedFindCameraCacheForUser(c.env, user);
-  }
-
-  return c.json(
-    remote.data || { error: "Failed to create the shared camera invitation." },
-    (remote.response.status || 502) as any
+  const shareResult = await createSharedFindInvitationForOwnedCamera(
+    c.env,
+    user,
+    cameraRow as Record<string, unknown>,
+    body
   );
+
+  return c.json(shareResult.data, shareResult.status as any);
 });
 
 app.post("/api/shared-find/shares/:shareId/accept", anyAuthMiddleware, async (c) => {
@@ -13334,6 +13805,9 @@ app.post("/api/auth/local/signup", async (c) => {
         locale,
         serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
         verifiedGrant: centralResult.verifiedGrant,
+        deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+          centralResult.data?.device_session
+        ),
       });
 
       if (!centralResult.verifiedGrant.claims.login_allowed) {
@@ -13549,6 +14023,9 @@ app.post("/api/auth/local/login", async (c) => {
             locale: userData?.locale || null,
             serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
             verifiedGrant: centralResult.verifiedGrant,
+            deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+              centralResult.data?.device_session
+            ),
           });
 
           if (!centralResult.verifiedGrant.claims.login_allowed) {
@@ -13763,52 +14240,58 @@ app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
           serverPublicId: user.id,
         })
       : null;
-  const serverPublicId =
-    typeof (localIdentity as any)?.server_public_id === "string"
-      ? String((localIdentity as any).server_public_id).trim()
-      : "";
-  const statusSignature =
-    typeof (localIdentity as any)?.status_signature === "string"
-      ? String((localIdentity as any).status_signature).trim()
-      : "";
+  const hasLegacyCentralLink = Boolean(normalizeText((localIdentity as any)?.server_public_id));
 
-  if (user.auth_provider === "local" && serverPublicId) {
-    if (!isCentralIdentityClientConfigured(c.env)) {
-      return c.json({ error: "Central identity server is not configured." }, 503);
-    }
-    if (!statusSignature) {
-      return c.json({ error: "This account requires a central identity refresh." }, 409);
-    }
-
-    let remoteResult: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+  if (isCentralIdentityClientConfigured(c.env)) {
+    let centralContext: CentralUserRelayContext | null = null;
     try {
-      remoteResult = await callCentralIdentityAuthorizedEndpoint(
-        c.env,
-        "/api/identity/handle",
-        {
-          method: "PATCH",
-          token: statusSignature,
-          body: {
-            handle: normalizedHandle,
-          },
-        }
-      );
+      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
     } catch (error) {
-      console.error("[AUTH] Central handle update request failed:", error);
-      return c.json({ error: "Unable to reach the central identity server." }, 502);
+      if (hasLegacyCentralLink) {
+        return c.json(
+          {
+            error:
+              normalizeText((error as any)?.message) ||
+              "This account requires a central identity refresh.",
+          },
+          409
+        );
+      }
     }
 
-    if (!remoteResult.response.ok) {
-      return c.json(
-        {
-          error: normalizeResponseErrorMessage(
-            remoteResult.data,
-            "Failed to update handle on the central identity server."
-          ),
-        },
-        (remoteResult.response.status || 502) as any
-      );
+    if (centralContext) {
+      let remoteResult: Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>;
+      try {
+        remoteResult = await callCentralIdentityAuthorizedEndpoint(
+          c.env,
+          "/api/identity/handle",
+          {
+            method: "PATCH",
+            token: centralContext.grantToken,
+            body: {
+              handle: normalizedHandle,
+            },
+          }
+        );
+      } catch (error) {
+        console.error("[AUTH] Central handle update request failed:", error);
+        return c.json({ error: "Unable to reach the central identity server." }, 502);
+      }
+
+      if (!remoteResult.response.ok) {
+        return c.json(
+          {
+            error: normalizeResponseErrorMessage(
+              remoteResult.data,
+              "Failed to update handle on the central identity server."
+            ),
+          },
+          (remoteResult.response.status || 502) as any
+        );
+      }
     }
+  } else if (hasLegacyCentralLink) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
   }
 
   await ensureAppUserRow(c.env.DB, {
@@ -13898,7 +14381,7 @@ app.post("/api/sessions", async (c) => {
         return c.json({ error: "Unable to reach the central identity server." }, 502);
       }
 
-      if (!centralGoogleResult.response.ok) {
+      if (!centralGoogleResult.response.ok || !centralGoogleResult.verifiedGrant) {
         console.error(
           "[GOOGLE LOGIN] Central Google sync rejected the login:",
           centralGoogleResult.response.status,
@@ -13932,6 +14415,31 @@ app.post("/api/sessions", async (c) => {
       });
       if (remoteHandle) {
         await updateAppUserHandle(c.env.DB, canonicalUserId, remoteHandle);
+      }
+      await updateAppUserCentralIdentityState(c.env.DB, {
+        appUserId: canonicalUserId,
+        email: googleUser.email,
+        authProvider: "google",
+        verifiedGrant: centralGoogleResult.verifiedGrant,
+        deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+          centralGoogleResult.data?.device_session
+        ),
+      });
+      await syncLegacyLocalUserGrantCacheFromGrant(c.env.DB, {
+        email: googleUser.email,
+        verifiedGrant: centralGoogleResult.verifiedGrant,
+      });
+
+      if (!centralGoogleResult.verifiedGrant.claims.login_allowed) {
+        clearGoogleOAuthFlowCookies(c);
+        return c.json(
+          {
+            error:
+              centralGoogleResult.verifiedGrant.claims.reason ||
+              "This account is not allowed to log in.",
+          },
+          403
+        );
       }
     }
 
@@ -23870,6 +24378,13 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
   }
 
   let overrideDraft: CameraInsertPayload = {} as CameraInsertPayload;
+  const overrideShareInviteeQuery = readChatCameraRegistrationShareInviteeQuery(body?.draft);
+  const sourceShareInviteeQuery = readChatCameraRegistrationShareInviteeQuery(
+    parsedSourceMetadata.draft
+  );
+  const effectiveShareInviteeQuery = overrideShareInviteeQuery.present
+    ? overrideShareInviteeQuery
+    : sourceShareInviteeQuery;
   if (body && Object.prototype.hasOwnProperty.call(body, "draft")) {
     const parsedOverrideDraft = normalizeCameraDraftForChatRegistration(body.draft || {});
     if (!parsedOverrideDraft) {
@@ -23964,10 +24479,33 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
     });
 
     const createdCameraRow = (createdCamera || {}) as Record<string, unknown>;
+    const createdCameraId = Number(createdCameraRow.id || 0);
+    const metadataDraft: Record<string, unknown> = { ...mergedDraft };
+    if (effectiveShareInviteeQuery.value) {
+      metadataDraft.shared_find_invitee_query = effectiveShareInviteeQuery.value;
+    }
+
+    let sharedFindInviteError: string | null = null;
+    if (effectiveShareInviteeQuery.value) {
+      const shareResult = await createSharedFindInvitationForOwnedCamera(
+        c.env,
+        user,
+        createdCameraRow,
+        { query: effectiveShareInviteeQuery.value }
+      );
+      if (!shareResult.ok) {
+        sharedFindInviteError =
+          typeof shareResult.data?.error === "string"
+            ? shareResult.data.error
+            : "Failed to create the shared camera invitation.";
+      }
+    }
+
     const updatedSourceMetadata = buildChatCameraRegisteredMetadata(
       parsedSourceMetadata,
-      createdCameraRow as Partial<CameraInsertPayload>,
-      Number(createdCameraRow.id || 0)
+      metadataDraft,
+      createdCameraId,
+      normalizeOptionalCameraField(createdCameraRow.name) || null
     );
 
     await c.env.DB.prepare(
@@ -24057,7 +24595,11 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
         sessionId,
         buildChatCameraRegistrationSuccessMessage(
           parsedSourceMetadata.language,
-          createdCameraRow as Partial<CameraInsertPayload>
+          createdCameraRow as Partial<CameraInsertPayload>,
+          {
+            sharedFindInviteeQuery: effectiveShareInviteeQuery.value,
+            sharedFindInviteError,
+          }
         ),
         createdCameraRow.id ? String(createdCameraRow.id) : null,
         now,
@@ -24136,7 +24678,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     normalizedChatModelTier === "core"
       ? normalizeChatRunningResolution(body.running_resolution)
       : null;
-  const chatV2Enabled = isChatV2EnabledForRequest(c.env, body.chat_mode);
+  const chatV2Enabled = isChatV2EnabledForRequest(c.env, "v2");
 
   if (!chatV2Enabled && !chatModelApiKey) {
     return c.json(
@@ -24340,7 +24882,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const chatQueryPayload = {
     query: body.content,
     chat_session_id: parseInt(sessionId),
-    chat_mode: chatV2Enabled ? "v2" : "v1",
+    chat_mode: "v2",
     camera_id: body.camera_id || null,
     app_language: appLanguage,
     query_language: queryLanguage,
@@ -24370,7 +24912,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   if (currentUserMessageId > 0) {
     (chatQueryPayload as any).context_before_message_id = currentUserMessageId;
   }
-  const commandType = chatV2Enabled ? "orchestrator_query" : "chat_query";
+  const commandType = "orchestrator_query";
 
   if (body.uploaded_video_id) {
     console.log(
@@ -24655,75 +25197,26 @@ app.post("/api/chat/sessions/:sessionId/cancel", anyAuthMiddleware, async (c) =>
   });
 });
 
-// Legacy chat endpoints (for backwards compatibility)
+// Legacy chat endpoints are intentionally disabled.
+// Chat must always go through chat sessions / chatv2.
 app.get("/api/chat/messages", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-
-  const { results } = await c.env.DB.prepare(
-    "SELECT * FROM chat_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT 50"
-  )
-    .bind(user.id)
-    .all();
-
-  return c.json(results.reverse());
+  return c.json(
+    {
+      error: "Legacy chat endpoint disabled. Use /api/chat/sessions and chatv2.",
+      chat_mode: "v2",
+    },
+    410
+  );
 });
 
 app.post("/api/chat/messages", anyAuthMiddleware, zValidator("json", SendChatMessageSchema), async (c) => {
-  const user = c.get("user")!;
-  const data = c.req.valid("json");
-  const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
-  const modelApiKey = userOpenAiApiKey;
-
-  if (!modelApiKey) {
-    return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
-  }
-
-  // Store user message
-  await c.env.DB.prepare(
-    `INSERT INTO chat_messages (user_id, role, content, camera_ids, tokens_used)
-     VALUES (?, 'user', ?, ?, 0)`
-  )
-    .bind(user.id, data.content, data.camera_id ? String(data.camera_id) : null)
-    .run();
-
-  // Create command for EXE to process
-  await c.env.DB.prepare(
-    `INSERT INTO commands (user_id, camera_id, command_type, payload)
-     VALUES (?, ?, 'chat_query', ?)`
-  )
-    .bind(
-      user.id,
-      data.camera_id || null,
-      JSON.stringify({
-        query: data.content,
-        camera_id: data.camera_id,
-        model_tier: "ultra",
-        model_fps: normalizeChatModelFps(undefined, "ultra"),
-        model_api_key: modelApiKey,
-        router_model_tier: "ultra",
-        router_api_key: modelApiKey,
-      })
-    )
-    .run();
-
-  // Placeholder response
-  const mockResponse = "Processing your query. The local executable will analyze the camera feed and respond shortly.";
-  const tokensUsed = 0;
-
-  await c.env.DB.prepare(
-    `INSERT INTO chat_messages (user_id, role, content, camera_ids, tokens_used)
-     VALUES (?, 'assistant', ?, ?, ?)`
-  )
-    .bind(user.id, mockResponse, data.camera_id ? String(data.camera_id) : null, tokensUsed)
-    .run();
-
-  const { results } = await c.env.DB.prepare(
-    "SELECT * FROM chat_messages WHERE user_id = ? ORDER BY created_at DESC LIMIT 50"
-  )
-    .bind(user.id)
-    .all();
-
-  return c.json(results.reverse());
+  return c.json(
+    {
+      error: "Legacy chat endpoint disabled. Use /api/chat/sessions and chatv2.",
+      chat_mode: "v2",
+    },
+    410
+  );
 });
 
 // Stripe billing endpoints
@@ -30819,11 +31312,7 @@ app.get("/api/agent/orchestrator/state", async (c) => {
     capabilities: {
       video_search_ultra_available: !!userOpenAiApiKey,
       video_search_core_available: !!userZAiApiKey,
-      chatv2_enabled:
-        String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "1" ||
-        String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "true" ||
-        String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "yes" ||
-        String(c.env.CHAT_V2_ENABLED || "").trim().toLowerCase() === "on",
+      chatv2_enabled: true,
     },
   });
 });
@@ -30886,9 +31375,7 @@ app.post("/api/agent/orchestrator/telemetry", async (c) => {
   const routingModeRaw = String(body.routing_mode || "").trim().toLowerCase();
   const routingMode = routingModeRaw === "shadow" ? "shadow" : "actual";
 
-  const actualCommandTypeRaw = String(body.actual_command_type || "").trim().toLowerCase();
-  const actualCommandType =
-    actualCommandTypeRaw === "orchestrator_query" ? "orchestrator_query" : "chat_query";
+  const actualCommandType = "orchestrator_query";
 
   const selectedSkill = String(body.selected_skill || "").trim();
   if (!selectedSkill) {
@@ -31873,9 +32360,10 @@ app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
 app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const itemType = normalizeHubItemType(c.req.query("type"));
+  const syncStateKey = getHubSyncStateKey(itemType);
   const syncState = await c.env.DB
     .prepare(`SELECT * FROM hub_sync_state WHERE sync_key = ? LIMIT 1`)
-    .bind(HUB_SYNC_STATE_KEY)
+    .bind(syncStateKey)
     .first();
 
   let cursor = normalizeText((syncState as any)?.last_cursor) || null;
@@ -31942,7 +32430,7 @@ app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
            last_success_at = excluded.last_success_at,
            last_error = NULL`
       )
-      .bind(HUB_SYNC_STATE_KEY, cursor, now, now)
+      .bind(syncStateKey, cursor, now, now)
       .run();
 
     return c.json({ success: true, synced_count: syncedCount, cursor });
@@ -31957,7 +32445,7 @@ app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
            last_sync_at = excluded.last_sync_at,
            last_error = excluded.last_error`
       )
-      .bind(HUB_SYNC_STATE_KEY, cursor, now, normalizeText(error?.message || error))
+      .bind(syncStateKey, cursor, now, normalizeText(error?.message || error))
       .run();
     console.error("[HUB] Failed to sync cache", error);
     return c.json({ error: "Failed to synchronize Hub cache" }, 500);
@@ -34347,7 +34835,11 @@ type HubTaskSnapshot = {
   tags?: string[];
 };
 
-const HUB_SYNC_STATE_KEY = "public_catalog";
+const HUB_SYNC_STATE_PREFIX = "public_catalog";
+
+function getHubSyncStateKey(itemType: HubItemType | null): string {
+  return `${HUB_SYNC_STATE_PREFIX}:${itemType || "all"}`;
+}
 const HUB_SYNC_BATCH_LIMIT = 100;
 const HUB_LIST_MAX_LIMIT = 100;
 

@@ -6,7 +6,7 @@ This topic should help another chat propose several valid job designs instead of
 
 ## What the product can do
 
-Jobs in Perceptrum are not limited to isolated per-camera analysis.
+Jobs in the product are not limited to isolated per-camera analysis.
 
 The product can:
 

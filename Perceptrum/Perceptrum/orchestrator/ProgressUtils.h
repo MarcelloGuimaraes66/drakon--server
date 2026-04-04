@@ -109,6 +109,20 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Resumindo o estado atual de forma clara para o chat.";
             }
         }
+        else if (skill == "scan_network") {
+            if (phase == "routing") {
+                update.headline = "Entendendo o scan solicitado";
+                update.detail = "Preparando a descoberta local de cameras, DVRs e NVRs.";
+            }
+            else if (phase == "running_scan") {
+                update.headline = "Escaneando a rede local";
+                update.detail = "Procurando dispositivos acessiveis a partir deste runtime.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Resumindo o que foi encontrado";
+                update.detail = "Organizando gravadores, canais detectados e cameras avulsas para o chat.";
+            }
+        }
         else if (skill == "general_answer") {
             if (phase == "routing") {
                 update.headline = "Entendendo sua pergunta";
@@ -241,6 +255,20 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "finalizing") {
                 update.headline = "Organizing the response";
                 update.detail = "Summarizing the current state for the chat.";
+            }
+        }
+        else if (skill == "scan_network") {
+            if (phase == "routing") {
+                update.headline = "Understanding the requested scan";
+                update.detail = "Preparing a local discovery pass for cameras, DVRs, and NVRs.";
+            }
+            else if (phase == "running_scan") {
+                update.headline = "Scanning the local network";
+                update.detail = "Looking for reachable devices from this runtime.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Summarizing what was found";
+                update.detail = "Organizing recorders, detected channels, and standalone cameras for chat.";
             }
         }
         else if (skill == "general_answer") {
