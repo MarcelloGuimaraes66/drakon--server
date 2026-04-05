@@ -424,7 +424,10 @@ namespace winrt::DrakonDesktop::implementation
                 core.Settings().AreDefaultContextMenusEnabled(false);
                 core.Settings().AreDevToolsEnabled(true);
                 core.Settings().IsStatusBarEnabled(false);
-                core.Settings().IsZoomControlEnabled(true);
+                // Keep the desktop shell at a fixed scale. On WebView2, trackpad pinch
+                // and browser zoom controls can resize the entire app surface.
+                core.Settings().IsZoomControlEnabled(false);
+                core.Settings().IsPinchZoomEnabled(false);
                 if (!m_webViewHooksInstalled)
                 {
                     core.NavigationStarting({ this, &SiteHostPage::OnNavigationStarting });

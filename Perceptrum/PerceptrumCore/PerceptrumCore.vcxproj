@@ -118,7 +118,9 @@
     <ClInclude Include="..\Perceptrum\orchestrator\SkillTypes.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCameraSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCamerasBatchSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateJobSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\EditCameraSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.h" />
@@ -152,7 +154,9 @@
     <ClCompile Include="..\Perceptrum\orchestrator\SkillRegistry.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCamerasBatchSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateJobSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\EditCameraSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.cpp" />

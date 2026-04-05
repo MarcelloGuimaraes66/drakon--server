@@ -172,6 +172,11 @@ interface SubmitCameraRegistrationOptions {
   draft: Record<string, unknown>;
 }
 
+interface SubmitCameraBatchRegistrationOptions {
+  sessionIdOverride?: number | null;
+  sourceMessageId: number;
+}
+
 export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSessionConfig) {
   const disableWebSocket = import.meta.env.VITE_DISABLE_WS === "true";
   const [isLoading, setIsLoading] = useState(false);
@@ -648,6 +653,52 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     [sessionId, upsertMessages]
   );
 
+  const submitCameraBatchRegistration = useCallback(
+    async ({
+      sessionIdOverride,
+      sourceMessageId,
+    }: SubmitCameraBatchRegistrationOptions) => {
+      const targetSessionId = sessionIdOverride ?? sessionId;
+      if (!targetSessionId || !sourceMessageId) return;
+
+      setError(null);
+      setWarning(null);
+
+      try {
+        const response = await fetch(
+          `/api/chat/sessions/${targetSessionId}/camera-batch-registration/confirm`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              source_message_id: sourceMessageId,
+            }),
+          }
+        );
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          if (Array.isArray((data as any)?.messages)) {
+            upsertMessages((data as any).messages);
+          }
+          const errorText =
+            typeof (data as any)?.error === "string"
+              ? (data as any).error
+              : "Failed to register camera batch";
+          throw new Error(errorText);
+        }
+
+        if (Array.isArray((data as any)?.messages)) {
+          upsertMessages((data as any).messages);
+        }
+      } catch (err) {
+        console.error("Failed to submit camera batch registration:", err);
+        throw err;
+      }
+    },
+    [sessionId, upsertMessages]
+  );
+
   const cancelMessage = useCallback(async ({ reason = "manual" }: CancelMessageOptions = {}) => {
     if (!sessionId) return;
 
@@ -712,6 +763,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     pendingExecutionState,
     sendMessage,
     submitCameraRegistration,
+    submitCameraBatchRegistration,
     cancelMessage,
     clearError,
     clearWarning,

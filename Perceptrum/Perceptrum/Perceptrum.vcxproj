@@ -209,7 +209,9 @@
     <ClInclude Include="orchestrator\SkillTypes.h" />
     <ClInclude Include="orchestrator\skills\CreateCameraAgentSkill.h" />
     <ClInclude Include="orchestrator\skills\CreateCameraSkill.h" />
+    <ClInclude Include="orchestrator\skills\CreateCamerasBatchSkill.h" />
     <ClInclude Include="orchestrator\skills\CreateJobSkill.h" />
+    <ClInclude Include="orchestrator\skills\EditCameraSkill.h" />
     <ClInclude Include="orchestrator\skills\ExplainAppSkill.h" />
     <ClInclude Include="orchestrator\skills\ReadStateSkill.h" />
     <ClInclude Include="orchestrator\skills\ScanNetworkSkill.h" />
@@ -247,7 +249,9 @@
     <ClCompile Include="orchestrator\SkillRegistry.cpp" />
     <ClCompile Include="orchestrator\skills\CreateCameraAgentSkill.cpp" />
     <ClCompile Include="orchestrator\skills\CreateCameraSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\CreateCamerasBatchSkill.cpp" />
     <ClCompile Include="orchestrator\skills\CreateJobSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\EditCameraSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ExplainAppSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ReadStateSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ScanNetworkSkill.cpp" />

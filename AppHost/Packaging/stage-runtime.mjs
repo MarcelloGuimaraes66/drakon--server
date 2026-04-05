@@ -27,6 +27,8 @@ const execFileAsync = promisify(execFile);
 const desktopRuntimeEnvKeys = [
   "GOOGLE_OAUTH_CLIENT_ID",
   "GOOGLE_OAUTH_CLIENT_SECRET",
+  "GOOGLE_GEOCODING_API_KEY",
+  "GEONAMES_USERNAME",
   "CHAT_V2_ENABLED",
   "STRIPE_SECRET_KEY",
   "STRIPE_WEBHOOK_SECRET",

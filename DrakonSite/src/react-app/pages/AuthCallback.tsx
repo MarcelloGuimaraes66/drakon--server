@@ -2,6 +2,25 @@ import { useEffect, useState } from "react";
 import { useAuth } from "@getmocha/users-service/react";
 import { Loader2 } from "lucide-react";
 
+function getGoogleCallbackErrorMessage(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const errorDescription = params.get("error_description")?.trim();
+  if (errorDescription) {
+    return errorDescription;
+  }
+
+  const errorCode = params.get("error")?.trim();
+  if (!errorCode) {
+    return null;
+  }
+
+  return errorCode.replace(/_/g, " ");
+}
+
 export default function AuthCallback() {
   const { exchangeCodeForSessionToken } = useAuth();
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -10,13 +29,21 @@ export default function AuthCallback() {
     let cancelled = false;
 
     const handleCallback = async () => {
+      const callbackError = getGoogleCallbackErrorMessage();
+      if (callbackError) {
+        if (!cancelled) {
+          setErrorMessage(callbackError);
+        }
+        return;
+      }
+
       try {
         const user = await exchangeCodeForSessionToken();
         if (cancelled) {
           return;
         }
         if (!user) {
-          setErrorMessage("Google sign in did not complete. Please try again.");
+          setErrorMessage("Google sign in did not return an authorization code.");
           return;
         }
         window.location.replace("/ai-agents");

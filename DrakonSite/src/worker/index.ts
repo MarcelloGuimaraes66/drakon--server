@@ -35,6 +35,7 @@ import {
 } from "@/shared/aiApiErrorDisplay";
 import type {
   CameraImportApplyResult,
+  CameraImportCandidate,
   CameraImportPreview,
 } from "@/shared/cameraImport";
 import {
@@ -73,8 +74,6 @@ import {
 } from "./sharedFindRelayState";
 import {
   getLocalSessionUserByToken,
-  localUserGrantAllowsOfflineLogin,
-  localUserRequiresCentralGrant,
   migrateLegacyLocalUserIdToCanonicalId,
   resolveCanonicalAppUserIdFromLocalUserRow,
   resolvePairingClientIdFromLocalUserRow,
@@ -458,6 +457,9 @@ function detectChatMessageLanguage(
   messageInput: unknown,
   fallbackLanguage: string
 ): { language: string; source: "detected" | "fallback" } {
+  return detectChatMessageLanguageRobust(messageInput, fallbackLanguage);
+
+  /*
   const fallback = normalizeSupportedChatLanguage(fallbackLanguage, "en");
   if (typeof messageInput !== "string" || !messageInput.trim()) {
     return { language: fallback, source: "fallback" };
@@ -533,6 +535,99 @@ function detectChatMessageLanguage(
   }
 
   return { language: bestLanguage, source: "detected" };
+  */
+}
+
+function detectChatMessageLanguageRobust(
+  messageInput: unknown,
+  fallbackLanguage: string
+): { language: string; source: "detected" | "fallback" } {
+  const fallback = normalizeSupportedChatLanguage(fallbackLanguage, "en");
+  if (typeof messageInput !== "string" || !messageInput.trim()) {
+    return { language: fallback, source: "fallback" };
+  }
+
+  const raw = messageInput.trim();
+  if (/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/u.test(raw)) {
+    return { language: "ar", source: "detected" };
+  }
+  if (/[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/u.test(raw)) {
+    return { language: "zh", source: "detected" };
+  }
+
+  const lower = raw.toLowerCase();
+  const normalizedForTokens = lower
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  const tokens = normalizedForTokens ? normalizedForTokens.split(/\s+/).filter(Boolean) : [];
+
+  const scores: Record<"en" | "es" | "pt" | "fr", number> = {
+    en: 0,
+    es: 0,
+    pt: 0,
+    fr: 0,
+  };
+
+  if (/[\u00E3\u00F5\u00E7]/u.test(lower)) scores.pt += 4;
+  if (/[\u00F1\u00A1\u00BF]/u.test(lower)) scores.es += 4;
+  if (/[\u00E0\u00E2\u00E6\u00E7\u00E9\u00E8\u00EA\u00EB\u00EE\u00EF\u00F4\u0153\u00F9\u00FB\u00FC\u00FF]/u.test(lower)) scores.fr += 4;
+
+  scores.en += scoreLanguageTokens(tokens, [
+    "how", "what", "where", "when", "why", "billing", "payment", "subscription",
+    "explain", "help", "works", "settings", "pairing", "scan", "network",
+    "discover", "register", "create",
+  ]);
+  scores.es += scoreLanguageTokens(tokens, [
+    "donde", "cuando", "pago", "pagos", "suscripcion", "camara", "camaras",
+    "explica", "ayuda", "configuracion", "clave", "emparejar", "registrar",
+    "agregar", "escanear", "red", "presentes",
+  ]);
+  scores.pt += scoreLanguageTokens(tokens, [
+    "onde", "quando", "pagamento", "pagamentos", "assinatura",
+    "camera", "cameras", "explica", "ajuda", "configuracao", "chave", "parear",
+    "funciona", "cadastrar", "cadastre", "adicionar", "adicione", "escanear",
+    "escaneie", "scaneie", "rede", "quais", "diga", "estao", "presentes",
+  ]);
+  scores.fr += scoreLanguageTokens(tokens, [
+    "comment", "quand", "paiement", "abonnement", "explique", "aide",
+    "parametres", "cle", "association", "fonctionne", "creer", "recherche",
+    "scanner", "reseau", "presents",
+  ]);
+
+  let bestLanguage: "en" | "es" | "pt" | "fr" | null = null;
+  let bestScore = -1;
+  let secondBestScore = -1;
+
+  for (const language of ["en", "es", "pt", "fr"] as const) {
+    const score = scores[language];
+    if (score > bestScore) {
+      secondBestScore = bestScore;
+      bestScore = score;
+      bestLanguage = language;
+    } else if (score > secondBestScore) {
+      secondBestScore = score;
+    }
+  }
+
+  if (!bestLanguage || bestScore <= 0) {
+    return { language: fallback, source: "fallback" };
+  }
+
+  if (bestScore === secondBestScore) {
+    return { language: fallback, source: "fallback" };
+  }
+
+  if (bestScore < 2) {
+    return { language: fallback, source: "fallback" };
+  }
+
+  if (bestScore - secondBestScore < 2) {
+    return { language: fallback, source: "fallback" };
+  }
+
+  return { language: bestLanguage ?? fallback, source: "detected" };
 }
 
 function buildExeHeartbeatSummary(pairing: any | null) {
@@ -1545,22 +1640,29 @@ function buildDrakonFindHitStorageKey(
   return `drakon_find/hits/${safeUserId}/search_${safeSearchId}/camera_${safeCameraId}/${Date.now()}_${generateUUID()}.${extension}`;
 }
 
-function normalizeCameraGeography(stateValue: unknown, countryValue: unknown) {
+function normalizeCameraGeography(
+  stateValue: unknown,
+  countryValue: unknown,
+  countryCodeValue?: unknown
+) {
   const stateText = normalizeOptionalCameraField(stateValue);
   const countryText = normalizeOptionalCameraField(countryValue);
   const stateCode = normalizeBrazilStateCode(stateText);
-  const countryCode = normalizeCountryCode(countryText, stateCode);
+  const countryCode =
+    normalizeCountryCode(countryCodeValue, stateCode) ||
+    normalizeCountryCode(countryText, stateCode);
+  const resolvedCountryText = countryText || resolveCountryDisplayName(countryCode);
 
   return {
     stateText,
-    countryText,
+    countryText: resolvedCountryText,
     stateCode,
     countryCode,
   };
 }
 
 type AddressLookupField = "street" | "city" | "state" | "country";
-type AddressLookupSource = "viacep" | "google-geocoding";
+type AddressLookupSource = "viacep" | "google-geocoding" | "geonames";
 
 type AddressLookupResult = {
   found: boolean;
@@ -1603,6 +1705,22 @@ type GoogleGeocodingPayload = {
   error_message?: unknown;
   results?: unknown;
 };
+
+type GeoNamesPostalCodeEntry = {
+  postalCode?: unknown;
+  countryCode?: unknown;
+  placeName?: unknown;
+  adminName1?: unknown;
+  adminCode1?: unknown;
+};
+
+type GeoNamesPostalCodePayload = {
+  postalCodes?: unknown;
+  status?: unknown;
+};
+
+const ADDRESS_LOOKUP_CACHE_POSITIVE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const ADDRESS_LOOKUP_CACHE_NEGATIVE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function resolveCountryDisplayName(countryCode: string | null): string | null {
   const normalized = typeof countryCode === "string" ? countryCode.trim().toUpperCase() : "";
@@ -1689,6 +1807,212 @@ function buildAddressLookupNotFound(
     auto_filled_fields: [],
     message,
   };
+}
+
+function normalizeAddressLookupSource(value: unknown): AddressLookupSource | null {
+  return value === "viacep" || value === "google-geocoding" || value === "geonames"
+    ? value
+    : null;
+}
+
+function normalizeAddressLookupConfidence(value: unknown): "high" | "medium" | null {
+  return value === "high" || value === "medium" ? value : null;
+}
+
+function getGeoNamesUsername(env: Env): string {
+  return String((env as any).GEONAMES_USERNAME || "").trim();
+}
+
+function getGoogleGeocodingApiKey(env: Env): string {
+  return String(env.GOOGLE_GEOCODING_API_KEY || "").trim();
+}
+
+function resolveInternationalAddressLookupProvider(
+  env: Env,
+  countryCode: string
+): Exclude<AddressLookupSource, "viacep"> {
+  if (getGeoNamesUsername(env)) {
+    return "geonames";
+  }
+
+  if (getGoogleGeocodingApiKey(env)) {
+    return "google-geocoding";
+  }
+
+  throw new Error(
+    `Address lookup for ${countryCode} is not configured. Set GEONAMES_USERNAME or GOOGLE_GEOCODING_API_KEY.`
+  );
+}
+
+async function readAddressLookupCache(
+  db: D1Database,
+  provider: Exclude<AddressLookupSource, "viacep">,
+  countryCode: string,
+  postalCode: string
+): Promise<AddressLookupResult | null> {
+  const normalizedCountryCode = normalizeCountryCode(countryCode, null);
+  const normalizedPostalCode = normalizePostalCodeForLookup(
+    postalCode,
+    normalizedCountryCode || countryCode
+  );
+
+  if (!normalizedCountryCode || !normalizedPostalCode) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT
+         provider,
+         country_code,
+         postal_code,
+         found,
+         country,
+         street,
+         city,
+         state,
+         state_code,
+         confidence,
+         source,
+         message,
+         expires_at
+       FROM address_lookup_cache
+       WHERE provider = ?
+         AND country_code = ?
+         AND postal_code = ?
+       LIMIT 1`
+    )
+    .bind(provider, normalizedCountryCode, normalizedPostalCode)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  const expiresAt = normalizeOptionalCameraField((row as any)?.expires_at);
+  if (!expiresAt || Date.parse(expiresAt) <= Date.now()) {
+    await db
+      .prepare(
+        `DELETE FROM address_lookup_cache
+         WHERE provider = ?
+           AND country_code = ?
+           AND postal_code = ?`
+      )
+      .bind(provider, normalizedCountryCode, normalizedPostalCode)
+      .run()
+      .catch(() => null);
+    return null;
+  }
+
+  const found = Number((row as any)?.found || 0) === 1;
+  const cachedCountryCode =
+    normalizeCountryCode((row as any)?.country_code, null) || normalizedCountryCode;
+  const cachedCountry = normalizeOptionalCameraField((row as any)?.country);
+  const cachedStreet = normalizeOptionalCameraField((row as any)?.street);
+  const cachedCity = normalizeOptionalCameraField((row as any)?.city);
+  const cachedState = normalizeOptionalCameraField((row as any)?.state);
+  const cachedStateCode = normalizeOptionalCameraField((row as any)?.state_code);
+  const cachedSource =
+    normalizeAddressLookupSource((row as any)?.source) || provider;
+  const cachedMessage = normalizeOptionalCameraField((row as any)?.message);
+  const autoFilledFields = found
+    ? buildAddressLookupAutoFilledFields({
+        street: cachedStreet,
+        city: cachedCity,
+        state: cachedState,
+        country: cachedCountry,
+      })
+    : [];
+
+  return {
+    found,
+    source: cachedSource,
+    postal_code: normalizePostalCodeForLookup((row as any)?.postal_code, cachedCountryCode),
+    country: cachedCountry,
+    country_code: cachedCountryCode,
+    street: cachedStreet,
+    city: cachedCity,
+    state: cachedState,
+    state_code: cachedStateCode,
+    confidence: normalizeAddressLookupConfidence((row as any)?.confidence),
+    auto_filled_fields: autoFilledFields,
+    message: cachedMessage,
+  };
+}
+
+async function writeAddressLookupCache(
+  db: D1Database,
+  provider: Exclude<AddressLookupSource, "viacep">,
+  result: AddressLookupResult
+): Promise<void> {
+  const normalizedCountryCode = normalizeCountryCode(result.country_code, null);
+  const normalizedPostalCode = normalizePostalCodeForLookup(
+    result.postal_code,
+    normalizedCountryCode
+  );
+
+  if (!normalizedCountryCode || !normalizedPostalCode) {
+    return;
+  }
+
+  const now = new Date();
+  const expiresAt = new Date(
+    now.getTime() +
+      (result.found
+        ? ADDRESS_LOOKUP_CACHE_POSITIVE_TTL_MS
+        : ADDRESS_LOOKUP_CACHE_NEGATIVE_TTL_MS)
+  ).toISOString();
+  const nowIso = now.toISOString();
+
+  await db
+    .prepare(
+      `DELETE FROM address_lookup_cache
+       WHERE provider = ?
+         AND country_code = ?
+         AND postal_code = ?`
+    )
+    .bind(provider, normalizedCountryCode, normalizedPostalCode)
+    .run();
+
+  await db
+    .prepare(
+      `INSERT INTO address_lookup_cache (
+         provider,
+         country_code,
+         postal_code,
+         found,
+         country,
+         street,
+         city,
+         state,
+         state_code,
+         confidence,
+         source,
+         message,
+         expires_at,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      provider,
+      normalizedCountryCode,
+      normalizedPostalCode,
+      result.found ? 1 : 0,
+      result.country || null,
+      result.street || null,
+      result.city || null,
+      result.state || null,
+      result.state_code || null,
+      result.confidence || null,
+      result.source || provider,
+      result.message || null,
+      expiresAt,
+      nowIso,
+      nowIso
+    )
+    .run();
 }
 
 async function lookupBrazilAddressByPostalCode(postalCode: string): Promise<AddressLookupResult> {
@@ -1845,12 +2169,187 @@ function selectGoogleGeocodingResult(
   return bestMatch && bestMatch.score >= 40 ? bestMatch.result : null;
 }
 
+function getGeoNamesPostalCodeEntries(payload: GeoNamesPostalCodePayload): GeoNamesPostalCodeEntry[] {
+  if (!Array.isArray(payload.postalCodes)) {
+    return [];
+  }
+
+  return payload.postalCodes.filter(
+    (entry): entry is GeoNamesPostalCodeEntry => Boolean(entry) && typeof entry === "object"
+  );
+}
+
+function selectGeoNamesPostalCodeEntry(
+  entries: GeoNamesPostalCodeEntry[],
+  requestedPostalKey: string,
+  requestedCountryCode: string
+): GeoNamesPostalCodeEntry | null {
+  let bestMatch: { entry: GeoNamesPostalCodeEntry; score: number } | null = null;
+
+  for (const entry of entries) {
+    const entryCountryCode =
+      normalizeCountryCode(entry.countryCode, null) || requestedCountryCode;
+    const entryPostalKey = buildPostalCodeComparisonKey(
+      normalizePostalCodeForLookup(
+        typeof entry.postalCode === "string" ? entry.postalCode : "",
+        entryCountryCode
+      )
+    );
+    let score = 0;
+
+    if (entryCountryCode === requestedCountryCode) {
+      score += 60;
+    }
+    if (requestedPostalKey && entryPostalKey === requestedPostalKey) {
+      score += 80;
+    } else if (
+      requestedPostalKey &&
+      entryPostalKey &&
+      (entryPostalKey.startsWith(requestedPostalKey) ||
+        requestedPostalKey.startsWith(entryPostalKey))
+    ) {
+      score += 15;
+    }
+    if (normalizeOptionalCameraField(entry.placeName)) {
+      score += 10;
+    }
+    if (normalizeOptionalCameraField(entry.adminName1)) {
+      score += 10;
+    }
+
+    if (!bestMatch || score > bestMatch.score) {
+      bestMatch = { entry, score };
+    }
+  }
+
+  return bestMatch && bestMatch.score >= 40 ? bestMatch.entry : null;
+}
+
+async function lookupGeoNamesAddressByPostalCode(
+  env: Env,
+  postalCode: string,
+  countryCode: string
+): Promise<AddressLookupResult> {
+  const username = getGeoNamesUsername(env);
+  if (!username) {
+    throw new Error(
+      `Address lookup for ${countryCode} is not configured. Set GEONAMES_USERNAME.`
+    );
+  }
+
+  const params = new URLSearchParams({
+    postalcode: postalCode,
+    country: countryCode,
+    maxRows: "10",
+    style: "FULL",
+    username,
+  });
+
+  const response = await fetch(
+    `https://secure.geonames.org/postalCodeSearchJSON?${params.toString()}`,
+    {
+      headers: {
+        accept: "application/json",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`GeoNames lookup failed with status ${response.status}.`);
+  }
+
+  const payload = (await response.json()) as GeoNamesPostalCodePayload;
+  const payloadStatus =
+    payload.status && typeof payload.status === "object"
+      ? (payload.status as Record<string, unknown>)
+      : null;
+  const payloadStatusMessage =
+    typeof payloadStatus?.message === "string" ? payloadStatus.message.trim() : "";
+  if (payloadStatusMessage) {
+    throw new Error(payloadStatusMessage);
+  }
+
+  const requestedPostalKey = buildPostalCodeComparisonKey(postalCode);
+  const entries = getGeoNamesPostalCodeEntries(payload);
+  const entry = selectGeoNamesPostalCodeEntry(entries, requestedPostalKey, countryCode);
+
+  if (!entry) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      countryCode,
+      "geonames",
+      "Postal code not found."
+    );
+  }
+
+  const resolvedCountryCode =
+    normalizeCountryCode(entry.countryCode, null) || countryCode;
+  const normalizedReturnedPostalCode = normalizePostalCodeForLookup(
+    typeof entry.postalCode === "string" ? entry.postalCode : postalCode,
+    resolvedCountryCode
+  );
+  const returnedPostalKey = buildPostalCodeComparisonKey(normalizedReturnedPostalCode);
+  if (
+    requestedPostalKey &&
+    returnedPostalKey &&
+    returnedPostalKey !== requestedPostalKey &&
+    !returnedPostalKey.startsWith(requestedPostalKey) &&
+    !requestedPostalKey.startsWith(returnedPostalKey)
+  ) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      resolvedCountryCode,
+      "geonames",
+      "No exact postal code match was returned."
+    );
+  }
+
+  const city = normalizeOptionalCameraField(entry.placeName);
+  const state =
+    normalizeOptionalCameraField(entry.adminName1) ||
+    normalizeOptionalCameraField(entry.adminCode1);
+  const stateCode = normalizeOptionalCameraField(entry.adminCode1);
+  const country = resolveCountryDisplayName(resolvedCountryCode);
+  const autoFilledFields = buildAddressLookupAutoFilledFields({
+    city,
+    state,
+    country,
+  });
+
+  if (!city && !state) {
+    return buildAddressLookupNotFound(
+      postalCode,
+      resolvedCountryCode,
+      "geonames",
+      "Postal code found but no address fields were returned."
+    );
+  }
+
+  return {
+    found: true,
+    source: "geonames",
+    postal_code: normalizedReturnedPostalCode || postalCode,
+    country,
+    country_code: resolvedCountryCode,
+    street: null,
+    city,
+    state,
+    state_code: stateCode,
+    confidence:
+      requestedPostalKey && returnedPostalKey === requestedPostalKey && city && state
+        ? "high"
+        : "medium",
+    auto_filled_fields: autoFilledFields,
+    message: null,
+  };
+}
+
 async function lookupGoogleAddressByPostalCode(
   env: Env,
   postalCode: string,
   countryCode: string
 ): Promise<AddressLookupResult> {
-  const apiKey = String(env.GOOGLE_GEOCODING_API_KEY || "").trim();
+  const apiKey = getGoogleGeocodingApiKey(env);
   if (!apiKey) {
     throw new Error(
       `Address lookup for ${countryCode} is not configured. Set GOOGLE_GEOCODING_API_KEY.`
@@ -1999,16 +2498,55 @@ async function lookupGoogleAddressByPostalCode(
   };
 }
 
+async function lookupInternationalAddressByPostalCode(
+  env: Env,
+  postalCode: string,
+  countryCode: string
+): Promise<AddressLookupResult> {
+  const provider = resolveInternationalAddressLookupProvider(env, countryCode);
+
+  try {
+    await ensureSchema(env.DB);
+    const cached = await readAddressLookupCache(env.DB, provider, countryCode, postalCode);
+    if (cached) {
+      return cached;
+    }
+  } catch (error) {
+    console.error("[ADDRESS LOOKUP] Failed to read international lookup cache:", error);
+  }
+
+  const result =
+    provider === "geonames"
+      ? await lookupGeoNamesAddressByPostalCode(env, postalCode, countryCode)
+      : await lookupGoogleAddressByPostalCode(env, postalCode, countryCode);
+
+  try {
+    await writeAddressLookupCache(env.DB, provider, result);
+  } catch (error) {
+    console.error("[ADDRESS LOOKUP] Failed to write international lookup cache:", error);
+  }
+
+  return result;
+}
+
 async function lookupAddressByPostalCode(
   env: Env,
   postalCode: string,
   countryCode: string
 ): Promise<AddressLookupResult> {
-  if (countryCode === "BR") {
-    return lookupBrazilAddressByPostalCode(postalCode);
+  const normalizedCountryCode = normalizeCountryCode(countryCode, null) || countryCode;
+  const normalizedPostalCode =
+    normalizePostalCodeForLookup(postalCode, normalizedCountryCode) || postalCode;
+
+  if (normalizedCountryCode === "BR") {
+    return lookupBrazilAddressByPostalCode(normalizedPostalCode);
   }
 
-  return lookupGoogleAddressByPostalCode(env, postalCode, countryCode);
+  return lookupInternationalAddressByPostalCode(
+    env,
+    normalizedPostalCode,
+    normalizedCountryCode
+  );
 }
 
 async function createDrakonFindAuditLog(
@@ -6105,6 +6643,50 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN country_code TEXT`);
       }
 
+      await db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS address_lookup_cache (
+          provider TEXT NOT NULL,
+          country_code TEXT NOT NULL,
+          postal_code TEXT NOT NULL,
+          found INTEGER NOT NULL DEFAULT 0,
+          country TEXT,
+          street TEXT,
+          city TEXT,
+          state TEXT,
+          state_code TEXT,
+          confidence TEXT,
+          source TEXT,
+          message TEXT,
+          expires_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (provider, country_code, postal_code)
+        )
+      `
+      ).run();
+
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN provider TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN country_code TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN postal_code TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN found INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN country TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN street TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN city TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN state TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN state_code TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN confidence TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN source TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN message TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN expires_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN created_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE address_lookup_cache ADD COLUMN updated_at TEXT`);
+
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_address_lookup_cache_expires_at
+        ON address_lookup_cache(expires_at)
+      `).run();
+
       if (await tableExists("camera_algorithms")) {
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN prompt_template TEXT`
@@ -7384,24 +7966,29 @@ async function updateAppUserCountryCodeIfMissing(
 async function getAppUserProfile(
   db: D1Database,
   userId: string
-): Promise<{ created_at: string | null; handle: string | null }> {
+): Promise<{
+  created_at: string | null;
+  handle: string | null;
+  country_code: string | null;
+}> {
   const row = await db
-    .prepare("SELECT created_at, handle FROM app_users WHERE id = ? LIMIT 1")
+    .prepare("SELECT created_at, handle, country_code FROM app_users WHERE id = ? LIMIT 1")
     .bind(userId)
     .first();
   const createdAt = (row as any)?.created_at;
   const handle = normalizeUserHandleInput((row as any)?.handle);
+  const countryCode = normalizeCountryCode((row as any)?.country_code, null);
   if (typeof createdAt === "string" && createdAt.trim()) {
-    return { created_at: createdAt, handle };
+    return { created_at: createdAt, handle, country_code: countryCode };
   }
   if (createdAt instanceof Date) {
-    return { created_at: createdAt.toISOString(), handle };
+    return { created_at: createdAt.toISOString(), handle, country_code: countryCode };
   }
   if (createdAt !== null && createdAt !== undefined) {
     const asString = String(createdAt).trim();
-    return { created_at: asString || null, handle };
+    return { created_at: asString || null, handle, country_code: countryCode };
   }
-  return { created_at: null, handle };
+  return { created_at: null, handle, country_code: countryCode };
 }
 
 type GoogleOidcDiscovery = {
@@ -7450,9 +8037,15 @@ type GoogleSessionUser = {
   handle: string | null;
 };
 
+type GoogleOAuthIntent = "login" | "signup";
+
 let googleOidcDiscoveryCache: { expiresAt: number; value: GoogleOidcDiscovery } | null = null;
 let googleRemoteJwkSet: ReturnType<typeof createRemoteJWKSet> | null = null;
 let googleRemoteJwkSetUri = "";
+
+function normalizeGoogleOAuthIntent(value: unknown): GoogleOAuthIntent {
+  return String(value || "").trim().toLowerCase() === "signup" ? "signup" : "login";
+}
 
 function getGoogleOAuthClientId(env: Env): string {
   const clientId = String(env.GOOGLE_OAUTH_CLIENT_ID || "").trim();
@@ -7676,7 +8269,8 @@ function shouldClearGoogleSessionOnAuthFailure(error: unknown): boolean {
     message.includes("invalid google login state") ||
     message.includes("missing google login state") ||
     message.includes("missing google login nonce") ||
-    message.includes("missing google login pkce verifier")
+    message.includes("missing google login pkce verifier") ||
+    message.includes("no local account found for this google account")
   );
 }
 
@@ -7766,11 +8360,15 @@ async function markAppUserAsGoogleLinked(
 
 async function createGoogleOAuthRedirectUrl(
   c: any,
-  countryCode?: string | null
+  options?: {
+    countryCode?: string | null;
+    intent?: GoogleOAuthIntent;
+  }
 ): Promise<string> {
   const { clientId } = getGoogleOAuthConfig(c.env);
   const discovery = await getGoogleOidcDiscovery();
   const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
+  const normalizedIntent = normalizeGoogleOAuthIntent(options?.intent);
   const redirectUriResolution = resolveGoogleRedirectUri(
     c,
     desktopHosted ? { preferLocalOrigin: true } : undefined
@@ -7782,7 +8380,7 @@ async function createGoogleOAuthRedirectUrl(
   const codeChallenge = await sha256Base64Url(codeVerifier);
 
   console.log(
-    `[GOOGLE LOGIN] redirect_uri=${redirectUri} source=${redirectUriResolution.source} desktop_hosted=${desktopHosted} request_origin=${resolveBrowserOrigin(c)}`
+    `[GOOGLE LOGIN] redirect_uri=${redirectUri} source=${redirectUriResolution.source} desktop_hosted=${desktopHosted} intent=${normalizedIntent} request_origin=${resolveBrowserOrigin(c)}`
   );
 
   setSessionCookie(c, GOOGLE_OAUTH_STATE_COOKIE_NAME, state, GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS);
@@ -7790,11 +8388,20 @@ async function createGoogleOAuthRedirectUrl(
   setSessionCookie(c, GOOGLE_OAUTH_PKCE_COOKIE_NAME, codeVerifier, GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS);
   setSessionCookie(
     c,
+    GOOGLE_OAUTH_INTENT_COOKIE_NAME,
+    normalizedIntent,
+    GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS
+  );
+  setSessionCookie(
+    c,
     GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME,
     redirectUri,
     GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS
   );
-  const normalizedCountryCode = normalizeCountryCode(countryCode, null);
+  const normalizedCountryCode =
+    normalizedIntent === "signup"
+      ? normalizeCountryCode(options?.countryCode, null)
+      : null;
   if (normalizedCountryCode) {
     setSessionCookie(
       c,
@@ -7888,6 +8495,7 @@ function clearGoogleOAuthFlowCookies(c: any) {
   clearSessionCookie(c, GOOGLE_OAUTH_PKCE_COOKIE_NAME);
   clearSessionCookie(c, GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME);
   clearSessionCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME);
+  clearSessionCookie(c, GOOGLE_OAUTH_INTENT_COOKIE_NAME);
 }
 
 async function createGoogleSession(
@@ -8154,6 +8762,64 @@ async function resolveOrCreateGoogleAppUser(
 
   console.log(`[GOOGLE AUTH] Created new user: ${canonicalId} (email: ${normalizedEmail})`);
   return canonicalId;
+}
+
+async function resolveExistingGoogleAppUser(
+  db: D1Database,
+  mochaUser: GoogleOAuthUser
+): Promise<string> {
+  const normalizedEmail = getNormalizedGoogleEmail(mochaUser);
+  const googleSubject = getGoogleSubject(mochaUser);
+
+  if (!isValidEmail(normalizedEmail)) {
+    throw new Error("Google account email is invalid.");
+  }
+
+  if (!isGoogleEmailVerified(mochaUser)) {
+    throw new Error("Google account email is not verified.");
+  }
+
+  if (!googleSubject) {
+    throw new Error("Google account subject is missing.");
+  }
+
+  const existingLinkedIdentity = await db.prepare(
+    `SELECT user_id FROM oauth_identities
+     WHERE provider = 'google' AND provider_subject = ?
+     LIMIT 1`
+  )
+    .bind(googleSubject)
+    .first();
+
+  if (existingLinkedIdentity) {
+    return resolveOrCreateGoogleAppUser(db, mochaUser, null);
+  }
+
+  if (isGoogleAuthoritativeEmail(mochaUser)) {
+    const existingAppUser = await db.prepare(
+      `SELECT id FROM app_users WHERE LOWER(email) = LOWER(?) LIMIT 1`
+    )
+      .bind(normalizedEmail)
+      .first();
+
+    if (existingAppUser) {
+      return resolveOrCreateGoogleAppUser(db, mochaUser, null);
+    }
+
+    const existingLocalUser = await db.prepare(
+      `SELECT id FROM local_users
+       WHERE LOWER(email) = LOWER(?)
+       LIMIT 1`
+    )
+      .bind(normalizedEmail)
+      .first();
+
+    if (existingLocalUser) {
+      return resolveOrCreateGoogleAppUser(db, mochaUser, null);
+    }
+  }
+
+  throw new Error("No local account found for this Google account. Please sign up first.");
 }
 
 // Helper function to upsert active card
@@ -8498,6 +9164,16 @@ type ChatCameraRegistrationMetadata = {
   created_camera_name?: string | null;
 };
 
+type ChatCameraBatchRegistrationMetadata = {
+  type: "camera_batch_registration_draft";
+  status: "awaiting_confirmation" | "registered";
+  language: string;
+  preview: CameraImportPreview;
+  target_client_id: string | null;
+  expected_count?: number | null;
+  apply_result?: CameraImportApplyResult | null;
+};
+
 function normalizeChatCameraRegistrationMetadata(
   value: unknown
 ): ChatCameraRegistrationMetadata | null {
@@ -8535,6 +9211,48 @@ function normalizeChatCameraRegistrationMetadata(
       typeof source.created_camera_name === "string" && source.created_camera_name.trim()
         ? source.created_camera_name.trim()
         : null,
+  };
+}
+
+function normalizeChatCameraBatchRegistrationMetadata(
+  value: unknown
+): ChatCameraBatchRegistrationMetadata | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  if (source.type !== "camera_batch_registration_draft") {
+    return null;
+  }
+
+  const preview =
+    source.preview && typeof source.preview === "object" && !Array.isArray(source.preview)
+      ? (source.preview as CameraImportPreview)
+      : null;
+  if (!preview) {
+    return null;
+  }
+
+  const targetClientId =
+    typeof source.target_client_id === "string" && source.target_client_id.trim()
+      ? source.target_client_id.trim()
+      : null;
+  const expectedCount = Number(source.expected_count);
+  const applyResult =
+    source.apply_result && typeof source.apply_result === "object" && !Array.isArray(source.apply_result)
+      ? (source.apply_result as CameraImportApplyResult)
+      : null;
+
+  return {
+    type: "camera_batch_registration_draft",
+    status: source.status === "registered" ? "registered" : "awaiting_confirmation",
+    language: normalizeSupportedChatLanguage(source.language, "en"),
+    preview,
+    target_client_id: targetClientId,
+    expected_count:
+      Number.isInteger(expectedCount) && expectedCount > 0 ? expectedCount : null,
+    apply_result: applyResult,
   };
 }
 
@@ -8696,6 +9414,108 @@ function buildChatCreateCameraCompletedTaskState(
       ...(normalizeOptionalCameraField(draft.name)
         ? { last_camera_name: normalizeOptionalCameraField(draft.name) }
         : {}),
+    },
+  };
+}
+
+function buildChatCameraBatchRegisteredMetadata(
+  metadata: ChatCameraBatchRegistrationMetadata,
+  applyResult: CameraImportApplyResult
+): ChatCameraBatchRegistrationMetadata {
+  return {
+    ...metadata,
+    status: "registered",
+    apply_result: applyResult,
+  };
+}
+
+function buildChatCameraBatchRegistrationSuccessMessage(
+  languageInput: unknown,
+  metadata: ChatCameraBatchRegistrationMetadata,
+  applyResult: CameraImportApplyResult & {
+    failed_candidates?: Array<{
+      source_index: number;
+      source_reference: string;
+      reason: string;
+    }>;
+  }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const readyCount = Number(metadata.preview?.ready_count || 0);
+  const createdCount = Number(applyResult.created_count || 0);
+  const skippedCount = Number(applyResult.skipped_count || 0);
+  const failedCandidates = Array.isArray(applyResult.failed_candidates)
+    ? applyResult.failed_candidates.slice(0, 5)
+    : [];
+
+  if (language === "pt") {
+    const failedLines =
+      failedCandidates.length > 0
+        ? `\nFalhas:\n${failedCandidates
+            .map((candidate) => `- ${candidate.source_reference}: ${candidate.reason}`)
+            .join("\n")}`
+        : "";
+    return `Lote concluido.\nCameras criadas: ${createdCount} de ${readyCount}.${skippedCount > 0 ? `\nItens pulados: ${skippedCount}.` : ""}${failedLines}\nSe quiser, agora eu posso te ajudar a iniciar essas cameras ou criar agentes nelas.`;
+  }
+
+  const failedLines =
+    failedCandidates.length > 0
+      ? `\nFailures:\n${failedCandidates
+          .map((candidate) => `- ${candidate.source_reference}: ${candidate.reason}`)
+          .join("\n")}`
+      : "";
+  return `Batch completed.\nCameras created: ${createdCount} of ${readyCount}.${skippedCount > 0 ? `\nSkipped items: ${skippedCount}.` : ""}${failedLines}\nIf you want, I can now help you start those cameras or create agents on them.`;
+}
+
+function buildChatCreateCameraBatchCompletedTaskState(
+  taskState: ReturnType<typeof normalizeChatTaskState>,
+  metadata: ChatCameraBatchRegistrationMetadata,
+  applyResult: CameraImportApplyResult
+) {
+  const language = normalizeSupportedChatLanguage(metadata.language, "en");
+  const createdCount = Number(applyResult.created_count || 0);
+  const existingRecent = Array.isArray(taskState.recent_tasks)
+    ? taskState.recent_tasks.filter((item) => item && typeof item === "object").slice(0, 3)
+    : [];
+  const existingSessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+
+  const recentTask = {
+    type: "create_cameras_batch",
+    entity_type: "camera",
+    intent: "create",
+    status: "completed",
+    phase: "created",
+    language,
+    reply_language: language,
+    goal:
+      Number(metadata.expected_count || 0) > 0
+        ? `register ${Number(metadata.expected_count || 0)} cameras`
+        : "register multiple cameras",
+    summary:
+      language === "pt"
+        ? `Lote concluido com ${createdCount} camera(s) criada(s)`
+        : `Batch completed with ${createdCount} camera(s) created`,
+    missing_fields: [],
+    collected_fields: ["items"],
+    draft: {
+      expected_count: metadata.expected_count ?? metadata.preview?.total_rows_detected ?? 0,
+      created_count: createdCount,
+      created_camera_ids: Array.isArray(applyResult.created_camera_ids)
+        ? applyResult.created_camera_ids
+        : [],
+    },
+  };
+
+  return {
+    version: 2,
+    active_task: null,
+    recent_tasks: [recentTask, ...existingRecent],
+    session_entities: {
+      ...existingSessionEntities,
+      last_camera_batch_count: createdCount,
     },
   };
 }
@@ -8958,6 +9778,7 @@ const GOOGLE_OAUTH_NONCE_COOKIE_NAME = `${brand.id}_google_oauth_nonce`;
 const GOOGLE_OAUTH_PKCE_COOKIE_NAME = `${brand.id}_google_oauth_pkce`;
 const GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME = `${brand.id}_google_oauth_redirect_uri`;
 const GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME = `${brand.id}_google_oauth_country_code`;
+const GOOGLE_OAUTH_INTENT_COOKIE_NAME = `${brand.id}_google_oauth_intent`;
 const SESSION_DURATION_DAYS = 30;
 const AUTH_DEBUG = process.env.AUTH_DEBUG === "1";
 const GOOGLE_OIDC_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration";
@@ -11895,6 +12716,7 @@ type CameraInsertPayload = {
   state?: string | null;
   zip_code?: string | null;
   country?: string | null;
+  country_code?: string | null;
   retention_days?: number | null;
   webcam_index?: number | null;
   allowpublicaccess?: boolean | number | null;
@@ -11957,7 +12779,11 @@ async function createCameraForUser(
     connectionMethod
   );
   const allowPublicAccess = input.allowpublicaccess ? 1 : 0;
-  const normalizedGeo = normalizeCameraGeography(input.state, input.country);
+  const normalizedGeo = normalizeCameraGeography(
+    input.state,
+    input.country,
+    input.country_code
+  );
   const normalizedStructuredDescription = normalizeStructuredCameraDescription(
     input.description
   );
@@ -12051,6 +12877,542 @@ async function createCameraForUser(
     .run();
 
   return camera;
+}
+
+async function getCameraForUser(
+  db: D1Database,
+  userId: string,
+  cameraId: number | string
+) {
+  return db
+    .prepare("SELECT * FROM cameras WHERE id = ? AND user_id = ?")
+    .bind(cameraId, userId)
+    .first();
+}
+
+async function updateCameraForUser(
+  db: D1Database,
+  userId: string,
+  cameraId: number | string,
+  input: Record<string, unknown>,
+  options?: {
+    targetClientId?: string | null;
+    targetExeId?: string | null;
+  }
+) {
+  const camera = await getCameraForUser(db, userId, cameraId);
+  if (!camera) {
+    throw new Error("Camera not found");
+  }
+
+  const data: any = { ...input };
+  const existingCam: any = camera;
+  const requestedConnectionMethod =
+    typeof data.connection_method === "string" ? data.connection_method : null;
+  const effectiveConnectionMethod =
+    requestedConnectionMethod || existingCam.connection_method || "RTSP";
+  const normalizedGeo = normalizeCameraGeography(
+    data.state ?? existingCam.state,
+    data.country ?? existingCam.country,
+    data.country_code ?? existingCam.country_code
+  );
+
+  if (effectiveConnectionMethod !== "WEBCAM") {
+    const mergedRtspValues = {
+      rtsp_port: data.rtsp_port ?? existingCam.rtsp_port,
+      manufacturer: data.manufacturer ?? existingCam.manufacturer,
+      username: data.username ?? existingCam.username,
+      password: data.password ?? existingCam.password,
+      connection_method: effectiveConnectionMethod,
+    };
+    const missingRtspFields = validateRequiredRtspCameraFields(mergedRtspValues);
+    if (missingRtspFields.length > 0) {
+      throw new Error(`Missing required RTSP fields: ${missingRtspFields.join(", ")}`);
+    }
+  }
+
+  if (effectiveConnectionMethod !== "WEBCAM") {
+    delete data.webcam_index;
+  }
+
+  const updates: string[] = [];
+  const values: any[] = [];
+
+  Object.entries(data).forEach(([key, value]) => {
+    if (key === "store_frames") {
+      updates.push(`${key} = ?`);
+      values.push(1);
+    } else if (key === "retention_days") {
+      const validRetentionDays = [1, 3, 7, 15, 30, 90, 180];
+      const normalizedRetention = validRetentionDays.includes(value as number) ? value : 1;
+      updates.push(`${key} = ?`);
+      values.push(normalizedRetention);
+    } else if (key === "allowpublicaccess") {
+      updates.push(`${key} = ?`);
+      values.push(value ? 1 : 0);
+    } else if (key === "webcam_index") {
+      if (value === null) return;
+      updates.push(`${key} = ?`);
+      values.push(value);
+    } else if (key === "ip_address") {
+      updates.push(`${key} = ?`);
+      values.push(normalizeCameraTransportField(value) ?? "");
+    } else if (key === "name") {
+      let normalizedName = typeof value === "string" ? value.trim() : "";
+      if (existingCam.connection_method === "WEBCAM") {
+        const prefix = "Webcam ";
+        if (!normalizedName.toLowerCase().startsWith(prefix.toLowerCase())) {
+          normalizedName = prefix + normalizedName;
+        }
+      }
+      updates.push(`${key} = ?`);
+      values.push(normalizedName);
+    } else if (key === "channel" || key === "subtype") {
+      updates.push(`${key} = ?`);
+      values.push(normalizeOptionalCameraField(value));
+    } else if (
+      key === "rtsp_port" ||
+      key === "manufacturer" ||
+      key === "username" ||
+      key === "password"
+    ) {
+      updates.push(`${key} = ?`);
+      values.push(normalizeOptionalCameraField(value));
+    } else if (key === "state") {
+      updates.push("state = ?");
+      values.push(normalizedGeo.stateText);
+    } else if (key === "country") {
+      updates.push("country = ?");
+      values.push(normalizedGeo.countryText);
+    } else if (key === "country_code") {
+      return;
+    } else if (key === "description") {
+      const normalizedStructuredDescription = normalizeStructuredCameraDescription(value);
+      const rawDescription = typeof value === "string" ? value.trim() : "";
+      const persistedDescription = normalizedStructuredDescription ?? rawDescription;
+
+      updates.push("description = ?");
+      values.push(persistedDescription);
+
+      if (normalizedStructuredDescription) {
+        updates.push("description_first_check_successful = ?");
+        values.push(1);
+        updates.push("description_first_check_success_at = COALESCE(description_first_check_success_at, ?)");
+        values.push(new Date().toISOString());
+      } else {
+        updates.push("description_first_check_successful = ?");
+        values.push(0);
+        updates.push("description_first_check_success_at = ?");
+        values.push(null);
+      }
+    } else {
+      updates.push(`${key} = ?`);
+      values.push(value);
+    }
+  });
+
+  updates.push("state_code = ?");
+  values.push(normalizedGeo.stateCode);
+  updates.push("country_code = ?");
+  values.push(normalizedGeo.countryCode);
+
+  if (updates.length > 0) {
+    updates.push("updated_at = CURRENT_TIMESTAMP");
+    values.push(cameraId, userId);
+
+    await db
+      .prepare(`UPDATE cameras SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`)
+      .bind(...values)
+      .run();
+  }
+
+  const updatedCamera = await getCameraForUser(db, userId, cameraId);
+  const activeSubscription = await db
+    .prepare(
+      "SELECT * FROM subscriptions WHERE user_id = ? AND is_active = 1 LIMIT 1"
+    )
+    .bind(userId)
+    .first();
+
+  const subscriptionModelTier = activeSubscription
+    ? normalizeTier((activeSubscription as any).model_tier ?? (activeSubscription as any).plan_tier ?? "light")
+    : "light";
+  const subscriptionSecondsPerFrame = activeSubscription
+    ? Number((activeSubscription as any).seconds_per_frame ?? 3)
+    : 3;
+
+  const updatePayload = {
+    ...(updatedCamera as any),
+    analysis_speed: subscriptionSecondsPerFrame,
+    model_tier: subscriptionModelTier,
+  };
+
+  await db
+    .prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         target_client_id,
+         target_exe_id
+       )
+       VALUES (?, ?, 'update_camera', ?, ?, ?)`
+    )
+    .bind(
+      userId,
+      cameraId,
+      JSON.stringify(updatePayload),
+      options?.targetClientId || null,
+      options?.targetExeId || null
+    )
+    .run();
+
+  return updatedCamera;
+}
+
+type CameraImportApplyFailure = {
+  source_index: number;
+  source_reference: string;
+  reason: string;
+};
+
+function normalizeChatBatchCameraCount(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  return Math.min(100, Math.max(0, Math.trunc(numeric)));
+}
+
+function normalizeChatBatchCameraText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeChatBatchConnectionMethod(
+  value: unknown
+): CameraImportCandidate["connection_method"] {
+  const normalized = normalizeChatBatchCameraText(value).toUpperCase();
+  if (normalized === "HTTP" || normalized === "ONVIF") {
+    return normalized;
+  }
+  return "RTSP";
+}
+
+function normalizeChatBatchCameraItem(
+  value: unknown,
+  fallbackIndex: number
+): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const item: Record<string, unknown> = {};
+  const stringFields = [
+    "name",
+    "ip_address",
+    "rtsp_port",
+    "manufacturer",
+    "username",
+    "password",
+    "channel",
+    "subtype",
+    "description",
+    "street",
+    "number",
+    "city",
+    "state",
+    "zip_code",
+    "country",
+    "source_reference",
+  ] as const;
+
+  stringFields.forEach((field) => {
+    const normalized = normalizeChatBatchCameraText(source[field]);
+    if (normalized) {
+      item[field] = normalized;
+    }
+  });
+
+  const retentionDays = Number(source.retention_days);
+  if ([1, 3, 7, 15, 30, 90, 180].includes(retentionDays)) {
+    item.retention_days = retentionDays;
+  }
+
+  if (source.allowpublicaccess !== undefined) {
+    item.allowpublicaccess =
+      source.allowpublicaccess === true ||
+      source.allowpublicaccess === 1 ||
+      source.allowpublicaccess === "1";
+  }
+
+  const connectionMethod = normalizeChatBatchCameraText(source.connection_method);
+  if (connectionMethod) {
+    item.connection_method = normalizeChatBatchConnectionMethod(connectionMethod);
+  }
+
+  const sourceIndex = normalizeChatBatchCameraCount(source.source_index);
+  item.source_index = sourceIndex > 0 || source.source_index === 0 ? sourceIndex : fallbackIndex;
+  if (!item.source_reference) {
+    item.source_reference = `Camera ${fallbackIndex + 1}`;
+  }
+
+  const hasAnyValue = Object.keys(item).some(
+    (key) => !["source_index", "source_reference"].includes(key)
+  );
+  return hasAnyValue ? item : null;
+}
+
+function collectChatBatchSourceValues(values: Record<string, unknown>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values)
+      .map(([key, value]) => [key, normalizeChatBatchCameraText(value)] as const)
+      .filter(([, value]) => value.length > 0)
+  );
+}
+
+async function resolveUserCountryCodeForBatchImport(
+  db: D1Database,
+  userId: string
+): Promise<string> {
+  const row = await db
+    .prepare("SELECT country_code FROM app_users WHERE id = ? LIMIT 1")
+    .bind(userId)
+    .first()
+    .catch(() => null);
+  return normalizeCountryCode((row as any)?.country_code, null) || "BR";
+}
+
+async function enrichChatBatchItemAddress(
+  env: Env,
+  mergedValues: Record<string, unknown>,
+  userCountryCode: string,
+  cache: Map<string, Awaited<ReturnType<typeof lookupAddressByPostalCode>> | null>
+): Promise<Record<string, unknown>> {
+  const zipCode = normalizeChatBatchCameraText(mergedValues.zip_code);
+  if (!zipCode) {
+    return mergedValues;
+  }
+
+  const missingAddressFields = [
+    "street",
+    "city",
+    "state",
+    "country",
+  ].some((field) => !normalizeChatBatchCameraText(mergedValues[field]));
+  if (!missingAddressFields) {
+    return mergedValues;
+  }
+
+  let effectiveCountryCode =
+    normalizeCountryCode(mergedValues.country, null) || userCountryCode || null;
+  const digitsOnly = zipCode.replace(/\D+/g, "");
+  if (!effectiveCountryCode && digitsOnly.length === 8) {
+    effectiveCountryCode = "BR";
+  }
+  if (!effectiveCountryCode) {
+    return mergedValues;
+  }
+
+  const normalizedPostalCode = normalizePostalCodeForLookup(zipCode, effectiveCountryCode);
+  if (!normalizedPostalCode) {
+    return mergedValues;
+  }
+
+  const cacheKey = `${effectiveCountryCode}:${normalizedPostalCode}`;
+  if (!cache.has(cacheKey)) {
+    try {
+      const result = await lookupAddressByPostalCode(
+        env,
+        normalizedPostalCode,
+        effectiveCountryCode
+      );
+      cache.set(cacheKey, result);
+    } catch {
+      cache.set(cacheKey, null);
+    }
+  }
+
+  const addressResult = cache.get(cacheKey);
+  if (!addressResult?.found) {
+    return mergedValues;
+  }
+
+  return {
+    ...mergedValues,
+    zip_code: addressResult.postal_code || mergedValues.zip_code || "",
+    street: addressResult.street || mergedValues.street || "",
+    city: addressResult.city || mergedValues.city || "",
+    state: addressResult.state || mergedValues.state || "",
+    country: addressResult.country || mergedValues.country || "",
+  };
+}
+
+async function buildChatCameraBatchPreview(
+  env: Env,
+  userId: string,
+  input: {
+    expected_count?: number;
+    shared_defaults?: Record<string, unknown>;
+    items?: Array<Record<string, unknown>>;
+  }
+): Promise<CameraImportPreview> {
+  const expectedCount = normalizeChatBatchCameraCount(input.expected_count);
+  const sharedDefaults =
+    normalizeChatBatchCameraItem(input.shared_defaults || {}, 0) || {};
+  const rawItems = Array.isArray(input.items) ? input.items : [];
+  const normalizedItems = rawItems
+    .map((item, index) => normalizeChatBatchCameraItem(item, index))
+    .filter((item): item is Record<string, unknown> => !!item)
+    .slice(0, 100);
+
+  const userCountryCode = await resolveUserCountryCodeForBatchImport(env.DB, userId);
+  const addressCache = new Map<string, Awaited<ReturnType<typeof lookupAddressByPostalCode>> | null>();
+  const candidates: CameraImportCandidate[] = [];
+  const globalWarnings: string[] = [];
+
+  if (expectedCount > normalizedItems.length) {
+    globalWarnings.push(
+      `The batch expects ${expectedCount} camera(s), but only ${normalizedItems.length} item(s) were structured so far.`
+    );
+  }
+
+  for (let index = 0; index < normalizedItems.length; index += 1) {
+    const item = normalizedItems[index];
+    const mergedValues = await enrichChatBatchItemAddress(
+      env,
+      {
+        ...sharedDefaults,
+        ...item,
+      },
+      userCountryCode,
+      addressCache
+    );
+
+    const sourceIndex = normalizeChatBatchCameraCount(mergedValues.source_index);
+    const sourceReference =
+      normalizeChatBatchCameraText(mergedValues.source_reference) || `Camera ${index + 1}`;
+    const candidate: CameraImportCandidate = {
+      source_index: sourceIndex > 0 || mergedValues.source_index === 0 ? sourceIndex : index,
+      source_reference: sourceReference,
+      source_sheet_name: null,
+      source_row_number: null,
+      source_values: collectChatBatchSourceValues(mergedValues),
+      name: normalizeChatBatchCameraText(mergedValues.name),
+      ip_address: normalizeChatBatchCameraText(mergedValues.ip_address),
+      rtsp_port: normalizeChatBatchCameraText(mergedValues.rtsp_port),
+      manufacturer: normalizeChatBatchCameraText(mergedValues.manufacturer),
+      username: normalizeChatBatchCameraText(mergedValues.username),
+      password: normalizeChatBatchCameraText(mergedValues.password),
+      channel: normalizeChatBatchCameraText(mergedValues.channel) || null,
+      subtype: normalizeChatBatchCameraText(mergedValues.subtype) || null,
+      connection_method: normalizeChatBatchConnectionMethod(mergedValues.connection_method),
+      description: normalizeChatBatchCameraText(mergedValues.description) || null,
+      street: normalizeChatBatchCameraText(mergedValues.street),
+      number: normalizeChatBatchCameraText(mergedValues.number),
+      city: normalizeChatBatchCameraText(mergedValues.city),
+      state: normalizeChatBatchCameraText(mergedValues.state),
+      zip_code: normalizeChatBatchCameraText(mergedValues.zip_code),
+      country: normalizeChatBatchCameraText(mergedValues.country),
+      missing_fields: [],
+      defaulted_fields: [],
+      warnings: [],
+      can_create: false,
+      address_was_defaulted: false,
+    };
+    candidates.push(candidate);
+  }
+
+  return normalizeImportedPreview(
+    {
+      file_name: "chat-batch",
+      file_extension: "text",
+      source_format: "text",
+      total_rows_detected: normalizedItems.length,
+      rows_sent_to_llm: normalizedItems.length,
+      ready_count: 0,
+      incomplete_count: 0,
+      defaulted_address_count: 0,
+      skipped_count: 0,
+      global_warnings: globalWarnings,
+      missing_field_summary: {},
+      candidates,
+    },
+    userCountryCode
+  );
+}
+
+async function applyNormalizedCameraImportPreviewForUser(
+  db: D1Database,
+  userId: string,
+  normalizedPreview: CameraImportPreview,
+  options?: {
+    commandId?: number;
+    targetClientId?: string | null;
+    targetExeId?: string | null;
+  }
+): Promise<
+  CameraImportApplyResult & {
+    failed_candidates: CameraImportApplyFailure[];
+  }
+> {
+  const readyCandidates = normalizedPreview.candidates.filter((candidate) => candidate.can_create);
+  const createdCameraIds: number[] = [];
+  const failedCandidates: CameraImportApplyFailure[] = [];
+
+  for (const candidate of readyCandidates) {
+    try {
+      const created = await createCameraForUser(
+        db,
+        userId,
+        {
+          name: candidate.name,
+          ip_address: candidate.ip_address,
+          rtsp_port: candidate.rtsp_port,
+          manufacturer: candidate.manufacturer,
+          username: candidate.username,
+          password: candidate.password,
+          channel: candidate.channel || null,
+          subtype: candidate.subtype || null,
+          connection_method: candidate.connection_method,
+          description: candidate.description || null,
+          street: candidate.street,
+          number: candidate.number,
+          city: candidate.city,
+          state: candidate.state,
+          zip_code: candidate.zip_code,
+          country: candidate.country,
+          retention_days: 1,
+          allowpublicaccess: false,
+        },
+        {
+          targetClientId: options?.targetClientId || null,
+          targetExeId: options?.targetExeId || null,
+        }
+      );
+      const createdId = Number((created as any)?.id || 0);
+      if (Number.isInteger(createdId) && createdId > 0) {
+        createdCameraIds.push(createdId);
+      }
+    } catch (error) {
+      failedCandidates.push({
+        source_index: candidate.source_index,
+        source_reference: candidate.source_reference,
+        reason: error instanceof Error ? error.message : "Failed to create camera",
+      });
+    }
+  }
+
+  return {
+    command_id: Number(options?.commandId || 0),
+    applied_at: new Date().toISOString(),
+    created_count: createdCameraIds.length,
+    skipped_count: normalizedPreview.candidates.length - createdCameraIds.length,
+    created_camera_ids: createdCameraIds,
+    duplicate_source_indexes: [],
+    failed_candidates: failedCandidates,
+  };
 }
 
 // Helper to clear local session
@@ -13920,141 +15282,6 @@ app.post("/api/auth/local/login", async (c) => {
       userData && hasLocalPassword
         ? await bcrypt.compare(password, String(userData.password_hash || ""))
         : false;
-    const centralConfigured = isCentralIdentityClientConfigured(c.env);
-    const requiresCentralGrant = localUserRequiresCentralGrant(userData);
-
-    if (userData && passwordMatches && requiresCentralGrant) {
-      if (!localUserGrantAllowsOfflineLogin(userData)) {
-        if (!centralConfigured) {
-          return c.json({ error: "Account requires online verification." }, 401);
-        }
-      } else {
-        const now = new Date().toISOString();
-        await c.env.DB
-          .prepare(
-            `UPDATE local_users
-             SET last_login_at = ?,
-                 updated_at = ?
-             WHERE id = ?`
-          )
-          .bind(now, now, userData.id)
-          .run();
-
-        const appUserId = resolveCanonicalAppUserIdFromLocalUserRow(userData);
-        await ensureAppUserRow(c.env.DB, {
-          id: appUserId,
-          email: userData.email,
-          auth_provider: "local",
-          country_code: userData.country_code || null,
-          locale: userData.locale || null,
-        });
-
-        await createLocalAuthSession(c, Number(userData.id || 0));
-
-        return c.json({
-          success: true,
-          user: {
-            id: appUserId,
-            email: userData.email,
-            country_code: userData.country_code,
-          },
-        });
-      }
-    }
-
-    const canAttemptCentralMigration =
-      centralConfigured && Boolean(userData && passwordMatches && !requiresCentralGrant);
-    const canAttemptCentralLogin =
-      centralConfigured && (!userData || requiresCentralGrant || !passwordMatches);
-
-    let preferredMigrationHandle: string | null = null;
-    if (canAttemptCentralMigration && userData) {
-      const profile = await getAppUserProfile(
-        c.env.DB,
-        resolveCanonicalAppUserIdFromLocalUserRow(userData)
-      );
-      preferredMigrationHandle = profile.handle;
-    }
-
-    if (canAttemptCentralMigration || canAttemptCentralLogin) {
-      const targetPath = canAttemptCentralMigration
-        ? "/api/identity/migrate-login"
-        : "/api/identity/login";
-
-      let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
-      try {
-        centralResult = await callCentralIdentityEndpoint(c.env, targetPath, {
-          email,
-          password,
-          country_code: userData?.country_code || null,
-          ...(canAttemptCentralMigration && preferredMigrationHandle
-            ? { handle: preferredMigrationHandle }
-            : {}),
-        });
-      } catch (error) {
-        console.error("[AUTH] Central login request failed:", error);
-        if (!canAttemptCentralMigration) {
-          return c.json({ error: "Unable to reach the central identity server." }, 502);
-        }
-      }
-
-      if (centralResult) {
-        if (!centralResult.response.ok || !centralResult.verifiedGrant) {
-          const status = centralResult.response.status || 502;
-          const errorMessage = normalizeResponseErrorMessage(
-            centralResult.data,
-            "Central identity login failed."
-          );
-
-          if (canAttemptCentralMigration && status >= 500) {
-            // Preserve legacy local login if the server is temporarily unavailable.
-          } else {
-            return c.json({ error: errorMessage }, status as any);
-          }
-        } else {
-          const passwordHash = await bcrypt.hash(password, 10);
-          const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
-            email,
-            passwordHash,
-            countryCode:
-              normalizeCountryCode(centralResult.data?.user?.country_code, null) ||
-              userData?.country_code ||
-              null,
-            locale: userData?.locale || null,
-            serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
-            verifiedGrant: centralResult.verifiedGrant,
-            deviceSession: normalizeCentralIdentityDeviceSessionPayload(
-              centralResult.data?.device_session
-            ),
-          });
-
-          if (!centralResult.verifiedGrant.claims.login_allowed) {
-            return c.json(
-              {
-                error:
-                  centralResult.verifiedGrant.claims.reason ||
-                  "This account is not allowed to log in.",
-              },
-              403
-            );
-          }
-
-          await createLocalAuthSession(c, synced.localUserId);
-
-          return c.json({
-            success: true,
-            user: {
-              id: synced.canonicalUserId,
-              email,
-              country_code: (synced.localUser as any)?.country_code || userData?.country_code || null,
-              handle:
-                normalizeUserHandleInput(centralResult.data?.user?.handle) ||
-                deriveHandleFromEmail(email),
-            },
-          });
-        }
-      }
-    }
 
     if (!userData || !passwordMatches) {
       return c.json({ error: "Invalid email or password" }, 401);
@@ -14317,7 +15544,11 @@ app.get("/api/oauth/google/redirect_url", async (c) => {
       normalizeCountryCode(c.req.query("country_code"), null) ||
       normalizeCountryCode(c.req.header("CF-IPCountry"), null) ||
       null;
-    const redirectUrl = await createGoogleOAuthRedirectUrl(c, requestedCountryCode);
+    const requestedIntent = normalizeGoogleOAuthIntent(c.req.query("intent"));
+    const redirectUrl = await createGoogleOAuthRedirectUrl(c, {
+      countryCode: requestedCountryCode,
+      intent: requestedIntent,
+    });
     return c.json({ redirectUrl }, 200);
   } catch (error) {
     console.error("[GOOGLE LOGIN] Failed to build redirect URL:", error);
@@ -14346,19 +15577,21 @@ app.post("/api/sessions", async (c) => {
   try {
     const state = typeof body.state === "string" ? body.state : "";
     const googleUser = await exchangeGoogleAuthorizationCode(c, body.code, state);
-    const requestedCountryCode = normalizeCountryCode(
-      getCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME),
-      null
+    const googleIntent = normalizeGoogleOAuthIntent(
+      getCookie(c, GOOGLE_OAUTH_INTENT_COOKIE_NAME)
     );
+    const requestedCountryCode =
+      googleIntent === "signup"
+        ? normalizeCountryCode(getCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME), null)
+        : null;
     let effectiveGoogleCountryCode = requestedCountryCode;
-    const canonicalUserId = await resolveOrCreateGoogleAppUser(
-      c.env.DB,
-      googleUser,
-      requestedCountryCode
-    );
+    const canonicalUserId =
+      googleIntent === "signup"
+        ? await resolveOrCreateGoogleAppUser(c.env.DB, googleUser, requestedCountryCode)
+        : await resolveExistingGoogleAppUser(c.env.DB, googleUser);
     const googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
 
-    if (isCentralIdentityClientConfigured(c.env)) {
+    if (googleIntent === "signup" && isCentralIdentityClientConfigured(c.env)) {
       if (!googleUser.google_id_token) {
         clearGoogleOAuthFlowCookies(c);
         return c.json({ error: "Google login could not be verified for central identity." }, 502);
@@ -14445,6 +15678,7 @@ app.post("/api/sessions", async (c) => {
 
     const providerSubject = getGoogleSubject(googleUser);
     const sessionToken = await createGoogleSession(c.env.DB, canonicalUserId, providerSubject);
+    const responseCountryCode = effectiveGoogleCountryCode || googleProfile.country_code || null;
 
     setSessionCookie(
       c,
@@ -14463,7 +15697,7 @@ app.post("/api/sessions", async (c) => {
         id: canonicalUserId,
         email: googleUser.email,
         auth_provider: "google",
-        country_code: effectiveGoogleCountryCode,
+        country_code: responseCountryCode,
       }
     }, 200);
   } catch (error) {
@@ -14471,9 +15705,13 @@ app.post("/api/sessions", async (c) => {
     clearGoogleOAuthFlowCookies(c);
 
     if (shouldClearGoogleSessionOnAuthFailure(error)) {
+      const errorMessage =
+        error instanceof Error ? error.message : "Google login not allowed";
+      const status =
+        errorMessage.toLowerCase().includes("no local account found") ? 404 : 403;
       return c.json(
-        { error: error instanceof Error ? error.message : "Google login not allowed" },
-        403
+        { error: errorMessage },
+        status as any
       );
     }
 
@@ -17576,11 +18814,20 @@ app.post(
   async (c) => {
     const user = c.get("user")!;
     const data = c.req.valid("json");
+    const requestedCountryInput =
+      typeof data.country_code === "string" && data.country_code.trim()
+        ? data.country_code.trim()
+        : typeof data.country === "string" && data.country.trim()
+          ? data.country.trim()
+          : "";
     const effectiveCountryCode =
-      normalizeCountryCode(
-        data.country_code || data.country || (user as any)?.country_code,
-        null
-      ) || null;
+      requestedCountryInput
+        ? normalizeCountryCode(data.country_code || data.country, null) || null
+        : normalizeCountryCode((user as any)?.country_code, null) || null;
+
+    if (requestedCountryInput && !effectiveCountryCode) {
+      return c.json({ error: "A valid country is required for postal code lookup." }, 400);
+    }
 
     if (!effectiveCountryCode) {
       return c.json({ error: "A country is required for postal code lookup." }, 400);
@@ -17610,7 +18857,9 @@ app.post(
       const message =
         error instanceof Error ? error.message : "Failed to look up the postal code";
       const status =
-        message.includes("GOOGLE_GEOCODING_API_KEY") || message.includes("not configured")
+        message.includes("GEONAMES_USERNAME") ||
+        message.includes("GOOGLE_GEOCODING_API_KEY") ||
+        message.includes("not configured")
           ? 503
           : 502;
       return c.json({ error: message }, status);
@@ -17683,7 +18932,9 @@ app.post("/api/agent/address-lookup", async (c) => {
     const message =
       error instanceof Error ? error.message : "Failed to look up the postal code";
     const status =
-      message.includes("GOOGLE_GEOCODING_API_KEY") || message.includes("not configured")
+      message.includes("GEONAMES_USERNAME") ||
+      message.includes("GOOGLE_GEOCODING_API_KEY") ||
+      message.includes("not configured")
         ? 503
         : 502;
     return c.json({ error: message }, status);
@@ -17901,67 +19152,12 @@ app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) =>
   const userCountryCode =
     normalizeCountryCode((user as any)?.country_code, null) || "BR";
   const normalizedPreview = normalizeImportedPreview(preview, userCountryCode);
-  const readyCandidates = normalizedPreview.candidates.filter(
-    (candidate) => candidate.can_create
+  const applyResult = await applyNormalizedCameraImportPreviewForUser(
+    c.env.DB,
+    user.id,
+    normalizedPreview,
+    { commandId }
   );
-
-  const createdCameraIds: number[] = [];
-  const failedCandidates: Array<{
-    source_index: number;
-    source_reference: string;
-    reason: string;
-  }> = [];
-
-  for (const candidate of readyCandidates) {
-    try {
-      const created = await createCameraForUser(c.env.DB, user.id, {
-        name: candidate.name,
-        ip_address: candidate.ip_address,
-        rtsp_port: candidate.rtsp_port,
-        manufacturer: candidate.manufacturer,
-        username: candidate.username,
-        password: candidate.password,
-        channel: candidate.channel || null,
-        subtype: candidate.subtype || null,
-        connection_method: candidate.connection_method,
-        description: candidate.description || null,
-        street: candidate.street,
-        number: candidate.number,
-        city: candidate.city,
-        state: candidate.state,
-        zip_code: candidate.zip_code,
-        country: candidate.country,
-        retention_days: 1,
-        allowpublicaccess: false,
-      });
-      const createdId = Number((created as any)?.id || 0);
-      if (Number.isInteger(createdId) && createdId > 0) {
-        createdCameraIds.push(createdId);
-      }
-    } catch (error) {
-      failedCandidates.push({
-        source_index: candidate.source_index,
-        source_reference: candidate.source_reference,
-        reason: error instanceof Error ? error.message : "Failed to create camera",
-      });
-    }
-  }
-
-  const applyResult: CameraImportApplyResult & {
-    failed_candidates: Array<{
-      source_index: number;
-      source_reference: string;
-      reason: string;
-    }>;
-  } = {
-    command_id: commandId,
-    applied_at: new Date().toISOString(),
-    created_count: createdCameraIds.length,
-    skipped_count: normalizedPreview.candidates.length - createdCameraIds.length,
-    created_camera_ids: createdCameraIds,
-    duplicate_source_indexes: [],
-    failed_candidates: failedCandidates,
-  };
 
   await c.env.DB
     .prepare(
@@ -18101,182 +19297,37 @@ app.patch("/api/cameras/:id", anyAuthMiddleware, zValidator("json", UpdateCamera
   const user = c.get("user")!;
   const id = c.req.param("id");
   const dataRaw = c.req.valid("json");
-  const data: any = { ...dataRaw };
-
-  const camera = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .first();
-
-  if (!camera) {
-    return c.json({ error: "Camera not found" }, 404);
-  }
-
-  const existingCam: any = camera;
-  const requestedConnectionMethod =
-    typeof data.connection_method === "string" ? data.connection_method : null;
-  const effectiveConnectionMethod = requestedConnectionMethod || existingCam.connection_method || "RTSP";
-  const normalizedGeo = normalizeCameraGeography(
-    data.state ?? existingCam.state,
-    data.country ?? existingCam.country
-  );
-  if (effectiveConnectionMethod !== "WEBCAM") {
-    const mergedRtspValues = {
-      rtsp_port: data.rtsp_port ?? existingCam.rtsp_port,
-      manufacturer: data.manufacturer ?? existingCam.manufacturer,
-      username: data.username ?? existingCam.username,
-      password: data.password ?? existingCam.password,
-      connection_method: effectiveConnectionMethod,
-    };
-    const missingRtspFields = validateRequiredRtspCameraFields(mergedRtspValues);
-    if (missingRtspFields.length > 0) {
+  try {
+    const updatedCamera = await updateCameraForUser(
+      c.env.DB,
+      user.id,
+      id,
+      dataRaw as Record<string, unknown>
+    );
+    return c.json(updatedCamera);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to update camera";
+    if (message === "Camera not found") {
+      return c.json({ error: message }, 404);
+    }
+    if (message.startsWith("Missing required RTSP fields:")) {
+      const missingFields = message
+        .replace("Missing required RTSP fields:", "")
+        .split(",")
+        .map((field) => field.trim())
+        .filter(Boolean);
       return c.json(
         {
-          error: `Missing required RTSP fields: ${missingRtspFields.join(", ")}`,
-          missing_fields: missingRtspFields,
+          error: message,
+          missing_fields: missingFields,
         },
         400
       );
     }
+
+    console.error("[PATCH /api/cameras/:id] Failed to update camera:", error);
+    return c.json({ error: message }, 500);
   }
-
-  // Don't apply webcam_index updates for RTSP cameras
-  const cam: any = camera;
-  if (cam.connection_method !== "WEBCAM") {
-    delete data.webcam_index;
-  }
-
-  const updates: string[] = [];
-  const values: any[] = [];
-
-  // Process each field, normalizing store_frames and retention_days
-  Object.entries(data).forEach(([key, value]) => {
-    if (key === "store_frames") {
-      // Always force store_frames to true
-      updates.push(`${key} = ?`);
-      values.push(1);
-    } else if (key === "retention_days") {
-      // Validate retention_days is one of the allowed values
-      const validRetentionDays = [1, 3, 7, 15, 30, 90, 180];
-      const normalizedRetention = validRetentionDays.includes(value as number) ? value : 1;
-      updates.push(`${key} = ?`);
-      values.push(normalizedRetention);
-    } else if (key === "allowpublicaccess") {
-      // Handle allowpublicaccess updates (boolean to integer)
-      updates.push(`${key} = ?`);
-      values.push(value ? 1 : 0);
-    } else if (key === "webcam_index") {
-      // Skip if value is null (don't write null redundantly)
-      if (value === null) return;
-      updates.push(`${key} = ?`);
-      values.push(value);
-    } else if (key === "ip_address") {
-      updates.push(`${key} = ?`);
-      values.push(normalizeCameraTransportField(value) ?? "");
-    } else if (key === "name") {
-      // Normalize name for webcam cameras: ensure "Webcam " prefix
-      let normalizedName = (value as string).trim();
-      const cam: any = camera;
-      if (cam.connection_method === "WEBCAM") {
-        const prefix = "Webcam ";
-        if (!normalizedName.toLowerCase().startsWith(prefix.toLowerCase())) {
-          normalizedName = prefix + normalizedName;
-        }
-      }
-      updates.push(`${key} = ?`);
-      values.push(normalizedName);
-    } else if (key === "channel" || key === "subtype") {
-      updates.push(`${key} = ?`);
-      values.push(normalizeOptionalCameraField(value));
-    } else if (key === "rtsp_port" || key === "manufacturer" || key === "username" || key === "password") {
-      updates.push(`${key} = ?`);
-      values.push(normalizeOptionalCameraField(value));
-    } else if (key === "state") {
-      updates.push("state = ?");
-      values.push(normalizedGeo.stateText);
-    } else if (key === "country") {
-      updates.push("country = ?");
-      values.push(normalizedGeo.countryText);
-    } else if (key === "description") {
-      const normalizedStructuredDescription = normalizeStructuredCameraDescription(value);
-      const rawDescription =
-        typeof value === "string" ? value.trim() : "";
-      const persistedDescription = normalizedStructuredDescription ?? rawDescription;
-
-      updates.push("description = ?");
-      values.push(persistedDescription);
-
-      if (normalizedStructuredDescription) {
-        updates.push("description_first_check_successful = ?");
-        values.push(1);
-        updates.push("description_first_check_success_at = COALESCE(description_first_check_success_at, ?)");
-        values.push(new Date().toISOString());
-      } else {
-        updates.push("description_first_check_successful = ?");
-        values.push(0);
-        updates.push("description_first_check_success_at = ?");
-        values.push(null);
-      }
-    } else {
-      updates.push(`${key} = ?`);
-      values.push(value);
-    }
-  });
-
-  updates.push("state_code = ?");
-  values.push(normalizedGeo.stateCode);
-  updates.push("country_code = ?");
-  values.push(normalizedGeo.countryCode);
-
-  if (updates.length > 0) {
-    updates.push("updated_at = CURRENT_TIMESTAMP");
-    values.push(id, user.id);
-
-    await c.env.DB.prepare(
-      `UPDATE cameras SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`
-    )
-      .bind(...values)
-      .run();
-  }
-
-  const updatedCamera = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .first();
-
-  // Get subscription to determine analysis_speed and model_tier for update_camera command
-  const activeSubscription = await c.env.DB.prepare(
-    "SELECT * FROM subscriptions WHERE user_id = ? AND is_active = 1 LIMIT 1"
-  )
-    .bind(user.id)
-    .first();
-
-  const subscriptionModelTier = activeSubscription
-    ? normalizeTier((activeSubscription as any).model_tier ?? (activeSubscription as any).plan_tier ?? "light")
-    : "light";
-
-  const subscriptionSecondsPerFrame = activeSubscription
-    ? Number((activeSubscription as any).seconds_per_frame ?? 3)
-    : 3;
-
-  // Build payload with subscription-based analysis_speed and model_tier
-  const updatePayload = {
-    ...(updatedCamera as any),
-    analysis_speed: subscriptionSecondsPerFrame,
-    model_tier: subscriptionModelTier,
-  };
-
-  // Create command for EXE
-  await c.env.DB.prepare(
-    `INSERT INTO commands (user_id, camera_id, command_type, payload)
-     VALUES (?, ?, 'update_camera', ?)`
-  )
-    .bind(user.id, id, JSON.stringify(updatePayload))
-    .run();
-
-  return c.json(updatedCamera);
 });
 
 app.delete("/api/cameras/:id", anyAuthMiddleware, async (c) => {
@@ -24402,22 +25453,30 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
     mergedDraft.connection_method = "RTSP";
   }
 
+  let effectiveCountryCode =
+    normalizeCountryCode(
+      mergedDraft.country_code || mergedDraft.country || (user as any)?.country_code,
+      null
+    ) || null;
   const zipCode = normalizeOptionalCameraField(mergedDraft.zip_code);
+  if (!effectiveCountryCode) {
+    const digitsOnly = (zipCode || "").replace(/\D+/g, "");
+    if (digitsOnly.length === 8) {
+      effectiveCountryCode = "BR";
+    }
+  }
+  if (!normalizeOptionalCameraField(mergedDraft.country) && effectiveCountryCode) {
+    mergedDraft.country = resolveCountryDisplayName(effectiveCountryCode) || "";
+  }
+  if (!normalizeOptionalCameraField(mergedDraft.country_code) && effectiveCountryCode) {
+    mergedDraft.country_code = effectiveCountryCode;
+  }
   const missingAddressBeforeLookup = buildRequiredCameraAddressFields(mergedDraft);
   if (
     zipCode &&
     missingAddressBeforeLookup.some((field) =>
       field === "street" || field === "city" || field === "state" || field === "country")
   ) {
-    let effectiveCountryCode =
-      normalizeCountryCode(mergedDraft.country, null) || null;
-    if (!effectiveCountryCode) {
-      const digitsOnly = zipCode.replace(/\D+/g, "");
-      if (digitsOnly.length === 8) {
-        effectiveCountryCode = "BR";
-      }
-    }
-
     if (effectiveCountryCode) {
       try {
         const addressResult = await lookupAddressByPostalCode(
@@ -24432,7 +25491,13 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
             street: addressResult.street || mergedDraft.street || "",
             city: addressResult.city || mergedDraft.city || "",
             state: addressResult.state || mergedDraft.state || "",
-            country: addressResult.country || mergedDraft.country || "",
+            country:
+              addressResult.country ||
+              mergedDraft.country ||
+              resolveCountryDisplayName(effectiveCountryCode) ||
+              "",
+            country_code:
+              addressResult.country_code || mergedDraft.country_code || effectiveCountryCode,
           };
         }
       } catch (error) {
@@ -24639,6 +25704,232 @@ app.post("/api/chat/sessions/:id/camera-registration/confirm", anyAuthMiddleware
         .filter(Boolean);
       return c.json({ error: message, missing_fields: missingRtspFields }, 400);
     }
+    return c.json({ error: message }, 500);
+  }
+});
+
+app.post("/api/chat/sessions/:id/camera-batch-registration/confirm", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const sessionId = Number(c.req.param("id"));
+  const body = await c.req.json<{
+    source_message_id?: number;
+  }>().catch(() => null);
+
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    return c.json({ error: "Invalid session id" }, 400);
+  }
+
+  const sourceMessageId = Number(body?.source_message_id || 0);
+  if (!Number.isInteger(sourceMessageId) || sourceMessageId <= 0) {
+    return c.json({ error: "source_message_id is required" }, 400);
+  }
+
+  const session = await c.env.DB.prepare(
+    "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?"
+  )
+    .bind(sessionId, user.id)
+    .first();
+
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  const sourceMessage = await c.env.DB.prepare(
+    `SELECT id, camera_selection_json
+     FROM chat_messages
+     WHERE id = ? AND user_id = ? AND session_id = ? AND role = 'assistant'
+     LIMIT 1`
+  )
+    .bind(sourceMessageId, user.id, sessionId)
+    .first();
+
+  if (!sourceMessage) {
+    return c.json({ error: "Draft message not found" }, 404);
+  }
+
+  const parsedSourceMetadata = normalizeChatCameraBatchRegistrationMetadata(
+    parseCommandJsonColumn((sourceMessage as any).camera_selection_json)
+  );
+  if (!parsedSourceMetadata) {
+    return c.json({ error: "This message does not contain a camera batch draft" }, 409);
+  }
+  if (parsedSourceMetadata.status === "registered") {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC"
+    )
+      .bind(user.id, sessionId)
+      .all();
+    return c.json({ error: "This camera batch draft was already registered", messages: results }, 409);
+  }
+
+  const userCountryCode =
+    normalizeCountryCode((user as any)?.country_code, null) || "BR";
+  const normalizedPreview = normalizeImportedPreview(
+    parsedSourceMetadata.preview,
+    userCountryCode
+  );
+
+  if (!Array.isArray(normalizedPreview.candidates) || normalizedPreview.candidates.length === 0) {
+    return c.json({ error: "The camera batch preview is empty" }, 409);
+  }
+
+  if (Number(normalizedPreview.incomplete_count || 0) > 0) {
+    return c.json(
+      {
+        error: "The camera batch still has incomplete items",
+        preview: normalizedPreview,
+      },
+      400
+    );
+  }
+
+  if (Number(normalizedPreview.ready_count || 0) <= 0) {
+    return c.json({ error: "No cameras are ready to register in this batch" }, 400);
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    const applyResult = await applyNormalizedCameraImportPreviewForUser(
+      c.env.DB,
+      user.id,
+      normalizedPreview,
+      {
+        targetClientId: parsedSourceMetadata.target_client_id || null,
+        targetExeId: null,
+      }
+    );
+
+    const updatedSourceMetadata = buildChatCameraBatchRegisteredMetadata(
+      {
+        ...parsedSourceMetadata,
+        preview: normalizedPreview,
+      },
+      applyResult
+    );
+
+    await c.env.DB.prepare(
+      `UPDATE chat_messages
+       SET camera_selection_json = ?, updated_at = ?
+       WHERE id = ? AND user_id = ? AND session_id = ?`
+    )
+      .bind(
+        JSON.stringify(updatedSourceMetadata),
+        now,
+        sourceMessageId,
+        user.id,
+        sessionId
+      )
+      .run();
+
+    const contextRow = await c.env.DB.prepare(
+      `SELECT compact_context_json, task_state_json, last_compacted_message_id, token_estimate
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+      .bind(user.id, sessionId)
+      .first();
+
+    const compactContext = normalizeChatCompactContext(
+      parseCommandJsonColumn((contextRow as any)?.compact_context_json)
+    );
+    const taskState = normalizeChatTaskState(
+      parseCommandJsonColumn((contextRow as any)?.task_state_json)
+    );
+    const completedTaskState = buildChatCreateCameraBatchCompletedTaskState(
+      taskState,
+      updatedSourceMetadata,
+      applyResult
+    );
+
+    await c.env.DB.prepare(
+      `INSERT INTO chat_session_contexts (
+         user_id,
+         session_id,
+         compact_context_json,
+         task_state_json,
+         last_compacted_message_id,
+         token_estimate,
+         compacted_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, session_id) DO UPDATE SET
+         compact_context_json = excluded.compact_context_json,
+         task_state_json = excluded.task_state_json,
+         last_compacted_message_id = excluded.last_compacted_message_id,
+         token_estimate = excluded.token_estimate,
+         compacted_at = excluded.compacted_at,
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        user.id,
+        sessionId,
+        JSON.stringify(compactContext),
+        JSON.stringify(completedTaskState),
+        Math.max(0, Number((contextRow as any)?.last_compacted_message_id || 0)),
+        Math.max(0, Number((contextRow as any)?.token_estimate || 0)),
+        (contextRow as any)?.compacted_at || now,
+        now
+      )
+      .run();
+
+    await c.env.DB.prepare(
+      `INSERT INTO chat_messages (
+         user_id,
+         session_id,
+         role,
+         content,
+         camera_ids,
+         tokens_used,
+         message_type,
+         is_pending,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'assistant', ?, ?, 0, 'final', 0, ?, ?)`
+    )
+      .bind(
+        user.id,
+        sessionId,
+        buildChatCameraBatchRegistrationSuccessMessage(
+          parsedSourceMetadata.language,
+          updatedSourceMetadata,
+          applyResult
+        ),
+        Array.isArray(applyResult.created_camera_ids) && applyResult.created_camera_ids.length > 0
+          ? applyResult.created_camera_ids.join(",")
+          : null,
+        now,
+        now
+      )
+      .run();
+
+    await c.env.DB.prepare(
+      `UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    )
+      .bind(sessionId)
+      .run();
+
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC"
+    )
+      .bind(user.id, sessionId)
+      .all();
+
+    wsHandler.broadcast(sessionId, {
+      type: "message_update",
+      messages: results,
+    });
+
+    return c.json({
+      ok: true,
+      messages: results,
+      apply_result: applyResult,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to create camera batch";
     return c.json({ error: message }, 500);
   }
 });
@@ -24904,6 +26195,9 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
       "video_search",
       "explain_app",
       "create_camera",
+      "edit_camera",
+      "create_cameras_batch",
+      "scan_network",
       "create_job",
       "create_camera_agent",
       "read_state",
@@ -31465,7 +32759,7 @@ app.get("/api/agent/cameras", async (c) => {
 
   // Query all cameras for this user
   const { results } = await c.env.DB.prepare(
-    `SELECT id, name, description
+    `SELECT id, name, description, ip_address, manufacturer, connection_method, channel, subtype
      FROM cameras
      WHERE user_id = ?
      ORDER BY created_at ASC`
@@ -31474,6 +32768,91 @@ app.get("/api/agent/cameras", async (c) => {
     .all();
 
   return c.json(results || []);
+});
+
+app.get("/api/agent/cameras/:id", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const cameraId = c.req.param("id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const camera = await getCameraForUser(c.env.DB, pairing.userId, cameraId);
+  if (!camera) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+
+  return c.json(camera);
+});
+
+app.post("/api/agent/camera-batches/preview", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{
+      expected_count?: number;
+      shared_defaults?: Record<string, unknown>;
+      items?: Array<Record<string, unknown>>;
+      language?: string;
+    }>()
+    .catch(() => null);
+
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  try {
+    const preview = await buildChatCameraBatchPreview(c.env, pairing.userId, {
+      expected_count: body.expected_count,
+      shared_defaults:
+        body.shared_defaults && typeof body.shared_defaults === "object" && !Array.isArray(body.shared_defaults)
+          ? body.shared_defaults
+          : {},
+      items: Array.isArray(body.items) ? body.items : [],
+    });
+
+    return c.json({
+      ok: true,
+      expected_count: normalizeChatBatchCameraCount(body.expected_count),
+      preview,
+    });
+  } catch (error) {
+    console.error("[POST /api/agent/camera-batches/preview] Failed to build preview:", error);
+    return c.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to prepare the camera batch preview",
+      },
+      500
+    );
+  }
 });
 
 app.post("/api/agent/cameras", async (c) => {
@@ -31529,6 +32908,73 @@ app.post("/api/agent/cameras", async (c) => {
     }
 
     console.error("[POST /api/agent/cameras] Failed to create camera:", error);
+    return c.json({ error: message }, 500);
+  }
+});
+
+app.patch("/api/agent/cameras/:id", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const cameraId = c.req.param("id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const rawBody = await c.req.json().catch(() => null);
+  const parsed = UpdateCameraSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: "Validation failed",
+        details: parsed.error.issues,
+      },
+      400
+    );
+  }
+
+  try {
+    const updatedCamera = await updateCameraForUser(
+      c.env.DB,
+      pairing.userId,
+      cameraId,
+      parsed.data as Record<string, unknown>,
+      {
+        targetClientId: pairing.clientId,
+        targetExeId: pairing.exeId,
+      }
+    );
+    return c.json(updatedCamera);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to update camera";
+    if (message === "Camera not found") {
+      return c.json({ error: message }, 404);
+    }
+    if (message.startsWith("Missing required RTSP fields:")) {
+      const missingFields = message
+        .replace("Missing required RTSP fields:", "")
+        .split(",")
+        .map((field) => field.trim())
+        .filter(Boolean);
+      return c.json(
+        {
+          error: message,
+          missing_fields: missingFields,
+        },
+        400
+      );
+    }
+
+    console.error("[PATCH /api/agent/cameras/:id] Failed to update camera:", error);
     return c.json({ error: message }, 500);
   }
 });

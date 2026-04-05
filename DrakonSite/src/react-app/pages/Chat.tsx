@@ -6,7 +6,10 @@ import ChatInput from "@/react-app/components/ChatInput";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
+import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
+import ChatCameraEditCard from "@/react-app/components/ChatCameraEditCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
 import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
@@ -18,9 +21,13 @@ import { ChatMessage, ChatSession } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
 import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lucide-react";
 import {
+  type CameraEditFormRequestMessageMetadata,
   extractHitMediaFromMessage,
+  extractCameraEditFormRequestFromMessage,
   extractCameraNetworkScanFromMessage,
+  extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
+  applyCameraEditDraftToCamera,
   extractChatProgressFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
@@ -78,6 +85,8 @@ export default function Chat() {
     message: string;
     type: "success" | "error" | "warning" | "info";
   } | null>(null);
+  const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
+  const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
   const [openHeaderDropdown, setOpenHeaderDropdown] = useState<ChatHeaderDropdown>(null);
   const [isHeaderGhostedWhileScrolling, setIsHeaderGhostedWhileScrolling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -99,7 +108,7 @@ export default function Chat() {
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
   }, []);
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, cancelMessage } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, cancelMessage } = usePerceptrumChatSession({
     sessionId: activeSessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -112,6 +121,33 @@ export default function Chat() {
       : pendingExecutionState.kind === "stale"
         ? "Desktop agent connection looks stale. Make sure the EXE is open and still connected."
         : null;
+
+  const openChatEditForm = async (
+    cameraId: number,
+    cameraDraftMetadata: CameraEditFormRequestMessageMetadata
+  ) => {
+    if (!cameraDraftMetadata) return;
+
+    const response = await fetch(`/api/cameras/${cameraId}`, {
+      credentials: "include",
+    });
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        typeof (data as any)?.error === "string"
+          ? (data as any).error
+          : "Failed to load the camera for editing."
+      );
+    }
+
+    const mergedCamera = applyCameraEditDraftToCamera(
+      data as CameraEditorCamera,
+      cameraDraftMetadata
+    );
+    setChatEditModalCamera(mergedCamera);
+    setIsChatEditModalOpen(true);
+  };
 
   useEffect(() => {
     return () => {
@@ -570,6 +606,8 @@ export default function Chat() {
 
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
+    const cameraBatchRegistrationDraft = extractCameraBatchRegistrationDraftFromMessage(message);
+    const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
 
@@ -591,6 +629,24 @@ export default function Chat() {
                   sourceMessageId,
                   draft,
                 })
+              }
+            />
+          ) : cameraBatchRegistrationDraft ? (
+            <ChatCameraBatchRegistrationCard
+              messageId={message.id}
+              metadata={cameraBatchRegistrationDraft}
+              onSubmit={(sourceMessageId) =>
+                submitCameraBatchRegistration({
+                  sessionIdOverride: activeSessionId,
+                  sourceMessageId,
+                })
+              }
+            />
+          ) : cameraEditFormRequest ? (
+            <ChatCameraEditCard
+              metadata={cameraEditFormRequest}
+              onOpen={() =>
+                openChatEditForm(cameraEditFormRequest.camera_id, cameraEditFormRequest)
               }
             />
           ) : cameraNetworkScan ? (
@@ -919,7 +975,7 @@ export default function Chat() {
                   onVideoRemove={() => setUploadedVideo(null)}
                 />
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
-                  <span>Drakon Chat can make mistakes. Consider verifying important details.</span>
+                  <span>{`${brand.chatName} can make mistakes. Consider verifying important details.`}</span>
                   {billingEnabled ? (
                     <span>
                       Token usage is tracked in{" "}
@@ -935,6 +991,22 @@ export default function Chat() {
           </div>
         </div>
       </div>
+
+      <CameraEditorModal
+        isOpen={isChatEditModalOpen}
+        camera={chatEditModalCamera}
+        onClose={() => {
+          setIsChatEditModalOpen(false);
+          setChatEditModalCamera(null);
+        }}
+        onSaved={(saved) => {
+          const savedName = saved?.cameraName || chatEditModalCamera?.name || "camera";
+          setToast({
+            message: `Camera ${savedName} updated.`,
+            type: "success",
+          });
+        }}
+      />
 
       {deletingSessionId !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">

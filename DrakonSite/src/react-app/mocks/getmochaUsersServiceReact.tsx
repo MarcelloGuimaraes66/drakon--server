@@ -18,10 +18,17 @@ type AuthUser = {
   google_user_data?: any;
 };
 
+type GoogleAuthIntent = "login" | "signup";
+
+type GoogleAuthRedirectOptions = {
+  intent?: GoogleAuthIntent;
+  countryCode?: string | null;
+};
+
 type AuthContextValue = {
   user: AuthUser | null;
   isPending: boolean;
-  redirectToLogin: (countryCode?: string | null) => Promise<void>;
+  redirectToLogin: (options?: GoogleAuthRedirectOptions) => Promise<void>;
   exchangeCodeForSessionToken: () => Promise<AuthUser | null>;
   logout: () => Promise<void>;
 };
@@ -76,13 +83,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loadUser();
   }, [loadUser]);
 
-  const redirectToLogin = useCallback(async (countryCode?: string | null) => {
+  const redirectToLogin = useCallback(async (options?: GoogleAuthRedirectOptions) => {
     const isDesktopHosted = isDesktopHostedShell();
     const params = new URLSearchParams();
-    const normalizedCountryCode = countryCode?.trim().toUpperCase() || "";
+    const normalizedIntent: GoogleAuthIntent =
+      options?.intent === "signup" ? "signup" : "login";
+    const normalizedCountryCode =
+      normalizedIntent === "signup"
+        ? options?.countryCode?.trim().toUpperCase() || ""
+        : "";
     if (isDesktopHosted) {
       params.set("desktop_host", "1");
     }
+    params.set("intent", normalizedIntent);
     if (normalizedCountryCode) {
       params.set("country_code", normalizedCountryCode);
     }
@@ -122,7 +135,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     const state = params.get("state");
+    const errorDescription = params.get("error_description");
+    const errorCode = params.get("error");
     if (!code) {
+      const authErrorMessage =
+        errorDescription?.trim() ||
+        errorCode?.trim()?.replace(/_/g, " ") ||
+        "";
+      if (authErrorMessage) {
+        throw new Error(authErrorMessage);
+      }
       return null;
     }
 

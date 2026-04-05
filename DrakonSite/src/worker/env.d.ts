@@ -9,6 +9,7 @@ declare global {
     GOOGLE_OAUTH_REDIRECT_URI?: string;
     DESKTOP_GOOGLE_OAUTH_REDIRECT_URI?: string;
     GOOGLE_GEOCODING_API_KEY?: string;
+    GEONAMES_USERNAME?: string;
     STRIPE_SECRET_KEY: string;
     STRIPE_WEBHOOK_SECRET: string;
     STRIPE_CHAT_PAYG_PRICE_ID: string;

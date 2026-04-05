@@ -282,6 +282,7 @@ int progressStepCountForSkill_(const std::string& skillName)
 {
     if (skillName == "video_search") return 5;
     if (skillName == "explain_app") return 4;
+    if (skillName == "create_cameras_batch") return 3;
     if (skillName == "scan_network") return 3;
     if (skillName == "read_state") return 3;
     if (skillName == "general_answer") return 2;
@@ -502,6 +503,13 @@ std::string skillFromSemanticSelection_(
     const SkillSelection& selection,
     const nlohmann::json& conversationContext)
 {
+    if (selection.selectedSkill == "create_cameras_batch") {
+        return "create_cameras_batch";
+    }
+    if (selection.selectedSkill == "edit_camera") {
+        return "edit_camera";
+    }
+
     if (selection.continueActiveTask) {
         const std::string activeTask = activeOperationTaskType(conversationContext);
         if (!activeTask.empty()) {
@@ -523,6 +531,9 @@ std::string skillFromSemanticSelection_(
     }
     if (entity == "state" || mode == "read" || intent == "read") {
         return "read_state";
+    }
+    if (entity == "camera" && intent == "update") {
+        return "edit_camera";
     }
     if (entity == "camera" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_camera";
@@ -560,6 +571,7 @@ bool shouldSemanticSkillOverrideSelected_(
         selection.mode == "operate" ||
         selection.mode == "read" ||
         selection.intent == "create" ||
+        selection.intent == "update" ||
         selection.intent == "continue" ||
         selection.intent == "inspect" ||
         selection.intent == "read";
@@ -569,6 +581,8 @@ bool shouldSemanticSkillOverrideSelected_(
     }
 
     return semanticSkill == "create_camera" ||
+        semanticSkill == "edit_camera" ||
+        semanticSkill == "create_cameras_batch" ||
         semanticSkill == "create_camera_agent" ||
         semanticSkill == "create_job" ||
         semanticSkill == "scan_network" ||
@@ -628,6 +642,7 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.operationType.empty() &&
         (selection.selectedSkill == "create_camera" ||
+         selection.selectedSkill == "create_cameras_batch" ||
          selection.selectedSkill == "create_camera_agent" ||
          selection.selectedSkill == "create_job" ||
          selection.selectedSkill == "scan_network")) {
@@ -636,6 +651,7 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.intent.empty()) {
         if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "create_cameras_batch" ||
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job") {
             selection.intent = selection.continueActiveTask ? "continue" : "create";
@@ -659,6 +675,7 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.mode.empty()) {
         if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "create_cameras_batch" ||
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job" ||
             selection.selectedSkill == "scan_network" ||
@@ -1025,15 +1042,27 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         SkillSelection unavailableSelection;
         unavailableSelection.selectedSkill = "unavailable";
         unavailableSelection.confidence = 0.0;
-        unavailableSelection.reason = llmReady ? std::string() : "missing_chat_model_credentials";
-        unavailableSelection.replyPreview = "Local assistant unavailable.";
+        unavailableSelection.reason = llmReady
+            ? (selection.reason.empty() ? "router_failed" : selection.reason)
+            : "missing_chat_model_credentials";
+        unavailableSelection.replyPreview =
+            unavailableSelection.reason == "router_failed"
+                ? buildRouterFailureAnswer_(appLanguageFromPayload_(payload))
+                : buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
         recordRoutingTelemetry_(agent, payload, unavailableSelection, "actual", "orchestrator_query");
 
         SkillRunResult unavailable;
         unavailable.status = SkillExecutionStatus::Completed;
         unavailable.skillName = "orchestrator";
-        unavailable.answer = buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
-        finalizeAsChatMessage_(agent, payload, SkillSelection{}, unavailable);
+        unavailable.answer =
+            unavailableSelection.reason == "router_failed"
+                ? buildRouterFailureAnswer_(appLanguageFromPayload_(payload))
+                : buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
+        unavailable.metadata = {
+            { "error_type", unavailableSelection.reason == "router_failed" ? "router_failure" : "assistant_unavailable" },
+            { "selection_reason", unavailableSelection.reason },
+        };
+        finalizeAsChatMessage_(agent, payload, unavailableSelection, unavailable);
         return;
     }
 
@@ -1127,6 +1156,9 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         if (selection.selectedSkill == "create_camera") {
             result.answer = buildComingSoonAnswer_(languageHint, "camera_creation");
         }
+        else if (selection.selectedSkill == "create_cameras_batch") {
+            result.answer = buildComingSoonAnswer_(languageHint, "camera_creation");
+        }
         else if (selection.selectedSkill == "create_job") {
             result.answer = buildComingSoonAnswer_(languageHint, "job_creation");
         }
@@ -1181,8 +1213,13 @@ void ChatV2Orchestrator::handleShadowQuery(
     if (selection.selectedSkill.empty()) {
         selection.selectedSkill = "unavailable";
         selection.confidence = 0.0;
-        selection.reason = llm.isConfigured() ? std::string() : "missing_chat_model_credentials";
-        selection.replyPreview = buildLlmUnavailableAnswer_();
+        selection.reason = llm.isConfigured()
+            ? (selection.reason.empty() ? "router_failed" : selection.reason)
+            : "missing_chat_model_credentials";
+        selection.replyPreview =
+            selection.reason == "router_failed"
+                ? buildRouterFailureAnswer_(appLanguageFromPayload_(payload))
+                : buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
     }
 
     Logger::instance().logDebug(
@@ -1497,6 +1534,16 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         if (!selection.selectedSkill.empty() && registry_.hasSkill(selection.selectedSkill)) {
             return selection;
         }
+
+        SkillSelection routerFailure;
+        routerFailure.reason = "router_failed";
+        routerFailure = applyReplyLanguageHints_(
+            routerFailure,
+            payload,
+            userMessage,
+            conversationContext);
+        routerFailure = finalizeSelectionLanguages_(std::move(routerFailure));
+        return routerFailure;
     }
 
     if (!allowHeuristicFallback) {
@@ -1589,6 +1636,27 @@ SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
 std::string ChatV2Orchestrator::buildLlmUnavailableAnswer_() const
 {
     return buildCapabilityUnavailableAnswer_("en");
+}
+
+std::string ChatV2Orchestrator::buildRouterFailureAnswer_(const std::string& languageHint) const
+{
+    const std::string language = normalizeAssistantLanguageTag(languageHint);
+    if (language == "pt") {
+        return "Houve um erro temporario ao analisar sua solicitacao. Nao consegui decidir a acao correta no chat. Tente novamente em alguns instantes.";
+    }
+    if (language == "es") {
+        return "Hubo un error temporal al analizar tu solicitud. No pude decidir la accion correcta en el chat. Intentalo de nuevo en unos instantes.";
+    }
+    if (language == "fr") {
+        return "Une erreur temporaire est survenue lors de l'analyse de votre demande. Je n'ai pas pu choisir la bonne action dans le chat. Reessayez dans un instant.";
+    }
+    if (language == "zh") {
+        return "Analyzing your request failed temporarily, so I could not choose the correct chat action. Please try again in a moment.";
+    }
+    if (language == "ar") {
+        return "Analyzing your request failed temporarily, so I could not choose the correct chat action. Please try again in a moment.";
+    }
+    return "A temporary error happened while analyzing your request, so I could not choose the correct chat action. Please try again in a moment.";
 }
 
 std::string ChatV2Orchestrator::buildCapabilityUnavailableAnswer_(const std::string& languageHint) const
@@ -1735,6 +1803,7 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
         { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(create_cameras_batch)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },
     };

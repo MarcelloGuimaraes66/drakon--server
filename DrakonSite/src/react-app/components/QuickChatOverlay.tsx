@@ -5,8 +5,11 @@ import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSes
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
+import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
+import ChatCameraEditCard from "@/react-app/components/ChatCameraEditCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
+import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
 import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
@@ -14,9 +17,13 @@ import { ChatMessage } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
 import { X, Bot, User, ExternalLink, Minus, AlertCircle } from "lucide-react";
 import {
+  type CameraEditFormRequestMessageMetadata,
   extractChatProgressFromMessage,
+  extractCameraEditFormRequestFromMessage,
   extractCameraNetworkScanFromMessage,
+  extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
+  applyCameraEditDraftToCamera,
   extractHitMediaFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
@@ -64,6 +71,8 @@ export default function QuickChatOverlay() {
     sizeBytes: number;
   } | null>(null);
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
+  const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
+  const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
@@ -74,7 +83,7 @@ export default function QuickChatOverlay() {
     core: "Core",
   };
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
     sessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -87,6 +96,31 @@ export default function QuickChatOverlay() {
       : pendingExecutionState.kind === "stale"
         ? "Desktop agent connection looks stale. Check whether the EXE is still connected."
         : null;
+
+  const openChatEditForm = async (
+    cameraId: number,
+    cameraDraftMetadata: CameraEditFormRequestMessageMetadata
+  ) => {
+    const response = await fetch(`/api/cameras/${cameraId}`, {
+      credentials: "include",
+    });
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        typeof (data as any)?.error === "string"
+          ? (data as any).error
+          : "Failed to load the camera for editing."
+      );
+    }
+
+    const mergedCamera = applyCameraEditDraftToCamera(
+      data as CameraEditorCamera,
+      cameraDraftMetadata
+    );
+    setChatEditModalCamera(mergedCamera);
+    setIsChatEditModalOpen(true);
+  };
 
   useEffect(() => {
     if (sessionId) {
@@ -283,6 +317,8 @@ export default function QuickChatOverlay() {
     // Extract hit media (images and videos) using shared utility
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
+    const cameraBatchRegistrationDraft = extractCameraBatchRegistrationDraftFromMessage(message);
+    const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
 
     return (
@@ -305,6 +341,24 @@ export default function QuickChatOverlay() {
                 })
               }
             />
+          ) : cameraBatchRegistrationDraft ? (
+            <ChatCameraBatchRegistrationCard
+              messageId={message.id}
+              metadata={cameraBatchRegistrationDraft}
+              onSubmit={(sourceMessageId) =>
+                submitCameraBatchRegistration({
+                  sessionIdOverride: sessionId,
+                  sourceMessageId,
+                })
+              }
+            />
+          ) : cameraEditFormRequest ? (
+            <ChatCameraEditCard
+              metadata={cameraEditFormRequest}
+              onOpen={() =>
+                openChatEditForm(cameraEditFormRequest.camera_id, cameraEditFormRequest)
+              }
+            />
           ) : cameraNetworkScan ? (
             <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
           ) : null
@@ -317,6 +371,15 @@ export default function QuickChatOverlay() {
 
   return (
     <>
+      <CameraEditorModal
+        isOpen={isChatEditModalOpen}
+        camera={chatEditModalCamera}
+        onClose={() => {
+          setIsChatEditModalOpen(false);
+          setChatEditModalCamera(null);
+        }}
+      />
+
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40 bg-black/18 backdrop-blur-[1.5px] transition-opacity"

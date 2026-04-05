@@ -4,6 +4,8 @@
 #include <cctype>
 #include <sstream>
 
+#include "../runtime/BrandingRuntime.h"
+
 namespace chatv2 {
 
 namespace {
@@ -65,6 +67,11 @@ nlohmann::json supportedLanguageValueOrNull_(const std::string& value)
     return nlohmann::json("en");
 }
 
+std::string activeBrandDisplayName_()
+{
+    return std::string(static_cast<const char*>(AppBrand::kDisplayName));
+}
+
 } // namespace
 
 std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
@@ -72,7 +79,7 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You are the semantic router for the Perceptrum desktop assistant.\n"
+        << "You are the semantic router for the " << activeBrandDisplayName_() << " desktop assistant.\n"
         << "Understand the user's intent semantically, then return JSON only.\n"
         << "Do not output reasoning, markdown, or code fences.\n"
         << "Requests may arrive in any language.\n"
@@ -94,12 +101,14 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Return a semantic plan plus the best executable skill.\n"
         << "mode must be one of: answer, operate, clarify, read.\n"
         << "entity must be one of: camera, camera_agent, job, state, app_help, video, general.\n"
-        << "intent must be one of: create, explain, inspect, read, continue, unknown.\n"
+        << "intent must be one of: create, update, explain, inspect, read, continue, unknown.\n"
         << "continue_active_task is true only when the message should stay inside the active multi-turn operation.\n"
         << "grounding_required is true when the answer should be grounded in the app knowledge base instead of a free-form direct answer.\n"
         << "Use video_search only when the user wants to inspect live or recorded footage, uploaded media, frames, or detections.\n"
         << "Use explain_app when the user wants explanations, tutorials, troubleshooting, or grounded product help about the app.\n"
         << "Use create_camera only when the user wants you to register a camera now.\n"
+        << "Use edit_camera only when the user wants you to change, update, rename, reconfigure, or edit an existing camera now.\n"
+        << "Use create_cameras_batch when the user wants you to register multiple network cameras in one operation, prepare a batch preview from several camera rows, or apply shared camera defaults across many items at once.\n"
         << "Use scan_network when the user wants you to run the local Scan Network flow now to discover cameras, DVRs, or NVRs on the local network, inventory what was found, or summarize a recent scan result.\n"
         << "When the user wants to onboard, import, or register cameras but does not know the IPs, hosts, or which devices exist on the local network yet, prefer scan_network over explain_app so the assistant can gather the inventory first.\n"
         << "Use create_job only when the user wants you to create a job now.\n"
@@ -108,6 +117,8 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Use general_answer only when no specialized skill is a strong fit.\n"
         << "selected_skill must stay consistent with mode, entity, and intent.\n"
         << "If mode=operate and entity=camera and intent=create, selected_skill must be create_camera, not explain_app.\n"
+        << "If mode=operate and entity=camera and intent=update, selected_skill must be edit_camera, not explain_app.\n"
+        << "If the user clearly wants multiple cameras created together, selected_skill must be create_cameras_batch and operation_type must be create_cameras_batch.\n"
         << "If mode=operate and operation_type=scan_network, selected_skill must be scan_network.\n"
         << "If mode=operate and entity=job and intent=create, selected_skill must be create_job, not explain_app.\n"
         << "If mode=operate and entity=camera_agent and intent=create, selected_skill must be create_camera_agent, not explain_app.\n"
@@ -121,7 +132,8 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "For explain_app, include arguments.topic when there is a clear primary knowledge topic and arguments.supporting_topics when multiple docs should be synthesized.\n"
         << "Valid explain_app topics are: app_overview, tutorial, billing, pairing, api_keys, camera_creation, camera_agents, jobs, job_steps, job_orchestration.\n"
         << "For scan_network, include arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", and arguments.task_goal when useful.\n"
-        << "For create_camera, create_job, and create_camera_agent, include arguments.operation_type, arguments.operation_phase, arguments.task_goal, arguments.draft_patch, and arguments.missing_fields_guess when useful.\n"
+        << "For create_camera, create_cameras_batch, create_job, and create_camera_agent, include arguments.operation_type, arguments.operation_phase, arguments.task_goal, arguments.draft_patch, and arguments.missing_fields_guess when useful.\n"
+        << "For edit_camera, include arguments.operation_type, arguments.operation_phase, arguments.task_goal, arguments.target_selector, arguments.draft_patch, arguments.clear_fields, and arguments.open_form when useful.\n"
         << "Never mention source code, databases, payloads, routers, endpoints, or internal skill names in reply_preview.\n"
         << "Return this JSON schema:\n"
         << "{"
@@ -144,28 +156,38 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "\"topic\":\"camera_creation\","
         << "\"supporting_topics\":[],"
         << "\"task_goal\":\"register the camera\","
+        << "\"target_selector\":{},"
         << "\"draft_patch\":{},"
-        << "\"missing_fields_guess\":[]"
+        << "\"missing_fields_guess\":[],"
+        << "\"clear_fields\":[],"
+        << "\"open_form\":false"
         << "}"
         << "}\n"
         << "Examples:\n"
         << "- user_message=\"me explique como cadastrar uma camera\" => selected_skill=\"explain_app\", mode=\"answer\", entity=\"app_help\", intent=\"explain\", grounding_required=true, arguments.topic=\"camera_creation\", reply_language=\"pt\"\n"
         << "- user_message=\"quero criar uma camera chamada quarto\" => selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"create\", arguments.draft_patch={\"name\":\"quarto\"}, reply_language=\"pt\"\n"
+        << "- user_message=\"edite o ip da camera mibo para 192.168.0.22\" => selected_skill=\"edit_camera\", mode=\"operate\", entity=\"camera\", intent=\"update\", arguments.operation_type=\"edit_camera\", arguments.operation_phase=\"resolving_target\", arguments.target_selector={\"name\":\"mibo\"}, arguments.draft_patch={\"ip_address\":\"192.168.0.22\"}, arguments.open_form=false, reply_language=\"pt\"\n"
+        << "- user_message=\"abra o formulario da camera mibo para eu editar\" => selected_skill=\"edit_camera\", mode=\"operate\", entity=\"camera\", intent=\"update\", arguments.operation_type=\"edit_camera\", arguments.operation_phase=\"resolving_target\", arguments.target_selector={\"name\":\"mibo\"}, arguments.open_form=true, reply_language=\"pt\"\n"
+        << "- user_message=\"remove o subtype da camera do portao\" => selected_skill=\"edit_camera\", mode=\"operate\", entity=\"camera\", intent=\"update\", arguments.operation_type=\"edit_camera\", arguments.operation_phase=\"resolving_target\", arguments.target_selector={\"name\":\"portao\"}, arguments.clear_fields=[\"subtype\"], reply_language=\"pt\"\n"
         << "- user_message=\"preciso cadastrar uma camera\" => selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"create\", reply_language=\"pt\"\n"
         << "- user_message=\"cadastre uma camera para mim chamada teste_1\" => selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"create\", arguments.draft_patch={\"name\":\"teste_1\"}, reply_language=\"pt\"\n"
+        << "- user_message=\"quero cadastrar 5 cameras de uma vez\" => selected_skill=\"create_cameras_batch\", mode=\"operate\", entity=\"camera\", intent=\"create\", arguments.operation_type=\"create_cameras_batch\", arguments.operation_phase=\"collecting_batch\", arguments.task_goal=\"register multiple cameras in one batch\", reply_language=\"pt\"\n"
+        << "- user_message=\"use o mesmo usuario e senha em todas as 5 cameras\" while active_task.type=create_cameras_batch => continue_active_task=true, selected_skill=\"create_cameras_batch\", mode=\"operate\", entity=\"camera\", intent=\"continue\", arguments.operation_type=\"create_cameras_batch\", arguments.operation_phase=\"collecting_batch\", reply_language=\"pt\"\n"
+        << "- user_message=\"register these 8 cameras together\" => selected_skill=\"create_cameras_batch\", mode=\"operate\", entity=\"camera\", intent=\"create\", arguments.operation_type=\"create_cameras_batch\", arguments.operation_phase=\"collecting_batch\", arguments.task_goal=\"register multiple cameras in one batch\", reply_language=\"en\"\n"
         << "- user_message=\"voce consegue executar camera scan?\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"scan the local network for cameras and recorders\", reply_language=\"pt\"\n"
         << "- user_message=\"escaneie a rede e veja quantos dvrs existem\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"scan the local network and summarize DVRs, NVRs, and cameras\", reply_language=\"pt\"\n"
         << "- user_message=\"procure cameras na minha rede para mim\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"discover cameras on the local network\", reply_language=\"pt\"\n"
         << "- user_message=\"quero cadastrar cameras mas nao sei os ips\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"scan the local network before camera registration\", reply_language=\"pt\"\n"
         << "- user_message=\"me ajuda a importar as cameras da rede sem eu saber os hosts\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"discover cameras and recorders on the local network before import\", reply_language=\"pt\"\n"
         << "- user_message=\"usa o mesmo endereco da anterior\" while active_task.type=create_camera => continue_active_task=true, selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"continue\"\n"
+        << "- user_message=\"troca para 192.168.0.30\" while active_task.type=edit_camera => continue_active_task=true, selected_skill=\"edit_camera\", mode=\"operate\", entity=\"camera\", intent=\"continue\", arguments.operation_type=\"edit_camera\", arguments.operation_phase=\"editing_target\"\n"
         << "- user_message=\"How do I create an agent?\" => selected_skill=\"explain_app\", mode=\"answer\", entity=\"app_help\", intent=\"explain\", grounding_required=true, arguments.topic=\"camera_agents\", arguments.supporting_topics=[\"job_steps\"], reply_language=\"en\"\n"
         << "- user_message=\"create a job that runs every hour\" => selected_skill=\"create_job\", mode=\"operate\", entity=\"job\", intent=\"create\", reply_language=\"en\"\n"
         << "- user_message in unsupported German => reply_language=\"en\", knowledge_language=\"en\", knowledge_fallback=true\n"
         << "Available skills:\n";
 
     for (const auto& skill : skills) {
-        out << "- " << skill.name << " | implemented="
+    out << "- " << skill.name << " | implemented="
             << (skill.implemented ? "true" : "false")
             << " | " << skill.description << "\n";
     }
@@ -188,7 +210,7 @@ std::string buildLanguageDetectionSystemPrompt()
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You detect the chat reply language for the Drakon app.\n"
+        << "You detect the chat reply language for the " << activeBrandDisplayName_() << " app.\n"
         << "Return JSON only.\n"
         << "Infer the user's language from user_message first.\n"
         << "reply_language must always be one of: en, es, pt, fr, zh, ar.\n"
@@ -256,7 +278,7 @@ std::string buildUserFacingAnswerSystemPrompt()
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You are the final user-facing assistant for the Drakon app.\n"
+        << "You are the final user-facing assistant for the " << activeBrandDisplayName_() << " app.\n"
         << "Rewrite the draft into a polished response for the end user.\n"
         << "The request payload may include conversation_compact_context and recent_turns from the current chat session.\n"
         << "The request payload may also include conversation_task_state for any active operation.\n"
@@ -306,7 +328,7 @@ std::string buildDirectAnswerSystemPrompt()
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You are the final user-facing assistant for the Drakon app.\n"
+        << "You are the final user-facing assistant for the " << activeBrandDisplayName_() << " app.\n"
         << "Answer the user directly when no specialized skill is the right fit.\n"
         << "Be helpful, but do not guess about product behavior when you are unsure.\n"
         << "The request payload may include conversation_compact_context and recent_turns from the same chat session.\n"

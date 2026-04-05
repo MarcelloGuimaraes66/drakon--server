@@ -123,6 +123,20 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Organizando gravadores, canais detectados e cameras avulsas para o chat.";
             }
         }
+        else if (skill == "create_cameras_batch") {
+            if (phase == "routing") {
+                update.headline = "Entendendo o lote de cameras";
+                update.detail = "Separando os dados por camera e identificando o que pode ser reaproveitado em todas.";
+            }
+            else if (phase == "extracting_batch") {
+                update.headline = "Estruturando o lote";
+                update.detail = "Montando os itens do lote e os valores compartilhados entre as cameras.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Preparando o preview";
+                update.detail = "Validando o lote e organizando a revisao final antes do cadastro.";
+            }
+        }
         else if (skill == "general_answer") {
             if (phase == "routing") {
                 update.headline = "Entendendo sua pergunta";
@@ -167,6 +181,10 @@ inline ChatProgressUpdate makeProgressUpdate(
             update.headline = "Redactando la respuesta";
             update.detail = "Preparando una respuesta clara para el chat.";
         }
+        else if (skill == "create_cameras_batch" && phase == "extracting_batch") {
+            update.headline = "Estructurando el lote";
+            update.detail = "Organizando las camaras y los valores compartidos antes del registro.";
+        }
     }
     else if (lang == "fr") {
         if (phase == "routing") {
@@ -200,6 +218,10 @@ inline ChatProgressUpdate makeProgressUpdate(
         else if (phase == "drafting") {
             update.headline = "Redaction de la reponse";
             update.detail = "Preparation d'une reponse claire pour le chat.";
+        }
+        else if (skill == "create_cameras_batch" && phase == "extracting_batch") {
+            update.headline = "Structuration du lot";
+            update.detail = "Organisation des cameras et des valeurs partagees avant l'enregistrement.";
         }
     }
     else {
@@ -269,6 +291,20 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "finalizing") {
                 update.headline = "Summarizing what was found";
                 update.detail = "Organizing recorders, detected channels, and standalone cameras for chat.";
+            }
+        }
+        else if (skill == "create_cameras_batch") {
+            if (phase == "routing") {
+                update.headline = "Understanding the camera batch";
+                update.detail = "Separating the per-camera rows from the shared values that apply to the whole batch.";
+            }
+            else if (phase == "extracting_batch") {
+                update.headline = "Structuring the batch";
+                update.detail = "Building the camera items and the shared defaults before registration.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Preparing the preview";
+                update.detail = "Validating the batch and organizing the final review before registration.";
             }
         }
         else if (skill == "general_answer") {

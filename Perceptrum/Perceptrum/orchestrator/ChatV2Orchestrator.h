@@ -62,6 +62,7 @@ private:
         const SkillSelection& selection,
         const std::string& routingMode,
         const std::string& actualCommandType) const;
+    std::string buildRouterFailureAnswer_(const std::string& languageHint) const;
     std::string buildCapabilityUnavailableAnswer_(const std::string& languageHint) const;
     std::string buildComingSoonAnswer_(
         const std::string& languageHint,

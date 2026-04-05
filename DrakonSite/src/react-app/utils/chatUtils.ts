@@ -1,4 +1,5 @@
 import { ChatMessage } from "@/shared/types";
+import type { CameraImportApplyResult, CameraImportPreview } from "@/shared/cameraImport";
 import type { CameraDiscoverySummary } from "@/shared/cameraDiscovery";
 
 export interface ChatProgressInfo {
@@ -42,6 +43,26 @@ export interface CameraNetworkScanMessageMetadata {
   elapsed_ms?: number;
   timeout_ms?: number;
   summary: CameraDiscoverySummary;
+}
+
+export interface CameraBatchRegistrationDraftMessageMetadata {
+  type: "camera_batch_registration_draft";
+  status: "awaiting_confirmation" | "registered";
+  language?: string;
+  expected_count?: number | null;
+  preview: CameraImportPreview;
+  target_client_id?: string | null;
+  apply_result?: CameraImportApplyResult | null;
+}
+
+export interface CameraEditFormRequestMessageMetadata {
+  type: "camera_edit_form_request";
+  status: "awaiting_form_open";
+  language?: string;
+  camera_id: number;
+  camera_name?: string | null;
+  draft_patch?: Record<string, unknown>;
+  clear_fields?: string[];
 }
 
 const TEMPORAL_ENGINE_SUFFIX_PATTERN =
@@ -547,6 +568,131 @@ export function extractCameraNetworkScanFromMessage(
     timeout_ms: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
     summary: parsed.summary as CameraDiscoverySummary,
   };
+}
+
+export function extractCameraBatchRegistrationDraftFromMessage(
+  message: ChatMessage
+): CameraBatchRegistrationDraftMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_batch_registration_draft") {
+    return null;
+  }
+
+  if (!parsed.preview || typeof parsed.preview !== "object" || Array.isArray(parsed.preview)) {
+    return null;
+  }
+
+  const expectedCount = Number(parsed.expected_count);
+
+  return {
+    type: "camera_batch_registration_draft",
+    status: parsed.status === "registered" ? "registered" : "awaiting_confirmation",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    expected_count:
+      Number.isInteger(expectedCount) && expectedCount > 0 ? expectedCount : undefined,
+    preview: parsed.preview as CameraImportPreview,
+    target_client_id:
+      typeof parsed.target_client_id === "string" ? parsed.target_client_id : undefined,
+    apply_result:
+      parsed.apply_result && typeof parsed.apply_result === "object" && !Array.isArray(parsed.apply_result)
+        ? (parsed.apply_result as CameraImportApplyResult)
+        : undefined,
+  };
+}
+
+export function extractCameraEditFormRequestFromMessage(
+  message: ChatMessage
+): CameraEditFormRequestMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_edit_form_request" || parsed.status !== "awaiting_form_open") {
+    return null;
+  }
+
+  const cameraId = Number(parsed.camera_id);
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return null;
+  }
+
+  return {
+    type: "camera_edit_form_request",
+    status: "awaiting_form_open",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    camera_id: cameraId,
+    camera_name:
+      typeof parsed.camera_name === "string" ? parsed.camera_name : undefined,
+    draft_patch:
+      parsed.draft_patch &&
+      typeof parsed.draft_patch === "object" &&
+      !Array.isArray(parsed.draft_patch)
+        ? (parsed.draft_patch as Record<string, unknown>)
+        : {},
+    clear_fields: Array.isArray(parsed.clear_fields)
+      ? parsed.clear_fields.filter((entry: unknown): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
+export function applyCameraEditDraftToCamera<T extends Record<string, any>>(
+  camera: T,
+  metadata: CameraEditFormRequestMessageMetadata
+): T {
+  const next: Record<string, any> = {
+    ...camera,
+  };
+
+  (metadata.clear_fields || []).forEach((field) => {
+    if (!field) return;
+    if (field === "webcam_index") {
+      next[field] = null;
+      return;
+    }
+    if (field === "country") {
+      next.country = "";
+      next.country_code = "";
+      return;
+    }
+    next[field] = "";
+  });
+
+  Object.entries(metadata.draft_patch || {}).forEach(([key, value]) => {
+    next[key] = value;
+  });
+
+  return next as T;
 }
 
 /**

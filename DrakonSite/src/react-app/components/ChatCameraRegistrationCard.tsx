@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "@getmocha/users-service/react";
 import { CheckCircle2, Loader2, MapPin } from "lucide-react";
-import { normalizeCountryCode } from "@/shared/brazilStates";
+import CountryCombobox from "@/react-app/components/CountryCombobox";
+import {
+  resolveCountryCodeFromValue,
+  resolveCountryNameFromValue,
+} from "@/react-app/lib/countrySelection";
 import type { CameraRegistrationDraftMessageMetadata } from "@/react-app/utils/chatUtils";
 
 type CameraRegistrationFormData = {
@@ -27,9 +32,10 @@ type CameraRegistrationFormData = {
 
 type AddressLookupResponse = {
   found: boolean;
-  source: "viacep" | "google-geocoding" | null;
+  source: "viacep" | "google-geocoding" | "geonames" | null;
   postal_code: string;
   country: string | null;
+  country_code?: string | null;
   street: string | null;
   city: string | null;
   state: string | null;
@@ -107,7 +113,15 @@ function isPostalCodeReadyForLookup(postalCode: string, countryCode: string | nu
   return postalCode.length >= 3;
 }
 
-function normalizeFormDraft(draft: Record<string, unknown>): CameraRegistrationFormData {
+function normalizeFormDraft(
+  draft: Record<string, unknown>,
+  defaultCountryName = ""
+): CameraRegistrationFormData {
+  const country =
+    toNonEmptyString(draft.country) ||
+    resolveCountryNameFromValue(draft.country_code || "") ||
+    defaultCountryName;
+
   return {
     name: toNonEmptyString(draft.name),
     connection_method: normalizeConnectionMethod(draft.connection_method),
@@ -124,7 +138,7 @@ function normalizeFormDraft(draft: Record<string, unknown>): CameraRegistrationF
     city: toNonEmptyString(draft.city),
     state: toNonEmptyString(draft.state),
     zip_code: toNonEmptyString(draft.zip_code),
-    country: toNonEmptyString(draft.country),
+    country,
     retention_days: normalizeRetentionDays(draft.retention_days),
     allowpublicaccess: toBoolean(draft.allowpublicaccess),
     shared_find_invitee_query: toNonEmptyString(draft.shared_find_invitee_query),
@@ -132,8 +146,13 @@ function normalizeFormDraft(draft: Record<string, unknown>): CameraRegistrationF
 }
 
 function buildSubmitPayload(form: CameraRegistrationFormData): Record<string, unknown> {
+  const resolvedCountryName =
+    resolveCountryNameFromValue(form.country) || form.country.trim();
+  const resolvedCountryCode = resolveCountryCodeFromValue(form.country);
   const payload: Record<string, unknown> = {
     ...form,
+    country: resolvedCountryName,
+    country_code: resolvedCountryCode,
   };
   const shareInviteeQuery = form.shared_find_invitee_query.trim();
   if (form.connection_method === "WEBCAM" && form.webcam_index !== null && form.webcam_index !== undefined) {
@@ -174,11 +193,15 @@ function buildErrors(form: CameraRegistrationFormData): Record<string, boolean> 
     });
   }
 
-  ["street", "number", "city", "state"].forEach((field) => {
+  ["street", "number", "city", "state", "zip_code", "country"].forEach((field) => {
     if (!toNonEmptyString(form[field as keyof CameraRegistrationFormData])) {
       nextErrors[field] = true;
     }
   });
+
+  if (form.country.trim() && !resolveCountryCodeFromValue(form.country)) {
+    nextErrors.country = true;
+  }
 
   return nextErrors;
 }
@@ -354,9 +377,13 @@ export default function ChatCameraRegistrationCard({
   metadata,
   onSubmit,
 }: Props) {
+  const { user } = useAuth();
   const copy = useCardCopy(metadata.language);
   const metadataDraftKey = useMemo(() => JSON.stringify(metadata.draft || {}), [metadata.draft]);
-  const [form, setForm] = useState<CameraRegistrationFormData>(() => normalizeFormDraft(metadata.draft));
+  const userCountryName = resolveCountryNameFromValue(user?.country_code || "");
+  const [form, setForm] = useState<CameraRegistrationFormData>(() =>
+    normalizeFormDraft(metadata.draft, userCountryName)
+  );
   const [errors, setErrors] = useState<Record<string, boolean>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -367,18 +394,29 @@ export default function ChatCameraRegistrationCard({
   const lookupRequestIdRef = useRef(0);
 
   useEffect(() => {
-    setForm(normalizeFormDraft(metadata.draft));
+    setForm(normalizeFormDraft(metadata.draft, userCountryName));
     setErrors({});
     setSubmitError(null);
     setIsSubmitting(false);
-  }, [messageId, metadata.status, metadata.created_camera_id, metadataDraftKey]);
+    setLookupState({ status: "idle", message: null });
+  }, [messageId, metadata.status, metadata.created_camera_id, metadataDraftKey, userCountryName]);
+
+  useEffect(() => {
+    if (!userCountryName) {
+      return;
+    }
+
+    setForm((current) =>
+      current.country.trim() ? current : { ...current, country: userCountryName }
+    );
+  }, [userCountryName]);
 
   useEffect(() => {
     if (metadata.status !== "awaiting_confirmation") {
       return;
     }
 
-    const countryCode = normalizeCountryCode(form.country, null);
+    const countryCode = resolveCountryCodeFromValue(form.country);
     const normalizedPostalCode = normalizePostalCodeForLookup(form.zip_code, countryCode);
 
     if (!isPostalCodeReadyForLookup(normalizedPostalCode, countryCode)) {
@@ -397,7 +435,8 @@ export default function ChatCameraRegistrationCard({
           credentials: "include",
           body: JSON.stringify({
             postal_code: normalizedPostalCode,
-            country: form.country || undefined,
+            country_code: countryCode || undefined,
+            country: resolveCountryNameFromValue(form.country) || form.country || undefined,
           }),
         });
         const result = (await response.json().catch(() => ({}))) as AddressLookupResponse & {
@@ -422,7 +461,10 @@ export default function ChatCameraRegistrationCard({
           street: result.street || current.street,
           city: result.city || current.city,
           state: result.state || current.state,
-          country: result.country || current.country,
+          country:
+            resolveCountryNameFromValue(result.country_code || result.country || "") ||
+            result.country ||
+            current.country,
         }));
         setErrors((current) => {
           const next = { ...current };
@@ -628,11 +670,27 @@ export default function ChatCameraRegistrationCard({
           </label>
           <label className="block">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.country}</span>
-            <input
+            <CountryCombobox
+              ariaLabel={copy.country}
               value={form.country}
               disabled={isRegistered}
-              onChange={(e) => setField("country", e.target.value)}
-              className={inputClass(!!errors.country)}
+              onChange={(countryName) => setField("country", countryName)}
+              placeholder={copy.country}
+              searchPlaceholder="Search country..."
+              buttonClassName={inputClass(!!errors.country)}
+              panelClassName="fixed z-[120] overflow-hidden rounded-2xl border border-white/10 bg-[#171717]/95 shadow-2xl backdrop-blur-xl"
+              searchContainerClassName="border-b border-white/10 bg-[#171717]/95 p-2"
+              searchInputClassName="w-full rounded-full border border-white/10 bg-transparent py-2.5 pl-11 pr-4 text-sm text-white placeholder:text-gray-500 outline-none transition focus:ring-2 focus:ring-sky-300/40"
+              optionClassName={(_, isSelected) =>
+                `w-full px-4 py-2.5 text-left text-sm transition-colors ${
+                  isSelected
+                    ? "bg-sky-400/15 text-sky-100"
+                    : "text-slate-200 hover:bg-white/[0.03]"
+                }`
+              }
+              selectedTextClassName="text-white"
+              placeholderTextClassName="text-slate-400"
+              emptyStateClassName="px-4 py-6 text-center text-sm text-slate-400"
             />
           </label>
           <label className="block md:col-span-2">

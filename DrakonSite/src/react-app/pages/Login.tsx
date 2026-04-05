@@ -387,7 +387,11 @@ export default function Login() {
 
     setIsGoogleLoading(true);
     try {
-      await redirectToLogin(countryCode || detectedCountry || null);
+      await redirectToLogin({
+        intent: activeTab,
+        countryCode:
+          activeTab === "signup" ? countryCode || detectedCountry || null : null,
+      });
     } catch (err) {
       const message =
         err instanceof Error && err.message.trim()

@@ -123,6 +123,21 @@ function resolveOptionalEnvSecretValue(inlineValue, filePathValue) {
   return String(inlineValue || "").replace(/\\n/g, "\n").trim();
 }
 
+function buildDesktopGoogleRedirectUri(baseUrl) {
+  try {
+    const normalizedBaseUrl = String(baseUrl || "").trim();
+    if (normalizedBaseUrl) {
+      return new URL(
+        "/auth/callback",
+        normalizedBaseUrl.endsWith("/") ? normalizedBaseUrl : `${normalizedBaseUrl}/`
+      ).toString();
+    }
+  } catch {
+  }
+
+  return `http://${bindHost}:${port}/auth/callback`;
+}
+
 function createWorkerEnv(DB) {
   const configuredGoogleRedirectUri = String(
     process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
@@ -130,6 +145,8 @@ function createWorkerEnv(DB) {
   const configuredDesktopGoogleRedirectUri = String(
     process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || ""
   ).trim();
+  const effectiveDesktopGoogleRedirectUri =
+    configuredDesktopGoogleRedirectUri || buildDesktopGoogleRedirectUri(appBaseUrl);
   const centralAuthPublicKey = resolveOptionalEnvSecretValue(
     process.env.CENTRAL_AUTH_PUBLIC_KEY,
     process.env.CENTRAL_AUTH_PUBLIC_KEY_PATH
@@ -140,10 +157,10 @@ function createWorkerEnv(DB) {
     R2_BUCKET,
     GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
     GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
-    // Leave the redirect unset unless it was explicitly configured so the
-    // worker can choose the correct callback per request (desktop vs browser).
     GOOGLE_OAUTH_REDIRECT_URI: configuredGoogleRedirectUri,
-    DESKTOP_GOOGLE_OAUTH_REDIRECT_URI: configuredDesktopGoogleRedirectUri,
+    DESKTOP_GOOGLE_OAUTH_REDIRECT_URI: effectiveDesktopGoogleRedirectUri,
+    GOOGLE_GEOCODING_API_KEY: process.env.GOOGLE_GEOCODING_API_KEY || "",
+    GEONAMES_USERNAME: process.env.GEONAMES_USERNAME || "",
     CHAT_V2_ENABLED: process.env.CHAT_V2_ENABLED || "",
     STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
     STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",

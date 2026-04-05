@@ -2,9 +2,14 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "@getmocha/users-service/react";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronUp, Eye, EyeOff, X } from "lucide-react";
+import CountryCombobox from "@/react-app/components/CountryCombobox";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { normalizeCountryCode } from "@/shared/brazilStates";
+import {
+  resolveCountryCodeFromValue,
+  resolveCountryNameFromValue,
+} from "@/react-app/lib/countrySelection";
 import type { CameraFindShare } from "@/shared/types";
 
 const CAMERA_LABEL_OPTIONS = [
@@ -92,7 +97,7 @@ type AddressLookupState = {
 
 type AddressLookupResponse = {
   found: boolean;
-  source: "viacep" | "google-geocoding" | null;
+  source: "viacep" | "google-geocoding" | "geonames" | null;
   postal_code: string;
   country: string | null;
   country_code: string | null;
@@ -146,6 +151,7 @@ export type CameraEditorCamera = {
   state?: string | null;
   zip_code?: string | null;
   country?: string | null;
+  country_code?: string | null;
   retention_days?: number | null;
   webcam_index?: number | null;
   allowpublicaccess?: number | boolean | null;
@@ -408,6 +414,10 @@ function formatAddressLookupSource(source: AddressLookupResponse["source"]): str
     return "ViaCEP";
   }
 
+  if (source === "geonames") {
+    return "GeoNames";
+  }
+
   if (source === "google-geocoding") {
     return "Google Geocoding";
   }
@@ -504,7 +514,7 @@ function buildEditForm(camera: CameraEditorCamera): EditFormData {
     city: camera.city || "",
     state: camera.state || "",
     zip_code: camera.zip_code || "",
-    country: camera.country || "",
+    country: camera.country || resolveCountryNameFromValue(camera.country_code || "") || "",
     webcam_index: camera.webcam_index ?? null,
     allowpublicaccess: Boolean(camera.allowpublicaccess),
   };
@@ -686,7 +696,8 @@ export default function CameraEditorModal({
     setTutorialProceedWithoutWebcam,
   } = useOnboarding();
   const userCountryCode = normalizeCountryCode(user?.country_code, null);
-  const userCountryName = resolveCountryName(user?.country_code);
+  const userCountryName =
+    resolveCountryNameFromValue(user?.country_code || "") || resolveCountryName(user?.country_code);
   const latestUserCountryNameRef = useRef(userCountryName);
   const tutorialWebcamSeededRef = useRef(false);
   const addressLookupRequestIdRef = useRef(0);
@@ -886,6 +897,15 @@ export default function CameraEditorModal({
   const webcamFields = formData && "webcam_index" in formData ? formData : null;
   const rtspFields = formData && "ip_address" in formData ? formData : null;
 
+  const resolveSelectedCountryCode = (countryValue: string | null | undefined): string | null => {
+    const trimmedCountryValue = typeof countryValue === "string" ? countryValue.trim() : "";
+    return trimmedCountryValue ? resolveCountryCodeFromValue(trimmedCountryValue) : null;
+  };
+
+  const resolveEffectiveCountryCode = (countryValue: string | null | undefined): string | null => {
+    return resolveSelectedCountryCode(countryValue) || userCountryCode;
+  };
+
   const runTutorialWebcamProbe = async (
     options: {
       autoApplyPreferredIndex?: boolean;
@@ -959,7 +979,7 @@ export default function CameraEditorModal({
     addressLookupRequestIdRef.current += 1;
     lastAutoLookupKeyRef.current = "";
     setAddressLookupState({ status: "idle", message: null });
-    updateCurrentFormData({ country: value });
+    updateCurrentFormData({ country: resolveCountryNameFromValue(value) || value });
   };
 
   const lookupAddressForCurrentForm = async () => {
@@ -967,9 +987,7 @@ export default function CameraEditorModal({
       return;
     }
 
-    const fallbackCountryCode = userCountryCode;
-    const effectiveCountryCode =
-      normalizeCountryCode(formData.country, null) || fallbackCountryCode;
+    const effectiveCountryCode = resolveEffectiveCountryCode(formData.country);
     const normalizedPostalCode = normalizePostalCodeForLookup(
       formData.zip_code || "",
       effectiveCountryCode
@@ -984,7 +1002,11 @@ export default function CameraEditorModal({
 
     const lookupRequestId = ++addressLookupRequestIdRef.current;
     const targetForm = isEditing ? "EDIT" : activeTab;
-    const sourceName = formData.country.trim() || userCountryName || undefined;
+    const sourceName =
+      resolveCountryNameFromValue(formData.country || "") ||
+      formData.country.trim() ||
+      userCountryName ||
+      undefined;
 
     setAddressLookupState({
       status: "loading",
@@ -1033,7 +1055,10 @@ export default function CameraEditorModal({
           street: result.street ?? current.street,
           city: result.city ?? current.city,
           state: result.state ?? current.state,
-          country: result.country ?? current.country,
+          country:
+            resolveCountryNameFromValue(result.country_code || result.country || "") ||
+            result.country ||
+            current.country,
         };
       };
 
@@ -1091,8 +1116,7 @@ export default function CameraEditorModal({
       return;
     }
 
-    const effectiveCountryCode =
-      normalizeCountryCode(formData.country, null) || userCountryCode;
+    const effectiveCountryCode = resolveEffectiveCountryCode(formData.country);
     const normalizedPostalCode = normalizePostalCodeForLookup(
       formData.zip_code || "",
       effectiveCountryCode
@@ -1214,6 +1238,10 @@ export default function CameraEditorModal({
 
     try {
       let payload: Record<string, unknown>;
+      const activeForm = activeTab === "WEBCAM" ? webcamForm : rtspForm;
+      const resolvedCountryName =
+        resolveCountryNameFromValue(activeForm.country) || activeForm.country.trim();
+      const resolvedCountryCode = resolveSelectedCountryCode(activeForm.country);
 
       if (activeTab === "WEBCAM") {
         payload = {
@@ -1231,7 +1259,8 @@ export default function CameraEditorModal({
           city: webcamForm.city,
           state: webcamForm.state,
           zip_code: webcamForm.zip_code,
-          country: webcamForm.country,
+          country: resolvedCountryName,
+          country_code: resolvedCountryCode,
         };
       } else {
         payload = {
@@ -1254,7 +1283,8 @@ export default function CameraEditorModal({
           city: rtspForm.city,
           state: rtspForm.state,
           zip_code: rtspForm.zip_code,
-          country: rtspForm.country,
+          country: resolvedCountryName,
+          country_code: resolvedCountryCode,
         };
       }
 
@@ -1338,6 +1368,10 @@ export default function CameraEditorModal({
         }
       });
 
+      if (editForm.country.trim() && !resolveSelectedCountryCode(editForm.country)) {
+        errors.country = true;
+      }
+
       if (editForm.connection_method !== "WEBCAM") {
         const requiredRtspFields = [
           "ip_address",
@@ -1371,6 +1405,9 @@ export default function CameraEditorModal({
           descriptionLabel.trim() || descriptionText.trim()
             ? `LABEL: ${descriptionLabel.trim()} DESCRIPTION: ${descriptionText.trim()}`
             : null;
+        const resolvedCountryName =
+          resolveCountryNameFromValue(editForm.country) || editForm.country.trim();
+        const resolvedCountryCode = resolveSelectedCountryCode(editForm.country);
 
         let payload: Record<string, unknown>;
 
@@ -1386,7 +1423,8 @@ export default function CameraEditorModal({
             city: editForm.city,
             state: editForm.state,
             zip_code: editForm.zip_code,
-            country: editForm.country,
+            country: resolvedCountryName,
+            country_code: resolvedCountryCode,
             description: finalDescription,
           };
         } else {
@@ -1409,7 +1447,8 @@ export default function CameraEditorModal({
             city: editForm.city,
             state: editForm.state,
             zip_code: editForm.zip_code,
-            country: editForm.country,
+            country: resolvedCountryName,
+            country_code: resolvedCountryCode,
             description: finalDescription,
           };
         }
@@ -1457,6 +1496,10 @@ export default function CameraEditorModal({
         errors[field] = true;
       }
     });
+
+    if (currentFormData.country.trim() && !resolveSelectedCountryCode(currentFormData.country)) {
+      errors.country = true;
+    }
 
     if (activeTab === "WEBCAM") {
       if (webcamForm.webcam_index === null || webcamForm.webcam_index === undefined) {
@@ -1998,16 +2041,29 @@ export default function CameraEditorModal({
 
                   <div>
                     <label className="block text-sm font-medium text-gray-300 mb-2">Country *</label>
-                    <input
-                      type="text"
+                    <CountryCombobox
                       name="camera_location_country"
+                      ariaLabel="Country"
                       value={formData?.country || ""}
-                      onChange={(e) => handleCountryChange(e.target.value)}
-                      autoComplete="section-camera-location country-name"
-                      className={`w-full px-4 py-2.5 bg-gray-800 border ${
+                      onChange={handleCountryChange}
+                      placeholder="Select country"
+                      searchPlaceholder="Search country..."
+                      buttonClassName={`w-full rounded-lg border px-4 py-2.5 bg-gray-800 text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all ${
                         addressErrors.country ? "border-red-500" : "border-gray-700"
-                      } rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all`}
-                      placeholder="United States"
+                      }`}
+                      panelClassName="fixed z-[120] overflow-hidden rounded-2xl border border-white/10 bg-[#171717]/95 shadow-2xl backdrop-blur-xl"
+                      searchContainerClassName="border-b border-white/10 bg-[#171717]/95 p-2"
+                      searchInputClassName="w-full rounded-full border border-white/10 bg-transparent py-2.5 pl-11 pr-4 text-sm text-white placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      optionClassName={(_, isSelected) =>
+                        `w-full px-4 py-2.5 text-left text-sm transition-colors ${
+                          isSelected
+                            ? "bg-blue-500/15 text-blue-100"
+                            : "text-gray-300 hover:bg-white/[0.03]"
+                        }`
+                      }
+                      selectedTextClassName="text-gray-100"
+                      placeholderTextClassName="text-gray-500"
+                      emptyStateClassName="px-4 py-6 text-center text-sm text-gray-400"
                     />
                     {addressErrors.country && <p className="text-red-400 text-xs mt-1">Required</p>}
                   </div>
