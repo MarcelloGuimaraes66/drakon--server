@@ -1205,6 +1205,8 @@ interface Agent {
   id: number;
   step_id: number;
   agent_key: string;
+  display_name?: string;
+  summary?: string | null;
   prompt_template: string;
   alert_condition?: string | null;
   params: string;
@@ -1292,6 +1294,7 @@ interface FaceTarget {
 
 interface AgentFormState {
   agent_key: string;
+  stored_agent_key: string;
   prompt_template: string;
   alert_condition: string;
   negative_condition: string;
@@ -1310,6 +1313,39 @@ interface AgentFormState {
   analysis_regions: AnalysisRegion[];
 }
 
+const parseAgentParamsObject = (value: unknown): Record<string, unknown> => {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return {};
+    }
+    return {};
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return {};
+};
+
+const getAgentDisplayName = (
+  agent?: Pick<Agent, "agent_key" | "display_name" | "params"> | null
+): string => {
+  if (!agent) return "";
+  const topLevel =
+    typeof agent.display_name === "string" ? agent.display_name.trim() : "";
+  if (topLevel) return topLevel;
+  const params = parseAgentParamsObject(agent.params);
+  const fromParams =
+    typeof params.display_name === "string" ? params.display_name.trim() : "";
+  return fromParams || String(agent.agent_key || "").trim();
+};
+
 const FACE_TARGET_MAX_IMAGES = 4;
 const NEGATIVE_REFERENCE_MAX_IMAGES = 3;
 const ANALYSIS_REGION_MAX = 6;
@@ -1321,6 +1357,7 @@ const PROMPT_EDITOR_SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 
 const buildEmptyAgentForm = (): AgentFormState => ({
   agent_key: "",
+  stored_agent_key: "",
   prompt_template: "",
   alert_condition: "",
   negative_condition: "",
@@ -3957,6 +3994,7 @@ function StepCard({
 }: StepCardProps) {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const stepLocale = (i18n.resolvedLanguage || i18n.language || "en").replace("_", "-");
   const localizedOptionalSuffix = extractOptionalSuffix(
     t("jobs.promptEditor.targetFacesOptionalLabel", {
@@ -3966,6 +4004,7 @@ function StepCard({
   const [targets, setTargets] = useState<Target[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [alerts, setAlerts] = useState<AlertRule[]>([]);
+  const [stepDataLoaded, setStepDataLoaded] = useState(false);
   const [pipelineTargetsByStepId, setPipelineTargetsByStepId] = useState<Record<string, Target[]>>({});
   const [startConditionStepTargets, setStartConditionStepTargets] = useState<Target[]>([]);
   const [showTargetSelect, setShowTargetSelect] = useState(false);
@@ -4014,6 +4053,10 @@ function StepCard({
   const agentFormRef = useRef<HTMLDivElement | null>(null);
   const [highlightAgentForm, setHighlightAgentForm] = useState(false);
   const agentFormHighlightTimerRef = useRef<number | null>(null);
+  const openAgentEditorForTargetRef = useRef<
+    ((target: Target, targetAgent: Agent | undefined, priorityValue: AgentPriority) => void) | null
+  >(null);
+  const handledAgentDeepLinkKeyRef = useRef<string | null>(null);
 
   const handleModelApiKeyRequired = (errorPayload: unknown): boolean => {
     if (isOpenAiKeyRequiredError(errorPayload)) {
@@ -4411,6 +4454,8 @@ function StepCard({
   useEffect(() => {
     setExpandedTargetId(null);
     setShowAllTargets(false);
+    setStepDataLoaded(false);
+    handledAgentDeepLinkKeyRef.current = null;
   }, [step.id]);
 
   useEffect(() => {
@@ -5047,6 +5092,7 @@ function StepCard({
   };
 
   const normalizeAgentFromApiRow = (agent: any): Agent => {
+    const paramsObject = parseAgentParamsObject(agent?.params);
     const split = parsePromptTemplate(agent?.prompt_template || "", agent?.alert_condition);
     const faceTargetIds: number[] = Array.isArray(agent?.face_target_ids)
       ? Array.from(
@@ -5085,6 +5131,16 @@ function StepCard({
     );
     return {
       ...agent,
+      display_name:
+        (typeof agent?.display_name === "string" ? agent.display_name.trim() : "") ||
+        (typeof paramsObject.display_name === "string" ? paramsObject.display_name.trim() : ""),
+      summary:
+        (typeof agent?.summary === "string" ? agent.summary.trim() : "") ||
+        (typeof paramsObject.summary === "string" ? paramsObject.summary.trim() : ""),
+      params:
+        typeof agent?.params === "string" && agent.params.trim()
+          ? agent.params
+          : JSON.stringify(paramsObject),
       video_packaging_mode: normalizeAgentVideoPackagingMode(
         agent?.video_packaging_mode ?? agent?.videoPackagingMode
       ),
@@ -5403,6 +5459,7 @@ function StepCard({
   };
 
   const fetchStepData = async () => {
+    setStepDataLoaded(false);
     try {
       const [targetsRes, agentsRes, alertsRes] = await Promise.all([
         fetch(`/api/job-steps/${step.id}/targets`),
@@ -5429,6 +5486,8 @@ function StepCard({
       }
     } catch (error) {
       console.error("Failed to fetch step data:", error);
+    } finally {
+      setStepDataLoaded(true);
     }
   };
 
@@ -5631,6 +5690,9 @@ function StepCard({
   }: {
     source: {
       agent_key: string;
+      stored_agent_key?: string | null;
+      display_name?: string | null;
+      summary?: string | null;
       params?: string | null;
       input_schema?: string | null;
       priority_level?: AgentPriority | null;
@@ -5651,12 +5713,25 @@ function StepCard({
     inputType?: TargetInputType | null;
   }) => {
     const inferenceModel = normalizeAgentInferenceModel(source.inference_model);
+    const sourceParams = parseAgentParamsObject(source.params ?? "{}");
+    const displayName =
+      (typeof source.display_name === "string" ? source.display_name.trim() : "") ||
+      (typeof sourceParams.display_name === "string" ? sourceParams.display_name.trim() : "") ||
+      String(source.agent_key || "").trim();
+    const summary =
+      (typeof source.summary === "string" ? source.summary.trim() : "") ||
+      (typeof sourceParams.summary === "string" ? sourceParams.summary.trim() : "") ||
+      String(promptPayload.alert_condition || "").trim();
     const body: Record<string, unknown> = {
-      agent_key: source.agent_key,
+      agent_key: source.stored_agent_key || source.agent_key,
       prompt_template: promptPayload.prompt_template,
       alert_condition: promptPayload.alert_condition,
       camera_id: cameraId,
-      params: source.params ?? "{}",
+      params: JSON.stringify({
+        ...sourceParams,
+        display_name: displayName,
+        summary,
+      }),
       input_schema: source.input_schema ?? "{}",
       priority_level: source.priority_level || "MEDIUM",
       inference_model: inferenceModel,
@@ -5761,7 +5836,9 @@ function StepCard({
       0
     );
     const hasFaceTargets = mergedFaceTargetIds.length > 0;
-    const normalizedAgentKey = String(form.agent_key || "").trim().toLowerCase();
+    const normalizedAgentKey = String(form.stored_agent_key || form.agent_key || "")
+      .trim()
+      .toLowerCase();
     const isFaceIdAgent =
       normalizedAgentKey === "faceid" ||
       normalizedAgentKey === "face_id" ||
@@ -7217,7 +7294,8 @@ function StepCard({
         normalizeAgentModelFps(targetAgent.model_fps)
       );
       nextForm = {
-        agent_key: targetAgent.agent_key,
+        agent_key: getAgentDisplayName(targetAgent),
+        stored_agent_key: targetAgent.agent_key,
         prompt_template: split.prompt_template,
         alert_condition: split.alert_condition,
         negative_condition: split.negative_condition,
@@ -7262,6 +7340,71 @@ function StepCard({
       targetAgent: targetAgent || null,
     });
   };
+  openAgentEditorForTargetRef.current = openAgentEditorForTarget;
+
+  useEffect(() => {
+    const shouldOpenAgent = searchParams.get("openAgent") === "1";
+    if (!shouldOpenAgent) {
+      handledAgentDeepLinkKeyRef.current = null;
+      return;
+    }
+
+    const requestedStepId = Number(searchParams.get("step") || 0);
+    const requestedCameraId = Number(searchParams.get("camera") || 0);
+    const requestedAgentId = Number(searchParams.get("agent") || 0);
+
+    if (!Number.isInteger(requestedStepId) || requestedStepId <= 0 || requestedStepId !== step.id) {
+      return;
+    }
+    if (!Number.isInteger(requestedCameraId) || requestedCameraId <= 0) {
+      return;
+    }
+    if (!stepDataLoaded || targets.length === 0) {
+      return;
+    }
+
+    const requestKey = `${requestedStepId}:${requestedCameraId}:${
+      Number.isInteger(requestedAgentId) && requestedAgentId > 0 ? requestedAgentId : 0
+    }`;
+    if (handledAgentDeepLinkKeyRef.current === requestKey) {
+      return;
+    }
+
+    const target = targets.find((candidate) => candidate.camera_id === requestedCameraId);
+    if (!target) {
+      return;
+    }
+
+    const exactAgent =
+      Number.isInteger(requestedAgentId) && requestedAgentId > 0
+        ? agents.find(
+            (candidate) =>
+              candidate.id === requestedAgentId && candidate.camera_id === requestedCameraId
+          )
+        : undefined;
+    const activeCameraAgent = agents.find(
+      (candidate) => candidate.is_active === 1 && candidate.camera_id === requestedCameraId
+    );
+    const targetAgent = exactAgent || activeCameraAgent;
+
+    if (Number.isInteger(requestedAgentId) && requestedAgentId > 0 && !targetAgent) {
+      return;
+    }
+
+    handledAgentDeepLinkKeyRef.current = requestKey;
+    openAgentEditorForTargetRef.current?.(
+      target,
+      targetAgent,
+      (agentPriorities[target.id] || targetAgent?.priority_level || "MEDIUM") as AgentPriority
+    );
+
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("step");
+    nextParams.delete("camera");
+    nextParams.delete("agent");
+    nextParams.delete("openAgent");
+    setSearchParams(nextParams, { replace: true });
+  }, [agentPriorities, agents, searchParams, setSearchParams, step.id, stepDataLoaded, targets]);
 
   const promptCoreFilled = agentForm.prompt_template.trim().length > 0;
   const promptAlertFilled = agentForm.alert_condition.trim().length > 0;
@@ -7483,7 +7626,7 @@ function StepCard({
         cameraId: target.camera_id,
         cameraLabel,
         agentKey: effectiveAgent.agent_key,
-        label: `${cameraLabel} - ${effectiveAgent.agent_key}${targetAgent ? "" : " (default)"}`,
+        label: `${cameraLabel} - ${getAgentDisplayName(effectiveAgent)}${targetAgent ? "" : " (default)"}`,
         inputType,
         priorityLevel,
         inferenceModel,
@@ -8015,11 +8158,11 @@ function StepCard({
                     group.targetIds.includes(target.id)
                   );
                   const isGrouped = !!activeGroupForTarget;
-                  const normalizedEffectiveAgentKey = String(effectiveAgent?.agent_key || "").trim();
+                  const normalizedEffectiveAgentLabel = getAgentDisplayName(effectiveAgent);
                   const agentSummaryText = effectiveAgent
                     ? targetAgent
-                      ? normalizedEffectiveAgentKey
-                      : `${t("jobs.usingDefault")}: ${normalizedEffectiveAgentKey}`
+                      ? normalizedEffectiveAgentLabel
+                      : `${t("jobs.usingDefault")}: ${normalizedEffectiveAgentLabel}`
                     : t("jobs.notConfigured");
                   const agentSummaryClass = effectiveAgent
                     ? targetAgent
@@ -8151,7 +8294,7 @@ function StepCard({
                 {defaultAgent && (
                   <div className="mt-2 p-2 bg-blue-900/20 rounded border border-blue-800">
                     <p className="text-xs text-blue-400">
-                      {t("jobs.defaultAgentFallback")}: {defaultAgent.agent_key}
+                      {t("jobs.defaultAgentFallback")}: {getAgentDisplayName(defaultAgent)}
                     </p>
                   </div>
                 )}
@@ -8379,7 +8522,9 @@ function StepCard({
                   message={
                     confirmCloneAgent.targetId !== null && confirmCloneAgent.sourceCameraId !== null
                       ? `Clone agent "${
-                          activeAgentByCameraId.get(confirmCloneAgent.sourceCameraId)?.agent_key || ""
+                          getAgentDisplayName(
+                            activeAgentByCameraId.get(confirmCloneAgent.sourceCameraId) || null
+                          ) || ""
                         }" from ${
                           targets.find(
                             (candidate) =>
@@ -10680,8 +10825,8 @@ function StepCard({
                       {inspectedEffectiveAgent ? (
                         <span className={inspectedTargetAgent ? "text-green-400" : "text-yellow-400"}>
                           {inspectedTargetAgent
-                            ? inspectedTargetAgent.agent_key
-                            : `${t("jobs.usingDefault")}: ${inspectedEffectiveAgent.agent_key}`}
+                            ? getAgentDisplayName(inspectedTargetAgent)
+                            : `${t("jobs.usingDefault")}: ${getAgentDisplayName(inspectedEffectiveAgent)}`}
                         </span>
                       ) : (
                         <span className="text-red-400">{t("jobs.notConfigured")}</span>
@@ -10813,7 +10958,7 @@ function StepCard({
                         >
                           {inspectedCloneCandidates.map((candidate) => (
                             <option key={`${inspectedTarget.id}-${candidate.cameraId}`} value={candidate.cameraId}>
-                              {candidate.cameraName} - {candidate.agent.agent_key}
+                              {candidate.cameraName} - {getAgentDisplayName(candidate.agent)}
                             </option>
                           ))}
                         </select>

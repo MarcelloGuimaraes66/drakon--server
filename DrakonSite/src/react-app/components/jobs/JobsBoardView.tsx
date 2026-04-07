@@ -78,7 +78,7 @@ export default function JobsBoardView({
           </p>
         </div>
         {tabs ? <div className="xl:justify-self-center">{tabs}</div> : <div className="hidden xl:block" />}
-        <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end xl:self-start">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start xl:justify-self-end xl:self-start">
           <label className="relative flex min-h-[44px] min-w-[260px] items-center">
             <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
               <Search className="h-4 w-4 text-gray-500" />

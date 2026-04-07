@@ -283,6 +283,7 @@ int progressStepCountForSkill_(const std::string& skillName)
     if (skillName == "video_search") return 5;
     if (skillName == "explain_app") return 4;
     if (skillName == "create_cameras_batch") return 3;
+    if (skillName == "edit_cameras_batch") return 3;
     if (skillName == "scan_network") return 3;
     if (skillName == "read_state") return 3;
     if (skillName == "general_answer") return 2;
@@ -360,7 +361,8 @@ SkillSelection rewriteInstructionalSelection_(SkillSelection selection, const st
 
     if ((selection.selectedSkill == "video_search" ||
          selection.selectedSkill == "general_answer" ||
-         selection.selectedSkill == "create_camera_agent") &&
+         selection.selectedSkill == "create_camera_agent" ||
+         selection.selectedSkill == "edit_camera_agent") &&
         isCameraAgentHelpRequest_(normalized)) {
         selection.selectedSkill = "explain_app";
         selection.confidence = std::max(selection.confidence, 0.99);
@@ -499,6 +501,118 @@ bool hasUploadedMedia_(const nlohmann::json& payload)
     return hasUploadedImage || hasUploadedVideo;
 }
 
+std::string activeTaskPhaseForContext_(const nlohmann::json& conversationContext)
+{
+    const nlohmann::json taskState = taskStateFromConversationContext(conversationContext);
+    if (!taskState.contains("active_task") || !taskState["active_task"].is_object()) {
+        return "";
+    }
+
+    const auto& activeTask = taskState["active_task"];
+    if (!activeTask.contains("phase") || !activeTask["phase"].is_string()) {
+        return "";
+    }
+    return trimCopy_(activeTask["phase"].get<std::string>());
+}
+
+std::string activeTaskGoalForContext_(const nlohmann::json& conversationContext)
+{
+    const nlohmann::json taskState = taskStateFromConversationContext(conversationContext);
+    if (!taskState.contains("active_task") || !taskState["active_task"].is_object()) {
+        return "";
+    }
+
+    const auto& activeTask = taskState["active_task"];
+    if (!activeTask.contains("goal") || !activeTask["goal"].is_string()) {
+        return "";
+    }
+    return trimCopy_(activeTask["goal"].get<std::string>());
+}
+
+std::size_t countRegexMatches_(const std::string& text, const std::regex& pattern)
+{
+    if (text.empty()) {
+        return 0;
+    }
+
+    return static_cast<std::size_t>(
+        std::distance(
+            std::sregex_iterator(text.begin(), text.end(), pattern),
+            std::sregex_iterator()));
+}
+
+bool isLikelyStructuredBatchPayload_(const std::string& userMessage)
+{
+    const std::string trimmed = trimCopy_(userMessage);
+    if (trimmed.size() < 24) {
+        return false;
+    }
+
+    const std::size_t commaCount = static_cast<std::size_t>(std::count(trimmed.begin(), trimmed.end(), ','));
+    const std::size_t semicolonCount = static_cast<std::size_t>(std::count(trimmed.begin(), trimmed.end(), ';'));
+    const std::size_t newlineCount = static_cast<std::size_t>(std::count(trimmed.begin(), trimmed.end(), '\n'));
+    const std::size_t separatorCount = commaCount + semicolonCount + newlineCount;
+    const std::size_t digitCount = static_cast<std::size_t>(std::count_if(
+        trimmed.begin(),
+        trimmed.end(),
+        [](unsigned char ch) { return std::isdigit(ch) != 0; }));
+
+    static const std::regex ipv4Pattern(R"(\b(?:\d{1,3}\.){3}\d{1,3}\b)");
+    const std::size_t ipv4Count = countRegexMatches_(trimmed, ipv4Pattern);
+
+    if (trimmed.find('?') != std::string::npos &&
+        ipv4Count == 0 &&
+        separatorCount < 4) {
+        return false;
+    }
+
+    if (ipv4Count >= 1 &&
+        (separatorCount >= 2 || trimmed.size() >= 40)) {
+        return true;
+    }
+
+    return separatorCount >= 6 && digitCount >= 6;
+}
+
+bool shouldBypassRouterForActiveBatchContinuation_(
+    const nlohmann::json& payload,
+    const std::string& userMessage,
+    const nlohmann::json& conversationContext)
+{
+    if (hasUploadedMedia_(payload)) {
+        return false;
+    }
+
+    if (activeOperationTaskType(conversationContext) != "create_cameras_batch") {
+        return false;
+    }
+
+    const std::string activeTaskPhase = activeTaskPhaseForContext_(conversationContext);
+    if (activeTaskPhase != "awaiting_missing_fields") {
+        return false;
+    }
+
+    return isLikelyStructuredBatchPayload_(userMessage);
+}
+
+SkillSelection buildActiveBatchContinuationSelection_(
+    const nlohmann::json& conversationContext)
+{
+    SkillSelection selection;
+    selection.selectedSkill = "create_cameras_batch";
+    selection.confidence = 0.98;
+    selection.reason = "active_batch_data_continuation";
+    selection.replyPreview = "Vou continuar o lote atual.";
+    selection.continueActiveTask = true;
+    selection.mode = "operate";
+    selection.entity = "camera";
+    selection.intent = "continue";
+    selection.operationType = "create_cameras_batch";
+    selection.operationPhase = "collecting_batch";
+    selection.taskGoal = activeTaskGoalForContext_(conversationContext);
+    return selection;
+}
+
 std::string skillFromSemanticSelection_(
     const SkillSelection& selection,
     const nlohmann::json& conversationContext)
@@ -506,8 +620,14 @@ std::string skillFromSemanticSelection_(
     if (selection.selectedSkill == "create_cameras_batch") {
         return "create_cameras_batch";
     }
+    if (selection.selectedSkill == "edit_cameras_batch") {
+        return "edit_cameras_batch";
+    }
     if (selection.selectedSkill == "edit_camera") {
         return "edit_camera";
+    }
+    if (selection.selectedSkill == "edit_camera_agent") {
+        return "edit_camera_agent";
     }
 
     if (selection.continueActiveTask) {
@@ -537,6 +657,9 @@ std::string skillFromSemanticSelection_(
     }
     if (entity == "camera" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_camera";
+    }
+    if (entity == "camera_agent" && intent == "update") {
+        return "edit_camera_agent";
     }
     if (entity == "camera_agent" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_camera_agent";
@@ -582,6 +705,8 @@ bool shouldSemanticSkillOverrideSelected_(
 
     return semanticSkill == "create_camera" ||
         semanticSkill == "edit_camera" ||
+        semanticSkill == "edit_camera_agent" ||
+        semanticSkill == "edit_cameras_batch" ||
         semanticSkill == "create_cameras_batch" ||
         semanticSkill == "create_camera_agent" ||
         semanticSkill == "create_job" ||
@@ -642,6 +767,9 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.operationType.empty() &&
         (selection.selectedSkill == "create_camera" ||
+         selection.selectedSkill == "edit_camera" ||
+         selection.selectedSkill == "edit_camera_agent" ||
+         selection.selectedSkill == "edit_cameras_batch" ||
          selection.selectedSkill == "create_cameras_batch" ||
          selection.selectedSkill == "create_camera_agent" ||
          selection.selectedSkill == "create_job" ||
@@ -655,6 +783,11 @@ SkillSelection applySemanticSelectionPlan_(
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job") {
             selection.intent = selection.continueActiveTask ? "continue" : "create";
+        }
+        else if (selection.selectedSkill == "edit_camera" ||
+                 selection.selectedSkill == "edit_camera_agent" ||
+                 selection.selectedSkill == "edit_cameras_batch") {
+            selection.intent = selection.continueActiveTask ? "continue" : "update";
         }
         else if (selection.selectedSkill == "scan_network") {
             selection.intent = "inspect";
@@ -675,6 +808,9 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.mode.empty()) {
         if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "edit_camera" ||
+            selection.selectedSkill == "edit_camera_agent" ||
+            selection.selectedSkill == "edit_cameras_batch" ||
             selection.selectedSkill == "create_cameras_batch" ||
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job" ||
@@ -1451,6 +1587,32 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
     const nlohmann::json promptConversationContext =
         normalizeConversationContextForPrompt_(conversationContext);
 
+    auto finalizeForcedSelection = [&](SkillSelection forcedSelection) -> SkillSelection {
+        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), payload, conversationContext);
+        forcedSelection = applyReplyLanguageHints_(forcedSelection, payload, userMessage, conversationContext);
+        if (llm.isConfigured() &&
+            (queryLanguageSource != "detected" ||
+             shouldDetectReplyLanguageForSelection_(forcedSelection))) {
+            const std::string detectedReplyLanguage = llm.detectReplyLanguage(
+                userMessage,
+                appLanguage);
+            if (!detectedReplyLanguage.empty()) {
+                forcedSelection.replyLanguage = detectedReplyLanguage;
+                forcedSelection.replyLanguageConfidence =
+                    (std::max)(forcedSelection.replyLanguageConfidence, 0.95);
+            }
+        }
+        forcedSelection = applyReplyLanguageHints_(forcedSelection, payload, userMessage, conversationContext);
+        forcedSelection = finalizeSelectionLanguages_(std::move(forcedSelection));
+        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), payload, conversationContext);
+        return forcedSelection;
+    };
+
+    if (shouldBypassRouterForActiveBatchContinuation_(payload, userMessage, conversationContext)) {
+        return finalizeForcedSelection(
+            buildActiveBatchContinuationSelection_(conversationContext));
+    }
+
     if (llm.isConfigured()) {
         nlohmann::json requestContext = {
             { "chat_session_id", hasPayloadObject ? payload.value("chat_session_id", -1) : -1 },
@@ -1533,6 +1695,11 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         }
         if (!selection.selectedSkill.empty() && registry_.hasSkill(selection.selectedSkill)) {
             return selection;
+        }
+
+        if (shouldBypassRouterForActiveBatchContinuation_(payload, userMessage, conversationContext)) {
+            return finalizeForcedSelection(
+                buildActiveBatchContinuationSelection_(conversationContext));
         }
 
         SkillSelection routerFailure;
@@ -1802,8 +1969,8 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
         sanitized.end());
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
-        { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
-        { std::regex("\\b(create_cameras_batch)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(create_cameras_batch|edit_cameras_batch)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },
     };

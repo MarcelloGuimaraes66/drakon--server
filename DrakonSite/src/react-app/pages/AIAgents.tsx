@@ -7,7 +7,6 @@ import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
   type CameraEditorDraft,
-  type CameraEditorSavedResult,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
@@ -223,7 +222,7 @@ function AIAgentsContent() {
     setIsEditorOpen(false);
   };
 
-  const handleCameraSaved = async (_saved?: CameraEditorSavedResult) => {
+  const handleCameraSaved = async () => {
     dashboardSummaryStore.refresh();
   };
 
@@ -370,18 +369,18 @@ function AIAgentsContent() {
 
   return (
     <>
-      <div className="max-w-7xl mx-auto">
+      <div className="space-y-5">
         {/* Header */}
-        <div className="mb-6 md:mb-8 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold text-gray-100 dark:text-gray-100 mb-2">
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr),auto] xl:items-start">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-bold text-gray-100">
               {t("aiAgents.title")}
             </h1>
-            <p className="text-sm md:text-base text-gray-400 dark:text-gray-400">
+            <p className="mt-1.5 text-sm text-gray-400">
               {t("aiAgents.subtitle")}
             </p>
           </div>
-          <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
+          <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end">
             <button
               onClick={openDiscoveryModal}
               className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
@@ -397,7 +396,7 @@ function AIAgentsContent() {
               Import Cameras
             </button>
 
-            <div className="w-full md:w-72">
+            <div className="w-full sm:min-w-[260px] xl:w-72">
               <label className="sr-only" htmlFor="ai-agents-search">
                 Search cameras
               </label>

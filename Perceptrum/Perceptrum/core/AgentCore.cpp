@@ -5935,6 +5935,46 @@ void AgentCore::processCommand_(const json& cmd) {
                 }
             }).detach();
         }
+        else if (type == "agent_design") {
+            std::thread([this, commandId, payload]() {
+                try {
+                    handleAgentDesignCommand_(commandId, payload);
+                }
+                catch (const std::exception& e) {
+                    logAgentException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::agentDesignThread",
+                        "agent_design",
+                        {
+                            { "command_id", commandId }
+                        },
+                        e
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = std::string("agent_design exception: ") + e.what();
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+                catch (...) {
+                    logAgentUnknownException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::agentDesignThread",
+                        "agent_design",
+                        {
+                            { "command_id", commandId }
+                        }
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = "agent_design unknown exception";
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+            }).detach();
+        }
         else if (type == "refresh_thumbnail") {
             std::thread([this, commandId, payload]() {
                 try {
@@ -25226,6 +25266,723 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
     }
     catch (...) {
         fail("prompt_enhance failed with unknown error");
+    }
+}
+
+void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        Logger::instance().logDebug("agent", "handleAgentDesignCommand_: missing command id");
+        return;
+    }
+
+    auto fail = [&](const std::string& reason) {
+        nlohmann::json err;
+        err["error"] = reason;
+        postCommandResult_(commandId, "failed", err);
+    };
+
+    try {
+        const int cameraId = payload.value("camera_id", -1);
+        std::string goalSummary = payload.value("goal_summary", std::string());
+        std::string languageHint = payload.value("user_language", std::string("pt-BR"));
+        std::string modelName = payload.value("model_name", std::string("gpt-5.1"));
+        std::string modelApiKey = payload.value("model_api_key", std::string());
+        std::string cameraName = payload.value("camera_name", std::string());
+        std::string cameraDescription = payload.value("camera_description", std::string());
+        const nlohmann::json agentPatch =
+            payload.contains("agent_patch") && payload["agent_patch"].is_object()
+                ? payload["agent_patch"]
+                : nlohmann::json::object();
+        const nlohmann::json faceTargets =
+            payload.contains("face_targets") && payload["face_targets"].is_array()
+                ? payload["face_targets"]
+                : nlohmann::json::array();
+        const nlohmann::json drakonFindTargets =
+            payload.contains("drakon_find_targets") && payload["drakon_find_targets"].is_array()
+                ? payload["drakon_find_targets"]
+                : nlohmann::json::array();
+
+        goalSummary = trimCopyPromptEnhance(goalSummary);
+        languageHint = trimCopyPromptEnhance(languageHint);
+        modelName = trimCopyPromptEnhance(modelName);
+        modelApiKey = trimCopyPromptEnhance(modelApiKey);
+        cameraName = trimCopyPromptEnhance(cameraName);
+        cameraDescription = trimCopyPromptEnhance(cameraDescription);
+
+        if (goalSummary.empty()) {
+            fail("goal_summary is required");
+            return;
+        }
+        if (modelApiKey.empty()) {
+            fail("model_api_key is required");
+            return;
+        }
+        if (modelName.empty()) {
+            modelName = "gpt-5.1";
+        }
+        if (languageHint.empty()) {
+            languageHint = "pt-BR";
+        }
+
+        auto jsonTextField = [](const nlohmann::json& node, const char* key) -> std::string {
+            if (!node.is_object() || !node.contains(key) || !node[key].is_string()) {
+                return std::string();
+            }
+            return trimCopyPromptEnhance(node[key].get<std::string>());
+        };
+
+        auto jsonBoolField = [&](const nlohmann::json& node, const char* key, bool fallback) -> bool {
+            if (!node.is_object() || !node.contains(key)) {
+                return fallback;
+            }
+            const auto& value = node[key];
+            if (value.is_boolean()) {
+                return value.get<bool>();
+            }
+            if (value.is_number_integer()) {
+                return value.get<int>() != 0;
+            }
+            if (value.is_string()) {
+                const std::string lower =
+                    toLowerCopyPromptEnhance(trimCopyPromptEnhance(value.get<std::string>()));
+                if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+                    return true;
+                }
+                if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+                    return false;
+                }
+            }
+            return fallback;
+        };
+
+        auto jsonIntField = [&](const nlohmann::json& node, const char* key, int fallback) -> int {
+            if (!node.is_object() || !node.contains(key)) {
+                return fallback;
+            }
+            const auto& value = node[key];
+            if (value.is_number_integer()) {
+                return value.get<int>();
+            }
+            if (value.is_number()) {
+                return static_cast<int>(value.get<double>());
+            }
+            if (value.is_string()) {
+                try {
+                    return std::stoi(trimCopyPromptEnhance(value.get<std::string>()));
+                }
+                catch (...) {
+                }
+            }
+            return fallback;
+        };
+
+        auto normalizeInputType = [](std::string value) {
+            value = toLowerCopyPromptEnhance(trimCopyPromptEnhance(std::move(value)));
+            return value == "image" ? std::string("image") : std::string("video");
+        };
+
+        auto normalizeVideoPackagingMode = [](std::string value) {
+            value = toLowerCopyPromptEnhance(trimCopyPromptEnhance(std::move(value)));
+            if (value == "frame_sequence" ||
+                value == "frame-sequence" ||
+                value == "frames" ||
+                value == "full_frame" ||
+                value == "full-frame" ||
+                value == "high_resolution" ||
+                value == "high-resolution" ||
+                value == "high resolution") {
+                return std::string("frame_sequence");
+            }
+            if (value == "mosaic_3x3" ||
+                value == "mosaic-3x3" ||
+                value == "mosaic" ||
+                value == "3x3" ||
+                value == "compact_resolution" ||
+                value == "compact-resolution" ||
+                value == "compact resolution") {
+                return std::string("mosaic_3x3");
+            }
+            return std::string("mosaic_2x2");
+        };
+
+        auto normalizeInferenceModel = [](std::string value) {
+            value = toLowerCopyPromptEnhance(trimCopyPromptEnhance(std::move(value)));
+            if (value == "ultra+" || value == "ultra-plus" || value == "ultraplus") {
+                return std::string("ultra_plus");
+            }
+            if (value == "core" ||
+                value == "light" ||
+                value == "ultra" ||
+                value == "ultra_plus" ||
+                value == "legacy" ||
+                value == "pro") {
+                return value;
+            }
+            return std::string("ultra");
+        };
+
+        auto normalizeRunEvery = [&](const nlohmann::json& node) {
+            const int requested = jsonIntField(node, "run_every", 60);
+            return requested <= 10 ? 10 : 60;
+        };
+
+        auto normalizeRunningResolution = [&](const nlohmann::json& node) {
+            const int requested = jsonIntField(node, "running_resolution", 640);
+            return requested == 1024 ? 1024 : 640;
+        };
+
+        auto normalizeModelFps = [&](const nlohmann::json& node, const std::string& inputType) {
+            int requested = jsonIntField(node, "model_fps", 1);
+            if (requested < 1) requested = 1;
+            if (requested > 10) requested = 10;
+            if (inputType != "video") {
+                return 1;
+            }
+            return requested;
+        };
+
+        auto clamp01 = [](double value) {
+            if (value < 0.0) return 0.0;
+            if (value > 1.0) return 1.0;
+            return value;
+        };
+
+        int warmupSeconds = 6;
+        int targetSecond = 5;
+        int maxCaptureSeconds = 12;
+        bool requireSnapshot = cameraId > 0;
+        bool preferRunningSessionSnapshot = true;
+
+        if (payload.contains("snapshot_strategy") && payload["snapshot_strategy"].is_object()) {
+            const auto& strategy = payload["snapshot_strategy"];
+            warmupSeconds = jsonIntOrPromptEnhance(strategy, "warmup_seconds", warmupSeconds);
+            targetSecond = jsonIntOrPromptEnhance(strategy, "target_second", targetSecond);
+            maxCaptureSeconds = jsonIntOrPromptEnhance(strategy, "max_capture_seconds", maxCaptureSeconds);
+            if (strategy.contains("require_snapshot") && strategy["require_snapshot"].is_boolean()) {
+                requireSnapshot = strategy["require_snapshot"].get<bool>();
+            }
+            if (strategy.contains("prefer_running_session_snapshot")) {
+                preferRunningSessionSnapshot = jsonBoolField(
+                    nlohmann::json::object({
+                        { "value", strategy["prefer_running_session_snapshot"] },
+                    }),
+                    "value",
+                    true);
+            }
+        }
+
+        if (warmupSeconds < 2) warmupSeconds = 2;
+        if (maxCaptureSeconds < warmupSeconds) maxCaptureSeconds = warmupSeconds;
+        if (maxCaptureSeconds < 2) maxCaptureSeconds = 2;
+        if (targetSecond < 0) targetSecond = 0;
+        if (targetSecond >= maxCaptureSeconds) targetSecond = (std::max)(0, maxCaptureSeconds - 1);
+
+        std::string snapshotDataUrl;
+        std::string snapshotTsUtcIso;
+        std::string snapshotSource;
+
+        if (cameraId > 0 && preferRunningSessionSnapshot) {
+            CameraSession* session = getCameraSession(cameraId);
+            if (session) {
+                snapshotDataUrl = trimCopyPromptEnhance(session->getLastJobStillJpegBase64());
+                snapshotTsUtcIso = trimCopyPromptEnhance(session->getLastJobStillTsUtcIso());
+                if (!snapshotDataUrl.empty()) {
+                    if (snapshotDataUrl.rfind("data:image", 0) != 0) {
+                        snapshotDataUrl = "data:image/jpeg;base64," + stripDataUrlPrefix(snapshotDataUrl);
+                    }
+                    snapshotSource = "running_session";
+                }
+            }
+        }
+
+        if (snapshotDataUrl.empty() && cameraId > 0) {
+            if (!payload.contains("camera_payload") || !payload["camera_payload"].is_object()) {
+                if (requireSnapshot) {
+                    fail("snapshot required, but camera_payload is missing");
+                    return;
+                }
+            }
+            else {
+                const auto& cameraPayload = payload["camera_payload"];
+                if (cameraName.empty() && cameraPayload.contains("name") && cameraPayload["name"].is_string()) {
+                    cameraName = trimCopyPromptEnhance(cameraPayload["name"].get<std::string>());
+                }
+                if (cameraDescription.empty() &&
+                    cameraPayload.contains("description") &&
+                    cameraPayload["description"].is_string())
+                {
+                    cameraDescription = trimCopyPromptEnhance(cameraPayload["description"].get<std::string>());
+                }
+
+                const int webcamIndex = jsonIntOrPromptEnhance(cameraPayload, "webcam_index", -1);
+                std::string connectionMethod;
+                if (cameraPayload.contains("connection_method") && cameraPayload["connection_method"].is_string()) {
+                    connectionMethod = toLowerCopyPromptEnhance(
+                        trimCopyPromptEnhance(cameraPayload["connection_method"].get<std::string>())
+                    );
+                }
+                const bool preferWebcam = (webcamIndex >= 0) || connectionMethod == "webcam";
+
+                cv::Mat capturedFrame;
+                std::string captureError;
+                bool captured = false;
+
+                if (preferWebcam && webcamIndex >= 0) {
+                    captured = captureStableWebcamSnapshotPromptEnhance(
+                        webcamIndex,
+                        targetSecond,
+                        maxCaptureSeconds,
+                        capturedFrame,
+                        captureError
+                    );
+                    if (captured) {
+                        snapshotSource = "on_demand_webcam";
+                    }
+                }
+
+                if (!captured) {
+                    captured = captureStableRtspSnapshotPromptEnhance(
+                        cameraPayload,
+                        targetSecond,
+                        maxCaptureSeconds,
+                        capturedFrame,
+                        captureError
+                    );
+                    if (captured) {
+                        snapshotSource = "on_demand_rtsp";
+                    }
+                }
+
+                if (!captured || capturedFrame.empty()) {
+                    if (requireSnapshot) {
+                        fail(
+                            "snapshot required, capture failed: " +
+                            (captureError.empty() ? std::string("no valid frame captured") : captureError)
+                        );
+                        return;
+                    }
+                }
+                else {
+                    if (!encodeJpegDataUrlForPromptEnhance(capturedFrame, snapshotDataUrl)) {
+                        if (requireSnapshot) {
+                            fail("snapshot required, failed to encode snapshot");
+                            return;
+                        }
+                    }
+                    else {
+                        snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+                    }
+                }
+            }
+        }
+
+        if (snapshotDataUrl.empty() && requireSnapshot) {
+            fail("snapshot required, but snapshot is empty");
+            return;
+        }
+
+        if (snapshotTsUtcIso.empty()) {
+            snapshotTsUtcIso = nowUtcIso8601PromptEnhance();
+        }
+        if (snapshotSource.empty()) {
+            snapshotSource = snapshotDataUrl.empty() ? "none" : "unknown";
+        }
+
+        auto sanitizeAnalysisRegions = [&](
+            const nlohmann::json& rawRegions,
+            const std::string& fallbackPrompt,
+            const std::string& fallbackAlert,
+            const std::string& fallbackNegative,
+            bool allowPolygonOutput)
+        {
+            nlohmann::json normalized = nlohmann::json::array();
+            if (!rawRegions.is_array()) {
+                return normalized;
+            }
+
+            int regionIndex = 0;
+            for (const auto& row : rawRegions) {
+                if (!row.is_object()) {
+                    continue;
+                }
+
+                bool fullFrame = jsonBoolField(row, "full_frame", false);
+                if (!row.contains("full_frame") && row.contains("fullFrame")) {
+                    fullFrame = jsonBoolField(
+                        nlohmann::json::object({ { "value", row["fullFrame"] } }),
+                        "value",
+                        false);
+                }
+
+                const nlohmann::json* polygonNode = nullptr;
+                if (row.contains("polygon_norm") && row["polygon_norm"].is_array()) {
+                    polygonNode = &row["polygon_norm"];
+                }
+                else if (row.contains("polygonNorm") && row["polygonNorm"].is_array()) {
+                    polygonNode = &row["polygonNorm"];
+                }
+
+                nlohmann::json polygon = nlohmann::json::array();
+                if (allowPolygonOutput && polygonNode != nullptr) {
+                    for (const auto& point : *polygonNode) {
+                        if (!point.is_object()) {
+                            continue;
+                        }
+                        const double x =
+                            point.contains("x") && point["x"].is_number()
+                                ? point["x"].get<double>()
+                                : 0.0;
+                        const double y =
+                            point.contains("y") && point["y"].is_number()
+                                ? point["y"].get<double>()
+                                : 0.0;
+                        polygon.push_back({
+                            { "x", clamp01(x) },
+                            { "y", clamp01(y) },
+                        });
+                    }
+                }
+
+                if (polygon.size() < 3) {
+                    fullFrame = true;
+                    polygon = nlohmann::json::array();
+                }
+
+                std::string regionId = jsonTextField(row, "region_id");
+                if (regionId.empty()) {
+                    regionId = jsonTextField(row, "regionId");
+                }
+                if (regionId.empty()) {
+                    regionId = "region-" + std::to_string(regionIndex + 1);
+                }
+
+                std::string label = jsonTextField(row, "label");
+                if (label.empty()) {
+                    label = "Region " + std::to_string(regionIndex + 1);
+                }
+
+                std::string promptCore = jsonTextField(row, "prompt_core");
+                if (promptCore.empty()) {
+                    promptCore = jsonTextField(row, "prompt_template");
+                }
+                if (promptCore.empty()) {
+                    promptCore = fallbackPrompt;
+                }
+
+                std::string regionAlert = jsonTextField(row, "alert_condition");
+                if (regionAlert.empty()) {
+                    regionAlert = fallbackAlert;
+                }
+                std::string regionNegative = jsonTextField(row, "negative_condition");
+                if (regionNegative.empty()) {
+                    regionNegative = fallbackNegative;
+                }
+
+                int drawRefWidth = jsonIntField(row, "draw_ref_width", 1920);
+                if (drawRefWidth <= 0) drawRefWidth = 1920;
+                int drawRefHeight = jsonIntField(row, "draw_ref_height", 1080);
+                if (drawRefHeight <= 0) drawRefHeight = 1080;
+
+                normalized.push_back({
+                    { "region_id", regionId },
+                    { "label", label },
+                    { "description", jsonTextField(row, "description") },
+                    { "enabled", jsonBoolField(row, "enabled", true) },
+                    { "full_frame", fullFrame },
+                    { "polygon_norm", polygon },
+                    { "draw_ref_width", drawRefWidth },
+                    { "draw_ref_height", drawRefHeight },
+                    { "context_padding_pct", 0 },
+                    { "prompt_core", promptCore },
+                    { "alert_condition", regionAlert },
+                    { "negative_condition", regionNegative },
+                    { "face_target_ids", nlohmann::json::array() },
+                    { "negative_image_ids", nlohmann::json::array() },
+                });
+
+                ++regionIndex;
+                if (regionIndex >= 6) {
+                    break;
+                }
+            }
+
+            return normalized;
+        };
+
+        std::ostringstream prompt;
+        prompt << "You design CCTV camera agents from a user's goal, optional explicit preferences, optional camera context, optional snapshot context, and optional known identity or search targets.\n";
+        prompt << "The user wants a complete agent configuration that can be created directly in the app.\n\n";
+        prompt << "PRIMARY GOAL:\n" << goalSummary << "\n\n";
+
+        if (!cameraName.empty() || !cameraDescription.empty()) {
+            prompt << "CAMERA CONTEXT:\n";
+            if (!cameraName.empty()) {
+                prompt << "camera_name: " << cameraName << "\n";
+            }
+            if (!cameraDescription.empty()) {
+                prompt << "camera_description: " << cameraDescription << "\n";
+            }
+            prompt << "\n";
+        }
+
+        if (agentPatch.is_object() && !agentPatch.empty()) {
+            prompt << "EXPLICIT USER PREFERENCES (preserve these when compatible):\n";
+            prompt << agentPatch.dump(2) << "\n\n";
+        }
+
+        if (faceTargets.is_array() && !faceTargets.empty()) {
+            prompt << "KNOWN FACE TARGETS AVAILABLE TO THE USER:\n";
+            prompt << faceTargets.dump(2) << "\n";
+            prompt << "- If the goal clearly references one of these identities, tailor the design for that identity.\n";
+            prompt << "- Do not invent new face identities.\n\n";
+        }
+
+        if (drakonFindTargets.is_array() && !drakonFindTargets.empty()) {
+            prompt << "KNOWN DRAKON FIND TARGETS AVAILABLE TO THE USER:\n";
+            prompt << drakonFindTargets.dump(2) << "\n";
+            prompt << "- If the goal clearly references one of these targets, use its semantics in the design.\n";
+            prompt << "- Do not invent target details that are not present here.\n\n";
+        }
+
+        if (!snapshotDataUrl.empty()) {
+            prompt << "VISUAL CONTEXT:\n";
+            prompt << "- You will receive one current snapshot from the selected camera.\n";
+            prompt << "- Use the visible scene to reduce false positives.\n";
+            prompt << "- Only propose polygons in analysis_regions when the user's goal clearly refers to a specific visible area.\n\n";
+        }
+        else {
+            prompt << "VISUAL CONTEXT:\n";
+            prompt << "- No snapshot is available for this design.\n";
+            prompt << "- Do not invent analysis_regions without visual evidence. Return analysis_regions as an empty array.\n\n";
+        }
+
+        prompt << "DESIGN RULES:\n";
+        prompt << "- Respond in the same language as the user's goal.\n";
+        prompt << "- Output JSON field names in English.\n";
+        prompt << "- prompt_template and alert_condition must be non-empty.\n";
+        prompt << "- Infer a concrete alert_condition even if the user only described what they want to detect.\n";
+        prompt << "- Keep negative_condition empty only if it truly adds no value; otherwise use it to reduce false positives.\n";
+        prompt << "- Prefer precise, testable alert and negative conditions.\n";
+        prompt << "- Choose stable defaults when the user did not specify execution settings.\n";
+        prompt << "- Valid input_type values: video, image.\n";
+        prompt << "- Valid video_packaging_mode values: mosaic_2x2, mosaic_3x3, frame_sequence.\n";
+        prompt << "- Valid inference_model values: ultra, ultra_plus, light, core, legacy, pro.\n";
+        prompt << "- model_fps must be 1-10 when input_type=video; use 1 otherwise.\n";
+        prompt << "- run_every should normally be 10 or 60 seconds.\n";
+        prompt << "- running_resolution should be 640 or 1024.\n";
+        prompt << "- only_capture_on_motion and use_temporal_context must be booleans.\n";
+        prompt << "- analysis_regions must be an array. When used, each polygon point must be normalized between 0 and 1.\n";
+        prompt << "- Use 3-8 polygon points per region when a polygon is required.\n";
+        prompt << "- Do not output markdown, comments, or code fences.\n";
+        prompt << "- Return RAW JSON only.\n\n";
+
+        prompt << "OUTPUT FORMAT (EXACT KEYS):\n";
+        prompt << "{\n";
+        prompt << "  \"display_name\": \"...\",\n";
+        prompt << "  \"summary\": \"...\",\n";
+        prompt << "  \"prompt_template\": \"...\",\n";
+        prompt << "  \"alert_condition\": \"...\",\n";
+        prompt << "  \"negative_condition\": \"...\",\n";
+        prompt << "  \"input_type\": \"video\",\n";
+        prompt << "  \"video_packaging_mode\": \"mosaic_2x2\",\n";
+        prompt << "  \"inference_model\": \"ultra\",\n";
+        prompt << "  \"model_fps\": 1,\n";
+        prompt << "  \"run_every\": 60,\n";
+        prompt << "  \"running_resolution\": 640,\n";
+        prompt << "  \"only_capture_on_motion\": true,\n";
+        prompt << "  \"use_temporal_context\": true,\n";
+        prompt << "  \"analysis_regions\": [\n";
+        prompt << "    {\n";
+        prompt << "      \"region_id\": \"gate-area\",\n";
+        prompt << "      \"label\": \"Gate area\",\n";
+        prompt << "      \"description\": \"...\",\n";
+        prompt << "      \"enabled\": true,\n";
+        prompt << "      \"full_frame\": false,\n";
+        prompt << "      \"polygon_norm\": [\n";
+        prompt << "        { \"x\": 0.10, \"y\": 0.20 },\n";
+        prompt << "        { \"x\": 0.50, \"y\": 0.20 },\n";
+        prompt << "        { \"x\": 0.55, \"y\": 0.75 },\n";
+        prompt << "        { \"x\": 0.08, \"y\": 0.75 }\n";
+        prompt << "      ],\n";
+        prompt << "      \"draw_ref_width\": 1920,\n";
+        prompt << "      \"draw_ref_height\": 1080,\n";
+        prompt << "      \"prompt_core\": \"...\",\n";
+        prompt << "      \"alert_condition\": \"...\",\n";
+        prompt << "      \"negative_condition\": \"...\"\n";
+        prompt << "    }\n";
+        prompt << "  ]\n";
+        prompt << "}\n\n";
+        prompt << "Language hint from user: " << languageHint << "\n";
+
+        nlohmann::json content = nlohmann::json::array();
+        content.push_back({ { "type", "text" }, { "text", prompt.str() } });
+        if (!snapshotDataUrl.empty()) {
+            content.push_back(
+                makeOpenAIImageContentFromBareJpeg(stripDataUrlPrefix(snapshotDataUrl), modelName)
+            );
+        }
+
+        nlohmann::json body = {
+            { "model", modelName },
+            { "messages", nlohmann::json::array({
+                {
+                    { "role", "user" },
+                    { "content", content }
+                }
+            })}
+        };
+        applyOpenAITemperatureField_(body, modelName, 0.1);
+
+        const bool useResponsesTransport = shouldUseOpenAIResponsesTransportForModel_(modelName);
+        const int baseRequestedLimit = 1800;
+        const int firstEffectiveLimit = resolveOpenAITokenLimitForModel_(modelName, baseRequestedLimit);
+        const int secondEffectiveLimit = (std::min)(3200, firstEffectiveLimit + 900);
+
+        std::string rawResp;
+        OpenAITextObjectResponse_ parsedResponse;
+        std::string postError;
+
+        auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            nlohmann::json reqBody = body;
+            applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
+
+            try {
+                if (useResponsesTransport) {
+                    rawResp = postOpenAIResponsesWithCoreLease_(
+                        modelApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "agent_design"
+                    );
+                }
+                else {
+                    rawResp = postOpenAIChatCompletionsWithCoreLease_(
+                        modelApiKey,
+                        reqBody,
+                        []() { MaybeNotifyFirstRetry(); },
+                        false,
+                        {},
+                        "agent_design"
+                    );
+                }
+            }
+            catch (const std::exception& e) {
+                postError = e.what();
+                return false;
+            }
+
+            parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            Logger::instance().logDebugNoEscalation(
+                "agent",
+                buildOpenAIResponseLogBlock_(
+                    "handleAgentDesignCommand_: rawResp (attempt=" + std::to_string(attemptNo) + ")",
+                    rawResp,
+                    parsedResponse)
+            );
+            return true;
+        };
+
+        if (!postAndParse(firstEffectiveLimit, 1)) {
+            fail(std::string("OpenAI agent design request failed: ") + postError);
+            return;
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse) &&
+            secondEffectiveLimit > firstEffectiveLimit)
+        {
+            Logger::instance().logDebug(
+                "agent",
+                "handleAgentDesignCommand_: finish_reason=length with incomplete JSON; retrying once with higher token limit " +
+                std::to_string(secondEffectiveLimit));
+            if (!postAndParse(secondEffectiveLimit, 2)) {
+                fail(std::string("OpenAI agent design request failed: ") + postError);
+                return;
+            }
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse)) {
+            fail("OpenAI agent design returned finish_reason=length before completing a valid JSON object");
+            return;
+        }
+        if (!parsedResponse.hasValidResponseJson) {
+            fail("OpenAI agent design returned invalid JSON response");
+            return;
+        }
+        if (parsedResponse.text.empty()) {
+            fail("OpenAI agent design returned empty text");
+            return;
+        }
+        if (!parsedResponse.hasJsonObjectSlice) {
+            fail("OpenAI agent design did not return a JSON object");
+            return;
+        }
+        if (!parsedResponse.hasValidJsonObject) {
+            fail("OpenAI agent design returned malformed JSON object");
+            return;
+        }
+
+        const nlohmann::json designed = parsedResponse.jsonObject;
+        std::string displayName = jsonTextField(designed, "display_name");
+        if (displayName.empty()) {
+            displayName = jsonTextField(agentPatch, "display_name");
+        }
+        if (displayName.empty()) {
+            displayName =
+                goalSummary.size() <= 80
+                    ? goalSummary
+                    : trimCopyPromptEnhance(goalSummary.substr(0, 77)) + "...";
+        }
+
+        const std::string promptTemplate = jsonTextField(designed, "prompt_template");
+        const std::string alertCondition = jsonTextField(designed, "alert_condition");
+        const std::string negativeCondition = jsonTextField(designed, "negative_condition");
+        if (promptTemplate.empty() || alertCondition.empty()) {
+            fail("OpenAI agent design returned empty required fields");
+            return;
+        }
+
+        const std::string inputType = normalizeInputType(jsonTextField(designed, "input_type"));
+        const std::string videoPackagingMode =
+            normalizeVideoPackagingMode(jsonTextField(designed, "video_packaging_mode"));
+        const std::string inferenceModel =
+            normalizeInferenceModel(jsonTextField(designed, "inference_model"));
+
+        nlohmann::json result;
+        result["design"] = {
+            { "display_name", displayName },
+            { "summary", jsonTextField(designed, "summary") },
+            { "prompt_template", promptTemplate },
+            { "alert_condition", alertCondition },
+            { "negative_condition", negativeCondition },
+            { "input_type", inputType },
+            { "video_packaging_mode", videoPackagingMode },
+            { "inference_model", inferenceModel },
+            { "model_fps", normalizeModelFps(designed, inputType) },
+            { "run_every", normalizeRunEvery(designed) },
+            { "running_resolution", normalizeRunningResolution(designed) },
+            { "only_capture_on_motion", jsonBoolField(designed, "only_capture_on_motion", true) },
+            { "use_temporal_context", jsonBoolField(designed, "use_temporal_context", true) },
+            { "analysis_regions", sanitizeAnalysisRegions(
+                designed.value("analysis_regions", nlohmann::json::array()),
+                promptTemplate,
+                alertCondition,
+                negativeCondition,
+                !snapshotDataUrl.empty()) },
+        };
+        result["model_name"] = modelName;
+        result["snapshot_source"] = snapshotSource;
+        result["snapshot_ts_utc_iso"] = snapshotTsUtcIso;
+
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        fail(std::string("agent_design failed: ") + e.what());
+    }
+    catch (...) {
+        fail("agent_design failed with unknown error");
     }
 }
 

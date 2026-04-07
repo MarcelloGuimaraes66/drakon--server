@@ -1,9 +1,10 @@
-import { useParams, useNavigate } from "react-router";
+import { useParams, useNavigate, useSearchParams } from "react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import CameraCustomAgentEditorModal, {
-  CameraCustomAgentRow,
+  type CameraAgentEditorTarget,
+  type CameraCustomAgentRow,
 } from "@/react-app/components/CameraCustomAgentEditorModal";
 import HubPublishModal from "@/react-app/components/hub/HubPublishModal";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
@@ -86,6 +87,7 @@ export default function Algorithms() {
   const { t } = useTranslation();
   const { cameraId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const {
     currentStepId: onboardingStepId,
     isOpen: isOnboardingOpen,
@@ -131,6 +133,13 @@ export default function Algorithms() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [publishingCustomAgent, setPublishingCustomAgent] = useState<CustomAlgorithm | null>(null);
   const [publishingToHub, setPublishingToHub] = useState(false);
+  const customEditorTarget: CameraAgentEditorTarget | null =
+    numericCameraId > 0
+      ? {
+          type: "camera",
+          camera_id: numericCameraId,
+        }
+      : null;
 
   // Toast helper function
   const showToast = (title: string, description: string, variant: "default" | "destructive" = "default") => {
@@ -445,6 +454,28 @@ export default function Algorithms() {
     });
     setShowCustomEditor(true);
   };
+
+  useEffect(() => {
+    const rawAgentId = searchParams.get("agentId");
+    const shouldOpenAgent = searchParams.get("openAgent") === "1";
+    const agentId = Number(rawAgentId || 0);
+
+    if (!shouldOpenAgent || !Number.isInteger(agentId) || agentId <= 0) {
+      return;
+    }
+
+    const deepLinkedAgent = customAlgorithms.find((candidate) => candidate.id === agentId);
+    if (!deepLinkedAgent) {
+      return;
+    }
+
+    openEditCustomEditor(deepLinkedAgent);
+
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("agentId");
+    nextParams.delete("openAgent");
+    setSearchParams(nextParams, { replace: true });
+  }, [customAlgorithms, searchParams, setSearchParams]);
 
   const handleCustomEditorSaved = async (savedAgentId?: number | null) => {
     await fetchCustomAlgorithms();
@@ -1784,7 +1815,7 @@ export default function Algorithms() {
 
         <CameraCustomAgentEditorModal
           open={showCustomEditor}
-          cameraId={Number(cameraId || 0)}
+          editorTarget={customEditorTarget}
           initialAgent={customEditorAgent}
           onClose={closeCustomEditor}
           onSaved={handleCustomEditorSaved}

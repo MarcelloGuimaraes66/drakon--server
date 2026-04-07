@@ -3,6 +3,9 @@ import { useAuth } from "@getmocha/users-service/react";
 import { useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
+import SettingsTabs, {
+  type SettingsTabView,
+} from "@/react-app/components/settings/SettingsTabs";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { brand } from "@/shared/brand";
@@ -50,8 +53,14 @@ export default function Settings() {
   const zAiKeysUrl = "https://z.ai/manage-apikey/apikey-list";
   const { t, i18n } = useTranslation();
   const { user } = useAuth();
-  const { startTutorial, status: onboardingStatus, syncProviderStatus } = useOnboarding();
+  const {
+    startTutorial,
+    status: onboardingStatus,
+    syncProviderStatus,
+    currentStepId,
+  } = useOnboarding();
   const location = useLocation();
+  const [activeTab, setActiveTab] = useState<SettingsTabView>("user");
   const [pairCode, setPairCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
   const [copied, setCopied] = useState(false);
@@ -483,22 +492,47 @@ export default function Settings() {
     const params = new URLSearchParams(location.search);
     const focus = params.get("focus");
     if (focus === "openai") {
+      setActiveTab("api-keys");
       setHighlightOpenAiCard(true);
-      openAiCardRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const frameId = window.requestAnimationFrame(() => {
+        openAiCardRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
       const timeoutId = window.setTimeout(() => {
         setHighlightOpenAiCard(false);
       }, 4200);
-      return () => window.clearTimeout(timeoutId);
+      return () => {
+        window.cancelAnimationFrame(frameId);
+        window.clearTimeout(timeoutId);
+      };
     }
     if (focus === "zai") {
+      setActiveTab("api-keys");
       setHighlightZAiCard(true);
-      zAiCardRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const frameId = window.requestAnimationFrame(() => {
+        zAiCardRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
       const timeoutId = window.setTimeout(() => {
         setHighlightZAiCard(false);
       }, 4200);
-      return () => window.clearTimeout(timeoutId);
+      return () => {
+        window.cancelAnimationFrame(frameId);
+        window.clearTimeout(timeoutId);
+      };
     }
   }, [location.search]);
+
+  useEffect(() => {
+    if (
+      currentStepId === "settings-zai-card" ||
+      currentStepId === "settings-openai-card" ||
+      currentStepId === "settings-provider-choice" ||
+      currentStepId === "provider-open" ||
+      currentStepId === "provider-input" ||
+      currentStepId === "provider-save"
+    ) {
+      setActiveTab("api-keys");
+    }
+  }, [currentStepId]);
 
   // Poll for pairing status when code is generated
   useEffect(() => {
@@ -528,69 +562,83 @@ export default function Settings() {
 
   return (
     <Layout>
-      <div className="max-w-4xl mx-auto">
+      <div className="space-y-4">
         {/* Header */}
-        <div className="mb-6 md:mb-8">
-          <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">{t("settings.title")}</h1>
-          <p className="text-sm md:text-base text-gray-400">{t("settings.subtitle")}</p>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)] xl:items-start">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-bold text-gray-100">{t("settings.title")}</h1>
+            <p className="mt-1.5 text-sm text-gray-400">{t("settings.subtitle")}</p>
+          </div>
+          <div className="flex justify-center xl:justify-self-center">
+            <SettingsTabs
+              activeView={activeTab}
+              onSelectUser={() => setActiveTab("user")}
+              onSelectApiKeys={() => setActiveTab("api-keys")}
+              onSelectAlerts={() => setActiveTab("alerts")}
+              onSelectConnectivity={() => setActiveTab("connectivity")}
+            />
+          </div>
+          <div className="hidden xl:block" />
         </div>
 
-        <div className="mb-4 md:mb-6 rounded-2xl border border-blue-500/20 bg-gradient-to-br from-blue-500/10 via-slate-900/40 to-cyan-500/10 p-4 md:p-5">
-          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-            <div className="flex items-start gap-3">
-              <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-blue-400/20 bg-blue-500/10 text-blue-200">
-                <Sparkles className="h-5 w-5" />
+        <div className="max-w-4xl">
+          <div className="mb-4 md:mb-6 rounded-2xl border border-blue-500/20 bg-gradient-to-br from-blue-500/10 via-slate-900/40 to-cyan-500/10 p-4 md:p-5">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div className="flex items-start gap-3">
+                <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-blue-400/20 bg-blue-500/10 text-blue-200">
+                  <Sparkles className="h-5 w-5" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-gray-100">{t("tutorial.settingsCard.title")}</p>
+                  <p className="mt-1 text-sm text-gray-300">{t("tutorial.settingsCard.description")}</p>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={startTutorial}
+                className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-400"
+              >
+                {tutorialButtonLabel}
+              </button>
+            </div>
+          </div>
+
+          {/* User Profile */}
+          {activeTab === "user" && (
+            <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mb-4 md:mb-6">
+            <div className="flex items-center gap-3 mb-6">
+              <User className="w-5 h-5 text-gray-400" />
+              <h2 className="text-lg font-semibold text-gray-100">
+                {t("settings.userProfile")}
+              </h2>
+            </div>
+
+            <div className="space-y-4">
               <div>
-                <p className="text-sm font-semibold text-gray-100">{t("tutorial.settingsCard.title")}</p>
-                <p className="mt-1 text-sm text-gray-300">{t("tutorial.settingsCard.description")}</p>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  {t("settings.name")}
+                </label>
+                <input
+                  type="text"
+                  value={user?.google_user_data?.name || ""}
+                  disabled
+                  className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
+                />
               </div>
-            </div>
-            <button
-              type="button"
-              onClick={startTutorial}
-              className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-400"
-            >
-              {tutorialButtonLabel}
-            </button>
-          </div>
-        </div>
 
-        {/* User Profile */}
-        <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mb-4 md:mb-6">
-          <div className="flex items-center gap-3 mb-6">
-            <User className="w-5 h-5 text-gray-400" />
-            <h2 className="text-lg font-semibold text-gray-100">
-              {t("settings.userProfile")}
-            </h2>
-          </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  {t("settings.email")}
+                </label>
+                <input
+                  type="email"
+                  value={user?.email || ""}
+                  disabled
+                  className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
+                />
+              </div>
 
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                {t("settings.name")}
-              </label>
-              <input
-                type="text"
-                value={user?.google_user_data?.name || ""}
-                disabled
-                className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                {t("settings.email")}
-              </label>
-              <input
-                type="email"
-                value={user?.email || ""}
-                disabled
-                className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
-              />
-            </div>
-
-            <form onSubmit={saveUserHandle} className="space-y-3">
+              <form onSubmit={saveUserHandle} className="space-y-3">
               <label className="block text-sm font-medium text-gray-300">
                 {t("settings.handle")}
               </label>
@@ -649,10 +697,12 @@ export default function Settings() {
               />
             </div>
           </div>
-        </div>
+          </div>
+        )}
 
         {/* Connect EXE */}
-        <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6">
+        {activeTab === "connectivity" && (
+          <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6">
           <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-3">
               <Link2 className="w-5 h-5 text-gray-400" />
@@ -869,13 +919,16 @@ export default function Settings() {
               </button>
             )}
           </div>
-        </div>
+          </div>
+        )}
 
+        {activeTab === "api-keys" && (
+          <>
         {/* Z.ai API Key */}
         <div
           ref={zAiCardRef}
           data-onboarding-target={ONBOARDING_TARGETS.settingsZAiCard}
-          className={`bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mt-4 md:mt-6 transition-all ${
+          className={`bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 transition-all ${
             highlightZAiCard
               ? "ring-2 ring-cyan-400/80 shadow-[0_0_0_4px_rgba(34,211,238,0.2)] animate-pulse"
               : ""
@@ -1119,9 +1172,12 @@ export default function Settings() {
             </form>
           )}
         </div>
+          </>
+        )}
 
         {/* Telegram Alerts */}
-        <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6 mt-4 md:mt-6">
+        {activeTab === "alerts" && (
+          <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-4 md:p-6">
           <div className="flex items-center gap-3 mb-6">
             <Send className="w-5 h-5 text-gray-400" />
             <h2 className="text-lg font-semibold text-gray-100">Telegram Alerts</h2>
@@ -1230,7 +1286,9 @@ export default function Settings() {
               </div>
             </div>
           </div>
-        </div>
+          </div>
+        )}
+      </div>
       </div>
     </Layout>
   );

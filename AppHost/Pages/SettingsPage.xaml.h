@@ -11,7 +11,16 @@ namespace winrt::DrakonDesktop::implementation
         void InitializeComponent();
 
     private:
+        enum class SettingsSectionTab
+        {
+            User = 0,
+            ApiKeys = 1,
+            Alerts = 2,
+            Connectivity = 3,
+        };
+
         void WireUpActions();
+        void ApplyActiveTab();
         void UpdatePairCodeCountdown();
         void RenderState();
         void ShowStatus(
@@ -63,12 +72,16 @@ namespace winrt::DrakonDesktop::implementation
         void OnRefreshClick(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnTabClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnPollTimerTick(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Windows::Foundation::IInspectable const& args);
 
         bool m_initialized{ false };
         bool m_quickInstructionsOpen{ false };
+        SettingsSectionTab m_activeTab{ SettingsSectionTab::User };
         services::AuthState m_authState{};
         services::ApiKeySettings m_openAiSettings{};
         services::ApiKeySettings m_zAiSettings{};

@@ -6,24 +6,53 @@ import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
+import ChatCameraBatchEditCard from "@/react-app/components/ChatCameraBatchEditCard";
 import ChatCameraEditCard from "@/react-app/components/ChatCameraEditCard";
+import ChatCameraAgentCard from "@/react-app/components/ChatCameraAgentCard";
+import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCreatedCard";
+import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
+import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
+import CameraCustomAgentEditorModal, {
+  type CameraAgentEditorTarget,
+  type CameraCustomAgentRow,
+  type ToastVariant,
+} from "@/react-app/components/CameraCustomAgentEditorModal";
 import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
-import { ChatMessage } from "@/shared/types";
+import Toast from "@/react-app/components/Toast";
+import { ChatMessage, ChatSession } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
-import { X, Bot, User, ExternalLink, Minus, AlertCircle } from "lucide-react";
 import {
+  X,
+  Bot,
+  User,
+  ExternalLink,
+  Minus,
+  AlertCircle,
+  ChevronDown,
+  Check,
+  Clock3,
+  Plus,
+} from "lucide-react";
+import {
+  type CameraAgentFormRequestMessageMetadata,
   type CameraEditFormRequestMessageMetadata,
   extractChatProgressFromMessage,
+  extractCameraAgentCreationResultFromMessage,
+  extractCameraAgentEditContextFromMessage,
+  extractCameraAgentFormRequestFromMessage,
+  extractCameraAgentUpdateResultFromMessage,
   extractCameraEditFormRequestFromMessage,
   extractCameraNetworkScanFromMessage,
+  extractCameraBatchEditDraftFromMessage,
   extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
   applyCameraEditDraftToCamera,
+  buildCameraAgentDraftForEditor,
   extractHitMediaFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
@@ -34,6 +63,9 @@ const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const QUICK_CHAT_PLEXUS_BACKGROUND_ENABLED = true;
+const QUICK_CHAT_SESSION_BATCH_SIZE = 24;
+const QUICK_CHAT_SCROLL_BOTTOM_THRESHOLD_PX = 140;
+const QUICK_CHAT_SESSION_MENU_LOAD_MORE_THRESHOLD_PX = 64;
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
@@ -57,10 +89,23 @@ function QuickThinkingDots() {
 }
 
 export default function QuickChatOverlay() {
-  const { isOpen, sessionId, closeQuickChat, minimizeQuickChat, setSessionId } = useQuickChat();
+  const {
+    isOpen,
+    sessionId,
+    sessionTitle,
+    closeQuickChat,
+    minimizeQuickChat,
+    openQuickChatSession,
+    setSessionId,
+    setSessionTitle,
+  } = useQuickChat();
   const navigate = useNavigate();
   const billingEnabled = brand.features.billingEnabled;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [isLoadingSessions, setIsLoadingSessions] = useState(false);
+  const [visibleSessionCount, setVisibleSessionCount] = useState(QUICK_CHAT_SESSION_BATCH_SIZE);
+  const [isSessionMenuOpen, setIsSessionMenuOpen] = useState(false);
   const [input, setInput] = useState("");
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
@@ -73,9 +118,20 @@ export default function QuickChatOverlay() {
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
   const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
   const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [chatAgentModalTarget, setChatAgentModalTarget] = useState<CameraAgentEditorTarget | null>(null);
+  const [chatAgentModalInitialAgent, setChatAgentModalInitialAgent] = useState<CameraCustomAgentRow | null>(null);
+  const [isChatAgentModalOpen, setIsChatAgentModalOpen] = useState(false);
+  const [toast, setToast] = useState<{
+    message: string;
+    type: "success" | "error" | "warning" | "info";
+  } | null>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const sessionMenuRef = useRef<HTMLDivElement | null>(null);
+  const sessionListRef = useRef<HTMLDivElement | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const autoScrollFrameRef = useRef<number | null>(null);
   const modelLabels: Record<ChatModelTier, string> = {
     ultra_plus: "Ultra+",
     ultra: "Ultra",
@@ -83,7 +139,7 @@ export default function QuickChatOverlay() {
     core: "Core",
   };
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, submitCameraBatchEdit, cancelMessage, clearError, clearWarning } = usePerceptrumChatSession({
     sessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -96,6 +152,98 @@ export default function QuickChatOverlay() {
       : pendingExecutionState.kind === "stale"
         ? "Desktop agent connection looks stale. Check whether the EXE is still connected."
         : null;
+
+  const resetQuickChatDraft = () => {
+    setInput("");
+    setUploadedImage(null);
+    setUploadedVideo(null);
+    shouldAutoScrollRef.current = true;
+    clearError();
+    clearWarning();
+  };
+
+  const upsertSessionSummary = (session: ChatSession) => {
+    setSessions((prev) => {
+      const next = [...prev];
+      const existingIndex = next.findIndex((entry) => entry.id === session.id);
+      if (existingIndex === -1) {
+        next.unshift(session);
+      } else {
+        next[existingIndex] = session;
+      }
+
+      next.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+      return next;
+    });
+  };
+
+  const fetchSessions = async (preferredSessionId?: number | null) => {
+    setIsLoadingSessions(true);
+    try {
+      const response = await fetch("/api/chat/sessions");
+      if (!response.ok) {
+        throw new Error("Failed to fetch chat sessions");
+      }
+
+      const data = (await response.json()) as ChatSession[];
+      const sortedSessions = [...data].sort(
+        (a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)
+      );
+      setSessions(sortedSessions);
+
+      const targetSessionId = preferredSessionId ?? sessionId;
+      if (targetSessionId) {
+        const currentSession = sortedSessions.find((session) => session.id === targetSessionId) || null;
+        if (currentSession) {
+          setSessionTitle(currentSession.title);
+        }
+      }
+
+      return sortedSessions;
+    } catch (fetchError) {
+      console.error("Failed to fetch quick chat sessions:", fetchError);
+      return [];
+    } finally {
+      setIsLoadingSessions(false);
+    }
+  };
+
+  const formatSessionTime = (dateString: string) => {
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return "Just now";
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+  };
+
+  const currentSession =
+    (sessionId ? sessions.find((entry) => entry.id === sessionId) : null) || null;
+  const currentSessionLabel = currentSession?.title?.trim() || sessionTitle?.trim() || "New conversation";
+  const visibleSessions = sessions.slice(0, visibleSessionCount);
+  const hasMoreSessions = visibleSessionCount < sessions.length;
+
+  const handleStartNewConversation = () => {
+    resetQuickChatDraft();
+    setSessionId(null);
+    setSessionTitle(null);
+    setMessages([]);
+    setIsSessionMenuOpen(false);
+  };
+
+  const handleSelectExistingSession = (session: ChatSession) => {
+    resetQuickChatDraft();
+    openQuickChatSession(session.id, session.title);
+    setMessages([]);
+    setIsSessionMenuOpen(false);
+  };
 
   const openChatEditForm = async (
     cameraId: number,
@@ -122,7 +270,42 @@ export default function QuickChatOverlay() {
     setIsChatEditModalOpen(true);
   };
 
+  const openChatAgentForm = async (
+    metadata: CameraAgentFormRequestMessageMetadata
+  ) => {
+    const target = metadata.editor_target ?? null;
+    const hasValidTarget =
+      !!target &&
+      (
+        (target.type === "camera" && Number.isInteger(target.camera_id) && Number(target.camera_id) > 0) ||
+        (target.type === "step_default" && Number.isInteger(target.step_id) && Number(target.step_id) > 0) ||
+        (target.type === "step_camera" &&
+          Number.isInteger(target.step_id) &&
+          Number(target.step_id) > 0 &&
+          Number.isInteger(target.camera_id) &&
+          Number(target.camera_id) > 0)
+      );
+
+    if (!hasValidTarget) {
+      throw new Error("Invalid agent target selected for the form.");
+    }
+
+    setChatAgentModalTarget(target);
+    setChatAgentModalInitialAgent(
+      buildCameraAgentDraftForEditor(metadata) as unknown as CameraCustomAgentRow
+    );
+    setIsChatAgentModalOpen(true);
+  };
+
   useEffect(() => {
+    if (autoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(autoScrollFrameRef.current);
+      autoScrollFrameRef.current = null;
+    }
+
+    shouldAutoScrollRef.current = true;
+    lastScrollTopRef.current = 0;
+
     if (sessionId) {
       // Clear messages immediately when session changes to prevent flicker
       setMessages([]);
@@ -134,30 +317,66 @@ export default function QuickChatOverlay() {
   }, [sessionId]);
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setIsSessionMenuOpen(false);
+      return;
+    }
     const savedTier = localStorage.getItem(getBrandStorageKey("globalModelTier"));
     const normalizedTier = normalizeChatModelTier(savedTier);
     setModelTier(normalizedTier);
-  }, [isOpen]);
+    void fetchSessions(sessionId);
+  }, [isOpen, sessionId]);
 
   useEffect(() => {
     if (!isOpen || sessionId) return;
 
     setMessages([]);
-    setInput("");
-    setUploadedImage(null);
-    setUploadedVideo(null);
-    setShouldAutoScroll(true);
-    clearError();
-    clearWarning();
+    resetQuickChatDraft();
   }, [clearError, clearWarning, isOpen, sessionId]);
 
   useEffect(() => {
-    // Only auto-scroll if user is near the bottom
-    if (shouldAutoScroll) {
-      scrollToBottom();
-    }
-  }, [messages, shouldAutoScroll]);
+    if (!isSessionMenuOpen) return;
+
+    const currentSessionIndex = sessionId
+      ? sessions.findIndex((session) => session.id === sessionId)
+      : -1;
+    const minimumVisibleSessions =
+      currentSessionIndex >= 0
+        ? Math.max(QUICK_CHAT_SESSION_BATCH_SIZE, currentSessionIndex + 1)
+        : QUICK_CHAT_SESSION_BATCH_SIZE;
+    setVisibleSessionCount((currentCount) =>
+      Math.min(sessions.length, Math.max(currentCount, minimumVisibleSessions))
+    );
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (
+        (sessionMenuRef.current && target && sessionMenuRef.current.contains(target)) ||
+        (sessionMenuButtonRef.current && target && sessionMenuButtonRef.current.contains(target))
+      ) {
+        return;
+      }
+
+      setIsSessionMenuOpen(false);
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [isSessionMenuOpen, sessionId, sessions]);
+
+  useEffect(() => {
+    if (!shouldAutoScrollRef.current) return;
+    scheduleAutoScroll();
+  }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      if (autoScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(autoScrollFrameRef.current);
+        autoScrollFrameRef.current = null;
+      }
+    };
+  }, []);
 
   const createQuickChatSession = async (): Promise<number | null> => {
     if (isCreatingSession) return null;
@@ -184,9 +403,11 @@ export default function QuickChatOverlay() {
         throw new Error("Failed to create chat session");
       }
 
-      const newSession = await response.json() as { id: number };
+      const newSession = await response.json() as ChatSession;
       setMessages([]);
       setSessionId(newSession.id);
+      setSessionTitle(newSession.title);
+      upsertSessionSummary(newSession);
       return newSession.id;
     } catch (error) {
       console.error("Failed to create quick chat session:", error);
@@ -207,7 +428,40 @@ export default function QuickChatOverlay() {
   };
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    container.scrollTop = container.scrollHeight;
+    lastScrollTopRef.current = container.scrollTop;
+  };
+
+  const scheduleAutoScroll = () => {
+    if (!shouldAutoScrollRef.current) return;
+    if (autoScrollFrameRef.current !== null) return;
+
+    autoScrollFrameRef.current = window.requestAnimationFrame(() => {
+      autoScrollFrameRef.current = null;
+      scrollToBottom();
+    });
+  };
+
+  const loadMoreSessions = () => {
+    setVisibleSessionCount((currentCount) =>
+      Math.min(sessions.length, currentCount + QUICK_CHAT_SESSION_BATCH_SIZE)
+    );
+  };
+
+  const handleSessionMenuScroll = () => {
+    const container = sessionListRef.current;
+    if (!container) return;
+
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distanceFromBottom > QUICK_CHAT_SESSION_MENU_LOAD_MORE_THRESHOLD_PX) {
+      return;
+    }
+
+    loadMoreSessions();
   };
 
   const handleScroll = () => {
@@ -215,10 +469,16 @@ export default function QuickChatOverlay() {
     if (!container) return;
 
     const { scrollTop, scrollHeight, clientHeight } = container;
+    const isScrollingUp = scrollTop < lastScrollTopRef.current;
+    lastScrollTopRef.current = scrollTop;
+
+    if (isScrollingUp) {
+      shouldAutoScrollRef.current = false;
+      return;
+    }
+
     const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
-    
-    // If user is within 100px of bottom, enable auto-scroll
-    setShouldAutoScroll(distanceFromBottom < 100);
+    shouldAutoScrollRef.current = distanceFromBottom < QUICK_CHAT_SCROLL_BOTTOM_THRESHOLD_PX;
   };
 
   const handleSend = async () => {
@@ -238,7 +498,7 @@ export default function QuickChatOverlay() {
     setUploadedVideo(null);
 
     // Enable auto-scroll when user sends a message
-    setShouldAutoScroll(true);
+    shouldAutoScrollRef.current = true;
 
     await sendMessage({
       sessionIdOverride: targetSessionId,
@@ -249,6 +509,7 @@ export default function QuickChatOverlay() {
       modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
       runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
     });
+    void fetchSessions(targetSessionId);
   };
 
   const handleOpenFullChat = () => {
@@ -318,6 +579,11 @@ export default function QuickChatOverlay() {
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
     const cameraBatchRegistrationDraft = extractCameraBatchRegistrationDraftFromMessage(message);
+    const cameraBatchEditDraft = extractCameraBatchEditDraftFromMessage(message);
+    const cameraAgentFormRequest = extractCameraAgentFormRequestFromMessage(message);
+    const cameraAgentCreationResult = extractCameraAgentCreationResultFromMessage(message);
+    const cameraAgentEditContext = extractCameraAgentEditContextFromMessage(message);
+    const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
 
@@ -352,6 +618,28 @@ export default function QuickChatOverlay() {
                 })
               }
             />
+          ) : cameraBatchEditDraft ? (
+            <ChatCameraBatchEditCard
+              messageId={message.id}
+              metadata={cameraBatchEditDraft}
+              onSubmit={(sourceMessageId) =>
+                submitCameraBatchEdit({
+                  sessionIdOverride: sessionId,
+                  sourceMessageId,
+                })
+              }
+            />
+          ) : cameraAgentFormRequest ? (
+            <ChatCameraAgentCard
+              metadata={cameraAgentFormRequest}
+              onOpen={() => openChatAgentForm(cameraAgentFormRequest)}
+            />
+          ) : cameraAgentEditContext ? (
+            <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
+          ) : cameraAgentUpdateResult ? (
+            <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+          ) : cameraAgentCreationResult ? (
+            <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
           ) : cameraEditFormRequest ? (
             <ChatCameraEditCard
               metadata={cameraEditFormRequest}
@@ -380,6 +668,41 @@ export default function QuickChatOverlay() {
         }}
       />
 
+      <CameraCustomAgentEditorModal
+        open={isChatAgentModalOpen && chatAgentModalTarget !== null}
+        editorTarget={chatAgentModalTarget}
+        initialAgent={chatAgentModalInitialAgent}
+        onClose={() => {
+          setIsChatAgentModalOpen(false);
+          setChatAgentModalTarget(null);
+          setChatAgentModalInitialAgent(null);
+        }}
+        onSaved={() => {
+          const fallbackName =
+            chatAgentModalInitialAgent?.config_json &&
+            typeof chatAgentModalInitialAgent.config_json === "object" &&
+            !Array.isArray(chatAgentModalInitialAgent.config_json) &&
+            typeof (chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name === "string"
+              ? String((chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name)
+              : "agent";
+          setToast({
+            message: `Agent ${fallbackName || "agent"} saved.`,
+            type: "success",
+          });
+        }}
+        showToast={(title: string, description: string, variant?: ToastVariant) => {
+          setToast({
+            message: title ? `${title}: ${description}` : description,
+            type:
+              variant === "destructive"
+                ? "error"
+                : variant === "default"
+                  ? "success"
+                  : "info",
+          });
+        }}
+      />
+
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40 bg-black/18 backdrop-blur-[1.5px] transition-opacity"
@@ -396,6 +719,107 @@ export default function QuickChatOverlay() {
             <div className="min-w-0">
               <h3 className="text-xl font-semibold tracking-tight text-white">{brand.quickChatName}</h3>
               <p className="mt-1 text-sm text-gray-400">Ask about live cameras, footage, and app help.</p>
+              <div className="relative mt-3">
+                <button
+                  ref={sessionMenuButtonRef}
+                  type="button"
+                  onClick={() => setIsSessionMenuOpen((current) => !current)}
+                  aria-expanded={isSessionMenuOpen}
+                  className="inline-flex max-w-full items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.035] px-3 py-1.5 text-xs text-gray-300 transition-colors hover:bg-white/[0.06] hover:text-white"
+                >
+                  <Clock3 className="h-3.5 w-3.5 flex-shrink-0 text-gray-400" />
+                  <span className="truncate font-medium text-gray-200">{currentSessionLabel}</span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 flex-shrink-0 text-gray-400 transition-transform ${
+                      isSessionMenuOpen ? "rotate-180" : ""
+                    }`}
+                  />
+                </button>
+
+                {isSessionMenuOpen ? (
+                  <div
+                    ref={sessionMenuRef}
+                    className="absolute left-0 top-full z-40 mt-3 w-[320px] max-w-[min(84vw,320px)] overflow-hidden rounded-[24px] border border-white/[0.08] bg-[#171c2b]/96 shadow-[0_24px_80px_-40px_rgba(0,0,0,0.95)] backdrop-blur-xl"
+                  >
+                    <div className="border-b border-white/[0.06] px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
+                      Conversations
+                    </div>
+                    <div
+                      ref={sessionListRef}
+                      onScroll={handleSessionMenuScroll}
+                      className="max-h-[320px] overflow-y-auto p-2 scrollbar-thin"
+                    >
+                      <button
+                        type="button"
+                        onClick={handleStartNewConversation}
+                        className={`flex w-full items-center gap-3 rounded-[18px] px-3 py-3 text-left transition-colors ${
+                          sessionId === null
+                            ? "bg-blue-500/12 text-white"
+                            : "text-gray-200 hover:bg-white/[0.05]"
+                        }`}
+                      >
+                        <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.04]">
+                          <Plus className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">New conversation</p>
+                          <p className="mt-0.5 text-xs text-gray-500">Start fresh in quick chat</p>
+                        </div>
+                        {sessionId === null ? <Check className="h-4 w-4 flex-shrink-0 text-blue-300" /> : null}
+                      </button>
+
+                      {isLoadingSessions ? (
+                        <div className="px-3 py-4 text-sm text-gray-500">Loading conversations...</div>
+                      ) : sessions.length === 0 ? (
+                        <div className="px-3 py-4 text-sm text-gray-500">No saved chats yet.</div>
+                      ) : (
+                        visibleSessions.map((session) => {
+                          const isCurrent = session.id === sessionId;
+                          return (
+                            <button
+                              key={session.id}
+                              type="button"
+                              onClick={() => handleSelectExistingSession(session)}
+                              className={`mt-1 flex w-full items-center gap-3 rounded-[18px] px-3 py-3 text-left transition-colors ${
+                                isCurrent
+                                  ? "bg-blue-500/12 text-white"
+                                  : "text-gray-200 hover:bg-white/[0.05]"
+                              }`}
+                            >
+                              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-2xl border border-white/[0.08] bg-white/[0.04]">
+                                <Bot className="h-4 w-4" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-sm font-medium text-inherit">
+                                  {session.title || "Untitled chat"}
+                                </p>
+                                <p className="mt-0.5 text-xs text-gray-500">
+                                  {formatSessionTime(session.updated_at)}
+                                </p>
+                              </div>
+                              {isCurrent ? (
+                                <Check className="h-4 w-4 flex-shrink-0 text-blue-300" />
+                              ) : null}
+                            </button>
+                          );
+                        })
+                      )}
+
+                      {!isLoadingSessions && hasMoreSessions ? (
+                        <div className="px-2 pb-2 pt-3">
+                          <button
+                            type="button"
+                            onClick={loadMoreSessions}
+                            className="w-full rounded-[16px] border border-white/[0.08] bg-white/[0.035] px-3 py-2 text-xs font-medium text-gray-300 transition-colors hover:bg-white/[0.06] hover:text-white"
+                          >
+                            Load older conversations
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -412,7 +836,7 @@ export default function QuickChatOverlay() {
                 <ExternalLink className="h-4 w-4" />
               </button>
               <button
-                onClick={minimizeQuickChat}
+                onClick={() => minimizeQuickChat(currentSessionLabel)}
                 className="rounded-2xl border border-white/[0.08] bg-white/[0.04] p-2.5 text-gray-300 transition-colors hover:bg-white/[0.08] hover:text-white"
                 title="Minimize"
               >
@@ -486,8 +910,6 @@ export default function QuickChatOverlay() {
           )}
 
           {messages.map((message) => renderMessage(message))}
-
-          <div ref={messagesEndRef} />
           </div>
         </div>
 
@@ -521,6 +943,8 @@ export default function QuickChatOverlay() {
           </div>
         </div>
       </div>
+
+      {toast ? <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} /> : null}
     </>
   );
 }

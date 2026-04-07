@@ -8,6 +8,83 @@
     Background="Transparent"
     RequestedTheme="Dark">
 
+    <Page.Resources>
+        <Style x:Key="SettingsTabButtonBaseStyle" TargetType="Button">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="999" />
+            <Setter Property="Foreground" Value="{StaticResource DrakonStrongTextBrush}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="MinWidth" Value="0" />
+            <Setter Property="Padding" Value="16,10" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border
+                            x:Name="RootBorder"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="{TemplateBinding CornerRadius}">
+                            <ContentPresenter
+                                HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                Content="{TemplateBinding Content}"
+                                ContentTemplate="{TemplateBinding ContentTemplate}"
+                                Padding="{TemplateBinding Padding}"
+                                TextElement.FontSize="{TemplateBinding FontSize}"
+                                TextElement.FontWeight="{TemplateBinding FontWeight}"
+                                TextElement.Foreground="{TemplateBinding Foreground}" />
+                        </Border>
+
+                        <VisualStateManager.VisualStateGroups>
+                            <VisualStateGroup x:Name="CommonStates">
+                                <VisualState x:Name="Normal" />
+                                <VisualState x:Name="PointerOver">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.92" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Pressed">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.82" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                                <VisualState x:Name="Disabled">
+                                    <VisualState.Setters>
+                                        <Setter Target="RootBorder.Opacity" Value="0.4" />
+                                    </VisualState.Setters>
+                                </VisualState>
+                            </VisualStateGroup>
+                        </VisualStateManager.VisualStateGroups>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style
+            x:Key="SettingsTabButtonStyle"
+            TargetType="Button"
+            BasedOn="{StaticResource SettingsTabButtonBaseStyle}">
+            <Setter Property="Foreground" Value="{StaticResource DrakonSecondaryTextBrush}" />
+        </Style>
+
+        <Style
+            x:Key="SettingsTabButtonActiveStyle"
+            TargetType="Button"
+            BasedOn="{StaticResource SettingsTabButtonBaseStyle}">
+            <Setter Property="Background" Value="{StaticResource DrakonAccentBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource DrakonAccentBrush}" />
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+    </Page.Resources>
+
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <Grid Padding="24">
             <StackPanel
@@ -37,11 +114,54 @@
                         Content="Refresh"
                         MinWidth="112" />
 
-                    <Border Style="{StaticResource DrakonPanelStyle}">
-                        <StackPanel Spacing="14">
-                            <TextBlock
-                                Style="{StaticResource DrakonSectionTitleTextStyle}"
-                                Text="User Profile" />
+                    <Border
+                        Padding="4"
+                        Background="{StaticResource DrakonPanelAltBrush}"
+                        BorderBrush="{StaticResource DrakonPanelBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="999">
+                        <Grid ColumnSpacing="4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Button
+                                x:Name="UserTabButton"
+                                Content="Usuario"
+                                Style="{StaticResource SettingsTabButtonActiveStyle}"
+                                Tag="0" />
+                            <Button
+                                x:Name="ApiKeysTabButton"
+                                Grid.Column="1"
+                                Content="Chaves de API"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="1" />
+                            <Button
+                                x:Name="AlertsTabButton"
+                                Grid.Column="2"
+                                Content="Alertas"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="2" />
+                            <Button
+                                x:Name="ConnectivityTabButton"
+                                Grid.Column="3"
+                                Content="Conectividade do EXE"
+                                Style="{StaticResource SettingsTabButtonStyle}"
+                                Tag="3" />
+                        </Grid>
+                    </Border>
+
+                    <StackPanel
+                        x:Name="UserSettingsSection"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
+                                <TextBlock
+                                    Style="{StaticResource DrakonSectionTitleTextStyle}"
+                                    Text="User Profile" />
 
                             <Grid ColumnSpacing="16" RowSpacing="12">
                                 <Grid.ColumnDefinitions>
@@ -82,9 +202,14 @@
                             </Grid>
                         </StackPanel>
                     </Border>
+                    </StackPanel>
 
-                    <Border Style="{StaticResource DrakonPanelStyle}">
-                        <StackPanel Spacing="14">
+                    <StackPanel
+                        x:Name="ConnectivitySettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
                             <Grid ColumnSpacing="12">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
@@ -267,8 +392,14 @@
                         </StackPanel>
                     </Border>
 
-                    <Border Style="{StaticResource DrakonPanelStyle}">
-                        <StackPanel Spacing="14">
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="ApiKeysSettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
                             <Grid ColumnSpacing="12">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
@@ -365,8 +496,14 @@
                         </StackPanel>
                     </Border>
 
-                    <Border Style="{StaticResource DrakonPanelStyle}">
-                        <StackPanel Spacing="14">
+                    </StackPanel>
+
+                    <StackPanel
+                        x:Name="AlertsSettingsSection"
+                        Visibility="Collapsed"
+                        Spacing="16">
+                        <Border Style="{StaticResource DrakonPanelStyle}">
+                            <StackPanel Spacing="14">
                             <TextBlock
                                 Style="{StaticResource DrakonSectionTitleTextStyle}"
                                 Text="Telegram Alerts" />
@@ -419,6 +556,7 @@
                             </Border>
                         </StackPanel>
                     </Border>
+                    </StackPanel>
                 </StackPanel>
             </StackPanel>
         </Grid>

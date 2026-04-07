@@ -139,6 +139,236 @@ std::string extractJsonObject_(const std::string& content)
     return content.substr(firstBrace, lastBrace - firstBrace + 1);
 }
 
+bool findJsonFieldValueStart_(
+    const std::string& content,
+    const std::string& key,
+    std::size_t& outValueStart)
+{
+    const std::string pattern = "\"" + key + "\"";
+    std::size_t fieldPos = content.find(pattern);
+    if (fieldPos == std::string::npos) {
+        return false;
+    }
+
+    const std::size_t colonPos = content.find(':', fieldPos + pattern.size());
+    if (colonPos == std::string::npos) {
+        return false;
+    }
+
+    std::size_t valuePos = colonPos + 1;
+    while (valuePos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[valuePos])) != 0) {
+        ++valuePos;
+    }
+    if (valuePos >= content.size()) {
+        return false;
+    }
+
+    outValueStart = valuePos;
+    return true;
+}
+
+bool extractJsonStringFieldPartial_(
+    const std::string& content,
+    const std::string& key,
+    std::string& outValue,
+    bool allowTruncatedValue)
+{
+    std::size_t valuePos = 0;
+    if (!findJsonFieldValueStart_(content, key, valuePos) || content[valuePos] != '"') {
+        return false;
+    }
+
+    ++valuePos;
+    std::string parsed;
+    parsed.reserve(64);
+
+    bool escaping = false;
+    while (valuePos < content.size()) {
+        const char ch = content[valuePos++];
+        if (escaping) {
+            switch (ch) {
+            case 'n':
+                parsed.push_back('\n');
+                break;
+            case 'r':
+                parsed.push_back('\r');
+                break;
+            case 't':
+                parsed.push_back('\t');
+                break;
+            default:
+                parsed.push_back(ch);
+                break;
+            }
+            escaping = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            escaping = true;
+            continue;
+        }
+        if (ch == '"') {
+            outValue = trimCopy(parsed);
+            return !outValue.empty();
+        }
+        parsed.push_back(ch);
+    }
+
+    if (!allowTruncatedValue) {
+        return false;
+    }
+
+    outValue = trimCopy(parsed);
+    return !outValue.empty();
+}
+
+bool extractJsonBoolFieldPartial_(
+    const std::string& content,
+    const std::string& key,
+    bool& outValue)
+{
+    std::size_t valuePos = 0;
+    if (!findJsonFieldValueStart_(content, key, valuePos)) {
+        return false;
+    }
+
+    if (content.compare(valuePos, 4, "true") == 0) {
+        outValue = true;
+        return true;
+    }
+    if (content.compare(valuePos, 5, "false") == 0) {
+        outValue = false;
+        return true;
+    }
+    return false;
+}
+
+bool extractJsonDoubleFieldPartial_(
+    const std::string& content,
+    const std::string& key,
+    double& outValue)
+{
+    std::size_t valuePos = 0;
+    if (!findJsonFieldValueStart_(content, key, valuePos)) {
+        return false;
+    }
+
+    std::size_t endPos = valuePos;
+    if (endPos < content.size() &&
+        (content[endPos] == '-' || content[endPos] == '+')) {
+        ++endPos;
+    }
+    while (endPos < content.size()) {
+        const char ch = content[endPos];
+        if ((ch >= '0' && ch <= '9') || ch == '.') {
+            ++endPos;
+            continue;
+        }
+        break;
+    }
+
+    if (endPos <= valuePos) {
+        return false;
+    }
+
+    try {
+        outValue = std::stod(content.substr(valuePos, endPos - valuePos));
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+double clampConfidence_(double value);
+std::string truncateForLog_(std::string value, std::size_t maxLength = 240);
+std::string trimLowerCopy_(std::string value);
+
+bool populateSkillSelectionFromPartialText_(
+    const std::string& partialText,
+    SkillSelection& selection,
+    const std::string& parseErrorSource)
+{
+    std::string stringValue;
+    if (extractJsonStringFieldPartial_(partialText, "selected_skill", stringValue, false)) {
+        selection.selectedSkill = trimCopy(stringValue);
+    }
+
+    double doubleValue = 0.0;
+    if (extractJsonDoubleFieldPartial_(partialText, "confidence", doubleValue)) {
+        selection.confidence = clampConfidence_(doubleValue);
+    }
+    if (extractJsonDoubleFieldPartial_(partialText, "reply_language_confidence", doubleValue)) {
+        selection.replyLanguageConfidence = clampConfidence_(doubleValue);
+    }
+
+    bool boolValue = false;
+    if (extractJsonBoolFieldPartial_(partialText, "continue_active_task", boolValue)) {
+        selection.continueActiveTask = boolValue;
+    }
+    if (extractJsonBoolFieldPartial_(partialText, "grounding_required", boolValue)) {
+        selection.groundingRequired = boolValue;
+    }
+    if (extractJsonBoolFieldPartial_(partialText, "knowledge_fallback", boolValue)) {
+        selection.knowledgeLanguageFallback = boolValue;
+    }
+
+    if (extractJsonStringFieldPartial_(partialText, "reason", stringValue, true)) {
+        selection.reason = stringValue;
+    }
+    if (extractJsonStringFieldPartial_(partialText, "reply_preview", stringValue, true)) {
+        selection.replyPreview = stringValue;
+    }
+    if (extractJsonStringFieldPartial_(partialText, "reply_language", stringValue, false)) {
+        selection.replyLanguage = normalizeReplyLanguageTag(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "knowledge_language", stringValue, false)) {
+        selection.knowledgeLanguage = normalizeAssistantLanguageTag(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "mode", stringValue, false)) {
+        selection.mode = trimLowerCopy_(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "entity", stringValue, false)) {
+        selection.entity = trimLowerCopy_(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "intent", stringValue, false)) {
+        selection.intent = trimLowerCopy_(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "operation_type", stringValue, false)) {
+        selection.operationType = trimCopy(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "operation_phase", stringValue, false)) {
+        selection.operationPhase = trimCopy(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "task_goal", stringValue, true)) {
+        selection.taskGoal = stringValue;
+    }
+
+    const bool hasSemanticPlan =
+        !selection.selectedSkill.empty() ||
+        !selection.mode.empty() ||
+        !selection.entity.empty() ||
+        !selection.intent.empty() ||
+        selection.continueActiveTask ||
+        selection.groundingRequired ||
+        !trimCopy(selection.operationType).empty() ||
+        !trimCopy(selection.operationPhase).empty() ||
+        !trimCopy(selection.taskGoal).empty();
+
+    if (!hasSemanticPlan) {
+        return false;
+    }
+
+    Logger::instance().logDebugNoEscalation(
+        "agent",
+        "LocalLlmClient::chooseSkill salvaged_partial_router_json " +
+            parseErrorSource + "=" + truncateForLog_(partialText));
+    selection.fromModel = true;
+    return true;
+}
+
 double clampConfidence_(double value)
 {
     if (value < 0.0) return 0.0;
@@ -146,7 +376,7 @@ double clampConfidence_(double value)
     return value;
 }
 
-std::string truncateForLog_(std::string value, std::size_t maxLength = 240)
+std::string truncateForLog_(std::string value, std::size_t maxLength)
 {
     value = trimCopy(std::move(value));
     if (value.size() <= maxLength) {
@@ -1128,6 +1358,29 @@ SkillSelection LocalLlmClient::chooseSkill(
 
     const Config configSnapshot = effectiveConfigSnapshot_();
 
+    int routingMaxTokens = 280;
+    const std::size_t trimmedLength = trimCopy(userMessage).size();
+    if (trimmedLength > 180) {
+        routingMaxTokens = 340;
+    }
+    if (trimmedLength > 420) {
+        routingMaxTokens = 420;
+    }
+    const std::string activeTaskType =
+        requestContext.is_object() &&
+            requestContext.contains("conversation_task_state") &&
+            requestContext["conversation_task_state"].is_object() &&
+            requestContext["conversation_task_state"].contains("active_task") &&
+            requestContext["conversation_task_state"]["active_task"].is_object() &&
+            requestContext["conversation_task_state"]["active_task"].contains("type") &&
+            requestContext["conversation_task_state"]["active_task"]["type"].is_string()
+        ? trimCopy(requestContext["conversation_task_state"]["active_task"]["type"].get<std::string>())
+        : std::string();
+    if (activeTaskType == "create_cameras_batch" ||
+        activeTaskType == "edit_cameras_batch") {
+        routingMaxTokens = (std::max)(routingMaxTokens, 420);
+    }
+
     nlohmann::json body = {
         { "model", configSnapshot.model },
         { "messages", nlohmann::json::array({
@@ -1140,8 +1393,8 @@ SkillSelection LocalLlmClient::chooseSkill(
                 { "content", buildRoutingUserPrompt(userMessage, requestContext) },
             },
         }) },
-        { "temperature", 0.1 },
-        { "max_tokens", 340 },
+        { "temperature", 0.0 },
+        { "max_tokens", routingMaxTokens },
         { "response_format", {
             { "type", "json_object" }
         } },
@@ -1164,6 +1417,12 @@ SkillSelection LocalLlmClient::chooseSkill(
                 selection,
                 fallbackContent,
                 "reasoning_preview")) {
+            if (populateSkillSelectionFromPartialText_(
+                    fallbackContent,
+                    selection,
+                    "reasoning_preview")) {
+                return selection;
+            }
             return SkillSelection{};
         }
         return selection;
@@ -1171,6 +1430,12 @@ SkillSelection LocalLlmClient::chooseSkill(
 
     const std::string jsonObject = extractJsonObject_(outcome.content);
     if (jsonObject.empty()) {
+        if (populateSkillSelectionFromPartialText_(
+                outcome.content,
+                selection,
+                "content_preview")) {
+            return selection;
+        }
         Logger::instance().logDebugNoEscalation(
             "agent",
             "LocalLlmClient::chooseSkill parse_error=missing_json_object content_preview=" +
@@ -1184,6 +1449,12 @@ SkillSelection LocalLlmClient::chooseSkill(
             selection,
             outcome.content,
             "content_preview")) {
+        if (populateSkillSelectionFromPartialText_(
+                outcome.content,
+                selection,
+                "content_preview")) {
+            return selection;
+        }
         return SkillSelection{};
     }
     return selection;

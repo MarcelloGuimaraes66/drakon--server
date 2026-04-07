@@ -18,6 +18,7 @@ import {
   getCoreModelNoticeCopy,
   shouldShowCoreModelNotice,
 } from "@/react-app/utils/coreModelNotice";
+import { isGeneratedCustomAgentName } from "@/react-app/utils/chatUtils";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 
 export type ToastVariant = "default" | "destructive";
@@ -100,9 +101,19 @@ type OwnedAgentTemplate = CameraCustomAgentRow & {
   updated_at: string | null;
 };
 
+export type CameraAgentEditorTarget = {
+  type: "camera" | "step_default" | "step_camera";
+  camera_id?: number | null;
+  camera_name?: string | null;
+  step_id?: number | null;
+  step_title?: string | null;
+  job_id?: number | null;
+  job_name?: string | null;
+};
+
 type Props = {
   open: boolean;
-  cameraId: number;
+  editorTarget: CameraAgentEditorTarget | null;
   initialAgent: CameraCustomAgentRow | null;
   onClose: () => void;
   onSaved: (savedAgentId?: number | null) => Promise<void> | void;
@@ -591,18 +602,43 @@ const normalizeRegionsForPayload = (
 
 const getDisplayNameFromAgent = (agent: CameraCustomAgentRow | null): string => {
   if (!agent) return "";
+  const topLevelDisplayName =
+    typeof (agent as unknown as { display_name?: unknown }).display_name === "string"
+      ? String((agent as unknown as { display_name?: string }).display_name).trim()
+      : "";
+  if (topLevelDisplayName && !isGeneratedCustomAgentName(topLevelDisplayName)) {
+    return topLevelDisplayName;
+  }
   if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
     const fromCfg = typeof (agent.config_json as any).display_name === "string"
       ? String((agent.config_json as any).display_name).trim()
       : "";
+    if (fromCfg && !isGeneratedCustomAgentName(fromCfg)) return fromCfg;
+  }
+  const summary = getSummaryFromAgent(agent);
+  if (summary) return summary;
+  const algorithmType = String(agent.algorithm_type || "").trim();
+  if (algorithmType && !isGeneratedCustomAgentName(algorithmType)) {
+    return algorithmType;
+  }
+  const numericId = Number(agent.id);
+  return Number.isInteger(numericId) && numericId > 0 ? `Agent ${numericId}` : "";
+};
+
+const getSummaryFromAgent = (agent: CameraCustomAgentRow | null): string => {
+  if (!agent) return "";
+  if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
+    const fromCfg = typeof (agent.config_json as any).summary === "string"
+      ? String((agent.config_json as any).summary).trim()
+      : "";
     if (fromCfg) return fromCfg;
   }
-  return String(agent.algorithm_type || "").trim();
+  return "";
 };
 
 export default function CameraCustomAgentEditorModal({
   open,
-  cameraId,
+  editorTarget,
   initialAgent,
   onClose,
   onSaved,
@@ -704,12 +740,34 @@ export default function CameraCustomAgentEditorModal({
   const snapshotRequestingRef = useRef(false);
   const snapshotCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const targetType = editorTarget?.type ?? "camera";
+  const previewCameraId =
+    typeof editorTarget?.camera_id === "number" && Number.isInteger(editorTarget.camera_id) && editorTarget.camera_id > 0
+      ? Number(editorTarget.camera_id)
+      : null;
+  const stepId =
+    typeof editorTarget?.step_id === "number" && Number.isInteger(editorTarget.step_id) && editorTarget.step_id > 0
+      ? Number(editorTarget.step_id)
+      : null;
+  const isStepTarget = targetType === "step_default" || targetType === "step_camera";
+  const stepCameraId = targetType === "step_camera" ? previewCameraId : null;
+  const cameraId = previewCameraId ?? 0;
+  const targetLabel =
+    targetType === "step_default"
+      ? editorTarget?.step_title?.trim() ||
+        (stepId ? `Step #${stepId}` : "Step default agent")
+      : targetType === "step_camera"
+        ? editorTarget?.camera_name?.trim() ||
+          (previewCameraId ? `Camera #${previewCameraId}` : "Step target camera")
+        : editorTarget?.camera_name?.trim() ||
+          (previewCameraId ? `Camera #${previewCameraId}` : "Camera");
+
   const snapshotUrl = snapshotMeta.thumbnail_url
     ? `/api/thumbnails/${snapshotMeta.thumbnail_url}${
         snapshotMeta.last_thumbnail_update ? `?ts=${encodeURIComponent(snapshotMeta.last_thumbnail_update)}` : ""
       }`
     : null;
-  const canLoadSavedAgentTemplate = !initialAgent && !isOnboardingOpen;
+  const canLoadSavedAgentTemplate = !isOnboardingOpen;
   const selectedTemplateAgent = useMemo(() => {
     const templateId = Number(selectedTemplateAgentId);
     if (!Number.isInteger(templateId) || templateId <= 0) return null;
@@ -718,7 +776,11 @@ export default function CameraCustomAgentEditorModal({
 
   const polygonCount = polygonRegions.length;
   const snapshotRefreshBlocked =
-    snapshotLoading || snapshotRequesting || snapshotRequestingRef.current || snapshotCooldownUntil > Date.now();
+    !previewCameraId ||
+    snapshotLoading ||
+    snapshotRequesting ||
+    snapshotRequestingRef.current ||
+    snapshotCooldownUntil > Date.now();
 
   const clearSnapshotCooldown = () => {
     if (snapshotCooldownTimerRef.current) {
@@ -780,7 +842,11 @@ export default function CameraCustomAgentEditorModal({
   };
 
   const refreshSnapshotMeta = async (): Promise<boolean> => {
-    const response = await fetch(`/api/cameras/${cameraId}`);
+    if (!previewCameraId) {
+      setSnapshotMeta({ thumbnail_url: null, last_thumbnail_update: null });
+      return false;
+    }
+    const response = await fetch(`/api/cameras/${previewCameraId}`);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data?.error || "Failed to load camera snapshot");
     const thumbnail_url =
@@ -794,13 +860,14 @@ export default function CameraCustomAgentEditorModal({
   };
 
   const requestSnapshotRefresh = async () => {
+    if (!previewCameraId) return;
     if (snapshotRequestingRef.current) return;
     if (Date.now() < snapshotCooldownUntil) return;
     snapshotRequestingRef.current = true;
     setSnapshotRequesting(true);
     startSnapshotCooldown();
     try {
-      const response = await fetch(`/api/cameras/${cameraId}/refresh-thumbnail`, { method: "POST" });
+      const response = await fetch(`/api/cameras/${previewCameraId}/refresh-thumbnail`, { method: "POST" });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || "Failed to request preview capture");
     } catch (error) {
@@ -817,7 +884,11 @@ export default function CameraCustomAgentEditorModal({
       setSelectedNegativeImageIds([]);
       return;
     }
-    const response = await fetch(`/api/camera-algorithms/${id}/negative-images`);
+    const response = await fetch(
+      isStepTarget
+        ? `/api/job-step-agents/${id}/negative-images`
+        : `/api/camera-algorithms/${id}/negative-images`
+    );
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data?.error || "Failed to load negative images");
     const images = normalizeNegativeImages(data?.images);
@@ -908,7 +979,7 @@ export default function CameraCustomAgentEditorModal({
         // ignore
       })
       .finally(() => setSnapshotLoading(false));
-  }, [open, initialAgent?.id, cameraId]);
+  }, [open, initialAgent?.id, previewCameraId, stepId, targetType]);
 
   useEffect(() => {
     if (!open || !canLoadSavedAgentTemplate) {
@@ -981,7 +1052,7 @@ export default function CameraCustomAgentEditorModal({
                 typeof row?.camera_name === "string" && row.camera_name.trim()
                   ? row.camera_name.trim()
                   : `Camera #${sourceCameraId}`,
-              display_name: getDisplayNameFromAgent(draftAgent) || `custom_${id}`,
+              display_name: getDisplayNameFromAgent(draftAgent) || `Agent ${id}`,
               updated_at:
                 typeof row?.updated_at === "string" && row.updated_at.trim()
                   ? row.updated_at.trim()
@@ -1523,10 +1594,15 @@ export default function CameraCustomAgentEditorModal({
         });
         const formData = new FormData();
         formData.append("image", normalized.file, normalized.file.name);
-        const response = await fetch(`/api/camera-algorithms/${algorithmId}/negative-images`, {
-          method: "POST",
-          body: formData,
-        });
+        const response = await fetch(
+          isStepTarget
+            ? `/api/job-step-agents/${algorithmId}/negative-images`
+            : `/api/camera-algorithms/${algorithmId}/negative-images`,
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data?.error || "Failed to upload negative image");
       }
@@ -1542,9 +1618,14 @@ export default function CameraCustomAgentEditorModal({
   const onDeleteNegativeImage = async (imageId: number) => {
     if (!algorithmId || !imageId) return;
     try {
-      const response = await fetch(`/api/camera-algorithms/${algorithmId}/negative-images/${imageId}`, {
-        method: "DELETE",
-      });
+      const response = await fetch(
+        isStepTarget
+          ? `/api/job-step-agents/${algorithmId}/negative-images/${imageId}`
+          : `/api/camera-algorithms/${algorithmId}/negative-images/${imageId}`,
+        {
+          method: "DELETE",
+        }
+      );
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data?.error || "Failed to remove negative image");
       await loadNegativeImages(algorithmId);
@@ -1559,24 +1640,40 @@ export default function CameraCustomAgentEditorModal({
       showToast("Validation", "Prompt Core and Alert Condition are required", "destructive");
       return;
     }
+    if (isStepTarget) {
+      if (!stepId) {
+        showToast("Validation", "This step target is missing its step reference", "destructive");
+        return;
+      }
+      if (!previewCameraId) {
+        showToast("Validation", "Select a step camera target before enhancing the prompt", "destructive");
+        return;
+      }
+    }
     setEnhancingPrompt(true);
     setSuggestion(null);
     try {
-      const response = await fetch(`/api/cameras/${cameraId}/custom-agents/enhance-prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt_template: normalized.prompt_template,
-          alert_condition: normalized.alert_condition,
-          negative_condition: normalized.negative_condition,
-          analysis_regions: normalizeRegionsForPayload(
-            polygonRegions,
-            normalized,
-            selectedFaceTargetIds,
-            selectedNegativeImageIds
-          ),
-        }),
-      });
+      const response = await fetch(
+        isStepTarget
+          ? `/api/job-steps/${stepId}/agents/enhance-prompt`
+          : `/api/cameras/${cameraId}/custom-agents/enhance-prompt`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(isStepTarget ? { camera_id: previewCameraId } : {}),
+            prompt_template: normalized.prompt_template,
+            alert_condition: normalized.alert_condition,
+            negative_condition: normalized.negative_condition,
+            analysis_regions: normalizeRegionsForPayload(
+              polygonRegions,
+              normalized,
+              selectedFaceTargetIds,
+              selectedNegativeImageIds
+            ),
+          }),
+        }
+      );
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
         if (isOpenAiKeyRequiredError(data)) {
@@ -1593,7 +1690,9 @@ export default function CameraCustomAgentEditorModal({
       while (Date.now() < timeoutAt) {
         await new Promise((resolve) => setTimeout(resolve, 1500));
         const pollRes = await fetch(
-          `/api/cameras/${cameraId}/custom-agents/enhance-prompt/${commandId}`
+          isStepTarget
+            ? `/api/job-steps/${stepId}/agents/enhance-prompt/${commandId}`
+            : `/api/cameras/${cameraId}/custom-agents/enhance-prompt/${commandId}`
         );
         const pollData = await pollRes.json().catch(() => ({}));
         if (!pollRes.ok) throw new Error(pollData?.error || "Failed to check enhancement status");
@@ -1653,7 +1752,9 @@ export default function CameraCustomAgentEditorModal({
 
     showToast(
       "Agent loaded",
-      "This draft now uses your saved agent as a starting point. Negative reference images need to be uploaded again after the first save.",
+      initialAgent
+        ? "Loaded into the editor. Saving now will create a new agent based on this template. Negative reference images need to be uploaded again after the first save."
+        : "This draft now uses your saved agent as a starting point. Negative reference images need to be uploaded again after the first save.",
       "default"
     );
   };
@@ -1666,6 +1767,14 @@ export default function CameraCustomAgentEditorModal({
     }
     if ((newFaceTargetName.trim().length > 0) !== !!newFaceTargetFile) {
       showToast("Validation", "Fill both target name and image, or leave both empty", "destructive");
+      return;
+    }
+    if (!editorTarget) {
+      showToast("Validation", "Missing agent destination", "destructive");
+      return;
+    }
+    if (isStepTarget && !stepId) {
+      showToast("Validation", "This step target is missing its step reference", "destructive");
       return;
     }
 
@@ -1682,40 +1791,69 @@ export default function CameraCustomAgentEditorModal({
       }
     }
 
+    const analysisRegions = normalizeRegionsForPayload(
+      polygonRegions,
+      normalized,
+      faceIds,
+      selectedNegativeImageIds
+    );
+    const modelFpsForSave =
+      supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
+        ? modelFps
+        : DEFAULT_ULTRA_VIDEO_MODEL_FPS;
     const payload = {
       display_name: displayName.trim(),
       prompt_template: normalized.prompt_template,
       alert_condition: normalized.alert_condition,
       negative_condition: normalized.negative_condition,
-      analysis_regions: normalizeRegionsForPayload(
-        polygonRegions,
-        normalized,
-        faceIds,
-        selectedNegativeImageIds
-      ),
+      analysis_regions: analysisRegions,
       face_target_ids: faceIds,
       is_enabled: isEnabled ? 1 : 0,
       input_type: inputType,
       video_packaging_mode: videoPackagingMode,
       inference_model: inferenceModel,
-      model_fps:
-        supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
-          ? modelFps
-          : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+      model_fps: modelFpsForSave,
       run_every: runEvery,
       running_resolution: inferenceModel === "core" ? runningResolution : null,
       only_capture_on_motion: onlyCaptureOnMotion,
     };
     setSaving(true);
     try {
-      const endpoint = algorithmId
-        ? `/api/cameras/${cameraId}/custom-agents/${algorithmId}`
-        : `/api/cameras/${cameraId}/custom-agents`;
-      const method = algorithmId ? "PATCH" : "POST";
+      const endpoint = isStepTarget
+        ? `/api/job-steps/${stepId}/agents`
+        : algorithmId
+          ? `/api/cameras/${cameraId}/custom-agents/${algorithmId}`
+          : `/api/cameras/${cameraId}/custom-agents`;
+      const method = isStepTarget ? "POST" : algorithmId ? "PATCH" : "POST";
+      const stepPayload = isStepTarget
+        ? {
+            agent_key:
+              typeof initialAgent?.algorithm_type === "string" && initialAgent.algorithm_type.trim()
+                ? initialAgent.algorithm_type.trim()
+                : "custom_template",
+            prompt_template: normalized.prompt_template,
+            alert_condition: normalized.alert_condition,
+            negative_condition: normalized.negative_condition,
+            camera_id: stepCameraId ?? null,
+            params: JSON.stringify({
+              display_name: displayName.trim(),
+              summary: getSummaryFromAgent(initialAgent) || normalized.alert_condition,
+            }),
+            input_type: inputType,
+            video_packaging_mode: videoPackagingMode,
+            inference_model: inferenceModel,
+            model_fps: modelFpsForSave,
+            run_every: runEvery,
+            running_resolution: inferenceModel === "core" ? runningResolution : null,
+            only_capture_on_motion: onlyCaptureOnMotion,
+            face_target_ids: faceIds,
+            analysis_regions: analysisRegions,
+          }
+        : payload;
       const response = await fetch(endpoint, {
         method,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(stepPayload),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -1784,7 +1922,7 @@ export default function CameraCustomAgentEditorModal({
                       templateAgentsError ||
                       "Load one of your saved agents. Negative reference images need to be re-uploaded after the first save."
                     }
-                    className="w-[200px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    className="w-[172px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     <option value="">
                       {templateAgentsLoading
@@ -1909,7 +2047,7 @@ export default function CameraCustomAgentEditorModal({
                   data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorPolygons}
                 >
                   <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
-                    <div className="text-xs text-gray-300 truncate">Camera #{cameraId}</div>
+                    <div className="text-xs text-gray-300 truncate">{targetLabel}</div>
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
@@ -1938,7 +2076,9 @@ export default function CameraCustomAgentEditorModal({
                         disabled={snapshotRefreshBlocked}
                         className="text-[11px] text-blue-300 hover:underline disabled:text-gray-500"
                       >
-                        {snapshotLoading
+                        {!previewCameraId
+                          ? "No preview camera"
+                          : snapshotLoading
                           ? "Loading..."
                           : snapshotRequesting
                           ? "Refreshing..."
@@ -2061,7 +2201,11 @@ export default function CameraCustomAgentEditorModal({
                       </div>
                     ) : (
                       <div className="h-full rounded border border-dashed border-gray-700 bg-gray-900/70 text-[13px] text-gray-500 flex items-center justify-center px-4 text-center">
-                        {snapshotLoading ? "Loading snapshot..." : "No snapshot available yet."}
+                        {!previewCameraId && isStepTarget
+                          ? "No preview camera is linked to this step agent yet."
+                          : snapshotLoading
+                            ? "Loading snapshot..."
+                            : "No snapshot available yet."}
                       </div>
                     )}
                   </div>

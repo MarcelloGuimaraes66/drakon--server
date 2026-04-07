@@ -2,13 +2,15 @@ import { Bot, Camera } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import HitMediaAlbum from "@/react-app/components/HitMediaAlbum";
 import MessageCopyButton from "@/react-app/components/MessageCopyButton";
+import usePrefersReducedMotion from "@/react-app/hooks/usePrefersReducedMotion";
 import {
   formatAssistantMessageContent,
   shouldSuppressAssistantCameraFooter,
 } from "@/react-app/utils/chatUtils";
+import { buildChatRevealPlan } from "@/react-app/utils/chatRevealPlan";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
 
 interface AssistantMessageProps {
@@ -23,6 +25,10 @@ interface AssistantMessageProps {
   compact?: boolean;
   variant?: "default" | "chat-page";
   supplementalContent?: ReactNode;
+  animateReveal?: boolean;
+  revealId?: string | null;
+  onRevealProgress?: () => void;
+  onRevealComplete?: (revealId: string) => void;
 }
 
 function assistantMarkdownComponents(compact: boolean) {
@@ -149,6 +155,167 @@ function assistantMarkdownComponents(compact: boolean) {
   };
 }
 
+interface TypingMarkdownProps {
+  markdown: string;
+  compact: boolean;
+  animateReveal: boolean;
+  revealId: string | null;
+  onRevealProgress?: () => void;
+  onRevealComplete?: (revealId: string) => void;
+}
+
+function easeOutCubic(progress: number): number {
+  return 1 - Math.pow(1 - progress, 3);
+}
+
+function TypingMarkdown({
+  markdown,
+  compact,
+  animateReveal,
+  revealId,
+  onRevealProgress,
+  onRevealComplete,
+}: TypingMarkdownProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
+  const planCacheRef = useRef<ReturnType<typeof buildChatRevealPlan> & { markdown: string } | null>(null);
+  const onRevealProgressRef = useRef(onRevealProgress);
+  const onRevealCompleteRef = useRef(onRevealComplete);
+  const completedRevealIdRef = useRef<string | null>(null);
+
+  if (!planCacheRef.current || planCacheRef.current.markdown !== markdown) {
+    planCacheRef.current = {
+      markdown,
+      ...buildChatRevealPlan(markdown),
+    };
+  }
+
+  const revealPlan = planCacheRef.current!;
+  const [forceRevealComplete, setForceRevealComplete] = useState(false);
+  const [visibleChunkCount, setVisibleChunkCount] = useState(() =>
+    animateReveal && revealId ? 1 : revealPlan.chunks.length,
+  );
+  const markdownComponents = assistantMarkdownComponents(compact);
+
+  const markRevealComplete = () => {
+    if (!revealId || completedRevealIdRef.current === revealId) {
+      return;
+    }
+
+    completedRevealIdRef.current = revealId;
+    onRevealCompleteRef.current?.(revealId);
+  };
+
+  useEffect(() => {
+    onRevealProgressRef.current = onRevealProgress;
+  }, [onRevealProgress]);
+
+  useEffect(() => {
+    onRevealCompleteRef.current = onRevealComplete;
+  }, [onRevealComplete]);
+
+  useEffect(() => {
+    setForceRevealComplete(false);
+    completedRevealIdRef.current = null;
+  }, [markdown, revealId]);
+
+  useEffect(() => {
+    const totalChunks = revealPlan.chunks.length;
+
+    if (!animateReveal || !revealId) {
+      setVisibleChunkCount(totalChunks);
+      return;
+    }
+
+    if (forceRevealComplete || prefersReducedMotion || totalChunks <= 1) {
+      setVisibleChunkCount(totalChunks);
+      onRevealProgressRef.current?.();
+      markRevealComplete();
+      return;
+    }
+
+    let animationFrameId = 0;
+    let cancelled = false;
+    let lastRenderedChunkCount = 1;
+
+    setVisibleChunkCount(1);
+    onRevealProgressRef.current?.();
+
+    const animationStartedAt = performance.now();
+    const revealDurationMs = revealPlan.totalDurationMs;
+
+    const renderFrame = (timestamp: number) => {
+      if (cancelled) {
+        return;
+      }
+
+      const rawProgress =
+        revealDurationMs <= 0
+          ? 1
+          : Math.min(1, (timestamp - animationStartedAt) / revealDurationMs);
+      const easedProgress = easeOutCubic(rawProgress);
+      const nextChunkCount = Math.max(
+        1,
+        Math.min(totalChunks, Math.ceil(easedProgress * totalChunks)),
+      );
+
+      if (nextChunkCount !== lastRenderedChunkCount) {
+        lastRenderedChunkCount = nextChunkCount;
+        setVisibleChunkCount(nextChunkCount);
+        onRevealProgressRef.current?.();
+      }
+
+      if (rawProgress >= 1) {
+        markRevealComplete();
+        return;
+      }
+
+      animationFrameId = window.requestAnimationFrame(renderFrame);
+    };
+
+    animationFrameId = window.requestAnimationFrame(renderFrame);
+
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(animationFrameId);
+    };
+  }, [
+    animateReveal,
+    forceRevealComplete,
+    markdown,
+    prefersReducedMotion,
+    revealId,
+    revealPlan.chunks.length,
+    revealPlan.totalDurationMs,
+  ]);
+
+  const displayMarkdown =
+    animateReveal && revealId
+      ? revealPlan.chunks.slice(0, visibleChunkCount).join("")
+      : markdown;
+
+  const handleTextInteractionStart = () => {
+    if (!animateReveal || !revealId || forceRevealComplete) {
+      return;
+    }
+
+    setForceRevealComplete(true);
+  };
+
+  return (
+    <div
+      className="select-text cursor-text"
+      onPointerDownCapture={handleTextInteractionStart}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={markdownComponents}
+      >
+        {displayMarkdown}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 export default function AssistantMessage({
   content,
   hitMedia = [],
@@ -156,6 +323,10 @@ export default function AssistantMessage({
   compact = false,
   variant = "default",
   supplementalContent = null,
+  animateReveal = false,
+  revealId = null,
+  onRevealProgress,
+  onRevealComplete,
 }: AssistantMessageProps) {
   const markdown = formatAssistantMessageContent(content);
   const suppressCameraFooter = shouldSuppressAssistantCameraFooter(content);
@@ -191,12 +362,14 @@ export default function AssistantMessage({
           >
             <div className={compact ? "space-y-3" : "space-y-5"}>
               <div className={contentWidthClasses}>
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkBreaks]}
-                  components={assistantMarkdownComponents(compact)}
-                >
-                  {markdown}
-                </ReactMarkdown>
+                <TypingMarkdown
+                  markdown={markdown}
+                  compact={compact}
+                  animateReveal={animateReveal}
+                  revealId={revealId}
+                  onRevealProgress={onRevealProgress}
+                  onRevealComplete={onRevealComplete}
+                />
               </div>
 
               {hitMedia.length > 0 && <HitMediaAlbum items={hitMedia} />}

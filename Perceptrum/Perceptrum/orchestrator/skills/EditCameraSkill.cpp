@@ -62,6 +62,389 @@ std::string compactToken_(std::string value)
 
 std::string jsonStringField_(
     const nlohmann::json& value,
+    const char* key);
+
+bool tryJsonIntField_(
+    const nlohmann::json& value,
+    const char* key,
+    int& outValue);
+
+std::string normalizeInlineWhitespace_(std::string value)
+{
+    std::string normalized;
+    normalized.reserve(value.size());
+
+    bool lastWasSpace = false;
+    for (unsigned char ch : value) {
+        if (std::isspace(ch) != 0) {
+            if (!normalized.empty() && !lastWasSpace) {
+                normalized.push_back(' ');
+            }
+            lastWasSpace = true;
+            continue;
+        }
+
+        normalized.push_back(static_cast<char>(ch));
+        lastWasSpace = false;
+    }
+
+    return trimCopy_(std::move(normalized));
+}
+
+std::string shortenForDisplay_(std::string value, std::size_t maxLength)
+{
+    value = normalizeInlineWhitespace_(std::move(value));
+    if (value.size() <= maxLength) {
+        return value;
+    }
+    if (maxLength <= 3) {
+        return value.substr(0, maxLength);
+    }
+    return trimCopy_(value.substr(0, maxLength - 3)) + "...";
+}
+
+std::string structuredDescriptionLabel_(std::string value)
+{
+    value = normalizeInlineWhitespace_(std::move(value));
+    if (value.empty()) {
+        return "";
+    }
+
+    const std::string upper = upperAsciiCopy_(value);
+    const std::string labelTag = "LABEL:";
+    const std::string descriptionTag = "DESCRIPTION:";
+
+    const std::size_t labelPos = upper.find(labelTag);
+    if (labelPos == std::string::npos) {
+        return "";
+    }
+
+    const std::size_t labelStart = labelPos + labelTag.size();
+    const std::size_t descriptionPos = upper.find(descriptionTag, labelStart);
+    return trimCopy_(
+        descriptionPos == std::string::npos
+            ? value.substr(labelStart)
+            : value.substr(labelStart, descriptionPos - labelStart));
+}
+
+std::string structuredDescriptionBody_(std::string value)
+{
+    value = normalizeInlineWhitespace_(std::move(value));
+    if (value.empty()) {
+        return "";
+    }
+
+    const std::string upper = upperAsciiCopy_(value);
+    const std::string descriptionTag = "DESCRIPTION:";
+    const std::size_t descriptionPos = upper.find(descriptionTag);
+    if (descriptionPos == std::string::npos) {
+        return "";
+    }
+
+    return trimCopy_(value.substr(descriptionPos + descriptionTag.size()));
+}
+
+std::string normalizedSceneLabelKey_(std::string value)
+{
+    value = lowerAsciiCopy_(trimCopy_(std::move(value)));
+    for (char& ch : value) {
+        if (ch == ' ' || ch == '-') {
+            ch = '_';
+        }
+    }
+    return value;
+}
+
+std::string cameraSceneLabel_(const nlohmann::json& camera)
+{
+    const std::string explicitLabel = jsonStringField_(camera, "scene_label");
+    if (!explicitLabel.empty()) {
+        return explicitLabel;
+    }
+    return structuredDescriptionLabel_(jsonStringField_(camera, "description"));
+}
+
+std::string cameraSceneDescription_(const nlohmann::json& camera)
+{
+    const std::string explicitDescription = jsonStringField_(camera, "scene_description");
+    if (!explicitDescription.empty()) {
+        return explicitDescription;
+    }
+
+    const std::string body = structuredDescriptionBody_(jsonStringField_(camera, "description"));
+    if (!body.empty()) {
+        return body;
+    }
+    return jsonStringField_(camera, "description");
+}
+
+std::string humanizeSceneLabel_(std::string value)
+{
+    for (char& ch : value) {
+        if (ch == '_' || ch == '-') {
+            ch = ' ';
+        }
+    }
+    return normalizeInlineWhitespace_(trimCopy_(std::move(value)));
+}
+
+std::string sceneAliasTextForLabel_(const std::string& rawLabel)
+{
+    const std::string label = normalizedSceneLabelKey_(rawLabel);
+    if (label.empty()) {
+        return "";
+    }
+
+    if (label == "office_room") return "office room escritorio escritorio sala ambiente interno indoor interior interno";
+    if (label == "reception") return "reception recepcao recepcao lobby entrada ambiente interno indoor interior interno";
+    if (label == "other_indoor") return "other indoor ambiente interno indoor interior interno sala interna";
+    if (label == "living_room") return "living room sala estar ambiente interno indoor interior interno";
+    if (label == "bedroom") return "bedroom quarto ambiente interno indoor interior interno";
+    if (label == "childrens_room") return "childrens room quarto infantil ambiente interno indoor interior interno";
+    if (label == "kitchen") return "kitchen cozinha ambiente interno indoor interior interno";
+    if (label == "corridor") return "corridor corredor ambiente interno indoor interior interno";
+    if (label == "elevator") return "elevator elevador ambiente interno indoor interior interno";
+    if (label == "classroom") return "classroom sala aula ambiente interno indoor interior interno";
+    if (label == "store") return "store loja ambiente interno indoor interior interno";
+    if (label == "supermarket") return "supermarket mercado ambiente interno indoor interior interno";
+    if (label == "warehouse") return "warehouse deposito galpao ambiente interno indoor interior interno";
+    if (label == "staircase") return "staircase escada ambiente interno indoor interior interno";
+    if (label == "lobby") return "lobby saguão saguao hall ambiente interno indoor interior interno";
+    if (label == "restaurant") return "restaurant restaurante ambiente interno indoor interior interno";
+    if (label == "bar") return "bar ambiente interno indoor interior interno";
+    if (label == "cafe") return "cafe cafeteria ambiente interno indoor interior interno";
+    if (label == "gym") return "gym academia ambiente interno indoor interior interno";
+
+    if (label == "street") return "street rua ambiente externo outdoor exterior externo";
+    if (label == "intersection") return "intersection cruzamento ambiente externo outdoor exterior externo";
+    if (label == "park") return "park parque ambiente externo outdoor exterior externo";
+    if (label == "yard") return "yard quintal ambiente externo outdoor exterior externo";
+    if (label == "frontyard") return "frontyard quintal frente jardim frente ambiente externo outdoor exterior externo";
+    if (label == "backyard") return "backyard quintal fundos ambiente externo outdoor exterior externo";
+    if (label == "parking_lot") return "parking lot estacionamento ambiente externo outdoor exterior externo";
+    if (label == "other_outdoor") return "other outdoor ambiente externo outdoor exterior externo";
+    if (label == "front_door") return "front door porta frente entrada ambiente externo outdoor exterior externo";
+    if (label == "back_door") return "back door porta fundos saida ambiente externo outdoor exterior externo";
+    if (label == "garage") return "garage garagem entrada veiculo";
+
+    return "";
+}
+
+std::string sceneSearchText_(const nlohmann::json& camera)
+{
+    const std::string sceneLabel = cameraSceneLabel_(camera);
+    const std::string sceneDescription = cameraSceneDescription_(camera);
+
+    std::string combined;
+    if (!sceneLabel.empty()) {
+        combined += sceneLabel;
+
+        const std::string humanized = humanizeSceneLabel_(sceneLabel);
+        combined += " " + humanized;
+
+        const std::string aliases = sceneAliasTextForLabel_(sceneLabel);
+        if (!aliases.empty()) {
+            combined += " " + aliases;
+        }
+    }
+
+    if (!sceneDescription.empty()) {
+        if (!combined.empty()) {
+            combined += " ";
+        }
+        combined += sceneDescription;
+    }
+
+    if (combined.empty()) {
+        combined = jsonStringField_(camera, "description");
+    }
+
+    return normalizeInlineWhitespace_(combined);
+}
+
+const std::vector<std::string>& semanticStopwords_()
+{
+    static const std::vector<std::string> stopwords = {
+        "a", "an", "as", "at", "ambiente", "area", "cam", "camera", "cameras", "com", "da",
+        "das", "de", "del", "description", "do", "dos", "e", "el", "em", "environment",
+        "filma", "film", "filming", "in", "la", "label", "le", "les", "local", "location",
+        "my", "na", "no", "o", "of", "on", "para", "parece", "por", "que", "scene", "space",
+        "the", "to", "uma", "um", "view",
+    };
+    return stopwords;
+}
+
+std::vector<std::string> semanticTokens_(std::string value)
+{
+    value = lowerAsciiCopy_(trimCopy_(std::move(value)));
+    std::vector<std::string> tokens;
+    std::string current;
+
+    const auto flushCurrent = [&]() {
+        if (current.empty()) {
+            return;
+        }
+        if (current.size() <= 1) {
+            current.clear();
+            return;
+        }
+        const auto& stopwords = semanticStopwords_();
+        if (std::find(stopwords.begin(), stopwords.end(), current) != stopwords.end()) {
+            current.clear();
+            return;
+        }
+        if (std::find(tokens.begin(), tokens.end(), current) == tokens.end()) {
+            tokens.push_back(current);
+        }
+        current.clear();
+    };
+
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) != 0) {
+            current.push_back(static_cast<char>(ch));
+            continue;
+        }
+        flushCurrent();
+    }
+    flushCurrent();
+
+    return tokens;
+}
+
+bool containsAllSemanticTokens_(
+    const std::vector<std::string>& candidateTokens,
+    const std::vector<std::string>& queryTokens)
+{
+    if (candidateTokens.empty() || queryTokens.empty()) {
+        return false;
+    }
+
+    for (const auto& token : queryTokens) {
+        if (std::find(candidateTokens.begin(), candidateTokens.end(), token) == candidateTokens.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool weakTokenMatch_(
+    const std::string& candidate,
+    const std::string& selector)
+{
+    if (candidate.empty() || selector.empty()) {
+        return false;
+    }
+    if (candidate.size() < 4 || selector.size() < 4) {
+        return candidate == selector;
+    }
+    return candidate.find(selector) != std::string::npos ||
+        selector.find(candidate) != std::string::npos;
+}
+
+void appendUniqueCameraCandidate_(
+    nlohmann::json& list,
+    const nlohmann::json& camera)
+{
+    if (!list.is_array() || !camera.is_object()) {
+        return;
+    }
+
+    int candidateId = 0;
+    if (!tryJsonIntField_(camera, "id", candidateId) || candidateId <= 0) {
+        return;
+    }
+
+    for (const auto& existing : list) {
+        int existingId = 0;
+        if (tryJsonIntField_(existing, "id", existingId) && existingId == candidateId) {
+            return;
+        }
+    }
+
+    list.push_back(camera);
+}
+
+nlohmann::json mergeUniqueCameraCandidates_(
+    const nlohmann::json& first,
+    const nlohmann::json& second)
+{
+    nlohmann::json merged = nlohmann::json::array();
+    if (first.is_array()) {
+        for (const auto& camera : first) {
+            appendUniqueCameraCandidate_(merged, camera);
+        }
+    }
+    if (second.is_array()) {
+        for (const auto& camera : second) {
+            appendUniqueCameraCandidate_(merged, camera);
+        }
+    }
+    return merged;
+}
+
+std::vector<std::string> selectorSceneQueries_(const nlohmann::json& selector)
+{
+    std::vector<std::string> queries;
+    const std::vector<const char*> keys = {
+        "scene_label",
+        "scene_description",
+        "description",
+    };
+
+    for (const auto* key : keys) {
+        const std::string value = trimCopy_(jsonStringField_(selector, key));
+        if (value.empty()) {
+            continue;
+        }
+        if (std::find(queries.begin(), queries.end(), value) == queries.end()) {
+            queries.push_back(value);
+        }
+    }
+
+    return queries;
+}
+
+std::string cameraDescriptionPreview_(const nlohmann::json& camera)
+{
+    const std::string label = cameraSceneLabel_(camera);
+    if (!label.empty()) {
+        return shortenForDisplay_(humanizeSceneLabel_(label), 60);
+    }
+
+    const std::string body = cameraSceneDescription_(camera);
+    if (!body.empty()) {
+        return shortenForDisplay_(body, 80);
+    }
+
+    const std::string rawDescription = jsonStringField_(camera, "description");
+    if (rawDescription.empty()) {
+        return "";
+    }
+
+    return shortenForDisplay_(rawDescription, 80);
+}
+
+std::string normalizedDescriptionLabel_(const nlohmann::json& camera)
+{
+    return compactToken_(cameraSceneLabel_(camera));
+}
+
+std::string normalizedDescriptionText_(const nlohmann::json& camera)
+{
+    return compactToken_(sceneSearchText_(camera));
+}
+
+std::vector<std::string> descriptionSemanticTokens_(const nlohmann::json& camera)
+{
+    const std::string searchable = sceneSearchText_(camera);
+    if (searchable.empty()) {
+        return {};
+    }
+    return semanticTokens_(searchable);
+}
+
+std::string jsonStringField_(
+    const nlohmann::json& value,
     const char* key)
 {
     if (!value.is_object() || !value.contains(key) || !value[key].is_string()) {
@@ -373,6 +756,9 @@ nlohmann::json normalizeTargetSelector_(const nlohmann::json& value)
 
     const std::vector<const char*> stringFields = {
         "name",
+        "description",
+        "scene_label",
+        "scene_description",
         "ip_address",
         "manufacturer",
         "channel",
@@ -820,18 +1206,19 @@ nlohmann::json extractEditDraft_(
         "camera_patch contains only the NEW values the user wants to apply.\n"
         "If the user says 'change the IP of camera mibo to 192.168.0.22', then target_selector.name='mibo' and camera_patch.ip_address='192.168.0.22'.\n"
         "Do not put the new value inside target_selector unless the user explicitly uses the current value to identify the existing camera.\n"
+        "If the user identifies the camera by what it sees, by the location, or by scene cues like pool, garage, front gate, reception, backyard, or sidewalk, prefer target_selector.description for that clue.\n"
         "Use clear_fields for intentional removals like remove channel, clear subtype, clear description, or blank the street.\n"
         "Set open_form=true only when the user explicitly asks to open, review, inspect, or edit through the form/modal instead of applying directly.\n"
         "If the user says pronouns like 'ela', 'essa camera', or 'a mesma', only rely on the active edit_camera task when it already has a resolved target.\n"
         "Return JSON only with this shape:\n"
         "{"
-        "\"target_selector\":{\"id\":123,\"name\":\"mibo\",\"ip_address\":\"192.168.0.21\",\"manufacturer\":\"Intelbras\",\"channel\":\"1\",\"subtype\":\"0\",\"connection_method\":\"RTSP\"},"
+        "\"target_selector\":{\"id\":123,\"name\":\"mibo\",\"description\":\"pool area\",\"ip_address\":\"192.168.0.21\",\"manufacturer\":\"Intelbras\",\"channel\":\"1\",\"subtype\":\"0\",\"connection_method\":\"RTSP\"},"
         "\"camera_patch\":{\"ip_address\":\"192.168.0.22\",\"password\":\"nova_senha\",\"description\":\"Recepcao\"},"
         "\"field_sources\":{\"ip_address\":\"explicit_user\",\"password\":\"explicit_user\"},"
         "\"clear_fields\":[\"subtype\"],"
         "\"open_form\":false"
         "}\n"
-        "Valid target_selector fields are: id, name, ip_address, manufacturer, channel, subtype, connection_method.\n"
+        "Valid target_selector fields are: id, name, description, ip_address, manufacturer, channel, subtype, connection_method.\n"
         "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess, is_service_running.\n"
         "Valid field_sources values are explicit_user or implied_user.\n"
         "Valid clear_fields values are: ip_address, rtsp_port, manufacturer, username, password, channel, subtype, description, street, number, city, state, zip_code, country, webcam_index.\n"
@@ -844,7 +1231,9 @@ nlohmann::json extractEditDraft_(
         "user_message='remove o subtype da camera mibo' => "
         "{\"target_selector\":{\"name\":\"mibo\"},\"camera_patch\":{},\"field_sources\":{},\"clear_fields\":[\"subtype\"],\"open_form\":false}\n"
         "user_message='abre o formulario da camera mibo para eu revisar' => "
-        "{\"target_selector\":{\"name\":\"mibo\"},\"camera_patch\":{},\"field_sources\":{},\"clear_fields\":[],\"open_form\":true}\n";
+        "{\"target_selector\":{\"name\":\"mibo\"},\"camera_patch\":{},\"field_sources\":{},\"clear_fields\":[],\"open_form\":true}\n"
+        "user_message='edite a camera da piscina e mude o nome para Piscina Principal' => "
+        "{\"target_selector\":{\"description\":\"piscina\"},\"camera_patch\":{\"name\":\"Piscina Principal\"},\"field_sources\":{\"name\":\"explicit_user\"},\"clear_fields\":[],\"open_form\":false}\n";
 
     nlohmann::json promptPayload = {
         { "reply_language", replyLanguage },
@@ -1050,6 +1439,9 @@ nlohmann::json fetchCameraInventory_(
         nlohmann::json camera = {
             { "id", id },
             { "name", jsonStringField_(item, "name") },
+            { "description", jsonStringField_(item, "description") },
+            { "scene_label", jsonStringField_(item, "scene_label") },
+            { "scene_description", jsonStringField_(item, "scene_description") },
             { "ip_address", jsonStringField_(item, "ip_address") },
             { "manufacturer", jsonStringField_(item, "manufacturer") },
             { "connection_method", normalizeConnectionMethod_(jsonStringField_(item, "connection_method")) },
@@ -1170,6 +1562,9 @@ nlohmann::json buildResolvedCameraDraft_(
 
     const std::vector<const char*> fields = {
         "name",
+        "description",
+        "scene_label",
+        "scene_description",
         "ip_address",
         "manufacturer",
         "connection_method",
@@ -1248,9 +1643,9 @@ nlohmann::json resolveTargetCamera_(
     }
 
     const std::string selectorName = normalizedSelectorField_(targetSelector, "name");
+    nlohmann::json exactNameMatches = nlohmann::json::array();
+    nlohmann::json weakNameMatches = nlohmann::json::array();
     if (!selectorName.empty()) {
-        nlohmann::json exactMatches = nlohmann::json::array();
-        nlohmann::json weakMatches = nlohmann::json::array();
         for (const auto& camera : cameras) {
             if (!matchesSelectorFilters_(camera, targetSelector)) {
                 continue;
@@ -1260,31 +1655,114 @@ nlohmann::json resolveTargetCamera_(
                 continue;
             }
             if (candidateName == selectorName) {
-                exactMatches.push_back(camera);
+                appendUniqueCameraCandidate_(exactNameMatches, camera);
             }
             else if (candidateName.find(selectorName) != std::string::npos ||
                      selectorName.find(candidateName) != std::string::npos) {
-                weakMatches.push_back(camera);
+                appendUniqueCameraCandidate_(weakNameMatches, camera);
             }
         }
-        if (exactMatches.size() == 1) {
+        if (exactNameMatches.size() == 1) {
             result["status"] = "resolved";
-            result["camera"] = exactMatches[0];
+            result["camera"] = exactNameMatches[0];
             return result;
         }
-        if (exactMatches.size() > 1) {
+        if (exactNameMatches.size() > 1) {
             result["status"] = "ambiguous";
-            result["candidates"] = exactMatches;
+            result["candidates"] = exactNameMatches;
             return result;
         }
-        if (weakMatches.size() == 1) {
-            result["status"] = "ambiguous";
-            result["candidates"] = weakMatches;
+    }
+
+    std::vector<std::string> sceneQueries = selectorSceneQueries_(targetSelector);
+    bool usedNameAsSceneFallback = false;
+    if (sceneQueries.empty()) {
+        const std::string rawNameQuery = trimCopy_(jsonStringField_(targetSelector, "name"));
+        if (!rawNameQuery.empty()) {
+            sceneQueries.push_back(rawNameQuery);
+            usedNameAsSceneFallback = true;
+        }
+    }
+
+    if (!sceneQueries.empty()) {
+        nlohmann::json exactSceneMatches = nlohmann::json::array();
+        nlohmann::json semanticSceneMatches = nlohmann::json::array();
+
+        for (const auto& rawSceneQuery : sceneQueries) {
+            const std::string normalizedSceneQuery = compactToken_(rawSceneQuery);
+            const std::vector<std::string> sceneQueryTokens = semanticTokens_(rawSceneQuery);
+            if (normalizedSceneQuery.empty() && sceneQueryTokens.empty()) {
+                continue;
+            }
+
+            for (const auto& camera : cameras) {
+                if (!matchesSelectorFilters_(camera, targetSelector)) {
+                    continue;
+                }
+
+                const std::string candidateLabel = normalizedDescriptionLabel_(camera);
+                const std::string candidateDescription = normalizedDescriptionText_(camera);
+                if (!normalizedSceneQuery.empty() &&
+                    ((!candidateLabel.empty() && candidateLabel == normalizedSceneQuery) ||
+                     (!candidateDescription.empty() && candidateDescription == normalizedSceneQuery))) {
+                    appendUniqueCameraCandidate_(exactSceneMatches, camera);
+                    continue;
+                }
+
+                const std::vector<std::string> candidateTokens = descriptionSemanticTokens_(camera);
+                if (!sceneQueryTokens.empty() &&
+                    containsAllSemanticTokens_(candidateTokens, sceneQueryTokens)) {
+                    appendUniqueCameraCandidate_(semanticSceneMatches, camera);
+                    continue;
+                }
+
+                if (!normalizedSceneQuery.empty() &&
+                    weakTokenMatch_(candidateDescription, normalizedSceneQuery)) {
+                    appendUniqueCameraCandidate_(semanticSceneMatches, camera);
+                }
+            }
+        }
+
+        if (exactSceneMatches.size() == 1) {
+            result["status"] = "resolved";
+            result["camera"] = exactSceneMatches[0];
             return result;
         }
-        if (weakMatches.size() > 1) {
+        if (exactSceneMatches.size() > 1) {
             result["status"] = "ambiguous";
-            result["candidates"] = weakMatches;
+            result["candidates"] = exactSceneMatches;
+            return result;
+        }
+
+        if (semanticSceneMatches.size() == 1 && weakNameMatches.empty()) {
+            result["status"] = "resolved";
+            result["camera"] = semanticSceneMatches[0];
+            return result;
+        }
+
+        const nlohmann::json uncertainMatches =
+            mergeUniqueCameraCandidates_(semanticSceneMatches, weakNameMatches);
+        if (!uncertainMatches.empty()) {
+            result["status"] = "ambiguous";
+            result["candidates"] = uncertainMatches;
+            return result;
+        }
+
+        if (selectorName.empty() || !usedNameAsSceneFallback) {
+            result["status"] = "not_found";
+            return result;
+        }
+    }
+
+    if (!selectorName.empty()) {
+        if (weakNameMatches.size() == 1) {
+            result["status"] = "ambiguous";
+            result["candidates"] = weakNameMatches;
+            return result;
+        }
+        if (weakNameMatches.size() > 1) {
+            result["status"] = "ambiguous";
+            result["candidates"] = weakNameMatches;
             return result;
         }
         result["status"] = "not_found";
@@ -1316,6 +1794,7 @@ std::string cameraReferenceLine_(
     const std::string name = jsonStringField_(camera, "name");
     const std::string ip = jsonStringField_(camera, "ip_address");
     const std::string manufacturer = jsonStringField_(camera, "manufacturer");
+    const std::string descriptionPreview = cameraDescriptionPreview_(camera);
 
     std::ostringstream out;
     if (language == "pt") {
@@ -1329,6 +1808,9 @@ std::string cameraReferenceLine_(
         if (!manufacturer.empty()) {
             out << ", fabricante " << manufacturer;
         }
+        if (!descriptionPreview.empty()) {
+            out << ", cena " << descriptionPreview;
+        }
         return out.str();
     }
 
@@ -1341,6 +1823,9 @@ std::string cameraReferenceLine_(
     }
     if (!manufacturer.empty()) {
         out << ", manufacturer " << manufacturer;
+    }
+    if (!descriptionPreview.empty()) {
+        out << ", scene " << descriptionPreview;
     }
     return out.str();
 }
@@ -1358,13 +1843,13 @@ std::string buildNeedTargetAnswer_(
         if (cameras.empty()) {
             return "Nao encontrei cameras cadastradas para editar neste momento.";
         }
-        return "Antes de editar qualquer coisa, preciso que voce me diga qual camera devo alterar. Pode me responder com o nome exato, o ID ou o IP da camera.";
+        return "Antes de editar qualquer coisa, preciso que voce me diga qual camera devo alterar. Pode me responder com o nome exato, o ID, o IP ou uma descricao do local/cena da camera.";
     }
 
     if (cameras.empty()) {
         return "I could not find any registered cameras to edit right now.";
     }
-    return "Before I edit anything, I need you to tell me which camera should be changed. Reply with the exact name, ID, or IP.";
+    return "Before I edit anything, I need you to tell me which camera should be changed. Reply with the exact name, ID, IP, or a description of the camera scene/location.";
 }
 
 std::string buildAmbiguousTargetAnswer_(
@@ -1377,7 +1862,7 @@ std::string buildAmbiguousTargetAnswer_(
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             out << "\n" << cameraReferenceLine_(candidates[index], index, language);
         }
-        out << "\n\nPode me responder com o nome exato, o ID ou o IP.";
+        out << "\n\nPode me responder com o nome exato, o ID, o IP ou uma descricao mais especifica da cena/local.";
         return out.str();
     }
 
@@ -1385,7 +1870,7 @@ std::string buildAmbiguousTargetAnswer_(
     for (std::size_t index = 0; index < candidates.size(); ++index) {
         out << "\n" << cameraReferenceLine_(candidates[index], index, language);
     }
-    out << "\n\nReply with the exact name, ID, or IP.";
+    out << "\n\nReply with the exact name, ID, IP, or a more specific scene/location description.";
     return out.str();
 }
 
@@ -1394,23 +1879,45 @@ std::string buildCameraNotFoundAnswer_(
     const nlohmann::json& targetSelector)
 {
     const std::string name = jsonStringField_(targetSelector, "name");
+    std::string description = jsonStringField_(targetSelector, "description");
+    if (description.empty()) {
+        description = jsonStringField_(targetSelector, "scene_description");
+    }
+    if (description.empty()) {
+        description = jsonStringField_(targetSelector, "scene_label");
+    }
     const std::string ip = jsonStringField_(targetSelector, "ip_address");
     const int id = targetSelector.value("id", 0);
 
     if (language == "pt") {
-        if (!name.empty()) {
-            return "Nao encontrei uma camera cadastrada com esse nome agora. Me confirme o nome exato, o ID ou o IP da camera.";
-        }
         if (!ip.empty()) {
             return "Nao encontrei uma camera cadastrada com esse IP agora. Me confirme o nome exato, o ID ou o IP atual da camera.";
         }
         if (id > 0) {
             return "Nao encontrei uma camera cadastrada com esse ID agora. Me confirme o nome exato, o ID ou o IP da camera.";
         }
-        return "Nao consegui localizar com seguranca a camera que deve ser editada. Me confirme o nome exato, o ID ou o IP.";
+        if (!description.empty()) {
+            return "Nao encontrei uma camera cadastrada que combine com essa descricao agora. Me confirme o nome exato, o ID, o IP ou uma descricao mais especifica da cena/local.";
+        }
+        if (!name.empty()) {
+            return "Nao encontrei uma camera cadastrada com esse nome agora. Me confirme o nome exato, o ID ou o IP da camera.";
+        }
+        return "Nao consegui localizar com seguranca a camera que deve ser editada. Me confirme o nome exato, o ID, o IP ou uma descricao da cena/local.";
     }
 
-    return "I could not safely locate the camera that should be edited. Please confirm the exact name, ID, or IP.";
+    if (!ip.empty()) {
+        return "I could not find a registered camera with that IP right now. Please confirm the exact name, ID, or current IP of the camera.";
+    }
+    if (id > 0) {
+        return "I could not find a registered camera with that ID right now. Please confirm the exact name, ID, or IP of the camera.";
+    }
+    if (!description.empty()) {
+        return "I could not find a registered camera matching that description right now. Please confirm the exact name, ID, IP, or a more specific scene/location description.";
+    }
+    if (!name.empty()) {
+        return "I could not find a registered camera with that name right now. Please confirm the exact name, ID, or IP of the camera.";
+    }
+    return "I could not safely locate the camera that should be edited. Please confirm the exact name, ID, IP, or a scene/location description.";
 }
 
 std::string buildNeedPatchAnswer_(
@@ -1890,6 +2397,12 @@ SkillRunResult EditCameraSkill::execute(
 
     const nlohmann::json extractedDraft =
         extractEditDraft_(llm, payload, conversationContext, selection);
+    if (extractedDraft.contains("target_selector") &&
+        hasTargetSelector_(extractedDraft["target_selector"])) {
+        mergedDraft.erase("target_selector");
+        mergedDraft.erase("resolved_camera");
+        mergedDraft.erase("candidate_cameras");
+    }
     mergedDraft = mergeEditDrafts_(mergedDraft, extractedDraft);
 
     if (!mergedDraft.contains("target_selector") || !hasTargetSelector_(mergedDraft["target_selector"])) {

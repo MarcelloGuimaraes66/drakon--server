@@ -377,6 +377,7 @@ private:
     void workerLoop_();
     void processCommand_(const nlohmann::json& cmd);
     void handlePromptEnhanceCommand_(int commandId, const nlohmann::json& payload);
+    void handleAgentDesignCommand_(int commandId, const nlohmann::json& payload);
     void handleRefreshThumbnailCommand_(int commandId, const nlohmann::json& payload);
     void handleCameraImportPreviewCommand_(int commandId, const nlohmann::json& payload);
     void handleProbeWebcamsCommand_(int commandId, const nlohmann::json& payload);

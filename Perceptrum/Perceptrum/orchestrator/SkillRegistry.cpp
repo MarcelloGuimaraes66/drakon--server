@@ -4,7 +4,9 @@
 #include "skills/CreateCamerasBatchSkill.h"
 #include "skills/CreateCameraAgentSkill.h"
 #include "skills/CreateJobSkill.h"
+#include "skills/EditCameraAgentSkill.h"
 #include "skills/EditCameraSkill.h"
+#include "skills/EditCamerasBatchSkill.h"
 #include "skills/ExplainAppSkill.h"
 #include "skills/ReadStateSkill.h"
 #include "skills/ScanNetworkSkill.h"
@@ -19,8 +21,10 @@ SkillRegistry::SkillRegistry()
     registerSkill(std::make_unique<CreateCameraSkill>());
     registerSkill(std::make_unique<CreateCamerasBatchSkill>());
     registerSkill(std::make_unique<EditCameraSkill>());
+    registerSkill(std::make_unique<EditCamerasBatchSkill>());
     registerSkill(std::make_unique<CreateJobSkill>());
     registerSkill(std::make_unique<CreateCameraAgentSkill>());
+    registerSkill(std::make_unique<EditCameraAgentSkill>());
     registerSkill(std::make_unique<ReadStateSkill>());
     registerSkill(std::make_unique<ScanNetworkSkill>());
 }

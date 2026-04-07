@@ -137,6 +137,16 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Validando o lote e organizando a revisao final antes do cadastro.";
             }
         }
+        else if (skill == "edit_cameras_batch") {
+            if (phase == "routing" || phase == "resolving_scope") {
+                update.headline = "Localizando o lote de cameras";
+                update.detail = "Conferindo quais cameras entram nessa edicao em lote.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Preparando o preview";
+                update.detail = "Validando as alteracoes e organizando a revisao final antes da confirmacao.";
+            }
+        }
         else if (skill == "general_answer") {
             if (phase == "routing") {
                 update.headline = "Entendendo sua pergunta";
@@ -185,6 +195,14 @@ inline ChatProgressUpdate makeProgressUpdate(
             update.headline = "Estructurando el lote";
             update.detail = "Organizando las camaras y los valores compartidos antes del registro.";
         }
+        else if (skill == "edit_cameras_batch" && (phase == "routing" || phase == "resolving_scope")) {
+            update.headline = "Identificando el lote";
+            update.detail = "Revisando que camaras entran en esta edicion por lote.";
+        }
+        else if (skill == "edit_cameras_batch" && phase == "finalizing") {
+            update.headline = "Preparando la revision";
+            update.detail = "Validando los cambios antes de confirmar la edicion por lote.";
+        }
     }
     else if (lang == "fr") {
         if (phase == "routing") {
@@ -222,6 +240,14 @@ inline ChatProgressUpdate makeProgressUpdate(
         else if (skill == "create_cameras_batch" && phase == "extracting_batch") {
             update.headline = "Structuration du lot";
             update.detail = "Organisation des cameras et des valeurs partagees avant l'enregistrement.";
+        }
+        else if (skill == "edit_cameras_batch" && (phase == "routing" || phase == "resolving_scope")) {
+            update.headline = "Identification du lot";
+            update.detail = "Verification des cameras qui entrent dans cette modification en lot.";
+        }
+        else if (skill == "edit_cameras_batch" && phase == "finalizing") {
+            update.headline = "Preparation de la revision";
+            update.detail = "Validation des changements avant confirmation du lot.";
         }
     }
     else {
@@ -305,6 +331,16 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "finalizing") {
                 update.headline = "Preparing the preview";
                 update.detail = "Validating the batch and organizing the final review before registration.";
+            }
+        }
+        else if (skill == "edit_cameras_batch") {
+            if (phase == "routing" || phase == "resolving_scope") {
+                update.headline = "Resolving the camera batch";
+                update.detail = "Checking which cameras belong in this batch edit.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Preparing the preview";
+                update.detail = "Validating the requested changes and preparing the final review before confirmation.";
             }
         }
         else if (skill == "general_answer") {

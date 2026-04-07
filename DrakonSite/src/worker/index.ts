@@ -38,6 +38,12 @@ import type {
   CameraImportCandidate,
   CameraImportPreview,
 } from "@/shared/cameraImport";
+import type {
+  CameraBatchEditApplyResult,
+  CameraBatchEditChange,
+  CameraBatchEditPreview,
+  CameraBatchEditPreviewTarget,
+} from "@/shared/cameraBatchEdit";
 import {
   BRAZIL_STATE_NAME_BY_CODE,
   normalizeBrazilStateCode,
@@ -9174,6 +9180,16 @@ type ChatCameraBatchRegistrationMetadata = {
   apply_result?: CameraImportApplyResult | null;
 };
 
+type ChatCameraBatchEditMetadata = {
+  type: "camera_batch_edit_draft";
+  status: "awaiting_confirmation" | "updated";
+  language: string;
+  preview: CameraBatchEditPreview;
+  patch_body: Record<string, unknown>;
+  target_client_id: string | null;
+  apply_result?: CameraBatchEditApplyResult | null;
+};
+
 function normalizeChatCameraRegistrationMetadata(
   value: unknown
 ): ChatCameraRegistrationMetadata | null {
@@ -9252,6 +9268,50 @@ function normalizeChatCameraBatchRegistrationMetadata(
     target_client_id: targetClientId,
     expected_count:
       Number.isInteger(expectedCount) && expectedCount > 0 ? expectedCount : null,
+    apply_result: applyResult,
+  };
+}
+
+function normalizeChatCameraBatchEditMetadata(
+  value: unknown
+): ChatCameraBatchEditMetadata | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  if (source.type !== "camera_batch_edit_draft") {
+    return null;
+  }
+
+  const preview =
+    source.preview && typeof source.preview === "object" && !Array.isArray(source.preview)
+      ? (source.preview as CameraBatchEditPreview)
+      : null;
+  const patchBody =
+    source.patch_body && typeof source.patch_body === "object" && !Array.isArray(source.patch_body)
+      ? (source.patch_body as Record<string, unknown>)
+      : null;
+  if (!preview || !patchBody) {
+    return null;
+  }
+
+  const targetClientId =
+    typeof source.target_client_id === "string" && source.target_client_id.trim()
+      ? source.target_client_id.trim()
+      : null;
+  const applyResult =
+    source.apply_result && typeof source.apply_result === "object" && !Array.isArray(source.apply_result)
+      ? (source.apply_result as CameraBatchEditApplyResult)
+      : null;
+
+  return {
+    type: "camera_batch_edit_draft",
+    status: source.status === "updated" ? "updated" : "awaiting_confirmation",
+    language: normalizeSupportedChatLanguage(source.language, "en"),
+    preview,
+    patch_body: patchBody,
+    target_client_id: targetClientId,
     apply_result: applyResult,
   };
 }
@@ -9429,6 +9489,17 @@ function buildChatCameraBatchRegisteredMetadata(
   };
 }
 
+function buildChatCameraBatchEditUpdatedMetadata(
+  metadata: ChatCameraBatchEditMetadata,
+  applyResult: CameraBatchEditApplyResult
+): ChatCameraBatchEditMetadata {
+  return {
+    ...metadata,
+    status: "updated",
+    apply_result: applyResult,
+  };
+}
+
 function buildChatCameraBatchRegistrationSuccessMessage(
   languageInput: unknown,
   metadata: ChatCameraBatchRegistrationMetadata,
@@ -9465,6 +9536,44 @@ function buildChatCameraBatchRegistrationSuccessMessage(
           .join("\n")}`
       : "";
   return `Batch completed.\nCameras created: ${createdCount} of ${readyCount}.${skippedCount > 0 ? `\nSkipped items: ${skippedCount}.` : ""}${failedLines}\nIf you want, I can now help you start those cameras or create agents on them.`;
+}
+
+function buildChatCameraBatchEditSuccessMessage(
+  languageInput: unknown,
+  metadata: ChatCameraBatchEditMetadata,
+  applyResult: CameraBatchEditApplyResult & {
+    failed_targets?: Array<{
+      camera_id: number;
+      camera_name?: string | null;
+      reason: string;
+    }>;
+  }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const readyCount = Number(metadata.preview?.ready_count || 0);
+  const updatedCount = Number(applyResult.updated_count || 0);
+  const skippedCount = Number(applyResult.skipped_count || 0);
+  const failedTargets = Array.isArray(applyResult.failed_targets)
+    ? applyResult.failed_targets.slice(0, 5)
+    : [];
+
+  if (language === "pt") {
+    const failedLines =
+      failedTargets.length > 0
+        ? `\nFalhas:\n${failedTargets
+            .map((target) => `- ${target.camera_name || `Camera ${target.camera_id}`}: ${target.reason}`)
+            .join("\n")}`
+        : "";
+    return `Edicao em lote concluida.\nCameras atualizadas: ${updatedCount} de ${readyCount}.${skippedCount > 0 ? `\nItens pulados: ${skippedCount}.` : ""}${failedLines}\nSe quiser, posso te ajudar a revisar as cameras atualizadas ou seguir para a criacao de agentes.`;
+  }
+
+  const failedLines =
+    failedTargets.length > 0
+      ? `\nFailures:\n${failedTargets
+          .map((target) => `- ${target.camera_name || `Camera ${target.camera_id}`}: ${target.reason}`)
+          .join("\n")}`
+      : "";
+  return `Batch edit completed.\nCameras updated: ${updatedCount} of ${readyCount}.${skippedCount > 0 ? `\nSkipped items: ${skippedCount}.` : ""}${failedLines}\nIf you want, I can help you review the updated cameras or continue with agent creation.`;
 }
 
 function buildChatCreateCameraBatchCompletedTaskState(
@@ -9516,6 +9625,59 @@ function buildChatCreateCameraBatchCompletedTaskState(
     session_entities: {
       ...existingSessionEntities,
       last_camera_batch_count: createdCount,
+    },
+  };
+}
+
+function buildChatEditCameraBatchCompletedTaskState(
+  taskState: ReturnType<typeof normalizeChatTaskState>,
+  metadata: ChatCameraBatchEditMetadata,
+  applyResult: CameraBatchEditApplyResult
+) {
+  const language = normalizeSupportedChatLanguage(metadata.language, "en");
+  const updatedCount = Number(applyResult.updated_count || 0);
+  const existingRecent = Array.isArray(taskState.recent_tasks)
+    ? taskState.recent_tasks.filter((item) => item && typeof item === "object").slice(0, 3)
+    : [];
+  const existingSessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+
+  const recentTask = {
+    type: "edit_cameras_batch",
+    entity_type: "camera",
+    intent: "update",
+    status: "completed",
+    phase: "updated",
+    language,
+    reply_language: language,
+    goal:
+      language === "pt"
+        ? "editar varias cameras"
+        : "edit multiple cameras",
+    summary:
+      language === "pt"
+        ? `Lote concluido com ${updatedCount} camera(s) atualizada(s)`
+        : `Batch completed with ${updatedCount} camera(s) updated`,
+    missing_fields: [],
+    collected_fields: ["camera_ids", "camera_patch"],
+    draft: {
+      matched_count: metadata.preview?.total_matched ?? 0,
+      updated_count: updatedCount,
+      updated_camera_ids: Array.isArray(applyResult.updated_camera_ids)
+        ? applyResult.updated_camera_ids
+        : [],
+    },
+  };
+
+  return {
+    version: 2,
+    active_task: null,
+    recent_tasks: [recentTask, ...existingRecent],
+    session_entities: {
+      ...existingSessionEntities,
+      last_camera_batch_edit_count: updatedCount,
     },
   };
 }
@@ -12689,6 +12851,27 @@ function normalizeStructuredCameraDescription(value: unknown): string | null {
   return `LABEL: ${parsed.label} DESCRIPTION: ${parsed.description}`;
 }
 
+function splitAgentSceneParts(value: unknown): {
+  raw_description: string;
+  scene_label: string;
+  scene_description: string;
+} {
+  const rawDescription = typeof value === "string" ? value.trim() : "";
+  const parsed = parseStructuredCameraDescription(value);
+  if (parsed) {
+    return {
+      raw_description: rawDescription,
+      scene_label: parsed.label,
+      scene_description: parsed.description,
+    };
+  }
+  return {
+    raw_description: rawDescription,
+    scene_label: "",
+    scene_description: rawDescription,
+  };
+}
+
 function validateRequiredRtspCameraFields(data: any): string[] {
   const missing: string[] = [];
   if (!normalizeOptionalCameraField(data?.rtsp_port)) missing.push("rtsp_port");
@@ -12697,6 +12880,40 @@ function validateRequiredRtspCameraFields(data: any): string[] {
   if (!normalizeOptionalCameraField(data?.username)) missing.push("username");
   if (!normalizeOptionalCameraField(data?.password)) missing.push("password");
   return missing;
+}
+
+const CAMERA_RTSP_TRANSPORT_FIELDS = new Set([
+  "connection_method",
+  "ip_address",
+  "rtsp_port",
+  "manufacturer",
+  "username",
+  "password",
+  "channel",
+  "subtype",
+]);
+
+function shouldValidateRtspCompletenessForPatch(
+  patchBody: Record<string, unknown> | null | undefined
+): boolean {
+  if (!patchBody || typeof patchBody !== "object") {
+    return false;
+  }
+
+  const requestedConnectionMethod =
+    typeof patchBody.connection_method === "string"
+      ? patchBody.connection_method.trim().toUpperCase()
+      : null;
+
+  if (requestedConnectionMethod === "WEBCAM") {
+    return false;
+  }
+
+  if (requestedConnectionMethod) {
+    return true;
+  }
+
+  return Object.keys(patchBody).some((field) => CAMERA_RTSP_TRANSPORT_FIELDS.has(field));
 }
 
 type CameraInsertPayload = {
@@ -12898,6 +13115,7 @@ async function updateCameraForUser(
   options?: {
     targetClientId?: string | null;
     targetExeId?: string | null;
+    rtspValidationMode?: "always" | "transport_only";
   }
 ) {
   const camera = await getCameraForUser(db, userId, cameraId);
@@ -12917,7 +13135,12 @@ async function updateCameraForUser(
     data.country_code ?? existingCam.country_code
   );
 
-  if (effectiveConnectionMethod !== "WEBCAM") {
+  const shouldValidateRtspCompleteness =
+    options?.rtspValidationMode === "transport_only"
+      ? shouldValidateRtspCompletenessForPatch(data)
+      : true;
+
+  if (effectiveConnectionMethod !== "WEBCAM" && shouldValidateRtspCompleteness) {
     const mergedRtspValues = {
       rtsp_port: data.rtsp_port ?? existingCam.rtsp_port,
       manufacturer: data.manufacturer ?? existingCam.manufacturer,
@@ -13069,6 +13292,483 @@ async function updateCameraForUser(
     .run();
 
   return updatedCamera;
+}
+
+type CameraBatchEditApplyFailure = {
+  camera_id: number;
+  camera_name?: string | null;
+  reason: string;
+};
+
+const CHAT_CAMERA_BATCH_EDIT_CLEARABLE_FIELDS = new Set([
+  "ip_address",
+  "rtsp_port",
+  "manufacturer",
+  "username",
+  "password",
+  "channel",
+  "subtype",
+  "description",
+  "street",
+  "number",
+  "city",
+  "state",
+  "zip_code",
+  "country",
+  "webcam_index",
+]);
+
+function normalizeChatBatchEditConnectionMethod(
+  value: unknown
+): CameraBatchEditPreviewTarget["connection_method"] {
+  const normalized = normalizeChatBatchCameraText(value).toUpperCase();
+  if (
+    normalized === "RTSP" ||
+    normalized === "WEBCAM" ||
+    normalized === "HTTP" ||
+    normalized === "ONVIF"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function normalizeChatCameraBatchEditClearFields(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const fields: string[] = [];
+  value.forEach((entry) => {
+    const field = normalizeChatBatchCameraText(entry);
+    if (!field || !CHAT_CAMERA_BATCH_EDIT_CLEARABLE_FIELDS.has(field)) {
+      return;
+    }
+    if (!fields.includes(field)) {
+      fields.push(field);
+    }
+  });
+  return fields;
+}
+
+function buildChatCameraBatchEditPatchBody(
+  patch: Record<string, unknown>,
+  clearFields: string[]
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ...patch,
+  };
+
+  clearFields.forEach((field) => {
+    body[field] = field === "webcam_index" ? null : "";
+  });
+
+  return body;
+}
+
+async function enrichChatCameraBatchEditPatchBody(
+  env: Env,
+  userCountryCode: string,
+  patchBody: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const enriched: Record<string, unknown> = {
+    ...patchBody,
+  };
+
+  const zipCode = normalizeOptionalCameraField(enriched.zip_code);
+  if (!zipCode) {
+    return enriched;
+  }
+
+  let effectiveCountryCode =
+    normalizeCountryCode(enriched.country_code || enriched.country, null) || userCountryCode || null;
+  if (!effectiveCountryCode) {
+    const digitsOnly = zipCode.replace(/\D+/g, "");
+    if (digitsOnly.length === 8) {
+      effectiveCountryCode = "BR";
+    }
+  }
+
+  if (!normalizeOptionalCameraField(enriched.country) && effectiveCountryCode) {
+    enriched.country = resolveCountryDisplayName(effectiveCountryCode) || "";
+  }
+  if (!normalizeOptionalCameraField(enriched.country_code) && effectiveCountryCode) {
+    enriched.country_code = effectiveCountryCode;
+  }
+
+  const missingAddressFields = ["street", "city", "state", "country"].some(
+    (field) => !normalizeOptionalCameraField(enriched[field])
+  );
+  if (!missingAddressFields || !effectiveCountryCode) {
+    return enriched;
+  }
+
+  const normalizedPostalCode = normalizePostalCodeForLookup(zipCode, effectiveCountryCode);
+  if (!normalizedPostalCode) {
+    return enriched;
+  }
+
+  try {
+    const result = await lookupAddressByPostalCode(
+      env,
+      normalizedPostalCode,
+      effectiveCountryCode
+    );
+    if (result.found) {
+      enriched.zip_code = result.postal_code || enriched.zip_code || "";
+      enriched.street = result.street || enriched.street || "";
+      enriched.city = result.city || enriched.city || "";
+      enriched.state = result.state || enriched.state || "";
+      enriched.country =
+        result.country ||
+        enriched.country ||
+        resolveCountryDisplayName(effectiveCountryCode) ||
+        "";
+      enriched.country_code =
+        result.country_code || enriched.country_code || effectiveCountryCode;
+    }
+  } catch (error) {
+    console.error("[CHAT CAMERA BATCH EDIT] Address lookup failed while building preview:", error);
+  }
+
+  return enriched;
+}
+
+function buildChatCameraBatchEditChanges(
+  patchBody: Record<string, unknown>
+): CameraBatchEditChange[] {
+  return Object.entries(patchBody)
+    .filter(([field]) => field !== "country_code")
+    .map(([field, value]) => ({
+      field,
+      mode:
+        (value === "" && CHAT_CAMERA_BATCH_EDIT_CLEARABLE_FIELDS.has(field)) ||
+        (value === null && field === "webcam_index")
+          ? "clear"
+          : "set",
+      value:
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        value === null
+          ? value
+          : null,
+    }));
+}
+
+function buildChatCameraBatchEditValidationErrors(
+  camera: Record<string, unknown>,
+  patchBody: Record<string, unknown>
+): string[] {
+  const requestedConnectionMethod =
+    typeof patchBody.connection_method === "string" ? patchBody.connection_method : null;
+  const effectiveConnectionMethod =
+    requestedConnectionMethod ||
+    normalizeOptionalCameraField(camera.connection_method) ||
+    "RTSP";
+
+  if (effectiveConnectionMethod === "WEBCAM") {
+    return [];
+  }
+
+  if (!shouldValidateRtspCompletenessForPatch(patchBody)) {
+    return [];
+  }
+
+  const mergedRtspValues = {
+    rtsp_port: patchBody.rtsp_port ?? camera.rtsp_port,
+    manufacturer: patchBody.manufacturer ?? camera.manufacturer,
+    username: patchBody.username ?? camera.username,
+    password: patchBody.password ?? camera.password,
+    connection_method: effectiveConnectionMethod,
+  };
+  const missingRtspFields = validateRequiredRtspCameraFields(mergedRtspValues);
+  if (missingRtspFields.length > 0) {
+    return [`Missing required RTSP fields: ${missingRtspFields.join(", ")}`];
+  }
+
+  return [];
+}
+
+function buildChatCameraBatchEditChangedFields(
+  camera: Record<string, unknown>,
+  patchBody: Record<string, unknown>
+): string[] {
+  const changedFields: string[] = [];
+  const normalizedGeo = normalizeCameraGeography(
+    patchBody.state ?? camera.state,
+    patchBody.country ?? camera.country,
+    patchBody.country_code ?? camera.country_code
+  );
+
+  Object.entries(patchBody).forEach(([field, value]) => {
+    if (field === "country_code") {
+      const currentCountryCode = normalizeCountryCode(camera.country_code, null) || "";
+      if ((normalizedGeo.countryCode || "") !== currentCountryCode) {
+        changedFields.push(field);
+      }
+      return;
+    }
+
+    let nextValue: unknown = value;
+    let currentValue: unknown = camera[field];
+
+    if (field === "ip_address") {
+      nextValue = normalizeCameraTransportField(value) ?? "";
+      currentValue = normalizeCameraTransportField(camera.ip_address) ?? "";
+    } else if (field === "name") {
+      let normalizedName = typeof value === "string" ? value.trim() : "";
+      if (
+        normalizeChatBatchEditConnectionMethod(camera.connection_method) === "WEBCAM" &&
+        normalizedName &&
+        !normalizedName.toLowerCase().startsWith("webcam ")
+      ) {
+        normalizedName = `Webcam ${normalizedName}`;
+      }
+      nextValue = normalizedName;
+      currentValue = normalizeOptionalCameraField(camera.name) || "";
+    } else if (
+      field === "rtsp_port" ||
+      field === "manufacturer" ||
+      field === "username" ||
+      field === "password" ||
+      field === "channel" ||
+      field === "subtype" ||
+      field === "street" ||
+      field === "number" ||
+      field === "city" ||
+      field === "zip_code" ||
+      field === "country"
+    ) {
+      nextValue = normalizeOptionalCameraField(value) || "";
+      currentValue = normalizeOptionalCameraField(camera[field]) || "";
+    } else if (field === "state") {
+      nextValue = normalizedGeo.stateText || "";
+      currentValue = normalizeOptionalCameraField(camera.state) || "";
+    } else if (field === "connection_method") {
+      nextValue = normalizeChatBatchEditConnectionMethod(value) || "RTSP";
+      currentValue = normalizeChatBatchEditConnectionMethod(camera.connection_method) || "RTSP";
+    } else if (field === "description") {
+      const normalizedStructuredDescription = normalizeStructuredCameraDescription(value);
+      nextValue =
+        normalizedStructuredDescription ??
+        (typeof value === "string" ? value.trim() : "");
+      currentValue = typeof camera.description === "string" ? camera.description : "";
+    } else if (field === "retention_days") {
+      const validRetentionDays = [1, 3, 7, 15, 30, 90, 180];
+      const requestedRetention = Number(value);
+      nextValue = validRetentionDays.includes(requestedRetention) ? requestedRetention : 1;
+      currentValue = Number(camera.retention_days || 0);
+    } else if (field === "allowpublicaccess") {
+      nextValue = value ? 1 : 0;
+      currentValue = Number(camera.allowpublicaccess || 0);
+    } else if (field === "is_service_running") {
+      nextValue = Number(value || 0) > 0 ? 1 : 0;
+      currentValue = Number(camera.is_service_running || 0);
+    } else if (field === "webcam_index") {
+      if (value === null) {
+        return;
+      }
+      nextValue = Number(value);
+      currentValue =
+        camera.webcam_index === null || camera.webcam_index === undefined
+          ? null
+          : Number(camera.webcam_index);
+    }
+
+    if (nextValue !== currentValue) {
+      changedFields.push(field);
+    }
+  });
+
+  return Array.from(new Set(changedFields));
+}
+
+async function buildChatCameraBatchEditPreview(
+  env: Env,
+  userId: string,
+  input: {
+    camera_ids?: unknown;
+    patch_body?: unknown;
+    language?: unknown;
+  }
+): Promise<CameraBatchEditPreview> {
+  const language = normalizeSupportedChatLanguage(input.language, "en");
+  const isPt = language === "pt";
+  const rawCameraIds = Array.isArray(input.camera_ids) ? input.camera_ids : [];
+  const cameraIds = Array.from(
+    new Set(
+      rawCameraIds
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  ).slice(0, 100);
+
+  const patchBody =
+    input.patch_body && typeof input.patch_body === "object" && !Array.isArray(input.patch_body)
+      ? ({ ...(input.patch_body as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+
+  if (cameraIds.length === 0) {
+    return {
+      total_matched: 0,
+      ready_count: 0,
+      blocked_count: 0,
+      unchanged_count: 0,
+      changes: buildChatCameraBatchEditChanges(patchBody),
+      global_warnings: [
+        isPt
+          ? "Nenhuma camera foi selecionada para este preview de edicao em lote."
+          : "No cameras were selected for this batch edit preview.",
+      ],
+      targets: [],
+    };
+  }
+
+  const placeholders = cameraIds.map(() => "?").join(", ");
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, description, ip_address, manufacturer, connection_method, channel, subtype,
+            username, password, rtsp_port, retention_days, allowpublicaccess, is_service_running,
+            webcam_index, state, country, country_code
+       FROM cameras
+      WHERE user_id = ? AND id IN (${placeholders})`
+  )
+    .bind(userId, ...cameraIds)
+    .all();
+
+  const cameraRows = Array.isArray(results) ? results : [];
+  const cameraById = new Map<number, Record<string, unknown>>();
+  cameraRows.forEach((row) => {
+    const cameraId = Number((row as any)?.id || 0);
+    if (cameraId > 0) {
+      cameraById.set(cameraId, row as Record<string, unknown>);
+    }
+  });
+
+  const globalWarnings: string[] = [];
+  if (cameraRows.length < cameraIds.length) {
+    globalWarnings.push(
+      isPt
+        ? "Algumas cameras deste lote nao estao mais disponiveis."
+        : "Some cameras from the requested batch are no longer available."
+    );
+  }
+
+  const targets = cameraIds
+    .map((cameraId) => {
+      const camera = cameraById.get(cameraId);
+      if (!camera) {
+        return null;
+      }
+
+      const changedFields = buildChatCameraBatchEditChangedFields(camera, patchBody);
+      const validationErrors = buildChatCameraBatchEditValidationErrors(camera, patchBody);
+      const status: CameraBatchEditPreviewTarget["status"] =
+        validationErrors.length > 0
+          ? "blocked"
+          : changedFields.length > 0
+            ? "ready"
+            : "no_change";
+
+      const warnings =
+        status === "no_change"
+          ? [
+              isPt
+                ? "Esta camera ja esta com os valores pedidos."
+                : "This camera already matches the requested values.",
+            ]
+          : validationErrors;
+
+      return {
+        camera_id: cameraId,
+        camera_name: normalizeOptionalCameraField(camera.name) || `Camera ${cameraId}`,
+        ip_address: normalizeOptionalCameraField(camera.ip_address),
+        description: normalizeOptionalCameraField(camera.description),
+        manufacturer: normalizeOptionalCameraField(camera.manufacturer),
+        connection_method: normalizeChatBatchEditConnectionMethod(camera.connection_method),
+        status,
+        changed_fields: changedFields,
+        warnings,
+      };
+    })
+    .filter((target): target is NonNullable<typeof target> => target !== null);
+
+  const readyCount = targets.filter((target) => target.status === "ready").length;
+  const blockedCount = targets.filter((target) => target.status === "blocked").length;
+  const unchangedCount = targets.filter((target) => target.status === "no_change").length;
+
+  if (readyCount === 0 && blockedCount === 0) {
+    globalWarnings.push(
+      isPt
+        ? "Todas as cameras encontradas ja estao com os valores pedidos."
+        : "Every matched camera already has the requested values."
+    );
+  }
+
+  return {
+    total_matched: targets.length,
+    ready_count: readyCount,
+    blocked_count: blockedCount,
+    unchanged_count: unchangedCount,
+    changes: buildChatCameraBatchEditChanges(patchBody),
+    global_warnings: Array.from(new Set(globalWarnings)),
+    targets,
+  };
+}
+
+async function applyChatCameraBatchEditPreviewForUser(
+  db: D1Database,
+  userId: string,
+  preview: CameraBatchEditPreview,
+  patchBody: Record<string, unknown>,
+  options?: {
+    targetClientId?: string | null;
+    targetExeId?: string | null;
+  }
+): Promise<
+  CameraBatchEditApplyResult & {
+    failed_targets: CameraBatchEditApplyFailure[];
+  }
+> {
+  const readyTargets = (Array.isArray(preview.targets) ? preview.targets : []).filter(
+    (target) => target.status === "ready"
+  );
+  const updatedCameraIds: number[] = [];
+  const failedTargets: CameraBatchEditApplyFailure[] = [];
+
+  for (const target of readyTargets) {
+    try {
+      const updated = await updateCameraForUser(
+        db,
+        userId,
+        target.camera_id,
+        patchBody,
+        {
+          targetClientId: options?.targetClientId || null,
+          targetExeId: options?.targetExeId || null,
+          rtspValidationMode: "transport_only",
+        }
+      );
+      const updatedId = Number((updated as any)?.id || 0);
+      if (Number.isInteger(updatedId) && updatedId > 0) {
+        updatedCameraIds.push(updatedId);
+      }
+    } catch (error) {
+      failedTargets.push({
+        camera_id: target.camera_id,
+        camera_name: target.camera_name || null,
+        reason: error instanceof Error ? error.message : "Failed to update camera",
+      });
+    }
+  }
+
+  return {
+    applied_at: new Date().toISOString(),
+    updated_count: updatedCameraIds.length,
+    skipped_count: Math.max(0, Number(preview.total_matched || 0) - updatedCameraIds.length),
+    updated_camera_ids: updatedCameraIds,
+    failed_targets: failedTargets,
+  };
 }
 
 type CameraImportApplyFailure = {
@@ -13952,6 +14652,357 @@ async function resolveAgentPairingForClient(
     userId: String(pairingRow.user_id || ""),
     clientId: String(pairingRow.client_id || clientId),
     exeId: String(pairingRow.exe_id || "unknown_exe"),
+  };
+}
+
+function normalizeAgentDesignText(value: unknown, maxLength: number): string {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, Math.max(0, maxLength));
+}
+
+function normalizeAgentDesignPatch(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const row = value as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+
+  const stringFields = [
+    "display_name",
+    "prompt_template",
+    "alert_condition",
+    "negative_condition",
+    "input_type",
+    "video_packaging_mode",
+    "inference_model",
+  ] as const;
+  for (const field of stringFields) {
+    const normalized = normalizeAgentDesignText(row[field], 4000);
+    if (normalized) {
+      patch[field] = normalized;
+    }
+  }
+
+  const numericFields = [
+    "model_fps",
+    "run_every",
+    "running_resolution",
+  ] as const;
+  for (const field of numericFields) {
+    const numeric = Number(row[field]);
+    if (Number.isFinite(numeric)) {
+      patch[field] = numeric;
+    }
+  }
+
+  const booleanFields = [
+    "only_capture_on_motion",
+    "use_temporal_context",
+    "is_enabled",
+  ] as const;
+  for (const field of booleanFields) {
+    if (row[field] === undefined) continue;
+    patch[field] = normalizeJobStepOnlyCaptureOnMotion(row[field], true);
+  }
+
+  if (Array.isArray(row.analysis_regions)) {
+    patch.analysis_regions = row.analysis_regions;
+  }
+
+  return patch;
+}
+
+async function validateFaceTargetIdsForUser(
+  db: D1Database,
+  userId: string,
+  requestedFaceTargetIds: number[]
+): Promise<string | null> {
+  if (!requestedFaceTargetIds.length) {
+    return null;
+  }
+
+  const placeholders = requestedFaceTargetIds.map(() => "?").join(", ");
+  const { results: rows } = await db
+    .prepare(
+      `SELECT ft.id, COUNT(fti.id) AS image_count
+       FROM face_targets ft
+       LEFT JOIN face_target_images fti ON fti.face_target_id = ft.id
+       WHERE ft.user_id = ?
+         AND ft.id IN (${placeholders})
+       GROUP BY ft.id`
+    )
+    .bind(userId, ...requestedFaceTargetIds)
+    .all();
+
+  const validated = new Map<number, number>();
+  for (const row of rows || []) {
+    const id = Number((row as any)?.id);
+    const imageCount = Number((row as any)?.image_count || 0);
+    if (!Number.isInteger(id) || id <= 0) continue;
+    validated.set(id, imageCount);
+  }
+
+  const missing = requestedFaceTargetIds.filter((id) => !validated.has(id));
+  if (missing.length > 0) {
+    return "Some selected face targets are invalid";
+  }
+
+  const withoutImages = requestedFaceTargetIds.filter((id) => (validated.get(id) || 0) <= 0);
+  if (withoutImages.length > 0) {
+    return "All selected face targets must have at least one image";
+  }
+
+  return null;
+}
+
+async function listAgentJobStepsForUser(
+  db: D1Database,
+  userId: string
+): Promise<
+  Array<{
+    id: number;
+    job_id: number;
+    job_name: string;
+    title: string;
+    prompt: string;
+    step_order: number;
+    target_count: number;
+    }>
+> {
+  let results: any[] | undefined;
+  try {
+    const modern = await db
+      .prepare(
+        `SELECT
+           js.id,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.title, '') AS title,
+           COALESCE(js.prompt, '') AS prompt,
+           COALESCE(js.step_order, 0) AS step_order,
+           COUNT(jst.id) AS target_count
+         FROM job_steps js
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN job_step_targets jst ON jst.step_id = js.id
+         WHERE j.user_id = ?
+         GROUP BY js.id, js.job_id, j.name, js.title, js.prompt, js.step_order
+         ORDER BY j.created_at ASC, js.step_order ASC, js.id ASC`
+      )
+      .bind(userId)
+      .all();
+    results = modern.results;
+  } catch {
+    const legacy = await db
+      .prepare(
+        `SELECT
+           js.id,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.name, '') AS title,
+           '' AS prompt,
+           COALESCE(js.step_order, 0) AS step_order,
+           COUNT(jst.id) AS target_count
+         FROM job_steps js
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN job_step_targets jst ON jst.step_id = js.id
+         WHERE j.user_id = ?
+         GROUP BY js.id, js.job_id, j.name, js.name, js.step_order
+         ORDER BY j.created_at ASC, js.step_order ASC, js.id ASC`
+      )
+      .bind(userId)
+      .all();
+    results = legacy.results;
+  }
+
+  return (results || []).map((row: any) => ({
+    id: Number(row?.id || 0),
+    job_id: Number(row?.job_id || 0),
+    job_name: String(row?.job_name || ""),
+    title: String(row?.title || ""),
+    prompt: String(row?.prompt || ""),
+    step_order: Number(row?.step_order || 0),
+    target_count: Number(row?.target_count || 0),
+  }));
+}
+
+async function listAgentJobStepTargetsForUser(
+  db: D1Database,
+  userId: string,
+  stepId: number
+): Promise<
+  | {
+      step: {
+        id: number;
+        job_id: number;
+        job_name: string;
+        title: string;
+        prompt: string;
+      };
+      targets: Array<{
+        id: number;
+        camera_id: number;
+        camera_name: string;
+        slot_key: string | null;
+        slot_label: string | null;
+        input_type: string;
+      }>;
+    }
+  | null
+> {
+  let step: any = null;
+  try {
+    step = await db
+      .prepare(
+        `SELECT
+           js.id,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.title, '') AS title,
+           COALESCE(js.prompt, '') AS prompt
+         FROM job_steps js
+         JOIN jobs j ON js.job_id = j.id
+         WHERE js.id = ? AND j.user_id = ?
+         LIMIT 1`
+      )
+      .bind(stepId, userId)
+      .first();
+  } catch {
+    step = await db
+      .prepare(
+        `SELECT
+           js.id,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.name, '') AS title,
+           '' AS prompt
+         FROM job_steps js
+         JOIN jobs j ON js.job_id = j.id
+         WHERE js.id = ? AND j.user_id = ?
+         LIMIT 1`
+      )
+      .bind(stepId, userId)
+      .first();
+  }
+  if (!step) {
+    return null;
+  }
+
+  let results: any[] | undefined;
+  try {
+    const modern = await db
+      .prepare(
+        `SELECT
+           jst.id,
+           jst.camera_id,
+           jst.slot_key,
+           jst.slot_label,
+           COALESCE(c.name, jst.slot_label, '') AS camera_name,
+           COALESCE(c.description, '') AS camera_description,
+           COALESCE(jsa.input_type, 'video') AS input_type
+         FROM job_step_targets jst
+         LEFT JOIN cameras c ON c.id = jst.camera_id
+         LEFT JOIN job_step_agents jsa
+           ON jsa.step_id = jst.step_id
+          AND jsa.camera_id = jst.camera_id
+          AND jsa.is_active = 1
+         WHERE jst.step_id = ?
+         ORDER BY jst.id ASC`
+      )
+      .bind(stepId)
+      .all();
+    results = modern.results;
+  } catch {
+    const legacy = await db
+      .prepare(
+        `SELECT
+           jst.id,
+           jst.camera_id,
+           NULL AS slot_key,
+           NULL AS slot_label,
+           COALESCE(c.name, '') AS camera_name,
+           COALESCE(c.description, '') AS camera_description,
+           COALESCE(jsa.input_type, 'video') AS input_type
+         FROM job_step_targets jst
+         LEFT JOIN cameras c ON c.id = jst.camera_id
+         LEFT JOIN job_step_agents jsa
+           ON jsa.step_id = jst.step_id
+          AND jsa.camera_id = jst.camera_id
+          AND jsa.is_active = 1
+         WHERE jst.step_id = ?
+         ORDER BY jst.id ASC`
+      )
+      .bind(stepId)
+      .all();
+    results = legacy.results;
+  }
+
+  return {
+    step: {
+      id: Number((step as any)?.id || 0),
+      job_id: Number((step as any)?.job_id || 0),
+      job_name: String((step as any)?.job_name || ""),
+      title: String((step as any)?.title || ""),
+      prompt: String((step as any)?.prompt || ""),
+    },
+    targets: (results || []).map((row: any) => {
+      const rawDescription =
+        typeof row?.camera_description === "string" ? row.camera_description : "";
+      const scene = splitAgentSceneParts(rawDescription);
+      return {
+        id: Number(row?.id || 0),
+        camera_id: Number(row?.camera_id || 0),
+        camera_name: String(row?.camera_name || ""),
+        slot_key: typeof row?.slot_key === "string" ? row.slot_key : null,
+        slot_label: typeof row?.slot_label === "string" ? row.slot_label : null,
+        description: rawDescription,
+        scene_label: scene.scene_label,
+        scene_description: scene.scene_description,
+        input_type: String(row?.input_type || "video"),
+      };
+    }),
+  };
+}
+
+async function buildAgentReferenceTargetsForUser(
+  db: D1Database,
+  userId: string
+): Promise<{
+  face_targets: Array<{
+    id: number;
+    name: string;
+    description: string;
+    image_count: number;
+  }>;
+  drakon_find_targets: Array<{
+    id: number;
+    entity_type: string;
+    name: string;
+    description: string;
+    traits: string[];
+    image_count: number;
+  }>;
+}> {
+  const faceTargets = await fetchFaceTargetsForUser(db, userId);
+  const drakonFindTargets = brand.features.drakonFindEnabled
+    ? await fetchDrakonFindTargetsForUser(db, userId)
+    : [];
+
+  return {
+    face_targets: faceTargets.map((target) => ({
+      id: Number(target.id || 0),
+      name: String(target.name || ""),
+      description: String(target.description || ""),
+      image_count: Number(target.image_count || 0),
+    })),
+    drakon_find_targets: drakonFindTargets.map((target: any) => ({
+      id: Number(target?.id || 0),
+      entity_type: String(target?.entity_type || ""),
+      name: String(target?.name || ""),
+      description: String(target?.description || ""),
+      traits: parseStringArray(target?.traits),
+      image_count: Number(target?.image_count || 0),
+    })),
   };
 }
 
@@ -22504,7 +23555,12 @@ const listOwnedCustomCameraAgents = async (
 ): Promise<any[]> => {
   const { results } = await db
     .prepare(
-      `SELECT ca.*, c.name AS camera_name
+      `SELECT ca.*,
+              c.name AS camera_name,
+              c.description AS camera_description,
+              c.ip_address AS camera_ip_address,
+              c.manufacturer AS camera_manufacturer,
+              c.connection_method AS camera_connection_method
        FROM camera_algorithms ca
        JOIN cameras c ON c.id = ca.camera_id
        WHERE c.user_id = ?
@@ -25934,6 +26990,237 @@ app.post("/api/chat/sessions/:id/camera-batch-registration/confirm", anyAuthMidd
   }
 });
 
+app.post("/api/chat/sessions/:id/camera-batch-edit/confirm", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const sessionId = Number(c.req.param("id"));
+  const body = await c.req.json<{
+    source_message_id?: number;
+  }>().catch(() => null);
+
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    return c.json({ error: "Invalid session id" }, 400);
+  }
+
+  const sourceMessageId = Number(body?.source_message_id || 0);
+  if (!Number.isInteger(sourceMessageId) || sourceMessageId <= 0) {
+    return c.json({ error: "source_message_id is required" }, 400);
+  }
+
+  const session = await c.env.DB.prepare(
+    "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?"
+  )
+    .bind(sessionId, user.id)
+    .first();
+
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  const sourceMessage = await c.env.DB.prepare(
+    `SELECT id, camera_selection_json
+       FROM chat_messages
+      WHERE id = ? AND user_id = ? AND session_id = ? AND role = 'assistant'
+      LIMIT 1`
+  )
+    .bind(sourceMessageId, user.id, sessionId)
+    .first();
+
+  if (!sourceMessage) {
+    return c.json({ error: "Draft message not found" }, 404);
+  }
+
+  const parsedSourceMetadata = normalizeChatCameraBatchEditMetadata(
+    parseCommandJsonColumn((sourceMessage as any).camera_selection_json)
+  );
+  if (!parsedSourceMetadata) {
+    return c.json({ error: "This message does not contain a camera batch edit draft" }, 409);
+  }
+  if (parsedSourceMetadata.status === "updated") {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC"
+    )
+      .bind(user.id, sessionId)
+      .all();
+    return c.json({ error: "This camera batch edit draft was already applied", messages: results }, 409);
+  }
+
+  const targetCameraIds = Array.isArray(parsedSourceMetadata.preview?.targets)
+    ? parsedSourceMetadata.preview.targets
+        .map((target) => Number(target.camera_id || 0))
+        .filter((cameraId) => Number.isInteger(cameraId) && cameraId > 0)
+    : [];
+  if (targetCameraIds.length === 0) {
+    return c.json({ error: "This camera batch edit preview is empty" }, 409);
+  }
+
+  const normalizedPreview = await buildChatCameraBatchEditPreview(c.env, user.id, {
+    camera_ids: targetCameraIds,
+    patch_body: parsedSourceMetadata.patch_body,
+    language: parsedSourceMetadata.language,
+  });
+
+  if (Number(normalizedPreview.blocked_count || 0) > 0) {
+    return c.json(
+      {
+        error: "The camera batch edit still has blocked targets",
+        preview: normalizedPreview,
+      },
+      400
+    );
+  }
+
+  if (Number(normalizedPreview.ready_count || 0) <= 0) {
+    return c.json({ error: "No cameras are ready to update in this batch" }, 400);
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    const applyResult = await applyChatCameraBatchEditPreviewForUser(
+      c.env.DB,
+      user.id,
+      normalizedPreview,
+      parsedSourceMetadata.patch_body,
+      {
+        targetClientId: parsedSourceMetadata.target_client_id || null,
+        targetExeId: null,
+      }
+    );
+
+    const updatedSourceMetadata = buildChatCameraBatchEditUpdatedMetadata(
+      {
+        ...parsedSourceMetadata,
+        preview: normalizedPreview,
+      },
+      applyResult
+    );
+
+    await c.env.DB.prepare(
+      `UPDATE chat_messages
+          SET camera_selection_json = ?, updated_at = ?
+        WHERE id = ? AND user_id = ? AND session_id = ?`
+    )
+      .bind(
+        JSON.stringify(updatedSourceMetadata),
+        now,
+        sourceMessageId,
+        user.id,
+        sessionId
+      )
+      .run();
+
+    const contextRow = await c.env.DB.prepare(
+      `SELECT compact_context_json, task_state_json, last_compacted_message_id, token_estimate
+         FROM chat_session_contexts
+        WHERE user_id = ? AND session_id = ?
+        LIMIT 1`
+    )
+      .bind(user.id, sessionId)
+      .first();
+
+    const compactContext = normalizeChatCompactContext(
+      parseCommandJsonColumn((contextRow as any)?.compact_context_json)
+    );
+    const taskState = normalizeChatTaskState(
+      parseCommandJsonColumn((contextRow as any)?.task_state_json)
+    );
+    const completedTaskState = buildChatEditCameraBatchCompletedTaskState(
+      taskState,
+      updatedSourceMetadata,
+      applyResult
+    );
+
+    await c.env.DB.prepare(
+      `INSERT INTO chat_session_contexts (
+         user_id,
+         session_id,
+         compact_context_json,
+         task_state_json,
+         last_compacted_message_id,
+         token_estimate,
+         compacted_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, session_id) DO UPDATE SET
+         compact_context_json = excluded.compact_context_json,
+         task_state_json = excluded.task_state_json,
+         last_compacted_message_id = excluded.last_compacted_message_id,
+         token_estimate = excluded.token_estimate,
+         compacted_at = excluded.compacted_at,
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        user.id,
+        sessionId,
+        JSON.stringify(compactContext),
+        JSON.stringify(completedTaskState),
+        Math.max(0, Number((contextRow as any)?.last_compacted_message_id || 0)),
+        Math.max(0, Number((contextRow as any)?.token_estimate || 0)),
+        (contextRow as any)?.compacted_at || now,
+        now
+      )
+      .run();
+
+    await c.env.DB.prepare(
+      `INSERT INTO chat_messages (
+         user_id,
+         session_id,
+         role,
+         content,
+         camera_ids,
+         tokens_used,
+         message_type,
+         is_pending,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'assistant', ?, ?, 0, 'final', 0, ?, ?)`
+    )
+      .bind(
+        user.id,
+        sessionId,
+        buildChatCameraBatchEditSuccessMessage(
+          parsedSourceMetadata.language,
+          updatedSourceMetadata,
+          applyResult
+        ),
+        Array.isArray(applyResult.updated_camera_ids) && applyResult.updated_camera_ids.length > 0
+          ? applyResult.updated_camera_ids.join(",")
+          : null,
+        now,
+        now
+      )
+      .run();
+
+    await c.env.DB.prepare(
+      `UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    )
+      .bind(sessionId)
+      .run();
+
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC"
+    )
+      .bind(user.id, sessionId)
+      .all();
+
+    wsHandler.broadcast(sessionId, {
+      type: "message_update",
+      messages: results,
+    });
+
+    return c.json({
+      ok: true,
+      messages: results,
+      apply_result: applyResult,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to update camera batch";
+    return c.json({ error: message }, 500);
+  }
+});
+
 app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const sessionId = c.req.param("id");
@@ -26196,6 +27483,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
       "explain_app",
       "create_camera",
       "edit_camera",
+      "edit_cameras_batch",
       "create_cameras_batch",
       "scan_network",
       "create_job",
@@ -32767,7 +34055,26 @@ app.get("/api/agent/cameras", async (c) => {
     .bind(userId)
     .all();
 
-  return c.json(results || []);
+  const normalizedResults = Array.isArray(results)
+    ? results.map((row: any) => {
+        const scene = splitAgentSceneParts(row?.description);
+        return {
+          id: Number(row?.id || 0),
+          name: typeof row?.name === "string" ? row.name : "",
+          description: typeof row?.description === "string" ? row.description : "",
+          scene_label: scene.scene_label,
+          scene_description: scene.scene_description,
+          ip_address: typeof row?.ip_address === "string" ? row.ip_address : "",
+          manufacturer: typeof row?.manufacturer === "string" ? row.manufacturer : "",
+          connection_method:
+            typeof row?.connection_method === "string" ? row.connection_method : "",
+          channel: typeof row?.channel === "string" ? row.channel : "",
+          subtype: typeof row?.subtype === "string" ? row.subtype : "",
+        };
+      })
+    : [];
+
+  return c.json(normalizedResults);
 });
 
 app.get("/api/agent/cameras/:id", async (c) => {
@@ -32793,7 +34100,38 @@ app.get("/api/agent/cameras/:id", async (c) => {
     return c.json({ error: "Camera not found" }, 404);
   }
 
-  return c.json(camera);
+  const scene = splitAgentSceneParts((camera as any)?.description);
+  return c.json({
+    ...camera,
+    scene_label: scene.scene_label,
+    scene_description: scene.scene_description,
+  });
+});
+
+app.get("/api/agent/agents", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const agents = await listEditableAgentInventoryForUser(c.env.DB, pairing.userId);
+    return c.json({ agents });
+  } catch (error) {
+    console.error("[GET /api/agent/agents] Failed to load editable agents:", error);
+    return c.json({ error: "Failed to load editable agents" }, 500);
+  }
 });
 
 app.post("/api/agent/camera-batches/preview", async (c) => {
@@ -32912,6 +34250,89 @@ app.post("/api/agent/cameras", async (c) => {
   }
 });
 
+app.post("/api/agent/cameras/batch-edit/preview", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const rawBody = await c.req.json().catch(() => null);
+  const patchSource =
+    rawBody && typeof rawBody === "object" && !Array.isArray(rawBody) && rawBody.patch && typeof rawBody.patch === "object" && !Array.isArray(rawBody.patch)
+      ? ({ ...(rawBody.patch as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const clearFields = normalizeChatCameraBatchEditClearFields(
+    rawBody && typeof rawBody === "object" && !Array.isArray(rawBody) ? (rawBody as any).clear_fields : []
+  );
+  const patchBody = buildChatCameraBatchEditPatchBody(patchSource, clearFields);
+
+  if (Object.keys(patchBody).length === 0) {
+    return c.json({ error: "At least one camera field is required for batch edit preview" }, 400);
+  }
+
+  try {
+    const userCountryCode = await resolveUserCountryCodeForBatchImport(
+      c.env.DB,
+      pairing.userId
+    );
+    const enrichedPatchBody = await enrichChatCameraBatchEditPatchBody(
+      c.env,
+      userCountryCode,
+      patchBody
+    );
+    const parsedPatch = UpdateCameraSchema.safeParse(enrichedPatchBody);
+    if (!parsedPatch.success) {
+      return c.json(
+        {
+          error: "Validation failed",
+          issues: parsedPatch.error.flatten(),
+        },
+        400
+      );
+    }
+
+    const preview = await buildChatCameraBatchEditPreview(c.env, pairing.userId, {
+      camera_ids:
+        rawBody && typeof rawBody === "object" && !Array.isArray(rawBody)
+          ? (rawBody as any).camera_ids
+          : [],
+      patch_body: parsedPatch.data as Record<string, unknown>,
+      language:
+        rawBody && typeof rawBody === "object" && !Array.isArray(rawBody)
+          ? (rawBody as any).language
+          : "en",
+    });
+
+    return c.json({
+      ok: true,
+      patch_body: parsedPatch.data,
+      preview,
+    });
+  } catch (error) {
+    console.error("[POST /api/agent/cameras/batch-edit/preview] Failed to build preview:", error);
+    return c.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to prepare the camera batch edit preview",
+      },
+      500
+    );
+  }
+});
+
 app.patch("/api/agent/cameras/:id", async (c) => {
   const url = new URL(c.req.url);
   const clientId = (url.searchParams.get("client_id") || "").trim();
@@ -32976,6 +34397,827 @@ app.patch("/api/agent/cameras/:id", async (c) => {
 
     console.error("[PATCH /api/agent/cameras/:id] Failed to update camera:", error);
     return c.json({ error: message }, 500);
+  }
+});
+
+app.get("/api/agent/reference-targets", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const targets = await buildAgentReferenceTargetsForUser(c.env.DB, pairing.userId);
+    return c.json(targets);
+  } catch (error) {
+    console.error("[GET /api/agent/reference-targets] Failed to load targets:", error);
+    return c.json({ error: "Failed to load reference targets" }, 500);
+  }
+});
+
+app.get("/api/agent/job-steps", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const steps = await listAgentJobStepsForUser(c.env.DB, pairing.userId);
+    return c.json({ steps });
+  } catch (error) {
+    console.error("[GET /api/agent/job-steps] Failed to load steps:", error);
+    return c.json({ error: "Failed to load job steps" }, 500);
+  }
+});
+
+app.get("/api/agent/job-steps/:stepId/targets", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const stepId = Number(c.req.param("stepId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(stepId) || stepId <= 0) {
+    return c.json({ error: "Invalid step id" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = await listAgentJobStepTargetsForUser(c.env.DB, pairing.userId, stepId);
+    if (!payload) {
+      return c.json({ error: "Step not found" }, 404);
+    }
+    return c.json(payload);
+  } catch (error) {
+    console.error("[GET /api/agent/job-steps/:stepId/targets] Failed to load targets:", error);
+    return c.json({ error: "Failed to load step targets" }, 500);
+  }
+});
+
+app.post("/api/agent/agent-design", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{
+      camera_id?: number | null;
+      goal_summary?: string;
+      language?: string;
+      require_snapshot?: boolean;
+      agent_patch?: Record<string, unknown>;
+      face_targets?: Array<Record<string, unknown>>;
+      drakon_find_targets?: Array<Record<string, unknown>>;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const goalSummary = normalizeAgentDesignText(body.goal_summary, 4000);
+  if (!goalSummary) {
+    return c.json({ error: "goal_summary is required" }, 400);
+  }
+
+  const cameraIdRaw = body.camera_id === null || body.camera_id === undefined
+    ? null
+    : Number(body.camera_id);
+  const cameraId =
+    Number.isInteger(cameraIdRaw) && Number(cameraIdRaw) > 0 ? Number(cameraIdRaw) : null;
+  const requireSnapshot =
+    typeof body.require_snapshot === "boolean" ? body.require_snapshot : cameraId !== null;
+
+  let camera: any = null;
+  if (cameraId !== null) {
+    camera = await c.env.DB
+      .prepare(
+        `SELECT id, name, description, ip_address, rtsp_port, username, password, manufacturer,
+                connection_method, webcam_index, channel, subtype
+         FROM cameras
+         WHERE id = ? AND user_id = ?
+         LIMIT 1`
+      )
+      .bind(cameraId, pairing.userId)
+      .first();
+    if (!camera) {
+      return c.json({ error: "Camera not found" }, 404);
+    }
+  }
+
+  const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, pairing.userId);
+  if (!userOpenAiApiKey) {
+    return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
+  }
+
+  const agentPatch = normalizeAgentDesignPatch(body.agent_patch);
+  const faceTargets = Array.isArray(body.face_targets)
+    ? body.face_targets
+        .map((row) => ({
+          id: Number((row as any)?.id || 0),
+          name: normalizeAgentDesignText((row as any)?.name, 120),
+          description: normalizeAgentDesignText((row as any)?.description, 600),
+        }))
+        .filter((row) => row.id > 0 || row.name)
+        .slice(0, 24)
+    : [];
+  const drakonFindTargets = Array.isArray(body.drakon_find_targets)
+    ? body.drakon_find_targets
+        .map((row) => ({
+          id: Number((row as any)?.id || 0),
+          entity_type: normalizeAgentDesignText((row as any)?.entity_type, 80),
+          name: normalizeAgentDesignText((row as any)?.name, 120),
+          description: normalizeAgentDesignText((row as any)?.description, 600),
+          traits: Array.isArray((row as any)?.traits)
+            ? (row as any).traits
+                .map((item: unknown) => normalizeAgentDesignText(item, 80))
+                .filter(Boolean)
+                .slice(0, 12)
+            : [],
+        }))
+        .filter((row) => row.id > 0 || row.name || row.description)
+        .slice(0, 24)
+    : [];
+
+  const commandPayload: Record<string, unknown> = {
+    goal_summary: goalSummary,
+    user_language: normalizeAgentDesignText(body.language, 32) || "pt-BR",
+    model_name: "gpt-5.1",
+    model_api_key: userOpenAiApiKey,
+    agent_patch: agentPatch,
+    face_targets: faceTargets,
+    drakon_find_targets: drakonFindTargets,
+    snapshot_strategy: {
+      prefer_running_session_snapshot: true,
+      warmup_seconds: 6,
+      target_second: 5,
+      max_capture_seconds: 12,
+      require_snapshot: requireSnapshot,
+    },
+  };
+
+  if (cameraId !== null && camera) {
+    commandPayload.camera_id = cameraId;
+    commandPayload.camera_name =
+      typeof camera.name === "string" ? camera.name : `Camera ${cameraId}`;
+    commandPayload.camera_description =
+      typeof camera.description === "string" ? camera.description : "";
+    commandPayload.camera_payload = {
+      camera_id: cameraId,
+      name: typeof camera.name === "string" ? camera.name : `Camera ${cameraId}`,
+      description: typeof camera.description === "string" ? camera.description : "",
+      ip: normalizeCameraTransportField(camera.ip_address) ?? "",
+      port: normalizeCameraTransportField(camera.rtsp_port),
+      username: normalizeCameraTransportField(camera.username) ?? "",
+      password: typeof camera.password === "string" ? camera.password : "",
+      manufacturer: normalizeCameraTransportField(camera.manufacturer) ?? "",
+      connection_method: normalizeCameraTransportField(camera.connection_method) ?? "",
+      webcam_index:
+        camera.webcam_index === null || camera.webcam_index === undefined
+          ? null
+          : Number(camera.webcam_index),
+      channel: normalizeCameraTransportField(camera.channel),
+      subtype: normalizeCameraTransportField(camera.subtype),
+    };
+  }
+
+  const now = new Date().toISOString();
+  const commandInsert = await c.env.DB
+    .prepare(
+      `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
+       VALUES (?, ?, 'agent_design', ?, 'pending', ?, ?)`
+    )
+    .bind(pairing.userId, cameraId, JSON.stringify(commandPayload), now, now)
+    .run();
+
+  const commandId = Number(commandInsert.meta.last_row_id || 0);
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return c.json({ error: "Failed to create agent design command" }, 500);
+  }
+
+  const terminalResult = await waitForCommandTerminalResult(
+    c.env.DB,
+    pairing.userId,
+    commandId,
+    25000,
+    500
+  );
+  if (!terminalResult) {
+    return c.json({ error: "Timed out while waiting for the agent design result" }, 504);
+  }
+
+  const envelope = terminalResult.envelope || {};
+  const resultPayload =
+    envelope.result && typeof envelope.result === "object" && !Array.isArray(envelope.result)
+      ? (envelope.result as Record<string, unknown>)
+      : envelope;
+
+  if (terminalResult.status === "failed") {
+    const errorMessage =
+      typeof resultPayload.error === "string" && resultPayload.error.trim()
+        ? resultPayload.error.trim()
+        : typeof envelope.error === "string" && envelope.error.trim()
+          ? envelope.error.trim()
+          : "Agent design failed";
+    return c.json({ error: errorMessage }, 500);
+  }
+
+  const design =
+    resultPayload.design && typeof resultPayload.design === "object" && !Array.isArray(resultPayload.design)
+      ? resultPayload.design
+      : resultPayload;
+
+  if (!design || typeof design !== "object" || Array.isArray(design)) {
+    return c.json({ error: "Agent design returned an invalid payload" }, 500);
+  }
+
+  return c.json({
+    ok: true,
+    design,
+    model_name:
+      typeof resultPayload.model_name === "string" ? resultPayload.model_name : "gpt-5.1",
+    snapshot_source:
+      typeof resultPayload.snapshot_source === "string" ? resultPayload.snapshot_source : null,
+    snapshot_ts_utc_iso:
+      typeof resultPayload.snapshot_ts_utc_iso === "string"
+        ? resultPayload.snapshot_ts_utc_iso
+        : null,
+  });
+});
+
+app.post("/api/agent/cameras/:cameraId/custom-agents", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const cameraId = Number(c.req.param("cameraId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return c.json({ error: "Invalid camera id" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const camera = await c.env.DB
+    .prepare("SELECT id FROM cameras WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(cameraId, pairing.userId)
+    .first();
+  if (!camera) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+
+  const body = await c.req
+    .json<{ snapshot?: unknown }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const normalizedSnapshot = normalizeHubAgentSnapshot(body.snapshot ?? body);
+  if (!normalizedSnapshot) {
+    return c.json({ error: "Invalid agent snapshot" }, 400);
+  }
+  const snapshotToInstall: HubAgentSnapshot = {
+    ...normalizedSnapshot,
+    is_enabled:
+      typeof normalizedSnapshot.is_enabled === "boolean"
+        ? normalizedSnapshot.is_enabled
+        : true,
+  };
+
+  const faceTargetIds = normalizeFaceTargetIdsInput(snapshotToInstall.face_target_ids) || [];
+  const faceTargetError = await validateFaceTargetIdsForUser(
+    c.env.DB,
+    pairing.userId,
+    faceTargetIds
+  );
+  if (faceTargetError) {
+    return c.json({ error: faceTargetError }, 400);
+  }
+
+  const executionSettings = applyInferenceExecutionConstraints(
+    normalizeJobStepInputType(snapshotToInstall.input_type) || "video",
+    normalizeJobStepInferenceModel(snapshotToInstall.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL,
+    normalizeJobStepRunEverySeconds(snapshotToInstall.run_every, FIXED_JOB_STEP_RUN_EVERY_SECONDS),
+    normalizeJobStepRunningResolution(snapshotToInstall.running_resolution, DEFAULT_CORE_RUNNING_RESOLUTION),
+    snapshotToInstall.model_fps
+  );
+
+  if (snapshotToInstall.is_enabled && executionSettings.inferenceModel === "core") {
+    const coreBusyState = await findCoreModelBusyStateForCameraEnable(c.env.DB, pairing.userId);
+    if (coreBusyState) {
+      return c.json(buildCoreModelBusyErrorBody(coreBusyState), 409);
+    }
+  }
+  if (snapshotToInstall.is_enabled && executionSettings.requiresOpenAiKey) {
+    const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, pairing.userId);
+    if (!userOpenAiApiKey) {
+      return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
+    }
+  }
+  if (snapshotToInstall.is_enabled && executionSettings.requiresZAiKey) {
+    const userZAiApiKey = await getUserZAIApiKey(c.env.DB, pairing.userId);
+    if (!userZAiApiKey) {
+      return c.json(buildZAiKeyRequiredErrorBody(), 400);
+    }
+  }
+
+  try {
+    const algorithmId = await createCameraAlgorithmFromHubSnapshot(
+      c.env.DB,
+      pairing.userId,
+      cameraId,
+      snapshotToInstall,
+      0,
+      0
+    );
+    const agents = await listCustomCameraAgents(c.env.DB, pairing.userId, cameraId);
+    const agent = agents.find((row: any) => Number(row?.id) === algorithmId) || null;
+    return c.json({ ok: true, agent_id: algorithmId, agent }, 201);
+  } catch (error) {
+    console.error("[POST /api/agent/cameras/:cameraId/custom-agents] Failed to create agent:", error);
+    return c.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to create the camera agent",
+      },
+      500
+    );
+  }
+});
+
+app.patch("/api/agent/cameras/:cameraId/custom-agents/:algorithmId", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const cameraId = Number(c.req.param("cameraId"));
+  const algorithmId = Number(c.req.param("algorithmId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return c.json({ error: "Invalid camera id" }, 400);
+  }
+  if (!Number.isInteger(algorithmId) || algorithmId <= 0) {
+    return c.json({ error: "Invalid algorithm id" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{ snapshot?: unknown }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const normalizedSnapshot = normalizeHubAgentSnapshot(body.snapshot ?? body);
+  if (!normalizedSnapshot) {
+    return c.json({ error: "Invalid agent snapshot" }, 400);
+  }
+
+  const faceTargetIds = normalizeFaceTargetIdsInput(normalizedSnapshot.face_target_ids) || [];
+  const faceTargetError = await validateFaceTargetIdsForUser(
+    c.env.DB,
+    pairing.userId,
+    faceTargetIds
+  );
+  if (faceTargetError) {
+    return c.json({ error: faceTargetError }, 400);
+  }
+
+  try {
+    await updateCameraAlgorithmFromHubSnapshot(
+      c.env.DB,
+      pairing.userId,
+      cameraId,
+      algorithmId,
+      normalizedSnapshot
+    );
+    const agents = await listCustomCameraAgents(c.env.DB, pairing.userId, cameraId);
+    const agent = agents.find((row: any) => Number(row?.id) === algorithmId) || null;
+    return c.json({ ok: true, agent_id: algorithmId, agent }, 200);
+  } catch (error) {
+    console.error(
+      "[PATCH /api/agent/cameras/:cameraId/custom-agents/:algorithmId] Failed to update agent:",
+      error
+    );
+    return c.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to update the camera agent",
+      },
+      500
+    );
+  }
+});
+
+app.post("/api/agent/job-steps/:stepId/agents", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const stepId = Number(c.req.param("stepId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(stepId) || stepId <= 0) {
+    return c.json({ error: "Invalid step id" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{ camera_id?: number | null; snapshot?: unknown }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const normalizedSnapshot = normalizeHubAgentSnapshot(body.snapshot ?? body);
+  if (!normalizedSnapshot) {
+    return c.json({ error: "Invalid agent snapshot" }, 400);
+  }
+
+  const step = await c.env.DB
+    .prepare(
+      `SELECT js.id, js.job_id
+       FROM job_steps js
+       JOIN jobs j ON js.job_id = j.id
+       WHERE js.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+    .bind(stepId, pairing.userId)
+    .first();
+  if (!step) {
+    return c.json({ error: "Step not found" }, 404);
+  }
+
+  const cameraIdRaw = body.camera_id === null || body.camera_id === undefined
+    ? null
+    : Number(body.camera_id);
+  const cameraId =
+    Number.isInteger(cameraIdRaw) && Number(cameraIdRaw) > 0 ? Number(cameraIdRaw) : null;
+  if (cameraId !== null) {
+    const targetExists = await c.env.DB
+      .prepare("SELECT 1 FROM job_step_targets WHERE step_id = ? AND camera_id = ? LIMIT 1")
+      .bind(stepId, cameraId)
+      .first();
+    if (!targetExists) {
+      return c.json({ error: "Invalid camera_id - camera must be added as a target first" }, 400);
+    }
+  }
+
+  const faceTargetIds = normalizeFaceTargetIdsInput(normalizedSnapshot.face_target_ids) || [];
+  const faceTargetError = await validateFaceTargetIdsForUser(
+    c.env.DB,
+    pairing.userId,
+    faceTargetIds
+  );
+  if (faceTargetError) {
+    return c.json({ error: faceTargetError }, 400);
+  }
+
+  const executionSettings = applyInferenceExecutionConstraints(
+    normalizeJobStepInputType(normalizedSnapshot.input_type) || "video",
+    normalizeJobStepInferenceModel(normalizedSnapshot.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL,
+    normalizeJobStepRunEverySeconds(normalizedSnapshot.run_every, FIXED_JOB_STEP_RUN_EVERY_SECONDS),
+    normalizeJobStepRunningResolution(normalizedSnapshot.running_resolution, DEFAULT_CORE_RUNNING_RESOLUTION),
+    normalizedSnapshot.model_fps
+  );
+
+  if (executionSettings.inferenceModel === "core") {
+    const existingAgent =
+      cameraId === null
+        ? await c.env.DB
+            .prepare(
+              `SELECT id FROM job_step_agents
+               WHERE step_id = ? AND is_active = 1 AND camera_id IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1`
+            )
+            .bind(stepId)
+            .first()
+        : await c.env.DB
+            .prepare(
+              `SELECT id FROM job_step_agents
+               WHERE step_id = ? AND is_active = 1 AND camera_id = ?
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1`
+            )
+            .bind(stepId, cameraId)
+            .first();
+
+    const jobId = Number((step as any)?.job_id || 0);
+    const activeCoreAgentsInJob = await countActiveCoreAgentsInJob(
+      c.env.DB,
+      pairing.userId,
+      jobId,
+      Number((existingAgent as any)?.id || 0)
+    );
+    if (activeCoreAgentsInJob >= 1) {
+      return c.json(buildCoreModelJobLimitErrorBody(), 409);
+    }
+
+    const currentJobSchedule = await loadRecurringScheduleForJob(c.env.DB, pairing.userId, jobId);
+    if (currentJobSchedule) {
+      const scheduleConflict = await findCoreScheduleConflictForCandidate(
+        c.env.DB,
+        pairing.userId,
+        currentJobSchedule,
+        jobId
+      );
+      if (scheduleConflict) {
+        return c.json(
+          buildCoreModelScheduleConflictErrorBody(
+            scheduleConflict.job_name,
+            scheduleConflict.job_id
+          ),
+          409
+        );
+      }
+    }
+  }
+
+  if (executionSettings.requiresOpenAiKey) {
+    const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, pairing.userId);
+    if (!userOpenAiApiKey) {
+      return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
+    }
+  }
+  if (executionSettings.requiresZAiKey) {
+    const userZAiApiKey = await getUserZAIApiKey(c.env.DB, pairing.userId);
+    if (!userZAiApiKey) {
+      return c.json(buildZAiKeyRequiredErrorBody(), 400);
+    }
+  }
+
+  try {
+    const agentId = await upsertStepAgentFromHubSnapshot(
+      c.env.DB,
+      pairing.userId,
+      stepId,
+      cameraId,
+      normalizedSnapshot,
+      0,
+      0
+    );
+    return c.json(
+      {
+        ok: true,
+        agent_id: agentId,
+        step_id: stepId,
+        camera_id: cameraId,
+      },
+      200
+    );
+  } catch (error) {
+    console.error("[POST /api/agent/job-steps/:stepId/agents] Failed to create agent:", error);
+    return c.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to create the step agent",
+      },
+      500
+    );
+  }
+});
+
+app.patch("/api/agent/job-steps/:stepId/agents/:agentId", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const stepId = Number(c.req.param("stepId"));
+  const agentId = Number(c.req.param("agentId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(stepId) || stepId <= 0) {
+    return c.json({ error: "Invalid step id" }, 400);
+  }
+  if (!Number.isInteger(agentId) || agentId <= 0) {
+    return c.json({ error: "Invalid agent id" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{ snapshot?: unknown }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const normalizedSnapshot = normalizeHubAgentSnapshot(body.snapshot ?? body);
+  if (!normalizedSnapshot) {
+    return c.json({ error: "Invalid agent snapshot" }, 400);
+  }
+
+  const existingAgent = await resolveOwnedJobStepAgentForUser(
+    c.env.DB,
+    pairing.userId,
+    agentId
+  );
+  if (!existingAgent) {
+    return c.json({ error: "Step agent not found" }, 404);
+  }
+  if (Number(existingAgent.step_id || 0) !== stepId) {
+    return c.json({ error: "Agent does not belong to the requested step" }, 400);
+  }
+
+  const cameraId =
+    existingAgent.camera_id === null || existingAgent.camera_id === undefined
+      ? null
+      : Number(existingAgent.camera_id);
+
+  const faceTargetIds = normalizeFaceTargetIdsInput(normalizedSnapshot.face_target_ids) || [];
+  const faceTargetError = await validateFaceTargetIdsForUser(
+    c.env.DB,
+    pairing.userId,
+    faceTargetIds
+  );
+  if (faceTargetError) {
+    return c.json({ error: faceTargetError }, 400);
+  }
+
+  const executionSettings = applyInferenceExecutionConstraints(
+    normalizeJobStepInputType(normalizedSnapshot.input_type) || "video",
+    normalizeJobStepInferenceModel(normalizedSnapshot.inference_model) ||
+      FIXED_JOB_STEP_INFERENCE_MODEL,
+    normalizeJobStepRunEverySeconds(
+      normalizedSnapshot.run_every,
+      FIXED_JOB_STEP_RUN_EVERY_SECONDS
+    ),
+    normalizeJobStepRunningResolution(
+      normalizedSnapshot.running_resolution,
+      DEFAULT_CORE_RUNNING_RESOLUTION
+    ),
+    normalizedSnapshot.model_fps
+  );
+
+  if (executionSettings.inferenceModel === "core") {
+    const step = await c.env.DB
+      .prepare(
+        `SELECT js.id, js.job_id
+         FROM job_steps js
+         JOIN jobs j ON js.job_id = j.id
+         WHERE js.id = ? AND j.user_id = ?
+         LIMIT 1`
+      )
+      .bind(stepId, pairing.userId)
+      .first();
+    if (!step) {
+      return c.json({ error: "Step not found" }, 404);
+    }
+
+    const jobId = Number((step as any)?.job_id || 0);
+    const activeCoreAgentsInJob = await countActiveCoreAgentsInJob(
+      c.env.DB,
+      pairing.userId,
+      jobId,
+      agentId
+    );
+    if (activeCoreAgentsInJob >= 1) {
+      return c.json(buildCoreModelJobLimitErrorBody(), 409);
+    }
+
+    const currentJobSchedule = await loadRecurringScheduleForJob(c.env.DB, pairing.userId, jobId);
+    if (currentJobSchedule) {
+      const scheduleConflict = await findCoreScheduleConflictForCandidate(
+        c.env.DB,
+        pairing.userId,
+        currentJobSchedule,
+        jobId
+      );
+      if (scheduleConflict) {
+        return c.json(
+          buildCoreModelScheduleConflictErrorBody(
+            scheduleConflict.job_name,
+            scheduleConflict.job_id
+          ),
+          409
+        );
+      }
+    }
+  }
+
+  if (executionSettings.requiresOpenAiKey) {
+    const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, pairing.userId);
+    if (!userOpenAiApiKey) {
+      return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
+    }
+  }
+  if (executionSettings.requiresZAiKey) {
+    const userZAiApiKey = await getUserZAIApiKey(c.env.DB, pairing.userId);
+    if (!userZAiApiKey) {
+      return c.json(buildZAiKeyRequiredErrorBody(), 400);
+    }
+  }
+
+  try {
+    await updateStepAgentFromHubSnapshot(
+      c.env.DB,
+      pairing.userId,
+      stepId,
+      agentId,
+      normalizedSnapshot
+    );
+    const updatedAgent = await resolveOwnedJobStepAgentForUser(
+      c.env.DB,
+      pairing.userId,
+      agentId
+    );
+    return c.json(
+      {
+        ok: true,
+        agent_id: agentId,
+        step_id: stepId,
+        camera_id: cameraId,
+        agent: updatedAgent,
+      },
+      200
+    );
+  } catch (error) {
+    console.error(
+      "[PATCH /api/agent/job-steps/:stepId/agents/:agentId] Failed to update agent:",
+      error
+    );
+    return c.json(
+      {
+        error: error instanceof Error ? error.message : "Failed to update the step agent",
+      },
+      500
+    );
   }
 });
 
@@ -36255,6 +38497,7 @@ type HubAgentSnapshot = {
   display_name: string;
   summary?: string;
   agent_key: string;
+  is_enabled?: boolean;
   input_type: "video" | "image";
   video_packaging_mode?: string | null;
   inference_model?: string;
@@ -36266,6 +38509,7 @@ type HubAgentSnapshot = {
   prompt_template: string;
   alert_condition: string;
   negative_condition?: string | null;
+  face_target_ids?: number[];
   analysis_regions?: unknown[];
   tags?: string[];
 };
@@ -36385,6 +38629,57 @@ function parseJsonValue<T>(value: unknown, fallback: T): T {
   if (value === null || value === undefined) return fallback;
   if (typeof value === "object") return value as T;
   return fallback;
+}
+
+function parseJobStepAgentParamsObject(value: unknown): Record<string, unknown> {
+  const parsed = parseJsonValue<Record<string, unknown> | null>(value, null);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  return { ...parsed };
+}
+
+function buildStoredJobStepAgentParams(
+  baseValue: unknown,
+  extras: {
+    hubItemId?: number | null;
+    versionId?: number | null;
+    displayName?: unknown;
+    summary?: unknown;
+  }
+): string {
+  const params = parseJobStepAgentParamsObject(baseValue);
+  const displayName = normalizeText(extras.displayName);
+  const summary = normalizeText(extras.summary);
+
+  if (Number.isInteger(extras.hubItemId) && Number(extras.hubItemId) >= 0) {
+    params.hub_item_id = Number(extras.hubItemId);
+  }
+  if (Number.isInteger(extras.versionId) && Number(extras.versionId) >= 0) {
+    params.hub_version_id = Number(extras.versionId);
+  }
+  if (displayName) {
+    params.display_name = displayName;
+  }
+  if (summary) {
+    params.summary = summary;
+  }
+
+  return JSON.stringify(params);
+}
+
+function getStoredJobStepAgentDisplayName(agent: any): string {
+  const topLevel = normalizeText(agent?.display_name);
+  if (topLevel) return topLevel;
+  const fromParams = normalizeText(parseJobStepAgentParamsObject(agent?.params).display_name);
+  return fromParams || normalizeText(agent?.agent_key) || "Hub Agent";
+}
+
+function getStoredJobStepAgentSummary(agent: any): string {
+  const topLevel = normalizeText(agent?.summary);
+  if (topLevel) return topLevel;
+  const fromParams = normalizeText(parseJobStepAgentParamsObject(agent?.params).summary);
+  return fromParams || normalizeText(agent?.alert_condition) || "Reusable step agent";
 }
 
 function normalizeHubTagsInput(value: unknown): string[] {
@@ -36921,6 +39216,7 @@ function normalizeHubAgentSnapshot(value: unknown): HubAgentSnapshot | null {
     display_name: normalizeText(row.display_name) || "Hub Agent",
     summary: normalizeText(row.summary) || "",
     agent_key: normalizeText(row.agent_key) || "custom_template",
+    is_enabled: normalizeJobStepOnlyCaptureOnMotion(row.is_enabled, false),
     input_type: normalizeJobStepInputType(row.input_type) || "video",
     video_packaging_mode: normalizeVideoPackagingMode(row.video_packaging_mode),
     inference_model:
@@ -36946,9 +39242,66 @@ function normalizeHubAgentSnapshot(value: unknown): HubAgentSnapshot | null {
     prompt_template: promptTemplate,
     alert_condition: alertCondition,
     negative_condition: normalizeOptionalPromptText(row.negative_condition),
+    face_target_ids: normalizeFaceTargetIdsInput(row.face_target_ids) || [],
     analysis_regions: Array.isArray(row.analysis_regions) ? row.analysis_regions : [],
     tags: normalizeHubTagsInput(row.tags),
   };
+}
+
+function isGeneratedCustomAgentName(value: unknown): boolean {
+  const normalized = normalizeText(value);
+  if (!normalized) return false;
+  return /^custom_(?:hub_)?\d+[a-z0-9_-]*$/i.test(normalized);
+}
+
+function parseCameraAgentConfigObject(agent: any): Record<string, unknown> {
+  if (!agent) return {};
+  if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
+    return { ...(agent.config_json as Record<string, unknown>) };
+  }
+  if (typeof agent.config_json === "string" && agent.config_json.trim()) {
+    try {
+      const parsed = JSON.parse(agent.config_json);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return { ...(parsed as Record<string, unknown>) };
+      }
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function getCustomCameraAgentDisplayName(agent: any): string {
+  const topLevelDisplayName = normalizeText(agent?.display_name);
+  const configJson = parseCameraAgentConfigObject(agent);
+  const configDisplayName = normalizeText(configJson.display_name);
+
+  if (topLevelDisplayName && !isGeneratedCustomAgentName(topLevelDisplayName)) {
+    return topLevelDisplayName;
+  }
+  if (configDisplayName) {
+    return configDisplayName;
+  }
+  if (topLevelDisplayName) {
+    return topLevelDisplayName;
+  }
+  return normalizeText(agent?.algorithm_type) || "Hub Agent";
+}
+
+function getCustomCameraAgentSummary(agent: any): string {
+  const topLevelSummary = normalizeText(agent?.summary);
+  if (topLevelSummary) {
+    return topLevelSummary;
+  }
+
+  const configJson = parseCameraAgentConfigObject(agent);
+  const configSummary = normalizeText(configJson.summary);
+  if (configSummary) {
+    return configSummary;
+  }
+
+  return normalizeText(agent?.alert_condition) || "Reusable camera agent";
 }
 
 async function buildHubAgentSnapshotFromCameraAlgorithm(
@@ -36990,9 +39343,10 @@ async function buildHubAgentSnapshotFromCameraAlgorithm(
 
   return {
     type: "agent",
-    display_name: normalizeText(agent?.display_name) || normalizeText(agent?.algorithm_type) || "Hub Agent",
-    summary: normalizeText(agent?.alert_condition) || "Reusable camera agent",
+    display_name: getCustomCameraAgentDisplayName(agent),
+    summary: getCustomCameraAgentSummary(agent),
     agent_key: normalizeText(agent?.algorithm_type) || "custom_template",
+    is_enabled: normalizeDbBoolean(agent?.is_enabled, false),
     input_type: execution.inputType,
     video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
     inference_model: execution.inferenceModel,
@@ -37007,6 +39361,7 @@ async function buildHubAgentSnapshotFromCameraAlgorithm(
     prompt_template: promptParts.prompt_template,
     alert_condition: normalizeText(promptParts.alert_condition),
     negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+    face_target_ids: normalizeFaceTargetIdsInput(agent?.face_target_ids) || [],
     analysis_regions: Array.isArray(agent?.analysis_regions) ? agent.analysis_regions : [],
     tags: [],
   };
@@ -37052,9 +39407,10 @@ function buildHubAgentSnapshotFromStepAgent(agent: any): HubAgentSnapshot | null
 
   return {
     type: "agent",
-    display_name: normalizeText(agent?.agent_key) || "Hub Agent",
-    summary: normalizeText(agent?.alert_condition) || "Reusable step agent",
+    display_name: getStoredJobStepAgentDisplayName(agent),
+    summary: getStoredJobStepAgentSummary(agent),
     agent_key: normalizeText(agent?.agent_key) || "custom_template",
+    is_enabled: normalizeDbBoolean(agent?.is_active, true),
     input_type: execution.inputType,
     video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
     inference_model: execution.inferenceModel,
@@ -37069,9 +39425,324 @@ function buildHubAgentSnapshotFromStepAgent(agent: any): HubAgentSnapshot | null
     prompt_template: promptParts.prompt_template,
     alert_condition: normalizeText(promptParts.alert_condition),
     negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+    face_target_ids: normalizeFaceTargetIdsInput((agent as any)?.face_target_ids) || [],
     analysis_regions: analysisRegions,
     tags: [],
   };
+}
+
+function buildHubAgentSnapshotFromCustomCameraAgentRow(agent: any): HubAgentSnapshot | null {
+  if (!agent || typeof agent !== "object") return null;
+
+  const promptParts = parsePromptTemplateParts(
+    agent?.prompt_template,
+    agent?.alert_condition,
+    agent?.negative_condition
+  );
+  const rawInputType = normalizeJobStepInputType(agent?.input_type) || "video";
+  const rawInferenceModel =
+    normalizeJobStepInferenceModel(agent?.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL;
+  const rawRunEvery = normalizeJobStepRunEverySeconds(
+    agent?.run_every,
+    FIXED_JOB_STEP_RUN_EVERY_SECONDS
+  );
+  const rawRunningResolution = normalizeJobStepRunningResolution(
+    agent?.running_resolution,
+    DEFAULT_CORE_RUNNING_RESOLUTION
+  );
+  const execution = applyInferenceExecutionConstraints(
+    rawInputType,
+    rawInferenceModel,
+    rawRunEvery,
+    rawRunningResolution,
+    agent?.model_fps
+  );
+
+  return {
+    type: "agent",
+    display_name: getCustomCameraAgentDisplayName(agent),
+    summary: getCustomCameraAgentSummary(agent),
+    agent_key: normalizeText(agent?.algorithm_type) || "custom_template",
+    is_enabled: normalizeDbBoolean(agent?.is_enabled, false),
+    input_type: execution.inputType,
+    video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
+    inference_model: execution.inferenceModel,
+    model_fps: execution.modelFps,
+    run_every: execution.runEvery,
+    running_resolution: execution.runningResolution,
+    only_capture_on_motion: normalizeJobStepOnlyCaptureOnMotion(
+      agent?.only_capture_on_motion,
+      true
+    ),
+    use_temporal_context: true,
+    prompt_template: promptParts.prompt_template,
+    alert_condition: normalizeText(promptParts.alert_condition),
+    negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+    face_target_ids: normalizeFaceTargetIdsInput(agent?.face_target_ids) || [],
+    analysis_regions: Array.isArray(agent?.analysis_regions) ? agent.analysis_regions : [],
+    tags: normalizeHubTagsInput(agent?.tags),
+  };
+}
+
+async function listEditableAgentInventoryForUser(
+  db: D1Database,
+  userId: string
+): Promise<
+  Array<{
+    location_type: "camera" | "step_default" | "step_camera";
+    agent_id: number;
+    agent_key: string;
+    display_name: string;
+    summary: string;
+    prompt_template: string;
+    alert_condition: string;
+    negative_condition: string | null;
+    camera_id: number | null;
+    camera_name: string;
+    camera_ip_address: string;
+    camera_manufacturer: string;
+    camera_connection_method: string;
+    scene_label: string;
+    scene_description: string;
+    step_id: number | null;
+    step_title: string;
+    job_id: number | null;
+    job_name: string;
+    target_id: number | null;
+    slot_key: string;
+    slot_label: string;
+    face_target_ids: number[];
+    analysis_regions: unknown[];
+    is_enabled: boolean;
+    run_every: number | null;
+    inference_model: string;
+    snapshot: HubAgentSnapshot;
+  }>
+> {
+  const inventory: Array<{
+    location_type: "camera" | "step_default" | "step_camera";
+    agent_id: number;
+    agent_key: string;
+    display_name: string;
+    summary: string;
+    prompt_template: string;
+    alert_condition: string;
+    negative_condition: string | null;
+    camera_id: number | null;
+    camera_name: string;
+    camera_ip_address: string;
+    camera_manufacturer: string;
+    camera_connection_method: string;
+    scene_label: string;
+    scene_description: string;
+    step_id: number | null;
+    step_title: string;
+    job_id: number | null;
+    job_name: string;
+    target_id: number | null;
+    slot_key: string;
+    slot_label: string;
+    face_target_ids: number[];
+    analysis_regions: unknown[];
+    is_enabled: boolean;
+    run_every: number | null;
+    inference_model: string;
+    snapshot: HubAgentSnapshot;
+  }> = [];
+
+  const cameraAgents = await listOwnedCustomCameraAgents(db, userId);
+  for (const agent of cameraAgents) {
+    const snapshot = buildHubAgentSnapshotFromCustomCameraAgentRow(agent);
+    if (!snapshot) continue;
+    const scene = splitAgentSceneParts((agent as any)?.camera_description);
+    inventory.push({
+      location_type: "camera",
+      agent_id: Number((agent as any)?.id || 0),
+      agent_key: normalizeText((agent as any)?.algorithm_type) || "custom_template",
+      display_name: snapshot.display_name,
+      summary: snapshot.summary || "",
+      prompt_template: snapshot.prompt_template,
+      alert_condition: snapshot.alert_condition,
+      negative_condition: snapshot.negative_condition || null,
+      camera_id: Number((agent as any)?.camera_id || 0) || null,
+      camera_name: normalizeText((agent as any)?.camera_name),
+      camera_ip_address: normalizeText((agent as any)?.camera_ip_address),
+      camera_manufacturer: normalizeText((agent as any)?.camera_manufacturer),
+      camera_connection_method: normalizeText((agent as any)?.camera_connection_method),
+      scene_label: scene.scene_label,
+      scene_description: scene.scene_description,
+      step_id: null,
+      step_title: "",
+      job_id: null,
+      job_name: "",
+      target_id: null,
+      slot_key: "",
+      slot_label: "",
+      face_target_ids: Array.isArray(snapshot.face_target_ids) ? snapshot.face_target_ids : [],
+      analysis_regions: Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
+      is_enabled: snapshot.is_enabled !== false,
+      run_every:
+        typeof snapshot.run_every === "number" && Number.isFinite(snapshot.run_every)
+          ? snapshot.run_every
+          : null,
+      inference_model: normalizeText(snapshot.inference_model),
+      snapshot,
+    });
+  }
+
+  let stepAgentResults: any[] = [];
+  try {
+    const modern = await db
+      .prepare(
+        `SELECT
+           jsa.*,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.title, '') AS step_title,
+           COALESCE(js.prompt, '') AS step_prompt,
+           COALESCE(c.name, '') AS camera_name,
+           COALESCE(c.description, '') AS camera_description,
+           COALESCE(c.ip_address, '') AS camera_ip_address,
+           COALESCE(c.manufacturer, '') AS camera_manufacturer,
+           COALESCE(c.connection_method, '') AS camera_connection_method,
+           COALESCE(jst.id, 0) AS target_id,
+           COALESCE(jst.slot_key, '') AS slot_key,
+           COALESCE(jst.slot_label, '') AS slot_label
+         FROM job_step_agents jsa
+         JOIN job_steps js ON js.id = jsa.step_id
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN cameras c ON c.id = jsa.camera_id
+         LEFT JOIN job_step_targets jst
+           ON jst.step_id = jsa.step_id
+          AND (
+            (jsa.camera_id IS NOT NULL AND jst.camera_id = jsa.camera_id) OR
+            (jsa.camera_id IS NULL AND jst.camera_id IS NULL)
+          )
+         WHERE j.user_id = ?
+           AND jsa.is_active = 1
+         ORDER BY j.created_at ASC, js.step_order ASC, jsa.created_at DESC, jsa.id DESC`
+      )
+      .bind(userId)
+      .all();
+    stepAgentResults = Array.isArray(modern.results) ? modern.results : [];
+  } catch {
+    const legacy = await db
+      .prepare(
+        `SELECT
+           jsa.*,
+           js.job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(js.name, '') AS step_title,
+           '' AS step_prompt,
+           COALESCE(c.name, '') AS camera_name,
+           COALESCE(c.description, '') AS camera_description,
+           COALESCE(c.ip_address, '') AS camera_ip_address,
+           COALESCE(c.manufacturer, '') AS camera_manufacturer,
+           COALESCE(c.connection_method, '') AS camera_connection_method,
+           COALESCE(jst.id, 0) AS target_id,
+           '' AS slot_key,
+           '' AS slot_label
+         FROM job_step_agents jsa
+         JOIN job_steps js ON js.id = jsa.step_id
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN cameras c ON c.id = jsa.camera_id
+         LEFT JOIN job_step_targets jst
+           ON jst.step_id = jsa.step_id
+          AND (
+            (jsa.camera_id IS NOT NULL AND jst.camera_id = jsa.camera_id) OR
+            (jsa.camera_id IS NULL AND jst.camera_id IS NULL)
+          )
+         WHERE j.user_id = ?
+           AND jsa.is_active = 1
+         ORDER BY j.created_at ASC, js.step_order ASC, jsa.created_at DESC, jsa.id DESC`
+      )
+      .bind(userId)
+      .all();
+    stepAgentResults = Array.isArray(legacy.results) ? legacy.results : [];
+  }
+
+  const stepAgents = stepAgentResults;
+  const agentIds = stepAgents
+    .map((row: any) => Number(row?.id))
+    .filter((id: number) => Number.isInteger(id) && id > 0);
+  const faceTargetIdsByAgentId = await loadFaceTargetIdsByAgentId(db, agentIds);
+  const negativeImagesByAgentId = await loadNegativeReferenceImagesByAgentId(db, agentIds);
+
+  for (const row of stepAgents) {
+    const agentId = Number((row as any)?.id || 0);
+    const faceTargetIds =
+      Number.isInteger(agentId) && agentId > 0
+        ? faceTargetIdsByAgentId.get(agentId) || []
+        : [];
+    const negativeReferenceImages =
+      Number.isInteger(agentId) && agentId > 0
+        ? negativeImagesByAgentId.get(agentId) || []
+        : [];
+    const useTemporalContext = normalizeJobStepUseTemporalContext(
+      (row as any)?.use_temporal_context,
+      true
+    );
+    const promptParts = parsePromptTemplatePartsForJobStepTemporalMode(
+      (row as any)?.prompt_template,
+      (row as any)?.alert_condition,
+      (row as any)?.negative_condition,
+      useTemporalContext
+    );
+    const analysisRegionsRaw = parseStoredAnalysisRegions((row as any)?.analysis_regions, {
+      promptParts,
+      faceTargetIds,
+      negativeImageIds: negativeReferenceImages
+        .map((img) => Number(img?.id))
+        .filter((id) => Number.isInteger(id) && id > 0),
+    });
+    const analysisRegions = useTemporalContext
+      ? analysisRegionsRaw
+      : sanitizeAnalysisRegionsForLegacyFlow(analysisRegionsRaw);
+    const snapshot = buildHubAgentSnapshotFromStepAgent({
+      ...row,
+      face_target_ids: faceTargetIds,
+      analysis_regions: analysisRegions,
+    });
+    if (!snapshot) continue;
+
+    const scene = splitAgentSceneParts((row as any)?.camera_description);
+    inventory.push({
+      location_type:
+        Number((row as any)?.camera_id || 0) > 0 ? "step_camera" : "step_default",
+      agent_id: agentId,
+      agent_key: normalizeText((row as any)?.agent_key) || "custom_template",
+      display_name: snapshot.display_name,
+      summary: snapshot.summary || "",
+      prompt_template: snapshot.prompt_template,
+      alert_condition: snapshot.alert_condition,
+      negative_condition: snapshot.negative_condition || null,
+      camera_id: Number((row as any)?.camera_id || 0) || null,
+      camera_name: normalizeText((row as any)?.camera_name),
+      camera_ip_address: normalizeText((row as any)?.camera_ip_address),
+      camera_manufacturer: normalizeText((row as any)?.camera_manufacturer),
+      camera_connection_method: normalizeText((row as any)?.camera_connection_method),
+      scene_label: scene.scene_label,
+      scene_description: scene.scene_description,
+      step_id: Number((row as any)?.step_id || 0) || null,
+      step_title: normalizeText((row as any)?.step_title),
+      job_id: Number((row as any)?.job_id || 0) || null,
+      job_name: normalizeText((row as any)?.job_name),
+      target_id: Number((row as any)?.target_id || 0) || null,
+      slot_key: normalizeText((row as any)?.slot_key),
+      slot_label: normalizeText((row as any)?.slot_label),
+      face_target_ids: faceTargetIds,
+      analysis_regions: Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
+      is_enabled: snapshot.is_enabled !== false,
+      run_every:
+        typeof snapshot.run_every === "number" && Number.isFinite(snapshot.run_every)
+          ? snapshot.run_every
+          : null,
+      inference_model: normalizeText(snapshot.inference_model),
+      snapshot,
+    });
+  }
+
+  return inventory;
 }
 
 function buildHubPipelinesStoredValue(
@@ -37406,6 +40077,7 @@ async function createCameraAlgorithmFromHubSnapshot(
     requestedRunningResolution,
     snapshot.model_fps
   );
+  const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
   const normalizedRegionsResult = normalizeAnalysisRegionsInput(
     Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
     {
@@ -37414,7 +40086,7 @@ async function createCameraAlgorithmFromHubSnapshot(
         alert_condition: promptParts.alert_condition,
         negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
       },
-      faceTargetIds: [],
+      faceTargetIds: requestedFaceTargetIds,
       negativeImageIds: [],
     }
   );
@@ -37438,11 +40110,12 @@ async function createCameraAlgorithmFromHubSnapshot(
          input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
          created_at, updated_at
        )
-       VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       cameraId,
       algorithmType,
+      normalizeJobStepOnlyCaptureOnMotion(snapshot.is_enabled, false) ? 1 : 0,
       promptParts.prompt_template,
       null,
       JSON.stringify(configJsonObject),
@@ -37469,6 +40142,172 @@ async function createCameraAlgorithmFromHubSnapshot(
   const algorithmId = Number(inserted.meta.last_row_id || 0);
   if (!Number.isInteger(algorithmId) || algorithmId <= 0) {
     throw new Error("Failed to install Hub agent into camera.");
+  }
+
+  if (requestedFaceTargetIds.length > 0) {
+    for (const faceTargetId of requestedFaceTargetIds) {
+      await db
+        .prepare(
+          `INSERT INTO camera_algorithm_face_targets (algorithm_id, face_target_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(algorithm_id, face_target_id) DO NOTHING`
+        )
+        .bind(algorithmId, faceTargetId, now, now)
+        .run();
+    }
+  }
+
+  await enqueueUpdateAlgorithmsIfCameraRunning(db, userId, cameraId);
+  return algorithmId;
+}
+
+async function updateCameraAlgorithmFromHubSnapshot(
+  db: D1Database,
+  userId: string,
+  cameraId: number,
+  algorithmId: number,
+  snapshot: HubAgentSnapshot
+): Promise<number> {
+  const ownedAlgorithm = await resolveOwnedCameraAlgorithmForUser(db, userId, algorithmId);
+  if (!ownedAlgorithm) {
+    throw new Error("Camera agent not found");
+  }
+  if (Number((ownedAlgorithm as any)?.camera_id) !== cameraId) {
+    throw new Error("Camera agent not found for this camera");
+  }
+
+  const existingAlgorithmType = normalizeText((ownedAlgorithm as any)?.algorithm_type);
+  if (!existingAlgorithmType.startsWith("custom_")) {
+    throw new Error("Only custom agents support this endpoint");
+  }
+
+  const promptParts = parsePromptTemplateParts(
+    snapshot.prompt_template,
+    snapshot.alert_condition,
+    snapshot.negative_condition
+  );
+  const requestedInputType = normalizeJobStepInputType(snapshot.input_type) || "video";
+  const requestedInferenceModel =
+    normalizeJobStepInferenceModel(snapshot.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL;
+  const requestedRunEvery = normalizeJobStepRunEverySeconds(
+    snapshot.run_every,
+    FIXED_JOB_STEP_RUN_EVERY_SECONDS
+  );
+  const requestedRunningResolution = normalizeJobStepRunningResolution(
+    snapshot.running_resolution,
+    DEFAULT_CORE_RUNNING_RESOLUTION
+  );
+  const execution = applyInferenceExecutionConstraints(
+    requestedInputType,
+    requestedInferenceModel,
+    requestedRunEvery,
+    requestedRunningResolution,
+    snapshot.model_fps
+  );
+  const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
+  const normalizedRegionsResult = normalizeAnalysisRegionsInput(
+    Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
+    {
+      promptParts: {
+        prompt_template: promptParts.prompt_template,
+        alert_condition: promptParts.alert_condition,
+        negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+      },
+      faceTargetIds: requestedFaceTargetIds,
+      negativeImageIds: [],
+    }
+  );
+  if (normalizedRegionsResult.error) {
+    throw new Error(normalizedRegionsResult.error);
+  }
+
+  let configJsonObject: Record<string, unknown> = {};
+  try {
+    const parsed =
+      typeof (ownedAlgorithm as any)?.config_json === "string"
+        ? JSON.parse(String((ownedAlgorithm as any).config_json))
+        : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      configJsonObject = { ...(parsed as Record<string, unknown>) };
+    }
+  } catch {
+    configJsonObject = {};
+  }
+  const requestedDisplayName = normalizeText(snapshot.display_name);
+  const existingConfigDisplayName = normalizeText(configJsonObject.display_name);
+  const preferredDisplayName =
+    requestedDisplayName && !isGeneratedCustomAgentName(requestedDisplayName)
+      ? requestedDisplayName
+      : "";
+  configJsonObject.display_name =
+    preferredDisplayName ||
+    existingConfigDisplayName ||
+    requestedDisplayName ||
+    existingAlgorithmType ||
+    "Hub Agent";
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE camera_algorithms
+       SET algorithm_type = ?,
+           is_enabled = ?,
+           llm_prompt = ?,
+           config_json = ?,
+           prompt_template = ?,
+           alert_condition = ?,
+           negative_condition = ?,
+           analysis_regions = ?,
+           input_type = ?,
+           video_packaging_mode = ?,
+           inference_model = ?,
+           model_fps = ?,
+           run_every = ?,
+           running_resolution = ?,
+           only_capture_on_motion = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      existingAlgorithmType,
+      normalizeJobStepOnlyCaptureOnMotion(snapshot.is_enabled, false) ? 1 : 0,
+      promptParts.prompt_template,
+      JSON.stringify(configJsonObject),
+      buildPromptTemplateFromParts({
+        prompt_template: promptParts.prompt_template,
+        alert_condition: promptParts.alert_condition,
+        negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+      }),
+      promptParts.alert_condition,
+      normalizeOptionalPromptText(promptParts.negative_condition),
+      JSON.stringify(normalizedRegionsResult.regions),
+      execution.inputType,
+      normalizeVideoPackagingMode(snapshot.video_packaging_mode),
+      execution.inferenceModel,
+      execution.modelFps,
+      execution.runEvery,
+      execution.runningResolution,
+      normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
+      now,
+      algorithmId
+    )
+    .run();
+
+  await db
+    .prepare("DELETE FROM camera_algorithm_face_targets WHERE algorithm_id = ?")
+    .bind(algorithmId)
+    .run();
+  if (requestedFaceTargetIds.length > 0) {
+    for (const faceTargetId of requestedFaceTargetIds) {
+      await db
+        .prepare(
+          `INSERT INTO camera_algorithm_face_targets (algorithm_id, face_target_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(algorithm_id, face_target_id) DO NOTHING`
+        )
+        .bind(algorithmId, faceTargetId, now, now)
+        .run();
+    }
   }
 
   await enqueueUpdateAlgorithmsIfCameraRunning(db, userId, cameraId);
@@ -37536,6 +40375,7 @@ async function upsertStepAgentFromHubSnapshot(
     requestedRunningResolution,
     snapshot.model_fps
   );
+  const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
   const normalizedAnalysisRegions = normalizeAnalysisRegionsInput(
     Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
     {
@@ -37544,7 +40384,7 @@ async function upsertStepAgentFromHubSnapshot(
         alert_condition: promptParts.alert_condition,
         negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
       },
-      faceTargetIds: [],
+      faceTargetIds: requestedFaceTargetIds,
       negativeImageIds: [],
     }
   );
@@ -37556,6 +40396,12 @@ async function upsertStepAgentFromHubSnapshot(
     : sanitizeAnalysisRegionsForLegacyFlow(normalizedAnalysisRegions.regions);
   const storedPromptTemplate = buildPromptTemplateFromParts(promptParts);
   const now = new Date().toISOString();
+  const storedDisplayName =
+    normalizeText(snapshot.display_name) || normalizeText(snapshot.agent_key) || "Hub Agent";
+  const storedSummary =
+    normalizeText(snapshot.summary) ||
+    normalizeText(promptParts.alert_condition) ||
+    "Reusable step agent";
 
   const existingAgent =
     cameraId === null
@@ -37615,7 +40461,12 @@ async function upsertStepAgentFromHubSnapshot(
         normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
         useTemporalContext ? 1 : 0,
         storedPromptTemplate,
-        JSON.stringify({ hub_item_id: hubItemId, hub_version_id: versionId }),
+        buildStoredJobStepAgentParams((existingAgent as any)?.params, {
+          hubItemId,
+          versionId,
+          displayName: storedDisplayName,
+          summary: storedSummary,
+        }),
         null,
         promptParts.alert_condition,
         normalizeOptionalPromptText(promptParts.negative_condition),
@@ -37624,6 +40475,23 @@ async function upsertStepAgentFromHubSnapshot(
         existingAgentId
       )
       .run();
+
+    await db
+      .prepare("DELETE FROM job_step_agent_face_targets WHERE agent_id = ?")
+      .bind(existingAgentId)
+      .run();
+    if (requestedFaceTargetIds.length > 0) {
+      for (const faceTargetId of requestedFaceTargetIds) {
+        await db
+          .prepare(
+            `INSERT INTO job_step_agent_face_targets (agent_id, face_target_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(agent_id, face_target_id) DO NOTHING`
+          )
+          .bind(existingAgentId, faceTargetId, now, now)
+          .run();
+      }
+    }
     return existingAgentId;
   }
 
@@ -37651,7 +40519,12 @@ async function upsertStepAgentFromHubSnapshot(
       normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
       useTemporalContext ? 1 : 0,
       storedPromptTemplate,
-      JSON.stringify({ hub_item_id: hubItemId, hub_version_id: versionId }),
+      buildStoredJobStepAgentParams(null, {
+        hubItemId,
+        versionId,
+        displayName: storedDisplayName,
+        summary: storedSummary,
+      }),
       null,
       promptParts.alert_condition,
       normalizeOptionalPromptText(promptParts.negative_condition),
@@ -37665,6 +40538,187 @@ async function upsertStepAgentFromHubSnapshot(
   if (!Number.isInteger(agentId) || agentId <= 0) {
     throw new Error("Failed to install Hub agent into step.");
   }
+  if (requestedFaceTargetIds.length > 0) {
+    for (const faceTargetId of requestedFaceTargetIds) {
+      await db
+        .prepare(
+          `INSERT INTO job_step_agent_face_targets (agent_id, face_target_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(agent_id, face_target_id) DO NOTHING`
+        )
+        .bind(agentId, faceTargetId, now, now)
+        .run();
+    }
+  }
+  return agentId;
+}
+
+async function updateStepAgentFromHubSnapshot(
+  db: D1Database,
+  userId: string,
+  stepId: number,
+  agentId: number,
+  snapshot: HubAgentSnapshot
+): Promise<number> {
+  const existingAgent = await resolveOwnedJobStepAgentForUser(db, userId, agentId);
+  if (!existingAgent) {
+    throw new Error("Step agent not found");
+  }
+  if (Number((existingAgent as any)?.step_id) !== stepId) {
+    throw new Error("Step agent not found for this step");
+  }
+
+  const step = await db
+    .prepare(
+      `SELECT js.*, j.user_id
+       FROM job_steps js
+       JOIN jobs j ON j.id = js.job_id
+       WHERE js.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+    .bind(stepId, userId)
+    .first();
+  if (!step) {
+    throw new Error("Step not found");
+  }
+
+  const existingCameraIdRaw = Number((existingAgent as any)?.camera_id || 0);
+  const existingCameraId =
+    Number.isInteger(existingCameraIdRaw) && existingCameraIdRaw > 0 ? existingCameraIdRaw : null;
+  if (existingCameraId !== null) {
+    const targetExists = await db
+      .prepare(`SELECT 1 FROM job_step_targets WHERE step_id = ? AND camera_id = ? LIMIT 1`)
+      .bind(stepId, existingCameraId)
+      .first();
+    if (!targetExists) {
+      throw new Error("Invalid camera target for step.");
+    }
+  }
+
+  const useTemporalContext = normalizeJobStepUseTemporalContext(
+    snapshot.use_temporal_context,
+    true
+  );
+  const promptParts = parsePromptTemplatePartsForJobStepTemporalMode(
+    snapshot.prompt_template,
+    snapshot.alert_condition,
+    snapshot.negative_condition,
+    useTemporalContext
+  );
+  const requestedInputType = normalizeJobStepInputType(snapshot.input_type) || "video";
+  const requestedInferenceModel =
+    normalizeJobStepInferenceModel(snapshot.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL;
+  const requestedRunEvery = normalizeJobStepRunEverySeconds(
+    snapshot.run_every,
+    FIXED_JOB_STEP_RUN_EVERY_SECONDS
+  );
+  const requestedRunningResolution = normalizeJobStepRunningResolution(
+    snapshot.running_resolution,
+    DEFAULT_CORE_RUNNING_RESOLUTION
+  );
+  const execution = applyInferenceExecutionConstraints(
+    requestedInputType,
+    requestedInferenceModel,
+    requestedRunEvery,
+    requestedRunningResolution,
+    snapshot.model_fps
+  );
+  const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
+  const normalizedAnalysisRegions = normalizeAnalysisRegionsInput(
+    Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
+    {
+      promptParts: {
+        prompt_template: promptParts.prompt_template,
+        alert_condition: promptParts.alert_condition,
+        negative_condition: normalizeOptionalPromptText(promptParts.negative_condition),
+      },
+      faceTargetIds: requestedFaceTargetIds,
+      negativeImageIds: [],
+    }
+  );
+  if (normalizedAnalysisRegions.error) {
+    throw new Error(normalizedAnalysisRegions.error);
+  }
+
+  const stableAgentKey =
+    normalizeText((existingAgent as any)?.agent_key) ||
+    normalizeText(snapshot.agent_key) ||
+    "custom_template";
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE job_step_agents
+       SET agent_key = ?,
+           priority_level = ?,
+           input_type = ?,
+           video_packaging_mode = ?,
+           inference_model = ?,
+           model_fps = ?,
+           run_every = ?,
+           running_resolution = ?,
+           only_capture_on_motion = ?,
+           use_temporal_context = ?,
+           prompt_template = ?,
+           params = ?,
+           alert_condition = ?,
+           negative_condition = ?,
+           analysis_regions = ?,
+           is_active = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      stableAgentKey,
+      "MEDIUM",
+      execution.inputType,
+      normalizeVideoPackagingMode(snapshot.video_packaging_mode),
+      execution.inferenceModel,
+      execution.modelFps,
+      execution.runEvery,
+      execution.runningResolution,
+      normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
+      useTemporalContext ? 1 : 0,
+      buildPromptTemplateFromParts(promptParts),
+      buildStoredJobStepAgentParams((existingAgent as any)?.params, {
+        displayName:
+          normalizeText(snapshot.display_name) ||
+          getStoredJobStepAgentDisplayName(existingAgent) ||
+          stableAgentKey,
+        summary:
+          normalizeText(snapshot.summary) ||
+          normalizeText(promptParts.alert_condition) ||
+          getStoredJobStepAgentSummary(existingAgent),
+      }),
+      promptParts.alert_condition,
+      normalizeOptionalPromptText(promptParts.negative_condition),
+      JSON.stringify(
+        useTemporalContext
+          ? normalizedAnalysisRegions.regions
+          : sanitizeAnalysisRegionsForLegacyFlow(normalizedAnalysisRegions.regions)
+      ),
+      normalizeJobStepOnlyCaptureOnMotion(snapshot.is_enabled, true) ? 1 : 0,
+      now,
+      agentId
+    )
+    .run();
+
+  await db
+    .prepare("DELETE FROM job_step_agent_face_targets WHERE agent_id = ?")
+    .bind(agentId)
+    .run();
+  if (requestedFaceTargetIds.length > 0) {
+    for (const faceTargetId of requestedFaceTargetIds) {
+      await db
+        .prepare(
+          `INSERT INTO job_step_agent_face_targets (agent_id, face_target_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(agent_id, face_target_id) DO NOTHING`
+        )
+        .bind(agentId, faceTargetId, now, now)
+        .run();
+    }
+  }
+
   return agentId;
 }
 
@@ -39667,8 +42721,15 @@ app.get("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       rawRunningResolution,
       agent?.model_fps
     );
+    const paramsObject = parseJobStepAgentParamsObject(agent?.params);
     return {
       ...agent,
+      params:
+        typeof agent?.params === "string" && agent.params.trim()
+          ? agent.params
+          : JSON.stringify(paramsObject),
+      display_name: getStoredJobStepAgentDisplayName(agent),
+      summary: getStoredJobStepAgentSummary(agent),
       input_type: execution.inputType,
       video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
       inference_model: execution.inferenceModel,
@@ -39740,6 +42801,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   const now = new Date().toISOString();
   const cameraId = body.camera_id ?? null;
   const normalizedAgentKey = String(body.agent_key || "").trim().toLowerCase();
+  const requestedParamsObject = parseJobStepAgentParamsObject(body.params);
   const isFaceIdAgent =
     normalizedAgentKey === "faceid" ||
     normalizedAgentKey === "face_id" ||
@@ -39945,6 +43007,23 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       useTemporalContext
     );
     const storedPromptTemplate = buildPromptTemplateFromParts(normalizedPromptParts);
+    const storedParams = buildStoredJobStepAgentParams(
+      {
+        ...parseJobStepAgentParamsObject((existingAgent as any)?.params),
+        ...requestedParamsObject,
+      },
+      {
+        displayName:
+          normalizeText(requestedParamsObject.display_name) ||
+          getStoredJobStepAgentDisplayName(existingAgent) ||
+          normalizeText(body.agent_key) ||
+          "Hub Agent",
+        summary:
+          normalizeText(requestedParamsObject.summary) ||
+          normalizeText(normalizedPromptParts.alert_condition) ||
+          getStoredJobStepAgentSummary(existingAgent),
+      }
+    );
     let analysisRegionsToStore: string | null = (existingAgent as any)?.analysis_regions ?? null;
     if (requestedAnalysisRegionsRaw !== undefined) {
       const normalizedAnalysisRegions = normalizeAnalysisRegionsInput(
@@ -40072,7 +43151,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
         onlyCaptureOnMotion ? 1 : 0,
         useTemporalContext ? 1 : 0,
         storedPromptTemplate,
-        body.params || null,
+        storedParams,
         body.input_schema || null,
         normalizedPromptParts.alert_condition,
         analysisRegionsToStore,
@@ -40140,6 +43219,9 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     );
     const responseAgent = {
       ...(agent as any),
+      params: storedParams,
+      display_name: getStoredJobStepAgentDisplayName(agent),
+      summary: getStoredJobStepAgentSummary(agent),
       ...(() => {
         const rawInputType = normalizeJobStepInputType((agent as any)?.input_type) || "video";
         const rawInferenceModel =
@@ -40253,6 +43335,16 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     useTemporalContext
   );
   const storedPromptTemplate = buildPromptTemplateFromParts(normalizedPromptParts);
+  const storedParams = buildStoredJobStepAgentParams(requestedParamsObject, {
+    displayName:
+      normalizeText(requestedParamsObject.display_name) ||
+      normalizeText(body.agent_key) ||
+      "Hub Agent",
+    summary:
+      normalizeText(requestedParamsObject.summary) ||
+      normalizeText(normalizedPromptParts.alert_condition) ||
+      "Reusable step agent",
+  });
   const insertFaceTargetIds = requestedFaceTargetIds || [];
   let insertAnalysisRegionsJson: string | null = null;
   if (requestedAnalysisRegionsRaw !== undefined) {
@@ -40297,7 +43389,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       onlyCaptureOnMotion ? 1 : 0,
       useTemporalContext ? 1 : 0,
       storedPromptTemplate,
-      body.params || null,
+      storedParams,
       body.input_schema || null,
       normalizedPromptParts.alert_condition,
       insertAnalysisRegionsJson,
@@ -40353,6 +43445,9 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   });
   const responseAgent = {
     ...(agent as any),
+    params: storedParams,
+    display_name: getStoredJobStepAgentDisplayName(agent),
+    summary: getStoredJobStepAgentSummary(agent),
     ...(() => {
       const rawInputType = normalizeJobStepInputType((agent as any)?.input_type) || "video";
       const rawInferenceModel =

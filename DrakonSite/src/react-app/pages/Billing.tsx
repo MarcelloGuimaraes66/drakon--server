@@ -287,13 +287,13 @@ export default function Billing() {
         }}
       />
 
-      <div className="max-w-6xl mx-auto">
+      <div className="max-w-6xl">
         {/* Header */}
         <div className="mb-6 md:mb-8">
-          <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">
+          <h1 className="text-2xl font-bold text-gray-100">
             {t("billing.title")}
           </h1>
-          <p className="text-sm md:text-base text-gray-400">{t("billing.subtitle")}</p>
+          <p className="mt-1.5 text-sm text-gray-400">{t("billing.subtitle")}</p>
         </div>
 
         {/* Subscription */}

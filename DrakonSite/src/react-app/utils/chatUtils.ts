@@ -1,5 +1,6 @@
 import { ChatMessage } from "@/shared/types";
 import type { CameraImportApplyResult, CameraImportPreview } from "@/shared/cameraImport";
+import type { CameraBatchEditApplyResult, CameraBatchEditPreview } from "@/shared/cameraBatchEdit";
 import type { CameraDiscoverySummary } from "@/shared/cameraDiscovery";
 
 export interface ChatProgressInfo {
@@ -55,6 +56,16 @@ export interface CameraBatchRegistrationDraftMessageMetadata {
   apply_result?: CameraImportApplyResult | null;
 }
 
+export interface CameraBatchEditDraftMessageMetadata {
+  type: "camera_batch_edit_draft";
+  status: "awaiting_confirmation" | "updated";
+  language?: string;
+  preview: CameraBatchEditPreview;
+  patch_body?: Record<string, unknown>;
+  target_client_id?: string | null;
+  apply_result?: CameraBatchEditApplyResult | null;
+}
+
 export interface CameraEditFormRequestMessageMetadata {
   type: "camera_edit_form_request";
   status: "awaiting_form_open";
@@ -63,6 +74,75 @@ export interface CameraEditFormRequestMessageMetadata {
   camera_name?: string | null;
   draft_patch?: Record<string, unknown>;
   clear_fields?: string[];
+}
+
+export interface CameraAgentFormEditorTarget {
+  type: "camera" | "step_default" | "step_camera";
+  camera_id?: number;
+  camera_name?: string | null;
+  step_id?: number;
+  step_title?: string | null;
+  job_id?: number;
+  job_name?: string | null;
+}
+
+export interface CameraAgentFormRequestMessageMetadata {
+  type: "camera_agent_form_request";
+  status: "awaiting_form_open";
+  language?: string;
+  camera_id?: number;
+  camera_name?: string | null;
+  agent_id?: number;
+  editor_target?: CameraAgentFormEditorTarget;
+  draft_agent?: Record<string, unknown>;
+}
+
+export interface CameraAgentCreationDestinationMetadata {
+  destination_type: "camera" | "step_default" | "step_camera";
+  label: string;
+  agent_id?: number;
+  camera_id?: number;
+  camera_name?: string | null;
+  step_id?: number;
+  step_title?: string | null;
+  job_id?: number;
+  job_name?: string | null;
+}
+
+export interface CameraAgentCreationResultMessageMetadata {
+  type: "camera_agent_creation_result";
+  status: "created" | "partially_created";
+  language?: string;
+  agent_name?: string | null;
+  created_destinations: CameraAgentCreationDestinationMetadata[];
+}
+
+export interface CameraAgentEditContextMessageMetadata {
+  type: "camera_agent_edit_context";
+  status: "awaiting_changes";
+  language?: string;
+  agent_id?: number;
+  agent_name?: string | null;
+  agent_summary?: string | null;
+  editor_target?: CameraAgentFormEditorTarget;
+}
+
+export interface CameraAgentUpdatedFieldMetadata {
+  field: string;
+  label?: string | null;
+  before?: string | null;
+  after?: string | null;
+}
+
+export interface CameraAgentUpdateResultMessageMetadata {
+  type: "camera_agent_update_result";
+  status: "updated";
+  language?: string;
+  agent_id?: number;
+  agent_name?: string | null;
+  agent_summary?: string | null;
+  editor_target?: CameraAgentFormEditorTarget;
+  updated_fields: CameraAgentUpdatedFieldMetadata[];
 }
 
 const TEMPORAL_ENGINE_SUFFIX_PATTERN =
@@ -87,6 +167,80 @@ const LARGE_PARAGRAPH_MIN_LENGTH = 220;
 const TARGET_PARAGRAPH_LENGTH = 210;
 const MAX_PARAGRAPH_LENGTH = 320;
 const MAX_SENTENCES_PER_PARAGRAPH = 2;
+const GENERATED_CUSTOM_AGENT_NAME_PATTERN = /^custom_(?:hub_)?\d+[a-z0-9_-]*$/i;
+
+function parseCameraAgentEditorTarget(
+  parsed: Record<string, unknown>
+): CameraAgentFormEditorTarget | undefined {
+  let editorTarget: CameraAgentFormEditorTarget | undefined;
+
+  if (
+    parsed.editor_target &&
+    typeof parsed.editor_target === "object" &&
+    !Array.isArray(parsed.editor_target)
+  ) {
+    const rawTarget = parsed.editor_target as Record<string, unknown>;
+    const targetType =
+      rawTarget.type === "camera" ||
+      rawTarget.type === "step_default" ||
+      rawTarget.type === "step_camera"
+        ? rawTarget.type
+        : null;
+    if (targetType) {
+      const cameraId = Number(rawTarget.camera_id);
+      const stepId = Number(rawTarget.step_id);
+      const jobId = Number(rawTarget.job_id);
+      editorTarget = {
+        type: targetType,
+        camera_id: Number.isInteger(cameraId) && cameraId > 0 ? cameraId : undefined,
+        camera_name:
+          typeof rawTarget.camera_name === "string" ? rawTarget.camera_name : undefined,
+        step_id: Number.isInteger(stepId) && stepId > 0 ? stepId : undefined,
+        step_title:
+          typeof rawTarget.step_title === "string" ? rawTarget.step_title : undefined,
+        job_id: Number.isInteger(jobId) && jobId > 0 ? jobId : undefined,
+        job_name:
+          typeof rawTarget.job_name === "string" ? rawTarget.job_name : undefined,
+      };
+    }
+  }
+
+  const legacyCameraId = Number(parsed.camera_id);
+  if (!editorTarget && Number.isInteger(legacyCameraId) && legacyCameraId > 0) {
+    editorTarget = {
+      type: "camera",
+      camera_id: legacyCameraId,
+      camera_name:
+        typeof parsed.camera_name === "string" ? parsed.camera_name : undefined,
+    };
+  }
+
+  return editorTarget;
+}
+
+function readAgentDraftConfigString(
+  draft: Record<string, unknown>,
+  key: string
+): string {
+  const configJson = draft.config_json;
+  if (!configJson || typeof configJson !== "object" || Array.isArray(configJson)) {
+    return "";
+  }
+  const value = (configJson as Record<string, unknown>)[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readAgentDraftString(draft: Record<string, unknown>, key: string): string {
+  const value = draft[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+export function isGeneratedCustomAgentName(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim();
+  if (!normalized) return false;
+  return GENERATED_CUSTOM_AGENT_NAME_PATTERN.test(normalized);
+}
 
 export function stripTemporalEngineDiagnostics(content: string): string {
   if (!content) return content;
@@ -617,6 +771,57 @@ export function extractCameraBatchRegistrationDraftFromMessage(
   };
 }
 
+export function extractCameraBatchEditDraftFromMessage(
+  message: ChatMessage
+): CameraBatchEditDraftMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_batch_edit_draft") {
+    return null;
+  }
+
+  if (!parsed.preview || typeof parsed.preview !== "object" || Array.isArray(parsed.preview)) {
+    return null;
+  }
+
+  return {
+    type: "camera_batch_edit_draft",
+    status: parsed.status === "updated" ? "updated" : "awaiting_confirmation",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    preview: parsed.preview as CameraBatchEditPreview,
+    patch_body:
+      parsed.patch_body &&
+      typeof parsed.patch_body === "object" &&
+      !Array.isArray(parsed.patch_body)
+        ? (parsed.patch_body as Record<string, unknown>)
+        : undefined,
+    target_client_id:
+      typeof parsed.target_client_id === "string" ? parsed.target_client_id : undefined,
+    apply_result:
+      parsed.apply_result &&
+      typeof parsed.apply_result === "object" &&
+      !Array.isArray(parsed.apply_result)
+        ? (parsed.apply_result as CameraBatchEditApplyResult)
+        : undefined,
+  };
+}
+
 export function extractCameraEditFormRequestFromMessage(
   message: ChatMessage
 ): CameraEditFormRequestMessageMetadata | null {
@@ -663,6 +868,354 @@ export function extractCameraEditFormRequestFromMessage(
     clear_fields: Array.isArray(parsed.clear_fields)
       ? parsed.clear_fields.filter((entry: unknown): entry is string => typeof entry === "string")
       : [],
+  };
+}
+
+export function extractCameraAgentFormRequestFromMessage(
+  message: ChatMessage
+): CameraAgentFormRequestMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_agent_form_request" || parsed.status !== "awaiting_form_open") {
+    return null;
+  }
+
+  const editorTarget = parseCameraAgentEditorTarget(parsed as Record<string, unknown>);
+  if (!editorTarget) {
+    return null;
+  }
+
+  const agentId = Number(parsed.agent_id);
+
+  return {
+    type: "camera_agent_form_request",
+    status: "awaiting_form_open",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    camera_id: editorTarget.camera_id,
+    camera_name:
+      typeof parsed.camera_name === "string"
+        ? parsed.camera_name
+        : editorTarget.camera_name,
+    agent_id: Number.isInteger(agentId) && agentId > 0 ? agentId : undefined,
+    editor_target: editorTarget,
+    draft_agent:
+      parsed.draft_agent &&
+      typeof parsed.draft_agent === "object" &&
+      !Array.isArray(parsed.draft_agent)
+        ? (parsed.draft_agent as Record<string, unknown>)
+        : {},
+  };
+}
+
+export function extractCameraAgentEditContextFromMessage(
+  message: ChatMessage
+): CameraAgentEditContextMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_agent_edit_context" || parsed.status !== "awaiting_changes") {
+    return null;
+  }
+
+  const editorTarget = parseCameraAgentEditorTarget(parsed as Record<string, unknown>);
+  if (!editorTarget) {
+    return null;
+  }
+
+  const agentId = Number(parsed.agent_id);
+
+  return {
+    type: "camera_agent_edit_context",
+    status: "awaiting_changes",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    agent_id: Number.isInteger(agentId) && agentId > 0 ? agentId : undefined,
+    agent_name: typeof parsed.agent_name === "string" ? parsed.agent_name : undefined,
+    agent_summary: typeof parsed.agent_summary === "string" ? parsed.agent_summary : undefined,
+    editor_target: editorTarget,
+  };
+}
+
+export function extractCameraAgentUpdateResultFromMessage(
+  message: ChatMessage
+): CameraAgentUpdateResultMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_agent_update_result" || parsed.status !== "updated") {
+    return null;
+  }
+
+  const editorTarget = parseCameraAgentEditorTarget(parsed as Record<string, unknown>);
+  if (!editorTarget) {
+    return null;
+  }
+
+  const updatedFields = Array.isArray(parsed.updated_fields)
+    ? parsed.updated_fields
+        .map((entry: unknown): CameraAgentUpdatedFieldMetadata | null => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null;
+          }
+          const row = entry as Record<string, unknown>;
+          const field =
+            typeof row.field === "string" && row.field.trim() ? row.field.trim() : "";
+          if (!field) {
+            return null;
+          }
+          return {
+            field,
+            label: typeof row.label === "string" ? row.label : undefined,
+            before: typeof row.before === "string" ? row.before : undefined,
+            after: typeof row.after === "string" ? row.after : undefined,
+          };
+        })
+        .filter(
+          (
+            entry: CameraAgentUpdatedFieldMetadata | null
+          ): entry is CameraAgentUpdatedFieldMetadata => entry !== null
+        )
+    : [];
+
+  const agentId = Number(parsed.agent_id);
+
+  return {
+    type: "camera_agent_update_result",
+    status: "updated",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    agent_id: Number.isInteger(agentId) && agentId > 0 ? agentId : undefined,
+    agent_name: typeof parsed.agent_name === "string" ? parsed.agent_name : undefined,
+    agent_summary: typeof parsed.agent_summary === "string" ? parsed.agent_summary : undefined,
+    editor_target: editorTarget,
+    updated_fields: updatedFields,
+  };
+}
+
+export function extractCameraAgentCreationResultFromMessage(
+  message: ChatMessage
+): CameraAgentCreationResultMessageMetadata | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: any = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  if (parsed.type !== "camera_agent_creation_result") {
+    return null;
+  }
+
+  const createdDestinationsRaw = Array.isArray(parsed.created_destinations)
+    ? parsed.created_destinations
+    : [];
+
+  const createdDestinations = createdDestinationsRaw
+    .map((entry: any): CameraAgentCreationDestinationMetadata | null => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+
+      const destinationType =
+        entry.destination_type === "camera" ||
+        entry.destination_type === "step_default" ||
+        entry.destination_type === "step_camera"
+          ? entry.destination_type
+          : null;
+      const label =
+        typeof entry.label === "string" && entry.label.trim()
+          ? entry.label.trim()
+          : "";
+
+      if (!destinationType || !label) {
+        return null;
+      }
+
+      const agentId = Number(entry.agent_id);
+      const cameraId = Number(entry.camera_id);
+      const stepId = Number(entry.step_id);
+      const jobId = Number(entry.job_id);
+
+      return {
+        destination_type: destinationType,
+        label,
+        agent_id: Number.isInteger(agentId) && agentId > 0 ? agentId : undefined,
+        camera_id: Number.isInteger(cameraId) && cameraId > 0 ? cameraId : undefined,
+        camera_name:
+          typeof entry.camera_name === "string" ? entry.camera_name : undefined,
+        step_id: Number.isInteger(stepId) && stepId > 0 ? stepId : undefined,
+        step_title:
+          typeof entry.step_title === "string" ? entry.step_title : undefined,
+        job_id: Number.isInteger(jobId) && jobId > 0 ? jobId : undefined,
+        job_name:
+          typeof entry.job_name === "string" ? entry.job_name : undefined,
+      };
+    })
+    .filter(
+      (
+        entry: CameraAgentCreationDestinationMetadata | null
+      ): entry is CameraAgentCreationDestinationMetadata => entry !== null
+    );
+
+  if (createdDestinations.length === 0) {
+    return null;
+  }
+
+  return {
+    type: "camera_agent_creation_result",
+    status:
+      parsed.status === "partially_created" ? "partially_created" : "created",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    agent_name:
+      typeof parsed.agent_name === "string" ? parsed.agent_name : undefined,
+    created_destinations: createdDestinations,
+  };
+}
+
+export function buildCameraAgentDraftForEditor(
+  metadata: CameraAgentFormRequestMessageMetadata
+): Record<string, unknown> {
+  const draft = metadata.draft_agent && typeof metadata.draft_agent === "object"
+    ? metadata.draft_agent
+    : {};
+  const faceTargetIds = Array.isArray(draft.face_target_ids)
+    ? draft.face_target_ids
+        .map((entry) => Number(entry))
+        .filter((entry) => Number.isInteger(entry) && entry > 0)
+    : [];
+  const analysisRegions = Array.isArray(draft.analysis_regions) ? draft.analysis_regions : [];
+  const directDisplayName = readAgentDraftString(draft, "display_name");
+  const configDisplayName = readAgentDraftConfigString(draft, "display_name");
+  const summary = readAgentDraftString(draft, "summary") || readAgentDraftConfigString(draft, "summary");
+  const alertCondition = readAgentDraftString(draft, "alert_condition");
+  const preferredDisplayName =
+    (directDisplayName && !isGeneratedCustomAgentName(directDisplayName) ? directDisplayName : "") ||
+    (configDisplayName && !isGeneratedCustomAgentName(configDisplayName) ? configDisplayName : "") ||
+    summary ||
+    alertCondition ||
+    directDisplayName ||
+    configDisplayName ||
+    "agent";
+  const displayName =
+    preferredDisplayName;
+  const existingId =
+    typeof draft.id === "number" && Number.isInteger(draft.id) && draft.id > 0
+      ? draft.id
+      : typeof metadata.agent_id === "number" &&
+          Number.isInteger(metadata.agent_id) &&
+          metadata.agent_id > 0
+        ? metadata.agent_id
+      : typeof draft.id === "string"
+        ? Number.parseInt(draft.id, 10)
+        : typeof (draft as { algorithm_id?: unknown }).algorithm_id === "number" &&
+            Number.isInteger((draft as { algorithm_id?: number }).algorithm_id) &&
+            Number((draft as { algorithm_id?: number }).algorithm_id) > 0
+          ? Number((draft as { algorithm_id?: number }).algorithm_id)
+          : typeof (draft as { algorithm_id?: unknown }).algorithm_id === "string"
+            ? Number.parseInt(
+                String((draft as { algorithm_id?: unknown }).algorithm_id),
+                10
+              )
+            : 0;
+
+  return {
+    id: Number.isInteger(existingId) && existingId > 0 ? existingId : 0,
+    algorithm_type:
+      typeof draft.agent_key === "string" && draft.agent_key.trim()
+        ? draft.agent_key.trim()
+        : "custom_template",
+    is_enabled:
+      typeof draft.is_enabled === "boolean"
+        ? draft.is_enabled
+        : typeof draft.is_enabled === "number"
+          ? draft.is_enabled !== 0
+          : true,
+    input_type:
+      typeof draft.input_type === "string" ? draft.input_type : undefined,
+    video_packaging_mode:
+      typeof draft.video_packaging_mode === "string" ? draft.video_packaging_mode : undefined,
+    inference_model:
+      typeof draft.inference_model === "string" ? draft.inference_model : undefined,
+    model_fps:
+      typeof draft.model_fps === "number" ? draft.model_fps : undefined,
+    run_every:
+      typeof draft.run_every === "number" ? draft.run_every : undefined,
+    running_resolution:
+      typeof draft.running_resolution === "number" ? draft.running_resolution : undefined,
+    only_capture_on_motion:
+      typeof draft.only_capture_on_motion === "boolean"
+        ? draft.only_capture_on_motion
+        : typeof draft.only_capture_on_motion === "number"
+          ? draft.only_capture_on_motion !== 0
+          : undefined,
+    prompt_template:
+      typeof draft.prompt_template === "string" ? draft.prompt_template : "",
+    alert_condition:
+      typeof draft.alert_condition === "string" ? draft.alert_condition : "",
+    negative_condition:
+      typeof draft.negative_condition === "string" ? draft.negative_condition : "",
+    face_target_ids: faceTargetIds,
+    negative_reference_images: [],
+    analysis_regions: analysisRegions,
+    config_json: {
+      display_name: displayName,
+      summary,
+    },
   };
 }
 

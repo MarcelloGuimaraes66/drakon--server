@@ -27,6 +27,7 @@ interface ChatInputProps {
   disabled?: boolean;
   isRunning?: boolean;
   placeholder?: string;
+  textareaId?: string;
   className?: string;
   variant?: "default" | "chat-page";
   uploadedImage?: string | null;
@@ -45,6 +46,7 @@ export default function ChatInput({
   disabled = false,
   isRunning = false,
   placeholder = "Ask about your cameras...",
+  textareaId,
   className = "",
   variant = "default",
   uploadedImage = null,
@@ -391,6 +393,7 @@ export default function ChatInput({
           </div>
 
           <textarea
+            id={textareaId}
             ref={textareaRef}
             value={value}
             onChange={handleTextChange}

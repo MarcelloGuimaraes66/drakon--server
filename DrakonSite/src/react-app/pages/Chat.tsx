@@ -7,9 +7,19 @@ import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
+import ChatCameraBatchEditCard from "@/react-app/components/ChatCameraBatchEditCard";
 import ChatCameraEditCard from "@/react-app/components/ChatCameraEditCard";
+import ChatCameraAgentCard from "@/react-app/components/ChatCameraAgentCard";
+import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCreatedCard";
+import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
+import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
+import CameraCustomAgentEditorModal, {
+  type CameraAgentEditorTarget,
+  type CameraCustomAgentRow,
+  type ToastVariant,
+} from "@/react-app/components/CameraCustomAgentEditorModal";
 import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
@@ -21,13 +31,20 @@ import { ChatMessage, ChatSession } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
 import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lucide-react";
 import {
+  type CameraAgentFormRequestMessageMetadata,
   type CameraEditFormRequestMessageMetadata,
-  extractHitMediaFromMessage,
-  extractCameraEditFormRequestFromMessage,
+   extractCameraAgentCreationResultFromMessage,
+   extractCameraAgentEditContextFromMessage,
+   extractHitMediaFromMessage,
+   extractCameraAgentFormRequestFromMessage,
+   extractCameraAgentUpdateResultFromMessage,
+   extractCameraEditFormRequestFromMessage,
   extractCameraNetworkScanFromMessage,
+  extractCameraBatchEditDraftFromMessage,
   extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
   applyCameraEditDraftToCamera,
+  buildCameraAgentDraftForEditor,
   extractChatProgressFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
@@ -43,6 +60,9 @@ const DEFAULT_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
+const CHAT_VISUAL_TYPING_ENABLED = true;
+const CHAT_VISUAL_TYPING_MESSAGE_TYPES = new Set(["final"]);
+const CHAT_PAGE_TEXTAREA_ID = "chat-page-message-input";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {
   if (typeof value !== "string") return DEFAULT_CHAT_MODEL_TIER;
@@ -53,6 +73,15 @@ function normalizeChatModelTier(value: string | null | undefined): ChatModelTier
   if (normalized === "core") return "core";
   if (normalized === "light") return "light";
   return "ultra";
+}
+
+function getAssistantRevealId(message: ChatMessage): string {
+  return [
+    message.id,
+    message.message_type || "",
+    message.updated_at || "",
+    message.content.length,
+  ].join(":");
 }
 
 export default function Chat() {
@@ -87,6 +116,9 @@ export default function Chat() {
   } | null>(null);
   const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
   const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
+  const [chatAgentModalTarget, setChatAgentModalTarget] = useState<CameraAgentEditorTarget | null>(null);
+  const [chatAgentModalInitialAgent, setChatAgentModalInitialAgent] = useState<CameraCustomAgentRow | null>(null);
+  const [isChatAgentModalOpen, setIsChatAgentModalOpen] = useState(false);
   const [openHeaderDropdown, setOpenHeaderDropdown] = useState<ChatHeaderDropdown>(null);
   const [isHeaderGhostedWhileScrolling, setIsHeaderGhostedWhileScrolling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -95,6 +127,13 @@ export default function Chat() {
   const emptyCamerasRef = useRef<any[]>([]);
   const previousMessageCountRef = useRef(0);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const shouldAutoScrollRef = useRef(true);
+  const previousMessageMetaRef = useRef(
+    new Map<number, { isPending: boolean; revealId: string; messageType: string | null }>(),
+  );
+  const animatedRevealIdsRef = useRef<Set<string>>(new Set());
+  const revealScrollFrameRef = useRef<number | null>(null);
+  const [activeRevealId, setActiveRevealId] = useState<string | null>(null);
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(
     emptyCamerasRef.current,
   );
@@ -108,7 +147,7 @@ export default function Chat() {
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
   }, []);
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, cancelMessage } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, submitCameraBatchEdit, cancelMessage } = usePerceptrumChatSession({
     sessionId: activeSessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -149,14 +188,56 @@ export default function Chat() {
     setIsChatEditModalOpen(true);
   };
 
+  const openChatAgentForm = async (
+    metadata: CameraAgentFormRequestMessageMetadata
+  ) => {
+    const target = metadata.editor_target ?? null;
+    const hasValidTarget =
+      !!target &&
+      (
+        (target.type === "camera" && Number.isInteger(target.camera_id) && Number(target.camera_id) > 0) ||
+        (target.type === "step_default" && Number.isInteger(target.step_id) && Number(target.step_id) > 0) ||
+        (target.type === "step_camera" &&
+          Number.isInteger(target.step_id) &&
+          Number(target.step_id) > 0 &&
+          Number.isInteger(target.camera_id) &&
+          Number(target.camera_id) > 0)
+      );
+
+    if (!hasValidTarget) {
+      throw new Error("Invalid agent target selected for the form.");
+    }
+
+    setChatAgentModalTarget(target);
+    setChatAgentModalInitialAgent(
+      buildCameraAgentDraftForEditor(metadata) as unknown as CameraCustomAgentRow
+    );
+    setIsChatAgentModalOpen(true);
+  };
+
   useEffect(() => {
     return () => {
       if (headerGhostTimeoutRef.current) {
         clearTimeout(headerGhostTimeoutRef.current);
         headerGhostTimeoutRef.current = null;
       }
+
+      if (revealScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(revealScrollFrameRef.current);
+        revealScrollFrameRef.current = null;
+      }
     };
   }, []);
+
+  useEffect(() => {
+    shouldAutoScrollRef.current = shouldAutoScroll;
+  }, [shouldAutoScroll]);
+
+  useEffect(() => {
+    previousMessageMetaRef.current = new Map();
+    animatedRevealIdsRef.current = new Set();
+    setActiveRevealId(null);
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (activeSessionId) {
@@ -179,6 +260,64 @@ export default function Chat() {
       scrollToBottom();
     }
   }, [messages, shouldAutoScroll]);
+
+  useEffect(() => {
+    const previousMessageMeta = previousMessageMetaRef.current;
+    const nextMessageMeta = new Map<number, { isPending: boolean; revealId: string; messageType: string | null }>();
+    let nextRevealId: string | null = null;
+
+    for (const message of messages) {
+      const isPending = Number((message as any).is_pending || 0) === 1;
+      const revealId = getAssistantRevealId(message);
+      const messageType = typeof message.message_type === "string" ? message.message_type.toLowerCase() : null;
+
+      nextMessageMeta.set(message.id, {
+        isPending,
+        revealId,
+        messageType,
+      });
+
+      if (!CHAT_VISUAL_TYPING_ENABLED) {
+        continue;
+      }
+
+      const wasPending = previousMessageMeta.get(message.id)?.isPending === true;
+      const isEligibleForReveal =
+        message.role === "assistant" &&
+        !isPending &&
+        typeof message.content === "string" &&
+        message.content.trim().length > 0 &&
+        Boolean(messageType && CHAT_VISUAL_TYPING_MESSAGE_TYPES.has(messageType)) &&
+        wasPending;
+
+      if (!isEligibleForReveal || animatedRevealIdsRef.current.has(revealId)) {
+        continue;
+      }
+
+      animatedRevealIdsRef.current.add(revealId);
+
+      if (shouldAutoScrollRef.current) {
+        nextRevealId = revealId;
+      }
+    }
+
+    previousMessageMetaRef.current = nextMessageMeta;
+
+    setActiveRevealId((currentRevealId) => {
+      if (nextRevealId) {
+        return nextRevealId;
+      }
+
+      if (
+        currentRevealId &&
+        !messages.some((message) => getAssistantRevealId(message) === currentRevealId)
+      ) {
+        return null;
+      }
+
+      return currentRevealId;
+    });
+  }, [messages]);
 
   const fetchSessions = async ({
     preferredSessionId = null,
@@ -251,6 +390,26 @@ export default function Chat() {
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "auto" });
+  };
+
+  const scheduleRevealAutoScroll = () => {
+    if (!shouldAutoScrollRef.current) {
+      return;
+    }
+
+    if (revealScrollFrameRef.current !== null) {
+      return;
+    }
+
+    revealScrollFrameRef.current = window.requestAnimationFrame(() => {
+      revealScrollFrameRef.current = null;
+      scrollToBottom();
+    });
+  };
+
+  const handleRevealComplete = (revealId: string) => {
+    setActiveRevealId((currentRevealId) => (currentRevealId === revealId ? null : currentRevealId));
+    scheduleRevealAutoScroll();
   };
 
   const markHeaderAsActivelyScrolling = () => {
@@ -488,10 +647,32 @@ export default function Chat() {
   };
 
   const starterPrompts = [
-    "What's happening in the entrance camera?",
-    "Is anyone wearing a mask in all cameras?",
-    "Search for intruders in the parking lot",
+    {
+      id: "chat.starterPrompt.scanNetwork",
+      text: t("chat.starterPrompt.scanNetwork"),
+    },
+    {
+      id: "chat.starterPrompt.createAgent",
+      text: t("chat.starterPrompt.createAgent"),
+    },
+    {
+      id: "chat.starterPrompt.searchRedCar",
+      text: t("chat.starterPrompt.searchRedCar"),
+    },
   ];
+
+  const handleStarterPromptSelect = (prompt: string) => {
+    setInput(prompt);
+    window.requestAnimationFrame(() => {
+      const textarea = document.getElementById(CHAT_PAGE_TEXTAREA_ID);
+      if (!(textarea instanceof HTMLTextAreaElement)) {
+        return;
+      }
+
+      textarea.focus();
+      textarea.setSelectionRange(prompt.length, prompt.length);
+    });
+  };
 
   const renderMessage = (message: ChatMessage) => {
     const msg = message as any;
@@ -607,9 +788,16 @@ export default function Chat() {
     const hitMedia = extractHitMediaFromMessage(message);
     const cameraRegistrationDraft = extractCameraRegistrationDraftFromMessage(message);
     const cameraBatchRegistrationDraft = extractCameraBatchRegistrationDraftFromMessage(message);
+    const cameraBatchEditDraft = extractCameraBatchEditDraftFromMessage(message);
+    const cameraAgentFormRequest = extractCameraAgentFormRequestFromMessage(message);
+    const cameraAgentCreationResult = extractCameraAgentCreationResultFromMessage(message);
+    const cameraAgentEditContext = extractCameraAgentEditContextFromMessage(message);
+    const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
+    const revealId = getAssistantRevealId(message);
+    const shouldAnimateReveal = CHAT_VISUAL_TYPING_ENABLED && activeRevealId === revealId;
 
     return (
       <AssistantMessage
@@ -618,6 +806,10 @@ export default function Chat() {
         hitMedia={hitMedia}
         cameraLabel={cameraLabel}
         variant="chat-page"
+        animateReveal={shouldAnimateReveal}
+        revealId={revealId}
+        onRevealProgress={scheduleRevealAutoScroll}
+        onRevealComplete={handleRevealComplete}
         supplementalContent={
           cameraRegistrationDraft ? (
             <ChatCameraRegistrationCard
@@ -642,6 +834,28 @@ export default function Chat() {
                 })
               }
             />
+          ) : cameraBatchEditDraft ? (
+            <ChatCameraBatchEditCard
+              messageId={message.id}
+              metadata={cameraBatchEditDraft}
+              onSubmit={(sourceMessageId) =>
+                submitCameraBatchEdit({
+                  sessionIdOverride: activeSessionId,
+                  sourceMessageId,
+                })
+              }
+            />
+          ) : cameraAgentFormRequest ? (
+            <ChatCameraAgentCard
+              metadata={cameraAgentFormRequest}
+              onOpen={() => openChatAgentForm(cameraAgentFormRequest)}
+            />
+          ) : cameraAgentEditContext ? (
+            <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
+          ) : cameraAgentUpdateResult ? (
+            <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+          ) : cameraAgentCreationResult ? (
+            <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
           ) : cameraEditFormRequest ? (
             <ChatCameraEditCard
               metadata={cameraEditFormRequest}
@@ -902,21 +1116,22 @@ export default function Chat() {
                       <Bot className="h-11 w-11 text-white" />
                     </div>
                     <h3 className="mt-8 text-3xl font-semibold tracking-tight text-white md:text-5xl">
-                      How can I help you today?
+                      {t("chat.emptyStateTitle")}
                     </h3>
                     <p className="mt-4 max-w-2xl text-base leading-8 text-gray-400 md:text-lg">
-                      Ask about live cameras, search through stored footage, or get help understanding how the app works.
+                      {t("chat.emptyStateDescription")}
                     </p>
                     <div className="mt-10 grid w-full max-w-4xl gap-4 md:grid-cols-3">
                       {starterPrompts.map((prompt) => (
                         <button
-                          key={prompt}
-                          onClick={() => setInput(prompt)}
+                          key={prompt.id}
+                          type="button"
+                          onClick={() => handleStarterPromptSelect(prompt.text)}
                           className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-5 text-left transition-all hover:-translate-y-0.5 hover:border-blue-300/25 hover:bg-white/[0.06]"
                         >
-                          <p className="text-sm font-medium leading-7 text-gray-100">{prompt}</p>
+                          <p className="text-sm font-medium leading-7 text-gray-100">{prompt.text}</p>
                           <p className="mt-3 text-sm leading-6 text-gray-500">
-                            Tap to start with this prompt.
+                            {t("chat.starterPromptHint")}
                           </p>
                         </button>
                       ))}
@@ -965,7 +1180,8 @@ export default function Chat() {
                   onCancel={cancelMessage}
                   isRunning={isLoading}
                   disabled={isCreatingSession}
-                  placeholder="Ask about your cameras..."
+                  placeholder={t("chat.placeholder")}
+                  textareaId={CHAT_PAGE_TEXTAREA_ID}
                   variant="chat-page"
                   uploadedImage={uploadedImage}
                   onImageUpload={setUploadedImage}
@@ -1004,6 +1220,41 @@ export default function Chat() {
           setToast({
             message: `Camera ${savedName} updated.`,
             type: "success",
+          });
+        }}
+      />
+
+      <CameraCustomAgentEditorModal
+        open={isChatAgentModalOpen && chatAgentModalTarget !== null}
+        editorTarget={chatAgentModalTarget}
+        initialAgent={chatAgentModalInitialAgent}
+        onClose={() => {
+          setIsChatAgentModalOpen(false);
+          setChatAgentModalTarget(null);
+          setChatAgentModalInitialAgent(null);
+        }}
+        onSaved={() => {
+          const fallbackName =
+            chatAgentModalInitialAgent?.config_json &&
+            typeof chatAgentModalInitialAgent.config_json === "object" &&
+            !Array.isArray(chatAgentModalInitialAgent.config_json) &&
+            typeof (chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name === "string"
+              ? String((chatAgentModalInitialAgent.config_json as Record<string, unknown>).display_name)
+              : "agent";
+          setToast({
+            message: `Agent ${fallbackName || "agent"} saved.`,
+            type: "success",
+          });
+        }}
+        showToast={(title: string, description: string, variant?: ToastVariant) => {
+          setToast({
+            message: title ? `${title}: ${description}` : description,
+            type:
+              variant === "destructive"
+                ? "error"
+                : variant === "default"
+                  ? "success"
+                  : "info",
           });
         }}
       />

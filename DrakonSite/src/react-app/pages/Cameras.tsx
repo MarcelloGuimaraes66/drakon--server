@@ -400,12 +400,12 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
   return (
     <>
-      <div className="max-w-7xl mx-auto">
+      <div className="max-w-7xl">
         <div className="mb-6 md:mb-8">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4 md:mb-0">
             <div>
-              <h1 className="text-2xl md:text-3xl font-bold text-gray-100 mb-2">Cameras</h1>
-              <p className="text-sm md:text-base text-gray-400">Manage your security cameras</p>
+              <h1 className="text-2xl font-bold text-gray-100">Cameras</h1>
+              <p className="mt-1.5 text-sm text-gray-400">Manage your security cameras</p>
             </div>
             <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
               <button

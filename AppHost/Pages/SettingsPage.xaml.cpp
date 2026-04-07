@@ -68,6 +68,15 @@ namespace
     {
         return winrt::to_hstring(value).c_str();
     }
+
+    int32_t ReadTaggedInt32(IInspectable const& sender)
+    {
+        if (auto element = sender.try_as<FrameworkElement>())
+        {
+            return unbox_value_or<int32_t>(element.Tag(), 0);
+        }
+        return 0;
+    }
 }
 
 namespace winrt::DrakonDesktop::implementation
@@ -76,6 +85,7 @@ namespace winrt::DrakonDesktop::implementation
     {
         InitializeComponent();
         WireUpActions();
+        ApplyActiveTab();
         m_pollTimer = DispatcherTimer();
         m_pollTimer.Interval(std::chrono::seconds(2));
         m_pollTimer.Tick({ this, &SettingsPage::OnPollTimerTick });
@@ -100,6 +110,10 @@ namespace winrt::DrakonDesktop::implementation
     void SettingsPage::WireUpActions()
     {
         FindName(L"SettingsRefreshButton").as<Button>().Click({ this, &SettingsPage::OnRefreshClick });
+        FindName(L"UserTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
+        FindName(L"ApiKeysTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
+        FindName(L"AlertsTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
+        FindName(L"ConnectivityTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
         FindName(L"GeneratePairCodeButton").as<Button>().Click({ this, &SettingsPage::OnGeneratePairCodeClick });
         FindName(L"DisconnectExeButton").as<Button>().Click({ this, &SettingsPage::OnDisconnectExeClick });
         FindName(L"ToggleQuickInstructionsButton").as<Button>().Click({ this, &SettingsPage::OnToggleQuickInstructionsClick });
@@ -113,6 +127,27 @@ namespace winrt::DrakonDesktop::implementation
         FindName(L"SaveZAiButton").as<Button>().Click({ this, &SettingsPage::OnSaveZAiClick });
         FindName(L"RemoveZAiButton").as<Button>().Click({ this, &SettingsPage::OnRemoveZAiClick });
         FindName(L"SaveTelegramButton").as<Button>().Click({ this, &SettingsPage::OnSaveTelegramClick });
+    }
+
+    void SettingsPage::ApplyActiveTab()
+    {
+        auto styles = Resources();
+        auto activeStyle = styles.Lookup(box_value(L"SettingsTabButtonActiveStyle")).as<Style>();
+        auto inactiveStyle = styles.Lookup(box_value(L"SettingsTabButtonStyle")).as<Style>();
+
+        FindName(L"UserTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::User ? activeStyle : inactiveStyle);
+        FindName(L"ApiKeysTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::ApiKeys ? activeStyle : inactiveStyle);
+        FindName(L"AlertsTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::Alerts ? activeStyle : inactiveStyle);
+        FindName(L"ConnectivityTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::Connectivity ? activeStyle : inactiveStyle);
+
+        FindName(L"UserSettingsSection").as<FrameworkElement>().Visibility(
+            m_activeTab == SettingsSectionTab::User ? Visibility::Visible : Visibility::Collapsed);
+        FindName(L"ApiKeysSettingsSection").as<FrameworkElement>().Visibility(
+            m_activeTab == SettingsSectionTab::ApiKeys ? Visibility::Visible : Visibility::Collapsed);
+        FindName(L"AlertsSettingsSection").as<FrameworkElement>().Visibility(
+            m_activeTab == SettingsSectionTab::Alerts ? Visibility::Visible : Visibility::Collapsed);
+        FindName(L"ConnectivitySettingsSection").as<FrameworkElement>().Visibility(
+            m_activeTab == SettingsSectionTab::Connectivity ? Visibility::Visible : Visibility::Collapsed);
     }
 
     void SettingsPage::SetText(hstring const& elementName, hstring const& value)
@@ -226,6 +261,8 @@ namespace winrt::DrakonDesktop::implementation
         telegramToggle.IsOn(m_telegramSettings.enabled);
         SetText(L"TelegramChatIdTextBox", to_hstring(m_telegramSettings.chatId));
         FindName(L"TelegramBotTokenPasswordBox").as<PasswordBox>().Password(to_hstring(m_telegramSettings.botToken));
+
+        ApplyActiveTab();
     }
 
     fire_and_forget SettingsPage::RefreshSettingsAsync(bool announceResult)
@@ -552,6 +589,28 @@ namespace winrt::DrakonDesktop::implementation
     void SettingsPage::OnRefreshClick(IInspectable const&, RoutedEventArgs const&)
     {
         RefreshSettingsAsync(true);
+    }
+
+    void SettingsPage::OnTabClick(IInspectable const& sender, RoutedEventArgs const&)
+    {
+        switch (ReadTaggedInt32(sender))
+        {
+        case 1:
+            m_activeTab = SettingsSectionTab::ApiKeys;
+            break;
+        case 2:
+            m_activeTab = SettingsSectionTab::Alerts;
+            break;
+        case 3:
+            m_activeTab = SettingsSectionTab::Connectivity;
+            break;
+        case 0:
+        default:
+            m_activeTab = SettingsSectionTab::User;
+            break;
+        }
+
+        ApplyActiveTab();
     }
 
     void SettingsPage::OnPollTimerTick(IInspectable const&, IInspectable const&)
