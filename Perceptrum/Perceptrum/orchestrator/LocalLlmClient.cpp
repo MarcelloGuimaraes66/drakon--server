@@ -1101,6 +1101,12 @@ LocalLlmClient::Config LocalLlmClient::effectiveConfigSnapshot_() const
     return configSnapshot;
 }
 
+LocalLlmClient::FailureInfo LocalLlmClient::lastFailureInfo() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lastFailureInfo_;
+}
+
 std::string LocalLlmClient::effectiveBaseUrl_() const
 {
     return effectiveConfigSnapshot_().baseUrl;
@@ -1116,8 +1122,18 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
 
     const Config configSnapshot = effectiveConfigSnapshot_();
     const std::string baseUrl = configSnapshot.baseUrl;
+    const std::string configuredModel = trimCopy(configSnapshot.model);
     if (baseUrl.empty()) {
         outcome.error = "missing_base_url";
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFailureInfo_ = FailureInfo{
+            true,
+            operation,
+            outcome.error,
+            "",
+            configuredModel,
+            0,
+        };
         return outcome;
     }
 
@@ -1136,6 +1152,7 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
         : requestBody.dump();
 
     const int attemptLimit = (std::max)(0, retries) + 1;
+    std::string lastFailureBody;
     for (int attempt = 1; attempt <= attemptLimit; ++attempt) {
         outcome.ok = false;
         outcome.content.clear();
@@ -1162,6 +1179,7 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
             outcome.error = response.error.empty()
                 ? ("http_status_" + std::to_string(response.statusCode))
                 : response.error;
+            lastFailureBody = response.body;
             logCompletionAttempt_(
                 operation,
                 attempt,
@@ -1178,6 +1196,7 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
         const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
         if (!parsed.is_object()) {
             outcome.error = "invalid_json_response";
+            lastFailureBody = response.body;
             logCompletionAttempt_(
                 operation,
                 attempt,
@@ -1198,6 +1217,7 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
             outcome.error = outcome.reasoningContent.empty()
                 ? "empty_message_content"
                 : "reasoning_without_message_content";
+            lastFailureBody = response.body;
             logCompletionAttempt_(
                 operation,
                 attempt,
@@ -1226,6 +1246,15 @@ LocalLlmClient::CompletionOutcome LocalLlmClient::requestCompletion_(
         return outcome;
     }
 
+    std::lock_guard<std::mutex> lock(mutex_);
+    lastFailureInfo_ = FailureInfo{
+        true,
+        operation,
+        outcome.error,
+        lastFailureBody,
+        modelName,
+        outcome.statusCode,
+    };
     return outcome;
 }
 

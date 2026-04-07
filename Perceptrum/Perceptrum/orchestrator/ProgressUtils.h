@@ -147,6 +147,34 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Validando as alteracoes e organizando a revisao final antes da confirmacao.";
             }
         }
+        else if (skill == "control_camera") {
+            if (phase == "routing") {
+                update.headline = "Entendendo o comando da camera";
+                update.detail = "Separando a acao pedida e a camera que voce quer controlar.";
+            }
+            else if (phase == "resolving_target") {
+                update.headline = "Localizando a camera";
+                update.detail = "Conferindo qual camera corresponde ao pedido.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Aplicando a acao";
+                update.detail = "Enviando o comando para ligar ou parar a camera.";
+            }
+        }
+        else if (skill == "control_job") {
+            if (phase == "routing") {
+                update.headline = "Entendendo o comando do job";
+                update.detail = "Separando a acao pedida e o job que voce quer controlar.";
+            }
+            else if (phase == "resolving_target") {
+                update.headline = "Localizando o job";
+                update.detail = "Conferindo qual job corresponde ao pedido.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Aplicando a acao";
+                update.detail = "Enviando o comando para iniciar ou parar o job.";
+            }
+        }
         else if (skill == "general_answer") {
             if (phase == "routing") {
                 update.headline = "Entendendo sua pergunta";
@@ -341,6 +369,34 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "finalizing") {
                 update.headline = "Preparing the preview";
                 update.detail = "Validating the requested changes and preparing the final review before confirmation.";
+            }
+        }
+        else if (skill == "control_camera") {
+            if (phase == "routing") {
+                update.headline = "Understanding the camera command";
+                update.detail = "Separating the requested action and the camera to control.";
+            }
+            else if (phase == "resolving_target") {
+                update.headline = "Resolving the camera";
+                update.detail = "Checking which camera matches your request.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Applying the action";
+                update.detail = "Sending the command to start or stop the camera.";
+            }
+        }
+        else if (skill == "control_job") {
+            if (phase == "routing") {
+                update.headline = "Understanding the job command";
+                update.detail = "Separating the requested action and the job to control.";
+            }
+            else if (phase == "resolving_target") {
+                update.headline = "Resolving the job";
+                update.detail = "Checking which job matches your request.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Applying the action";
+                update.detail = "Sending the command to start or stop the job.";
             }
         }
         else if (skill == "general_answer") {

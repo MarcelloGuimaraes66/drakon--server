@@ -2604,17 +2604,104 @@ std::string buildReferenceNotFoundAnswer_(
 
 std::string buildFormAnswer_(const std::string& language, const nlohmann::json& camera)
 {
-    const std::string name = jsonStringField_(camera, "name");
+    const std::string targetType = lowerAsciiCopy_(jsonStringField_(camera, "type"));
+    const std::string name = jsonStringField_(camera, "camera_name").empty()
+        ? jsonStringField_(camera, "name")
+        : jsonStringField_(camera, "camera_name");
+    const std::string stepTitle = jsonStringField_(camera, "step_title");
     if (language == "pt") {
+        if (targetType == "step_camera" && !name.empty() && !stepTitle.empty()) {
+            return "Preparei o formulario do agente para a camera " + name + " na etapa " + stepTitle + " no card abaixo.";
+        }
+        if (targetType == "step_default" && !stepTitle.empty()) {
+            return "Preparei o formulario do agente para a etapa " + stepTitle + " no card abaixo.";
+        }
         if (!name.empty()) {
             return "Preparei o formulario do agente para a camera " + name + " no card abaixo.";
         }
         return "Preparei o formulario do agente no card abaixo.";
     }
+    if (targetType == "step_camera" && !name.empty() && !stepTitle.empty()) {
+        return "I prepared the agent form for camera " + name + " in step " + stepTitle + " in the card below.";
+    }
+    if (targetType == "step_default" && !stepTitle.empty()) {
+        return "I prepared the agent form for step " + stepTitle + " in the card below.";
+    }
     if (!name.empty()) {
         return "I prepared the agent form for camera " + name + " in the card below.";
     }
     return "I prepared the agent form in the card below.";
+}
+
+std::string buildVisualPolygonNotFoundAnswer_(const std::string& language)
+{
+    if (language == "pt") {
+        return "Analisei o snapshot da camera, mas nao consegui localizar com seguranca a area pedida para desenhar o poligono. Preparei o formulario do agente no card abaixo para voce revisar e marcar manualmente.";
+    }
+    return "I analyzed the camera snapshot, but I could not safely locate the requested area to draw the polygon. I prepared the agent form in the card below so you can review it and mark it manually.";
+}
+
+nlohmann::json buildEditorTargetForCreate_(
+    bool needsCameraDestination,
+    bool needsStepDefaultDestination,
+    bool needsStepCameraDestination,
+    const nlohmann::json& resolvedCamera,
+    const nlohmann::json& resolvedStep,
+    const nlohmann::json& resolvedStepCamera)
+{
+    if (needsStepCameraDestination) {
+        nlohmann::json target = nlohmann::json::object({
+            { "type", "step_camera" },
+        });
+        if (resolvedStep.contains("id")) target["step_id"] = resolvedStep["id"];
+        if (resolvedStep.contains("job_id")) target["job_id"] = resolvedStep["job_id"];
+        if (!jsonStringField_(resolvedStep, "title").empty()) target["step_title"] = jsonStringField_(resolvedStep, "title");
+        if (!jsonStringField_(resolvedStep, "job_name").empty()) target["job_name"] = jsonStringField_(resolvedStep, "job_name");
+        if (resolvedStepCamera.contains("camera_id")) target["camera_id"] = resolvedStepCamera["camera_id"];
+        if (!jsonStringField_(resolvedStepCamera, "camera_name").empty()) target["camera_name"] = jsonStringField_(resolvedStepCamera, "camera_name");
+        return target;
+    }
+    if (needsStepDefaultDestination) {
+        nlohmann::json target = nlohmann::json::object({
+            { "type", "step_default" },
+        });
+        if (resolvedStep.contains("id")) target["step_id"] = resolvedStep["id"];
+        if (resolvedStep.contains("job_id")) target["job_id"] = resolvedStep["job_id"];
+        if (!jsonStringField_(resolvedStep, "title").empty()) target["step_title"] = jsonStringField_(resolvedStep, "title");
+        if (!jsonStringField_(resolvedStep, "job_name").empty()) target["job_name"] = jsonStringField_(resolvedStep, "job_name");
+        return target;
+    }
+    if (needsCameraDestination) {
+        nlohmann::json target = nlohmann::json::object({
+            { "type", "camera" },
+        });
+        if (resolvedCamera.contains("id")) target["camera_id"] = resolvedCamera["id"];
+        if (!jsonStringField_(resolvedCamera, "name").empty()) {
+            target["camera_name"] = jsonStringField_(resolvedCamera, "name");
+            target["name"] = jsonStringField_(resolvedCamera, "name");
+        }
+        return target;
+    }
+    return nlohmann::json::object();
+}
+
+nlohmann::json buildFormRequestMetadata_(
+    const std::string& language,
+    const nlohmann::json& editorTarget,
+    const nlohmann::json& draftAgent)
+{
+    nlohmann::json metadata = {
+        { "type", "camera_agent_form_request" },
+        { "status", "awaiting_form_open" },
+        { "language", normalizeAssistantLanguageTag(language) },
+        { "draft_agent", draftAgent },
+    };
+    if (editorTarget.is_object() && !editorTarget.empty()) {
+        metadata["editor_target"] = editorTarget;
+        if (editorTarget.contains("camera_id")) metadata["camera_id"] = editorTarget["camera_id"];
+        if (editorTarget.contains("camera_name")) metadata["camera_name"] = editorTarget["camera_name"];
+    }
+    return metadata;
 }
 
 std::string buildSuccessAnswer_(
@@ -3257,23 +3344,6 @@ SkillRunResult CreateCameraAgentSkill::execute(
     }
     mergedDraft["goal_summary"] = goalSummary;
 
-    if (openForm && (!needsCameraDestination || needsAnyStepDestination)) {
-        result.answer = language == "pt"
-            ? "Consigo abrir o formulario apenas para um agente direto em uma camera especifica. Me confirme uma camera unica para eu preparar esse formulario."
-            : "I can only open the form for an agent that will be created directly on one specific camera. Please confirm a single camera for that form.";
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            mergedDraft,
-            "collecting_input",
-            "awaiting_form_destination",
-            language == "pt" ? "Aguardando destino compativel com formulario" : "Waiting for a form-compatible destination",
-            result.answer,
-            language,
-            { "camera" },
-            nlohmann::json::object());
-        return result;
-    }
-
     int designCameraId = 0;
     if (mergedDraft.contains("resolved_camera") && mergedDraft["resolved_camera"].is_object()) {
         designCameraId = mergedDraft["resolved_camera"].value("id", 0);
@@ -3447,17 +3517,40 @@ SkillRunResult CreateCameraAgentSkill::execute(
         return result;
     }
 
+    const nlohmann::json resolvedCamera = mergedDraft.value("resolved_camera", nlohmann::json::object());
+    const nlohmann::json resolvedStep = mergedDraft.value("resolved_step", nlohmann::json::object());
+    const nlohmann::json resolvedStepCamera = mergedDraft.value("resolved_step_camera", nlohmann::json::object());
+    const nlohmann::json editorTarget = buildEditorTargetForCreate_(
+        needsCameraDestination,
+        needsStepDefaultDestination,
+        needsStepCameraDestination,
+        resolvedCamera,
+        resolvedStep,
+        resolvedStepCamera);
+
+    if (needsVisualContext &&
+        (!finalAnalysisRegions.is_array() || finalAnalysisRegions.empty())) {
+        result.answer = buildVisualPolygonNotFoundAnswer_(language);
+        result.metadata["message_metadata"] = buildFormRequestMetadata_(language, editorTarget, finalSnapshot);
+        result.metadata["task_state"] = buildTaskState_(
+            conversationContext,
+            mergedDraft,
+            "awaiting_confirmation",
+            "awaiting_form_open",
+            language == "pt" ? "Poligono precisa de revisao manual" : "Polygon needs manual review",
+            result.answer,
+            language,
+            {},
+            nlohmann::json::object({
+                { "type", "camera_agent_form_request" },
+                { "status", "awaiting_form_open" },
+            }));
+        return result;
+    }
+
     if (openForm) {
-        const nlohmann::json resolvedCamera = mergedDraft.value("resolved_camera", nlohmann::json::object());
-        result.answer = buildFormAnswer_(language, resolvedCamera);
-        result.metadata["message_metadata"] = {
-            { "type", "camera_agent_form_request" },
-            { "status", "awaiting_form_open" },
-            { "language", normalizeAssistantLanguageTag(language) },
-            { "camera_id", resolvedCamera.value("id", 0) },
-            { "camera_name", jsonStringField_(resolvedCamera, "name") },
-            { "draft_agent", finalSnapshot },
-        };
+        result.answer = buildFormAnswer_(language, editorTarget);
+        result.metadata["message_metadata"] = buildFormRequestMetadata_(language, editorTarget, finalSnapshot);
         result.metadata["task_state"] = buildTaskState_(
             conversationContext,
             mergedDraft,

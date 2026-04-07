@@ -20427,6 +20427,10 @@ async function enqueueStartCameraCommand(
   error_code?: string;
 }> {
   try {
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      return { success: false, error: "Invalid camera id" };
+    }
+
     // Optional: ensure EXE is connected
     const pairing = await env.DB.prepare(
       "SELECT * FROM exe_pairings WHERE user_id = ? AND status = 'connected'"
@@ -20624,6 +20628,303 @@ async function enqueueStartCameraCommand(
     console.error(`[START CAMERA] Error for camera ${cameraId}:`, error);
     return { success: false, error: "Internal server error" };
   }
+}
+
+async function enqueueStopCameraCommand(
+  env: Env,
+  userId: string,
+  cameraId: number
+): Promise<{
+  success: boolean;
+  already_stopped?: boolean;
+  camera_name?: string;
+  error?: string;
+}> {
+  try {
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      return { success: false, error: "Invalid camera id" };
+    }
+
+    const camera = await env.DB.prepare(
+      "SELECT id, user_id, name, is_service_running FROM cameras WHERE id = ? AND user_id = ?"
+    )
+      .bind(cameraId, userId)
+      .first();
+
+    if (!camera) {
+      return { success: false, error: "Camera not found" };
+    }
+
+    const cameraRow = camera as any;
+    const cameraName =
+      normalizeCameraStartSummaryText(cameraRow.name) || `Camera #${cameraId}`;
+
+    if (Number(cameraRow.is_service_running ?? 0) !== 1) {
+      return {
+        success: true,
+        already_stopped: true,
+        camera_name: cameraName,
+      };
+    }
+
+    await env.DB.prepare(
+      "UPDATE cameras SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
+    )
+      .bind(cameraId, userId)
+      .run();
+
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
+       VALUES (?, ?, 'stop_camera', ?, 'pending', ?, ?)`
+    )
+      .bind(
+        userId,
+        cameraId,
+        JSON.stringify({ camera_id: cameraId }),
+        now,
+        now
+      )
+      .run();
+
+    return {
+      success: true,
+      already_stopped: false,
+      camera_name: cameraName,
+    };
+  } catch (error) {
+    console.error(`[STOP CAMERA] Error for camera ${cameraId}:`, error);
+    return { success: false, error: "Internal server error" };
+  }
+}
+
+async function startJobForUser(
+  env: Env,
+  userId: string,
+  jobId: number
+): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return { statusCode: 400, body: { error: "Invalid job id" } };
+  }
+
+  const job = await env.DB.prepare(
+    `SELECT
+       j.*,
+       jrs.status AS runtime_status
+     FROM jobs j
+     LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
+     WHERE j.id = ? AND j.user_id = ?
+     LIMIT 1`
+  )
+    .bind(jobId, userId)
+    .first();
+
+  if (!job) {
+    return { statusCode: 404, body: { error: "Job not found" } };
+  }
+
+  const jobData = job as any;
+  if (jobData.runtime_status === "running") {
+    return { statusCode: 200, body: { ok: true, already_running: true, status: "running" } };
+  }
+
+  if (jobData.runtime_status === "stopping") {
+    return { statusCode: 409, body: { error: "Job is currently stopping" } };
+  }
+
+  const { results: stepRows } = await env.DB.prepare(
+    `SELECT id
+     FROM job_steps
+     WHERE job_id = ?
+     ORDER BY step_order ASC`
+  )
+    .bind(jobId)
+    .all();
+
+  if (!stepRows || stepRows.length === 0) {
+    return {
+      statusCode: 400,
+      body: { error: "Job must have at least one step before it can be started." },
+    };
+  }
+
+  for (const row of stepRows) {
+    const stepId = Number((row as any)?.id);
+    if (!Number.isInteger(stepId) || stepId <= 0) {
+      return { statusCode: 400, body: { error: "Job step is invalid." } };
+    }
+
+    const [targetsResult, agentsResult] = await Promise.all([
+      env.DB.prepare(
+        `SELECT camera_id
+         FROM job_step_targets
+         WHERE step_id = ?`
+      )
+        .bind(stepId)
+        .all(),
+      env.DB.prepare(
+        `SELECT camera_id
+         FROM job_step_agents
+         WHERE step_id = ?
+           AND is_active = 1`
+      )
+        .bind(stepId)
+        .all(),
+    ]);
+
+    const targets = (targetsResult.results || [])
+      .map((target: any) => Number(target.camera_id))
+      .filter((cameraIdValue: number) => Number.isInteger(cameraIdValue));
+    const agentCameraIds = new Set(
+      (agentsResult.results || [])
+        .map((agent: any) =>
+          agent.camera_id === null || agent.camera_id === undefined ? null : Number(agent.camera_id)
+        )
+    );
+    const hasDefaultAgent = agentCameraIds.has(null);
+    const allTargetsAssigned = targets.length > 0 && targets.every((cameraIdValue: number) => cameraIdValue > 0);
+    const allTargetsHaveAgents =
+      allTargetsAssigned &&
+      targets.every((cameraIdValue: number) => hasDefaultAgent || agentCameraIds.has(cameraIdValue));
+
+    if (!allTargetsHaveAgents) {
+      return {
+        statusCode: 400,
+        body: {
+          error: "All steps must have at least one target and an active agent before the job can be started.",
+        },
+      };
+    }
+  }
+
+  const providerRequirements = await loadJobInferenceProviderRequirements(env.DB, jobId);
+  if (providerRequirements.requiresOpenAi) {
+    const openAiKey = await getUserOpenAIApiKey(env.DB, userId);
+    if (!openAiKey) {
+      return { statusCode: 400, body: buildOpenAiKeyRequiredErrorBody() as Record<string, unknown> };
+    }
+  }
+  if (providerRequirements.requiresZAi) {
+    const zAiKey = await getUserZAIApiKey(env.DB, userId);
+    if (!zAiKey) {
+      return { statusCode: 400, body: buildZAiKeyRequiredErrorBody() as Record<string, unknown> };
+    }
+  }
+
+  const startResult = await enqueueManualJobStart(env, jobData);
+  if (!startResult.ok) {
+    return { statusCode: 500, body: { error: startResult.error || "Failed to start job" } };
+  }
+
+  return { statusCode: 200, body: { ok: true } };
+}
+
+async function stopJobForUser(
+  env: Env,
+  userId: string,
+  jobId: number
+): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return { statusCode: 400, body: { error: "Invalid job id" } };
+  }
+
+  const job = await env.DB.prepare(
+    "SELECT id, name FROM jobs WHERE id = ? AND user_id = ?"
+  )
+    .bind(jobId, userId)
+    .first();
+
+  if (!job) {
+    return { statusCode: 404, body: { error: "Job not found" } };
+  }
+
+  const jobData = job as any;
+  const now = new Date().toISOString();
+
+  const { results: targetRows } = await env.DB.prepare(
+    `SELECT DISTINCT jst.camera_id
+     FROM job_step_targets jst
+     JOIN job_steps js ON jst.step_id = js.id
+     WHERE js.job_id = ?`
+  )
+    .bind(jobId)
+    .all();
+
+  const allCameraIds = (targetRows || []).map((row: any) => row.camera_id);
+  let filteredCameraIds: number[] = [];
+
+  if (allCameraIds.length > 0) {
+    const placeholders = allCameraIds.map(() => "?").join(", ");
+    const { results: runningCameras } = await env.DB.prepare(
+      `SELECT id FROM cameras 
+       WHERE user_id = ? AND id IN (${placeholders}) AND is_service_running = 1`
+    )
+      .bind(userId, ...allCameraIds)
+      .all();
+
+    const runningCameraIds = (runningCameras || []).map((row: any) => row.id);
+
+    if (runningCameraIds.length > 0) {
+      const runningPlaceholders = runningCameraIds.map(() => "?").join(", ");
+      const { results: agentCameras } = await env.DB.prepare(
+        `SELECT DISTINCT camera_id FROM camera_algorithms
+         WHERE camera_id IN (${runningPlaceholders}) AND is_enabled = 1`
+      )
+        .bind(...runningCameraIds)
+        .all();
+
+      const camerasWithAgents = new Set((agentCameras || []).map((row: any) => row.camera_id));
+      filteredCameraIds = runningCameraIds.filter((cameraIdValue: number) => !camerasWithAgents.has(cameraIdValue));
+    }
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
+     VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?)`
+  )
+    .bind(
+      userId,
+      JSON.stringify({
+        job: { id: jobData.id, name: jobData.name },
+        requested_at_utc: now,
+        reason: "user_stop_from_dashboard",
+        camera_ids: filteredCameraIds,
+      }),
+      now,
+      now
+    )
+    .run();
+
+  if (filteredCameraIds.length > 0) {
+    const cameraPlaceholders = filteredCameraIds.map(() => "?").join(", ");
+    await env.DB.prepare(
+      `UPDATE cameras 
+       SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = ? AND id IN (${cameraPlaceholders})`
+    )
+      .bind(userId, ...filteredCameraIds)
+      .run();
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, last_event_at_utc, created_at, updated_at)
+     VALUES (?, ?, ?, 'stopping', ?, ?, ?)
+     ON CONFLICT(job_id) DO UPDATE SET
+       status = 'stopping',
+       last_event_at_utc = ?,
+       updated_at = ?`
+  )
+    .bind(jobData.id, userId, jobData.name, now, now, now, now, now)
+    .run();
+
+  await env.DB.prepare(
+    `INSERT INTO events (user_id, camera_id, event_type, message, is_unread, created_at, updated_at)
+     VALUES (?, NULL, 'job_stop_requested', ?, 0, ?, ?)`
+  )
+    .bind(userId, `Job "${jobData.name}" stop requested.`, now, now)
+    .run();
+
+  return { statusCode: 200, body: { ok: true, camera_ids: filteredCameraIds } };
 }
 
 const DEFAULT_WEBCAM_PROBE_INDICES = [0, 1, 2, 3, 4, 5] as const;
@@ -20923,6 +21224,22 @@ app.post("/api/cameras/:cameraId/start", anyAuthMiddleware, async (c) => {
     agents_disabled_no_subscription: result.agents_disabled_no_subscription,
     camera_name: result.camera_name ?? null,
     running_analytics: Array.isArray(result.running_analytics) ? result.running_analytics : [],
+  });
+});
+
+app.post("/api/cameras/:cameraId/stop", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameraId = c.req.param("cameraId");
+
+  const result = await enqueueStopCameraCommand(c.env, user.id, Number(cameraId));
+  if (!result.success) {
+    return c.json({ error: result.error || "Unable to stop camera" }, 400);
+  }
+
+  return c.json({
+    success: true,
+    already_stopped: Boolean(result.already_stopped),
+    camera_name: result.camera_name ?? null,
   });
 });
 
@@ -34016,38 +34333,26 @@ app.post("/api/agent/orchestrator/telemetry", async (c) => {
 // EXE cameras list endpoint (for desktop agent)
 app.get("/api/agent/cameras", async (c) => {
   const url = new URL(c.req.url);
-  const clientId = url.searchParams.get("client_id");
+  const clientId = (url.searchParams.get("client_id") || "").trim();
 
   if (!clientId) {
     return c.json({ error: "client_id is required" }, 400);
   }
 
-  // Read Bearer token from Authorization header
-  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Authorization header" }, 401);
-  }
-
-  const exeToken = authHeader.slice("Bearer ".length).trim();
-  const exeTokenHash = await hashToken(exeToken);
-
-  // Find pairing for this client + token
-  const pairing = await c.env.DB.prepare(
-    `SELECT * FROM exe_pairings
-     WHERE client_id = ? AND exe_token_hash = ? AND status = 'connected'`
-  )
-    .bind(clientId, exeTokenHash)
-    .first();
-
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
   if (!pairing) {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const userId = (pairing as any).user_id;
+  const userId = pairing.userId;
 
   // Query all cameras for this user
   const { results } = await c.env.DB.prepare(
-    `SELECT id, name, description, ip_address, manufacturer, connection_method, channel, subtype
+    `SELECT id, name, description, ip_address, manufacturer, connection_method, channel, subtype, is_service_running
      FROM cameras
      WHERE user_id = ?
      ORDER BY created_at ASC`
@@ -34070,6 +34375,7 @@ app.get("/api/agent/cameras", async (c) => {
             typeof row?.connection_method === "string" ? row.connection_method : "",
           channel: typeof row?.channel === "string" ? row.channel : "",
           subtype: typeof row?.subtype === "string" ? row.subtype : "",
+          is_service_running: Number(row?.is_service_running ?? 0) === 1,
         };
       })
     : [];
@@ -34106,6 +34412,181 @@ app.get("/api/agent/cameras/:id", async (c) => {
     scene_label: scene.scene_label,
     scene_description: scene.scene_description,
   });
+});
+
+app.get("/api/agent/jobs", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT
+       j.id,
+       j.name,
+       j.description,
+       j.status,
+       j.is_active,
+       j.schedule_mode,
+       j.timezone,
+       j.created_at,
+       j.updated_at,
+       jrs.status AS runtime_status,
+       jrs.started_at_utc AS runtime_started_at_utc,
+       jrs.stopped_at_utc AS runtime_stopped_at_utc,
+       jrs.last_event_at_utc AS runtime_last_event_at_utc
+     FROM jobs j
+     LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
+     WHERE j.user_id = ?
+     ORDER BY j.created_at DESC`
+  )
+    .bind(pairing.userId)
+    .all();
+
+  const normalizedResults = Array.isArray(results)
+    ? results.map((row: any) => ({
+        id: Number(row?.id ?? 0),
+        name: typeof row?.name === "string" ? row.name : "",
+        description: typeof row?.description === "string" ? row.description : "",
+        status: typeof row?.status === "string" ? row.status : "",
+        is_active: Number(row?.is_active ?? 0) === 1,
+        schedule_mode: typeof row?.schedule_mode === "string" ? row.schedule_mode : "",
+        timezone: typeof row?.timezone === "string" ? row.timezone : "",
+        runtime_status:
+          typeof row?.runtime_status === "string" ? row.runtime_status : "",
+        runtime_started_at_utc: row?.runtime_started_at_utc ?? null,
+        runtime_stopped_at_utc: row?.runtime_stopped_at_utc ?? null,
+        runtime_last_event_at_utc: row?.runtime_last_event_at_utc ?? null,
+        created_at: row?.created_at ?? null,
+        updated_at: row?.updated_at ?? null,
+      }))
+    : [];
+
+  return c.json(normalizedResults);
+});
+
+app.post("/api/agent/cameras/:cameraId/start", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const numericCameraId = Number(c.req.param("cameraId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const result = await enqueueStartCameraCommand(c.env, pairing.userId, numericCameraId);
+  if (!result.success) {
+    return c.json(
+      result.error_code === OPENAI_KEY_REQUIRED_ERROR
+        ? buildOpenAiKeyRequiredErrorBody()
+        : result.error_code === ZAI_KEY_REQUIRED_ERROR
+        ? buildZAiKeyRequiredErrorBody()
+        : { error: result.error || "Unable to start camera" },
+      400
+    );
+  }
+
+  return c.json({
+    ok: true,
+    already_running: false,
+    agents_disabled_no_subscription: result.agents_disabled_no_subscription,
+    camera_name: result.camera_name ?? null,
+    running_analytics: Array.isArray(result.running_analytics) ? result.running_analytics : [],
+  });
+});
+
+app.post("/api/agent/cameras/:cameraId/stop", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const numericCameraId = Number(c.req.param("cameraId"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const result = await enqueueStopCameraCommand(c.env, pairing.userId, numericCameraId);
+  if (!result.success) {
+    return c.json({ error: result.error || "Unable to stop camera" }, 400);
+  }
+
+  return c.json({
+    ok: true,
+    already_stopped: Boolean(result.already_stopped),
+    camera_name: result.camera_name ?? null,
+  });
+});
+
+app.post("/api/agent/jobs/:id/start", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const numericJobId = Number(c.req.param("id"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const result = await startJobForUser(c.env, pairing.userId, numericJobId);
+  return c.json(result.body, result.statusCode as any);
+});
+
+app.post("/api/agent/jobs/:id/stop", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const numericJobId = Number(c.req.param("id"));
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const result = await stopJobForUser(c.env, pairing.userId, numericJobId);
+  return c.json(result.body, result.statusCode as any);
 });
 
 app.get("/api/agent/agents", async (c) => {
@@ -34485,6 +34966,61 @@ app.get("/api/agent/job-steps/:stepId/targets", async (c) => {
   }
 });
 
+app.post("/api/agent/tasks/install", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{
+      snapshot?: HubTaskSnapshot | null;
+      camera_slot_mapping?: Array<Record<string, unknown>>;
+      name_override?: string | null;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const snapshot =
+    body.snapshot && typeof body.snapshot === "object" && !Array.isArray(body.snapshot)
+      ? (body.snapshot as HubTaskSnapshot)
+      : null;
+  if (!snapshot || snapshot.type !== "task") {
+    return c.json({ error: "Invalid task snapshot" }, 400);
+  }
+
+  try {
+    const jobId = await installHubTaskIntoRuntime(c.env.DB, pairing.userId, snapshot, 0, 0, {
+      cameraSlotMapping: Array.isArray(body.camera_slot_mapping) ? body.camera_slot_mapping : [],
+      nameOverride: normalizeText(body.name_override) || null,
+    });
+    const job = await fetchOwnedHubJob(c.env.DB, pairing.userId, jobId);
+    return c.json({ ok: true, job_id: jobId, job }, 201);
+  } catch (error) {
+    console.error("[POST /api/agent/tasks/install] Failed to install task snapshot:", error);
+    return c.json(
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to install the task snapshot",
+      },
+      500
+    );
+  }
+});
+
 app.post("/api/agent/agent-design", async (c) => {
   const url = new URL(c.req.url);
   const clientId = (url.searchParams.get("client_id") || "").trim();
@@ -34509,6 +35045,7 @@ app.post("/api/agent/agent-design", async (c) => {
       language?: string;
       require_snapshot?: boolean;
       agent_patch?: Record<string, unknown>;
+      design_context?: Record<string, unknown>;
       face_targets?: Array<Record<string, unknown>>;
       drakon_find_targets?: Array<Record<string, unknown>>;
     }>()
@@ -34587,6 +35124,12 @@ app.post("/api/agent/agent-design", async (c) => {
     model_name: "gpt-5.1",
     model_api_key: userOpenAiApiKey,
     agent_patch: agentPatch,
+    design_context:
+      body.design_context &&
+      typeof body.design_context === "object" &&
+      !Array.isArray(body.design_context)
+        ? body.design_context
+        : {},
     face_targets: faceTargets,
     drakon_find_targets: drakonFindTargets,
     snapshot_strategy: {
@@ -37276,233 +37819,16 @@ app.put("/api/jobs/:id", anyAuthMiddleware, async (c) => {
 
 app.post("/api/jobs/:id/start", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  const id = c.req.param("id");
-  const numericJobId = Number(id);
-
-  if (!Number.isInteger(numericJobId) || numericJobId <= 0) {
-    return c.json({ error: "Invalid job id" }, 400);
-  }
-
-  const job = await c.env.DB.prepare(
-    `SELECT
-       j.*,
-       jrs.status AS runtime_status
-     FROM jobs j
-     LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
-     WHERE j.id = ? AND j.user_id = ?
-     LIMIT 1`
-  )
-    .bind(id, user.id)
-    .first();
-
-  if (!job) {
-    return c.json({ error: "Job not found" }, 404);
-  }
-
-  const jobData = job as any;
-  if (jobData.runtime_status === "running") {
-    return c.json({ ok: true, already_running: true, status: "running" });
-  }
-
-  if (jobData.runtime_status === "stopping") {
-    return c.json({ error: "Job is currently stopping" }, 409);
-  }
-
-  const { results: stepRows } = await c.env.DB.prepare(
-    `SELECT id
-     FROM job_steps
-     WHERE job_id = ?
-     ORDER BY step_order ASC`
-  )
-    .bind(id)
-    .all();
-
-  if (!stepRows || stepRows.length === 0) {
-    return c.json({ error: "Job must have at least one step before it can be started." }, 400);
-  }
-
-  for (const row of stepRows) {
-    const stepId = Number((row as any)?.id);
-    if (!Number.isInteger(stepId) || stepId <= 0) {
-      return c.json({ error: "Job step is invalid." }, 400);
-    }
-
-    const [targetsResult, agentsResult] = await Promise.all([
-      c.env.DB.prepare(
-        `SELECT camera_id
-         FROM job_step_targets
-         WHERE step_id = ?`
-      )
-        .bind(stepId)
-        .all(),
-      c.env.DB.prepare(
-        `SELECT camera_id
-         FROM job_step_agents
-         WHERE step_id = ?
-           AND is_active = 1`
-      )
-        .bind(stepId)
-        .all(),
-    ]);
-
-    const targets = (targetsResult.results || [])
-      .map((target: any) => Number(target.camera_id))
-      .filter((cameraId: number) => Number.isInteger(cameraId));
-    const agentCameraIds = new Set(
-      (agentsResult.results || [])
-        .map((agent: any) =>
-          agent.camera_id === null || agent.camera_id === undefined ? null : Number(agent.camera_id)
-        )
-    );
-    const hasDefaultAgent = agentCameraIds.has(null);
-    const allTargetsAssigned = targets.length > 0 && targets.every((cameraId: number) => cameraId > 0);
-    const allTargetsHaveAgents =
-      allTargetsAssigned &&
-      targets.every((cameraId: number) => hasDefaultAgent || agentCameraIds.has(cameraId));
-
-    if (!allTargetsHaveAgents) {
-      return c.json(
-        { error: "All steps must have at least one target and an active agent before the job can be started." },
-        400
-      );
-    }
-  }
-
-  const providerRequirements = await loadJobInferenceProviderRequirements(c.env.DB, numericJobId);
-  if (providerRequirements.requiresOpenAi) {
-    const openAiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
-    if (!openAiKey) {
-      return c.json(buildOpenAiKeyRequiredErrorBody(), 400);
-    }
-  }
-  if (providerRequirements.requiresZAi) {
-    const zAiKey = await getUserZAIApiKey(c.env.DB, user.id);
-    if (!zAiKey) {
-      return c.json(buildZAiKeyRequiredErrorBody(), 400);
-    }
-  }
-
-  const startResult = await enqueueManualJobStart(c.env, jobData);
-  if (!startResult.ok) {
-    return c.json({ error: startResult.error || "Failed to start job" }, 500);
-  }
-
-  return c.json({ ok: true });
+  const numericJobId = Number(c.req.param("id"));
+  const result = await startJobForUser(c.env, user.id, numericJobId);
+  return c.json(result.body, result.statusCode as any);
 });
 
 app.post("/api/jobs/:id/stop", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  const id = c.req.param("id");
-
-  // Validate job belongs to user
-  const job = await c.env.DB.prepare(
-    "SELECT id, name FROM jobs WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .first();
-
-  if (!job) {
-    return c.json({ error: "Job not found" }, 404);
-  }
-
-  const jobData = job as any;
-  const now = new Date().toISOString();
-
-  // Step A: Get all distinct camera IDs from job step targets
-  const { results: targetRows } = await c.env.DB.prepare(
-    `SELECT DISTINCT jst.camera_id
-     FROM job_step_targets jst
-     JOIN job_steps js ON jst.step_id = js.id
-     WHERE js.job_id = ?`
-  )
-    .bind(id)
-    .all();
-
-  const allCameraIds = (targetRows || []).map((row: any) => row.camera_id);
-
-  // Initialize filtered camera IDs
-  let filteredCameraIds: number[] = [];
-
-  if (allCameraIds.length > 0) {
-    // Step B: Filter to running cameras only (is_service_running = 1)
-    const placeholders = allCameraIds.map(() => "?").join(", ");
-    const { results: runningCameras } = await c.env.DB.prepare(
-      `SELECT id FROM cameras 
-       WHERE user_id = ? AND id IN (${placeholders}) AND is_service_running = 1`
-    )
-      .bind(user.id, ...allCameraIds)
-      .all();
-
-    const runningCameraIds = (runningCameras || []).map((row: any) => row.id);
-
-    if (runningCameraIds.length > 0) {
-      // Step C: Get cameras with enabled AI agents (to exclude them)
-      const runningPlaceholders = runningCameraIds.map(() => "?").join(", ");
-      const { results: agentCameras } = await c.env.DB.prepare(
-        `SELECT DISTINCT camera_id FROM camera_algorithms
-         WHERE camera_id IN (${runningPlaceholders}) AND is_enabled = 1`
-      )
-        .bind(...runningCameraIds)
-        .all();
-
-      const camerasWithAgents = new Set((agentCameras || []).map((row: any) => row.camera_id));
-
-      // Step D: Filter out cameras with enabled agents
-      filteredCameraIds = runningCameraIds.filter((cameraId: number) => !camerasWithAgents.has(cameraId));
-    }
-  }
-
-  // Insert job_stop command with filtered camera list
-  await c.env.DB.prepare(
-    `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-     VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?)`
-  )
-    .bind(
-      user.id,
-      JSON.stringify({
-        job: { id: jobData.id, name: jobData.name },
-        requested_at_utc: now,
-        reason: "user_stop_from_dashboard",
-        camera_ids: filteredCameraIds,
-      }),
-      now,
-      now
-    )
-    .run();
-
-  // Immediately update cameras table: set stopped cameras to is_service_running=0, is_online=0
-  if (filteredCameraIds.length > 0) {
-    const cameraPlaceholders = filteredCameraIds.map(() => "?").join(", ");
-    await c.env.DB.prepare(
-      `UPDATE cameras 
-       SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = ? AND id IN (${cameraPlaceholders})`
-    )
-      .bind(user.id, ...filteredCameraIds)
-      .run();
-  }
-
-  // Optimistically update runtime state to 'stopping'
-  await c.env.DB.prepare(
-    `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, last_event_at_utc, created_at, updated_at)
-     VALUES (?, ?, ?, 'stopping', ?, ?, ?)
-     ON CONFLICT(job_id) DO UPDATE SET
-       status = 'stopping',
-       last_event_at_utc = ?,
-       updated_at = ?`
-  )
-    .bind(jobData.id, user.id, jobData.name, now, now, now, now, now)
-    .run();
-
-  // Insert event for Live Activity
-  await c.env.DB.prepare(
-    `INSERT INTO events (user_id, camera_id, event_type, message, is_unread, created_at, updated_at)
-     VALUES (?, NULL, 'job_stop_requested', ?, 0, ?, ?)`
-  )
-    .bind(user.id, `Job "${jobData.name}" stop requested.`, now, now)
-    .run();
-
-  return c.json({ ok: true, camera_ids: filteredCameraIds });
+  const numericJobId = Number(c.req.param("id"));
+  const result = await stopJobForUser(c.env, user.id, numericJobId);
+  return c.json(result.body, result.statusCode as any);
 });
 
 app.delete("/api/jobs/:id", anyAuthMiddleware, async (c) => {
@@ -38519,7 +38845,17 @@ type HubTaskSnapshot = {
   title: string;
   summary?: string;
   description?: string | null;
-  job?: Record<string, unknown>;
+  job?: {
+    name?: string;
+    description?: string | null;
+    schedule_mode?: string | null;
+    timezone?: string | null;
+    active_from?: string | null;
+    active_until?: string | null;
+    schedule_days?: Array<Record<string, unknown>>;
+    status?: string | null;
+    [key: string]: unknown;
+  };
   camera_slots?: Array<Record<string, unknown>>;
   steps?: Array<Record<string, unknown>>;
   tags?: string[];
@@ -40722,6 +41058,72 @@ async function updateStepAgentFromHubSnapshot(
   return agentId;
 }
 
+function normalizeHubTaskScheduleMode(value: unknown): "weekly" | "monthly" | "yearly" | null {
+  const mode = normalizeText(value).toLowerCase();
+  if (mode === "weekly" || mode === "monthly" || mode === "yearly") {
+    return mode;
+  }
+  return null;
+}
+
+function normalizeHubTaskScheduleDays(
+  value: unknown,
+  scheduleMode: "weekly" | "monthly" | "yearly" | null
+): Array<{
+  day_name: string;
+  day_of_week?: number | null;
+  day_of_month?: number | null;
+  month_of_year?: number | null;
+  windows: Array<{ start_time: string; end_time: string }>;
+}> {
+  if (!scheduleMode || !Array.isArray(value)) return [];
+
+  const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+  const days: Array<{
+    day_name: string;
+    day_of_week?: number | null;
+    day_of_month?: number | null;
+    month_of_year?: number | null;
+    windows: Array<{ start_time: string; end_time: string }>;
+  }> = [];
+
+  for (const row of value) {
+    const day = row as any;
+    const dayName = normalizeText(day?.day_name);
+    const windowsRaw = Array.isArray(day?.windows) ? day.windows : [];
+    const windows = windowsRaw
+      .map((windowRow: any) => {
+        const startTime = normalizeText(windowRow?.start_time);
+        const endTime = normalizeText(windowRow?.end_time);
+        if (!timeRegex.test(startTime) || !timeRegex.test(endTime) || startTime >= endTime) {
+          return null;
+        }
+        return { start_time: startTime, end_time: endTime };
+      })
+      .filter(Boolean) as Array<{ start_time: string; end_time: string }>;
+
+    if (!dayName || windows.length === 0) continue;
+
+    const dayOfWeek = Number(day?.day_of_week);
+    const dayOfMonth = Number(day?.day_of_month);
+    const monthOfYear = Number(day?.month_of_year);
+
+    if (scheduleMode === "weekly" && !Number.isInteger(dayOfWeek)) continue;
+    if (scheduleMode === "monthly" && !Number.isInteger(dayOfMonth)) continue;
+    if (scheduleMode === "yearly" && (!Number.isInteger(dayOfMonth) || !Number.isInteger(monthOfYear))) continue;
+
+    days.push({
+      day_name: dayName,
+      day_of_week: Number.isInteger(dayOfWeek) ? dayOfWeek : null,
+      day_of_month: Number.isInteger(dayOfMonth) ? dayOfMonth : null,
+      month_of_year: Number.isInteger(monthOfYear) ? monthOfYear : null,
+      windows,
+    });
+  }
+
+  return days;
+}
+
 async function installHubTaskIntoRuntime(
   db: D1Database,
   userId: string,
@@ -40781,6 +41183,15 @@ async function installHubTaskIntoRuntime(
   }
 
   const now = new Date().toISOString();
+  const todayDate = now.split("T")[0];
+  const scheduleMode = normalizeHubTaskScheduleMode(snapshot.job?.schedule_mode);
+  const normalizedScheduleDays = normalizeHubTaskScheduleDays(
+    snapshot.job?.schedule_days,
+    scheduleMode
+  );
+  const timezone = normalizeText(snapshot.job?.timezone) || null;
+  const activeFrom = normalizeText(snapshot.job?.active_from) || (scheduleMode ? todayDate : null);
+  const activeUntil = normalizeText(snapshot.job?.active_until) || null;
   const jobName =
     normalizeText(input.nameOverride) ||
     normalizeText(snapshot.job?.name) ||
@@ -40789,8 +41200,8 @@ async function installHubTaskIntoRuntime(
   const jobInsert = await db
     .prepare(
       `INSERT INTO jobs (
-         user_id, name, description, status, created_at, updated_at, schedule_mode
-       ) VALUES (?, ?, ?, 'draft', ?, ?, ?)`
+         user_id, name, description, status, created_at, updated_at, schedule_mode, timezone, active_from, active_until
+       ) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       userId,
@@ -40798,12 +41209,60 @@ async function installHubTaskIntoRuntime(
       normalizeText(snapshot.job?.description) || normalizeText(snapshot.description) || null,
       now,
       now,
-      normalizeText(snapshot.job?.schedule_mode) || null
+      scheduleMode,
+      timezone,
+      activeFrom,
+      activeUntil
     )
     .run();
   const jobId = Number(jobInsert.meta.last_row_id || 0);
   if (!Number.isInteger(jobId) || jobId <= 0) {
     throw new Error("Failed to create task from Hub item.");
+  }
+
+  if (scheduleMode && normalizedScheduleDays.length > 0) {
+    let daySortOrder = 0;
+    for (const day of normalizedScheduleDays) {
+      const dayInsert = await db
+        .prepare(
+          `INSERT INTO job_schedule_days (
+             job_id, schedule_mode, day_name, day_of_week, day_of_month, month_of_year, sort_order, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          jobId,
+          scheduleMode,
+          day.day_name,
+          day.day_of_week ?? null,
+          day.day_of_month ?? null,
+          day.month_of_year ?? null,
+          daySortOrder++,
+          now,
+          now
+        )
+        .run();
+
+      const scheduleDayId = Number(dayInsert.meta.last_row_id || 0);
+      let windowSortOrder = 0;
+      for (const window of day.windows) {
+        await db
+          .prepare(
+            `INSERT INTO job_schedule_windows (
+               job_id, schedule_day_id, start_time, end_time, is_enabled, sort_order, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+          )
+          .bind(
+            jobId,
+            scheduleDayId,
+            window.start_time,
+            window.end_time,
+            windowSortOrder++,
+            now,
+            now
+          )
+          .run();
+      }
+    }
   }
 
   const stepIdByKey = new Map<string, number>();

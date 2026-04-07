@@ -544,7 +544,6 @@ const std::vector<std::string>& editableCameraFieldNames_()
         "retention_days",
         "webcam_index",
         "allowpublicaccess",
-        "is_service_running",
     };
     return fields;
 }
@@ -731,12 +730,6 @@ nlohmann::json normalizeCameraPatch_(const nlohmann::json& value)
     if (value.contains("allowpublicaccess") &&
         parseBoolLoose_(value["allowpublicaccess"], allowPublicAccess)) {
         normalized["allowpublicaccess"] = allowPublicAccess;
-    }
-
-    bool serviceRunning = false;
-    if (value.contains("is_service_running") &&
-        parseBoolLoose_(value["is_service_running"], serviceRunning)) {
-        normalized["is_service_running"] = serviceRunning ? 1 : 0;
     }
 
     return normalized;
@@ -1219,7 +1212,7 @@ nlohmann::json extractEditDraft_(
         "\"open_form\":false"
         "}\n"
         "Valid target_selector fields are: id, name, description, ip_address, manufacturer, channel, subtype, connection_method.\n"
-        "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess, is_service_running.\n"
+        "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess.\n"
         "Valid field_sources values are explicit_user or implied_user.\n"
         "Valid clear_fields values are: ip_address, rtsp_port, manufacturer, username, password, channel, subtype, description, street, number, city, state, zip_code, country, webcam_index.\n"
         "Do not emit empty strings, placeholder values, unknown fields, or nulls except webcam_index when the user clearly wants to clear it.\n"

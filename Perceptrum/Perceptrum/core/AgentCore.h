@@ -708,6 +708,39 @@ private:
         bool requestCoreChatPriority = false,
         const std::function<bool()>& shouldAbort = {});
 
+    struct ChatTemporalState;
+
+    struct ChatTemporalVideoAnalysisResult {
+        std::vector<VideoHit> visibleHits;
+        int promptTokens = 0;
+        int outputTokens = 0;
+        int totalTokens = 0;
+        std::string modelAnswer;
+        bool temporalAlert = false;
+        bool temporalReport = false;
+        nlohmann::json temporalOperatorResults = nlohmann::json::array();
+        std::string temporalSummary;
+        bool aborted = false;
+    };
+
+    std::vector<std::size_t> buildChatTemporalExecutionOrder_(
+        const std::vector<EncodedVideoSegment>& videos,
+        const nlohmann::json& routerResult) const;
+
+    ChatTemporalVideoAnalysisResult analyzeVideosWithOpenAISequentialTemporalChat_(
+        const std::vector<EncodedVideoSegment>& videos,
+        const nlohmann::json& routerResult,
+        const std::string& userQuestionBase,
+        const std::string& uploadedImageBase64,
+        const std::string& openAiModelName,
+        const std::string& openAiApiKey,
+        int modelInputFps,
+        int runningResolution,
+        int chatSessionId,
+        ChatTemporalState& chatTemporalState,
+        bool requestCoreChatPriority = false,
+        const std::function<bool()>& shouldAbort = {});
+
     void updateCameraAlgorithms_(int cameraId, const nlohmann::json& payload);
     void runConfiguredFrameRetentionSweepIfDue_(bool force = false);
 

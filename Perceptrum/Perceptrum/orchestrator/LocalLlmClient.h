@@ -38,10 +38,20 @@ public:
         int statusCode = 0;
     };
 
+    struct FailureInfo {
+        bool hasFailure = false;
+        std::string operation;
+        std::string error;
+        std::string rawBody;
+        std::string model;
+        int statusCode = 0;
+    };
+
     LocalLlmClient();
 
     bool isConfigured() const;
     const Config& config() const { return config_; }
+    FailureInfo lastFailureInfo() const;
     bool hasStoredConfiguration() const;
     void setRequestOverride(const Config& config);
     void clearRequestOverride();
@@ -99,6 +109,7 @@ private:
     Config requestOverride_;
     bool requestOverrideActive_ = false;
     std::string endpointOverride_;
+    mutable FailureInfo lastFailureInfo_;
 };
 
 } // namespace chatv2

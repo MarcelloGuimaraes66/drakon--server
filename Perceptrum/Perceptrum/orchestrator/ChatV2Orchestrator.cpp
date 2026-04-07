@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <utility>
@@ -47,6 +48,158 @@ bool containsAny_(const std::string& haystack, const std::vector<std::string>& n
         }
     }
     return false;
+}
+
+std::string appLanguageFromPayload_(const nlohmann::json& payload);
+std::string truncateForContext_(std::string value, std::size_t maxChars);
+
+std::string jsonStringFieldOrEmpty_(const nlohmann::json& source, const char* key)
+{
+    if (!source.is_object() || !key || !source.contains(key) || !source[key].is_string()) {
+        return "";
+    }
+    return trimCopy_(source[key].get<std::string>());
+}
+
+std::string localizeChatApiErrorMessage_(
+    const std::string& languageHint,
+    int httpStatus,
+    const std::string& apiCode,
+    const std::string& apiMessage,
+    const std::string& rawError)
+{
+    const std::string language = normalizeAssistantLanguageTag(languageHint);
+    const std::string normalizedCode = lowerAsciiCopy_(trimCopy_(apiCode));
+
+    auto messageForLanguage = [&](const char* en, const char* pt, const char* es, const char* fr) {
+        if (language == "pt") return std::string(pt);
+        if (language == "es") return std::string(es);
+        if (language == "fr") return std::string(fr);
+        return std::string(en);
+    };
+
+    if (normalizedCode == "insufficient_quota") {
+        return messageForLanguage(
+            "OpenAI API quota exceeded. Check plan and billing details.",
+            "A quota da API da OpenAI foi excedida. Verifique o plano e os dados de cobranca.",
+            "Se excedio la cuota de la API de OpenAI. Revisa el plan y los datos de facturacion.",
+            "Le quota de l'API OpenAI est depasse. Verifiez le forfait et les informations de facturation.");
+    }
+
+    if (normalizedCode == "invalid_api_key" || httpStatus == 401) {
+        return messageForLanguage(
+            "OpenAI API key is invalid or unauthorized.",
+            "A chave da API da OpenAI e invalida ou nao autorizada.",
+            "La clave de la API de OpenAI es invalida o no esta autorizada.",
+            "La cle API OpenAI est invalide ou non autorisee.");
+    }
+
+    if (httpStatus == 429) {
+        return messageForLanguage(
+            "OpenAI API rate limit or quota reached. Try again shortly.",
+            "O limite ou a quota da API da OpenAI foi atingido. Tente novamente em instantes.",
+            "Se alcanzo el limite o la cuota de la API de OpenAI. Intentalo de nuevo en breve.",
+            "La limite ou le quota de l'API OpenAI a ete atteint. Reessayez dans un instant.");
+    }
+
+    const std::string truncatedMessage = truncateForContext_(apiMessage, 220);
+    if (!truncatedMessage.empty()) {
+        if (language == "pt") return "Erro da API da OpenAI: " + truncatedMessage;
+        if (language == "es") return "Error de la API de OpenAI: " + truncatedMessage;
+        if (language == "fr") return "Erreur de l'API OpenAI : " + truncatedMessage;
+        return "OpenAI API error: " + truncatedMessage;
+    }
+
+    const std::string truncatedRawError = truncateForContext_(rawError, 220);
+    if (!truncatedRawError.empty()) {
+        if (language == "pt") return "Falha na requisicao da API da OpenAI: " + truncatedRawError;
+        if (language == "es") return "Fallo en la solicitud a la API de OpenAI: " + truncatedRawError;
+        if (language == "fr") return "Echec de la requete vers l'API OpenAI : " + truncatedRawError;
+        return "OpenAI API request failed: " + truncatedRawError;
+    }
+
+    return messageForLanguage(
+        "OpenAI API request failed.",
+        "A requisicao para a API da OpenAI falhou.",
+        "La solicitud a la API de OpenAI fallo.",
+        "La requete vers l'API OpenAI a echoue.");
+}
+
+std::optional<nlohmann::json> buildChatRouterApiErrorDetails_(
+    const LocalLlmClient::FailureInfo& failure,
+    const std::string& languageHint,
+    std::string& outMessage)
+{
+    if (!failure.hasFailure) {
+        return std::nullopt;
+    }
+
+    const std::string rawBody = trimCopy_(failure.rawBody);
+    std::string apiCode;
+    std::string apiType;
+    std::string apiMessage;
+
+    if (!rawBody.empty()) {
+        const nlohmann::json parsed = nlohmann::json::parse(rawBody, nullptr, false);
+        if (parsed.is_object() && parsed.contains("error") && parsed["error"].is_object()) {
+            const nlohmann::json& errorNode = parsed["error"];
+            apiCode = jsonStringFieldOrEmpty_(errorNode, "code");
+            apiType = jsonStringFieldOrEmpty_(errorNode, "type");
+            apiMessage = jsonStringFieldOrEmpty_(errorNode, "message");
+        }
+    }
+
+    const bool hasApiSignal =
+        failure.statusCode == 401 ||
+        failure.statusCode == 429 ||
+        !apiCode.empty() ||
+        !apiType.empty() ||
+        !apiMessage.empty();
+    if (!hasApiSignal) {
+        return std::nullopt;
+    }
+
+    outMessage = localizeChatApiErrorMessage_(
+        languageHint,
+        failure.statusCode,
+        apiCode,
+        apiMessage,
+        failure.error.empty() ? rawBody : failure.error);
+
+    nlohmann::json details = nlohmann::json::object();
+    details["provider"] = "openai";
+    details["source"] = "chat_router";
+    if (!failure.operation.empty()) details["stage"] = failure.operation;
+    if (!failure.model.empty()) details["model"] = failure.model;
+    if (failure.statusCode > 0) details["http_status"] = failure.statusCode;
+    if (!apiCode.empty()) details["api_error_code"] = apiCode;
+    if (!apiType.empty()) details["api_error_type"] = apiType;
+    if (!apiMessage.empty()) details["api_error_message"] = truncateForContext_(apiMessage, 320);
+    if (!rawBody.empty()) details["raw_error"] = truncateForContext_(rawBody, 420);
+
+    return details;
+}
+
+void emitChatRouterApiErrorEvent_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const LocalLlmClient& llm)
+{
+    std::string message;
+    const auto details = buildChatRouterApiErrorDetails_(
+        llm.lastFailureInfo(),
+        appLanguageFromPayload_(payload),
+        message);
+    if (!details.has_value() || trimCopy_(message).empty()) {
+        return;
+    }
+
+    agent.postAgentEvent(
+        "agent_api_error",
+        std::nullopt,
+        "",
+        message,
+        *details);
 }
 
 bool isInstructionalIntent_(const std::string& normalized)
@@ -282,6 +435,8 @@ int progressStepCountForSkill_(const std::string& skillName)
 {
     if (skillName == "video_search") return 5;
     if (skillName == "explain_app") return 4;
+    if (skillName == "control_camera") return 3;
+    if (skillName == "control_job") return 3;
     if (skillName == "create_cameras_batch") return 3;
     if (skillName == "edit_cameras_batch") return 3;
     if (skillName == "scan_network") return 3;
@@ -626,8 +781,14 @@ std::string skillFromSemanticSelection_(
     if (selection.selectedSkill == "edit_camera") {
         return "edit_camera";
     }
+    if (selection.selectedSkill == "control_camera") {
+        return "control_camera";
+    }
     if (selection.selectedSkill == "edit_camera_agent") {
         return "edit_camera_agent";
+    }
+    if (selection.selectedSkill == "control_job") {
+        return "control_job";
     }
 
     if (selection.continueActiveTask) {
@@ -645,6 +806,11 @@ std::string skillFromSemanticSelection_(
     const std::string mode = normalizeSemanticToken_(selection.mode);
     const std::string entity = normalizeSemanticToken_(selection.entity);
     const std::string intent = normalizeSemanticToken_(selection.intent);
+    const bool hasRuntimeAction =
+        selection.arguments.is_object() &&
+        selection.arguments.contains("runtime_action") &&
+        selection.arguments["runtime_action"].is_string() &&
+        !trimCopy_(selection.arguments["runtime_action"].get<std::string>()).empty();
 
     if (entity == "video" || intent == "inspect") {
         return "video_search";
@@ -653,7 +819,7 @@ std::string skillFromSemanticSelection_(
         return "read_state";
     }
     if (entity == "camera" && intent == "update") {
-        return "edit_camera";
+        return hasRuntimeAction ? "control_camera" : "edit_camera";
     }
     if (entity == "camera" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_camera";
@@ -663,6 +829,9 @@ std::string skillFromSemanticSelection_(
     }
     if (entity == "camera_agent" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_camera_agent";
+    }
+    if (entity == "job" && intent == "update" && hasRuntimeAction) {
+        return "control_job";
     }
     if (entity == "job" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_job";
@@ -704,12 +873,14 @@ bool shouldSemanticSkillOverrideSelected_(
     }
 
     return semanticSkill == "create_camera" ||
+        semanticSkill == "control_camera" ||
         semanticSkill == "edit_camera" ||
         semanticSkill == "edit_camera_agent" ||
         semanticSkill == "edit_cameras_batch" ||
         semanticSkill == "create_cameras_batch" ||
         semanticSkill == "create_camera_agent" ||
         semanticSkill == "create_job" ||
+        semanticSkill == "control_job" ||
         semanticSkill == "scan_network" ||
         semanticSkill == "read_state" ||
         semanticSkill == "video_search";
@@ -767,12 +938,14 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.operationType.empty() &&
         (selection.selectedSkill == "create_camera" ||
+         selection.selectedSkill == "control_camera" ||
          selection.selectedSkill == "edit_camera" ||
          selection.selectedSkill == "edit_camera_agent" ||
          selection.selectedSkill == "edit_cameras_batch" ||
          selection.selectedSkill == "create_cameras_batch" ||
          selection.selectedSkill == "create_camera_agent" ||
          selection.selectedSkill == "create_job" ||
+         selection.selectedSkill == "control_job" ||
          selection.selectedSkill == "scan_network")) {
         selection.operationType = selection.selectedSkill;
     }
@@ -783,6 +956,10 @@ SkillSelection applySemanticSelectionPlan_(
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job") {
             selection.intent = selection.continueActiveTask ? "continue" : "create";
+        }
+        else if (selection.selectedSkill == "control_camera" ||
+                 selection.selectedSkill == "control_job") {
+            selection.intent = selection.continueActiveTask ? "continue" : "update";
         }
         else if (selection.selectedSkill == "edit_camera" ||
                  selection.selectedSkill == "edit_camera_agent" ||
@@ -808,12 +985,14 @@ SkillSelection applySemanticSelectionPlan_(
 
     if (selection.mode.empty()) {
         if (selection.selectedSkill == "create_camera" ||
+            selection.selectedSkill == "control_camera" ||
             selection.selectedSkill == "edit_camera" ||
             selection.selectedSkill == "edit_camera_agent" ||
             selection.selectedSkill == "edit_cameras_batch" ||
             selection.selectedSkill == "create_cameras_batch" ||
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job" ||
+            selection.selectedSkill == "control_job" ||
             selection.selectedSkill == "scan_network" ||
             selection.selectedSkill == "video_search") {
             selection.mode = "operate";
@@ -1186,6 +1365,10 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
                 ? buildRouterFailureAnswer_(appLanguageFromPayload_(payload))
                 : buildCapabilityUnavailableAnswer_(appLanguageFromPayload_(payload));
         recordRoutingTelemetry_(agent, payload, unavailableSelection, "actual", "orchestrator_query");
+
+        if (unavailableSelection.reason == "router_failed") {
+            emitChatRouterApiErrorEvent_(agent, payload, llm);
+        }
 
         SkillRunResult unavailable;
         unavailable.status = SkillExecutionStatus::Completed;
@@ -1969,7 +2152,7 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
         sanitized.end());
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
-        { std::regex("\\b(read_state|video_search|create_camera|create_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(read_state|video_search|create_camera|control_camera|create_job|control_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(create_cameras_batch|edit_cameras_batch)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },

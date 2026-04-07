@@ -1355,6 +1355,54 @@ const ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH = 1920;
 const ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT = 1080;
 const PROMPT_EDITOR_SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
 
+type RenderedSnapshotBounds = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  naturalWidth: number;
+  naturalHeight: number;
+};
+
+const computeContainedImageBounds = (
+  hostWidth: number,
+  hostHeight: number,
+  naturalWidth: number,
+  naturalHeight: number
+): RenderedSnapshotBounds | null => {
+  if (hostWidth <= 1 || hostHeight <= 1) return null;
+
+  const safeNaturalWidth = Math.max(
+    1,
+    Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)
+  );
+  const safeNaturalHeight = Math.max(
+    1,
+    Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)
+  );
+  const imageAspect = safeNaturalWidth / safeNaturalHeight;
+  const hostAspect = hostWidth / hostHeight;
+
+  let width = hostWidth;
+  let height = hostHeight;
+  if (hostAspect > imageAspect) {
+    height = hostHeight;
+    width = height * imageAspect;
+  } else {
+    width = hostWidth;
+    height = width / imageAspect;
+  }
+
+  return {
+    left: (hostWidth - width) / 2,
+    top: (hostHeight - height) / 2,
+    width,
+    height,
+    naturalWidth: safeNaturalWidth,
+    naturalHeight: safeNaturalHeight,
+  };
+};
+
 const buildEmptyAgentForm = (): AgentFormState => ({
   agent_key: "",
   stored_agent_key: "",
@@ -4333,6 +4381,12 @@ function StepCard({
     thumbnail_url: null,
     last_thumbnail_update: null,
   });
+  const [promptEditorSnapshotNaturalSize, setPromptEditorSnapshotNaturalSize] = useState({
+    width: 0,
+    height: 0,
+  });
+  const [promptEditorSnapshotRenderBounds, setPromptEditorSnapshotRenderBounds] =
+    useState<RenderedSnapshotBounds | null>(null);
   const [promptEditorSnapshotLoading, setPromptEditorSnapshotLoading] = useState(false);
   const [promptEditorSnapshotRequesting, setPromptEditorSnapshotRequesting] = useState(false);
   const [promptEditorSnapshotError, setPromptEditorSnapshotError] = useState<string | null>(
@@ -6758,16 +6812,19 @@ function StepCard({
 
   const getPreviewPointFromClient = (clientX: number, clientY: number) => {
     const host = previewCanvasRef.current;
-    if (!host) return null;
+    const bounds = measurePromptEditorSnapshotRenderBounds();
+    if (!host || !bounds) return null;
     const rect = host.getBoundingClientRect();
-    if (rect.width <= 1 || rect.height <= 1) return null;
+    const x = clientX - rect.left - bounds.left;
+    const y = clientY - rect.top - bounds.top;
+    if (x < 0 || y < 0 || x > bounds.width || y > bounds.height) return null;
     return {
       point: {
-        x: clamp01((clientX - rect.left) / rect.width),
-        y: clamp01((clientY - rect.top) / rect.height),
+        x: clamp01(x / bounds.width),
+        y: clamp01(y / bounds.height),
       } as AnalysisRegionPoint,
-      draw_ref_width: Math.max(1, Math.round(rect.width)),
-      draw_ref_height: Math.max(1, Math.round(rect.height)),
+      draw_ref_width: bounds.naturalWidth,
+      draw_ref_height: bounds.naturalHeight,
     };
   };
 
@@ -7440,6 +7497,11 @@ function StepCard({
   const regionActionCentroid = regionActionRegion
     ? getPolygonCentroid(regionActionRegion.polygon_norm)
     : null;
+  const activePolygonToolbarRegion =
+    (activePromptRegion && hasPolygonPoints(activePromptRegion) ? activePromptRegion : null) ||
+    polygonOnlyRegions.find((region) => region.region_id === hoveredPromptRegionId) ||
+    polygonOnlyRegions[0] ||
+    null;
   const currentPromptCameraAgent = getEditingCameraAgent();
   const currentPromptCameraRow = useMemo(() => {
     if (!Number.isInteger(agentFormCameraId) || (agentFormCameraId as number) <= 0) return null;
@@ -7464,6 +7526,17 @@ function StepCard({
           : ""
       }`
     : null;
+  const measurePromptEditorSnapshotRenderBounds = (): RenderedSnapshotBounds | null => {
+    const host = previewCanvasRef.current;
+    if (!host) return null;
+    const rect = host.getBoundingClientRect();
+    return computeContainedImageBounds(
+      rect.width,
+      rect.height,
+      promptEditorSnapshotNaturalSize.width,
+      promptEditorSnapshotNaturalSize.height
+    );
+  };
   const promptEditorSnapshotRefreshCooldownActive =
     promptEditorSnapshotRefreshCooldownUntil > Date.now();
   const promptEditorSnapshotRefreshBlocked =
@@ -7472,6 +7545,35 @@ function StepCard({
     promptEditorSnapshotRetryInFlightRef.current ||
     promptEditorSnapshotRefreshInFlightRef.current ||
     promptEditorSnapshotRefreshCooldownActive;
+  useEffect(() => {
+    if (!showPromptEditor || !promptEditorSnapshotUrl) {
+      setPromptEditorSnapshotRenderBounds(null);
+      return;
+    }
+
+    const refreshBounds = () => {
+      setPromptEditorSnapshotRenderBounds(measurePromptEditorSnapshotRenderBounds());
+    };
+
+    refreshBounds();
+    const host = previewCanvasRef.current;
+    if (!host) return;
+
+    const observer =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => refreshBounds()) : null;
+    observer?.observe(host);
+    window.addEventListener("resize", refreshBounds);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", refreshBounds);
+    };
+  }, [
+    showPromptEditor,
+    promptEditorSnapshotUrl,
+    promptEditorSnapshotNaturalSize.width,
+    promptEditorSnapshotNaturalSize.height,
+  ]);
   const canManageNegativeReferences =
     !!currentPromptCameraAgent &&
     Number.isInteger(Number(currentPromptCameraAgent.id)) &&
@@ -9213,7 +9315,7 @@ function StepCard({
                                   : polygonDrawEnabled
                                   ? "Click once on image to define polygon name and description."
                                   : polygonOnlyRegions.length > 0
-                                  ? `${polygonOnlyRegions.length} polygon(s) configured.`
+                                  ? `${polygonOnlyRegions.length} polygon(s) configured. Use the controls below to select or delete one.`
                                   : "No polygons configured. Full frame will be used."}
                               </div>
                               <div
@@ -9239,6 +9341,13 @@ function StepCard({
                                         alt={getPromptEditorCameraName(agentFormCameraId)}
                                         className="h-full w-full object-contain object-center select-none pointer-events-none"
                                         draggable={false}
+                                        onLoad={(event) => {
+                                          const img = event.currentTarget;
+                                          setPromptEditorSnapshotNaturalSize({
+                                            width: img.naturalWidth || 0,
+                                            height: img.naturalHeight || 0,
+                                          });
+                                        }}
                                         onError={() => {
                                           setPromptEditorSnapshotMeta({
                                             thumbnail_url: null,
@@ -9249,109 +9358,117 @@ function StepCard({
                                           );
                                         }}
                                       />
-                                      <svg
-                                        className="absolute inset-0 h-full w-full"
-                                        viewBox="0 0 100 100"
-                                        preserveAspectRatio="none"
-                                      >
-                                        {polygonOnlyRegions.map((region) => {
-                                          const isActive = activePromptRegion?.region_id === region.region_id;
-                                          const isHovered = hoveredPromptRegionId === region.region_id;
-                                          const points = Array.isArray(region.polygon_norm)
-                                            ? region.polygon_norm
-                                            : [];
-                                          const centroid = getPolygonCentroid(points);
-                                          return (
-                                            <g key={region.region_id}>
-                                              <polygon
-                                                points={toSvgPoints(points)}
-                                                fill="rgba(0,0,0,0.001)"
-                                                stroke="rgba(0,0,0,0)"
-                                                strokeWidth={4}
-                                                onMouseEnter={() => {
-                                                  setHoveredPromptRegionId(region.region_id);
-                                                  setRegionActionRegionId(region.region_id);
-                                                }}
-                                                onMouseMove={() => {
-                                                  setHoveredPromptRegionId(region.region_id);
-                                                  setRegionActionRegionId(region.region_id);
-                                                }}
-                                                onMouseLeave={() => {
-                                                  if (!isRegionActionHovered) {
-                                                    setHoveredPromptRegionId(null);
+                                      {promptEditorSnapshotRenderBounds ? (
+                                        <svg
+                                          className="absolute"
+                                          style={{
+                                            left: promptEditorSnapshotRenderBounds.left,
+                                            top: promptEditorSnapshotRenderBounds.top,
+                                            width: promptEditorSnapshotRenderBounds.width,
+                                            height: promptEditorSnapshotRenderBounds.height,
+                                          }}
+                                          viewBox="0 0 100 100"
+                                          preserveAspectRatio="none"
+                                        >
+                                          {polygonOnlyRegions.map((region) => {
+                                            const isActive = activePromptRegion?.region_id === region.region_id;
+                                            const isHovered = hoveredPromptRegionId === region.region_id;
+                                            const points = Array.isArray(region.polygon_norm)
+                                              ? region.polygon_norm
+                                              : [];
+                                            const centroid = getPolygonCentroid(points);
+                                            return (
+                                              <g key={region.region_id}>
+                                                <polygon
+                                                  points={toSvgPoints(points)}
+                                                  fill="rgba(0,0,0,0.001)"
+                                                  stroke="rgba(0,0,0,0)"
+                                                  strokeWidth={4}
+                                                  onMouseEnter={() => {
+                                                    setHoveredPromptRegionId(region.region_id);
+                                                    setRegionActionRegionId(region.region_id);
+                                                  }}
+                                                  onMouseMove={() => {
+                                                    setHoveredPromptRegionId(region.region_id);
+                                                    setRegionActionRegionId(region.region_id);
+                                                  }}
+                                                  onMouseLeave={() => {
+                                                    if (!isRegionActionHovered) {
+                                                      setHoveredPromptRegionId(null);
+                                                    }
+                                                  }}
+                                                  onMouseDown={(e) => {
+                                                    e.stopPropagation();
+                                                    setActivePromptRegionId(region.region_id);
+                                                    setRegionActionRegionId(region.region_id);
+                                                  }}
+                                                  onClick={(e) => handleAddVertexToRegion(region.region_id, e)}
+                                                />
+                                                <polygon
+                                                  points={toSvgPoints(points)}
+                                                  fill={
+                                                    region.enabled === false
+                                                      ? "rgba(251,146,60,0.18)"
+                                                      : isActive
+                                                      ? "rgba(59,130,246,0.28)"
+                                                      : "rgba(59,130,246,0.16)"
                                                   }
-                                                }}
-                                                onMouseDown={(e) => {
-                                                  e.stopPropagation();
-                                                  setActivePromptRegionId(region.region_id);
-                                                  setRegionActionRegionId(region.region_id);
-                                                }}
-                                                onClick={(e) => handleAddVertexToRegion(region.region_id, e)}
-                                              />
-                                              <polygon
-                                                points={toSvgPoints(points)}
-                                                fill={
-                                                  region.enabled === false
-                                                    ? "rgba(251,146,60,0.18)"
-                                                    : isActive
-                                                    ? "rgba(59,130,246,0.28)"
-                                                    : "rgba(59,130,246,0.16)"
-                                                }
-                                                stroke={
-                                                  region.enabled === false
-                                                    ? "rgba(251,146,60,0.95)"
-                                                    : isActive
-                                                    ? "rgba(147,197,253,0.98)"
-                                                    : "rgba(96,165,250,0.9)"
-                                                }
-                                                strokeWidth={isActive ? 0.65 : 0.45}
-                                                pointerEvents="none"
-                                              />
-                                              <text
-                                                x={Math.max(1, Math.min(95, centroid.x * 100))}
-                                                y={Math.max(8, Math.min(97, centroid.y * 100))}
-                                                fill="#e5e7eb"
-                                                fontSize="2.6"
-                                                textAnchor="middle"
-                                                className="pointer-events-none"
-                                              >
-                                                {region.label || "Region"}
-                                              </text>
-                                              {(isActive || isHovered) &&
-                                                points.map((point, idx) => (
-                                                  <circle
-                                                    key={`${region.region_id}-point-${idx}`}
-                                                    cx={clamp01(point.x) * 100}
-                                                    cy={clamp01(point.y) * 100}
-                                                    r={1.05}
-                                                    fill={idx === 0 ? "#34d399" : "#60a5fa"}
-                                                    stroke="#0b1220"
-                                                    strokeWidth={0.35}
-                                                    onMouseDown={(e) => {
-                                                      e.stopPropagation();
-                                                      setActivePromptRegionId(region.region_id);
-                                                      setRegionActionRegionId(region.region_id);
-                                                      setDraggingPromptVertex({
-                                                        region_id: region.region_id,
-                                                        vertex_index: idx,
-                                                      });
-                                                    }}
-                                                  />
-                                                ))}
-                                            </g>
-                                          );
-                                        })}
-                                        {draftPolygonPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
-                                          <polygon
-                                            points={toSvgPoints(draftPolygonPoints)}
-                                            fill="rgba(16,185,129,0.2)"
-                                            stroke="rgba(52,211,153,0.95)"
-                                            strokeWidth={0.6}
-                                            strokeDasharray="1.8 1.2"
-                                            pointerEvents="none"
-                                          />
-                                        ) : null}
-                                      </svg>
+                                                  stroke={
+                                                    region.enabled === false
+                                                      ? "rgba(251,146,60,0.95)"
+                                                      : isActive
+                                                      ? "rgba(147,197,253,0.98)"
+                                                      : "rgba(96,165,250,0.9)"
+                                                  }
+                                                  strokeWidth={isActive ? 0.65 : 0.45}
+                                                  pointerEvents="none"
+                                                />
+                                                <text
+                                                  x={Math.max(1, Math.min(95, centroid.x * 100))}
+                                                  y={Math.max(8, Math.min(97, centroid.y * 100))}
+                                                  fill="#e5e7eb"
+                                                  fontSize="2.6"
+                                                  textAnchor="middle"
+                                                  className="pointer-events-none"
+                                                >
+                                                  {region.label || "Region"}
+                                                </text>
+                                                {(isActive || isHovered) &&
+                                                  points.map((point, idx) => (
+                                                    <circle
+                                                      key={`${region.region_id}-point-${idx}`}
+                                                      cx={clamp01(point.x) * 100}
+                                                      cy={clamp01(point.y) * 100}
+                                                      r={1.05}
+                                                      fill={idx === 0 ? "#34d399" : "#60a5fa"}
+                                                      stroke="#0b1220"
+                                                      strokeWidth={0.35}
+                                                      onMouseDown={(e) => {
+                                                        e.stopPropagation();
+                                                        setActivePromptRegionId(region.region_id);
+                                                        setRegionActionRegionId(region.region_id);
+                                                        setDraggingPromptVertex({
+                                                          region_id: region.region_id,
+                                                          vertex_index: idx,
+                                                        });
+                                                      }}
+                                                    />
+                                                  ))}
+                                              </g>
+                                            );
+                                          })}
+                                          {draftPolygonPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
+                                            <polygon
+                                              points={toSvgPoints(draftPolygonPoints)}
+                                              fill="rgba(16,185,129,0.2)"
+                                              stroke="rgba(52,211,153,0.95)"
+                                              strokeWidth={0.6}
+                                              strokeDasharray="1.8 1.2"
+                                              pointerEvents="none"
+                                            />
+                                          ) : null}
+                                        </svg>
+                                      ) : null}
                                     </div>
                                     {regionActionRegion && regionActionCentroid ? (
                                       <div
@@ -9484,6 +9601,74 @@ function StepCard({
                                   </div>
                                 )}
                               </div>
+                              {polygonOnlyRegions.length > 0 ? (
+                                <div className="border-t border-gray-700/80 bg-gray-950/55 px-3 py-3 space-y-3">
+                                  <div className="flex flex-wrap gap-2">
+                                    {polygonOnlyRegions.map((region, index) => {
+                                      const isActive =
+                                        activePolygonToolbarRegion?.region_id === region.region_id;
+                                      return (
+                                        <button
+                                          key={region.region_id}
+                                          type="button"
+                                          onClick={() => {
+                                            setActivePromptRegionId(region.region_id);
+                                            setHoveredPromptRegionId(region.region_id);
+                                            setRegionActionRegionId(region.region_id);
+                                            setPolygonDrawEnabled(false);
+                                          }}
+                                          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
+                                            isActive
+                                              ? "border-blue-500 bg-blue-500/20 text-blue-100"
+                                              : "border-gray-700 bg-gray-900 text-gray-300 hover:bg-gray-800"
+                                          }`}
+                                        >
+                                          <span
+                                            className={`h-2 w-2 rounded-full ${
+                                              region.enabled === false ? "bg-amber-400" : "bg-emerald-400"
+                                            }`}
+                                          />
+                                          {region.label || `Region ${index + 1}`}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                  {activePolygonToolbarRegion ? (
+                                    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-700 bg-gray-900/80 px-3 py-2 text-xs text-gray-200">
+                                      <span className="font-medium text-gray-100">
+                                        Selected polygon: {activePolygonToolbarRegion.label || "Region"}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleToggleRegionEnabled(activePolygonToolbarRegion.region_id)
+                                        }
+                                        className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 transition-colors ${
+                                          activePolygonToolbarRegion.enabled === false
+                                            ? "border-emerald-600/70 text-emerald-300 hover:bg-emerald-500/10"
+                                            : "border-amber-600/70 text-amber-300 hover:bg-amber-500/10"
+                                        }`}
+                                      >
+                                        {activePolygonToolbarRegion.enabled === false
+                                          ? "Enable"
+                                          : "Disable"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          removeRegionAndFallbackToFullFrame(
+                                            activePolygonToolbarRegion.region_id
+                                          )
+                                        }
+                                        className="inline-flex items-center gap-1.5 rounded border border-rose-600/70 px-2.5 py-1 text-rose-300 transition-colors hover:bg-rose-500/10"
+                                      >
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                        Delete polygon
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ) : null}
                             </div>
                             <div className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30">
                               <div className="px-4 py-3 border-b border-gray-700">

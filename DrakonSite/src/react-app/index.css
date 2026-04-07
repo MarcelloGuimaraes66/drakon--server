@@ -140,7 +140,8 @@
 }
 
 .sidebar-nav-scroll::-webkit-scrollbar {
-  width: 3px;
+  width: 2px;
+  height: 2px;
 }
 
 .sidebar-nav-scroll::-webkit-scrollbar-track {
@@ -152,18 +153,26 @@
   border-radius: 9999px;
 }
 
-.sidebar-nav-scroll::-webkit-scrollbar-button {
+.sidebar-nav-scroll::-webkit-scrollbar-button,
+.sidebar-nav-scroll::-webkit-scrollbar-button:single-button,
+.sidebar-nav-scroll::-webkit-scrollbar-button:vertical:decrement,
+.sidebar-nav-scroll::-webkit-scrollbar-button:vertical:increment,
+.sidebar-nav-scroll::-webkit-scrollbar-button:horizontal:decrement,
+.sidebar-nav-scroll::-webkit-scrollbar-button:horizontal:increment,
+.scrollbar-thin::-webkit-scrollbar-button,
+.scrollbar-thin::-webkit-scrollbar-button:single-button,
+.scrollbar-thin::-webkit-scrollbar-button:vertical:decrement,
+.scrollbar-thin::-webkit-scrollbar-button:vertical:increment,
+.scrollbar-thin::-webkit-scrollbar-button:horizontal:decrement,
+.scrollbar-thin::-webkit-scrollbar-button:horizontal:increment {
   display: none;
   width: 0;
   height: 0;
+  margin: 0;
+  padding: 0;
   background: transparent;
   border: 0;
-}
-
-.sidebar-nav-scroll::-webkit-scrollbar-button:single-button {
-  display: none;
-  width: 0;
-  height: 0;
+  -webkit-appearance: none;
 }
 
 .sidebar-nav-scroll::-webkit-scrollbar-corner {
@@ -426,7 +435,8 @@ body {
   }
   
   .scrollbar-thin::-webkit-scrollbar {
-    width: 6px;
+    width: 4px;
+    height: 4px;
   }
   
   .scrollbar-thin::-webkit-scrollbar-track {
@@ -435,7 +445,7 @@ body {
   
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background: rgb(52 52 52);
-    border-radius: 3px;
+    border-radius: 9999px;
   }
   
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Maximize2, Minimize2, Sparkles, X } from "lucide-react";
+import { Maximize2, Minimize2, Sparkles, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
@@ -127,6 +127,53 @@ const ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT = 1080;
 const NEGATIVE_REFERENCE_MAX_IMAGES = 3;
 const FACE_TARGET_MAX_IMAGES = 4;
 const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
+type RenderedSnapshotBounds = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  naturalWidth: number;
+  naturalHeight: number;
+};
+
+const computeContainedImageBounds = (
+  hostWidth: number,
+  hostHeight: number,
+  naturalWidth: number,
+  naturalHeight: number
+): RenderedSnapshotBounds | null => {
+  if (hostWidth <= 1 || hostHeight <= 1) return null;
+
+  const safeNaturalWidth = Math.max(
+    1,
+    Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)
+  );
+  const safeNaturalHeight = Math.max(
+    1,
+    Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)
+  );
+  const imageAspect = safeNaturalWidth / safeNaturalHeight;
+  const hostAspect = hostWidth / hostHeight;
+
+  let width = hostWidth;
+  let height = hostHeight;
+  if (hostAspect > imageAspect) {
+    height = hostHeight;
+    width = height * imageAspect;
+  } else {
+    width = hostWidth;
+    height = width / imageAspect;
+  }
+
+  return {
+    left: (hostWidth - width) / 2,
+    top: (hostHeight - height) / 2,
+    width,
+    height,
+    naturalWidth: safeNaturalWidth,
+    naturalHeight: safeNaturalHeight,
+  };
+};
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
 type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
@@ -681,6 +728,7 @@ export default function CameraCustomAgentEditorModal({
   const [polygonRegions, setPolygonRegions] = useState<AnalysisRegion[]>([]);
   const [polygonDrawEnabled, setPolygonDrawEnabled] = useState(false);
   const [hoveredRegionId, setHoveredRegionId] = useState<string | null>(null);
+  const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [pendingRegionSeed, setPendingRegionSeed] = useState<{
     start: AnalysisRegionPoint;
     label: string;
@@ -734,6 +782,7 @@ export default function CameraCustomAgentEditorModal({
     last_thumbnail_update: null,
   });
   const [snapshotNaturalSize, setSnapshotNaturalSize] = useState({ width: 0, height: 0 });
+  const [snapshotRenderBounds, setSnapshotRenderBounds] = useState<RenderedSnapshotBounds | null>(null);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [snapshotRequesting, setSnapshotRequesting] = useState(false);
   const [snapshotCooldownUntil, setSnapshotCooldownUntil] = useState(0);
@@ -767,6 +816,17 @@ export default function CameraCustomAgentEditorModal({
         snapshotMeta.last_thumbnail_update ? `?ts=${encodeURIComponent(snapshotMeta.last_thumbnail_update)}` : ""
       }`
     : null;
+  const measureSnapshotRenderBounds = (): RenderedSnapshotBounds | null => {
+    const host = previewRef.current;
+    if (!host) return null;
+    const rect = host.getBoundingClientRect();
+    return computeContainedImageBounds(
+      rect.width,
+      rect.height,
+      snapshotNaturalSize.width,
+      snapshotNaturalSize.height
+    );
+  };
   const canLoadSavedAgentTemplate = !isOnboardingOpen;
   const selectedTemplateAgent = useMemo(() => {
     const templateId = Number(selectedTemplateAgentId);
@@ -946,6 +1006,7 @@ export default function CameraCustomAgentEditorModal({
     setIsSizingRect(false);
     setDragVertex(null);
     setHoveredRegionId(null);
+    setSelectedRegionId(null);
     setSuggestion(null);
     setTargetFacesExpanded(false);
     setCreatingFaceTarget(false);
@@ -980,6 +1041,41 @@ export default function CameraCustomAgentEditorModal({
       })
       .finally(() => setSnapshotLoading(false));
   }, [open, initialAgent?.id, previewCameraId, stepId, targetType]);
+
+  useEffect(() => {
+    if (!open || !snapshotUrl) {
+      setSnapshotRenderBounds(null);
+      return;
+    }
+
+    const refreshBounds = () => {
+      setSnapshotRenderBounds(measureSnapshotRenderBounds());
+    };
+
+    refreshBounds();
+    const host = previewRef.current;
+    if (!host) return;
+
+    const observer =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => refreshBounds()) : null;
+    observer?.observe(host);
+    window.addEventListener("resize", refreshBounds);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", refreshBounds);
+    };
+  }, [open, snapshotUrl, snapshotNaturalSize.width, snapshotNaturalSize.height]);
+
+  useEffect(() => {
+    if (polygonRegions.length === 0) {
+      setSelectedRegionId(null);
+      return;
+    }
+    if (!selectedRegionId || !polygonRegions.some((region) => region.region_id === selectedRegionId)) {
+      setSelectedRegionId(polygonRegions[0].region_id);
+    }
+  }, [polygonRegions, selectedRegionId]);
 
   useEffect(() => {
     if (!open || !canLoadSavedAgentTemplate) {
@@ -1191,41 +1287,53 @@ export default function CameraCustomAgentEditorModal({
     }
   }, [inferenceModel, inputType, modelFps, runEvery, runningResolution]);
 
-  const activeHoverRegion = useMemo(
-    () => polygonRegions.find((region) => region.region_id === hoveredRegionId) || null,
-    [polygonRegions, hoveredRegionId]
-  );
+  const selectedRegion = useMemo(() => {
+    if (polygonRegions.length === 0) return null;
+    return (
+      polygonRegions.find((region) => region.region_id === selectedRegionId) ||
+      polygonRegions.find((region) => region.region_id === hoveredRegionId) ||
+      polygonRegions[0]
+    );
+  }, [polygonRegions, selectedRegionId, hoveredRegionId]);
+
+  const togglePolygonRegionEnabled = (regionId: string) => {
+    if (!regionId) return;
+    setPolygonRegions((prev) =>
+      prev.map((region) =>
+        region.region_id === regionId ? { ...region, enabled: !region.enabled } : region
+      )
+    );
+  };
+
+  const removePolygonRegion = (regionId: string) => {
+    if (!regionId) return;
+    const remaining = polygonRegions.filter((region) => region.region_id !== regionId);
+    setPolygonRegions(remaining);
+    if (hoveredRegionId === regionId) {
+      setHoveredRegionId(null);
+    }
+    setSelectedRegionId((prev) => {
+      if (remaining.length === 0) return null;
+      if (prev && prev !== regionId && remaining.some((region) => region.region_id === prev)) {
+        return prev;
+      }
+      return remaining[0].region_id;
+    });
+  };
 
   const getPointFromMouse = (clientX: number, clientY: number) => {
     const host = previewRef.current;
-    if (!host) return null;
+    const bounds = measureSnapshotRenderBounds();
+    if (!host || !bounds) return null;
     const rect = host.getBoundingClientRect();
-    if (!rect.width || !rect.height) return null;
-    const naturalW = snapshotNaturalSize.width || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH;
-    const naturalH = snapshotNaturalSize.height || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT;
-    const imageAspect = naturalW / naturalH;
-    const hostAspect = rect.width / rect.height;
-
-    let renderW = rect.width;
-    let renderH = rect.height;
-    if (hostAspect > imageAspect) {
-      renderH = rect.height;
-      renderW = renderH * imageAspect;
-    } else {
-      renderW = rect.width;
-      renderH = renderW / imageAspect;
-    }
-
-    const offsetX = (rect.width - renderW) / 2;
-    const offsetY = (rect.height - renderH) / 2;
-    const x = clientX - rect.left - offsetX;
-    const y = clientY - rect.top - offsetY;
-    if (x < 0 || y < 0 || x > renderW || y > renderH) return null;
+    const x = clientX - rect.left - bounds.left;
+    const y = clientY - rect.top - bounds.top;
+    if (x < 0 || y < 0 || x > bounds.width || y > bounds.height) return null;
 
     return {
-      point: { x: clamp01(x / renderW), y: clamp01(y / renderH) },
-      draw_ref_width: naturalW,
-      draw_ref_height: naturalH,
+      point: { x: clamp01(x / bounds.width), y: clamp01(y / bounds.height) },
+      draw_ref_width: bounds.naturalWidth,
+      draw_ref_height: bounds.naturalHeight,
     };
   };
 
@@ -1349,6 +1457,7 @@ export default function CameraCustomAgentEditorModal({
     };
     setPolygonRegions((prev) => [...prev, nextRegion]);
     setHoveredRegionId(nextId);
+    setSelectedRegionId(nextId);
     setPendingRegionSeed(null);
   };
 
@@ -2095,7 +2204,7 @@ export default function CameraCustomAgentEditorModal({
                       : polygonDrawEnabled
                       ? "Click once on image to define polygon name and description."
                       : polygonCount > 0
-                      ? `${polygonCount} polygon(s) configured.`
+                      ? `${polygonCount} polygon(s) configured. Select one below to manage or delete it.`
                       : "No polygons configured. Full frame will be used."}
                   </div>
 
@@ -2120,83 +2229,93 @@ export default function CameraCustomAgentEditorModal({
                             });
                           }}
                         />
-                        <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-                          {polygonRegions.map((region) => {
-                            const points = Array.isArray(region.polygon_norm) ? region.polygon_norm : [];
-                            if (points.length < ANALYSIS_REGION_MIN_POINTS) return null;
-                            const centroid = getPolygonCentroid(points);
-                            return (
-                              <g key={region.region_id}>
-                                <polygon
-                                  points={toSvgPoints(points)}
-                                  fill={region.enabled ? "rgba(96,165,250,0.20)" : "rgba(245,158,11,0.20)"}
-                                  stroke={hoveredRegionId === region.region_id ? "#60a5fa" : "#93c5fd"}
-                                  strokeWidth={0.35}
-                                  onMouseEnter={() => setHoveredRegionId(region.region_id)}
-                                  onDoubleClick={() => {
-                                    setPolygonRegions((prev) =>
-                                      prev.map((r) =>
-                                        r.region_id === region.region_id ? { ...r, enabled: !r.enabled } : r
-                                      )
-                                    );
-                                  }}
-                                />
-                                <text
-                                  x={centroid.x * 100}
-                                  y={centroid.y * 100}
-                                  textAnchor="middle"
-                                  dominantBaseline="middle"
-                                  fill="#dbeafe"
-                                  fontSize={3}
-                                  fontWeight={700}
-                                  style={{ pointerEvents: "none" }}
-                                >
-                                  {region.label}
-                                </text>
-                                {points.map((p, idx) => (
-                                  <circle
-                                    key={`${region.region_id}-${idx}`}
-                                    cx={p.x * 100}
-                                    cy={p.y * 100}
-                                    r={0.7}
-                                    fill="#93c5fd"
-                                    stroke="#111827"
-                                    strokeWidth={0.2}
+                        {snapshotRenderBounds ? (
+                          <svg
+                            className="absolute"
+                            style={{
+                              left: snapshotRenderBounds.left,
+                              top: snapshotRenderBounds.top,
+                              width: snapshotRenderBounds.width,
+                              height: snapshotRenderBounds.height,
+                            }}
+                            viewBox="0 0 100 100"
+                            preserveAspectRatio="none"
+                          >
+                            {polygonRegions.map((region) => {
+                              const points = Array.isArray(region.polygon_norm) ? region.polygon_norm : [];
+                              if (points.length < ANALYSIS_REGION_MIN_POINTS) return null;
+                              const centroid = getPolygonCentroid(points);
+                              return (
+                                <g key={region.region_id}>
+                                  <polygon
+                                    points={toSvgPoints(points)}
+                                    fill={region.enabled ? "rgba(96,165,250,0.20)" : "rgba(245,158,11,0.20)"}
+                                    stroke={
+                                      hoveredRegionId === region.region_id || selectedRegionId === region.region_id
+                                        ? "#60a5fa"
+                                        : "#93c5fd"
+                                    }
+                                    strokeWidth={0.35}
+                                    onMouseEnter={() => setHoveredRegionId(region.region_id)}
                                     onMouseDown={(event) => {
                                       event.preventDefault();
                                       event.stopPropagation();
-                                      setDragVertex({ regionId: region.region_id, index: idx });
+                                      setSelectedRegionId(region.region_id);
+                                      setHoveredRegionId(region.region_id);
+                                    }}
+                                    onDoubleClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      setPolygonRegions((prev) =>
+                                        prev.map((r) =>
+                                          r.region_id === region.region_id ? { ...r, enabled: !r.enabled } : r
+                                        )
+                                      );
                                     }}
                                   />
-                                ))}
-                              </g>
-                            );
-                          })}
-                          {draftPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
-                            <polygon
-                              points={toSvgPoints(draftPoints)}
-                              fill="rgba(59,130,246,0.22)"
-                              stroke="rgba(96,165,250,0.95)"
-                              strokeDasharray="2 1"
-                              strokeWidth={0.35}
-                            />
-                          ) : null}
-                        </svg>
-                        {activeHoverRegion ? (
-                          <div className="absolute top-2 left-2 z-20 rounded bg-black/70 px-2 py-1 text-[11px] text-white flex gap-2">
-                            <span>{activeHoverRegion.label}</span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const id = activeHoverRegion.region_id;
-                                setPolygonRegions((prev) => prev.filter((r) => r.region_id !== id));
-                                setHoveredRegionId(null);
-                              }}
-                              className="text-rose-300 hover:text-rose-200"
-                            >
-                              X
-                            </button>
-                          </div>
+                                  <text
+                                    x={centroid.x * 100}
+                                    y={centroid.y * 100}
+                                    textAnchor="middle"
+                                    dominantBaseline="middle"
+                                    fill="#dbeafe"
+                                    fontSize={3}
+                                    fontWeight={700}
+                                    style={{ pointerEvents: "none" }}
+                                  >
+                                    {region.label}
+                                  </text>
+                                  {points.map((p, idx) => (
+                                    <circle
+                                      key={`${region.region_id}-${idx}`}
+                                      cx={p.x * 100}
+                                      cy={p.y * 100}
+                                      r={0.7}
+                                      fill="#93c5fd"
+                                      stroke="#111827"
+                                      strokeWidth={0.2}
+                                      onMouseDown={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        setSelectedRegionId(region.region_id);
+                                        setHoveredRegionId(region.region_id);
+                                        setDragVertex({ regionId: region.region_id, index: idx });
+                                      }}
+                                    />
+                                  ))}
+                                </g>
+                              );
+                            })}
+                            {draftPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
+                              <polygon
+                                points={toSvgPoints(draftPoints)}
+                                fill="rgba(59,130,246,0.22)"
+                                stroke="rgba(96,165,250,0.95)"
+                                strokeDasharray="2 1"
+                                strokeWidth={0.35}
+                              />
+                            ) : null}
+                          </svg>
                         ) : null}
                       </div>
                     ) : (
@@ -2209,6 +2328,63 @@ export default function CameraCustomAgentEditorModal({
                       </div>
                     )}
                   </div>
+                  {polygonRegions.length > 0 ? (
+                    <div className="border-t border-gray-700/80 bg-gray-950/50 px-4 py-3 space-y-3">
+                      <div className="flex flex-wrap gap-2">
+                        {polygonRegions.map((region, index) => {
+                          const isSelected = selectedRegion?.region_id === region.region_id;
+                          return (
+                            <button
+                              key={region.region_id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedRegionId(region.region_id);
+                                setHoveredRegionId(region.region_id);
+                              }}
+                              className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
+                                isSelected
+                                  ? "border-blue-500 bg-blue-500/20 text-blue-100"
+                                  : "border-gray-700 bg-gray-900 text-gray-300 hover:bg-gray-800"
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 rounded-full ${
+                                  region.enabled === false ? "bg-amber-400" : "bg-emerald-400"
+                                }`}
+                              />
+                              {region.label || `Region ${index + 1}`}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {selectedRegion ? (
+                        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-gray-700 bg-gray-900/80 px-3 py-2 text-xs text-gray-200">
+                          <span className="font-medium text-gray-100">
+                            Selected polygon: {selectedRegion.label || "Region"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => togglePolygonRegionEnabled(selectedRegion.region_id)}
+                            className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1 transition-colors ${
+                              selectedRegion.enabled === false
+                                ? "border-emerald-600/70 text-emerald-300 hover:bg-emerald-500/10"
+                                : "border-amber-600/70 text-amber-300 hover:bg-amber-500/10"
+                            }`}
+                          >
+                            {selectedRegion.enabled === false ? "Enable" : "Disable"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removePolygonRegion(selectedRegion.region_id)}
+                            className="inline-flex items-center gap-1.5 rounded border border-rose-600/70 px-2.5 py-1 text-rose-300 transition-colors hover:bg-rose-500/10"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Delete polygon
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30">

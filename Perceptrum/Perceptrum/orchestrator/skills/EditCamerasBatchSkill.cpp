@@ -299,7 +299,7 @@ nlohmann::json normalizePatchFieldValue_(
         return nullptr;
     }
 
-    if (key == "allowpublicaccess" || key == "is_service_running") {
+    if (key == "allowpublicaccess") {
         if (value.is_boolean()) {
             return value.get<bool>();
         }
@@ -934,7 +934,7 @@ nlohmann::json extractBatchEditDraft_(
         "\"clear_fields\":[\"subtype\"]"
         "}\n"
         "Valid selection_status values are: resolved, missing_scope, needs_clarification, not_found.\n"
-        "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess, is_service_running.\n"
+        "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess.\n"
         "Valid clear_fields values are: ip_address, rtsp_port, manufacturer, username, password, channel, subtype, description, street, number, city, state, zip_code, country, webcam_index.\n"
         "Do not emit empty strings, nulls, placeholders, or unsupported fields.\n";
 

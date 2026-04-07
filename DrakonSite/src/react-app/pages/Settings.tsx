@@ -581,7 +581,7 @@ export default function Settings() {
           <div className="hidden xl:block" />
         </div>
 
-        <div className="max-w-4xl">
+        <div className="mx-auto w-full max-w-4xl">
           <div className="mb-4 md:mb-6 rounded-2xl border border-blue-500/20 bg-gradient-to-br from-blue-500/10 via-slate-900/40 to-cyan-500/10 p-4 md:p-5">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div className="flex items-start gap-3">

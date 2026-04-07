@@ -5574,6 +5574,7 @@ bool CameraSession::matchesStartConfig(const CameraConfig& cfg) const
         config_.modelTier == cfg.modelTier &&
         config_.startOrigin == cfg.startOrigin &&
         config_.isDrakonFindTemporarySession == cfg.isDrakonFindTemporarySession &&
+        config_.isVideoSearchTemporarySession == cfg.isVideoSearchTemporarySession &&
         config_.forceVideoRecordingWithoutInference == cfg.forceVideoRecordingWithoutInference;
 }
 
@@ -5736,6 +5737,8 @@ bool CameraSession::shouldForceVideoCapture_() const
     // Drakon Find 60s windows must keep writing frames even when the motion
     // gate is idle, otherwise the rolling 60s clip never reaches finalization.
     return
+        owner_->getChatRequestedVideoCaptureFps(cameraNumericId, 10) > 0 ||
+        owner_->getChatRequestedVideoCaptureFps(cameraNumericId, 60) > 0 ||
         owner_->getDrakonFindRequestedVideoCaptureFps(cameraNumericId, 10) > 0 ||
         owner_->getDrakonFindRequestedVideoCaptureFps(cameraNumericId, 60) > 0;
 }

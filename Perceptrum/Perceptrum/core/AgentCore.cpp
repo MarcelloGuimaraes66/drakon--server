@@ -2178,9 +2178,12 @@ static bool deriveSegmentRangeFromPathForPrompt_(
 static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
     const std::string& clipsRoot,
     const json& routerResult,
-    bool preferTenSecondClips = false)
+    bool preferTenSecondClips = false,
+    int maxSegmentSeconds = kMaxSegmentSeconds)
 {
     std::vector<EncodedVideoSegment> encoded;
+    const int safeMaxSegmentSeconds =
+        maxSegmentSeconds > 0 ? maxSegmentSeconds : kMaxSegmentSeconds;
 
     const std::string startTs =
         routerResult.value("start_timestamp", "");
@@ -2416,7 +2419,7 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
             int clipSeconds = ci->nominalSeconds > 0 ? ci->nominalSeconds : 10;
 
             if (!currentGroup.empty() &&
-                currentGroupSeconds + clipSeconds > kMaxSegmentSeconds)
+                currentGroupSeconds + clipSeconds > safeMaxSegmentSeconds)
             {
                 groups.push_back(currentGroup);
                 currentGroup.clear();
@@ -2431,7 +2434,9 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
         Logger::instance().logDebug(
             "agent",
             "buildEncodedVideosFromMp4Clips: camId=" + std::to_string(camId) +
-            " grouping -> " + std::to_string(groups.size()) + " merged segments"
+            " grouping -> " + std::to_string(groups.size()) +
+            " merged segments (max_segment_seconds=" +
+            std::to_string(safeMaxSegmentSeconds) + ")"
         );
 
         // 6) Build EncodedVideoSegment for each group (same logic as before)
@@ -2991,6 +2996,9 @@ namespace {
 
         std::string manufacturer = trimCopy(getStringSafe("manufacturer"));
         std::string ip = trimCopy(getStringSafe("ip"));
+        if (ip.empty()) {
+            ip = trimCopy(getStringSafe("ip_address"));
+        }
         std::string username = trimCopy(getStringSafe("username"));
         std::string password = getStringSafe("password");
         std::string channelOverride = normalizeNumericToken(getStringSafe("channel"));
@@ -3003,6 +3011,14 @@ namespace {
             }
             else if (p["port"].is_number_integer()) {
                 portStr = std::to_string(p["port"].get<int>());
+            }
+        }
+        else if (p.contains("rtsp_port") && !p["rtsp_port"].is_null()) {
+            if (p["rtsp_port"].is_string()) {
+                portStr = p["rtsp_port"].get<std::string>();
+            }
+            else if (p["rtsp_port"].is_number_integer()) {
+                portStr = std::to_string(p["rtsp_port"].get<int>());
             }
         }
         portStr = normalizeNumericToken(portStr);
@@ -6327,6 +6343,16 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
         }
     }
 
+    cfg.isVideoSearchTemporarySession = false;
+    if (p.contains("video_search_temporary_session")) {
+        if (p["video_search_temporary_session"].is_boolean()) {
+            cfg.isVideoSearchTemporarySession = p["video_search_temporary_session"].get<bool>();
+        }
+        else if (p["video_search_temporary_session"].is_number_integer()) {
+            cfg.isVideoSearchTemporarySession = p["video_search_temporary_session"].get<int>() != 0;
+        }
+    }
+
     // ---- NEW: parse enabled_algorithms from payload ----
 
     cfg.enabledAlgorithms.clear();
@@ -6688,6 +6714,8 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         " timeOffsetSeconds=" + std::to_string(cfg.timeOffsetSeconds) +
         " forceVideoRecordingWithoutInference=" +
         std::string(cfg.forceVideoRecordingWithoutInference ? "true" : "false") +
+        " isVideoSearchTemporarySession=" +
+        std::string(cfg.isVideoSearchTemporarySession ? "true" : "false") +
         " hydrateExistingSegments=" +
         std::string(cfg.storage.hydrateExistingSegments ? "true" : "false") +
         " descriptionModelName=" + cfg.descriptionModelName +
@@ -12410,6 +12438,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         std::string chatTemporalSummary;
         ChatTemporalState chatTemporalState;
         std::string userQuestionForVision = userQuestion;
+        const bool deferTemporalPromptInjectionForSequentialVideo =
+            isOpenAIChatModelTier(modelTier);
         std::vector<std::pair<int, int>> chatCaptureRegistrations;
         struct ScopeExit_ {
             std::function<void()> fn;
@@ -12444,7 +12474,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 userQuestion,
                 "",
                 "",
-                (!uploadedVideoUrl.empty()) ? "video" : "image",
+                "video",
                 userLocale.empty() ? "en" : userLocale,
                 modelFamily,
                 modelApiKey,
@@ -12453,21 +12483,34 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             );
             if (temporalReady && temporal::planUsable(envelope)) {
                 chatTemporalState.planEnvelope = envelope;
-                const nlohmann::json temporalInput = temporal::buildInferenceInput(
-                    chatTemporalState.planEnvelope,
-                    chatTemporalState.state,
-                    -1,
-                    temporal::nowIso()
-                );
-                Logger::instance().logDebug(
-                    "agent",
-                    "handleChatQuery_: temporal input injected chat_session_id=" +
-                    std::to_string(chatSessionId) +
-                    " now_utc=" +
-                    temporalInput.value("time_context", nlohmann::json::object()).value("now_utc", "") +
-                    " payload=" + temporalInput.dump()
-                );
-                userQuestionForVision += temporal::runtimePromptAppendix(temporalInput);
+                if (envelope.contains("plan_hash") && envelope["plan_hash"].is_string()) {
+                    chatTemporalState.promptHash = envelope["plan_hash"].get<std::string>();
+                }
+                if (deferTemporalPromptInjectionForSequentialVideo) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: temporal plan prepared for sequential video rounds chat_session_id=" +
+                        std::to_string(chatSessionId) +
+                        " plan_hash=" + chatTemporalState.promptHash
+                    );
+                }
+                else {
+                    const nlohmann::json temporalInput = temporal::buildInferenceInput(
+                        chatTemporalState.planEnvelope,
+                        chatTemporalState.state,
+                        -1,
+                        temporal::nowIso()
+                    );
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: temporal input injected chat_session_id=" +
+                        std::to_string(chatSessionId) +
+                        " now_utc=" +
+                        temporalInput.value("time_context", nlohmann::json::object()).value("now_utc", "") +
+                        " payload=" + temporalInput.dump()
+                    );
+                    userQuestionForVision += temporal::runtimePromptAppendix(temporalInput);
+                }
                 chatTemporalActive = true;
             }
         }
@@ -12573,22 +12616,430 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             " | total=" + std::to_string(routerTotalTokens)
         );
 
-        if (!hasUploadedVideo && modelInputFps > 1) {
-            std::unordered_set<int> uniqueCameraIds;
-            const json routerCameraIds = routerResult.value("camera_ids", json::array());
-            if (routerCameraIds.is_array()) {
-                for (const auto& cameraNode : routerCameraIds) {
-                    if (!cameraNode.is_number_integer()) continue;
-                    const int requestedCameraId = cameraNode.get<int>();
-                    if (requestedCameraId > 0) {
-                        uniqueCameraIds.insert(requestedCameraId);
-                    }
+        std::unordered_map<int, json> cameraPayloadById;
+        std::unordered_map<int, std::string> cameraNameById;
+        if (!hasUploadedVideo && cameras.is_array()) {
+            for (const auto& cameraNode : cameras) {
+                if (!cameraNode.is_object()) continue;
+                if (!cameraNode.contains("id") || !cameraNode["id"].is_number_integer()) continue;
+                const int cameraId = cameraNode["id"].get<int>();
+                if (cameraId <= 0) continue;
+                cameraPayloadById[cameraId] = cameraNode;
+                if (cameraNode.contains("name") && cameraNode["name"].is_string()) {
+                    cameraNameById[cameraId] = cameraNode["name"].get<std::string>();
                 }
             }
-            for (int requestedCameraId : uniqueCameraIds) {
-                const int requestId = acquireChatVideoCapture_(requestedCameraId, modelInputFps, 10);
-                if (requestId > 0) {
-                    chatCaptureRegistrations.emplace_back(requestedCameraId, requestId);
+        }
+
+        std::unordered_set<int> selectedCameraIds;
+        const json routerCameraIds = routerResult.value("camera_ids", json::array());
+        if (routerCameraIds.is_array()) {
+            for (const auto& cameraNode : routerCameraIds) {
+                if (!cameraNode.is_number_integer()) continue;
+                const int requestedCameraId = cameraNode.get<int>();
+                if (requestedCameraId > 0) {
+                    selectedCameraIds.insert(requestedCameraId);
+                }
+            }
+        }
+        if (!hasUploadedVideo &&
+            selectedCameraIds.empty() &&
+            routerResult.value("all_cameras", false) &&
+            cameras.is_array())
+        {
+            for (const auto& cameraNode : cameras) {
+                if (!cameraNode.is_object()) continue;
+                if (!cameraNode.contains("id") || !cameraNode["id"].is_number_integer()) continue;
+                const int requestedCameraId = cameraNode["id"].get<int>();
+                if (requestedCameraId > 0) {
+                    selectedCameraIds.insert(requestedCameraId);
+                }
+            }
+        }
+        if (routerCameraIds.is_array() &&
+            routerResult.contains("camera_names") &&
+            routerResult["camera_names"].is_array())
+        {
+            const auto& routerCameraNames = routerResult["camera_names"];
+            const std::size_t count =
+                (std::min)(routerCameraIds.size(), routerCameraNames.size());
+            for (std::size_t i = 0; i < count; ++i) {
+                if (!routerCameraIds[i].is_number_integer()) continue;
+                if (!routerCameraNames[i].is_string()) continue;
+                const int cameraId = routerCameraIds[i].get<int>();
+                if (cameraId > 0 && cameraNameById[cameraId].empty()) {
+                    cameraNameById[cameraId] = routerCameraNames[i].get<std::string>();
+                }
+            }
+        }
+
+        const std::string lowerUserQuestion = lowerAsciiCopy(trimAscii(userQuestion));
+        auto questionHasAnyPhrase = [&](std::initializer_list<const char*> phrases) {
+            for (const char* phrase : phrases) {
+                if (!phrase || *phrase == '\0') continue;
+                if (lowerUserQuestion.find(phrase) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto jsonBoolish = [](const json& obj, const char* key, bool fallback) {
+            if (!obj.is_object() || !key) return fallback;
+            if (!obj.contains(key) || obj[key].is_null()) return fallback;
+            const auto& value = obj[key];
+            if (value.is_boolean()) return value.get<bool>();
+            if (value.is_number_integer()) return value.get<int>() != 0;
+            if (value.is_number_unsigned()) return value.get<unsigned int>() != 0U;
+            if (value.is_string()) {
+                const std::string lowerValue = lowerAsciiCopy(trimAscii(value.get<std::string>()));
+                if (lowerValue == "1" || lowerValue == "true" || lowerValue == "yes") return true;
+                if (lowerValue == "0" || lowerValue == "false" || lowerValue == "no") return false;
+            }
+            return fallback;
+        };
+        auto appendUniqueCameraLabel = [](std::vector<std::string>& labels, std::string label) {
+            label = trimAscii(label);
+            if (label.empty()) return;
+            if (std::find(labels.begin(), labels.end(), label) != labels.end()) return;
+            labels.push_back(std::move(label));
+        };
+        auto formatCameraLabelList = [](const std::vector<std::string>& labels) {
+            std::ostringstream oss;
+            for (std::size_t i = 0; i < labels.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << labels[i];
+            }
+            return oss.str();
+        };
+
+        const bool explicitLiveNowQuery = questionHasAnyPhrase({
+            "agora",
+            "neste momento",
+            "nesse momento",
+            "no momento",
+            "neste exato momento",
+            "nesse exato momento",
+            "right now",
+            "at this moment",
+            "currently"
+            });
+        const bool explicitHistoricalWindowQuery = questionHasAnyPhrase({
+            "hoje",
+            "ontem",
+            "essa semana",
+            "esta semana",
+            "today",
+            "yesterday",
+            "this week",
+            "last ",
+            "minutes",
+            "minute",
+            "hours",
+            "hour",
+            "segundos",
+            "segundo",
+            "minutos",
+            "minuto",
+            "horas",
+            "hora",
+            "entre ",
+            "between ",
+            "from ",
+            " ago",
+            " atras",
+            " atrás"
+            });
+
+        const int routedMinutes = routerResult.value("time_window_minutes_before_now", 0);
+        const std::string routedStartTs = routerResult.value("start_timestamp", "");
+        const std::string routedEndTs = routerResult.value("end_timestamp", "");
+        std::chrono::system_clock::time_point routedStartTp{};
+        std::chrono::system_clock::time_point routedEndTp{};
+        const bool parsedRoutedWindow =
+            parseTimestampToTimePoint(routedStartTs, routedStartTp) &&
+            parseTimestampToTimePoint(routedEndTs, routedEndTp);
+        const long long routedWindowSec = parsedRoutedWindow
+            ? std::chrono::duration_cast<std::chrono::seconds>(routedEndTp - routedStartTp).count()
+            : 0;
+        bool routerLooksLikeDefaultOneMinute = (routedMinutes == 1);
+        if (parsedRoutedWindow && (routedWindowSec <= 0 || routedWindowSec > 70)) {
+            routerLooksLikeDefaultOneMinute = false;
+        }
+
+        const bool liveOrImplicitNowSearch =
+            !hasUploadedVideo &&
+            !selectedCameraIds.empty() &&
+            (explicitLiveNowQuery ||
+                (routerLooksLikeDefaultOneMinute && !explicitHistoricalWindowQuery));
+
+        if (liveOrImplicitNowSearch) {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: live/implicit-now video_search enabled camera_count=" +
+                std::to_string(selectedCameraIds.size()) +
+                " explicit_live=" + std::string(explicitLiveNowQuery ? "true" : "false") +
+                " routed_minutes=" + std::to_string(routedMinutes)
+            );
+        }
+
+        struct VideoSearchTemporarySession_ {
+            int cameraId = 0;
+            bool originallyRunning = false;
+            std::optional<CameraConfig> temporaryCfg;
+        };
+        std::vector<VideoSearchTemporarySession_> videoSearchTemporarySessions;
+        auto stopVideoSearchTemporarySessionIfSafe = [&](const VideoSearchTemporarySession_& sessionInfo) {
+            if (sessionInfo.cameraId <= 0) return;
+            if (sessionInfo.originallyRunning) return;
+            if (!sessionInfo.temporaryCfg.has_value()) return;
+
+            CameraSession* currentSession = getCameraSession(sessionInfo.cameraId);
+            if (!currentSession) return;
+            if (!currentSession->matchesStartConfig(*sessionInfo.temporaryCfg)) return;
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: stopping temporary video_search session for camera " +
+                std::to_string(sessionInfo.cameraId)
+            );
+            stopCamera_(sessionInfo.cameraId);
+        };
+        ScopeExit_ videoSearchTempSessionGuard{
+            [&, this]() {
+                for (const auto& sessionInfo : videoSearchTemporarySessions) {
+                    stopVideoSearchTemporarySessionIfSafe(sessionInfo);
+                }
+            }
+        };
+
+        std::atomic<bool> liveCaptureCancelRequested{ false };
+        std::thread liveCaptureCancelBridge;
+        ScopeExit_ liveCaptureCancelBridgeGuard{
+            [&]() {
+                liveCaptureCancelRequested.store(true);
+                if (liveCaptureCancelBridge.joinable()) {
+                    liveCaptureCancelBridge.join();
+                }
+            }
+        };
+        if (liveOrImplicitNowSearch) {
+            liveCaptureCancelBridge = std::thread([&, this]() {
+                while (running_ && !liveCaptureCancelRequested.load()) {
+                    if (isCancelled()) {
+                        liveCaptureCancelRequested.store(true);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                }
+            });
+        }
+
+        auto getNewestStoredTenSecondClipForCamera = [&](int cameraId) -> std::optional<std::string> {
+            try {
+                std::error_code ec;
+                const fs::path camRoot = fs::path("frames") / ("cam_" + std::to_string(cameraId));
+                if (!fs::exists(camRoot, ec) || !fs::is_directory(camRoot, ec)) {
+                    return std::nullopt;
+                }
+
+                fs::path bestPath;
+                fs::file_time_type bestTime{};
+                bool found = false;
+
+                for (fs::recursive_directory_iterator it(camRoot, ec), end;
+                    !ec && it != end;
+                    it.increment(ec))
+                {
+                    if (ec) break;
+
+                    const auto& entry = *it;
+                    if (!entry.is_regular_file(ec)) {
+                        if (ec) break;
+                        continue;
+                    }
+
+                    const std::string filename = entry.path().filename().string();
+                    if (!hasSuffixDrakonFind_(filename, "_10s.mp4")) {
+                        continue;
+                    }
+                    if (entry.path().string().find("_merge_failed") != std::string::npos) {
+                        continue;
+                    }
+
+                    std::string parsedCameraId;
+                    std::string parsedStartTs;
+                    std::string parsedEndTs;
+                    int nominalSeconds = 0;
+                    if (!parseClipNamePartsForAgent(
+                        entry.path().stem().string(),
+                        parsedCameraId,
+                        parsedStartTs,
+                        parsedEndTs,
+                        nominalSeconds))
+                    {
+                        continue;
+                    }
+                    if (nominalSeconds < 8 || nominalSeconds > 20) {
+                        continue;
+                    }
+
+                    const auto t = entry.last_write_time(ec);
+                    if (ec) break;
+
+                    const auto nowFileClock = fs::file_time_type::clock::now();
+                    if (t > nowFileClock) {
+                        continue;
+                    }
+                    if ((nowFileClock - t) < std::chrono::seconds(2)) {
+                        continue;
+                    }
+
+                    if (!found || t > bestTime) {
+                        bestPath = entry.path();
+                        bestTime = t;
+                        found = true;
+                    }
+                }
+
+                if (ec || !found) {
+                    return std::nullopt;
+                }
+                return bestPath.string();
+            }
+            catch (...) {
+                return std::nullopt;
+            }
+        };
+
+        auto waitForNewStoredTenSecondClip = [&](int cameraId,
+                                                 const std::string& previousClipPath,
+                                                 const std::chrono::steady_clock::time_point& deadline,
+                                                 std::string& outClipPath) {
+            outClipPath.clear();
+
+            while (running_ && !isCancelled()) {
+                if (liveCaptureCancelRequested.load()) {
+                    break;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+
+                const auto newestClip = getNewestStoredTenSecondClipForCamera(cameraId);
+                if (newestClip.has_value() &&
+                    !newestClip->empty() &&
+                    *newestClip != previousClipPath)
+                {
+                    outClipPath = *newestClip;
+                    return true;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+
+            const auto newestClip = getNewestStoredTenSecondClipForCamera(cameraId);
+            if (newestClip.has_value() &&
+                !newestClip->empty() &&
+                *newestClip != previousClipPath)
+            {
+                outClipPath = *newestClip;
+                return true;
+            }
+
+            return false;
+        };
+
+        auto buildStoredTenSecondSegment = [&](int cameraId,
+                                               const std::string& cameraName,
+                                               const std::string& clipPath,
+                                               EncodedVideoSegment& outSegment,
+                                               std::string& outError) {
+            outSegment = EncodedVideoSegment{};
+            outError.clear();
+
+            if (clipPath.empty()) {
+                outError = "stored clip path is empty";
+                return false;
+            }
+
+            std::error_code ec;
+            if (!fs::exists(clipPath, ec) || ec) {
+                outError = "stored 10s clip is not available on disk";
+                return false;
+            }
+
+            std::string parsedCameraId;
+            std::string parsedStartTs;
+            std::string parsedEndTs;
+            int nominalSeconds = 0;
+            if (!parseClipNamePartsForAgent(
+                fs::path(clipPath).stem().string(),
+                parsedCameraId,
+                parsedStartTs,
+                parsedEndTs,
+                nominalSeconds))
+            {
+                outError = "failed to parse stored clip name";
+                return false;
+            }
+
+            ClipInfo clipInfo;
+            clipInfo.path = clipPath;
+            clipInfo.startTs = parsedStartTs;
+            clipInfo.endTs = parsedEndTs;
+            clipInfo.nominalSeconds = nominalSeconds;
+            clipInfo.cameraId = cameraId;
+            clipInfo.cameraName = cameraName;
+
+            const std::vector<const ClipInfo*> group{ &clipInfo };
+            if (!buildEncodedSegmentFromGroup(group, outSegment)) {
+                outError = "failed to build encoded segment from stored clip";
+                return false;
+            }
+            return true;
+        };
+
+        auto prepareVideoSearchTemporaryPayload = [&](int cameraId, const json& cameraPayload) {
+            json temporaryPayload = cameraPayload.is_object() ? cameraPayload : json::object();
+            if ((!temporaryPayload.contains("id") || !temporaryPayload["id"].is_number_integer()) &&
+                cameraId > 0)
+            {
+                temporaryPayload["id"] = cameraId;
+            }
+            if (!temporaryPayload.contains("ip") &&
+                temporaryPayload.contains("ip_address") &&
+                temporaryPayload["ip_address"].is_string())
+            {
+                temporaryPayload["ip"] = temporaryPayload["ip_address"];
+            }
+            if (!temporaryPayload.contains("port") &&
+                temporaryPayload.contains("rtsp_port") &&
+                !temporaryPayload["rtsp_port"].is_null())
+            {
+                temporaryPayload["port"] = temporaryPayload["rtsp_port"];
+            }
+            temporaryPayload["video_search_temporary_session"] = true;
+            temporaryPayload["hydrate_existing_segments"] = false;
+            temporaryPayload["store_frames"] = true;
+            temporaryPayload["enabled_algorithms"] = json::array();
+            return temporaryPayload;
+        };
+
+        std::vector<std::string> liveCaptureFailedCameraLabels;
+
+        if (!hasUploadedVideo) {
+            const int proactiveCaptureFps =
+                (modelInputFps > 1) ? modelInputFps : (liveOrImplicitNowSearch ? 1 : 0);
+            if (proactiveCaptureFps > 0) {
+                for (int requestedCameraId : selectedCameraIds) {
+                    const int requestId = acquireChatVideoCapture_(
+                        requestedCameraId,
+                        proactiveCaptureFps,
+                        10
+                    );
+                    if (requestId > 0) {
+                        chatCaptureRegistrations.emplace_back(requestedCameraId, requestId);
+                    }
                 }
             }
         }
@@ -12654,12 +13105,23 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         // Build encodedVideos (conditional)
         // ------------------------------------------------------------
         std::vector<EncodedVideoSegment> encodedVideos;
+        const bool useSequentialTemporalVideoRunner =
+            chatTemporalActive &&
+            isOpenAIChatModelTier(modelTier) &&
+            temporal::planUsable(chatTemporalState.planEnvelope);
+        const int chatVideoSearchMaxSegmentSeconds =
+            useSequentialTemporalVideoRunner ? 60 : kMaxSegmentSeconds;
 
         if (!hasUploadedVideo) {
             // Existing behavior: find MP4 clips on disk based on routerResult
             // (keep EXACTLY your existing root variable here)
             const std::string clipsRoot = "frames";
-            encodedVideos = buildEncodedVideosFromMp4Clips(clipsRoot, routerResult);
+            encodedVideos = buildEncodedVideosFromMp4Clips(
+                clipsRoot,
+                routerResult,
+                /*preferTenSecondClips=*/false,
+                chatVideoSearchMaxSegmentSeconds
+            );
 
             // Race-safe fallback for the default "last minute" query:
             // if the newest 10s clip is being finalized right now, first scan can miss it.
@@ -12703,7 +13165,12 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     if (abortIfCancelled("after_retry_grace")) {
                         return;
                     }
-                    encodedVideos = buildEncodedVideosFromMp4Clips(clipsRoot, routerResult);
+                    encodedVideos = buildEncodedVideosFromMp4Clips(
+                        clipsRoot,
+                        routerResult,
+                        /*preferTenSecondClips=*/false,
+                        chatVideoSearchMaxSegmentSeconds
+                    );
 
                     if (encodedVideos.empty()) {
                         // If still empty, widen backward a bit and force preference for 10s clips.
@@ -12725,10 +13192,201 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                             encodedVideos = buildEncodedVideosFromMp4Clips(
                                 clipsRoot,
                                 fallbackRouter,
-                                /*preferTenSecondClips=*/true
+                                /*preferTenSecondClips=*/true,
+                                chatVideoSearchMaxSegmentSeconds
                             );
                         }
                     }
+                }
+            }
+
+            if (liveOrImplicitNowSearch && !selectedCameraIds.empty()) {
+                std::unordered_set<int> camerasWithSegments;
+                for (const auto& segment : encodedVideos) {
+                    if (segment.cameraId > 0) {
+                        camerasWithSegments.insert(segment.cameraId);
+                    }
+                }
+
+                std::vector<int> missingCameraIds;
+                missingCameraIds.reserve(selectedCameraIds.size());
+                for (int selectedCameraId : selectedCameraIds) {
+                    if (selectedCameraId <= 0) continue;
+                    if (camerasWithSegments.find(selectedCameraId) == camerasWithSegments.end()) {
+                        missingCameraIds.push_back(selectedCameraId);
+                    }
+                }
+
+                if (!missingCameraIds.empty()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: attempting live capture fallback for missing cameras count=" +
+                        std::to_string(missingCameraIds.size())
+                    );
+                }
+
+                for (int missingCameraId : missingCameraIds) {
+                    if (abortIfCancelled("before_live_capture_camera")) {
+                        return;
+                    }
+
+                    const auto payloadIt = cameraPayloadById.find(missingCameraId);
+                    const bool hasCameraPayload = payloadIt != cameraPayloadById.end();
+                    const json cameraPayload =
+                        hasCameraPayload ? payloadIt->second : json::object();
+                    const std::string cameraLabel =
+                        !trimAscii(cameraNameById[missingCameraId]).empty()
+                        ? trimAscii(cameraNameById[missingCameraId])
+                        : ("camera " + std::to_string(missingCameraId));
+
+                    const bool originallyRunning =
+                        (hasCameraPayload &&
+                            jsonBoolish(cameraPayload, "is_service_running", false)) ||
+                        getCameraSession(missingCameraId) != nullptr;
+
+                    std::string previousClipPath;
+                    if (const auto newestClip = getNewestStoredTenSecondClipForCamera(missingCameraId);
+                        newestClip.has_value())
+                    {
+                        previousClipPath = *newestClip;
+                    }
+
+                    int localCaptureRequestId = acquireChatVideoCapture_(missingCameraId, 1, 10);
+                    auto releaseLocalCaptureRequest = [&](int* requestIdPtr) {
+                        if (!requestIdPtr || *requestIdPtr <= 0) return;
+                        releaseChatVideoCapture_(missingCameraId, *requestIdPtr);
+                        *requestIdPtr = -1;
+                    };
+                    std::unique_ptr<int, decltype(releaseLocalCaptureRequest)> localCaptureGuard(
+                        nullptr,
+                        releaseLocalCaptureRequest
+                    );
+                    if (localCaptureRequestId > 0) {
+                        localCaptureGuard.reset(&localCaptureRequestId);
+                    }
+
+                    CameraSession* session = getCameraSession(missingCameraId);
+                    bool temporarySessionStarted = false;
+                    if (!session && !originallyRunning && hasCameraPayload) {
+                        json temporaryPayload =
+                            prepareVideoSearchTemporaryPayload(missingCameraId, cameraPayload);
+                        std::optional<CameraConfig> temporaryCfg;
+                        try {
+                            temporaryCfg =
+                                buildCameraConfigFromPayload_(missingCameraId, temporaryPayload);
+                        }
+                        catch (...) {
+                            temporaryCfg.reset();
+                        }
+
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: starting temporary video_search session for camera " +
+                            std::to_string(missingCameraId)
+                        );
+                        startCameraFromPayload_(missingCameraId, temporaryPayload);
+                        session = getCameraSession(missingCameraId);
+                        if (session) {
+                            temporarySessionStarted = true;
+                            videoSearchTemporarySessions.push_back(
+                                VideoSearchTemporarySession_{
+                                    missingCameraId,
+                                    originallyRunning,
+                                    temporaryCfg
+                                }
+                            );
+                        }
+                    }
+
+                    EncodedVideoSegment recoveredSegment;
+                    std::string recoveryError;
+                    bool recovered = false;
+
+                    if (session || temporarySessionStarted || originallyRunning) {
+                        std::string newClipPath;
+                        const auto waitDeadline =
+                            std::chrono::steady_clock::now() + std::chrono::seconds(22);
+                        if (waitForNewStoredTenSecondClip(
+                            missingCameraId,
+                            previousClipPath,
+                            waitDeadline,
+                            newClipPath))
+                        {
+                            recovered = buildStoredTenSecondSegment(
+                                missingCameraId,
+                                cameraLabel,
+                                newClipPath,
+                                recoveredSegment,
+                                recoveryError
+                            );
+                        }
+                        else {
+                            recoveryError = "timed out waiting for a new 10s stored clip";
+                        }
+                    }
+
+                    localCaptureGuard.reset();
+
+                    if (!recovered &&
+                        hasCameraPayload &&
+                        !liveCaptureCancelRequested.load())
+                    {
+                        EncodedVideoSegment onDemandSegment;
+                        std::string onDemandError;
+                        if (captureOnDemandVideoWindowDrakonFind_(
+                            cameraPayload,
+                            missingCameraId,
+                            10,
+                            1,
+                            liveCaptureCancelRequested,
+                            onDemandSegment,
+                            onDemandError))
+                        {
+                            onDemandSegment.cameraId = missingCameraId;
+                            onDemandSegment.cameraName = cameraLabel;
+                            if (onDemandSegment.bytes.empty() &&
+                                !onDemandSegment.sourceFilePath.empty())
+                            {
+                                (void)readFileToBytes(
+                                    onDemandSegment.sourceFilePath,
+                                    onDemandSegment.bytes
+                                );
+                            }
+
+                            const bool providerNeedsBytes = !isOpenAIChatModelTier(modelTier);
+                            if (!providerNeedsBytes || !onDemandSegment.bytes.empty()) {
+                                recoveredSegment = std::move(onDemandSegment);
+                                recovered = true;
+                            }
+                            else {
+                                recoveryError =
+                                    "on-demand capture succeeded but video bytes could not be loaded";
+                            }
+                        }
+                        else if (!onDemandError.empty()) {
+                            recoveryError = onDemandError;
+                        }
+                    }
+
+                    if (recovered) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: live capture fallback recovered camera " +
+                            std::to_string(missingCameraId) +
+                            " source=" + recoveredSegment.sourceFilePath
+                        );
+                        camerasWithSegments.insert(missingCameraId);
+                        encodedVideos.push_back(std::move(recoveredSegment));
+                        continue;
+                    }
+
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: live capture fallback failed camera=" +
+                        std::to_string(missingCameraId) +
+                        " error=" + recoveryError
+                    );
+                    appendUniqueCameraLabel(liveCaptureFailedCameraLabels, cameraLabel);
                 }
             }
 
@@ -12758,6 +13416,18 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     noFramesAnswer =
                         "Nao encontrei videos/frames armazenados no intervalo de tempo solicitado. "
                         "Tente aumentar a janela de tempo e perguntar novamente.";
+                }
+                if (!liveCaptureFailedCameraLabels.empty()) {
+                    if (userLocale.rfind("pt", 0) == 0) {
+                        noFramesAnswer +=
+                            " Tambem nao consegui capturar um video ao vivo em: " +
+                            formatCameraLabelList(liveCaptureFailedCameraLabels) + ".";
+                    }
+                    else {
+                        noFramesAnswer +=
+                            " I also could not capture a live 10-second clip from: " +
+                            formatCameraLabelList(liveCaptureFailedCameraLabels) + ".";
+                    }
                 }
 
                 postBody["answer"] = noFramesAnswer;
@@ -12918,6 +13588,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         std::string visionAnswer;
 
         std::vector<VideoHit> videoHits;
+        bool temporalHandledInline = false;
         if (isOpenAIChatModelTier(modelTier)) {
             const std::string openAiModelName = chatOpenAIModelNameForTier(modelTier);
             Logger::instance().logDebug(
@@ -12925,22 +13596,57 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 "handleChatQuery_: vision provider=openai model=" + openAiModelName +
                 " fps=" + std::to_string(modelInputFps)
             );
-            videoHits = analyzeVideosWithOpenAI_(
-                encodedVideos,
-                userQuestionForVision,
-                /*stopOnFirstHit=*/false,
-                uploadedImageBase64,
-                openAiModelName,
-                modelApiKey,
-                modelInputFps,
-                runningResolution,
-                visionPromptTokens,
-                visionOutputTokens,
-                visionTotalTokens,
-                visionAnswer,
-                coreChatPriorityActive,
-                isCancelled
-            );
+            if (useSequentialTemporalVideoRunner) {
+                ChatTemporalVideoAnalysisResult temporalResult =
+                    analyzeVideosWithOpenAISequentialTemporalChat_(
+                        encodedVideos,
+                        routerResult,
+                        userQuestion,
+                        uploadedImageBase64,
+                        openAiModelName,
+                        modelApiKey,
+                        modelInputFps,
+                        runningResolution,
+                        chatSessionId,
+                        chatTemporalState,
+                        coreChatPriorityActive,
+                        isCancelled
+                    );
+                videoHits = std::move(temporalResult.visibleHits);
+                visionPromptTokens = temporalResult.promptTokens;
+                visionOutputTokens = temporalResult.outputTokens;
+                visionTotalTokens = temporalResult.totalTokens;
+                visionAnswer = std::move(temporalResult.modelAnswer);
+                if (temporalResult.temporalAlert) chatTemporalAlert = true;
+                if (temporalResult.temporalReport) chatTemporalReport = true;
+                if (temporalResult.temporalOperatorResults.is_array() &&
+                    !temporalResult.temporalOperatorResults.empty())
+                {
+                    chatTemporalOperatorResults = std::move(temporalResult.temporalOperatorResults);
+                }
+                if (!temporalResult.temporalSummary.empty()) {
+                    chatTemporalSummary = std::move(temporalResult.temporalSummary);
+                }
+                temporalHandledInline = true;
+            }
+            else {
+                videoHits = analyzeVideosWithOpenAI_(
+                    encodedVideos,
+                    userQuestionForVision,
+                    /*stopOnFirstHit=*/false,
+                    uploadedImageBase64,
+                    openAiModelName,
+                    modelApiKey,
+                    modelInputFps,
+                    runningResolution,
+                    visionPromptTokens,
+                    visionOutputTokens,
+                    visionTotalTokens,
+                    visionAnswer,
+                    coreChatPriorityActive,
+                    isCancelled
+                );
+            }
         }
         else {
             Logger::instance().logDebug(
@@ -12965,7 +13671,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             return;
         }
 
-        if (chatTemporalActive) {
+        if (chatTemporalActive && !temporalHandledInline) {
             for (const auto& hitTemporal : videoHits) {
                 const std::string temporalDecisionNowIso =
                     temporal::decisionAnchorUtc(temporal::nowIso(), hitTemporal.segmentEndTs);
@@ -13077,6 +13783,18 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 temporalSuffix << ". Operator results: " << chatTemporalOperatorResults.dump();
             }
             finalAnswer += temporalSuffix.str();
+        }
+        if (!liveCaptureFailedCameraLabels.empty()) {
+            if (userLocale.rfind("pt", 0) == 0) {
+                finalAnswer +=
+                    "<br/><br/>Nao consegui capturar um video ao vivo em: " +
+                    formatCameraLabelList(liveCaptureFailedCameraLabels) + ".";
+            }
+            else {
+                finalAnswer +=
+                    "<br/><br/>I could not capture a live 10-second clip from: " +
+                    formatCameraLabelList(liveCaptureFailedCameraLabels) + ".";
+            }
         }
 
         if (abortIfCancelled("before_final_post")) {
@@ -25302,6 +26020,10 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             payload.contains("drakon_find_targets") && payload["drakon_find_targets"].is_array()
                 ? payload["drakon_find_targets"]
                 : nlohmann::json::array();
+        const nlohmann::json designContext =
+            payload.contains("design_context") && payload["design_context"].is_object()
+                ? payload["design_context"]
+                : nlohmann::json::object();
 
         goalSummary = trimCopyPromptEnhance(goalSummary);
         languageHint = trimCopyPromptEnhance(languageHint);
@@ -25731,6 +26453,17 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             prompt << agentPatch.dump(2) << "\n\n";
         }
 
+        if (designContext.is_object() && !designContext.empty()) {
+            prompt << "STRUCTURED EXECUTION CONTEXT:\n";
+            prompt << designContext.dump(2) << "\n";
+            prompt << "- Respect alert_policy.\n";
+            prompt << "- If alert_policy is \"never\", design this as an analysis-only agent that keeps alert_condition false and focuses on structured evidence.\n";
+            prompt << "- If alert_policy is \"final_decision_only\", only let alert_condition become true when this step is clearly the decision layer.\n";
+            prompt << "- If output_contract is present, make prompt_template instruct the model to return that contract as compact JSON with no markdown.\n";
+            prompt << "- If knowledge_inputs or pipeline semantics are present, instruct the downstream agent to use PIPELINE_INPUTS as the primary source when relevant.\n";
+            prompt << "- Align the behavior with the step role when the context says collector, validator, or decision.\n\n";
+        }
+
         if (faceTargets.is_array() && !faceTargets.empty()) {
             prompt << "KNOWN FACE TARGETS AVAILABLE TO THE USER:\n";
             prompt << faceTargets.dump(2) << "\n";
@@ -25944,6 +26677,19 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             return;
         }
 
+        std::string alertPolicy;
+        if (designContext.is_object() &&
+            designContext.contains("alert_policy") &&
+            designContext["alert_policy"].is_string()) {
+            alertPolicy = toLowerCopyPromptEnhance(
+                trimCopyPromptEnhance(designContext["alert_policy"].get<std::string>())
+            );
+        }
+        const std::string effectiveAlertCondition =
+            alertPolicy == "never"
+                ? std::string("Never set alert_condition=true. This step is analysis-only and must only return structured evidence.")
+                : alertCondition;
+
         const std::string inputType = normalizeInputType(jsonTextField(designed, "input_type"));
         const std::string videoPackagingMode =
             normalizeVideoPackagingMode(jsonTextField(designed, "video_packaging_mode"));
@@ -25955,7 +26701,7 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             { "display_name", displayName },
             { "summary", jsonTextField(designed, "summary") },
             { "prompt_template", promptTemplate },
-            { "alert_condition", alertCondition },
+            { "alert_condition", effectiveAlertCondition },
             { "negative_condition", negativeCondition },
             { "input_type", inputType },
             { "video_packaging_mode", videoPackagingMode },
@@ -26721,6 +27467,270 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
     );
 
     return allHits;
+}
+
+std::vector<std::size_t> AgentCore::buildChatTemporalExecutionOrder_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const nlohmann::json& routerResult) const
+{
+    std::vector<std::size_t> orderedIndices;
+    if (videos.empty()) {
+        return orderedIndices;
+    }
+
+    std::unordered_map<int, std::vector<std::size_t>> lanesByCamera;
+    for (std::size_t idx = 0; idx < videos.size(); ++idx) {
+        lanesByCamera[videos[idx].cameraId].push_back(idx);
+    }
+
+    for (auto& lane : lanesByCamera) {
+        auto& indices = lane.second;
+        std::sort(
+            indices.begin(),
+            indices.end(),
+            [&](std::size_t lhs, std::size_t rhs) {
+                const EncodedVideoSegment& a = videos[lhs];
+                const EncodedVideoSegment& b = videos[rhs];
+                if (a.startTs != b.startTs) return a.startTs < b.startTs;
+                if (a.endTs != b.endTs) return a.endTs < b.endTs;
+                if (a.sourceFilePath != b.sourceFilePath) {
+                    return a.sourceFilePath < b.sourceFilePath;
+                }
+                return lhs < rhs;
+            });
+    }
+
+    std::vector<int> orderedCameraIds;
+    std::unordered_set<int> seenCameraIds;
+    if (routerResult.is_object() &&
+        routerResult.contains("camera_ids") &&
+        routerResult["camera_ids"].is_array())
+    {
+        for (const auto& item : routerResult["camera_ids"]) {
+            if (!item.is_number_integer()) continue;
+            const int cameraId = item.get<int>();
+            if (seenCameraIds.find(cameraId) != seenCameraIds.end()) continue;
+            if (lanesByCamera.find(cameraId) == lanesByCamera.end()) continue;
+            orderedCameraIds.push_back(cameraId);
+            seenCameraIds.insert(cameraId);
+        }
+    }
+
+    std::vector<int> remainingCameraIds;
+    remainingCameraIds.reserve(lanesByCamera.size());
+    for (const auto& lane : lanesByCamera) {
+        if (seenCameraIds.find(lane.first) != seenCameraIds.end()) continue;
+        remainingCameraIds.push_back(lane.first);
+    }
+    std::sort(
+        remainingCameraIds.begin(),
+        remainingCameraIds.end(),
+        [](int lhs, int rhs) {
+            const bool lhsUnknown = lhs <= 0;
+            const bool rhsUnknown = rhs <= 0;
+            if (lhsUnknown != rhsUnknown) return !lhsUnknown;
+            return lhs < rhs;
+        });
+
+    orderedCameraIds.insert(
+        orderedCameraIds.end(),
+        remainingCameraIds.begin(),
+        remainingCameraIds.end());
+
+    for (const int cameraId : orderedCameraIds) {
+        auto itLane = lanesByCamera.find(cameraId);
+        if (itLane == lanesByCamera.end()) continue;
+        orderedIndices.insert(
+            orderedIndices.end(),
+            itLane->second.begin(),
+            itLane->second.end());
+    }
+
+    return orderedIndices;
+}
+
+AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISequentialTemporalChat_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const nlohmann::json& routerResult,
+    const std::string& userQuestionBase,
+    const std::string& uploadedImageBase64,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int modelInputFps,
+    int runningResolution,
+    int chatSessionId,
+    ChatTemporalState& chatTemporalState,
+    bool requestCoreChatPriority,
+    const std::function<bool()>& shouldAbort)
+{
+    ChatTemporalVideoAnalysisResult result;
+    if (videos.empty()) {
+        return result;
+    }
+
+    const std::vector<std::size_t> orderedIndices =
+        buildChatTemporalExecutionOrder_(videos, routerResult);
+    if (orderedIndices.empty()) {
+        return result;
+    }
+
+    const std::string effectiveModelName =
+        openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName;
+
+    auto persistTemporalState = [&]() {
+        chatTemporalState.touchedAt = std::chrono::steady_clock::now();
+        if (chatTemporalState.planEnvelope.contains("plan_hash") &&
+            chatTemporalState.planEnvelope["plan_hash"].is_string())
+        {
+            chatTemporalState.promptHash =
+                chatTemporalState.planEnvelope["plan_hash"].get<std::string>();
+        }
+        if (chatSessionId > 0) {
+            std::lock_guard<std::mutex> lock(chatTemporalMu_);
+            chatTemporalBySession_[chatSessionId] = chatTemporalState;
+        }
+    };
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithOpenAISequentialTemporalChat_: videos=" +
+        std::to_string(videos.size()) +
+        " ordered_rounds=" + std::to_string(orderedIndices.size()) +
+        " model=" + effectiveModelName +
+        " fps=" + std::to_string(modelInputFps) +
+        " running_resolution=" + std::to_string(runningResolution)
+    );
+
+    std::size_t executedRounds = 0;
+    for (std::size_t executionPos = 0; executionPos < orderedIndices.size(); ++executionPos) {
+        if (shouldAbort && shouldAbort()) {
+            result.aborted = true;
+            break;
+        }
+
+        const std::size_t segmentIndex = orderedIndices[executionPos];
+        const EncodedVideoSegment& segment = videos[segmentIndex];
+        const std::string nowIsoForInference = temporal::nowIso();
+        const std::string temporalDecisionNowIso =
+            temporal::decisionAnchorUtc(nowIsoForInference, segment.endTs);
+        nlohmann::json temporalInput = temporal::buildInferenceInput(
+            chatTemporalState.planEnvelope,
+            chatTemporalState.state,
+            segment.cameraId,
+            temporalDecisionNowIso,
+            segment.startTs,
+            segment.endTs
+        );
+
+        Logger::instance().logDebug(
+            "agent",
+            "analyzeVideosWithOpenAISequentialTemporalChat_: round=" +
+            std::to_string(executionPos + 1) + "/" + std::to_string(orderedIndices.size()) +
+            " camera_id=" + std::to_string(segment.cameraId) +
+            " segment_start=" + segment.startTs +
+            " segment_end=" + segment.endTs +
+            " now_utc=" +
+            temporalInput.value("time_context", nlohmann::json::object()).value("now_utc", "") +
+            " payload=" + temporalInput.dump()
+        );
+
+        const std::string roundPrompt =
+            userQuestionBase + temporal::runtimePromptAppendix(temporalInput);
+
+        int batchPrompt = 0;
+        int batchOutput = 0;
+        int batchTotal = 0;
+        VideoHit hit = callOpenAIVisionVideoSegment_(
+            segment,
+            roundPrompt,
+            uploadedImageBase64,
+            std::vector<FaceReferenceImage>{},
+            std::vector<NegativeReferenceImage>{},
+            std::string(),
+            std::string(),
+            effectiveModelName,
+            openAiApiKey,
+            modelInputFps,
+            /*expectedWindowSeconds*/ 0,
+            runningResolution,
+            std::string("mosaic"),
+            batchPrompt,
+            batchOutput,
+            batchTotal,
+            requestCoreChatPriority,
+            shouldAbort
+        );
+
+        hit.segmentIndex = segmentIndex;
+
+        result.promptTokens += batchPrompt;
+        result.outputTokens += batchOutput;
+        result.totalTokens += batchTotal;
+        if (!hit.answer.empty()) {
+            result.modelAnswer = hit.answer;
+        }
+
+        const std::string roundEndTs =
+            trimAscii(hit.segmentEndTs).empty() ? segment.endTs : hit.segmentEndTs;
+        const std::string roundDecisionNow =
+            temporal::decisionAnchorUtc(nowIsoForInference, roundEndTs);
+
+        temporal::applyRound(
+            chatTemporalState.state,
+            chatTemporalState.planEnvelope,
+            hit.identityPatch,
+            hit.observations,
+            hit.temporalEvidenceCandidates,
+            roundDecisionNow,
+            hit.answer,
+            hit.unknownReasons,
+            hit.segmentStartTs,
+            hit.segmentEndTs,
+            hit.faceIdentityMatches
+        );
+
+        const nlohmann::json candidateDecisions =
+            temporal::extractLastRoundCandidateDecisions(chatTemporalState.state);
+        if (candidateDecisions.is_array() && !candidateDecisions.empty()) {
+            Logger::instance().logDebug(
+                "agent",
+                "analyzeVideosWithOpenAISequentialTemporalChat_: candidate decisions camera_id=" +
+                std::to_string(segment.cameraId) +
+                " decisions=" + candidateDecisions.dump()
+            );
+        }
+
+        const temporal::EvalResult eval = temporal::evaluate(
+            chatTemporalState.state,
+            chatTemporalState.planEnvelope,
+            roundDecisionNow
+        );
+        if (eval.alert) result.temporalAlert = true;
+        if (eval.report) result.temporalReport = true;
+        if (eval.operatorResults.is_array() && !eval.operatorResults.empty()) {
+            result.temporalOperatorResults = eval.operatorResults;
+        }
+        if (!eval.summary.empty()) {
+            result.temporalSummary = eval.summary;
+        }
+
+        persistTemporalState();
+        ++executedRounds;
+
+        if (hit.hasMatch) {
+            result.visibleHits.push_back(std::move(hit));
+        }
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithOpenAISequentialTemporalChat_: completed rounds=" +
+        std::to_string(executedRounds) + "/" + std::to_string(orderedIndices.size()) +
+        " visible_hits=" + std::to_string(result.visibleHits.size()) +
+        " aborted=" + std::string(result.aborted ? "true" : "false")
+    );
+
+    return result;
 }
 
 

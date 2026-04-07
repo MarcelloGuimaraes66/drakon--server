@@ -106,6 +106,7 @@ struct CameraConfig {
     std::string telegramChatId;
     std::string startOrigin;
     bool isDrakonFindTemporarySession{ false };
+    bool isVideoSearchTemporarySession{ false };
 
     std::string descriptionModelName{ "gpt-5.1" };
     std::string descriptionModelApiKey;

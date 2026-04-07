@@ -229,6 +229,23 @@ nlohmann::json loadConversationContext_(AgentCore& agent, const nlohmann::json& 
     return parsed.is_object() ? parsed : fallback;
 }
 
+std::string latestUserMessageFromConversationContext_(const nlohmann::json& conversationContext)
+{
+    if (!conversationContext.is_object() ||
+        !conversationContext.contains("recent_turns") ||
+        !conversationContext["recent_turns"].is_array()) {
+        return "";
+    }
+    const auto& recentTurns = conversationContext["recent_turns"];
+    for (auto it = recentTurns.rbegin(); it != recentTurns.rend(); ++it) {
+        if (!it->is_object()) continue;
+        if (lowerAsciiCopy_(jsonStringField_(*it, "role")) != "user") continue;
+        const std::string content = normalizeInlineWhitespace_(jsonStringField_(*it, "content"));
+        if (!content.empty()) return content;
+    }
+    return "";
+}
+
 std::string effectiveReplyLanguage_(
     const SkillSelection& selection,
     const nlohmann::json& payload,
@@ -713,6 +730,64 @@ nlohmann::json buildEditorTarget_(const nlohmann::json& resolvedAgent)
     return target;
 }
 
+std::string agentDesignUrl_(AgentCore& agent, const nlohmann::json& payload)
+{
+    const std::string clientId = clientIdFromPayload_(payload).empty() ? agent.getClientId() : clientIdFromPayload_(payload);
+    return agent.getBackendBaseUrl() + "/api/agent/agent-design?client_id=" + clientId;
+}
+
+bool hasPolygonRequestCue_(std::string text)
+{
+    text = lowerAsciiCopy_(trimCopy_(std::move(text)));
+    if (text.empty()) return false;
+    const bool hasShapeCue =
+        text.find("polygon") != std::string::npos ||
+        text.find("polig") != std::string::npos ||
+        text.find("roi") != std::string::npos ||
+        text.find("regiao") != std::string::npos ||
+        text.find("region") != std::string::npos ||
+        text.find("area") != std::string::npos ||
+        text.find("zona") != std::string::npos ||
+        text.find("zone") != std::string::npos;
+    const bool hasActionCue =
+        text.find("draw") != std::string::npos ||
+        text.find("desenh") != std::string::npos ||
+        text.find("mark") != std::string::npos ||
+        text.find("marc") != std::string::npos ||
+        text.find("outline") != std::string::npos ||
+        text.find("around") != std::string::npos ||
+        text.find("volta") != std::string::npos;
+    return hasShapeCue || (hasActionCue && (text.find("porta") != std::string::npos || text.find("door") != std::string::npos));
+}
+
+std::string resolveVisualGoal_(
+    const SkillSelection& selection,
+    const nlohmann::json& analysisRegionOps,
+    const nlohmann::json& conversationContext)
+{
+    const std::string semanticHint = normalizeInlineWhitespace_(jsonStringField_(analysisRegionOps, "semantic_hint"));
+    if (!semanticHint.empty()) return semanticHint;
+
+    const std::string latestUserMessage = latestUserMessageFromConversationContext_(conversationContext);
+    if (!latestUserMessage.empty()) return latestUserMessage;
+
+    return normalizeInlineWhitespace_(selection.taskGoal);
+}
+
+std::string buildNeedVisualEditCameraAnswer_(const std::string& language, const nlohmann::json& resolvedAgent)
+{
+    if (locationTypeOf_(resolvedAgent) == "step_default") {
+        if (language == "pt") {
+            return "Para sugerir o poligono com seguranca nesse agente da etapa, preciso saber qual camera alvo do step deve fornecer o snapshot.";
+        }
+        return "To suggest the polygon safely for this step agent, I need to know which target camera in the step should provide the snapshot.";
+    }
+    if (language == "pt") {
+        return "Para sugerir o poligono com seguranca, preciso de uma camera valida para analisar o snapshot desse agente.";
+    }
+    return "To suggest the polygon safely, I need a valid camera to analyze the snapshot for this agent.";
+}
+
 bool isGeneratedCustomAgentName_(const std::string& value)
 {
     std::string normalized = lowerAsciiCopy_(trimCopy_(value));
@@ -1016,6 +1091,33 @@ nlohmann::json buildUpdateResultMetadata_(
     return metadata;
 }
 
+nlohmann::json buildAgentFormRequestMetadata_(
+    const std::string& language,
+    const int agentId,
+    const nlohmann::json& editorTarget,
+    const nlohmann::json& draftAgent)
+{
+    nlohmann::json metadata = {
+        { "type", "camera_agent_form_request" },
+        { "status", "awaiting_form_open" },
+        { "language", normalizeAssistantLanguageTag(language) },
+        { "agent_id", agentId },
+        { "editor_target", editorTarget },
+        { "draft_agent", draftAgent },
+    };
+    if (editorTarget.contains("camera_id")) metadata["camera_id"] = editorTarget["camera_id"];
+    if (editorTarget.contains("camera_name")) metadata["camera_name"] = editorTarget["camera_name"];
+    return metadata;
+}
+
+std::string buildVisualPolygonNotFoundAnswer_(const std::string& language)
+{
+    if (language == "pt") {
+        return "Analisei o snapshot da camera, mas nao consegui localizar com seguranca a area pedida para desenhar o poligono. Preparei o formulario de edicao do agente no card abaixo para voce revisar e marcar manualmente.";
+    }
+    return "I analyzed the camera snapshot, but I could not safely locate the requested area to draw the polygon. I prepared the agent edit form in the card below so you can review it and mark it manually.";
+}
+
 void applyClearFields_(nlohmann::json& snapshot, const nlohmann::json& clearFields)
 {
     for (const auto& entry : clearFields) {
@@ -1132,6 +1234,7 @@ SkillRunResult EditCameraAgentSkill::execute(
     const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
     const std::string language = effectiveReplyLanguage_(selection, payload, conversationContext);
     nlohmann::json mergedDraft = mergeDrafts_(activeEditAgentDraft_(conversationContext), normalizeRouterEditAgentDraft_(selection));
+    const std::string latestUserMessage = latestUserMessageFromConversationContext_(conversationContext);
 
     const nlohmann::json inventory = fetchAgentInventory_(agent, payload);
     if (!inventory.value("ok", false)) {
@@ -1176,16 +1279,25 @@ SkillRunResult EditCameraAgentSkill::execute(
 
     const nlohmann::json analysisRegionOps = mergedDraft.value("analysis_region_ops", nlohmann::json::object());
     const std::string analysisMode = lowerAsciiCopy_(jsonStringField_(analysisRegionOps, "mode"));
-    const bool openForm = mergedDraft.value("open_form", false) ||
+    const bool explicitOpenForm = mergedDraft.value("open_form", false);
+    const bool requiresVisualContext =
+        analysisRegionOps.contains("requires_visual_context") &&
+        analysisRegionOps["requires_visual_context"].is_boolean() &&
+        analysisRegionOps["requires_visual_context"].get<bool>();
+    const bool inferredVisualRequest =
+        analysisRegionOps.empty() &&
+        hasPolygonRequestCue_(latestUserMessage);
+    const bool visualDesignRequested =
         analysisMode == "needs_form" ||
         !jsonStringField_(analysisRegionOps, "semantic_hint").empty() ||
-        (analysisRegionOps.contains("requires_visual_context") && analysisRegionOps["requires_visual_context"].is_boolean() && analysisRegionOps["requires_visual_context"].get<bool>());
+        requiresVisualContext ||
+        inferredVisualRequest;
 
     const bool hasPatch = mergedDraft.contains("agent_patch") && mergedDraft["agent_patch"].is_object() && !mergedDraft["agent_patch"].empty();
     const bool hasClear = mergedDraft.contains("clear_fields") && mergedDraft["clear_fields"].is_array() && !mergedDraft["clear_fields"].empty();
     const bool hasFaceOps = mergedDraft.contains("face_target_ops") && mergedDraft["face_target_ops"].is_object() && !mergedDraft["face_target_ops"].empty();
     const bool hasRegionOps = analysisMode == "clear" || analysisMode == "replace";
-    if (!openForm && !hasPatch && !hasClear && !hasFaceOps && !hasRegionOps) {
+    if (!explicitOpenForm && !hasPatch && !hasClear && !hasFaceOps && !hasRegionOps && !visualDesignRequested) {
         result.answer = language == "pt"
             ? "Encontrei o agente. Veja o card abaixo e me diga o que voce quer mudar nele."
             : "I found the agent. Check the card below and tell me what you want to change.";
@@ -1232,21 +1344,120 @@ SkillRunResult EditCameraAgentSkill::execute(
         for (int id : ids) snapshot["face_target_ids"].push_back(id);
     }
 
-    if (openForm) {
+    if (visualDesignRequested && !hasRegionOps) {
+        const int designCameraId = resolution["item"].value("camera_id", 0);
+        if (designCameraId <= 0) {
+            result.answer = buildNeedVisualEditCameraAnswer_(language, resolution["item"]);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_visual_camera",
+                result.answer,
+                result.answer,
+                language,
+                { "visual_camera" },
+                nlohmann::json::object());
+            return result;
+        }
+
+        nlohmann::json designAgentPatch = nlohmann::json::object();
+        for (const auto* field : {
+                "display_name", "summary", "prompt_template", "alert_condition", "negative_condition",
+                "input_type", "video_packaging_mode", "inference_model", "model_fps", "run_every",
+                "running_resolution", "only_capture_on_motion", "use_temporal_context"
+            }) {
+            if (snapshot.contains(field)) {
+                designAgentPatch[field] = snapshot[field];
+            }
+        }
+
+        const std::string visualGoal = resolveVisualGoal_(selection, analysisRegionOps, conversationContext);
+        if (visualGoal.empty()) {
+            result.answer = language == "pt"
+                ? "Me diga qual area visivel da imagem voce quer marcar com o poligono."
+                : "Tell me which visible area in the image you want me to mark with the polygon.";
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_visual_goal",
+                result.answer,
+                result.answer,
+                language,
+                { "visual_goal" },
+                nlohmann::json::object());
+            return result;
+        }
+
+        nlohmann::json designRequest = {
+            { "goal_summary", visualGoal },
+            { "language", normalizeAssistantLanguageTag(language) },
+            { "require_snapshot", true },
+            { "camera_id", designCameraId },
+            { "agent_patch", designAgentPatch },
+            { "face_targets", nlohmann::json::array() },
+            { "drakon_find_targets", nlohmann::json::array() },
+        };
+        const HttpResponse designResponse = postJson(
+            agentDesignUrl_(agent, payload),
+            designRequest.dump(),
+            agent.getExeToken(),
+            {},
+            30000);
+        if (!designResponse.ok()) {
+            result.answer = language == "pt"
+                ? "Nao consegui analisar o snapshot da camera para sugerir o poligono. Detalhe: " + parseErrorMessage_(designResponse)
+                : "I could not analyze the camera snapshot to suggest the polygon. Detail: " + parseErrorMessage_(designResponse);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_design_retry",
+                result.answer,
+                result.answer,
+                language,
+                {},
+                nlohmann::json::object());
+            return result;
+        }
+
+        const nlohmann::json parsedDesignResponse = nlohmann::json::parse(designResponse.body, nullptr, false);
+        const nlohmann::json design =
+            parsedDesignResponse.is_object() &&
+            parsedDesignResponse.contains("design") &&
+            parsedDesignResponse["design"].is_object()
+                ? parsedDesignResponse["design"]
+                : nlohmann::json::object();
+        const nlohmann::json suggestedRegions = design.value("analysis_regions", nlohmann::json::array());
+        if (!suggestedRegions.is_array() || suggestedRegions.empty()) {
+            const int agentId = resolution["item"].value("agent_id", 0);
+            const nlohmann::json editorTarget = buildEditorTarget_(resolution["item"]);
+            snapshot["id"] = agentId;
+            result.answer = buildVisualPolygonNotFoundAnswer_(language);
+            result.metadata["message_metadata"] = buildAgentFormRequestMetadata_(language, agentId, editorTarget, snapshot);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "awaiting_confirmation",
+                "awaiting_form_open",
+                result.answer,
+                result.answer,
+                language,
+                {},
+                nlohmann::json::object({ { "type", "camera_agent_form_request" }, { "status", "awaiting_form_open" } }));
+            return result;
+        }
+
+        snapshot["analysis_regions"] = suggestedRegions;
+    }
+
+    if (explicitOpenForm) {
         const int agentId = resolution["item"].value("agent_id", 0);
         snapshot["id"] = agentId;
         const nlohmann::json editorTarget = buildEditorTarget_(resolution["item"]);
         result.answer = language == "pt" ? "Preparei o formulario de edicao do agente no card abaixo." : "I prepared the agent edit form in the card below.";
-        result.metadata["message_metadata"] = {
-            { "type", "camera_agent_form_request" },
-            { "status", "awaiting_form_open" },
-            { "language", normalizeAssistantLanguageTag(language) },
-            { "agent_id", agentId },
-            { "editor_target", editorTarget },
-            { "camera_id", editorTarget.value("camera_id", 0) },
-            { "camera_name", jsonStringField_(editorTarget, "camera_name") },
-            { "draft_agent", snapshot },
-        };
+        result.metadata["message_metadata"] = buildAgentFormRequestMetadata_(language, agentId, editorTarget, snapshot);
         result.metadata["task_state"] = buildTaskState_(conversationContext, mergedDraft, "awaiting_confirmation", "awaiting_form_open", result.answer, result.answer, language, {}, nlohmann::json::object({ { "type", "camera_agent_form_request" }, { "status", "awaiting_form_open" } }));
         return result;
     }
