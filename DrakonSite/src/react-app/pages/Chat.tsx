@@ -14,6 +14,7 @@ import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCr
 import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
 import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import ChatIdentityCardsPanel from "@/react-app/components/ChatIdentityCardsPanel";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
 import CameraCustomAgentEditorModal, {
   type CameraAgentEditorTarget,
@@ -35,6 +36,7 @@ import {
   type CameraEditFormRequestMessageMetadata,
    extractCameraAgentCreationResultFromMessage,
    extractCameraAgentEditContextFromMessage,
+   extractIdentityCardsFromMessage,
    extractHitMediaFromMessage,
    extractCameraAgentFormRequestFromMessage,
    extractCameraAgentUpdateResultFromMessage,
@@ -795,9 +797,73 @@ export default function Chat() {
     const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
+    const identityCards = extractIdentityCardsFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
     const revealId = getAssistantRevealId(message);
     const shouldAnimateReveal = CHAT_VISUAL_TYPING_ENABLED && activeRevealId === revealId;
+    const workflowSupplementalContent =
+      cameraRegistrationDraft ? (
+        <ChatCameraRegistrationCard
+          messageId={message.id}
+          metadata={cameraRegistrationDraft}
+          onSubmit={(sourceMessageId, draft) =>
+            submitCameraRegistration({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+              draft,
+            })
+          }
+        />
+      ) : cameraBatchRegistrationDraft ? (
+        <ChatCameraBatchRegistrationCard
+          messageId={message.id}
+          metadata={cameraBatchRegistrationDraft}
+          onSubmit={(sourceMessageId) =>
+            submitCameraBatchRegistration({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+            })
+          }
+        />
+      ) : cameraBatchEditDraft ? (
+        <ChatCameraBatchEditCard
+          messageId={message.id}
+          metadata={cameraBatchEditDraft}
+          onSubmit={(sourceMessageId) =>
+            submitCameraBatchEdit({
+              sessionIdOverride: activeSessionId,
+              sourceMessageId,
+            })
+          }
+        />
+      ) : cameraAgentFormRequest ? (
+        <ChatCameraAgentCard
+          metadata={cameraAgentFormRequest}
+          onOpen={() => openChatAgentForm(cameraAgentFormRequest)}
+        />
+      ) : cameraAgentEditContext ? (
+        <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
+      ) : cameraAgentUpdateResult ? (
+        <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+      ) : cameraAgentCreationResult ? (
+        <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
+      ) : cameraEditFormRequest ? (
+        <ChatCameraEditCard
+          metadata={cameraEditFormRequest}
+          onOpen={() =>
+            openChatEditForm(cameraEditFormRequest.camera_id, cameraEditFormRequest)
+          }
+        />
+      ) : cameraNetworkScan ? (
+        <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
+      ) : null;
+
+    const supplementalContent = (
+      <>
+        {workflowSupplementalContent}
+        {identityCards.length > 0 ? <ChatIdentityCardsPanel cards={identityCards} /> : null}
+      </>
+    );
 
     return (
       <AssistantMessage
@@ -810,63 +876,7 @@ export default function Chat() {
         revealId={revealId}
         onRevealProgress={scheduleRevealAutoScroll}
         onRevealComplete={handleRevealComplete}
-        supplementalContent={
-          cameraRegistrationDraft ? (
-            <ChatCameraRegistrationCard
-              messageId={message.id}
-              metadata={cameraRegistrationDraft}
-              onSubmit={(sourceMessageId, draft) =>
-                submitCameraRegistration({
-                  sessionIdOverride: activeSessionId,
-                  sourceMessageId,
-                  draft,
-                })
-              }
-            />
-          ) : cameraBatchRegistrationDraft ? (
-            <ChatCameraBatchRegistrationCard
-              messageId={message.id}
-              metadata={cameraBatchRegistrationDraft}
-              onSubmit={(sourceMessageId) =>
-                submitCameraBatchRegistration({
-                  sessionIdOverride: activeSessionId,
-                  sourceMessageId,
-                })
-              }
-            />
-          ) : cameraBatchEditDraft ? (
-            <ChatCameraBatchEditCard
-              messageId={message.id}
-              metadata={cameraBatchEditDraft}
-              onSubmit={(sourceMessageId) =>
-                submitCameraBatchEdit({
-                  sessionIdOverride: activeSessionId,
-                  sourceMessageId,
-                })
-              }
-            />
-          ) : cameraAgentFormRequest ? (
-            <ChatCameraAgentCard
-              metadata={cameraAgentFormRequest}
-              onOpen={() => openChatAgentForm(cameraAgentFormRequest)}
-            />
-          ) : cameraAgentEditContext ? (
-            <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
-          ) : cameraAgentUpdateResult ? (
-            <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
-          ) : cameraAgentCreationResult ? (
-            <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
-          ) : cameraEditFormRequest ? (
-            <ChatCameraEditCard
-              metadata={cameraEditFormRequest}
-              onOpen={() =>
-                openChatEditForm(cameraEditFormRequest.camera_id, cameraEditFormRequest)
-              }
-            />
-          ) : cameraNetworkScan ? (
-            <ChatCameraDiscoveryCard metadata={cameraNetworkScan} />
-          ) : null
-        }
+        supplementalContent={supplementalContent}
       />
     );
   };

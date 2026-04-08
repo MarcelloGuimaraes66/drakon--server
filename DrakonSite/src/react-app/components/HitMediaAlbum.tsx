@@ -91,43 +91,49 @@ export default function HitMediaAlbum({ items }: HitMediaAlbumProps) {
       {/* Lightbox Modal */}
       {selectedIndex !== null && (
         <div
-          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4"
+          className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-sm flex items-center justify-center p-4"
           onClick={() => setSelectedIndex(null)}
           onKeyDown={handleKeyDown as any}
           tabIndex={0}
         >
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               setSelectedIndex(null);
             }}
-            className="absolute top-4 right-4 w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
+            aria-label="Close media viewer"
+            className="absolute top-4 right-4 z-30 w-10 h-10 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
           >
             <X className="w-6 h-6" />
           </button>
 
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               handlePrevious();
             }}
-            className="absolute left-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
+            aria-label="Previous media"
+            className="absolute left-4 top-1/2 z-30 -translate-y-1/2 w-12 h-12 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
           >
             <ChevronLeft className="w-6 h-6" />
           </button>
 
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               handleNext();
             }}
-            className="absolute right-4 top-1/2 -translate-y-1/2 w-12 h-12 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
+            aria-label="Next media"
+            className="absolute right-4 top-1/2 z-30 -translate-y-1/2 w-12 h-12 bg-white/10 hover:bg-white/20 rounded-full flex items-center justify-center text-white transition-colors"
           >
             <ChevronRight className="w-6 h-6" />
           </button>
 
           <div
-            className="max-w-4xl max-h-[90vh] flex flex-col items-center"
+            className="relative z-10 max-w-4xl max-h-[90vh] flex flex-col items-center"
             onClick={(e) => e.stopPropagation()}
           >
             {items[selectedIndex].url ? (

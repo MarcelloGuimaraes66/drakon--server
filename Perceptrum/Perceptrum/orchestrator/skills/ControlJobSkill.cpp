@@ -10,6 +10,7 @@
 #include "../OperationTaskState.h"
 #include "../ProgressUtils.h"
 #include "../PromptBuilder.h"
+#include "../RoutingLexicon.h"
 #include "shared/AgentAuthoringShared.h"
 
 namespace chatv2 {
@@ -25,9 +26,10 @@ std::string safeText_(const json& value, const char* key)
 
 std::string normalizedAction_(std::string value)
 {
-    value = shared::lowerAscii(shared::trimText(std::move(value)));
-    if (value == "start" || value == "stop") {
-        return value;
+    const RoutingLexiconSignals signals = detectRoutingLexiconSignals(value);
+    const std::string runtimeAction = runtimeActionFromRoutingSignals(signals);
+    if (!runtimeAction.empty()) {
+        return runtimeAction;
     }
     return "";
 }
@@ -153,6 +155,31 @@ json buildResolvedJob_(const json& job)
     });
 }
 
+json refreshResolvedJob_(AgentCore& agent, const json& payload, const json& job)
+{
+    const int jobId = job.value("id", 0);
+    if (jobId <= 0) {
+        return json::object();
+    }
+
+    const json inventory = shared::fetchJobInventory(agent, payload);
+    if (!inventory.value("ok", false)) {
+        return json::object();
+    }
+
+    const json resolution = shared::resolveJob(
+        inventory,
+        json::object({ { "id", jobId } }),
+        json::object());
+    if (safeText_(resolution, "status") != "resolved" ||
+        !resolution.contains("item") ||
+        !resolution["item"].is_object()) {
+        return json::object();
+    }
+
+    return buildResolvedJob_(resolution["item"]);
+}
+
 std::string jobName_(const json& job)
 {
     const std::string name = safeText_(job, "name");
@@ -235,7 +262,7 @@ std::string buildNeedTargetAnswer_(const std::string& language, const std::strin
 {
     const bool pt = isPt_(language);
     return pt
-        ? "Qual job voce quer que eu " + actionVerb_(pt, action) + "?"
+        ? "Qual job ou tarefa voce quer que eu " + actionVerb_(pt, action) + "?"
         : "Which job do you want me to " + actionVerb_(pt, action) + "?";
 }
 
@@ -245,11 +272,11 @@ std::string buildNotFoundAnswer_(const std::string& language, const std::string&
     const std::string selectorName = selectorLabel_(selector);
     if (!selectorName.empty()) {
         return pt
-            ? "Nao encontrei um job para " + actionVerb_(pt, action) + " que combine com \"" + selectorName + "\"."
-            : "I could not find a job to " + actionVerb_(pt, action) + " that matches \"" + selectorName + "\".";
+            ? "Nao encontrei um job ou tarefa para " + actionVerb_(pt, action) + " que combine com \"" + selectorName + "\". Se voce quis dizer um agente, esse comando ainda controla apenas jobs."
+            : "I could not find a job to " + actionVerb_(pt, action) + " that matches \"" + selectorName + "\". If you meant an agent, this command currently controls jobs only.";
     }
     return pt
-        ? "Nao encontrei o job que voce quer controlar."
+        ? "Nao encontrei o job ou a tarefa que voce quer controlar."
         : "I could not find the job you want to control.";
 }
 
@@ -552,6 +579,29 @@ SkillRunResult ControlJobSkill::execute(
         {},
         action == "start" ? 15000 : 12000);
     if (!response.ok()) {
+        const json refreshedJob = refreshResolvedJob_(agent, payload, resolvedJob);
+        const std::string refreshedStatus = runtimeStatus_(refreshedJob);
+        const bool reconciledSuccess =
+            (action == "start" && refreshedStatus == "running") ||
+            (action == "stop" && refreshedStatus != "running" && !refreshedJob.empty());
+        if (reconciledSuccess) {
+            const json updatedJob = refreshedJob.empty() ? buildResolvedJob_(resolvedJob) : refreshedJob;
+            draft["resolved_job"] = updatedJob;
+            result.answer = buildSuccessAnswer_(language, action, updatedJob);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "completed",
+                action == "start" ? "job_started" : "job_stopped",
+                action == "start"
+                    ? (isPt_(language) ? "Job iniciado apos reconciliar estado" : "Job started after state reconciliation")
+                    : (isPt_(language) ? "Job parado apos reconciliar estado" : "Job stopped after state reconciliation"),
+                result.answer,
+                {},
+                true);
+            return result;
+        }
         result.answer = buildFailureAnswer_(language, action, shared::parseErrorMessage(response));
         result.metadata["task_state"] = buildTaskState_(
             conversationContext,

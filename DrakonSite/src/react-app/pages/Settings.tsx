@@ -23,6 +23,7 @@ import {
   Clock3,
   ExternalLink,
   Sparkles,
+  X,
 } from "lucide-react";
 
 interface PairingStatus {
@@ -33,6 +34,42 @@ interface PairingStatus {
   timezone_iana?: string;
   timezone_updated_at?: string | null;
 }
+
+interface AccountDeletionPreviewSection {
+  key: string;
+  count: number;
+}
+
+interface AccountDeletionPreviewSummary {
+  total_records: number;
+  storage_object_count?: number;
+  sections: AccountDeletionPreviewSection[];
+}
+
+interface AccountDeletionPreviewPayload {
+  confirmation_email: string;
+  requires_password: boolean;
+  local: AccountDeletionPreviewSummary;
+  remote: {
+    configured: boolean;
+    linked: boolean;
+    unavailable_reason: string | null;
+    preview: AccountDeletionPreviewSummary & {
+      already_deleted?: boolean;
+    };
+  };
+}
+
+type DesktopWebViewBridge = {
+  postMessage?: (message: unknown) => void;
+};
+
+type DesktopShellWindow = Window & {
+  chrome?: {
+    webview?: DesktopWebViewBridge;
+  };
+  __drakonDesktopShell?: boolean;
+};
 
 function deriveHandleFromEmail(email?: string | null): string {
   if (typeof email !== "string") {
@@ -46,6 +83,36 @@ function deriveHandleFromEmail(email?: string | null): string {
 
 function normalizeHandleInput(value: string): string {
   return value.replace(/@/g, "").trim();
+}
+
+function requestDesktopAccountDeletionCleanup(clearStorageRoot: boolean): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const desktopWindow = window as DesktopShellWindow;
+  const webview = desktopWindow.chrome?.webview;
+  if (
+    desktopWindow.__drakonDesktopShell !== true &&
+    !(desktopWindow.chrome && typeof webview !== "undefined")
+  ) {
+    return false;
+  }
+
+  if (!webview || typeof webview.postMessage !== "function") {
+    return false;
+  }
+
+  try {
+    webview.postMessage({
+      type: "account-delete-cleanup",
+      clear_storage_root: clearStorageRoot,
+    });
+    return true;
+  } catch (error) {
+    console.warn("Failed to request desktop AppData cleanup after account deletion:", error);
+    return false;
+  }
 }
 
 export default function Settings() {
@@ -99,6 +166,20 @@ export default function Settings() {
   const [highlightZAiCard, setHighlightZAiCard] = useState(false);
   const openAiCardRef = useRef<HTMLDivElement | null>(null);
   const zAiCardRef = useRef<HTMLDivElement | null>(null);
+  const [accountDeletionPreview, setAccountDeletionPreview] =
+    useState<AccountDeletionPreviewPayload | null>(null);
+  const [accountDeletionLoading, setAccountDeletionLoading] = useState(false);
+  const [accountDeletionError, setAccountDeletionError] = useState("");
+  const [deleteConfirmEmail, setDeleteConfirmEmail] = useState("");
+  const [deleteConfirmationText, setDeleteConfirmationText] = useState("");
+  const [deletePassword, setDeletePassword] = useState("");
+  const [deleteAccountMessage, setDeleteAccountMessage] = useState("");
+  const [deleteAccountMessageType, setDeleteAccountMessageType] = useState<
+    "success" | "error" | null
+  >(null);
+  const [deletingAccount, setDeletingAccount] = useState(false);
+  const [isDeleteAccountModalOpen, setIsDeleteAccountModalOpen] = useState(false);
+  const [showDeleteAccountDetails, setShowDeleteAccountDetails] = useState(false);
 
   const fetchPairingStatus = async () => {
     try {
@@ -448,12 +529,148 @@ export default function Settings() {
     }
   };
 
+  const fetchAccountDeletionPreview = async () => {
+    if (!user?.email) {
+      setAccountDeletionPreview(null);
+      setAccountDeletionError("");
+      return;
+    }
+
+    setAccountDeletionLoading(true);
+    setAccountDeletionError("");
+    try {
+      const response = await fetch("/api/account/deletion-preview");
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data) {
+        throw new Error(data?.error || t("settings.deleteAccount.previewFailed"));
+      }
+
+      setAccountDeletionPreview(data as AccountDeletionPreviewPayload);
+    } catch (error: any) {
+      setAccountDeletionPreview(null);
+      setAccountDeletionError(
+        error?.message || t("settings.deleteAccount.previewFailed")
+      );
+    } finally {
+      setAccountDeletionLoading(false);
+    }
+  };
+
+  const resetDeleteAccountForm = () => {
+    setDeleteConfirmEmail("");
+    setDeleteConfirmationText("");
+    setDeletePassword("");
+    setDeleteAccountMessage("");
+    setDeleteAccountMessageType(null);
+  };
+
+  const openDeleteAccountModal = () => {
+    resetDeleteAccountForm();
+    setShowDeleteAccountDetails(false);
+    setIsDeleteAccountModalOpen(true);
+  };
+
+  const closeDeleteAccountModal = () => {
+    if (deletingAccount) {
+      return;
+    }
+
+    resetDeleteAccountForm();
+    setShowDeleteAccountDetails(false);
+    setIsDeleteAccountModalOpen(false);
+  };
+
+  const deleteAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!accountDeletionPreview) {
+      return;
+    }
+
+    let holdDeletingState = false;
+    setDeletingAccount(true);
+    setDeleteAccountMessage("");
+    setDeleteAccountMessageType(null);
+    try {
+      const response = await fetch("/api/account", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirm_email: deleteConfirmEmail.trim(),
+          confirmation_text: deleteConfirmationText.trim(),
+          ...(accountDeletionPreview.requires_password
+            ? { password: deletePassword }
+            : {}),
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || t("settings.deleteAccount.errorDefault"));
+      }
+
+      setDeleteAccountMessageType("success");
+      const redirectPath =
+        typeof data?.redirect_path === "string" && data.redirect_path.trim()
+          ? data.redirect_path
+          : "/login?accountDeleted=1";
+      const clearStorageRoot = Boolean(data?.desktop_cleanup?.clear_storage_root);
+      if (requestDesktopAccountDeletionCleanup(clearStorageRoot)) {
+        holdDeletingState = true;
+        setDeleteAccountMessage(t("settings.deleteAccount.desktopCleanup", {
+          brand: brand.displayName,
+        }));
+        window.setTimeout(() => {
+          window.location.assign(redirectPath);
+        }, 5000);
+        return;
+      }
+
+      setDeleteAccountMessage(t("settings.deleteAccount.deleting"));
+      window.location.assign(redirectPath);
+    } catch (error: any) {
+      setDeleteAccountMessageType("error");
+      setDeleteAccountMessage(
+        error?.message || t("settings.deleteAccount.errorDefault")
+      );
+    } finally {
+      if (!holdDeletingState) {
+        setDeletingAccount(false);
+      }
+    }
+  };
+
   useEffect(() => {
     fetchPairingStatus();
     fetchTelegramSettings();
     fetchOpenAiSettings();
     fetchZAiSettings();
   }, []);
+
+  useEffect(() => {
+    if (isDeleteAccountModalOpen && user?.email) {
+      fetchAccountDeletionPreview();
+    }
+  }, [isDeleteAccountModalOpen, user?.email]);
+
+  useEffect(() => {
+    if (!isDeleteAccountModalOpen) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !deletingAccount) {
+        closeDeleteAccountModal();
+      }
+    };
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isDeleteAccountModalOpen, deletingAccount]);
 
   useEffect(() => {
     const initialHandle =
@@ -463,6 +680,15 @@ export default function Settings() {
     setHandleInput(initialHandle);
     setHandleMessage("");
     setHandleMessageType(null);
+    setDeleteConfirmEmail("");
+    setDeleteConfirmationText("");
+    setDeletePassword("");
+    setDeleteAccountMessage("");
+    setDeleteAccountMessageType(null);
+    setIsDeleteAccountModalOpen(false);
+    setShowDeleteAccountDetails(false);
+    setAccountDeletionPreview(null);
+    setAccountDeletionError("");
   }, [user?.email, user?.handle]);
 
   const accountCreatedRaw = (user as { created_at?: string } | null)?.created_at || "";
@@ -487,6 +713,67 @@ export default function Settings() {
     onboardingStatus === "never_started"
       ? t("tutorial.settingsCard.start")
       : t("tutorial.settingsCard.reopen");
+  const normalizedDeleteConfirmEmail = deleteConfirmEmail.trim().toLowerCase();
+  const expectedDeleteEmail =
+    accountDeletionPreview?.confirmation_email?.trim().toLowerCase() ||
+    (typeof user?.email === "string" ? user.email.trim().toLowerCase() : "");
+  const deletePhraseMatches = deleteConfirmationText.trim().toUpperCase() === "DELETE";
+  const deleteEmailMatches =
+    !!expectedDeleteEmail && normalizedDeleteConfirmEmail === expectedDeleteEmail;
+  const deleteRequiresPassword = !!accountDeletionPreview?.requires_password;
+  const remoteDeletionBlocked = Boolean(
+    accountDeletionPreview?.remote.linked &&
+      accountDeletionPreview.remote.unavailable_reason
+  );
+  const deleteAccountDisabled =
+    deletingAccount ||
+    accountDeletionLoading ||
+    !accountDeletionPreview ||
+    !deleteEmailMatches ||
+    !deletePhraseMatches ||
+    remoteDeletionBlocked ||
+    (deleteRequiresPassword && !deletePassword.trim());
+
+  const getDeletionSectionLabel = (key: string) => {
+    switch (key) {
+      case "credentials":
+        return t("settings.deleteAccount.section.credentials");
+      case "sessions":
+        return t("settings.deleteAccount.section.sessions");
+      case "pairings":
+        return t("settings.deleteAccount.section.pairings");
+      case "cameras":
+        return t("settings.deleteAccount.section.cameras");
+      case "jobs":
+        return t("settings.deleteAccount.section.jobs");
+      case "chat":
+        return t("settings.deleteAccount.section.chat");
+      case "events":
+        return t("settings.deleteAccount.section.events");
+      case "api_keys":
+        return t("settings.deleteAccount.section.apiKeys");
+      case "face_targets":
+        return t("settings.deleteAccount.section.faceTargets");
+      case "drakon_find":
+        return t("settings.deleteAccount.section.drakonFind");
+      case "shared_find":
+        return t("settings.deleteAccount.section.sharedFind");
+      case "hub":
+        return t("settings.deleteAccount.section.hub");
+      case "uploads":
+        return t("settings.deleteAccount.section.uploads");
+      case "billing":
+        return t("settings.deleteAccount.section.billing");
+      case "monitoring":
+        return t("settings.deleteAccount.section.monitoring");
+      case "device_sessions":
+        return t("settings.deleteAccount.section.deviceSessions");
+      case "find_shares":
+        return t("settings.deleteAccount.section.findShares");
+      default:
+        return key.replace(/_/g, " ");
+    }
+  };
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -696,6 +983,319 @@ export default function Settings() {
                 className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
               />
             </div>
+
+            <div className="mt-6 border-t border-gray-800/80 pt-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <p className="text-sm text-gray-400">
+                    {t("settings.deleteAccount.inlineTitle")}
+                  </p>
+                  <p className="mt-1 text-xs text-gray-500">
+                    {t("settings.deleteAccount.inlineHint")}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={openDeleteAccountModal}
+                  className="inline-flex min-h-[36px] items-center justify-center self-start rounded-lg px-2 py-2 text-sm font-medium text-gray-500 transition-colors hover:text-rose-300 sm:self-auto"
+                >
+                  {t("settings.deleteAccount.open")}
+                </button>
+              </div>
+            </div>
+
+            {isDeleteAccountModalOpen ? (
+              <div className="fixed inset-0 z-[80] flex items-center justify-center px-4 py-6">
+                <button
+                  type="button"
+                  className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+                  onClick={closeDeleteAccountModal}
+                  disabled={deletingAccount}
+                  aria-label="Close delete account modal"
+                />
+                <div
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="delete-account-modal-title"
+                  className="relative max-h-[92vh] w-full max-w-xl overflow-hidden rounded-[28px] border border-gray-800/80 bg-gray-950 text-gray-100 shadow-[0_40px_120px_-48px_rgba(0,0,0,0.95)]"
+                >
+                  <div className="flex items-start justify-between gap-4 border-b border-gray-800/80 px-6 py-5">
+                    <div className="min-w-0">
+                      <h3
+                        id="delete-account-modal-title"
+                        className="text-lg font-semibold text-gray-100"
+                      >
+                        {t("settings.deleteAccount.title")}
+                      </h3>
+                      <p className="mt-1 text-sm text-gray-400">
+                        {t("settings.deleteAccount.description", {
+                          brand: brand.displayName,
+                        })}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={closeDeleteAccountModal}
+                      disabled={deletingAccount}
+                      className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-gray-800 bg-gray-900 text-gray-400 transition-colors hover:border-gray-700 hover:text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label="Close delete account modal"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="max-h-[calc(92vh-88px)] overflow-y-auto px-6 py-5">
+                    <div className="space-y-4">
+                      {accountDeletionLoading ? (
+                        <div className="flex items-center gap-2 rounded-xl border border-white/8 bg-white/[0.03] px-4 py-3 text-sm text-gray-300">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <span>{t("settings.deleteAccount.loading")}</span>
+                        </div>
+                      ) : null}
+
+                      {accountDeletionError ? (
+                        <div className="rounded-xl border border-rose-400/20 bg-rose-500/10 p-4">
+                          <p className="text-sm text-rose-200">{accountDeletionError}</p>
+                          <button
+                            type="button"
+                            onClick={fetchAccountDeletionPreview}
+                            className="mt-3 inline-flex min-h-[40px] items-center justify-center rounded-lg border border-rose-300/20 bg-rose-500/10 px-4 py-2 text-sm font-medium text-rose-100 transition-colors hover:bg-rose-500/20"
+                          >
+                            {t("settings.deleteAccount.fetchRetry")}
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {accountDeletionPreview ? (
+                        <form onSubmit={deleteAccount} className="space-y-4">
+                          <div className="rounded-2xl border border-gray-800/80 bg-white/[0.03] p-4">
+                            <div className="grid gap-4 sm:grid-cols-2">
+                              <div className="min-w-0">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
+                                  {t("settings.deleteAccount.localData")}
+                                </p>
+                                <p className="mt-2 text-sm font-medium text-gray-100">
+                                  {t("settings.deleteAccount.records", {
+                                    count: accountDeletionPreview.local.total_records,
+                                  })}
+                                </p>
+                                <p className="mt-1 text-xs text-gray-500">
+                                  {t("settings.deleteAccount.storageObjects", {
+                                    count:
+                                      accountDeletionPreview.local.storage_object_count || 0,
+                                  })}
+                                </p>
+                              </div>
+
+                              <div className="min-w-0 sm:border-l sm:border-gray-800/80 sm:pl-4">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
+                                  {t("settings.deleteAccount.centralData")}
+                                </p>
+                                {accountDeletionPreview.remote.linked ? (
+                                  <p className="mt-2 text-sm font-medium text-gray-100">
+                                    {accountDeletionPreview.remote.preview.already_deleted
+                                      ? t("settings.deleteAccount.remoteAlreadyDeleted")
+                                      : accountDeletionPreview.remote.preview.total_records > 0
+                                        ? t("settings.deleteAccount.records", {
+                                            count:
+                                              accountDeletionPreview.remote.preview.total_records,
+                                          })
+                                        : t("settings.deleteAccount.remoteNoExtraData")}
+                                  </p>
+                                ) : (
+                                  <p className="mt-2 text-sm text-gray-400">
+                                    {t("settings.deleteAccount.localOnly")}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowDeleteAccountDetails((current) => !current)
+                              }
+                              className="mt-4 inline-flex items-center gap-2 text-sm text-gray-400 transition-colors hover:text-gray-200"
+                            >
+                              {showDeleteAccountDetails ? (
+                                <ChevronDown className="h-4 w-4" />
+                              ) : (
+                                <ChevronRight className="h-4 w-4" />
+                              )}
+                              {showDeleteAccountDetails
+                                ? t("settings.deleteAccount.hideDetails")
+                                : t("settings.deleteAccount.reviewDetails")}
+                            </button>
+
+                            {showDeleteAccountDetails ? (
+                              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                                <div className="rounded-xl border border-gray-800/80 bg-black/20 p-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">
+                                    {t("settings.deleteAccount.localData")}
+                                  </p>
+                                  <div className="mt-3 space-y-2">
+                                    {accountDeletionPreview.local.sections.map((section) => (
+                                      <div
+                                        key={`local-${section.key}`}
+                                        className="flex items-center justify-between gap-4 text-sm"
+                                      >
+                                        <span className="text-gray-300">
+                                          {getDeletionSectionLabel(section.key)}
+                                        </span>
+                                        <span className="font-medium text-gray-100">
+                                          {section.count}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <div className="rounded-xl border border-gray-800/80 bg-black/20 p-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-gray-500">
+                                    {t("settings.deleteAccount.centralData")}
+                                  </p>
+                                  {accountDeletionPreview.remote.linked ? (
+                                    accountDeletionPreview.remote.preview.sections.length > 0 ? (
+                                      <div className="mt-3 space-y-2">
+                                        {accountDeletionPreview.remote.preview.sections.map(
+                                          (section) => (
+                                            <div
+                                              key={`remote-${section.key}`}
+                                              className="flex items-center justify-between gap-4 text-sm"
+                                            >
+                                              <span className="text-gray-300">
+                                                {getDeletionSectionLabel(section.key)}
+                                              </span>
+                                              <span className="font-medium text-gray-100">
+                                                {section.count}
+                                              </span>
+                                            </div>
+                                          )
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <p className="mt-3 text-sm text-gray-400">
+                                        {t("settings.deleteAccount.remoteNoExtraData")}
+                                      </p>
+                                    )
+                                  ) : (
+                                    <p className="mt-3 text-sm text-gray-400">
+                                      {t("settings.deleteAccount.localOnly")}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+
+                          {remoteDeletionBlocked ? (
+                            <div className="rounded-xl border border-amber-400/20 bg-amber-500/10 px-4 py-3">
+                              <p className="text-sm text-amber-100">
+                                {t("settings.deleteAccount.remoteUnavailable")}
+                              </p>
+                              <p className="mt-1 text-xs text-amber-100/80">
+                                {t("settings.deleteAccount.remoteUnavailableReason", {
+                                  reason: accountDeletionPreview.remote.unavailable_reason,
+                                })}
+                              </p>
+                            </div>
+                          ) : null}
+
+                          <p className="text-sm text-gray-300">
+                            {t("settings.deleteAccount.confirmHelp")}
+                          </p>
+
+                          <div className="grid gap-3 md:grid-cols-2">
+                            <div>
+                              <label className="mb-2 block text-sm font-medium text-gray-300">
+                                {t("settings.deleteAccount.emailLabel")}
+                              </label>
+                              <input
+                                type="email"
+                                value={deleteConfirmEmail}
+                                onChange={(e) => setDeleteConfirmEmail(e.target.value)}
+                                placeholder={accountDeletionPreview.confirmation_email}
+                                disabled={deletingAccount}
+                                className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:opacity-50"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="mb-2 block text-sm font-medium text-gray-300">
+                                {t("settings.deleteAccount.confirmTextLabel")}
+                              </label>
+                              <input
+                                type="text"
+                                value={deleteConfirmationText}
+                                onChange={(e) => setDeleteConfirmationText(e.target.value)}
+                                placeholder="DELETE"
+                                disabled={deletingAccount}
+                                className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:opacity-50"
+                              />
+                            </div>
+                          </div>
+
+                          {accountDeletionPreview.requires_password ? (
+                            <div>
+                              <label className="mb-2 block text-sm font-medium text-gray-300">
+                                {t("settings.deleteAccount.passwordLabel")}
+                              </label>
+                              <input
+                                type="password"
+                                value={deletePassword}
+                                onChange={(e) => setDeletePassword(e.target.value)}
+                                disabled={deletingAccount}
+                                className="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-2.5 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-rose-500 disabled:opacity-50"
+                              />
+                              <p className="mt-2 text-xs text-gray-500">
+                                {t("settings.deleteAccount.passwordHelp")}
+                              </p>
+                            </div>
+                          ) : null}
+
+                          {deleteAccountMessage ? (
+                            <p
+                              className={`text-sm ${
+                                deleteAccountMessageType === "success"
+                                  ? "text-emerald-300"
+                                  : "text-rose-300"
+                              }`}
+                            >
+                              {deleteAccountMessage}
+                            </p>
+                          ) : null}
+
+                          <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                            <button
+                              type="button"
+                              onClick={closeDeleteAccountModal}
+                              disabled={deletingAccount}
+                              className="inline-flex min-h-[44px] items-center justify-center rounded-xl border border-gray-700 bg-gray-900 px-5 py-2.5 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {t("settings.deleteAccount.cancel")}
+                            </button>
+                            <button
+                              type="submit"
+                              disabled={deleteAccountDisabled}
+                              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-500"
+                            >
+                              {deletingAccount ? (
+                                <>
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                  {t("settings.deleteAccount.deleting")}
+                                </>
+                              ) : (
+                                t("settings.deleteAccount.submit")
+                              )}
+                            </button>
+                          </div>
+                        </form>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
           </div>
         )}

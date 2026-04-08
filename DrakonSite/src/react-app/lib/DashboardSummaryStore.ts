@@ -79,6 +79,11 @@ export interface DashboardPayload {
   perCamera?: Record<number, {
     enabled_agents_count: number;
     enabled_agents_types: string[];
+    enabled_agents?: Array<{
+      id: number;
+      algorithm_type: string;
+      display_name: string;
+    }>;
     last_started_at: string | null;
     last_error_at: string | null;
     detections_24h: number;

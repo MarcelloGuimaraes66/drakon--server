@@ -314,6 +314,7 @@ function DashboardContent() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
   const [stoppingJobs, setStoppingJobs] = useState<Set<number>>(new Set());
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(new Set());
+  const [expandedCameras, setExpandedCameras] = useState<Set<number>>(new Set());
   const [alertsSearchTerm, setAlertsSearchTerm] = useState("");
   const [alertsFilter, setAlertsFilter] = useState("ALL");
   const [activeAlert, setActiveAlert] = useState<any | null>(null);
@@ -341,6 +342,16 @@ function DashboardContent() {
   const perCamera = dashboard?.perCamera || {};
   const jobs = dashboard?.jobs;
   const activity = dashboard?.activity;
+  const runningCameras = [...cameras]
+    .filter((camera: any) => isCameraServiceRunning(camera))
+    .sort((a: any, b: any) => {
+      const aStartedAt = Date.parse(perCamera[a.id]?.last_started_at || "") || 0;
+      const bStartedAt = Date.parse(perCamera[b.id]?.last_started_at || "") || 0;
+      if (aStartedAt !== bStartedAt) {
+        return bStartedAt - aStartedAt;
+      }
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    });
   const panelPriorityLabels: Record<string, string> = {
     CRITIC: t("dashboard.alertFilters.critic").toUpperCase(),
     HIGH: t("dashboard.alertFilters.high").toUpperCase(),
@@ -1080,6 +1091,18 @@ function DashboardContent() {
     });
   };
 
+  const toggleCameraExpanded = (cameraId: number) => {
+    setExpandedCameras((prev) => {
+      const next = new Set(prev);
+      if (next.has(cameraId)) {
+        next.delete(cameraId);
+      } else {
+        next.add(cameraId);
+      }
+      return next;
+    });
+  };
+
   // Show loading state if no data yet
   if (!stats && cameras.length === 0) {
     return (
@@ -1178,218 +1201,322 @@ function DashboardContent() {
 
       {/* Main Grid */}
         <div className="grid grid-cols-1 gap-6 mb-6 lg:grid-cols-[0.29fr_1fr] lg:gap-1">
-          {/* Jobs & Pipelines */}
+          {/* Jobs & Cameras */}
           <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-3 backdrop-blur-sm min-w-0 flex flex-col min-h-0 h-[840px] max-h-[90vh] overflow-hidden">
             <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold text-white">{t("dashboard.jobsPipelines")}</h2>
-            <Link
-              to="/jobs"
-              className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
-            >
-              {t("dashboard.manage")} {"->"}
-            </Link>
-          </div>
-
-          {/* Running Jobs */}
-          <div className="mb-6">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <h3 className="text-sm font-medium text-gray-300">{t("dashboard.runningJobs")}</h3>
+              <h2 className="text-xl font-semibold text-white">{t("dashboard.jobsPipelines")}</h2>
+              <Link
+                to="/jobs"
+                className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                {t("dashboard.manage")} {"->"}
+              </Link>
             </div>
-            {!jobs?.runningJobs || jobs.runningJobs.length === 0 ? (
-              <div className="text-sm text-gray-500 text-center py-4">{t("dashboard.noJobsRunning")}</div>
-            ) : (
-              <div className="space-y-2">
-                {jobs.runningJobs.map((job: any) => {
-                  const isStopping = job.status === "stopping" || stoppingJobs.has(job.job_id);
-                  const steps = jobs?.runningJobSteps?.[job.job_id] || [];
-                  const isExpanded = expandedJobs.has(job.job_id);
-                  const totalSteps = steps.length;
-                  const completedSteps = steps.filter((s: any) => s.status === "completed").length;
-                  //const runningStep = steps.find((s: any) => s.status === "running");
-                  steps.find((s: any) => s.status === "running");
+            <div className="flex-1 min-h-0 overflow-y-auto pr-1">
+              {/* Running Jobs */}
+              <div className="mb-6">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-medium text-gray-300">{t("dashboard.runningJobs")}</h3>
+                </div>
+                {!jobs?.runningJobs || jobs.runningJobs.length === 0 ? (
+                  <div className="text-sm text-gray-500 text-center py-4">{t("dashboard.noJobsRunning")}</div>
+                ) : (
+                  <div className="space-y-2">
+                    {jobs.runningJobs.map((job: any) => {
+                      const isStopping = job.status === "stopping" || stoppingJobs.has(job.job_id);
+                      const steps = jobs?.runningJobSteps?.[job.job_id] || [];
+                      const isExpanded = expandedJobs.has(job.job_id);
+                      const totalSteps = steps.length;
+                      const completedSteps = steps.filter((step: any) => step.status === "completed").length;
 
-                  
-                  return (
-                    <div
-                      key={job.job_id}
-                      className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2"
-                    >
-                      <div className="flex items-center justify-between">
+                      return (
                         <div
-                          className="flex items-start gap-3 flex-1 min-w-0 cursor-pointer"
-                          onClick={() => toggleJobExpanded(job.job_id)}
+                          key={job.job_id}
+                          className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2"
                         >
-                          <div className="mt-1 text-gray-400">
-                            {isExpanded ? (
-                              <ChevronDown className="w-4 h-4" />
-                            ) : (
-                              <ChevronRight className="w-4 h-4" />
-                            )}
-                          </div>
-                          <div className="min-w-0">
-                            <span className="text-white font-medium truncate block">{job.job_name || t("dashboard.unknownJob")}</span>
-                            <div className="flex items-center gap-2 mt-1">
-                              <span
-                                className={`px-2 py-0.5 text-xs rounded-full ${
-                                  isStopping
-                                    ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
-                                    : "bg-green-500/20 text-green-400 border border-green-500/30"
-                                }`}
-                              >
-                                {isStopping ? t("dashboard.stopping") : t("dashboard.running")}
-                              </span>
+                          <div className="flex items-center justify-between">
+                            <div
+                              className="flex items-start gap-3 flex-1 min-w-0 cursor-pointer"
+                              onClick={() => toggleJobExpanded(job.job_id)}
+                            >
+                              <div className="mt-1 text-gray-400">
+                                {isExpanded ? (
+                                  <ChevronDown className="w-4 h-4" />
+                                ) : (
+                                  <ChevronRight className="w-4 h-4" />
+                                )}
+                              </div>
+                              <div className="min-w-0">
+                                <span className="text-white font-medium truncate block">{job.job_name || t("dashboard.unknownJob")}</span>
+                                <div className="flex items-center gap-2 mt-1 flex-wrap">
+                                  <span
+                                    className={`px-2 py-0.5 text-xs rounded-full ${
+                                      isStopping
+                                        ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
+                                        : "bg-green-500/20 text-green-400 border border-green-500/30"
+                                    }`}
+                                  >
+                                    {isStopping ? t("dashboard.stopping") : t("dashboard.running")}
+                                  </span>
 
-                              {job.started_at_utc && (
-                                <span className="text-xs text-gray-400">
-                                  {t("dashboard.startedAgo", { value: timeAgo(job.started_at_utc) })}
+                                  {job.started_at_utc && (
+                                    <span className="text-xs text-gray-400">
+                                      {t("dashboard.startedAgo", { value: timeAgo(job.started_at_utc) })}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex flex-col items-end gap-1 ml-3" onClick={(e) => e.stopPropagation()}>
+                              {totalSteps > 0 && (
+                                <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                  {completedSteps}/{totalSteps}
                                 </span>
                               )}
+                              <button
+                                onClick={() => handleStopJob(job.job_id, job.job_name)}
+                                disabled={isStopping}
+                                className={`px-3 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
+                                  isStopping
+                                    ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+                                    : "bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20"
+                                }`}
+                              >
+                                <StopCircle className="w-3 h-3" />
+                                {t("dashboard.stop")}
+                              </button>
                             </div>
                           </div>
-                        </div>
-                        <div className="flex flex-col items-end gap-1 ml-3" onClick={(e) => e.stopPropagation()}>
-                          {totalSteps > 0 && (
-                            <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                              {completedSteps}/{totalSteps}
-                            </span>
-                          )}
-                          <button
-                            onClick={() => handleStopJob(job.job_id, job.job_name)}
-                            disabled={isStopping}
-                            className={`px-3 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
-                              isStopping
-                                ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-                                : "bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20"
-                            }`}
-                          >
-                            <StopCircle className="w-3 h-3" />
-                            {t("dashboard.stop")}
-                          </button>
-                        </div>
-                      </div>
 
-                      {isExpanded && steps.length > 0 && (
-                        <div className="mt-3 pt-3 border-t border-gray-800/60">
-                          <div className="space-y-2 pl-2">
-                            {steps.map((step: any) => {
-                              const isCompleted = step.status === "completed";
-                              const isRunning = step.status === "running";
-                              const isPending = step.status === "pending";
-                              const isSkipped = step.status === "skipped";
-                              const iconColor = isCompleted
-                                ? "text-green-400"
-                                : isRunning
-                                ? "text-purple-400"
-                                : isSkipped
-                                ? "text-yellow-400"
-                                : "text-gray-500";
-                              const textColor = isCompleted
-                                ? "text-green-300"
-                                : isRunning
-                                ? "text-purple-300"
-                                : isSkipped
-                                ? "text-yellow-300"
-                                : "text-gray-500";
-                              const Icon = isCompleted ? CheckCircle : isRunning ? Loader2 : isSkipped ? XCircle : Circle;
-                              return (
-                                <div key={step.id} className="flex items-center gap-3 text-sm">
-                                  <div className={`w-4 h-4 ${iconColor} flex items-center justify-center`}>
-                                    <Icon className={`w-4 h-4 ${isRunning ? "animate-spin" : ""}`} />
-                                  </div>
-                                  <span className={`truncate ${textColor}`}>
-                                    {t("dashboard.stepWithOrder", { order: step.step_order, name: step.name })}
+                          {isExpanded && steps.length > 0 && (
+                            <div className="mt-3 pt-3 border-t border-gray-800/60">
+                              <div className="space-y-2 pl-2">
+                                {steps.map((step: any) => {
+                                  const isCompleted = step.status === "completed";
+                                  const isRunning = step.status === "running";
+                                  const isPending = step.status === "pending";
+                                  const isSkipped = step.status === "skipped";
+                                  const iconColor = isCompleted
+                                    ? "text-green-400"
+                                    : isRunning
+                                    ? "text-purple-400"
+                                    : isSkipped
+                                    ? "text-yellow-400"
+                                    : "text-gray-500";
+                                  const textColor = isCompleted
+                                    ? "text-green-300"
+                                    : isRunning
+                                    ? "text-purple-300"
+                                    : isSkipped
+                                    ? "text-yellow-300"
+                                    : "text-gray-500";
+                                  const Icon = isCompleted ? CheckCircle : isRunning ? Loader2 : isSkipped ? XCircle : Circle;
+                                  return (
+                                    <div key={step.id} className="flex items-center gap-3 text-sm">
+                                      <div className={`w-4 h-4 ${iconColor} flex items-center justify-center`}>
+                                        <Icon className={`w-4 h-4 ${isRunning ? "animate-spin" : ""}`} />
+                                      </div>
+                                      <span className={`truncate ${textColor}`}>
+                                        {t("dashboard.stepWithOrder", { order: step.step_order, name: step.name })}
+                                      </span>
+                                      {isPending ? <span className="text-xs text-gray-600 ml-auto">{t("dashboard.pending")}</span> : null}
+                                      {isSkipped ? <span className="text-xs text-yellow-400 ml-auto">{t("dashboard.skipped")}</span> : null}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Running Cameras */}
+              <div className="mb-6">
+                <div className="mb-3 flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-medium text-gray-300">{t("dashboard.runningCameras")}</h3>
+                </div>
+                {runningCameras.length === 0 ? (
+                  <div className="text-sm text-gray-500 text-center py-4">{t("dashboard.noCamerasRunning")}</div>
+                ) : (
+                  <div className="space-y-2">
+                    {runningCameras.map((camera: any) => {
+                      const cameraStats = perCamera[camera.id] || {};
+                      const enabledAgents = Array.isArray(cameraStats.enabled_agents) ? cameraStats.enabled_agents : [];
+                      const isExpanded = expandedCameras.has(camera.id);
+                      const connectionState = getCameraConnectionState(camera);
+                      const isOnline = connectionState === "online";
+                      const isReconnecting = connectionState === "reconnecting";
+
+                      return (
+                        <div
+                          key={camera.id}
+                          className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2"
+                        >
+                          <div
+                            className="flex items-center justify-between gap-3 cursor-pointer"
+                            onClick={() => toggleCameraExpanded(camera.id)}
+                          >
+                            <div className="flex items-start gap-3 flex-1 min-w-0">
+                              <div className="mt-1 text-gray-400">
+                                {isExpanded ? (
+                                  <ChevronDown className="w-4 h-4" />
+                                ) : (
+                                  <ChevronRight className="w-4 h-4" />
+                                )}
+                              </div>
+                              <div className="min-w-0">
+                                <span className="text-white font-medium truncate block">{camera.name || t("dashboard.unknownCamera")}</span>
+                                <div className="flex items-center gap-2 mt-1 flex-wrap">
+                                  <span className="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                                    {t("dashboard.running")}
                                   </span>
-                                  {isPending ? <span className="text-xs text-gray-600 ml-auto">{t("dashboard.pending")}</span> : null}
-                                  {isSkipped ? <span className="text-xs text-yellow-400 ml-auto">{t("dashboard.skipped")}</span> : null}
+                                  <span
+                                    className={`px-2 py-0.5 text-xs rounded-full ${
+                                      isOnline
+                                        ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                                        : isReconnecting
+                                        ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                                        : "bg-red-500/20 text-red-400 border border-red-500/30"
+                                    }`}
+                                  >
+                                    {isOnline
+                                      ? t("dashboard.online")
+                                      : isReconnecting
+                                      ? "Reconnecting"
+                                      : t("dashboard.offline")}
+                                  </span>
+                                  {cameraStats.last_started_at && (
+                                    <span className="text-xs text-gray-400">
+                                      {t("dashboard.startedAgo", { value: timeAgo(cameraStats.last_started_at) })}
+                                    </span>
+                                  )}
                                 </div>
-                              );
-                            })}
+                              </div>
+                            </div>
+                            <div className="flex flex-col items-end gap-1 shrink-0">
+                              <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                {enabledAgents.length}
+                              </span>
+                              <span className="text-[11px] text-gray-500 uppercase tracking-wide">{t("dashboard.agents")}</span>
+                            </div>
+                          </div>
+
+                          {isExpanded && (
+                            <div className="mt-3 pt-3 border-t border-gray-800/60">
+                              {enabledAgents.length === 0 ? (
+                                <div className="pl-2 text-sm text-gray-500">{t("dashboard.noAgentsRunning")}</div>
+                              ) : (
+                                <div className="space-y-2 pl-2">
+                                  {enabledAgents.map((agent: any) => (
+                                    <div
+                                      key={`${camera.id}-${agent.id || agent.algorithm_type || agent.display_name}`}
+                                      className="flex items-start gap-3 text-sm"
+                                    >
+                                      <div className="w-4 h-4 text-blue-300 flex items-center justify-center mt-0.5">
+                                        <Sparkles className="w-4 h-4" />
+                                      </div>
+                                      <div className="min-w-0 flex-1">
+                                        <span className="text-blue-100 truncate block">
+                                          {agent.display_name || agent.algorithm_type || t("dashboard.agents")}
+                                        </span>
+                                        {agent.algorithm_type ? (
+                                          <span className="text-xs text-gray-500 truncate block">{agent.algorithm_type}</span>
+                                        ) : null}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Scheduled Jobs */}
+              <div className="mb-6">
+                <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-gray-400" />
+                  {t("dashboard.scheduledJobs.title")}
+                </h3>
+                {!jobs?.scheduledJobs || jobs.scheduledJobs.length === 0 ? (
+                  <div className="text-sm text-gray-500 text-center py-4">
+                    {t("dashboard.scheduledJobs.none")}
+                  </div>
+                ) : (
+                  <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                    {jobs.scheduledJobs.map((sched: any) => (
+                      <div
+                        key={`${sched.job_id}-${sched.next_run_local_date}-${sched.next_run_local_time}`}
+                        className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="min-w-0">
+                            <div className="text-white font-medium truncate">{sched.job_name || t("dashboard.unknownJob")}</div>
+                            <div className="text-xs text-gray-400">
+                              {sched.camera_count} {t("dashboard.scheduledJobs.cameras")} - {sched.step_count} {t("dashboard.scheduledJobs.steps")}
+                            </div>
+                          </div>
+                          <div className="ml-3 px-2.5 py-1 text-xs rounded bg-gray-800 text-gray-200 border border-gray-700 whitespace-nowrap">
+                            {sched.next_run_local_time || "--:--"}
                           </div>
                         </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* Scheduled Jobs */}
-          <div className="mb-6">
-            <h3 className="text-sm font-medium text-gray-300 mb-3 flex items-center gap-2">
-              <Calendar className="w-4 h-4 text-gray-400" />
-              {t("dashboard.scheduledJobs.title")}
-            </h3>
-            {!jobs?.scheduledJobs || jobs.scheduledJobs.length === 0 ? (
-              <div className="text-sm text-gray-500 text-center py-4">
-                {t("dashboard.scheduledJobs.none")}
-              </div>
-            ) : (
-              <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
-                {jobs.scheduledJobs.map((sched: any) => (
-                  <div
-                    key={`${sched.job_id}-${sched.next_run_local_date}-${sched.next_run_local_time}`}
-                    className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2"
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="min-w-0">
-                        <div className="text-white font-medium truncate">{sched.job_name || t("dashboard.unknownJob")}</div>
-                        <div className="text-xs text-gray-400">
-                          {sched.camera_count} {t("dashboard.scheduledJobs.cameras")} - {sched.step_count} {t("dashboard.scheduledJobs.steps")}
-                        </div>
                       </div>
-                      <div className="ml-3 px-2.5 py-1 text-xs rounded bg-gray-800 text-gray-200 border border-gray-700 whitespace-nowrap">
-                        {sched.next_run_local_time || "--:--"}
-                      </div>
-                    </div>
+                    ))}
                   </div>
-                ))}
+                )}
               </div>
-            )}
-          </div>
 
-          {/* Recent Job Starts */}
-          <div>
-            <h3 className="text-sm font-medium text-gray-300 mb-3">{t("dashboard.recentJobStarts")}</h3>
-            {!jobs?.recentCommands || jobs.recentCommands.filter((c: any) => c.command_type === "job_start").length === 0 ? (
-              <div className="text-sm text-gray-500 text-center py-4">{t("dashboard.noRecentJobStarts")}</div>
-            ) : (
-              <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                {jobs.recentCommands
-                  .filter((c: any) => c.command_type === "job_start")
-                  .map((cmd: any) => (
-                    <div
-                      key={cmd.id}
-                      className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2 text-sm"
-                    >
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-white font-medium truncate">
-                          {cmd.job_name || t("dashboard.unknownJob")}
-                        </span>
-                        <span
-                          className={`px-2 py-0.5 text-xs rounded-full ${
-                            cmd.status === "completed"
-                              ? "bg-green-500/20 text-green-400 border border-green-500/30"
-                              : cmd.status === "pending"
-                              ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
-                              : cmd.status === "failed"
-                              ? "bg-red-500/20 text-red-400 border border-red-500/30"
-                              : "bg-gray-500/20 text-gray-400 border border-gray-500/30"
-                          }`}
+              {/* Recent Job Starts */}
+              <div>
+                <h3 className="text-sm font-medium text-gray-300 mb-3">{t("dashboard.recentJobStarts")}</h3>
+                {!jobs?.recentCommands || jobs.recentCommands.filter((command: any) => command.command_type === "job_start").length === 0 ? (
+                  <div className="text-sm text-gray-500 text-center py-4">{t("dashboard.noRecentJobStarts")}</div>
+                ) : (
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    {jobs.recentCommands
+                      .filter((command: any) => command.command_type === "job_start")
+                      .map((cmd: any) => (
+                        <div
+                          key={cmd.id}
+                          className="bg-gray-900/50 border border-gray-700/50 rounded px-3 py-2 text-sm"
                         >
-                          {cmd.status}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between text-xs text-gray-400">
-                        {cmd.step_count && <span>{cmd.step_count} {t("dashboard.scheduledJobs.steps")}</span>}
-                        <span>{timeAgo(cmd.created_at)}</span>
-                      </div>
-                    </div>
-                  ))}
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-white font-medium truncate">
+                              {cmd.job_name || t("dashboard.unknownJob")}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 text-xs rounded-full ${
+                                cmd.status === "completed"
+                                  ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                                  : cmd.status === "pending"
+                                  ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
+                                  : cmd.status === "failed"
+                                  ? "bg-red-500/20 text-red-400 border border-red-500/30"
+                                  : "bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                              }`}
+                            >
+                              {cmd.status}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-gray-400">
+                            {cmd.step_count && <span>{cmd.step_count} {t("dashboard.scheduledJobs.steps")}</span>}
+                            <span>{timeAgo(cmd.created_at)}</span>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
               </div>
-            )}
+            </div>
           </div>
-        </div>
         {/* Recent Alerts */}
         <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6 backdrop-blur-sm min-w-0 flex flex-col min-h-0 h-[840px] max-h-[90vh] overflow-hidden relative">
           <div className="flex items-center justify-between mb-3">
@@ -2065,6 +2192,10 @@ function DashboardContent() {
             <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
               {cameras.map((camera: any) => {
                 const cameraStats = perCamera[camera.id] || {};
+                const enabledAgents = Array.isArray(cameraStats.enabled_agents) ? cameraStats.enabled_agents : [];
+                const enabledAgentLabels = enabledAgents
+                  .map((agent: any) => agent.display_name || agent.algorithm_type)
+                  .filter(Boolean);
                 const connectionState = getCameraConnectionState(camera);
                 const isRunning = isCameraServiceRunning(camera);
                 const isOnline = connectionState === "online";
@@ -2110,10 +2241,10 @@ function DashboardContent() {
                           <div>
                             <span className="text-gray-500">{t("dashboard.agents")}:</span>{" "}
                             <span className="text-white">{cameraStats.enabled_agents_count || 0}</span>
-                            {cameraStats.enabled_agents_types && cameraStats.enabled_agents_types.length > 0 && (
+                            {enabledAgentLabels.length > 0 && (
                               <span className="ml-1">
-                                ({cameraStats.enabled_agents_types.slice(0, 2).join(", ")}
-                                {cameraStats.enabled_agents_types.length > 2 && "..."})
+                                ({enabledAgentLabels.slice(0, 2).join(", ")}
+                                {enabledAgentLabels.length > 2 && "..."})
                               </span>
                             )}
                           </div>

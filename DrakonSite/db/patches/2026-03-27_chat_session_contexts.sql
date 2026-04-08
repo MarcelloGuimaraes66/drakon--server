@@ -2,9 +2,11 @@ CREATE TABLE IF NOT EXISTS chat_session_contexts (
   user_id TEXT NOT NULL,
   session_id INTEGER NOT NULL,
   compact_context_json TEXT NOT NULL DEFAULT '{}',
+  task_state_json TEXT NOT NULL DEFAULT '{}',
   last_compacted_message_id INTEGER NOT NULL DEFAULT 0,
   token_estimate INTEGER NOT NULL DEFAULT 0,
   compacted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, session_id)
 );

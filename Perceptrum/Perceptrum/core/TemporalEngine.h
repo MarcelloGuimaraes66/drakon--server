@@ -4044,6 +4044,63 @@ inline void upsertIdentityMemory(
         if (entityState) (*entityState)["scene_brief"] = sceneBrief;
     }
 
+    if (structuredIdentityFeatureCandidates.is_array() &&
+        !structuredIdentityFeatureCandidates.empty())
+    {
+        auto mergeIdentityFeatureCandidates = [](json target, const json& source) {
+            if (!target.is_array()) target = json::array();
+            std::unordered_set<std::string> seen;
+            for (const auto& item : target) {
+                if (!item.is_object()) continue;
+                const std::string key =
+                    lower(trim(strField(item, "text"))) + "|" +
+                    lower(trim(strField(item, "category"))) + "|" +
+                    lower(trim(strField(item, "relation_to_target")));
+                if (key == "||") continue;
+                seen.insert(key);
+            }
+
+            const json normalizedSource = parseIdentityFeatureCandidatesValue(source);
+            if (normalizedSource.is_array()) {
+                for (const auto& item : normalizedSource) {
+                    if (!item.is_object()) continue;
+                    const std::string key =
+                        lower(trim(strField(item, "text"))) + "|" +
+                        lower(trim(strField(item, "category"))) + "|" +
+                        lower(trim(strField(item, "relation_to_target")));
+                    if (key == "||" || !seen.insert(key).second) continue;
+                    target.push_back(item);
+                }
+            }
+
+            if (target.size() > 12) {
+                target.erase(target.begin() + 12, target.end());
+            }
+            return target;
+        };
+
+        json mergedIdentityFeatureCandidates =
+            mem.contains("identity_feature_candidates")
+                ? mem["identity_feature_candidates"]
+                : json::array();
+        if (entityState && entityState->contains("identity_feature_candidates")) {
+            mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
+                mergedIdentityFeatureCandidates,
+                (*entityState)["identity_feature_candidates"]);
+        }
+        mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
+            mergedIdentityFeatureCandidates,
+            structuredIdentityFeatureCandidates);
+        if (mergedIdentityFeatureCandidates.is_array() &&
+            !mergedIdentityFeatureCandidates.empty())
+        {
+            mem["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
+            if (entityState) {
+                (*entityState)["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
+            }
+        }
+    }
+
     json mergedIdentitySignatureTraits = json::array();
     if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
         mem.contains("identity_signature_traits"))
@@ -4578,13 +4635,39 @@ inline void applyRound(json& st,
                !description.empty();
     };
 
+    auto makeIdentityPatchDecisionCandidate = [&](const json& patch,
+                                                  const std::string& patchEntityId,
+                                                  const std::string& patchEntityHint,
+                                                  const std::string& patchZone,
+                                                  const std::string& patchTs,
+                                                  const json& patchEvidenceRef) {
+        TemporalEvidenceCandidate candidate;
+        candidate.eventName = "identity_patch";
+        candidate.entityId = trim(patchEntityId);
+        if (candidate.entityId.empty()) candidate.entityId = trim(patchEntityHint);
+        candidate.zone = trim(patchZone);
+        candidate.timestampUtcIso = normalizeAcceptedEventTs(patchTs, defaultRoundEventTs);
+        if (candidate.timestampUtcIso.empty()) {
+            candidate.timestampUtcIso = normalizeFlexibleTs(
+                strField(patchEvidenceRef, "ts_utc", strField(patch, "ts_utc")));
+        }
+        if (candidate.timestampUtcIso.empty()) candidate.timestampUtcIso = nowTs;
+        if (patchEvidenceRef.is_object()) {
+            candidate.evidenceKey = trim(strField(patchEvidenceRef, "temporal_evidence_key"));
+            candidate.frameIndex = intField(patchEvidenceRef, "frame_index", -1);
+            candidate.timestampName = trim(strField(patchEvidenceRef, "timestamp_name"));
+            candidate.frameTimestampInSegment = trim(strField(patchEvidenceRef, "frame_timestamp_in_segment"));
+        }
+        return candidate;
+    };
+
     auto tryUpsertIdentityMemoryFromWeakPatch = [&](const json& patch,
                                                     const std::string& patchEntityId,
                                                     const std::string& patchEntityHint,
                                                     const std::string& patchEntityType,
                                                     const std::string& patchZone,
-                                                    const std::string& patchTs) -> bool {
-        if (!patchSupportsIdentityMemoryFallback(patch)) return false;
+                                                    const std::string& patchTs) -> std::string {
+        if (!patchSupportsIdentityMemoryFallback(patch)) return std::string();
 
         std::string resolvedEntityId = trim(patchEntityId);
         if (!resolvedEntityId.empty() && !entityExists(resolvedEntityId)) {
@@ -4614,7 +4697,7 @@ inline void applyRound(json& st,
         if (resolvedEntityId.empty() && roundPositiveEntityIds.size() == 1) {
             resolvedEntityId = *roundPositiveEntityIds.begin();
         }
-        if (resolvedEntityId.empty()) return false;
+        if (resolvedEntityId.empty()) return std::string();
 
         json pseudoPatch = patch;
         pseudoPatch["entity_id"] = resolvedEntityId;
@@ -4644,7 +4727,7 @@ inline void applyRound(json& st,
             resolvedEntityId,
             patchEntityHint.empty() ? patchEntityId : patchEntityHint,
             "weak_identity_patch");
-        return true;
+        return resolvedEntityId;
     };
 
     auto resolveExistingEntityIdForAbsence = [&](const std::string& entityIdRaw,
@@ -4893,13 +4976,27 @@ inline void applyRound(json& st,
                     : ((confidence >= newThreshold) ? "new_entity" : "unknown");
             }
             if (decision == "unknown") {
-                tryUpsertIdentityMemoryFromWeakPatch(
+                const std::string weakResolvedEntityId = tryUpsertIdentityMemoryFromWeakPatch(
                     p,
                     patchEntityId,
                     patchEntityHint,
                     patchEntityType,
                     patchZone,
                     patchTs);
+                if (!weakResolvedEntityId.empty()) {
+                    recordLastRoundCandidateDecision(
+                        st,
+                        makeIdentityPatchDecisionCandidate(
+                            p,
+                            patchEntityId,
+                            patchEntityHint,
+                            patchZone,
+                            patchTs,
+                            patchEvidenceRef),
+                        "accepted_weak_identity_patch",
+                        weakResolvedEntityId,
+                        nowTs);
+                }
                 continue;
             }
 
@@ -4920,7 +5017,19 @@ inline void applyRound(json& st,
                     if (entityExists(resolved)) entityId = resolved;
                 }
             }
-            if (entityId.empty()) continue;
+            if (entityId.empty()) {
+                recordLastRoundCandidateDecision(
+                    st,
+                    makeIdentityPatchDecisionCandidate(
+                        p,
+                        patchEntityId,
+                        patchEntityHint,
+                        patchZone,
+                        patchTs,
+                        patchEvidenceRef),
+                    "rejected_missing_entity");
+                continue;
+            }
 
             const json traits = extractTraitsFromNode(p);
             const std::string zone = patchZone;
@@ -4929,6 +5038,18 @@ inline void applyRound(json& st,
             roundTouchedEntityIds.insert(entityId);
             roundPositiveEntityIds.insert(entityId);
             upsertIdentityMemory(st, entityId, p, nowTs, zone);
+            recordLastRoundCandidateDecision(
+                st,
+                makeIdentityPatchDecisionCandidate(
+                    p,
+                    patchEntityId,
+                    patchEntityHint,
+                    patchZone,
+                    patchTs,
+                    patchEvidenceRef),
+                decision == "new_entity" ? "accepted_new_identity_patch" : "accepted_identity_patch",
+                entityId,
+                nowTs);
 
             if (p.contains("events") && p["events"].is_array()) {
                 for (const auto& ev : p["events"]) {

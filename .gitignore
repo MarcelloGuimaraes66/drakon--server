@@ -66,6 +66,7 @@ DrakonSite/tmp_investigation/
 DrakonSite/tmp_*
 DrakonSite/_deploy_payload/
 DrakonSite/_partner_zip/
+DrakonSite/.deploy-account-delete/
 DrakonSite/_diff_jobruntime.patch
 DrakonSite/__pycache__/
 DrakonSite/*.docx
@@ -80,3 +81,4 @@ DrakonSite/env.dev
 Perceptrum/.local/
 Perceptrum/Perceptrum/generated/
 Perceptrum/Perceptrum/gcm-diagnose.log
+perceptrum_site*.sqlite

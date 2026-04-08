@@ -701,6 +701,20 @@ namespace winrt::DrakonDesktop::implementation
             return;
         }
 
+        if (messageType == "account-delete-cleanup")
+        {
+            auto const clearStorageRoot = payload.value("clear_storage_root", false);
+            auto const result =
+                ::DrakonDesktop::platform::ScheduleLocalAppDataCleanupAfterAccountDeletionFromWeb(
+                    clearStorageRoot);
+            if (!result.succeeded)
+            {
+                AppendBootstrapTrace("site-host: account deletion cleanup scheduling failed");
+                AppendBootstrapTrace(winrt::to_string(result.message));
+            }
+            return;
+        }
+
         if (messageType != "resident-runtime-session" || m_pairingRequested || m_pairingCompleted)
         {
             return;

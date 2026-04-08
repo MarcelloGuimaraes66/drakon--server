@@ -13,6 +13,12 @@ namespace DrakonDesktop::platform
         winrt::hstring message;
     };
 
+    struct DesktopShellRequestResult
+    {
+        bool succeeded{ false };
+        winrt::hstring message;
+    };
+
     class LocalBackendHost;
     class PerceptrumRuntimeHost;
     class TrayIconHost;
@@ -22,6 +28,7 @@ namespace DrakonDesktop::platform
         winrt::hstring const& exeId,
         winrt::hstring const& exeToken,
         winrt::hstring const& timezoneIana);
+    DesktopShellRequestResult ScheduleLocalAppDataCleanupAfterAccountDeletionFromWeb(bool clearStorageRoot);
     bool IsRuntimeAlreadyProvisioned();
 }
 

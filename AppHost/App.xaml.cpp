@@ -18,6 +18,7 @@
 #include <winrt/Microsoft.UI.Windowing.h>
 
 #include <exception>
+#include <vector>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -25,6 +26,128 @@ using namespace Microsoft::UI::Xaml;
 namespace
 {
     ::DrakonDesktop::platform::PerceptrumRuntimeHost* g_runtimeHost = nullptr;
+
+    std::wstring EscapePowerShellSingleQuotedLiteral(std::wstring const& value)
+    {
+        std::wstring escaped;
+        escaped.reserve(value.size() + 8);
+        for (auto const ch : value)
+        {
+            if (ch == L'\'')
+            {
+                escaped += L"''";
+            }
+            else
+            {
+                escaped.push_back(ch);
+            }
+        }
+        return escaped;
+    }
+
+    std::filesystem::path ResolvePowerShellPath()
+    {
+        wchar_t systemDirectory[MAX_PATH + 1]{};
+        auto const bufferLength = static_cast<UINT>(MAX_PATH + 1);
+        auto const length = GetSystemDirectoryW(systemDirectory, bufferLength);
+        if (length > 0 && length < bufferLength)
+        {
+            auto candidate = std::filesystem::path(std::wstring(systemDirectory, length)) /
+                "WindowsPowerShell" / "v1.0" / "powershell.exe";
+            if (std::filesystem::exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return std::filesystem::path(L"powershell.exe");
+    }
+
+    bool LaunchAccountDeletionCleanupProcess(
+        std::filesystem::path const& serviceSessionDirectory,
+        bool clearStorageRoot,
+        std::wstring& error)
+    {
+        auto const powerShellPath = ResolvePowerShellPath();
+        std::vector<std::filesystem::path> cleanupTargets{
+            serviceSessionDirectory / "backend-host.log",
+            serviceSessionDirectory / "service-cpp.log",
+            serviceSessionDirectory / "logs",
+            serviceSessionDirectory / "webview2",
+            serviceSessionDirectory / "exe_token.txt",
+            serviceSessionDirectory / "client_id.txt",
+            serviceSessionDirectory / "exe_id.txt",
+            serviceSessionDirectory / "paired_timezone.txt",
+            serviceSessionDirectory / "drakon_base_url.txt",
+            serviceSessionDirectory / "perceptrum_base_url.txt",
+            serviceSessionDirectory / "drakon_desktop_session.cookie",
+        };
+        if (clearStorageRoot)
+        {
+            cleanupTargets.push_back(serviceSessionDirectory / "storage");
+        }
+
+        std::wstring targetsLiteral = L"$targets=@(";
+        for (size_t index = 0; index < cleanupTargets.size(); ++index)
+        {
+            if (index > 0)
+            {
+                targetsLiteral += L",";
+            }
+
+            targetsLiteral += L"'";
+            targetsLiteral += EscapePowerShellSingleQuotedLiteral(cleanupTargets[index].wstring());
+            targetsLiteral += L"'";
+        }
+        targetsLiteral += L");";
+
+        std::wstring script;
+        script.reserve(2048);
+        script += L"$parentPid=" + std::to_wstring(GetCurrentProcessId()) + L";";
+        script += L"$sessionDir='" + EscapePowerShellSingleQuotedLiteral(serviceSessionDirectory.wstring()) + L"';";
+        script += targetsLiteral;
+        script += L"$waitDeadline=(Get-Date).AddSeconds(45);";
+        script += L"while((Get-Process -Id $parentPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $waitDeadline){Start-Sleep -Milliseconds 250};";
+        script += L"$cleanupDeadline=(Get-Date).AddSeconds(12);";
+        script += L"do {";
+        script += L"foreach($target in $targets){Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue};";
+        script += L"$remaining=@($targets | Where-Object { Test-Path -LiteralPath $_ });";
+        script += L"if($remaining.Count -eq 0){break};";
+        script += L"Start-Sleep -Milliseconds 300;";
+        script += L"} while((Get-Date) -lt $cleanupDeadline);";
+        script += L"try {$sessionChildren=@(Get-ChildItem -LiteralPath $sessionDir -Force -ErrorAction SilentlyContinue);";
+        script += L"if($sessionChildren.Count -eq 0){Remove-Item -LiteralPath $sessionDir -Force -ErrorAction SilentlyContinue}} catch {}";
+
+        std::wstring commandLine =
+            L"\"" + powerShellPath.wstring() +
+            L"\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"" +
+            script + L"\"";
+
+        STARTUPINFOW startupInfo{};
+        startupInfo.cb = sizeof(startupInfo);
+
+        PROCESS_INFORMATION processInfo{};
+        if (!CreateProcessW(
+                powerShellPath.wstring().c_str(),
+                commandLine.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW | DETACHED_PROCESS,
+                nullptr,
+                nullptr,
+                &startupInfo,
+                &processInfo))
+        {
+            error = L"Unable to start local AppData cleanup helper. Win32=" +
+                std::to_wstring(GetLastError());
+            return false;
+        }
+
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        return true;
+    }
 
     void ApplyMainWindowIcon(HWND hwnd)
     {
@@ -122,6 +245,38 @@ namespace DrakonDesktop::platform
             winrt::to_string(exeId),
             std::optional<std::string>{ winrt::to_string(timezoneIana) });
         return { status.running || status.paired, winrt::to_hstring(status.summary) };
+    }
+
+    DesktopShellRequestResult ScheduleLocalAppDataCleanupAfterAccountDeletionFromWeb(bool clearStorageRoot)
+    {
+        auto const& config = RuntimeConfig();
+        if (config.serviceSessionDirectory.empty())
+        {
+            return { false, L"Local AppData session directory is not configured." };
+        }
+
+        std::wstring error;
+        if (!LaunchAccountDeletionCleanupProcess(
+                config.serviceSessionDirectory,
+                clearStorageRoot,
+                error))
+        {
+            return { false, winrt::hstring(error) };
+        }
+
+        AppendBootstrapTrace("app: scheduled local AppData cleanup after account deletion");
+        try
+        {
+            if (auto current = winrt::Microsoft::UI::Xaml::Application::Current())
+            {
+                current.Exit();
+            }
+        }
+        catch (...)
+        {
+        }
+
+        return { true, L"Local AppData cleanup scheduled." };
     }
 }
 

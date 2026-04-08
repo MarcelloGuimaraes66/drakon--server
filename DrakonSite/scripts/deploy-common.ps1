@@ -55,7 +55,8 @@ function Invoke-RemoteBashScript {
     return
   }
 
-  $ScriptContent | & ssh @SshArguments
+  $NormalizedScriptContent = $ScriptContent -replace "`r`n", "`n"
+  $NormalizedScriptContent | & ssh @SshArguments
   if ($LASTEXITCODE -ne 0) {
     throw "$Label failed with exit code $LASTEXITCODE."
   }

@@ -410,7 +410,8 @@ void configureActionModelClient(LocalLlmClient& llm, const nlohmann::json& paylo
 std::string parseErrorMessage(const HttpResponse& response)
 {
     if (!response.body.empty()) {
-        const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+        const std::string bodyText = trimText(response.body);
+        const nlohmann::json parsed = nlohmann::json::parse(bodyText, nullptr, false);
         if (parsed.is_object()) {
             const std::string error = jsonStringField(parsed, "error");
             if (!error.empty()) {
@@ -419,6 +420,16 @@ std::string parseErrorMessage(const HttpResponse& response)
             const std::string message = jsonStringField(parsed, "message");
             if (!message.empty()) {
                 return message;
+            }
+        }
+        if (!bodyText.empty() && bodyText.front() != '<') {
+            const std::string singleLine = normalizeInlineWhitespace(bodyText);
+            constexpr std::size_t kMaxErrorLen = 240;
+            if (singleLine.size() > kMaxErrorLen) {
+                return singleLine.substr(0, kMaxErrorLen - 3) + "...";
+            }
+            if (!singleLine.empty()) {
+                return singleLine;
             }
         }
     }

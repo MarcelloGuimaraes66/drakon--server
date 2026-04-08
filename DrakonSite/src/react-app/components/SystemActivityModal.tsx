@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Camera as DashboardCamera, DashboardPayload } from "@/react-app/lib/DashboardSummaryStore";
+import { brand } from "@/shared/brand";
 import {
   Activity,
   ArrowDownToLine,
@@ -157,6 +158,36 @@ type OpenMonitorResponse = {
   alerts?: Array<{ severity?: string | null; code?: string | null; message?: string | null }> | null;
 };
 
+type TimedMetricSample = {
+  sampled_at?: string | null;
+  updated_at?: string | null;
+};
+
+type CaptureThreadSample = TimedMetricSample & {
+  client_id?: string | null;
+  exe_id?: string | null;
+  camera_id?: number | null;
+  camera_name?: string | null;
+  thread_name?: string | null;
+  cpu_percent?: number | null;
+  capture_mem_estimated_bytes?: number | null;
+  process_working_set_bytes?: number | null;
+  process_private_bytes?: number | null;
+  queue_depth?: number | null;
+  dropped_items?: number | null;
+  capture_read_latency_ms?: number | null;
+  decode_latency_ms?: number | null;
+  disk_read_bytes_per_sec?: number | null;
+  disk_read_latency_ms?: number | null;
+  disk_write_bytes_per_sec?: number | null;
+  disk_write_latency_ms?: number | null;
+  input_rate?: number | null;
+  processing_rate?: number | null;
+  last_inference_age_ms?: number | null;
+  success_count?: number | null;
+  error_count?: number | null;
+};
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) {
     return error.message.trim();
@@ -250,8 +281,9 @@ export default function SystemActivityModal({
     Boolean(openMonitor?.process);
   const telemetrySource = hasOpenMonitorData ? "Open Monitor" : "Legacy dashboard fallback";
   const hasOpenMonitorError = Boolean(openMonitorError);
+  const processSectionTitle = brand.id === "perceptrum" ? "Perceptrum Process" : "Drakon Process";
 
-  const captureThreads = hasOpenMonitorData
+  const captureThreads: CaptureThreadSample[] = hasOpenMonitorData
     ? openMonitorThreads.map((thread) => ({
         ...thread,
         cpu_percent: thread.thread_cpu_percent,
@@ -302,7 +334,7 @@ export default function SystemActivityModal({
     return Math.max(0, Math.floor((Date.now() - ts) / 1000));
   };
 
-  const isMetricStale = (sample: any) => {
+  const isMetricStale = (sample: TimedMetricSample) => {
     const ageSeconds = getAgeSeconds(sample?.updated_at || sample?.sampled_at);
     return ageSeconds > 90;
   };
@@ -310,7 +342,7 @@ export default function SystemActivityModal({
   const openMonitorHost = openMonitor?.host || null;
   const openMonitorProcess = openMonitor?.process || null;
 
-  const captureThreadsByCamera: Record<number, any[]> = {};
+  const captureThreadsByCamera: Record<number, CaptureThreadSample[]> = {};
   for (const sample of captureThreads) {
     const cameraId = Number(sample?.camera_id) || 0;
     if (cameraId <= 0) continue;
@@ -322,7 +354,7 @@ export default function SystemActivityModal({
 
   for (const cameraIdRaw of Object.keys(captureThreadsByCamera)) {
     const cameraId = Number(cameraIdRaw);
-    captureThreadsByCamera[cameraId].sort((a: any, b: any) => {
+    captureThreadsByCamera[cameraId].sort((a, b) => {
       const ta = Date.parse(a?.updated_at || a?.sampled_at || "") || 0;
       const tb = Date.parse(b?.updated_at || b?.sampled_at || "") || 0;
       return tb - ta;
@@ -620,7 +652,7 @@ export default function SystemActivityModal({
                 <div className="rounded-lg border border-gray-700/70 bg-gray-800/45 p-4">
                   <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
                     <Server className="h-4 w-4 text-purple-300" />
-                    Drakon Process
+                    {processSectionTitle}
                   </div>
                   <div className="grid grid-cols-1 gap-2 text-xs md:grid-cols-2">
                     <div className="rounded border border-gray-700/60 bg-gray-900/45 px-3 py-2 text-gray-200">

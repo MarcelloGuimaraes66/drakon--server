@@ -22,6 +22,13 @@ HttpResponse postJson(
     const std::vector<std::string>& extraHeaders = {},
     long timeoutMs = 15000);
 
+HttpResponse putJson(
+    const std::string& url,
+    const std::string& jsonBody,
+    const std::string& bearerToken = "",
+    const std::vector<std::string>& extraHeaders = {},
+    long timeoutMs = 15000);
+
 HttpResponse patchJson(
     const std::string& url,
     const std::string& jsonBody,

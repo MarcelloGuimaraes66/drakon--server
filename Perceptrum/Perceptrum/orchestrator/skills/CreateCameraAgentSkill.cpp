@@ -1090,14 +1090,14 @@ nlohmann::json extractCreateAgentDraft_(
         "You extract structured data for creating a camera agent directly from chat.\n"
         "Use the latest user_message plus the active create_camera_agent task in conversation_task_state when present.\n"
         "This is a semantic extraction task, not a delimiter-only parser.\n"
-        "Understand natural requests about detecting, recognizing, watching for, tracking, alerting on, creating an AI agent, using an existing face target, using Drakon Find targets, applying the agent on a camera, applying it on a job step, or opening the form for review.\n"
+        "Understand natural requests about detecting, recognizing, watching for, tracking, alerting on, creating an AI agent, using an existing face target, using Drakon Find targets, applying the agent on a camera, applying it on a workflow step, or opening the form for review.\n"
         "Never invent camera names, step names, target ids, target names, destinations, polygons, or installation scope that the user did not provide or clearly imply.\n"
         "goal_summary is the user's high-level detection goal in one sentence.\n"
         "If the user only says they want to create or add an agent on a camera or step, but does not say what the agent should analyze, detect, recognize, compare, count, or alert on, goal_summary must stay empty.\n"
         "When the analytical goal is missing, do not invent generic monitoring, security, person-detection, office-monitoring, or any other default agent.\n"
         "camera_selector identifies a direct camera target when the user wants the agent on a specific camera or references a specific camera snapshot.\n"
         "When the user identifies the camera by room, environment, scene label, or location description instead of the exact camera name, prefer camera_selector.scene_label for a short structured scene hint and camera_selector.scene_description for the natural-language scene/location hint.\n"
-        "step_selector identifies a job step when the user wants the agent on a task/step.\n"
+        "step_selector identifies a workflow step when the user wants the agent on a job step, workflow step, step, or etapa.\n"
         "step_camera_selector identifies a specific camera target inside that step when the user wants the agent inside one camera target of the step.\n"
         "When the user identifies a step camera by room, environment, scene label, or location description instead of the exact camera name, prefer step_camera_selector.scene_label for a short structured scene hint and step_camera_selector.scene_description for the natural-language scene/location hint.\n"
         "destination_types must use only these values: camera, step_default, step_camera.\n"
@@ -1110,7 +1110,7 @@ nlohmann::json extractCreateAgentDraft_(
         "Use face_target_refs only when the user clearly references one or more existing face targets.\n"
         "Use drakon_find_target_refs only when the user clearly references one or more existing Drakon Find targets.\n"
         "Set open_form=true only when the user explicitly asks to open, review, inspect, or edit through the form/modal instead of applying directly.\n"
-        "If the user says pronouns like 'essa camera', 'essa tarefa', 'o mesmo agente', or 'ali', only rely on the active create_camera_agent task when it already has resolved entities.\n"
+        "If the user says pronouns like 'essa camera', 'essa etapa', 'o mesmo agente', or 'ali', only rely on the active create_camera_agent task when it already has resolved entities.\n"
         "Return JSON only with this shape:\n"
         "{"
         "\"goal_summary\":\"detect people entering the gate\","
@@ -2439,7 +2439,7 @@ std::string buildNeedDestinationAnswer_(
         if (resolvedStep.is_object() && !resolvedStep.empty()) {
             out << " e ja localizei o step " << jsonStringField_(resolvedStep, "title");
         }
-        out << ", mas antes de modificar qualquer coisa preciso confirmar onde ele deve ser usado: direto em uma camera, como agente padrao de um step/tarefa, ou em uma camera especifica dentro de um step.";
+        out << ", mas antes de modificar qualquer coisa preciso confirmar onde ele deve ser usado: direto em uma camera, como agente padrao de uma etapa, ou em uma camera especifica dentro dessa etapa.";
         return out.str();
     }
 
@@ -2485,7 +2485,7 @@ std::string buildCameraNotFoundAnswer_(const std::string& language)
 std::string buildNeedStepAnswer_(const std::string& language)
 {
     if (language == "pt") {
-        return "Antes de criar o agente nesse fluxo, preciso confirmar em qual step/tarefa ele deve ser usado.";
+        return "Antes de criar o agente nesse fluxo, preciso confirmar em qual step ou etapa ele deve ser usado.";
     }
     return "Before I create the agent in that flow, I need to confirm which step/task should receive it.";
 }
@@ -2494,7 +2494,7 @@ std::string buildAmbiguousStepAnswer_(const std::string& language, const nlohman
 {
     std::ostringstream out;
     if (language == "pt") {
-        out << "Encontrei mais de um step/tarefa possivel. Antes de criar qualquer agente, confirme qual deles devo usar:\n";
+        out << "Encontrei mais de um step ou etapa possivel. Antes de criar qualquer agente, confirme qual deles devo usar:\n";
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             out << "\n" << stepReferenceLine_(candidates[index], index, language);
         }
@@ -2513,7 +2513,7 @@ std::string buildAmbiguousStepAnswer_(const std::string& language, const nlohman
 std::string buildStepNotFoundAnswer_(const std::string& language)
 {
     if (language == "pt") {
-        return "Nao encontrei um step/tarefa cadastrado que combine com esse pedido. Me confirme o titulo do step, o ID ou o nome do job.";
+        return "Nao encontrei um step ou etapa cadastrado que combine com esse pedido. Me confirme o titulo do step, o ID ou o nome do job.";
     }
     return "I could not find a registered step matching that request. Please confirm the step title, ID, or job name.";
 }

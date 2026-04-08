@@ -27,6 +27,58 @@ export interface HitMediaItem {
   key?: string;
 }
 
+export interface ChatIdentityCardPortrait {
+  image_url?: string;
+  portrait_kind?: string;
+  card_role?: string;
+  confidence?: number;
+  camera_id?: number;
+  camera_name?: string;
+  frame_timestamp_in_segment?: string;
+  timestamp_utc_iso?: string;
+  [key: string]: unknown;
+}
+
+export interface ChatIdentityCardLastSeen {
+  timestamp_utc_iso?: string;
+  camera_id?: number;
+  camera_name?: string;
+  zone?: string;
+  [key: string]: unknown;
+}
+
+export interface ChatIdentityFeatureCandidate {
+  text?: string;
+  category?: string;
+  relation_to_target?: string;
+  confidence?: number;
+  [key: string]: unknown;
+}
+
+export interface ChatIdentityCardMetadata {
+  card_id?: string;
+  entity_id?: string;
+  entity_type?: string;
+  display_name?: string;
+  known_name?: string;
+  description?: string;
+  aliases?: string[];
+  stable_attributes?: string[];
+  key_traits?: string[];
+  identity_signature_traits?: string[];
+  identity_context_traits?: string[];
+  identity_signature_summary?: string;
+  identity_feature_candidates?: ChatIdentityFeatureCandidate[];
+  reference_image_urls?: string[];
+  portrait_url?: string;
+  face_available?: boolean;
+  primary_portrait?: ChatIdentityCardPortrait;
+  context_portrait?: ChatIdentityCardPortrait;
+  last_seen?: ChatIdentityCardLastSeen;
+  resolved_identity?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 export interface CameraRegistrationDraftMessageMetadata {
   type: "camera_registration_draft";
   status: "awaiting_confirmation" | "registered";
@@ -143,6 +195,42 @@ export interface CameraAgentUpdateResultMessageMetadata {
   agent_summary?: string | null;
   editor_target?: CameraAgentFormEditorTarget;
   updated_fields: CameraAgentUpdatedFieldMetadata[];
+}
+
+function parseMessageCameraSelectionJson(message: ChatMessage): Record<string, unknown> | null {
+  const raw = (message as any)?.camera_selection_json;
+  if (!raw) {
+    return null;
+  }
+
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+function identityCardDedupeKey(card: Record<string, unknown>, fallbackIndex: number): string {
+  const rawCardId = typeof card.card_id === "string" ? card.card_id.trim() : "";
+  if (rawCardId) {
+    return `card:${rawCardId}`;
+  }
+
+  const rawEntityId = typeof card.entity_id === "string" ? card.entity_id.trim() : "";
+  if (rawEntityId) {
+    return `entity:${rawEntityId}`;
+  }
+
+  return `fallback:${fallbackIndex}:${JSON.stringify(card)}`;
 }
 
 const TEMPORAL_ENGINE_SUFFIX_PATTERN =
@@ -471,16 +559,8 @@ export function formatAssistantMessageContent(content: string): string {
  * 4. Legacy base64 formats (frames_jpeg_base64, frame_jpeg_base64)
  */
 export function extractHitMediaFromMessage(message: ChatMessage): HitMediaItem[] {
-  const msg = message as any;
-  
-  if (!msg.camera_selection_json) {
-    return [];
-  }
-
-  let selectionData: any;
-  try {
-    selectionData = JSON.parse(msg.camera_selection_json);
-  } catch (e) {
+  const selectionData = parseMessageCameraSelectionJson(message);
+  if (!selectionData) {
     return [];
   }
 
@@ -583,6 +663,89 @@ export function extractHitMediaFromMessage(message: ChatMessage): HitMediaItem[]
   });
 
   return allFrames;
+}
+
+export function extractIdentityCardsFromMessage(
+  message: ChatMessage
+): ChatIdentityCardMetadata[] {
+  const selectionData = parseMessageCameraSelectionJson(message);
+  if (!selectionData) {
+    return [];
+  }
+
+  const cardsByKey = new Map<string, ChatIdentityCardMetadata>();
+  const primaryCardOrder: string[] = [];
+  let fallbackIndex = 0;
+
+  const pushCard = (card: unknown) => {
+    if (!card || typeof card !== "object" || Array.isArray(card)) {
+      return;
+    }
+
+    const normalizedCard = card as Record<string, unknown>;
+    const dedupeKey = identityCardDedupeKey(normalizedCard, fallbackIndex++);
+    if (!cardsByKey.has(dedupeKey)) {
+      cardsByKey.set(dedupeKey, normalizedCard as ChatIdentityCardMetadata);
+    }
+  };
+
+  const topLevelIdentityCards = Array.isArray((selectionData as any).identity_cards)
+    ? ((selectionData as any).identity_cards as unknown[])
+    : [];
+  topLevelIdentityCards.forEach(pushCard);
+
+  const visionHits = Array.isArray((selectionData as any).vision_hits)
+    ? ((selectionData as any).vision_hits as unknown[])
+    : [];
+
+  visionHits.forEach((hit) => {
+    if (!hit || typeof hit !== "object" || Array.isArray(hit)) {
+      return;
+    }
+
+    const hitRecord = hit as Record<string, unknown>;
+    const primaryIdentityCardId =
+      typeof hitRecord.primary_identity_card_id === "string"
+        ? hitRecord.primary_identity_card_id.trim()
+        : "";
+    if (primaryIdentityCardId) {
+      primaryCardOrder.push(primaryIdentityCardId);
+    }
+
+    const hitCards = Array.isArray(hitRecord.identity_cards)
+      ? (hitRecord.identity_cards as unknown[])
+      : [];
+    hitCards.forEach(pushCard);
+  });
+
+  if (cardsByKey.size === 0) {
+    return [];
+  }
+
+  const orderedCards = Array.from(cardsByKey.values());
+  if (primaryCardOrder.length === 0) {
+    return orderedCards;
+  }
+
+  const priority = new Map<string, number>();
+  primaryCardOrder.forEach((cardId, index) => {
+    if (!priority.has(cardId)) {
+      priority.set(cardId, index);
+    }
+  });
+
+  orderedCards.sort((lhs, rhs) => {
+    const lhsCardId = typeof lhs.card_id === "string" ? lhs.card_id : "";
+    const rhsCardId = typeof rhs.card_id === "string" ? rhs.card_id : "";
+    const lhsPriority = priority.has(lhsCardId) ? priority.get(lhsCardId)! : Number.MAX_SAFE_INTEGER;
+    const rhsPriority = priority.has(rhsCardId) ? priority.get(rhsCardId)! : Number.MAX_SAFE_INTEGER;
+    if (lhsPriority !== rhsPriority) {
+      return lhsPriority - rhsPriority;
+    }
+    return (lhsCardId || lhs.entity_id || "").localeCompare(rhsCardId || rhs.entity_id || "");
+  });
+
+  return orderedCards;
 }
 
 export function extractChatProgressFromMessage(message: ChatMessage): ChatProgressInfo | null {

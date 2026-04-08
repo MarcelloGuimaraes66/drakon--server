@@ -15,6 +15,35 @@ function normalizeOpenAIApiKeyInput(value: unknown): string {
   return value.trim();
 }
 
+function describeJobSchedulerError(error: unknown, fallback: string): string {
+  if (typeof error === "string") {
+    const normalized = error.trim();
+    if (normalized) return normalized;
+  }
+  if (error instanceof Error) {
+    const normalizedMessage = typeof error.message === "string" ? error.message.trim() : "";
+    if (normalizedMessage) return normalizedMessage;
+  }
+  if (error !== null && error !== undefined) {
+    try {
+      const serialized = JSON.stringify(error);
+      if (typeof serialized === "string") {
+        const normalizedSerialized = serialized.trim();
+        if (
+          normalizedSerialized &&
+          normalizedSerialized !== "{}" &&
+          normalizedSerialized !== "null"
+        ) {
+          return normalizedSerialized;
+        }
+      }
+    } catch {
+      // Ignore secondary serialization errors and keep the fallback below.
+    }
+  }
+  return fallback;
+}
+
 // Helper function to get Telegram settings for a user
 async function getTelegramSettingsForUser(db: D1Database, userId: string) {
   const row = await db
@@ -1730,12 +1759,11 @@ async function buildJobStartPayload(
       let start_condition: any;
       
       // Check for new start_condition column first
-      if (step.start_condition !== null && step.start_condition !== undefined) {
+      const fromStepId = step.start_condition_from_step_id ?? null;
+      const conditionStr =
+        typeof step.start_condition === "string" ? step.start_condition.trim() : "";
+      if (conditionStr) {
         // New format: start_condition is stored in dedicated column
-        const conditionStr = step.start_condition;
-        const fromStepId = step.start_condition_from_step_id ?? null;
-        
-        // Parse start_condition string to determine mode
         // Format examples: "start:positive:result:XYZ", "start:time:13:56", "start:elapsed:900"
         if (conditionStr.startsWith("start:")) {
           const parts = conditionStr.split(":");
@@ -1803,6 +1831,18 @@ async function buildJobStartPayload(
             time_offset_sec: fromStepId ? null : 0,
           };
         }
+      } else if (step.start_condition !== null && step.start_condition !== undefined) {
+        console.log(
+          `[JOB SCHEDULER] Warning: step ${step.id} has unsupported start_condition type (${typeof step.start_condition}); using derived fallback`
+        );
+        start_condition = {
+          mode: fromStepId ? "sequential" : "time",
+          from_step_id: fromStepId,
+          camera_id: null,
+          extract: fromStepId ? "result" : null,
+          pattern: null,
+          time_offset_sec: fromStepId ? null : 0,
+        };
       } else if (step.input_inject_key && typeof step.input_inject_key === "string" && step.input_inject_key.startsWith("start:")) {
         // Legacy fallback: start condition encoded in input_inject_key
         const conditionStr = step.input_inject_key;
@@ -2331,28 +2371,39 @@ export async function enqueueManualJobStart(
   env: Env,
   job: any
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const nowUtc = new Date().toISOString();
-  const fallbackTimezone = normalizeTimezoneForScheduler(job?.timezone) || "UTC";
-  const timezone = await resolveSchedulerTimezoneForUser(
-    env.DB,
-    String(job?.user_id || ""),
-    fallbackTimezone
-  );
-  const localTime = getLocalTimeInTimezone(timezone);
-  const manualScheduleDay = {
-    id: null,
-    day_name: "Manual",
-    day_of_week: localTime.dayOfWeek,
-    day_of_month: localTime.dayOfMonth,
-    month_of_year: localTime.monthOfYear,
-  };
-  const manualWindow = {
-    id: null,
-    start_time: localTime.localTimeHHMM,
-    end_time: localTime.localTimeHHMM,
-  };
-
+  let commandQueued = false;
   try {
+    const nowUtc = new Date().toISOString();
+    const fallbackTimezone = normalizeTimezoneForScheduler(job?.timezone) || "UTC";
+    let timezone = await resolveSchedulerTimezoneForUser(
+      env.DB,
+      String(job?.user_id || ""),
+      fallbackTimezone
+    );
+    let localTime: LocalTimeParts;
+    try {
+      localTime = getLocalTimeInTimezone(timezone);
+    } catch (timezoneError) {
+      console.warn(
+        `[JOB SCHEDULER] Invalid timezone "${timezone}" for manual start job ${job?.id}; falling back to UTC`,
+        timezoneError
+      );
+      timezone = "UTC";
+      localTime = getLocalTimeInTimezone(timezone);
+    }
+    const manualScheduleDay = {
+      id: null,
+      day_name: "Manual",
+      day_of_week: localTime.dayOfWeek,
+      day_of_month: localTime.dayOfMonth,
+      month_of_year: localTime.monthOfYear,
+    };
+    const manualWindow = {
+      id: null,
+      start_time: localTime.localTimeHHMM,
+      end_time: localTime.localTimeHHMM,
+    };
+
     let jobStartPayload = await buildJobStartPayload(
       env,
       job,
@@ -2398,29 +2449,37 @@ export async function enqueueManualJobStart(
         nowUtc
       )
       .run();
+    commandQueued = true;
 
-    await env.DB.prepare(
-      `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, started_at_utc, last_event_at_utc, created_at, updated_at)
-       VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
-       ON CONFLICT(job_id) DO UPDATE SET
-         status = 'running',
-         started_at_utc = ?,
-         last_event_at_utc = ?,
-         updated_at = ?`
-    )
-      .bind(
-        job.id,
-        job.user_id,
-        job.name,
-        nowUtc,
-        nowUtc,
-        nowUtc,
-        nowUtc,
-        nowUtc,
-        nowUtc,
-        nowUtc
+    try {
+      await env.DB.prepare(
+        `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, started_at_utc, last_event_at_utc, created_at, updated_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+         ON CONFLICT(job_id) DO UPDATE SET
+           status = 'running',
+           started_at_utc = ?,
+           last_event_at_utc = ?,
+           updated_at = ?`
       )
-      .run();
+        .bind(
+          job.id,
+          job.user_id,
+          job.name,
+          nowUtc,
+          nowUtc,
+          nowUtc,
+          nowUtc,
+          nowUtc,
+          nowUtc,
+          nowUtc
+        )
+        .run();
+    } catch (runtimeStateError) {
+      console.error(
+        `[JOB SCHEDULER] Failed to update runtime state for manual start job ${job.id}:`,
+        runtimeStateError
+      );
+    }
 
     const startedMessage = `Job "${job.name}" started successfully.`;
     const startedDetails = JSON.stringify({
@@ -2446,28 +2505,42 @@ export async function enqueueManualJobStart(
         )
         .run();
     } catch (richInsertError) {
-      await env.DB.prepare(
-        `INSERT INTO events (user_id, camera_id, event_type, message, created_at, updated_at)
-         VALUES (?, NULL, 'job_started', ?, ?, ?)`
-      )
-        .bind(
-          job.user_id,
-          startedMessage,
-          nowUtc,
-          nowUtc
+      try {
+        await env.DB.prepare(
+          `INSERT INTO events (user_id, camera_id, event_type, message, created_at, updated_at)
+           VALUES (?, NULL, 'job_started', ?, ?, ?)`
         )
-        .run();
-      console.warn(
-        `[JOB SCHEDULER] job_started fallback insert used for manual start job ${job.id}:`,
-        richInsertError
-      );
+          .bind(
+            job.user_id,
+            startedMessage,
+            nowUtc,
+            nowUtc
+          )
+          .run();
+        console.warn(
+          `[JOB SCHEDULER] job_started fallback insert used for manual start job ${job.id}:`,
+          richInsertError
+        );
+      } catch (fallbackEventInsertError) {
+        console.error(
+          `[JOB SCHEDULER] Failed to insert job_started event for manual start job ${job.id}:`,
+          fallbackEventInsertError
+        );
+      }
     }
 
     console.log(`[JOB SCHEDULER] Enqueued manual job_start for job ${job.id} (${job.name})`);
     return { ok: true };
   } catch (error) {
+    const message = describeJobSchedulerError(error, "Failed to start job");
     console.error(`[JOB SCHEDULER] Failed manual start for job ${job?.id}:`, error);
-    return { ok: false, error: "Failed to start job" };
+    if (commandQueued) {
+      console.warn(
+        `[JOB SCHEDULER] Manual start already enqueued for job ${job?.id}; treating late failure as success.`
+      );
+      return { ok: true };
+    }
+    return { ok: false, error: message };
   }
 }
 

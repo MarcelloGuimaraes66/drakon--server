@@ -117,6 +117,10 @@ struct VideoHit {
     std::string eventTimestampUtcIso;
     std::string eventTimestampLocalIso;
     std::vector<TemporalEvidenceCandidate> temporalEvidenceCandidates;
+    nlohmann::json identityPortraitCandidates = nlohmann::json::array();
+    nlohmann::json matchedEntityIds = nlohmann::json::array();
+    nlohmann::json identityCards = nlohmann::json::array();
+    std::string primaryIdentityCardId;
 
 };
 
@@ -469,13 +473,15 @@ private:
     void handleOrchestratorQuery_(const nlohmann::json& payload);
     void handleChatQuery_(const nlohmann::json& payload);
     nlohmann::json fetchAgentCameras_();
+    nlohmann::json fetchAgentCameraById_(int cameraId);
     nlohmann::json routeQuestionToCamerasWithLlm_(
         const std::string& userQuestion,
         const nlohmann::json& cameras,
         const std::string& routerModelTier,
         const std::string& routerApiKey,
         bool requestCoreChatPriority = false,
-        const std::function<bool()>& shouldAbort = {});
+        const std::function<bool()>& shouldAbort = {},
+        const nlohmann::json& conversationContext = nlohmann::json::object());
     std::string buildCameraRouterSystemPrompt_() const;
     CoreChatPriorityReservation reserveCoreChatPriority_(int chatSessionId);
     CoreModelExecutionLease acquireCoreModelExecutionLease_(
@@ -768,6 +774,7 @@ private:
     struct ChatTemporalState {
         nlohmann::json planEnvelope = nlohmann::json::object();
         nlohmann::json state = nlohmann::json::object();
+        nlohmann::json visualState = nlohmann::json::object();
         std::string promptHash;
         std::chrono::steady_clock::time_point touchedAt{};
     };

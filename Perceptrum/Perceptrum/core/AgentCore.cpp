@@ -8010,6 +8010,8 @@ std::string AgentCore::buildCameraRouterSystemPrompt_() const
     s += "   - description (string)\n";
     s += "3) A field now_utc with the current UTC time in ISO 8601 format, ";
     s += "   for example \"2025-12-01T13:03:43Z\".\n";
+    s += "4) Optional conversation_context JSON with recent camera scopes and recent turns ";
+    s += "from the same chat session.\n";
     s += "\n";
     s += "Your job is ONLY to:\n";
     s += "- Decide which camera IDs the user is referring to.\n";
@@ -8024,6 +8026,13 @@ std::string AgentCore::buildCameraRouterSystemPrompt_() const
     s += "  'office' ~ 'office_room', etc.\n";
     s += "- Ignore details of the user's security question EXCEPT what helps you\n";
     s += "  identify the camera(s) and the time period.\n";
+    s += "- If conversation_context contains a prior explicit camera scope and the\n";
+    s += "  current question is a follow-up that omits the camera, you may reuse\n";
+    s += "  that prior scope.\n";
+    s += "- Prefer structured scopes from conversation_context.last_video_scope or\n";
+    s += "  conversation_context.recent_camera_scopes over raw free-form text.\n";
+    s += "- If the current question explicitly overrides the camera scope, the current\n";
+    s += "  question wins over conversation_context.\n";
     s += "- If the user mentions 'all cameras', set all_cameras=true and include\n";
     s += "  all relevant cameras.\n";
     s += "- If you are NOT sure which camera(s) they mean, you may return an empty\n";
@@ -8225,13 +8234,72 @@ json AgentCore::fetchAgentCameras_()
 
     return json::array();
 }
+
+json AgentCore::fetchAgentCameraById_(int cameraId)
+{
+    if (cameraId <= 0) {
+        return json::object();
+    }
+
+    try {
+        std::string url =
+            baseUrl_ + "/api/agent/cameras/" +
+            std::to_string(cameraId) +
+            "?client_id=" + clientId_;
+
+        std::string body;
+        long code = HttpGetJson(url, exeToken_, body);
+
+        Logger::instance().logDebug(
+            "agent",
+            "fetchAgentCameraById_: camera_id=" + std::to_string(cameraId) +
+            " HTTP " + std::to_string(code) +
+            " bodySize=" + std::to_string(body.size())
+        );
+
+        if (code != 200) {
+            Logger::instance().logDebug(
+                "agent",
+                "fetchAgentCameraById_: non-200 response, returning empty object"
+            );
+            return json::object();
+        }
+
+        json parsed = json::parse(body, nullptr, false);
+        if (!parsed.is_object()) {
+            Logger::instance().logDebug(
+                "agent",
+                "fetchAgentCameraById_: response is not object, returning empty"
+            );
+            return json::object();
+        }
+
+        return parsed;
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("fetchAgentCameraById_ exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "fetchAgentCameraById_ unknown exception"
+        );
+    }
+
+    return json::object();
+}
+
 json AgentCore::routeQuestionToCamerasWithLlm_(
     const std::string& userQuestion,
     const json& cameras,
     const std::string& routerModelTier,
     const std::string& routerApiKey,
     bool requestCoreChatPriority,
-    const std::function<bool()>& shouldAbort)
+    const std::function<bool()>& shouldAbort,
+    const json& conversationContext)
 {
     // Default fallback if anything goes wrong
     json fallback = {
@@ -8367,6 +8435,9 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
         routerUser["question"] = userQuestion;
         routerUser["cameras"] = cameras;
         routerUser["now_local"] = nowLocalIso;
+        if (conversationContext.is_object() && !conversationContext.empty()) {
+            routerUser["conversation_context"] = conversationContext;
+        }
 
         std::string userContent = routerUser.dump(2);
 
@@ -8395,6 +8466,8 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
             "agent",
             "routeQuestionToCamerasWithLlm_: sending body, model=" + modelName +
             " tier=" + normalizedTier +
+            " has_conversation_context=" +
+            std::string(conversationContext.is_object() && !conversationContext.empty() ? "true" : "false") +
             " question=" + userQuestion
         );
 
@@ -9526,15 +9599,46 @@ static bool tryReadFrameIndexField_(
         return false;
     };
 
-    if (node.contains("frame_index") && tryReadValue(node["frame_index"])) {
-        return true;
-    }
-    if (node.contains("frame_ref") &&
-        node["frame_ref"].is_object() &&
-        node["frame_ref"].contains("frame_index") &&
-        tryReadValue(node["frame_ref"]["frame_index"]))
-    {
-        return true;
+    const auto collectSearchNodes = [&](const nlohmann::json& source) {
+        std::vector<const nlohmann::json*> searchNodes;
+        std::unordered_set<const nlohmann::json*> seen;
+        auto appendObject = [&](const nlohmann::json& obj) {
+            if (!obj.is_object()) return;
+            const nlohmann::json* ptr = &obj;
+            if (!seen.insert(ptr).second) return;
+            searchNodes.push_back(ptr);
+        };
+        auto appendContainer = [&](const nlohmann::json& container) {
+            if (!container.is_object()) return;
+            appendObject(container);
+            if (container.contains("frame_ref") && container["frame_ref"].is_object()) {
+                appendObject(container["frame_ref"]);
+            }
+        };
+
+        appendContainer(source);
+        for (const char* key : {
+                 "frame_ref",
+                 "first_seen_in_segment",
+                 "last_seen_in_segment",
+                 "representative_frame",
+                 "representative_evidence",
+                 "best_frame",
+                 "first_seen",
+                 "last_seen",
+                 "details" })
+        {
+            if (!source.contains(key) || !source[key].is_object()) continue;
+            appendContainer(source[key]);
+        }
+        return searchNodes;
+    };
+
+    for (const nlohmann::json* searchNode : collectSearchNodes(node)) {
+        if (searchNode == nullptr || !searchNode->is_object()) continue;
+        if (searchNode->contains("frame_index") && tryReadValue((*searchNode)["frame_index"])) {
+            return true;
+        }
     }
 
     return false;
@@ -9556,11 +9660,42 @@ static std::string readPromptFrameOffsetField_(
         return std::string();
     };
 
-    const std::string topLevel = tryReadOffset(node);
-    if (!topLevel.empty()) return topLevel;
-    if (node.contains("frame_ref")) {
-        const std::string nested = tryReadOffset(node["frame_ref"]);
-        if (!nested.empty()) return nested;
+    std::vector<const nlohmann::json*> searchNodes;
+    std::unordered_set<const nlohmann::json*> seen;
+    auto appendObject = [&](const nlohmann::json& obj) {
+        if (!obj.is_object()) return;
+        const nlohmann::json* ptr = &obj;
+        if (!seen.insert(ptr).second) return;
+        searchNodes.push_back(ptr);
+    };
+    auto appendContainer = [&](const nlohmann::json& container) {
+        if (!container.is_object()) return;
+        appendObject(container);
+        if (container.contains("frame_ref") && container["frame_ref"].is_object()) {
+            appendObject(container["frame_ref"]);
+        }
+    };
+
+    appendContainer(node);
+    for (const char* key : {
+             "frame_ref",
+             "first_seen_in_segment",
+             "last_seen_in_segment",
+             "representative_frame",
+             "representative_evidence",
+             "best_frame",
+             "first_seen",
+             "last_seen",
+             "details" })
+    {
+        if (!node.contains(key) || !node[key].is_object()) continue;
+        appendContainer(node[key]);
+    }
+
+    for (const nlohmann::json* searchNode : searchNodes) {
+        if (searchNode == nullptr || !searchNode->is_object()) continue;
+        const std::string value = tryReadOffset(*searchNode);
+        if (!value.empty()) return value;
     }
     return std::string();
 }
@@ -9616,10 +9751,46 @@ static bool tryReadPromptVideoMosaicRef_(
         return true;
     };
 
-    if (node.contains("frame_ref") && tryReadFromObject(node["frame_ref"])) {
-        return true;
+    std::vector<const nlohmann::json*> searchNodes;
+    std::unordered_set<const nlohmann::json*> seen;
+    auto appendObject = [&](const nlohmann::json& obj) {
+        if (!obj.is_object()) return;
+        const nlohmann::json* ptr = &obj;
+        if (!seen.insert(ptr).second) return;
+        searchNodes.push_back(ptr);
+    };
+    auto appendContainer = [&](const nlohmann::json& container) {
+        if (!container.is_object()) return;
+        appendObject(container);
+        if (container.contains("frame_ref") && container["frame_ref"].is_object()) {
+            appendObject(container["frame_ref"]);
+        }
+    };
+
+    appendContainer(node);
+    for (const char* key : {
+             "frame_ref",
+             "first_seen_in_segment",
+             "last_seen_in_segment",
+             "representative_frame",
+             "representative_evidence",
+             "best_frame",
+             "first_seen",
+             "last_seen",
+             "details" })
+    {
+        if (!node.contains(key) || !node[key].is_object()) continue;
+        appendContainer(node[key]);
     }
-    return tryReadFromObject(node);
+
+    for (const nlohmann::json* searchNode : searchNodes) {
+        if (searchNode == nullptr || !searchNode->is_object()) continue;
+        if (tryReadFromObject(*searchNode)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static bool deriveTimePointFromSegmentOffset_(
@@ -11083,6 +11254,798 @@ static void normalizeTemporalPayloadForStill_(
     }
 }
 
+struct IdentityPortraitBBox_ {
+    double x = 0.0;
+    double y = 0.0;
+    double w = 0.0;
+    double h = 0.0;
+};
+
+struct PromptVideoCellPlacement_ {
+    double scale = 1.0;
+    int resizedWidth = 0;
+    int resizedHeight = 0;
+    int offsetX = 0;
+    int offsetY = 0;
+};
+
+static bool tryReadNumberLikeValue_(const nlohmann::json& value, double& outValue)
+{
+    outValue = 0.0;
+    try {
+        if (value.is_number_float() || value.is_number_integer()) {
+            outValue = value.get<double>();
+            return std::isfinite(outValue);
+        }
+        if (value.is_string()) {
+            const std::string raw = trimAscii(value.get<std::string>());
+            if (raw.empty()) return false;
+            std::size_t consumed = 0;
+            outValue = std::stod(raw, &consumed);
+            return consumed == raw.size() && std::isfinite(outValue);
+        }
+    }
+    catch (...) {
+        outValue = 0.0;
+    }
+    return false;
+}
+
+static bool tryReadNumberLikeField_(
+    const nlohmann::json& node,
+    std::initializer_list<const char*> keys,
+    double& outValue)
+{
+    outValue = 0.0;
+    if (!node.is_object()) return false;
+    for (const char* key : keys) {
+        if (key == nullptr || !node.contains(key)) continue;
+        if (tryReadNumberLikeValue_(node[key], outValue)) return true;
+    }
+    return false;
+}
+
+static bool parseIdentityPortraitBBox_(
+    const nlohmann::json& node,
+    IdentityPortraitBBox_& out)
+{
+    out = IdentityPortraitBBox_{};
+    if (!node.is_object()) return false;
+
+    double x = 0.0;
+    double y = 0.0;
+    double w = 0.0;
+    double h = 0.0;
+    if (!tryReadNumberLikeField_(node, { "x", "left" }, x)) return false;
+    if (!tryReadNumberLikeField_(node, { "y", "top" }, y)) return false;
+    if (!tryReadNumberLikeField_(node, { "w", "width" }, w)) return false;
+    if (!tryReadNumberLikeField_(node, { "h", "height" }, h)) return false;
+
+    x = clamp01PromptEnhance_(x);
+    y = clamp01PromptEnhance_(y);
+    const double right = clamp01PromptEnhance_(x + (std::max)(0.0, w));
+    const double bottom = clamp01PromptEnhance_(y + (std::max)(0.0, h));
+    w = right - x;
+    h = bottom - y;
+    if (w <= 0.01 || h <= 0.01) return false;
+
+    out.x = x;
+    out.y = y;
+    out.w = w;
+    out.h = h;
+    return true;
+}
+
+static bool tryGetPortraitBBoxNode_(
+    const nlohmann::json& node,
+    const std::vector<std::string>& candidateKeys,
+    IdentityPortraitBBox_& out)
+{
+    out = IdentityPortraitBBox_{};
+    if (!node.is_object()) return false;
+    for (const auto& key : candidateKeys) {
+        if (key.empty() || !node.contains(key)) continue;
+        const auto& value = node[key];
+        if (!value.is_object()) continue;
+        if (parseIdentityPortraitBBox_(value, out)) return true;
+    }
+    return false;
+}
+
+static std::string readIdentityPortraitKind_(const nlohmann::json& node)
+{
+    if (!node.is_object()) return std::string();
+    if (node.contains("kind") && node["kind"].is_string()) {
+        return lowerAsciiCopy_(trimAscii(node["kind"].get<std::string>()));
+    }
+    return std::string();
+}
+
+static double readIdentityPortraitConfidence_(const nlohmann::json& node, double fallback)
+{
+    double value = fallback;
+    if (!node.is_object()) return value;
+    if (tryReadNumberLikeField_(node, { "confidence", "bbox_confidence" }, value)) {
+        return (std::max)(0.0, (std::min)(1.0, value));
+    }
+    return fallback;
+}
+
+static std::string readIdentityPatchStringField_(
+    const nlohmann::json& node,
+    std::initializer_list<const char*> keys)
+{
+    if (!node.is_object()) return std::string();
+    for (const char* key : keys) {
+        if (key == nullptr || !node.contains(key) || !node[key].is_string()) continue;
+        const std::string value = trimAscii(node[key].get<std::string>());
+        if (!value.empty()) return value;
+    }
+    return std::string();
+}
+
+static bool computePromptVideoCellPlacement_(
+    const cv::Size& sourceSize,
+    int cellWidth,
+    int cellHeight,
+    PromptVideoCellPlacement_& out)
+{
+    out = PromptVideoCellPlacement_{};
+    if (sourceSize.width <= 0 || sourceSize.height <= 0 || cellWidth <= 0 || cellHeight <= 0) {
+        return false;
+    }
+
+    out.scale = (std::min)(
+        static_cast<double>(cellWidth) / static_cast<double>(sourceSize.width),
+        static_cast<double>(cellHeight) / static_cast<double>(sourceSize.height));
+    if (!std::isfinite(out.scale) || out.scale <= 0.0) return false;
+
+    out.resizedWidth =
+        (std::max)(1, static_cast<int>(std::round(static_cast<double>(sourceSize.width) * out.scale)));
+    out.resizedHeight =
+        (std::max)(1, static_cast<int>(std::round(static_cast<double>(sourceSize.height) * out.scale)));
+    out.offsetX = (std::max)(0, (cellWidth - out.resizedWidth) / 2);
+    out.offsetY = (std::max)(0, (cellHeight - out.resizedHeight) / 2);
+    return out.resizedWidth > 0 && out.resizedHeight > 0;
+}
+
+static bool computeSourceCropRectFromCellBBox_(
+    const cv::Size& sourceSize,
+    int cellWidth,
+    int cellHeight,
+    const IdentityPortraitBBox_& bboxNormInCell,
+    double paddingPct,
+    cv::Rect& outCropRect)
+{
+    outCropRect = cv::Rect();
+    PromptVideoCellPlacement_ placement;
+    if (!computePromptVideoCellPlacement_(sourceSize, cellWidth, cellHeight, placement)) return false;
+
+    const double cellX1 = bboxNormInCell.x * static_cast<double>(cellWidth);
+    const double cellY1 = bboxNormInCell.y * static_cast<double>(cellHeight);
+    const double cellX2 = (bboxNormInCell.x + bboxNormInCell.w) * static_cast<double>(cellWidth);
+    const double cellY2 = (bboxNormInCell.y + bboxNormInCell.h) * static_cast<double>(cellHeight);
+
+    const double contentX1 = static_cast<double>(placement.offsetX);
+    const double contentY1 = static_cast<double>(placement.offsetY);
+    const double contentX2 = static_cast<double>(placement.offsetX + placement.resizedWidth);
+    const double contentY2 = static_cast<double>(placement.offsetY + placement.resizedHeight);
+
+    const double intersectX1 = (std::max)(cellX1, contentX1);
+    const double intersectY1 = (std::max)(cellY1, contentY1);
+    const double intersectX2 = (std::min)(cellX2, contentX2);
+    const double intersectY2 = (std::min)(cellY2, contentY2);
+    if (intersectX2 <= intersectX1 || intersectY2 <= intersectY1) return false;
+
+    const double srcX1 = (intersectX1 - contentX1) / placement.scale;
+    const double srcY1 = (intersectY1 - contentY1) / placement.scale;
+    const double srcX2 = (intersectX2 - contentX1) / placement.scale;
+    const double srcY2 = (intersectY2 - contentY1) / placement.scale;
+    if (srcX2 <= srcX1 || srcY2 <= srcY1) return false;
+
+    int x1 = (std::max)(0, static_cast<int>(std::floor(srcX1)));
+    int y1 = (std::max)(0, static_cast<int>(std::floor(srcY1)));
+    int x2 = (std::min)(sourceSize.width, static_cast<int>(std::ceil(srcX2)));
+    int y2 = (std::min)(sourceSize.height, static_cast<int>(std::ceil(srcY2)));
+    if (x2 <= x1 || y2 <= y1) return false;
+
+    const int width = x2 - x1;
+    const int height = y2 - y1;
+    const double safePaddingPct = (std::max)(0.0, (std::min)(0.40, paddingPct));
+    const int padX = static_cast<int>(std::llround(static_cast<double>(width) * safePaddingPct));
+    const int padY = static_cast<int>(std::llround(static_cast<double>(height) * safePaddingPct));
+
+    x1 = (std::max)(0, x1 - padX);
+    y1 = (std::max)(0, y1 - padY);
+    x2 = (std::min)(sourceSize.width, x2 + padX);
+    y2 = (std::min)(sourceSize.height, y2 + padY);
+    if (x2 <= x1 || y2 <= y1) return false;
+
+    outCropRect = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+    return outCropRect.width > 0 && outCropRect.height > 0;
+}
+
+static bool buildPortraitDataUrlFromPromptFrame_(
+    const PromptVideoFrame& matchedFrame,
+    const IdentityPortraitBBox_& bboxNormInCell,
+    const std::string& videoPackagingMode,
+    double paddingPct,
+    int minDimension,
+    std::string& outImageDataUrl,
+    nlohmann::json& outMeta)
+{
+    outImageDataUrl.clear();
+    outMeta = nlohmann::json::object();
+
+    cv::Mat decodedFrame;
+    if (!decodePromptVideoFrameToMat_(matchedFrame.jpegBase64, decodedFrame) || decodedFrame.empty()) {
+        return false;
+    }
+
+    const PromptVideoMosaicProfile_& profile =
+        getPromptVideoMosaicProfile_(normalizeVideoPackagingMode_(videoPackagingMode));
+    const PromptVideoMosaicLayout_ layout = getPromptVideoMosaicLayout_(profile);
+
+    cv::Rect cropRect;
+    if (!computeSourceCropRectFromCellBBox_(
+            decodedFrame.size(),
+            layout.cellWidth,
+            layout.cellHeight,
+            bboxNormInCell,
+            paddingPct,
+            cropRect))
+    {
+        return false;
+    }
+
+    if (cropRect.width < minDimension || cropRect.height < minDimension) {
+        return false;
+    }
+
+    cv::Mat cropped = decodedFrame(cropRect).clone();
+    if (cropped.empty()) return false;
+    if (!encodeJpegDataUrlForPromptEnhance(cropped, outImageDataUrl) || outImageDataUrl.empty()) {
+        return false;
+    }
+
+    outMeta["crop_width"] = cropRect.width;
+    outMeta["crop_height"] = cropRect.height;
+    outMeta["frame_width"] = decodedFrame.cols;
+    outMeta["frame_height"] = decodedFrame.rows;
+    outMeta["crop_rect"] = {
+        { "x", cropRect.x },
+        { "y", cropRect.y },
+        { "w", cropRect.width },
+        { "h", cropRect.height }
+    };
+    return true;
+}
+
+static void appendIdentityPortraitCandidate_(
+    VideoHit& hit,
+    const nlohmann::json& patch,
+    const PromptVideoFrame& matchedFrame,
+    const std::string& videoPackagingMode,
+    const std::string& cardRole,
+    const std::string& portraitKind,
+    const IdentityPortraitBBox_& bboxNormInCell,
+    double confidence)
+{
+    if (cardRole.empty() || portraitKind.empty()) return;
+
+    std::string imageDataUrl;
+    nlohmann::json cropMeta = nlohmann::json::object();
+    const bool facePortrait = portraitKind == "face";
+    const double paddingPct = facePortrait ? 0.18 : 0.10;
+    const int minDimension = facePortrait ? 40 : 48;
+    if (!buildPortraitDataUrlFromPromptFrame_(
+            matchedFrame,
+            bboxNormInCell,
+            videoPackagingMode,
+            paddingPct,
+            minDimension,
+            imageDataUrl,
+            cropMeta))
+    {
+        return;
+    }
+
+    nlohmann::json candidate = nlohmann::json::object();
+    const std::string patchEntityId =
+        readIdentityPatchStringField_(patch, { "entity_id", "id" });
+    const std::string patchEntityHint =
+        readIdentityPatchStringField_(patch, { "entity_key", "entity_type" });
+    const std::string patchEntityType =
+        readIdentityPatchStringField_(patch, { "entity_type", "entity_key" });
+    if (!patchEntityId.empty()) candidate["candidate_entity_id"] = patchEntityId;
+    if (!patchEntityHint.empty()) candidate["candidate_entity_hint"] = patchEntityHint;
+    if (!patchEntityHint.empty()) candidate["entity_key"] = patchEntityHint;
+    if (!patchEntityType.empty()) candidate["entity_type"] = patchEntityType;
+    candidate["card_role"] = cardRole;
+    candidate["portrait_kind"] = portraitKind;
+    candidate["confidence"] = (std::max)(0.0, (std::min)(1.0, confidence));
+    candidate["image_data_url"] = imageDataUrl;
+    candidate["camera_id"] = hit.cameraId;
+    if (!hit.cameraName.empty()) candidate["camera_name"] = hit.cameraName;
+    if (patch.contains("frame_ref") && patch["frame_ref"].is_object()) {
+        candidate["frame_ref"] = patch["frame_ref"];
+    }
+    else {
+        int patchMosaicIndex = -1;
+        int patchCellIndex = -1;
+        if (tryReadPromptVideoMosaicRef_(patch, patchMosaicIndex, patchCellIndex) &&
+            patchMosaicIndex > 0 && patchCellIndex > 0)
+        {
+            candidate["frame_ref"] = {
+                { "mosaic_index", patchMosaicIndex },
+                { "cell_index", patchCellIndex }
+            };
+        }
+    }
+    if (patch.contains("temporal_evidence_key") && patch["temporal_evidence_key"].is_string()) {
+        candidate["temporal_evidence_key"] = trimAscii(patch["temporal_evidence_key"].get<std::string>());
+    }
+    if (patch.contains("frame_index")) candidate["frame_index"] = patch["frame_index"];
+    if (patch.contains("frame_timestamp_in_segment")) {
+        candidate["frame_timestamp_in_segment"] = patch["frame_timestamp_in_segment"];
+    } else if (!matchedFrame.frameTimestampInSegment.empty()) {
+        candidate["frame_timestamp_in_segment"] = matchedFrame.frameTimestampInSegment;
+    }
+    if (patch.contains("timestamp_name")) {
+        candidate["timestamp_name"] = patch["timestamp_name"];
+    } else if (!matchedFrame.timestampName.empty()) {
+        candidate["timestamp_name"] = matchedFrame.timestampName;
+    }
+    if (patch.contains("ts_utc")) candidate["timestamp_utc_iso"] = patch["ts_utc"];
+    if (patch.contains("last_seen_ts_utc") && patch["last_seen_ts_utc"].is_string()) {
+        candidate["last_seen_ts_utc"] = trimAscii(patch["last_seen_ts_utc"].get<std::string>());
+        if (!candidate.contains("timestamp_utc_iso")) {
+            candidate["timestamp_utc_iso"] = candidate["last_seen_ts_utc"];
+        }
+    }
+    candidate["bbox_norm_in_cell"] = {
+        { "x", bboxNormInCell.x },
+        { "y", bboxNormInCell.y },
+        { "w", bboxNormInCell.w },
+        { "h", bboxNormInCell.h }
+    };
+    for (const char* key : {
+             "description",
+             "short_description",
+             "appearance_summary",
+             "entity_description",
+             "person_description",
+             "object_description",
+             "scene_brief",
+             "stable_attributes",
+             "key_traits",
+             "identity_signature_traits",
+             "identity_context_traits",
+             "reference_image_urls",
+             "known_name",
+             "resolved_identity" })
+    {
+        if (key == nullptr || !patch.contains(key)) continue;
+        candidate[key] = patch[key];
+    }
+    if (!cropMeta.empty()) candidate["crop_meta"] = cropMeta;
+
+    hit.identityPortraitCandidates.push_back(std::move(candidate));
+}
+
+static void appendIdentityPortraitCandidatesFromPatch_(
+    VideoHit& hit,
+    const nlohmann::json& patch,
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& videoPackagingMode)
+{
+    if (!patch.is_object() || frameCatalog == nullptr) return;
+
+    const PromptVideoFrame* matchedFrame =
+        findPromptVideoFrameForNode_(patch, frameCatalog, videoPackagingMode);
+    if (matchedFrame == nullptr || trimAscii(matchedFrame->jpegBase64).empty()) return;
+
+    const std::string rawEntityType =
+        lowerAsciiCopy_(readIdentityPatchStringField_(patch, { "entity_type", "entity_key" }));
+    const bool isPerson =
+        rawEntityType == "person" ||
+        rawEntityType == "people" ||
+        rawEntityType == "pessoa" ||
+        rawEntityType == "human";
+
+    const nlohmann::json* portraitCropNode = nullptr;
+    if (patch.contains("portrait_crop") && patch["portrait_crop"].is_object()) {
+        portraitCropNode = &patch["portrait_crop"];
+    }
+
+    IdentityPortraitBBox_ primaryBBox;
+    std::string primaryKind;
+    double primaryConfidence = 0.75;
+    if (portraitCropNode != nullptr) {
+        primaryKind = readIdentityPortraitKind_(*portraitCropNode);
+        if (primaryKind.empty()) primaryKind = isPerson ? "face" : "full_object";
+        if (parseIdentityPortraitBBox_(*portraitCropNode, primaryBBox) ||
+            tryGetPortraitBBoxNode_(
+                *portraitCropNode,
+                { "bbox_norm_in_cell", "target_bbox_norm_in_cell", "portrait_bbox_norm_in_cell" },
+                primaryBBox))
+        {
+            primaryConfidence = readIdentityPortraitConfidence_(*portraitCropNode, primaryConfidence);
+        }
+        else {
+            primaryKind.clear();
+        }
+    }
+
+    IdentityPortraitBBox_ contextBBox;
+    bool hasContextBBox = false;
+    if (portraitCropNode != nullptr) {
+        hasContextBBox = tryGetPortraitBBoxNode_(
+            *portraitCropNode,
+            { "context_bbox_norm_in_cell", "context_bbox", "body_bbox_norm_in_cell" },
+            contextBBox);
+    }
+    if (!hasContextBBox) {
+        hasContextBBox = tryGetPortraitBBoxNode_(
+            patch,
+            { "context_bbox_norm_in_cell", "body_bbox_norm_in_cell" },
+            contextBBox);
+    }
+
+    if (isPerson) {
+        if (primaryKind == "face") {
+            appendIdentityPortraitCandidate_(
+                hit,
+                patch,
+                *matchedFrame,
+                videoPackagingMode,
+                "primary",
+                "face",
+                primaryBBox,
+                primaryConfidence);
+        }
+        else if (!primaryKind.empty()) {
+            appendIdentityPortraitCandidate_(
+                hit,
+                patch,
+                *matchedFrame,
+                videoPackagingMode,
+                "primary",
+                "context_fallback",
+                primaryBBox,
+                primaryConfidence);
+        }
+
+        if (hasContextBBox) {
+            appendIdentityPortraitCandidate_(
+                hit,
+                patch,
+                *matchedFrame,
+                videoPackagingMode,
+                hit.identityPortraitCandidates.empty() ? "primary" : "context",
+                hit.identityPortraitCandidates.empty() ? "context_fallback" : "full_object",
+                contextBBox,
+                portraitCropNode != nullptr
+                    ? readIdentityPortraitConfidence_(*portraitCropNode, 0.70)
+                    : 0.70);
+        }
+    }
+    else {
+        IdentityPortraitBBox_ chosenBBox;
+        bool hasChosenBBox = false;
+        if (!primaryKind.empty()) {
+            chosenBBox = primaryBBox;
+            hasChosenBBox = true;
+        }
+        else if (hasContextBBox) {
+            chosenBBox = contextBBox;
+            hasChosenBBox = true;
+        }
+        if (hasChosenBBox) {
+            appendIdentityPortraitCandidate_(
+                hit,
+                patch,
+                *matchedFrame,
+                videoPackagingMode,
+                "primary",
+                "full_object",
+                chosenBBox,
+                primaryConfidence);
+        }
+    }
+}
+
+static std::string normalizeFallbackEntityType_(const std::string& rawType)
+{
+    const std::string normalized = lowerAsciiCopy_(trimAscii(rawType));
+    if (normalized == "person" || normalized == "people" || normalized == "human" || normalized == "pessoa") {
+        return "person";
+    }
+    if (normalized == "vehicle" || normalized == "car" || normalized == "veiculo" || normalized == "carro") {
+        return "vehicle";
+    }
+    if (normalized == "animal") return "animal";
+    if (normalized == "object" || normalized == "objeto") return "object";
+    return normalized;
+}
+
+static std::string latestKnownEntitySeenTs_(
+    const nlohmann::json& temporalState,
+    const std::string& entityId)
+{
+    const std::string normalizedEntityId = trimAscii(entityId);
+    if (normalizedEntityId.empty()) return std::string();
+
+    if (temporalState.is_object() &&
+        temporalState.contains("entities") &&
+        temporalState["entities"].is_object() &&
+        temporalState["entities"].contains(normalizedEntityId) &&
+        temporalState["entities"][normalizedEntityId].is_object())
+    {
+        const std::string entityLastSeen =
+            trimAscii(temporalState["entities"][normalizedEntityId].value("last_seen_ts", ""));
+        if (!entityLastSeen.empty()) return entityLastSeen;
+    }
+
+    const nlohmann::json* identityMemoryRow =
+        temporal::findIdentityMemoryByEntityId(temporalState, normalizedEntityId);
+    if (identityMemoryRow != nullptr && identityMemoryRow->is_object()) {
+        return temporal::identityMemoryLastSeenTs(*identityMemoryRow);
+    }
+    return std::string();
+}
+
+static bool hitHasPositiveIdentityPatch_(const VideoHit& hit)
+{
+    if (!hit.identityPatch.is_array()) return false;
+    for (const auto& item : hit.identityPatch) {
+        if (!item.is_object()) continue;
+        if (temporalIdentityPatchCarriesPositiveEntity_(item)) return true;
+    }
+    return false;
+}
+
+static const PromptVideoFrame* selectRepresentativePromptVideoFrameForHit_(
+    const VideoHit& hit,
+    const std::vector<PromptVideoFrame>* frameCatalog,
+    const std::string& videoPackagingMode)
+{
+    if (frameCatalog == nullptr || frameCatalog->empty()) return nullptr;
+
+    if (hit.identityPatch.is_array()) {
+        for (const auto& item : hit.identityPatch) {
+            if (!item.is_object()) continue;
+            if (!temporalIdentityPatchCarriesPositiveEntity_(item)) continue;
+            if (const PromptVideoFrame* match =
+                    findPromptVideoFrameForNode_(item, frameCatalog, videoPackagingMode))
+            {
+                return match;
+            }
+        }
+    }
+
+    if (hit.eventFrameIndex >= 0 || !trimAscii(hit.eventFrameTimestampInSegment).empty()) {
+        nlohmann::json probe = nlohmann::json::object();
+        if (hit.eventFrameIndex >= 0) probe["frame_index"] = hit.eventFrameIndex;
+        if (!trimAscii(hit.eventFrameTimestampInSegment).empty()) {
+            probe["frame_timestamp_in_segment"] = hit.eventFrameTimestampInSegment;
+        }
+        if (!trimAscii(hit.eventTimestampName).empty()) {
+            probe["timestamp_name"] = hit.eventTimestampName;
+        }
+        if (const PromptVideoFrame* match =
+                findPromptVideoFrameForNode_(probe, frameCatalog, videoPackagingMode))
+        {
+            return match;
+        }
+    }
+
+    for (const auto& candidate : hit.temporalEvidenceCandidates) {
+        nlohmann::json probe = nlohmann::json::object();
+        if (candidate.frameIndex >= 0) probe["frame_index"] = candidate.frameIndex;
+        if (!candidate.frameTimestampInSegment.empty()) {
+            probe["frame_timestamp_in_segment"] = candidate.frameTimestampInSegment;
+        }
+        if (!candidate.timestampName.empty()) {
+            probe["timestamp_name"] = candidate.timestampName;
+        }
+        if (const PromptVideoFrame* match =
+                findPromptVideoFrameForNode_(probe, frameCatalog, videoPackagingMode))
+        {
+            return match;
+        }
+    }
+
+    for (auto it = hit.detectionTimeInVideo.rbegin(); it != hit.detectionTimeInVideo.rend(); ++it) {
+        if (const PromptVideoFrame* match =
+                findPromptVideoFrameBySegmentOffset_(frameCatalog, trimAscii(*it)))
+        {
+            return match;
+        }
+    }
+
+    return &frameCatalog->front();
+}
+
+static bool buildPortraitDataUrlFromSourceRect_(
+    const cv::Mat& decodedFrame,
+    const cv::Rect& sourceRect,
+    double paddingPct,
+    int minDimension,
+    std::string& outImageDataUrl,
+    nlohmann::json& outMeta)
+{
+    outImageDataUrl.clear();
+    outMeta = nlohmann::json::object();
+    if (decodedFrame.empty()) return false;
+
+    const cv::Rect frameBounds(0, 0, decodedFrame.cols, decodedFrame.rows);
+    cv::Rect cropRect = sourceRect & frameBounds;
+    if (cropRect.width <= 0 || cropRect.height <= 0) return false;
+
+    const double safePaddingPct = (std::max)(0.0, (std::min)(0.40, paddingPct));
+    const int padX = static_cast<int>(std::llround(static_cast<double>(cropRect.width) * safePaddingPct));
+    const int padY = static_cast<int>(std::llround(static_cast<double>(cropRect.height) * safePaddingPct));
+    cropRect.x = (std::max)(0, cropRect.x - padX);
+    cropRect.y = (std::max)(0, cropRect.y - padY);
+    cropRect.width = (std::min)(decodedFrame.cols - cropRect.x, cropRect.width + (padX * 2));
+    cropRect.height = (std::min)(decodedFrame.rows - cropRect.y, cropRect.height + (padY * 2));
+    if (cropRect.width < minDimension || cropRect.height < minDimension) return false;
+
+    cv::Mat cropped = decodedFrame(cropRect).clone();
+    if (cropped.empty()) return false;
+    if (!encodeJpegDataUrlForPromptEnhance(cropped, outImageDataUrl) || outImageDataUrl.empty()) {
+        return false;
+    }
+
+    outMeta["crop_width"] = cropRect.width;
+    outMeta["crop_height"] = cropRect.height;
+    outMeta["frame_width"] = decodedFrame.cols;
+    outMeta["frame_height"] = decodedFrame.rows;
+    outMeta["crop_rect"] = {
+        { "x", cropRect.x },
+        { "y", cropRect.y },
+        { "w", cropRect.width },
+        { "h", cropRect.height }
+    };
+    return true;
+}
+
+static cv::Rect deriveFaceRectFromBodyRect_(
+    const cv::Rect& bodyRect,
+    const cv::Size& frameSize)
+{
+    if (bodyRect.width <= 0 || bodyRect.height <= 0) return cv::Rect();
+    cv::Rect faceRect(
+        bodyRect.x + static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.22)),
+        bodyRect.y + static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.05)),
+        static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.56)),
+        static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.34)));
+    return faceRect & cv::Rect(0, 0, frameSize.width, frameSize.height);
+}
+
+static cv::Rect deriveHeuristicPersonFaceRect_(
+    const cv::Size& frameSize)
+{
+    if (frameSize.width <= 0 || frameSize.height <= 0) return cv::Rect();
+    cv::Rect faceRect(
+        static_cast<int>(std::llround(static_cast<double>(frameSize.width) * 0.24)),
+        static_cast<int>(std::llround(static_cast<double>(frameSize.height) * 0.08)),
+        static_cast<int>(std::llround(static_cast<double>(frameSize.width) * 0.52)),
+        static_cast<int>(std::llround(static_cast<double>(frameSize.height) * 0.48)));
+    return faceRect & cv::Rect(0, 0, frameSize.width, frameSize.height);
+}
+
+static cv::Rect deriveFallbackContextRectForEntityType_(
+    const std::string& rawEntityType,
+    const cv::Size& frameSize,
+    const cv::Rect& bodyRect)
+{
+    if (frameSize.width <= 0 || frameSize.height <= 0) return cv::Rect();
+    const std::string entityType = normalizeFallbackEntityType_(rawEntityType);
+    if (entityType == "person" && bodyRect.width > 0 && bodyRect.height > 0) {
+        cv::Rect expanded(
+            bodyRect.x - static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.10)),
+            bodyRect.y - static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.08)),
+            bodyRect.width + static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.20)),
+            bodyRect.height + static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.18)));
+        return expanded & cv::Rect(0, 0, frameSize.width, frameSize.height);
+    }
+    return cv::Rect(0, 0, frameSize.width, frameSize.height);
+}
+
+static void appendSyntheticIdentityPortraitCandidateFromSourceRect_(
+    VideoHit& hit,
+    const nlohmann::json& seed,
+    const PromptVideoFrame& matchedFrame,
+    const cv::Mat& decodedFrame,
+    const cv::Rect& sourceRect,
+    const std::string& cardRole,
+    const std::string& portraitKind,
+    double confidence,
+    const std::string& fallbackReason)
+{
+    if (sourceRect.width <= 0 || sourceRect.height <= 0) return;
+    if (cardRole.empty() || portraitKind.empty()) return;
+
+    std::string imageDataUrl;
+    nlohmann::json cropMeta = nlohmann::json::object();
+    cropMeta["fallback_reason"] = fallbackReason;
+    cropMeta["synthetic_crop"] = true;
+
+    const bool facePortrait = portraitKind == "face";
+    const double paddingPct = facePortrait ? 0.18 : 0.10;
+    const int minDimension = facePortrait ? 40 : 48;
+    nlohmann::json imageMeta = nlohmann::json::object();
+    if (!buildPortraitDataUrlFromSourceRect_(
+            decodedFrame,
+            sourceRect,
+            paddingPct,
+            minDimension,
+            imageDataUrl,
+            imageMeta))
+    {
+        return;
+    }
+    for (auto it = imageMeta.begin(); it != imageMeta.end(); ++it) {
+        cropMeta[it.key()] = it.value();
+    }
+
+    nlohmann::json candidate = nlohmann::json::object();
+    const std::string candidateEntityId =
+        trimAscii(seed.value("candidate_entity_id", std::string()));
+    const std::string fallbackEntityId =
+        trimAscii(seed.value("entity_id", std::string()));
+    const std::string candidateEntityHint =
+        trimAscii(seed.value("candidate_entity_hint", std::string()));
+    const std::string fallbackEntityHint =
+        trimAscii(seed.value("entity_key", std::string()));
+    const std::string candidateEntityType =
+        trimAscii(seed.value("entity_type", std::string()));
+    if (!candidateEntityId.empty()) candidate["candidate_entity_id"] = candidateEntityId;
+    else if (!fallbackEntityId.empty()) candidate["candidate_entity_id"] = fallbackEntityId;
+    if (!candidateEntityHint.empty()) candidate["candidate_entity_hint"] = candidateEntityHint;
+    else if (!fallbackEntityHint.empty()) candidate["candidate_entity_hint"] = fallbackEntityHint;
+    if (!candidateEntityHint.empty()) candidate["entity_key"] = candidateEntityHint;
+    else if (!fallbackEntityHint.empty()) candidate["entity_key"] = fallbackEntityHint;
+    if (!candidateEntityType.empty()) candidate["entity_type"] = candidateEntityType;
+    if (seed.contains("description")) candidate["description"] = seed["description"];
+    if (seed.contains("short_description")) candidate["short_description"] = seed["short_description"];
+    if (seed.contains("identity_signature_traits")) {
+        candidate["identity_signature_traits"] = seed["identity_signature_traits"];
+    }
+    if (seed.contains("identity_feature_candidates")) {
+        candidate["identity_feature_candidates"] = seed["identity_feature_candidates"];
+    }
+    candidate["card_role"] = cardRole;
+    candidate["portrait_kind"] = portraitKind;
+    candidate["confidence"] = (std::max)(0.0, (std::min)(1.0, confidence));
+    candidate["image_data_url"] = imageDataUrl;
+    candidate["camera_id"] = hit.cameraId;
+    if (!hit.cameraName.empty()) candidate["camera_name"] = hit.cameraName;
+    if (matchedFrame.frameIndex >= 0) candidate["frame_index"] = matchedFrame.frameIndex;
+    if (!matchedFrame.frameTimestampInSegment.empty()) {
+        candidate["frame_timestamp_in_segment"] = matchedFrame.frameTimestampInSegment;
+    }
+    if (!matchedFrame.timestampName.empty()) {
+        candidate["timestamp_name"] = matchedFrame.timestampName;
+    }
+    if (matchedFrame.hasAbsoluteTimestamp) {
+        candidate["timestamp_utc_iso"] = formatTimePointToIsoUtcZ_(matchedFrame.absoluteTimestamp);
+    }
+    if (seed.contains("timestamp_utc_iso")) candidate["timestamp_utc_iso"] = seed["timestamp_utc_iso"];
+    if (seed.contains("last_seen_ts_utc")) candidate["last_seen_ts_utc"] = seed["last_seen_ts_utc"];
+    candidate["bbox_norm_in_cell"] = {
+        { "x", decodedFrame.cols > 0 ? static_cast<double>(sourceRect.x) / static_cast<double>(decodedFrame.cols) : 0.0 },
+        { "y", decodedFrame.rows > 0 ? static_cast<double>(sourceRect.y) / static_cast<double>(decodedFrame.rows) : 0.0 },
+        { "w", decodedFrame.cols > 0 ? static_cast<double>(sourceRect.width) / static_cast<double>(decodedFrame.cols) : 1.0 },
+        { "h", decodedFrame.rows > 0 ? static_cast<double>(sourceRect.height) / static_cast<double>(decodedFrame.rows) : 1.0 }
+    };
+    candidate["crop_meta"] = std::move(cropMeta);
+
+    hit.identityPortraitCandidates.push_back(std::move(candidate));
+}
+
 static void normalizeTemporalPayloadForVideo_(
     VideoHit& hit,
     const std::string& sourceFilePath,
@@ -11093,6 +12056,7 @@ static void normalizeTemporalPayloadForVideo_(
     const std::string& videoPackagingMode = std::string())
 {
     hit.temporalEvidenceCandidates.clear();
+    hit.identityPortraitCandidates = nlohmann::json::array();
     const std::string normalizedVideoPackagingMode =
         normalizeVideoPackagingMode_(videoPackagingMode);
 
@@ -11337,6 +12301,11 @@ static void normalizeTemporalPayloadForVideo_(
             }
             buildAlertReferenceFromUtc(item);
             appendEvidenceCandidateFromNode(item, "present");
+            appendIdentityPortraitCandidatesFromPatch_(
+                hit,
+                item,
+                frameCatalog,
+                normalizedVideoPackagingMode);
         }
     }
 
@@ -11424,6 +12393,1281 @@ static void normalizeTemporalPayloadForVideo_(
     }
 
     compactContinuousTemporalEvidenceCandidatesForVideo_(hit, logStreamId, scopeTag);
+}
+
+static void ensureChatTemporalVisualState_(nlohmann::json& visualState)
+{
+    if (!visualState.is_object()) visualState = nlohmann::json::object();
+    if (!visualState.contains("portraits_by_asset_id") || !visualState["portraits_by_asset_id"].is_object()) {
+        visualState["portraits_by_asset_id"] = nlohmann::json::object();
+    }
+    if (!visualState.contains("entity_primary_portrait_by_entity_id") ||
+        !visualState["entity_primary_portrait_by_entity_id"].is_object())
+    {
+        visualState["entity_primary_portrait_by_entity_id"] = nlohmann::json::object();
+    }
+    if (!visualState.contains("entity_context_portrait_by_entity_id") ||
+        !visualState["entity_context_portrait_by_entity_id"].is_object())
+    {
+        visualState["entity_context_portrait_by_entity_id"] = nlohmann::json::object();
+    }
+    if (!visualState.contains("identity_cards_by_entity_id") ||
+        !visualState["identity_cards_by_entity_id"].is_object())
+    {
+        visualState["identity_cards_by_entity_id"] = nlohmann::json::object();
+    }
+    if (!visualState.contains("entity_aliases") || !visualState["entity_aliases"].is_object()) {
+        visualState["entity_aliases"] = nlohmann::json::object();
+    }
+    if (!visualState.contains("last_seen_by_entity_id") ||
+        !visualState["last_seen_by_entity_id"].is_object())
+    {
+        visualState["last_seen_by_entity_id"] = nlohmann::json::object();
+    }
+}
+
+static bool temporalStateHasEntity_(const nlohmann::json& state, const std::string& entityId)
+{
+    const std::string normalizedId = trimAscii(entityId);
+    return !normalizedId.empty() &&
+        state.is_object() &&
+        state.contains("entities") &&
+        state["entities"].is_object() &&
+        state["entities"].contains(normalizedId) &&
+        state["entities"][normalizedId].is_object();
+}
+
+static std::string buildChatPortraitAssetId_(const std::string& entityId, const std::string& role)
+{
+    return trimAscii(entityId).empty()
+        ? std::string()
+        : (trimAscii(entityId) + "::" + (trimAscii(role).empty() ? std::string("primary") : trimAscii(role)));
+}
+
+static const nlohmann::json* findChatPortraitAsset_(
+    const nlohmann::json& visualState,
+    const std::string& assetId)
+{
+    const std::string normalizedId = trimAscii(assetId);
+    if (normalizedId.empty() ||
+        !visualState.is_object() ||
+        !visualState.contains("portraits_by_asset_id") ||
+        !visualState["portraits_by_asset_id"].is_object() ||
+        !visualState["portraits_by_asset_id"].contains(normalizedId) ||
+        !visualState["portraits_by_asset_id"][normalizedId].is_object())
+    {
+        return nullptr;
+    }
+    return &visualState["portraits_by_asset_id"][normalizedId];
+}
+
+static std::string selectPortraitAssetIdForEntity_(
+    const nlohmann::json& visualState,
+    const std::string& entityId,
+    const char* mappingKey)
+{
+    const std::string normalizedEntityId = trimAscii(entityId);
+    if (normalizedEntityId.empty() ||
+        !visualState.is_object() ||
+        !visualState.contains(mappingKey) ||
+        !visualState[mappingKey].is_object() ||
+        !visualState[mappingKey].contains(normalizedEntityId) ||
+        !visualState[mappingKey][normalizedEntityId].is_string())
+    {
+        return std::string();
+    }
+    return trimAscii(visualState[mappingKey][normalizedEntityId].get<std::string>());
+}
+
+static std::string selectCardStringField_(
+    const nlohmann::json* primary,
+    const nlohmann::json* secondary,
+    std::initializer_list<const char*> keys)
+{
+    for (const auto* src : { primary, secondary }) {
+        if (src == nullptr || !src->is_object()) continue;
+        for (const char* key : keys) {
+            if (key == nullptr || !src->contains(key) || !(*src)[key].is_string()) continue;
+            const std::string value = trimAscii((*src)[key].get<std::string>());
+            if (!value.empty()) return value;
+        }
+    }
+    return std::string();
+}
+
+static void appendUniqueTrimmedStringsToJsonArray_(
+    nlohmann::json& target,
+    const nlohmann::json& value)
+{
+    if (!target.is_array()) target = nlohmann::json::array();
+    std::unordered_set<std::string> seen;
+    for (const auto& item : target) {
+        if (!item.is_string()) continue;
+        seen.insert(lowerAsciiCopy_(trimAscii(item.get<std::string>())));
+    }
+
+    auto appendValue = [&](const std::string& rawValue) {
+        const std::string value = trimAscii(rawValue);
+        if (value.empty()) return;
+        const std::string dedupe = lowerAsciiCopy_(value);
+        if (!seen.insert(dedupe).second) return;
+        target.push_back(value);
+    };
+
+    if (value.is_string()) {
+        appendValue(value.get<std::string>());
+        return;
+    }
+    if (!value.is_array()) return;
+    for (const auto& item : value) {
+        if (!item.is_string()) continue;
+        appendValue(item.get<std::string>());
+    }
+}
+
+static void appendUniqueIdentityFeatureCandidatesToJsonArray_(
+    nlohmann::json& target,
+    const nlohmann::json& value)
+{
+    if (!target.is_array()) target = nlohmann::json::array();
+    std::unordered_set<std::string> seen;
+    for (const auto& item : target) {
+        if (!item.is_object()) continue;
+        const std::string dedupeKey =
+            lowerAsciiCopy_(trimAscii(item.value("text", std::string()))) + "|" +
+            lowerAsciiCopy_(trimAscii(item.value("category", std::string()))) + "|" +
+            lowerAsciiCopy_(trimAscii(item.value("relation_to_target", std::string())));
+        if (dedupeKey == "||") continue;
+        seen.insert(dedupeKey);
+    }
+
+    const nlohmann::json normalized = temporal::parseIdentityFeatureCandidatesValue(value);
+    if (!normalized.is_array()) return;
+    for (const auto& item : normalized) {
+        if (!item.is_object()) continue;
+        const std::string dedupeKey =
+            lowerAsciiCopy_(trimAscii(item.value("text", std::string()))) + "|" +
+            lowerAsciiCopy_(trimAscii(item.value("category", std::string()))) + "|" +
+            lowerAsciiCopy_(trimAscii(item.value("relation_to_target", std::string())));
+        if (dedupeKey == "||" || !seen.insert(dedupeKey).second) continue;
+        target.push_back(item);
+        if (target.size() >= 12) return;
+    }
+}
+
+static std::string canonicalizeEntityTypeForCard_(const std::string& rawType)
+{
+    const std::string normalized = lowerAsciiCopy_(trimAscii(rawType));
+    if (normalized == "person" || normalized == "people" || normalized == "human" || normalized == "pessoa") {
+        return "person";
+    }
+    if (normalized == "vehicle" || normalized == "car" || normalized == "veiculo" || normalized == "carro") {
+        return "vehicle";
+    }
+    if (normalized == "animal") return "animal";
+    if (normalized == "object" || normalized == "objeto") return "object";
+    return normalized;
+}
+
+static bool shouldReplaceStoredPortrait_(
+    const nlohmann::json* currentAsset,
+    const nlohmann::json& candidateAsset,
+    bool primaryRole)
+{
+    if (currentAsset == nullptr || !currentAsset->is_object()) return true;
+
+    const std::string currentKind = lowerAsciiCopy_(trimAscii(currentAsset->value("portrait_kind", "")));
+    const std::string candidateKind = lowerAsciiCopy_(trimAscii(candidateAsset.value("portrait_kind", "")));
+    if (primaryRole) {
+        if (candidateKind == "face" && currentKind != "face") return true;
+        if (currentKind == "face" && candidateKind != "face") return false;
+    }
+
+    const double currentConfidence = currentAsset->value("confidence", 0.0);
+    const double candidateConfidence = candidateAsset.value("confidence", 0.0);
+    if (candidateConfidence > currentConfidence + 0.05) return true;
+    if (candidateConfidence + 0.05 < currentConfidence) return false;
+
+    const std::string currentTs = trimAscii(currentAsset->value("timestamp_utc_iso", ""));
+    const std::string candidateTs = trimAscii(candidateAsset.value("timestamp_utc_iso", ""));
+    if (!candidateTs.empty() && (currentTs.empty() || candidateTs > currentTs)) return true;
+
+    const std::string currentImage = trimAscii(currentAsset->value("image_data_url", ""));
+    const std::string candidateImage = trimAscii(candidateAsset.value("image_data_url", ""));
+    return currentImage.empty() && !candidateImage.empty();
+}
+
+static bool portraitAssetIsGoodEnough_(const nlohmann::json& asset)
+{
+    if (!asset.is_object()) return false;
+
+    const std::string imageDataUrl = trimAscii(asset.value("image_data_url", ""));
+    if (imageDataUrl.empty()) return false;
+
+    const std::string kind = lowerAsciiCopy_(trimAscii(asset.value("portrait_kind", "")));
+    const double confidence = asset.value("confidence", 0.0);
+    int cropWidth = 0;
+    int cropHeight = 0;
+    if (asset.contains("crop_meta") && asset["crop_meta"].is_object()) {
+        cropWidth = asset["crop_meta"].value("crop_width", 0);
+        cropHeight = asset["crop_meta"].value("crop_height", 0);
+    }
+    const int minDim = (std::min)(cropWidth, cropHeight);
+
+    if (kind == "face") {
+        return confidence >= 0.78 && minDim >= 64;
+    }
+    if (kind == "full_object" || kind == "context_fallback") {
+        return confidence >= 0.76 && minDim >= 80;
+    }
+    return confidence >= 0.80 && minDim >= 80;
+}
+
+static std::string resolvePortraitCandidateEntityId_(
+    const nlohmann::json& candidate,
+    const nlohmann::json& candidateDecisions,
+    const nlohmann::json& temporalState)
+{
+    const std::string candidateEntityId = trimAscii(candidate.value("candidate_entity_id", ""));
+    const std::string candidateEntityHint = trimAscii(candidate.value("candidate_entity_hint", ""));
+    const std::string candidateEvidenceKey = trimAscii(candidate.value("temporal_evidence_key", ""));
+    const std::string candidateToken =
+        !candidateEntityId.empty() ? candidateEntityId : candidateEntityHint;
+
+    if (candidateDecisions.is_array()) {
+        for (const auto& entry : candidateDecisions) {
+            if (!entry.is_object()) continue;
+            const std::string status = lowerAsciiCopy_(trimAscii(entry.value("status", "")));
+            const std::string eventName = lowerAsciiCopy_(trimAscii(entry.value("event", "")));
+            if (status.rfind("accepted_", 0) != 0) continue;
+            if (eventName != "identity_patch" && status.find("identity_patch") == std::string::npos) continue;
+
+            const std::string resolvedEntityId = trimAscii(entry.value("resolved_entity_id", ""));
+            if (resolvedEntityId.empty()) continue;
+
+            const std::string decisionEvidenceKey = trimAscii(entry.value("evidence_key", ""));
+            const std::string decisionEntityToken = trimAscii(entry.value("candidate_entity_id", ""));
+            const bool evidenceMatches =
+                !candidateEvidenceKey.empty() && candidateEvidenceKey == decisionEvidenceKey;
+            const bool tokenMatches =
+                candidateToken.empty() ||
+                decisionEntityToken.empty() ||
+                lowerAsciiCopy_(candidateToken) == lowerAsciiCopy_(decisionEntityToken);
+
+            if ((evidenceMatches && tokenMatches) ||
+                (candidateEvidenceKey.empty() && !candidateToken.empty() && tokenMatches))
+            {
+                return resolvedEntityId;
+            }
+        }
+    }
+
+    if (!candidateEntityId.empty() && temporalStateHasEntity_(temporalState, candidateEntityId)) {
+        return candidateEntityId;
+    }
+
+    if (!candidateEntityHint.empty() &&
+        temporalState.is_object() &&
+        temporalState.contains("entities") &&
+        temporalState["entities"].is_object())
+    {
+        std::string matchedEntityId;
+        for (auto it = temporalState["entities"].begin(); it != temporalState["entities"].end(); ++it) {
+            if (!it.value().is_object()) continue;
+            const nlohmann::json* identityMemoryRow =
+                temporal::findIdentityMemoryByEntityId(temporalState, it.key());
+            if (!temporal::entityMatchesFilter(it.key(), candidateEntityHint, &it.value(), identityMemoryRow)) {
+                continue;
+            }
+            if (!matchedEntityId.empty()) return std::string();
+            matchedEntityId = it.key();
+        }
+        return matchedEntityId;
+    }
+
+    static const std::unordered_set<std::string> kGenericEntityHints = {
+        "person", "people", "human", "pessoa",
+        "vehicle", "veiculo", "car", "carro",
+        "animal",
+        "object", "objeto"
+    };
+
+    if (!candidateEntityId.empty()) {
+        return candidateEntityId;
+    }
+    if (!candidateEntityHint.empty() &&
+        kGenericEntityHints.find(lowerAsciiCopy_(candidateEntityHint)) == kGenericEntityHints.end())
+    {
+        return candidateEntityHint;
+    }
+
+    return std::string();
+}
+
+static void seedIdentityMemoryFromPortraitCandidate_(
+    const nlohmann::json& candidate,
+    const std::string& resolvedEntityId,
+    nlohmann::json& temporalState)
+{
+    const std::string normalizedEntityId = trimAscii(resolvedEntityId);
+    if (normalizedEntityId.empty() || !candidate.is_object()) return;
+
+    temporal::ensureState(temporalState);
+
+    nlohmann::json pseudoPatch = nlohmann::json::object();
+    pseudoPatch["entity_id"] = normalizedEntityId;
+
+    const std::string entityHint = candidate.contains("entity_key") && candidate["entity_key"].is_string()
+        ? trimAscii(candidate["entity_key"].get<std::string>())
+        : (candidate.contains("candidate_entity_hint") && candidate["candidate_entity_hint"].is_string()
+            ? trimAscii(candidate["candidate_entity_hint"].get<std::string>())
+            : std::string());
+    const std::string entityType =
+        candidate.contains("entity_type") && candidate["entity_type"].is_string()
+            ? trimAscii(candidate["entity_type"].get<std::string>())
+            : std::string();
+    if (!entityHint.empty()) pseudoPatch["entity_key"] = entityHint;
+    if (!entityType.empty()) pseudoPatch["entity_type"] = entityType;
+
+    for (const char* key : {
+             "description",
+             "short_description",
+             "appearance_summary",
+             "entity_description",
+             "person_description",
+             "object_description",
+             "scene_brief",
+             "stable_attributes",
+             "key_traits",
+             "identity_signature_traits",
+             "identity_context_traits",
+             "reference_image_urls",
+             "known_name",
+             "resolved_identity" })
+    {
+        if (key == nullptr || !candidate.contains(key)) continue;
+        pseudoPatch[key] = candidate[key];
+    }
+
+    if (candidate.contains("frame_ref") && candidate["frame_ref"].is_object()) {
+        pseudoPatch["frame_ref"] = candidate["frame_ref"];
+    }
+
+    const std::string seenTs = candidate.contains("timestamp_utc_iso") && candidate["timestamp_utc_iso"].is_string()
+        ? trimAscii(candidate["timestamp_utc_iso"].get<std::string>())
+        : (candidate.contains("last_seen_ts_utc") && candidate["last_seen_ts_utc"].is_string()
+            ? trimAscii(candidate["last_seen_ts_utc"].get<std::string>())
+            : std::string());
+    const std::string normalizedSeenTs = seenTs.empty() ? temporal::nowIso() : seenTs;
+    temporal::upsertIdentityMemory(
+        temporalState,
+        normalizedEntityId,
+        pseudoPatch,
+        normalizedSeenTs,
+        std::string());
+
+    if (candidate.contains("resolved_identity") && candidate["resolved_identity"].is_object()) {
+        temporal::upsertResolvedIdentity(
+            temporalState,
+            normalizedEntityId,
+            candidate["resolved_identity"],
+            normalizedSeenTs);
+    }
+}
+
+static void appendResolvedIdentityPatchEntityIdsFromDecisions_(
+    const nlohmann::json& candidateDecisions,
+    std::vector<std::string>& entityIds,
+    std::unordered_set<std::string>& seenEntityIds)
+{
+    if (!candidateDecisions.is_array()) return;
+    for (const auto& entry : candidateDecisions) {
+        if (!entry.is_object()) continue;
+        const std::string status = lowerAsciiCopy_(trimAscii(entry.value("status", "")));
+        const std::string eventName = lowerAsciiCopy_(trimAscii(entry.value("event", "")));
+        if (status.rfind("accepted_", 0) != 0) continue;
+        if (eventName != "identity_patch" && status.find("identity_patch") == std::string::npos) continue;
+
+        const std::string resolvedEntityId = trimAscii(entry.value("resolved_entity_id", ""));
+        if (resolvedEntityId.empty() || !seenEntityIds.insert(resolvedEntityId).second) continue;
+        entityIds.push_back(resolvedEntityId);
+    }
+}
+
+static std::string promotePortraitCandidateToVisualState_(
+    const nlohmann::json& candidate,
+    const nlohmann::json& candidateDecisions,
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState)
+{
+    ensureChatTemporalVisualState_(visualState);
+    const std::string resolvedEntityId =
+        resolvePortraitCandidateEntityId_(candidate, candidateDecisions, temporalState);
+    if (resolvedEntityId.empty()) return std::string();
+
+    const std::string cardRole = trimAscii(candidate.value("card_role", "primary"));
+    const std::string assetId = buildChatPortraitAssetId_(resolvedEntityId, cardRole);
+    if (assetId.empty()) return std::string();
+
+    nlohmann::json asset = candidate;
+    asset["asset_id"] = assetId;
+    asset["entity_id"] = resolvedEntityId;
+    asset["card_role"] = cardRole;
+    asset["image_url"] = trimAscii(candidate.value("image_data_url", ""));
+    if (!asset.contains("timestamp_utc_iso") || !asset["timestamp_utc_iso"].is_string()) {
+        const std::string fallbackTs = trimAscii(candidate.value("last_seen_ts_utc", ""));
+        if (!fallbackTs.empty()) asset["timestamp_utc_iso"] = fallbackTs;
+    }
+
+    const nlohmann::json* currentAsset = findChatPortraitAsset_(visualState, assetId);
+    const bool primaryRole = cardRole != "context";
+    const bool currentFrozen = currentAsset != nullptr && portraitAssetIsGoodEnough_(*currentAsset);
+    if (!currentFrozen && shouldReplaceStoredPortrait_(currentAsset, asset, primaryRole)) {
+        asset["portrait_frozen"] = portraitAssetIsGoodEnough_(asset);
+        visualState["portraits_by_asset_id"][assetId] = asset;
+        if (primaryRole) {
+            visualState["entity_primary_portrait_by_entity_id"][resolvedEntityId] = assetId;
+        }
+        else {
+            visualState["entity_context_portrait_by_entity_id"][resolvedEntityId] = assetId;
+        }
+    }
+
+    nlohmann::json lastSeen = nlohmann::json::object();
+    const std::string tsUtc = trimAscii(asset.value("timestamp_utc_iso", ""));
+    if (!tsUtc.empty()) lastSeen["timestamp_utc_iso"] = tsUtc;
+    const int cameraId = asset.value("camera_id", -1);
+    if (cameraId > 0) lastSeen["camera_id"] = cameraId;
+    const std::string cameraName = trimAscii(asset.value("camera_name", ""));
+    if (!cameraName.empty()) lastSeen["camera_name"] = cameraName;
+    if (!lastSeen.empty()) {
+        visualState["last_seen_by_entity_id"][resolvedEntityId] = std::move(lastSeen);
+    }
+
+    return resolvedEntityId;
+}
+
+static nlohmann::json buildChatIdentityCardForEntity_(
+    const std::string& entityId,
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState)
+{
+    ensureChatTemporalVisualState_(visualState);
+    const std::string normalizedEntityId = trimAscii(entityId);
+    if (normalizedEntityId.empty()) return nlohmann::json::object();
+
+    const nlohmann::json* entityState = nullptr;
+    if (temporalStateHasEntity_(temporalState, normalizedEntityId)) {
+        entityState = &temporalState["entities"][normalizedEntityId];
+    }
+    const nlohmann::json* identityMemoryRow =
+        temporal::findIdentityMemoryByEntityId(temporalState, normalizedEntityId);
+
+    const std::string primaryAssetId =
+        selectPortraitAssetIdForEntity_(visualState, normalizedEntityId, "entity_primary_portrait_by_entity_id");
+    const std::string contextAssetId =
+        selectPortraitAssetIdForEntity_(visualState, normalizedEntityId, "entity_context_portrait_by_entity_id");
+    const nlohmann::json* primaryAsset = findChatPortraitAsset_(visualState, primaryAssetId);
+    const nlohmann::json* contextAsset = findChatPortraitAsset_(visualState, contextAssetId);
+    const bool hasPortraitAsset =
+        (primaryAsset != nullptr && primaryAsset->is_object()) ||
+        (contextAsset != nullptr && contextAsset->is_object());
+    const bool hasIdentityMetadata =
+        (entityState != nullptr && entityState->is_object() && !entityState->empty()) ||
+        (identityMemoryRow != nullptr && identityMemoryRow->is_object() && !identityMemoryRow->empty());
+    if (!hasPortraitAsset && !hasIdentityMetadata)
+    {
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json card = nlohmann::json::object();
+    card["card_id"] = "identity_card:" + normalizedEntityId;
+    card["entity_id"] = normalizedEntityId;
+
+    const std::string entityType = canonicalizeEntityTypeForCard_(
+        selectCardStringField_(entityState, identityMemoryRow, { "entity_type", "entity_key" }));
+    if (!entityType.empty()) card["entity_type"] = entityType;
+
+    const std::string knownName = selectCardStringField_(entityState, identityMemoryRow, { "known_name" });
+    if (!knownName.empty()) card["known_name"] = knownName;
+
+    const nlohmann::json* resolvedIdentity = nullptr;
+    if (entityState && entityState->is_object() &&
+        entityState->contains("resolved_identity") && (*entityState)["resolved_identity"].is_object())
+    {
+        resolvedIdentity = &(*entityState)["resolved_identity"];
+    }
+    else if (identityMemoryRow && identityMemoryRow->is_object() &&
+             identityMemoryRow->contains("resolved_identity") &&
+             (*identityMemoryRow)["resolved_identity"].is_object())
+    {
+        resolvedIdentity = &(*identityMemoryRow)["resolved_identity"];
+    }
+    if (resolvedIdentity != nullptr) {
+        card["resolved_identity"] = *resolvedIdentity;
+    }
+
+    const std::string displayName =
+        !knownName.empty()
+            ? knownName
+            : (resolvedIdentity != nullptr
+                ? trimAscii(resolvedIdentity->value("target_name", ""))
+                : normalizedEntityId);
+    card["display_name"] = displayName.empty() ? normalizedEntityId : displayName;
+
+    const std::string description =
+        selectCardStringField_(identityMemoryRow, entityState, { "description" });
+    if (!description.empty()) card["description"] = description;
+
+    const std::string identitySignatureSummary =
+        selectCardStringField_(identityMemoryRow, entityState, { "identity_signature_summary" });
+    if (!identitySignatureSummary.empty()) card["identity_signature_summary"] = identitySignatureSummary;
+
+    nlohmann::json stableAttributes = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(stableAttributes, identityMemoryRow != nullptr ? (*identityMemoryRow).value("stable_attributes", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(stableAttributes, entityState != nullptr ? (*entityState).value("stable_attributes", nlohmann::json::array()) : nlohmann::json::array());
+    if (!stableAttributes.empty()) card["stable_attributes"] = stableAttributes;
+
+    nlohmann::json keyTraits = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(keyTraits, identityMemoryRow != nullptr ? (*identityMemoryRow).value("key_traits", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(keyTraits, entityState != nullptr ? (*entityState).value("key_traits", nlohmann::json::array()) : nlohmann::json::array());
+    if (!keyTraits.empty()) card["key_traits"] = keyTraits;
+
+    nlohmann::json signatureTraits = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(signatureTraits, identityMemoryRow != nullptr ? (*identityMemoryRow).value("identity_signature_traits", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(signatureTraits, entityState != nullptr ? (*entityState).value("identity_signature_traits", nlohmann::json::array()) : nlohmann::json::array());
+    if (!signatureTraits.empty()) card["identity_signature_traits"] = signatureTraits;
+
+    nlohmann::json contextTraits = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(contextTraits, identityMemoryRow != nullptr ? (*identityMemoryRow).value("identity_context_traits", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(contextTraits, entityState != nullptr ? (*entityState).value("identity_context_traits", nlohmann::json::array()) : nlohmann::json::array());
+    if (!contextTraits.empty()) card["identity_context_traits"] = contextTraits;
+
+    nlohmann::json identityFeatureCandidates = nlohmann::json::array();
+    appendUniqueIdentityFeatureCandidatesToJsonArray_(
+        identityFeatureCandidates,
+        identityMemoryRow != nullptr ? (*identityMemoryRow).value("identity_feature_candidates", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueIdentityFeatureCandidatesToJsonArray_(
+        identityFeatureCandidates,
+        entityState != nullptr ? (*entityState).value("identity_feature_candidates", nlohmann::json::array()) : nlohmann::json::array());
+    if (!identityFeatureCandidates.empty()) card["identity_feature_candidates"] = identityFeatureCandidates;
+
+    nlohmann::json referenceImageUrls = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(referenceImageUrls, identityMemoryRow != nullptr ? (*identityMemoryRow).value("reference_image_urls", nlohmann::json::array()) : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(referenceImageUrls, entityState != nullptr ? (*entityState).value("reference_image_urls", nlohmann::json::array()) : nlohmann::json::array());
+    if (resolvedIdentity != nullptr && resolvedIdentity->contains("reference_image_urls")) {
+        appendUniqueTrimmedStringsToJsonArray_(referenceImageUrls, (*resolvedIdentity)["reference_image_urls"]);
+    }
+    if (!referenceImageUrls.empty()) card["reference_image_urls"] = referenceImageUrls;
+
+    const std::string sceneBrief =
+        selectCardStringField_(identityMemoryRow, entityState, { "scene_brief" });
+    if (!sceneBrief.empty()) card["scene_brief"] = sceneBrief;
+
+    if (primaryAsset != nullptr && primaryAsset->is_object()) {
+        card["primary_portrait"] = *primaryAsset;
+        card["portrait_url"] = trimAscii(primaryAsset->value("image_url", ""));
+    }
+    else if (contextAsset != nullptr && contextAsset->is_object()) {
+        card["primary_portrait"] = *contextAsset;
+        card["portrait_url"] = trimAscii(contextAsset->value("image_url", ""));
+    }
+    if (contextAsset != nullptr && contextAsset->is_object()) {
+        card["context_portrait"] = *contextAsset;
+    }
+
+    if (entityType == "person") {
+        const std::string primaryKind =
+            card.contains("primary_portrait") && card["primary_portrait"].is_object()
+                ? lowerAsciiCopy_(trimAscii(card["primary_portrait"].value("portrait_kind", "")))
+                : std::string();
+        card["face_available"] = (primaryKind == "face");
+    }
+
+    if (visualState.contains("last_seen_by_entity_id") &&
+        visualState["last_seen_by_entity_id"].is_object() &&
+        visualState["last_seen_by_entity_id"].contains(normalizedEntityId) &&
+        visualState["last_seen_by_entity_id"][normalizedEntityId].is_object())
+    {
+        card["last_seen"] = visualState["last_seen_by_entity_id"][normalizedEntityId];
+    }
+    else {
+        nlohmann::json lastSeen = nlohmann::json::object();
+        const std::string lastSeenTs =
+            entityState != nullptr
+                ? trimAscii((*entityState).value("last_seen_ts", ""))
+                : temporal::identityMemoryLastSeenTs(identityMemoryRow != nullptr ? *identityMemoryRow : nlohmann::json::object());
+        if (!lastSeenTs.empty()) lastSeen["timestamp_utc_iso"] = lastSeenTs;
+        const std::string lastZone =
+            selectCardStringField_(entityState, identityMemoryRow, { "current_zone", "last_seen_zone" });
+        if (!lastZone.empty()) lastSeen["zone"] = lastZone;
+        if (!lastSeen.empty()) card["last_seen"] = lastSeen;
+    }
+
+    nlohmann::json aliases = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(aliases, knownName);
+    if (resolvedIdentity != nullptr && resolvedIdentity->contains("target_name")) {
+        appendUniqueTrimmedStringsToJsonArray_(aliases, (*resolvedIdentity)["target_name"]);
+    }
+    if (!aliases.empty()) {
+        card["aliases"] = aliases;
+        visualState["entity_aliases"][normalizedEntityId] = aliases;
+    }
+
+    visualState["identity_cards_by_entity_id"][normalizedEntityId] = card;
+    return card;
+}
+
+static nlohmann::json collectChatIdentityCardsForEntityIds_(
+    const std::vector<std::string>& entityIds,
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState)
+{
+    nlohmann::json cards = nlohmann::json::array();
+    std::unordered_set<std::string> seen;
+    for (const auto& rawEntityId : entityIds) {
+        const std::string entityId = trimAscii(rawEntityId);
+        if (entityId.empty() || !seen.insert(entityId).second) continue;
+        nlohmann::json card = buildChatIdentityCardForEntity_(entityId, temporalState, visualState);
+        if (!card.is_object() || card.empty()) continue;
+        cards.push_back(std::move(card));
+    }
+    return cards;
+}
+
+static nlohmann::json collectAllChatIdentityCards_(
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState)
+{
+    ensureChatTemporalVisualState_(visualState);
+    std::vector<std::string> entityIds;
+    if (visualState.contains("entity_primary_portrait_by_entity_id") &&
+        visualState["entity_primary_portrait_by_entity_id"].is_object())
+    {
+        for (auto it = visualState["entity_primary_portrait_by_entity_id"].begin();
+             it != visualState["entity_primary_portrait_by_entity_id"].end();
+             ++it)
+        {
+            entityIds.push_back(it.key());
+        }
+    }
+    if (visualState.contains("entity_context_portrait_by_entity_id") &&
+        visualState["entity_context_portrait_by_entity_id"].is_object())
+    {
+        for (auto it = visualState["entity_context_portrait_by_entity_id"].begin();
+             it != visualState["entity_context_portrait_by_entity_id"].end();
+             ++it)
+        {
+            entityIds.push_back(it.key());
+        }
+    }
+    if (visualState.contains("identity_cards_by_entity_id") &&
+        visualState["identity_cards_by_entity_id"].is_object())
+    {
+        for (auto it = visualState["identity_cards_by_entity_id"].begin();
+             it != visualState["identity_cards_by_entity_id"].end();
+             ++it)
+        {
+            entityIds.push_back(it.key());
+        }
+    }
+    if (visualState.contains("last_seen_by_entity_id") &&
+        visualState["last_seen_by_entity_id"].is_object())
+    {
+        for (auto it = visualState["last_seen_by_entity_id"].begin();
+             it != visualState["last_seen_by_entity_id"].end();
+             ++it)
+        {
+            entityIds.push_back(it.key());
+        }
+    }
+    if (temporalState.contains("entities") &&
+        temporalState["entities"].is_object())
+    {
+        for (auto it = temporalState["entities"].begin();
+             it != temporalState["entities"].end();
+             ++it)
+        {
+            entityIds.push_back(it.key());
+        }
+    }
+    if (temporalState.contains("identity_memory") &&
+        temporalState["identity_memory"].is_array())
+    {
+        for (const auto& row : temporalState["identity_memory"]) {
+            if (!row.is_object()) continue;
+            const std::string entityId = trimAscii(row.value("entity_id", std::string()));
+            if (!entityId.empty()) entityIds.push_back(entityId);
+        }
+    }
+    return collectChatIdentityCardsForEntityIds_(entityIds, temporalState, visualState);
+}
+
+static bool chatTemporalStateHasPromptIdentityMemory_(
+    const nlohmann::json& temporalState)
+{
+    if (!temporalState.is_object()) return false;
+    if (temporalState.contains("identity_memory") &&
+        temporalState["identity_memory"].is_array() &&
+        !temporalState["identity_memory"].empty())
+    {
+        return true;
+    }
+    if (temporalState.contains("entities") &&
+        temporalState["entities"].is_object() &&
+        !temporalState["entities"].empty())
+    {
+        return true;
+    }
+    return false;
+}
+
+static std::string buildDirectChatIdentityMemoryPromptAppendix_(
+    const nlohmann::json& temporalState)
+{
+    if (!chatTemporalStateHasPromptIdentityMemory_(temporalState)) {
+        return std::string();
+    }
+
+    const nlohmann::json runtimeState = temporal::buildInferenceRuntimeState(
+        nlohmann::json::object(),
+        temporalState,
+        -1,
+        temporal::nowIso());
+    const nlohmann::json identityMemory =
+        runtimeState.contains("identity_memory") && runtimeState["identity_memory"].is_array()
+            ? runtimeState["identity_memory"]
+            : nlohmann::json::array();
+    if (identityMemory.empty()) {
+        return std::string();
+    }
+
+    nlohmann::json payload = nlohmann::json::object();
+    payload["identity_memory"] = identityMemory;
+
+    std::ostringstream oss;
+    oss << "\n\nDIRECT_CHAT_IDENTITY_MEMORY_JSON:\n"
+        << payload.dump()
+        << "\n\nDIRECT CHAT IDENTITY MEMORY RULES:\n"
+        << "- This is prior confirmed identity memory from this same chat session.\n"
+        << "- Use it only to match currently visible targets to previously seen entities.\n"
+        << "- This memory does not activate temporal operators, cumulative counts, duration reasoning, or absence tracking.\n"
+        << "- Do not emit absent/not_visible continuity patches for prior entities when they are not visible now.\n"
+        << "- If a visible target clearly matches prior memory, reuse the same entity_id in identity_patch.\n";
+    return oss.str();
+}
+
+static bool hitShouldBackfillIdentityCard_(
+    const VideoHit& hit)
+{
+    if (hitHasPositiveIdentityPatch_(hit)) return false;
+    if (!hit.hasMatch) return false;
+    if (!trimAscii(hit.answer).empty()) return true;
+    if (hit.temporalPayloadPresent) return true;
+    if ((hit.identityPortraitCandidates.is_array() && !hit.identityPortraitCandidates.empty()) ||
+        !hit.temporalEvidenceCandidates.empty())
+    {
+        return true;
+    }
+    return false;
+}
+
+static std::string selectBestExistingEntityIdForFallbackHint_(
+    const nlohmann::json& temporalState,
+    const std::string& entityHint,
+    const std::string& entityType)
+{
+    if (!temporalState.is_object() ||
+        !temporalState.contains("entities") ||
+        !temporalState["entities"].is_object())
+    {
+        return std::string();
+    }
+
+    const std::string normalizedHint = trimAscii(entityHint);
+    const std::string normalizedType = normalizeFallbackEntityType_(entityType);
+    std::string bestEntityId;
+    std::string bestSeenTs;
+    for (auto it = temporalState["entities"].begin(); it != temporalState["entities"].end(); ++it) {
+        if (!it.value().is_object()) continue;
+        const nlohmann::json* identityMemoryRow =
+            temporal::findIdentityMemoryByEntityId(temporalState, it.key());
+
+        bool matches = true;
+        if (!normalizedHint.empty()) {
+            matches = temporal::entityMatchesFilter(it.key(), normalizedHint, &it.value(), identityMemoryRow);
+        }
+        if (matches && !normalizedType.empty()) {
+            matches = temporal::entityMatchesFilter(it.key(), normalizedType, &it.value(), identityMemoryRow);
+        }
+        if (!matches) continue;
+
+        const std::string lastSeenTs = latestKnownEntitySeenTs_(temporalState, it.key());
+        if (bestEntityId.empty() || (!lastSeenTs.empty() && lastSeenTs > bestSeenTs)) {
+            bestEntityId = it.key();
+            bestSeenTs = lastSeenTs;
+        }
+    }
+
+    return bestEntityId;
+}
+
+static nlohmann::json buildFallbackIdentityPatchForPositiveHit_(
+    const VideoHit& hit,
+    const nlohmann::json& temporalState)
+{
+    if (!hitShouldBackfillIdentityCard_(hit)) return nlohmann::json::object();
+
+    std::string candidateEntityId;
+    std::string candidateEntityHint;
+    std::string candidateEntityType;
+    std::string candidateDescription = trimAscii(hit.answer);
+    nlohmann::json candidateFrameRef = nlohmann::json::object();
+    nlohmann::json candidateIdentitySignatureTraits = nlohmann::json::array();
+    nlohmann::json candidateIdentityFeatureCandidates = nlohmann::json::array();
+    std::string candidateTimestampUtcIso;
+    std::string candidateLastSeenTsUtc;
+    int candidateFrameIndex = -1;
+    std::string candidateFrameTimestampInSegment;
+    std::string candidateTimestampName;
+
+    auto applyCandidateSeed = [&](const nlohmann::json& seed) {
+        if (!seed.is_object()) return;
+        if (candidateEntityId.empty()) {
+            candidateEntityId =
+                trimAscii(seed.value("candidate_entity_id", seed.value("entity_id", std::string())));
+        }
+        if (candidateEntityHint.empty()) {
+            candidateEntityHint =
+                trimAscii(seed.value("candidate_entity_hint", seed.value("entity_key", std::string())));
+        }
+        if (candidateEntityType.empty()) {
+            candidateEntityType = trimAscii(seed.value("entity_type", std::string()));
+        }
+        if (candidateDescription.empty()) {
+            candidateDescription = trimAscii(seed.value("description", std::string()));
+        }
+        if (candidateFrameRef.empty() &&
+            seed.contains("frame_ref") &&
+            seed["frame_ref"].is_object())
+        {
+            candidateFrameRef = seed["frame_ref"];
+        }
+        if (candidateIdentitySignatureTraits.empty() &&
+            seed.contains("identity_signature_traits") &&
+            seed["identity_signature_traits"].is_array())
+        {
+            candidateIdentitySignatureTraits = seed["identity_signature_traits"];
+        }
+        if (candidateIdentityFeatureCandidates.empty() &&
+            seed.contains("identity_feature_candidates") &&
+            seed["identity_feature_candidates"].is_array())
+        {
+            candidateIdentityFeatureCandidates = seed["identity_feature_candidates"];
+        }
+        if (candidateTimestampUtcIso.empty()) {
+            candidateTimestampUtcIso = trimAscii(seed.value("timestamp_utc_iso", std::string()));
+        }
+        if (candidateLastSeenTsUtc.empty()) {
+            candidateLastSeenTsUtc = trimAscii(seed.value("last_seen_ts_utc", std::string()));
+        }
+        if (candidateFrameIndex < 0 && seed.contains("frame_index") && seed["frame_index"].is_number_integer()) {
+            candidateFrameIndex = seed["frame_index"].get<int>();
+        }
+        if (candidateFrameTimestampInSegment.empty()) {
+            candidateFrameTimestampInSegment =
+                trimAscii(seed.value("frame_timestamp_in_segment", std::string()));
+        }
+        if (candidateTimestampName.empty()) {
+            candidateTimestampName = trimAscii(seed.value("timestamp_name", std::string()));
+        }
+    };
+
+    if (hit.identityPortraitCandidates.is_array()) {
+        for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
+            if (!portraitCandidate.is_object()) continue;
+            applyCandidateSeed(portraitCandidate);
+            if (!candidateEntityHint.empty() || !candidateEntityId.empty()) break;
+        }
+    }
+
+    candidateEntityType = normalizeFallbackEntityType_(candidateEntityType);
+    if (candidateTimestampUtcIso.empty()) candidateTimestampUtcIso = trimAscii(hit.eventTimestampUtcIso);
+    if (candidateLastSeenTsUtc.empty()) candidateLastSeenTsUtc = candidateTimestampUtcIso;
+    if (candidateEntityHint.empty()) {
+        if (!candidateEntityId.empty()) {
+            candidateEntityHint = temporal::sanitizeToken(candidateEntityId, "entity");
+        }
+        else if (!candidateEntityType.empty()) {
+            candidateEntityHint = temporal::sanitizeToken(candidateEntityType, "entity");
+        }
+    }
+
+    std::string matchedEntityId;
+    if (!candidateEntityId.empty() && temporalStateHasEntity_(temporalState, candidateEntityId)) {
+        matchedEntityId = candidateEntityId;
+    }
+    if (matchedEntityId.empty()) {
+        matchedEntityId = selectBestExistingEntityIdForFallbackHint_(
+            temporalState,
+            candidateEntityHint,
+            candidateEntityType);
+    }
+
+    nlohmann::json patch = nlohmann::json::object();
+    if (!candidateEntityHint.empty()) patch["entity_key"] = candidateEntityHint;
+    if (!candidateEntityType.empty()) patch["entity_type"] = candidateEntityType;
+    if (!candidateDescription.empty()) patch["description"] = candidateDescription;
+    if (!candidateIdentitySignatureTraits.empty()) {
+        patch["identity_signature_traits"] = candidateIdentitySignatureTraits;
+    }
+    if (!candidateIdentityFeatureCandidates.empty()) {
+        patch["identity_feature_candidates"] = candidateIdentityFeatureCandidates;
+    }
+    if (!candidateFrameRef.empty()) patch["frame_ref"] = candidateFrameRef;
+    if (candidateFrameIndex >= 0) patch["frame_index"] = candidateFrameIndex;
+    if (!candidateFrameTimestampInSegment.empty()) {
+        patch["frame_timestamp_in_segment"] = candidateFrameTimestampInSegment;
+    }
+    if (!candidateTimestampName.empty()) patch["timestamp_name"] = candidateTimestampName;
+    if (!candidateTimestampUtcIso.empty()) patch["ts_utc"] = candidateTimestampUtcIso;
+    if (!candidateLastSeenTsUtc.empty()) patch["last_seen_ts_utc"] = candidateLastSeenTsUtc;
+
+    if (!matchedEntityId.empty()) {
+        patch["decision"] = "match_existing";
+        patch["entity_id"] = matchedEntityId;
+        patch["confidence"] = 0.86;
+    }
+    else {
+        if (candidateEntityHint.empty() && candidateEntityType.empty()) {
+            return nlohmann::json::object();
+        }
+        patch["decision"] = "new_entity";
+        patch["confidence"] = 0.72;
+    }
+
+    return patch;
+}
+
+static nlohmann::json applyChatIdentityContinuityRound_(
+    VideoHit& hit,
+    const nlohmann::json& envelopeForApply,
+    const std::string& roundDecisionNow,
+    bool allowTemporalObservations,
+    nlohmann::json& temporalState,
+    nlohmann::json& visualState,
+    const std::string& logStreamId = std::string(),
+    const std::string& scopeTag = std::string())
+{
+    ensureChatTemporalVisualState_(visualState);
+
+    if (hitShouldBackfillIdentityCard_(hit)) {
+        const nlohmann::json fallbackIdentityPatch =
+            buildFallbackIdentityPatchForPositiveHit_(hit, temporalState);
+        if (fallbackIdentityPatch.is_object() && !fallbackIdentityPatch.empty()) {
+            if (!hit.identityPatch.is_array()) {
+                hit.identityPatch = nlohmann::json::array();
+            }
+            hit.identityPatch.push_back(fallbackIdentityPatch);
+            if (!logStreamId.empty() && !scopeTag.empty()) {
+                Logger::instance().logDebug(
+                    logStreamId,
+                    scopeTag + ": synthesized fallback identity_patch=" + fallbackIdentityPatch.dump());
+            }
+        }
+    }
+
+    nlohmann::json identityPatchForApply = nlohmann::json::array();
+    if (hit.identityPatch.is_array()) {
+        for (const auto& item : hit.identityPatch) {
+            if (!item.is_object()) continue;
+            if (!allowTemporalObservations && !temporalIdentityPatchCarriesPositiveEntity_(item)) {
+                continue;
+            }
+            nlohmann::json normalizedItem = item;
+            if (!allowTemporalObservations && normalizedItem.contains("events")) {
+                normalizedItem.erase("events");
+            }
+            identityPatchForApply.push_back(std::move(normalizedItem));
+        }
+    }
+
+    const nlohmann::json observationsForApply =
+        allowTemporalObservations
+            ? hit.observations
+            : nlohmann::json::array();
+    const nlohmann::json unknownReasonsForApply =
+        allowTemporalObservations
+            ? hit.unknownReasons
+            : nlohmann::json::array();
+
+    const bool hasIdentityPatch =
+        identityPatchForApply.is_array() && !identityPatchForApply.empty();
+    const bool hasObservations =
+        observationsForApply.is_array() && !observationsForApply.empty();
+    const bool hasFaceIdentityMatches =
+        hit.faceIdentityMatches.is_array() && !hit.faceIdentityMatches.empty();
+    const bool hasUnknownReasons =
+        unknownReasonsForApply.is_array() && !unknownReasonsForApply.empty();
+    const bool hasEvidenceCandidates = !hit.temporalEvidenceCandidates.empty();
+    const bool hasAnswer = !trimAscii(hit.answer).empty();
+    const bool shouldApplyRound =
+        allowTemporalObservations
+            ? (hasIdentityPatch || hasObservations || hasFaceIdentityMatches ||
+               hasUnknownReasons || hasEvidenceCandidates || hasAnswer)
+            : (hasIdentityPatch || hasFaceIdentityMatches);
+    if (!shouldApplyRound) {
+        return nlohmann::json::array();
+    }
+
+    temporal::applyRound(
+        temporalState,
+        envelopeForApply,
+        identityPatchForApply,
+        observationsForApply,
+        hit.temporalEvidenceCandidates,
+        roundDecisionNow,
+        hit.answer,
+        unknownReasonsForApply,
+        hit.segmentStartTs,
+        hit.segmentEndTs,
+        hit.faceIdentityMatches);
+
+    const nlohmann::json candidateDecisions =
+        temporal::extractLastRoundCandidateDecisions(temporalState);
+    if (!logStreamId.empty() &&
+        !scopeTag.empty() &&
+        candidateDecisions.is_array() &&
+        !candidateDecisions.empty())
+    {
+        Logger::instance().logDebug(
+            logStreamId,
+            scopeTag + ": candidate decisions=" + candidateDecisions.dump());
+    }
+
+    std::vector<std::string> roundResolvedEntityIds;
+    std::unordered_set<std::string> seenRoundEntityIds;
+    appendResolvedIdentityPatchEntityIdsFromDecisions_(
+        candidateDecisions,
+        roundResolvedEntityIds,
+        seenRoundEntityIds);
+
+    if (hit.identityPortraitCandidates.is_array()) {
+        for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
+            if (!portraitCandidate.is_object()) continue;
+            const std::string resolvedEntityId = promotePortraitCandidateToVisualState_(
+                portraitCandidate,
+                candidateDecisions,
+                temporalState,
+                visualState);
+            if (resolvedEntityId.empty() || !seenRoundEntityIds.insert(resolvedEntityId).second) continue;
+            seedIdentityMemoryFromPortraitCandidate_(
+                portraitCandidate,
+                resolvedEntityId,
+                temporalState);
+            roundResolvedEntityIds.push_back(resolvedEntityId);
+        }
+    }
+
+    if (!roundResolvedEntityIds.empty()) {
+        hit.matchedEntityIds = nlohmann::json::array();
+        for (const auto& entityId : roundResolvedEntityIds) {
+            hit.matchedEntityIds.push_back(entityId);
+        }
+        hit.identityCards = collectChatIdentityCardsForEntityIds_(
+            roundResolvedEntityIds,
+            temporalState,
+            visualState);
+        if (hit.identityCards.is_array() &&
+            !hit.identityCards.empty() &&
+            hit.identityCards[0].is_object() &&
+            hit.identityCards[0].contains("card_id") &&
+            hit.identityCards[0]["card_id"].is_string())
+        {
+            hit.primaryIdentityCardId =
+                trimAscii(hit.identityCards[0]["card_id"].get<std::string>());
+        }
+        if (!logStreamId.empty() && !scopeTag.empty() && hit.identityCards.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag +
+                    ": resolved entities present but no identity card could be built (likely missing portrait assets)");
+        }
+    }
+
+    return candidateDecisions;
+}
+
+static bool queryLooksLikeIdentityCardRecall_(const std::string& userQuestion)
+{
+    const std::string q = lowerAsciiCopy_(trimAscii(userQuestion));
+    if (q.empty()) return false;
+    return q.find("identity") != std::string::npos ||
+        q.find("identidade") != std::string::npos ||
+        q.find("card") != std::string::npos ||
+        q.find("cartao") != std::string::npos ||
+        q.find("quem e") != std::string::npos ||
+        q.find("who is") != std::string::npos ||
+        q.find("o que sabemos") != std::string::npos ||
+        q.find("what do we know") != std::string::npos;
+}
+
+static std::vector<std::string> tokenizeIdentityRecallQuery_(const std::string& raw)
+{
+    std::vector<std::string> tokens;
+    std::string current;
+    const std::string lower = lowerAsciiCopy_(raw);
+    auto flush = [&]() {
+        const std::string value = trimAscii(current);
+        current.clear();
+        if (value.size() < 3) return;
+        static const std::unordered_set<std::string> kStopWords = {
+            "the", "and", "that", "this", "with", "from", "para", "uma", "uns", "umas",
+            "como", "about", "show", "mostra", "card", "identidade", "identity"
+        };
+        if (kStopWords.find(value) != kStopWords.end()) return;
+        tokens.push_back(value);
+    };
+
+    for (unsigned char c : lower) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            current.push_back(static_cast<char>(c));
+        }
+        else {
+            flush();
+        }
+    }
+    flush();
+    return tokens;
+}
+
+static int scoreIdentityCardForRecallQuery_(
+    const nlohmann::json& card,
+    const std::string& userQuestion)
+{
+    if (!card.is_object()) return 0;
+    const std::string q = lowerAsciiCopy_(trimAscii(userQuestion));
+    if (q.empty()) return 0;
+
+    std::string haystack;
+    auto appendText = [&](const std::string& raw) {
+        const std::string value = lowerAsciiCopy_(trimAscii(raw));
+        if (value.empty()) return;
+        if (!haystack.empty()) haystack.push_back(' ');
+        haystack += value;
+    };
+    appendText(card.value("entity_id", ""));
+    appendText(card.value("entity_type", ""));
+    appendText(card.value("display_name", ""));
+    appendText(card.value("known_name", ""));
+    appendText(card.value("description", ""));
+    if (card.contains("aliases")) {
+        for (const auto& alias : card["aliases"]) {
+            if (!alias.is_string()) continue;
+            appendText(alias.get<std::string>());
+        }
+    }
+    for (const char* arrayKey : { "identity_signature_traits", "key_traits", "stable_attributes" }) {
+        if (!card.contains(arrayKey) || !card[arrayKey].is_array()) continue;
+        for (const auto& item : card[arrayKey]) {
+            if (!item.is_string()) continue;
+            appendText(item.get<std::string>());
+        }
+    }
+    if (card.contains("resolved_identity") && card["resolved_identity"].is_object()) {
+        appendText(card["resolved_identity"].value("target_name", ""));
+        appendText(card["resolved_identity"].value("target_description", ""));
+    }
+
+    int score = 0;
+    const std::string displayName = lowerAsciiCopy_(trimAscii(card.value("display_name", "")));
+    if (!displayName.empty() && q.find(displayName) != std::string::npos) score += 25;
+
+    const std::string entityId = lowerAsciiCopy_(trimAscii(card.value("entity_id", "")));
+    if (!entityId.empty() && q.find(entityId) != std::string::npos) score += 20;
+
+    const std::string entityType = lowerAsciiCopy_(trimAscii(card.value("entity_type", "")));
+    if ((entityType == "person" && (q.find("pessoa") != std::string::npos || q.find("person") != std::string::npos)) ||
+        (entityType == "vehicle" && (q.find("veiculo") != std::string::npos || q.find("carro") != std::string::npos || q.find("vehicle") != std::string::npos || q.find("car") != std::string::npos)) ||
+        (entityType == "animal" && (q.find("animal") != std::string::npos || q.find("dog") != std::string::npos || q.find("cat") != std::string::npos || q.find("cachorro") != std::string::npos || q.find("gato") != std::string::npos)) ||
+        (entityType == "object" && (q.find("objeto") != std::string::npos || q.find("object") != std::string::npos)))
+    {
+        score += 6;
+    }
+
+    const std::vector<std::string> tokens = tokenizeIdentityRecallQuery_(userQuestion);
+    std::unordered_set<std::string> matchedTokens;
+    for (const auto& token : tokens) {
+        if (haystack.find(token) == std::string::npos) continue;
+        if (!matchedTokens.insert(token).second) continue;
+        score += 2;
+    }
+    return score;
+}
+
+static bool resolveChatIdentityRecallCards_(
+    const std::string& userQuestion,
+    const std::string& userLocale,
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState,
+    nlohmann::json& outCards,
+    std::string& outAnswer)
+{
+    outCards = nlohmann::json::array();
+    outAnswer.clear();
+    if (!queryLooksLikeIdentityCardRecall_(userQuestion)) return false;
+
+    nlohmann::json allCards = collectAllChatIdentityCards_(temporalState, visualState);
+    if (!allCards.is_array() || allCards.empty()) return false;
+
+    struct RankedCard_ {
+        int score = 0;
+        nlohmann::json card;
+    };
+    std::vector<RankedCard_> ranked;
+    ranked.reserve(allCards.size());
+    for (const auto& card : allCards) {
+        if (!card.is_object()) continue;
+        ranked.push_back(RankedCard_{ scoreIdentityCardForRecallQuery_(card, userQuestion), card });
+    }
+    if (ranked.empty()) return false;
+
+    std::sort(
+        ranked.begin(),
+        ranked.end(),
+        [](const RankedCard_& lhs, const RankedCard_& rhs) {
+            if (lhs.score != rhs.score) return lhs.score > rhs.score;
+            return lhs.card.dump() < rhs.card.dump();
+        });
+
+    const bool pt = userLocale.rfind("pt", 0) == 0;
+    if (ranked.size() == 1) {
+        outCards.push_back(ranked.front().card);
+        outAnswer = pt
+            ? "Aqui esta o card de identidade que encontrei na memoria desta conversa."
+            : "Here is the identity card I found in this conversation memory.";
+        return true;
+    }
+
+    if (ranked.front().score <= 0) {
+        return false;
+    }
+
+    const int secondScore = ranked.size() > 1 ? ranked[1].score : -1;
+    const bool ambiguous = ranked.size() > 1 && secondScore >= ranked.front().score - 1;
+    const std::size_t maxCards = ambiguous ? 3u : 1u;
+    for (std::size_t i = 0; i < ranked.size() && i < maxCards; ++i) {
+        outCards.push_back(ranked[i].card);
+    }
+
+    outAnswer = ambiguous
+        ? (pt
+            ? "Encontrei mais de uma identidade que pode corresponder ao seu pedido. Estou trazendo os melhores candidatos."
+            : "I found more than one identity that may match your request. I am returning the best candidates.")
+        : (pt
+            ? "Aqui esta o card de identidade que encontrei na memoria desta conversa."
+            : "Here is the identity card I found in this conversation memory.");
+    return !outCards.empty();
 }
 
 } // namespace
@@ -12465,6 +14709,64 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             if (!chatTemporalState.state.is_object() || chatTemporalState.state.empty()) {
                 chatTemporalState.state = temporal::defaultState();
             }
+            if (!chatTemporalState.visualState.is_object()) {
+                chatTemporalState.visualState = nlohmann::json::object();
+            }
+            ensureChatTemporalVisualState_(chatTemporalState.visualState);
+
+            {
+                nlohmann::json recalledCards = nlohmann::json::array();
+                std::string recalledAnswer;
+                if (resolveChatIdentityRecallCards_(
+                        userQuestion,
+                        userLocale,
+                        chatTemporalState.state,
+                        chatTemporalState.visualState,
+                        recalledCards,
+                        recalledAnswer))
+                {
+                    chatTemporalState.touchedAt = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> lock(chatTemporalMu_);
+                        chatTemporalBySession_[chatSessionId] = chatTemporalState;
+                    }
+
+                    json postBody;
+                    postBody["chat_session_id"] = chatSessionId;
+                    postBody["command_id"] = commandId;
+                    postBody["original_query"] = userQuestion;
+                    postBody["answer"] = recalledAnswer;
+                    postBody["model_prompt_tokens"] = 0;
+                    postBody["model_output_tokens"] = 0;
+                    postBody["model_total_tokens"] = 0;
+                    postBody["vision_hits"] = json::array();
+                    postBody["identity_cards"] = std::move(recalledCards);
+                    postBody["status"] = "vision_done";
+
+                    try {
+                        if (abortIfCancelled("before_identity_card_recall_post")) {
+                            return;
+                        }
+                        std::string url = baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+                        std::string respBody;
+                        long httpCode = HttpPostJson(url, exeToken_, postBody.dump(), respBody);
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: identity-card recall chat-response HTTP " +
+                            std::to_string(httpCode) +
+                            " cards=" + std::to_string(postBody["identity_cards"].size()) +
+                            " responseSize=" + std::to_string(respBody.size())
+                        );
+                    }
+                    catch (...) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "handleChatQuery_: identity-card recall chat-response post exception"
+                        );
+                    }
+                    return;
+                }
+            }
 
             nlohmann::json envelope = chatTemporalState.planEnvelope;
             const std::string modelFamily = (modelTier == "core") ? "core" : "ultra";
@@ -12512,6 +14814,28 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     userQuestionForVision += temporal::runtimePromptAppendix(temporalInput);
                 }
                 chatTemporalActive = true;
+            }
+        }
+
+        if (chatSessionId > 0 &&
+            !chatTemporalActive &&
+            isOpenAIChatModelTier(modelTier))
+        {
+            const std::string identityMemoryAppendix =
+                buildDirectChatIdentityMemoryPromptAppendix_(chatTemporalState.state);
+            if (!identityMemoryAppendix.empty()) {
+                userQuestionForVision += identityMemoryAppendix;
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: direct chat identity memory injected chat_session_id=" +
+                    std::to_string(chatSessionId) +
+                    " rows=" +
+                    std::to_string(
+                        chatTemporalState.state.contains("identity_memory") &&
+                            chatTemporalState.state["identity_memory"].is_array()
+                            ? chatTemporalState.state["identity_memory"].size()
+                            : 0)
+                );
             }
         }
 
@@ -12582,7 +14906,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 routerModelTier,
                 routerApiKey,
                 coreChatPriorityActive,
-                isCancelled);
+                isCancelled,
+                payload.value("video_routing_context", json::object()));
         }
         else {
             // Uploaded video path: fabricate a minimal routerResult so frontend stays happy
@@ -13025,6 +15350,132 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             return temporaryPayload;
         };
 
+        auto cameraPayloadHasTemporaryStartTransport = [&](const json& cameraPayload) {
+            if (!cameraPayload.is_object()) return false;
+
+            auto toUpperAscii = [](std::string value) {
+                for (char& ch : value) {
+                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                }
+                return value;
+            };
+            const std::string connectionMethod =
+                toUpperAscii(trimAscii(cameraPayload.value("connection_method", "RTSP")));
+            if (connectionMethod == "WEBCAM") {
+                return true;
+            }
+
+            auto hasNonEmptyStringField = [&](std::initializer_list<const char*> keys) {
+                for (const char* key : keys) {
+                    if (key == nullptr || !cameraPayload.contains(key)) continue;
+                    const auto& value = cameraPayload[key];
+                    if (value.is_string() && !trimAscii(value.get<std::string>()).empty()) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const bool hasIp = hasNonEmptyStringField({ "ip", "ip_address" });
+            const bool hasUsername = hasNonEmptyStringField({ "username" });
+            const bool hasPassword =
+                cameraPayload.contains("password") &&
+                cameraPayload["password"].is_string();
+            const bool hasManufacturer = hasNonEmptyStringField({ "manufacturer" });
+            const bool hasPort =
+                (cameraPayload.contains("port") && !cameraPayload["port"].is_null()) ||
+                (cameraPayload.contains("rtsp_port") && !cameraPayload["rtsp_port"].is_null());
+
+            return hasIp && hasUsername && hasPassword && hasManufacturer && hasPort;
+        };
+
+        auto mergeCameraPayloadForTemporaryStart = [&](json basePayload, const json& detailPayload) {
+            if (!detailPayload.is_object()) {
+                return basePayload;
+            }
+            if (!basePayload.is_object()) {
+                basePayload = json::object();
+            }
+
+            for (auto it = detailPayload.begin(); it != detailPayload.end(); ++it) {
+                const std::string key = it.key();
+                const bool baseMissing =
+                    !basePayload.contains(key) ||
+                    basePayload[key].is_null() ||
+                    (basePayload[key].is_string() &&
+                        trimAscii(basePayload[key].get<std::string>()).empty());
+
+                const bool preferDetailForTransportSecret =
+                    key == "username" ||
+                    key == "password" ||
+                    key == "rtsp_port" ||
+                    key == "port" ||
+                    key == "manufacturer" ||
+                    key == "ip" ||
+                    key == "ip_address" ||
+                    key == "connection_method";
+
+                if (baseMissing || preferDetailForTransportSecret) {
+                    basePayload[key] = it.value();
+                }
+            }
+            return basePayload;
+        };
+
+        auto ensureDetailedCameraPayloadForTemporaryStart = [&](int cameraId, const json& cameraPayload) {
+            json enrichedPayload = cameraPayload.is_object() ? cameraPayload : json::object();
+            if (cameraPayloadHasTemporaryStartTransport(enrichedPayload)) {
+                return enrichedPayload;
+            }
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: camera payload missing RTSP transport fields for temporary start; fetching details camera_id=" +
+                std::to_string(cameraId) +
+                " has_ip=" + std::string(
+                    enrichedPayload.contains("ip") || enrichedPayload.contains("ip_address")
+                        ? "true"
+                        : "false") +
+                " has_username=" + std::string(
+                    enrichedPayload.contains("username") ? "true" : "false") +
+                " has_password=" + std::string(
+                    enrichedPayload.contains("password") ? "true" : "false") +
+                " has_rtsp_port=" + std::string(
+                    enrichedPayload.contains("rtsp_port") || enrichedPayload.contains("port")
+                        ? "true"
+                        : "false")
+            );
+
+            const json detailedPayload = fetchAgentCameraById_(cameraId);
+            if (!detailedPayload.is_object() || detailedPayload.empty()) {
+                return enrichedPayload;
+            }
+
+            enrichedPayload = mergeCameraPayloadForTemporaryStart(
+                std::move(enrichedPayload),
+                detailedPayload);
+
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: fetched detailed camera payload for temporary start camera_id=" +
+                std::to_string(cameraId) +
+                " has_ip=" + std::string(
+                    enrichedPayload.contains("ip") || enrichedPayload.contains("ip_address")
+                        ? "true"
+                        : "false") +
+                " has_username=" + std::string(
+                    enrichedPayload.contains("username") ? "true" : "false") +
+                " has_password=" + std::string(
+                    enrichedPayload.contains("password") ? "true" : "false") +
+                " has_rtsp_port=" + std::string(
+                    enrichedPayload.contains("rtsp_port") || enrichedPayload.contains("port")
+                        ? "true"
+                        : "false")
+            );
+
+            return enrichedPayload;
+        };
+
         std::vector<std::string> liveCaptureFailedCameraLabels;
 
         if (!hasUploadedVideo) {
@@ -13097,6 +15548,26 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 "agent",
                 "handleChatQuery_ post unknown exception"
             );
+        }
+
+        const bool routerHasExplicitCameraIds =
+            routerCameraIds.is_array() && !routerCameraIds.empty();
+        const bool routerFinalizedWithoutVisionStep =
+            !hasUploadedVideo &&
+            (!routerHasExplicitCameraIds ||
+                routerResult.value("time_window_minutes_before_now", 0) <= 0);
+        if (routerFinalizedWithoutVisionStep) {
+            Logger::instance().logDebug(
+                "agent",
+                "handleChatQuery_: router result finalized chat without stored-video analysis camera_count=" +
+                std::to_string(
+                    routerHasExplicitCameraIds
+                        ? static_cast<unsigned long long>(routerCameraIds.size())
+                        : 0ULL) +
+                " window_minutes=" +
+                std::to_string(routerResult.value("time_window_minutes_before_now", 0))
+            );
+            return;
         }
 
         postVideoSearchProgress("searching_footage", 2, 2);
@@ -13231,13 +15702,28 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     }
 
                     const auto payloadIt = cameraPayloadById.find(missingCameraId);
-                    const bool hasCameraPayload = payloadIt != cameraPayloadById.end();
-                    const json cameraPayload =
-                        hasCameraPayload ? payloadIt->second : json::object();
+                    json cameraPayload =
+                        payloadIt != cameraPayloadById.end() ? payloadIt->second : json::object();
+                    cameraPayload = ensureDetailedCameraPayloadForTemporaryStart(
+                        missingCameraId,
+                        cameraPayload);
+                    const bool hasCameraPayload =
+                        cameraPayload.is_object() && !cameraPayload.empty();
+                    if (hasCameraPayload) {
+                        cameraPayloadById[missingCameraId] = cameraPayload;
+                        if (cameraPayload.contains("name") && cameraPayload["name"].is_string()) {
+                            cameraNameById[missingCameraId] = cameraPayload["name"].get<std::string>();
+                        }
+                    }
                     const std::string cameraLabel =
                         !trimAscii(cameraNameById[missingCameraId]).empty()
                         ? trimAscii(cameraNameById[missingCameraId])
-                        : ("camera " + std::to_string(missingCameraId));
+                        : (hasCameraPayload &&
+                           cameraPayload.contains("name") &&
+                           cameraPayload["name"].is_string() &&
+                           !trimAscii(cameraPayload["name"].get<std::string>()).empty()
+                            ? trimAscii(cameraPayload["name"].get<std::string>())
+                            : ("camera " + std::to_string(missingCameraId)));
 
                     const bool originallyRunning =
                         (hasCameraPayload &&
@@ -13297,10 +15783,13 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                             );
                         }
                     }
-
                     EncodedVideoSegment recoveredSegment;
                     std::string recoveryError;
                     bool recovered = false;
+
+                    if (!session && !originallyRunning && !hasCameraPayload) {
+                        recoveryError = "camera payload missing transport details";
+                    }
 
                     if (session || temporarySessionStarted || originallyRunning) {
                         std::string newClipPath;
@@ -13672,31 +16161,18 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         }
 
         if (chatTemporalActive && !temporalHandledInline) {
-            for (const auto& hitTemporal : videoHits) {
+            for (auto& hitTemporal : videoHits) {
                 const std::string temporalDecisionNowIso =
                     temporal::decisionAnchorUtc(temporal::nowIso(), hitTemporal.segmentEndTs);
-                temporal::applyRound(
-                    chatTemporalState.state,
+                (void)applyChatIdentityContinuityRound_(
+                    hitTemporal,
                     chatTemporalState.planEnvelope,
-                    hitTemporal.identityPatch,
-                    hitTemporal.observations,
-                    hitTemporal.temporalEvidenceCandidates,
                     temporalDecisionNowIso,
-                    hitTemporal.answer,
-                    hitTemporal.unknownReasons,
-                    hitTemporal.segmentStartTs,
-                    hitTemporal.segmentEndTs,
-                    hitTemporal.faceIdentityMatches
-                );
-                const nlohmann::json candidateDecisions =
-                    temporal::extractLastRoundCandidateDecisions(chatTemporalState.state);
-                if (candidateDecisions.is_array() && !candidateDecisions.empty()) {
-                    Logger::instance().logDebug(
-                        "agent",
-                        "handleChatQuery_: temporal candidate decisions decisions=" +
-                        candidateDecisions.dump()
-                    );
-                }
+                    /*allowTemporalObservations=*/true,
+                    chatTemporalState.state,
+                    chatTemporalState.visualState,
+                    "agent",
+                    "handleChatQuery_");
                 const temporal::EvalResult eval = temporal::evaluate(
                     chatTemporalState.state,
                     chatTemporalState.planEnvelope,
@@ -13715,6 +16191,39 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             {
                 std::lock_guard<std::mutex> lock(chatTemporalMu_);
                 chatTemporalBySession_[chatSessionId] = chatTemporalState;
+            }
+        }
+        else if (!chatTemporalActive && chatSessionId > 0) {
+            bool identityStateChanged = false;
+            for (auto& hitTemporal : videoHits) {
+                const std::string identityDecisionNowIso =
+                    temporal::decisionAnchorUtc(temporal::nowIso(), hitTemporal.segmentEndTs);
+                const nlohmann::json candidateDecisions = applyChatIdentityContinuityRound_(
+                    hitTemporal,
+                    nlohmann::json::object(),
+                    identityDecisionNowIso,
+                    /*allowTemporalObservations=*/false,
+                    chatTemporalState.state,
+                    chatTemporalState.visualState,
+                    "agent",
+                    "handleChatQuery_::identity_only");
+                if (candidateDecisions.is_array() && !candidateDecisions.empty()) {
+                    identityStateChanged = true;
+                }
+                else if ((hitTemporal.identityPatch.is_array() && !hitTemporal.identityPatch.empty()) ||
+                         (hitTemporal.faceIdentityMatches.is_array() && !hitTemporal.faceIdentityMatches.empty()) ||
+                         (hitTemporal.matchedEntityIds.is_array() && !hitTemporal.matchedEntityIds.empty()) ||
+                         (hitTemporal.identityCards.is_array() && !hitTemporal.identityCards.empty()))
+                {
+                    identityStateChanged = true;
+                }
+            }
+            if (identityStateChanged || chatTemporalStateHasPromptIdentityMemory_(chatTemporalState.state)) {
+                chatTemporalState.touchedAt = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> lock(chatTemporalMu_);
+                    chatTemporalBySession_[chatSessionId] = chatTemporalState;
+                }
             }
         }
 
@@ -13837,6 +16346,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
 
 
         nlohmann::json hitsJson = nlohmann::json::array();
+        nlohmann::json identityCardsById = nlohmann::json::object();
 
         postVideoSearchProgress("uploading_media", 4, 4);
 
@@ -13888,6 +16398,21 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 }
                 if (!evidenceMeta.empty()) {
                     hitObj["temporal_evidence"] = std::move(evidenceMeta);
+                }
+            }
+            if (h.matchedEntityIds.is_array() && !h.matchedEntityIds.empty()) {
+                hitObj["matched_entity_ids"] = h.matchedEntityIds;
+            }
+            if (!trimAscii(h.primaryIdentityCardId).empty()) {
+                hitObj["primary_identity_card_id"] = h.primaryIdentityCardId;
+            }
+            if (h.identityCards.is_array() && !h.identityCards.empty()) {
+                hitObj["identity_cards"] = h.identityCards;
+                for (const auto& card : h.identityCards) {
+                    if (!card.is_object()) continue;
+                    const std::string cardId = trimAscii(card.value("card_id", ""));
+                    if (cardId.empty()) continue;
+                    identityCardsById[cardId] = card;
                 }
             }
 
@@ -14236,6 +16761,13 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         }
 
         postBody["vision_hits"] = hitsJson;
+        if (!identityCardsById.empty()) {
+            nlohmann::json identityCardsJson = nlohmann::json::array();
+            for (auto it = identityCardsById.begin(); it != identityCardsById.end(); ++it) {
+                identityCardsJson.push_back(it.value());
+            }
+            postBody["identity_cards"] = identityCardsJson;
+        }
         postBody["status"] = "vision_done";
 
         postVideoSearchProgress("finalizing", 5, 5);
@@ -16435,6 +18967,470 @@ namespace {
             q.find("cross_camera_watchlist") != std::string::npos;
     }
 
+    struct FallbackChatIdentityDescriptor_ {
+        std::string entityId;
+        std::string entityHint;
+        std::string entityType;
+    };
+
+    static nlohmann::json extractJsonObjectAfterMarkerFromPrompt_(
+        const std::string& prompt,
+        const std::string& marker)
+    {
+        const std::size_t markerPos = prompt.find(marker);
+        if (markerPos == std::string::npos) return nlohmann::json::object();
+
+        const std::size_t firstBrace = prompt.find('{', markerPos + marker.size());
+        if (firstBrace == std::string::npos) return nlohmann::json::object();
+
+        const std::size_t endExclusive = findMatchingJsonObjectEnd_(prompt, firstBrace);
+        if (endExclusive == std::string::npos || endExclusive <= firstBrace) {
+            return nlohmann::json::object();
+        }
+
+        const std::string jsonSlice = prompt.substr(firstBrace, endExclusive - firstBrace);
+        const nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
+        return parsed.is_object() ? parsed : nlohmann::json::object();
+    }
+
+    static std::string extractIdentityMemoryRowSeenTs_(const nlohmann::json& row)
+    {
+        return temporal::identityMemoryLastSeenTs(row);
+    }
+
+    static void applyIdentityDescriptorFromMemoryRows_(
+        const nlohmann::json& identityMemory,
+        FallbackChatIdentityDescriptor_& descriptor)
+    {
+        if (!identityMemory.is_array() || identityMemory.empty()) return;
+
+        auto applyRow = [&](const nlohmann::json& row) {
+            if (!row.is_object()) return;
+            if (descriptor.entityId.empty()) {
+                descriptor.entityId = trimAscii(row.value("entity_id", std::string()));
+            }
+            if (descriptor.entityHint.empty()) {
+                descriptor.entityHint = trimAscii(row.value("entity_key", std::string()));
+                if (descriptor.entityHint.empty()) {
+                    descriptor.entityHint = trimAscii(row.value("entity_type", std::string()));
+                }
+            }
+            if (descriptor.entityType.empty()) {
+                descriptor.entityType = trimAscii(row.value("entity_type", std::string()));
+            }
+        };
+
+        if (identityMemory.size() == 1) {
+            applyRow(identityMemory.front());
+            return;
+        }
+
+        if (!descriptor.entityHint.empty()) {
+            std::string bestSeenTs;
+            const nlohmann::json* bestRow = nullptr;
+            for (const auto& row : identityMemory) {
+                if (!row.is_object()) continue;
+                const std::string rowEntityId = trimAscii(row.value("entity_id", std::string()));
+                const std::string rowEntityKey = trimAscii(row.value("entity_key", std::string()));
+                const std::string rowEntityType = trimAscii(row.value("entity_type", std::string()));
+                const bool hintMatches =
+                    temporal::entityMatchesFilter(rowEntityId, descriptor.entityHint) ||
+                    temporal::entityMatchesFilter(rowEntityKey, descriptor.entityHint) ||
+                    temporal::entityMatchesFilter(rowEntityType, descriptor.entityHint);
+                if (!hintMatches) continue;
+                const std::string seenTs = extractIdentityMemoryRowSeenTs_(row);
+                if (bestRow == nullptr || (!seenTs.empty() && seenTs > bestSeenTs)) {
+                    bestRow = &row;
+                    bestSeenTs = seenTs;
+                }
+            }
+            if (bestRow != nullptr) {
+                applyRow(*bestRow);
+                return;
+            }
+        }
+
+        applyRow(identityMemory.front());
+    }
+
+    static std::string detectColorCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kColorCues[] = {
+            { "camisa verde", "green" },
+            { "shirt green", "green" },
+            { "green shirt", "green" },
+            { "verde", "green" },
+            { "green", "green" },
+            { "vermelh", "red" },
+            { "red", "red" },
+            { "azul", "blue" },
+            { "blue", "blue" },
+            { "preto", "black" },
+            { "black", "black" },
+            { "branc", "white" },
+            { "white", "white" },
+            { "amarel", "yellow" },
+            { "yellow", "yellow" },
+            { "laranja", "orange" },
+            { "orange", "orange" },
+            { "cinza", "gray" },
+            { "gray", "gray" },
+            { "grey", "gray" },
+            { "marrom", "brown" },
+            { "brown", "brown" }
+        };
+
+        for (const auto& item : kColorCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
+    static std::string detectPersonTraitCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kTraitCues[] = {
+            { "camisa", "shirt" },
+            { "shirt", "shirt" },
+            { "camiseta", "shirt" },
+            { "jacket", "jacket" },
+            { "jaqueta", "jacket" },
+            { "bone", "hat" },
+            { "chapeu", "hat" },
+            { "hat", "hat" },
+            { "cap", "hat" },
+            { "mochila", "backpack" },
+            { "backpack", "backpack" },
+            { "careca", "bald" },
+            { "bald", "bald" },
+            { "barba", "beard" },
+            { "beard", "beard" },
+            { "oculos", "glasses" },
+            { "glasses", "glasses" }
+        };
+
+        for (const auto& item : kTraitCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
+    static std::string detectSpecificObjectCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kObjectCues[] = {
+            { "copo", "cup" },
+            { "cup", "cup" },
+            { "garrafa", "bottle" },
+            { "bottle", "bottle" },
+            { "celular", "phone" },
+            { "phone", "phone" },
+            { "caixa", "box" },
+            { "box", "box" },
+            { "pacote", "package" },
+            { "package", "package" },
+            { "arma", "gun" },
+            { "gun", "gun" },
+            { "mochila", "backpack" },
+            { "backpack", "backpack" },
+            { "bolsa", "bag" },
+            { "bag", "bag" }
+        };
+
+        for (const auto& item : kObjectCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
+    static FallbackChatIdentityDescriptor_ inferFallbackIdentityDescriptorFromText_(
+        const std::string& rawPrompt,
+        const std::string& answerText)
+    {
+        FallbackChatIdentityDescriptor_ descriptor;
+        const std::string normalizedText =
+            normalizeTemporalCueText_(rawPrompt + " " + answerText);
+        if (normalizedText.empty()) return descriptor;
+
+        const bool looksLikePerson =
+            normalizedText.find("pessoa") != std::string::npos ||
+            normalizedText.find("person") != std::string::npos ||
+            normalizedText.find("people") != std::string::npos ||
+            normalizedText.find("human") != std::string::npos ||
+            normalizedText.find("homem") != std::string::npos ||
+            normalizedText.find("mulher") != std::string::npos ||
+            normalizedText.find("shirt") != std::string::npos ||
+            normalizedText.find("camisa") != std::string::npos;
+        const bool looksLikeVehicle =
+            normalizedText.find("vehicle") != std::string::npos ||
+            normalizedText.find("veiculo") != std::string::npos ||
+            normalizedText.find("carro") != std::string::npos ||
+            normalizedText.find("car ") != std::string::npos ||
+            normalizedText.rfind("car", 0) == 0;
+        const bool looksLikeAnimal =
+            normalizedText.find("animal") != std::string::npos ||
+            normalizedText.find("dog") != std::string::npos ||
+            normalizedText.find("cachorro") != std::string::npos ||
+            normalizedText.find("cat") != std::string::npos ||
+            normalizedText.find("gato") != std::string::npos;
+
+        if (looksLikePerson) descriptor.entityType = "person";
+        else if (looksLikeVehicle) descriptor.entityType = "vehicle";
+        else if (looksLikeAnimal) descriptor.entityType = "animal";
+        else descriptor.entityType = "object";
+
+        const std::string colorCue = detectColorCueForIdentityText_(normalizedText);
+        if (descriptor.entityType == "person") {
+            const std::string traitCue = detectPersonTraitCueForIdentityText_(normalizedText);
+            if (!colorCue.empty() && !traitCue.empty()) {
+                descriptor.entityHint = temporal::sanitizeToken(
+                    "person_" + colorCue + "_" + traitCue,
+                    "person");
+            }
+            else if (!traitCue.empty()) {
+                descriptor.entityHint = temporal::sanitizeToken(
+                    "person_" + traitCue,
+                    "person");
+            }
+            else if (!colorCue.empty()) {
+                descriptor.entityHint = temporal::sanitizeToken(
+                    "person_" + colorCue,
+                    "person");
+            }
+            else {
+                descriptor.entityHint = "person";
+            }
+        }
+        else if (descriptor.entityType == "vehicle") {
+            descriptor.entityHint = colorCue.empty()
+                ? std::string("vehicle")
+                : temporal::sanitizeToken("vehicle_" + colorCue, "vehicle");
+        }
+        else if (descriptor.entityType == "animal") {
+            descriptor.entityHint = "animal";
+        }
+        else {
+            const std::string objectCue = detectSpecificObjectCueForIdentityText_(normalizedText);
+            if (!objectCue.empty() && !colorCue.empty()) {
+                descriptor.entityHint = temporal::sanitizeToken(objectCue + "_" + colorCue, objectCue);
+            }
+            else if (!objectCue.empty()) {
+                descriptor.entityHint = temporal::sanitizeToken(objectCue, "object");
+            }
+            else {
+                descriptor.entityHint = colorCue.empty()
+                    ? std::string("object")
+                    : temporal::sanitizeToken("object_" + colorCue, "object");
+            }
+        }
+
+        return descriptor;
+    }
+
+    static FallbackChatIdentityDescriptor_ deriveFallbackChatIdentityDescriptor_(
+        const std::string& rawPrompt,
+        const std::string& basePrompt,
+        const std::string& temporalStaticJson,
+        const std::string& temporalRuntimeJson,
+        const std::string& answerText)
+    {
+        FallbackChatIdentityDescriptor_ descriptor;
+
+        const nlohmann::json directIdentityPromptJson =
+            extractJsonObjectAfterMarkerFromPrompt_(
+                rawPrompt,
+                "DIRECT_CHAT_IDENTITY_MEMORY_JSON:");
+        if (directIdentityPromptJson.is_object() &&
+            directIdentityPromptJson.contains("identity_memory"))
+        {
+            applyIdentityDescriptorFromMemoryRows_(
+                directIdentityPromptJson["identity_memory"],
+                descriptor);
+        }
+
+        const nlohmann::json staticPromptJson =
+            nlohmann::json::parse(temporalStaticJson, nullptr, false);
+        if (staticPromptJson.is_object()) {
+            const nlohmann::json entitiesContract =
+                staticPromptJson.contains("entities_contract") && staticPromptJson["entities_contract"].is_array()
+                    ? staticPromptJson["entities_contract"]
+                    : (staticPromptJson.contains("entities") && staticPromptJson["entities"].is_array()
+                        ? staticPromptJson["entities"]
+                        : nlohmann::json::array());
+            for (const auto& item : entitiesContract) {
+                if (!item.is_object()) continue;
+                const bool trackIdentity = item.value("track_identity", false);
+                const std::string entityKey = trimAscii(item.value("entity_key", std::string()));
+                const std::string entityType = trimAscii(item.value("entity_type", item.value("type", std::string())));
+                if (descriptor.entityHint.empty() && !entityKey.empty() && trackIdentity) {
+                    descriptor.entityHint = entityKey;
+                }
+                if (descriptor.entityType.empty() && !entityType.empty() && trackIdentity) {
+                    descriptor.entityType = entityType;
+                }
+                if (!descriptor.entityHint.empty() && !descriptor.entityType.empty()) break;
+            }
+        }
+
+        const nlohmann::json runtimePromptJson =
+            nlohmann::json::parse(temporalRuntimeJson, nullptr, false);
+        if (runtimePromptJson.is_object() &&
+            runtimePromptJson.contains("identity_memory"))
+        {
+            applyIdentityDescriptorFromMemoryRows_(
+                runtimePromptJson["identity_memory"],
+                descriptor);
+        }
+
+        if (descriptor.entityHint.empty() || descriptor.entityType.empty()) {
+            const FallbackChatIdentityDescriptor_ inferred =
+                inferFallbackIdentityDescriptorFromText_(
+                    basePrompt.empty() ? rawPrompt : basePrompt,
+                    answerText);
+            if (descriptor.entityHint.empty()) descriptor.entityHint = inferred.entityHint;
+            if (descriptor.entityType.empty()) descriptor.entityType = inferred.entityType;
+        }
+
+        descriptor.entityHint = temporal::sanitizeToken(
+            descriptor.entityHint.empty() ? descriptor.entityType : descriptor.entityHint,
+            "entity");
+        descriptor.entityType = normalizeFallbackEntityType_(descriptor.entityType);
+        return descriptor;
+    }
+
+    static void ensureFallbackIdentityPortraitCandidatesForChatHit_(
+        VideoHit& hit,
+        const std::string& rawPrompt,
+        const std::string& basePrompt,
+        const std::string& temporalStaticJson,
+        const std::string& temporalRuntimeJson,
+        const std::vector<PromptVideoFrame>* frameCatalog,
+        const std::string& videoPackagingMode,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string())
+    {
+        if (!hit.hasMatch) return;
+        if (hit.identityPortraitCandidates.is_array() && !hit.identityPortraitCandidates.empty()) return;
+        if (frameCatalog == nullptr || frameCatalog->empty()) return;
+
+        const PromptVideoFrame* representativeFrame =
+            selectRepresentativePromptVideoFrameForHit_(hit, frameCatalog, videoPackagingMode);
+        if (representativeFrame == nullptr || trimAscii(representativeFrame->jpegBase64).empty()) return;
+
+        cv::Mat decodedFrame;
+        if (!decodePromptVideoFrameToMat_(representativeFrame->jpegBase64, decodedFrame) || decodedFrame.empty()) {
+            return;
+        }
+
+        const FallbackChatIdentityDescriptor_ descriptor =
+            deriveFallbackChatIdentityDescriptor_(
+                rawPrompt,
+                basePrompt,
+                temporalStaticJson,
+                temporalRuntimeJson,
+                hit.answer);
+
+        nlohmann::json seed = nlohmann::json::object();
+        if (!descriptor.entityId.empty()) seed["candidate_entity_id"] = descriptor.entityId;
+        if (!descriptor.entityHint.empty()) seed["candidate_entity_hint"] = descriptor.entityHint;
+        if (!descriptor.entityHint.empty()) seed["entity_key"] = descriptor.entityHint;
+        if (!descriptor.entityType.empty()) seed["entity_type"] = descriptor.entityType;
+        if (!trimAscii(hit.answer).empty()) seed["description"] = trimAscii(hit.answer);
+        if (!representativeFrame->frameTimestampInSegment.empty()) {
+            seed["frame_timestamp_in_segment"] = representativeFrame->frameTimestampInSegment;
+        }
+        if (!representativeFrame->timestampName.empty()) {
+            seed["timestamp_name"] = representativeFrame->timestampName;
+        }
+        if (representativeFrame->frameIndex >= 0) {
+            seed["frame_index"] = representativeFrame->frameIndex;
+        }
+        if (!trimAscii(hit.eventTimestampUtcIso).empty()) {
+            seed["timestamp_utc_iso"] = hit.eventTimestampUtcIso;
+            seed["last_seen_ts_utc"] = hit.eventTimestampUtcIso;
+        }
+        else if (representativeFrame->hasAbsoluteTimestamp) {
+            const std::string tsUtc = formatTimePointToIsoUtcZ_(representativeFrame->absoluteTimestamp);
+            if (!tsUtc.empty()) {
+                seed["timestamp_utc_iso"] = tsUtc;
+                seed["last_seen_ts_utc"] = tsUtc;
+            }
+        }
+
+        const std::string entityType =
+            normalizeFallbackEntityType_(descriptor.entityType);
+        cv::Rect bodyRect;
+        const bool detectedBody = false;
+        if (entityType == "person") {
+            const cv::Rect faceRect = deriveHeuristicPersonFaceRect_(decodedFrame.size());
+            if (faceRect.width > 0 && faceRect.height > 0) {
+                appendSyntheticIdentityPortraitCandidateFromSourceRect_(
+                    hit,
+                    seed,
+                    *representativeFrame,
+                    decodedFrame,
+                    faceRect,
+                    "primary",
+                    "face",
+                    0.44,
+                    "person_face_heuristic");
+            }
+
+            const cv::Rect contextRect =
+                deriveFallbackContextRectForEntityType_(
+                    entityType,
+                    decodedFrame.size(),
+                    bodyRect);
+            if (contextRect.width > 0 && contextRect.height > 0) {
+                appendSyntheticIdentityPortraitCandidateFromSourceRect_(
+                    hit,
+                    seed,
+                    *representativeFrame,
+                    decodedFrame,
+                    contextRect,
+                    hit.identityPortraitCandidates.empty() ? "primary" : "context",
+                    hit.identityPortraitCandidates.empty() ? "context_fallback" : "full_object",
+                    0.50,
+                    "person_full_frame_context");
+            }
+        }
+        else {
+            const cv::Rect objectRect =
+                deriveFallbackContextRectForEntityType_(
+                    entityType,
+                    decodedFrame.size(),
+                    cv::Rect());
+            appendSyntheticIdentityPortraitCandidateFromSourceRect_(
+                hit,
+                seed,
+                *representativeFrame,
+                decodedFrame,
+                objectRect,
+                "primary",
+                "full_object",
+                0.50,
+                "object_full_frame_fallback");
+        }
+
+        if (!logStreamId.empty() &&
+            !scopeTag.empty() &&
+            hit.identityPortraitCandidates.is_array() &&
+            !hit.identityPortraitCandidates.empty())
+        {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag +
+                    ": synthesized fallback identity portrait candidates count=" +
+                    std::to_string(static_cast<unsigned long long>(hit.identityPortraitCandidates.size())) +
+                    " entity_hint=" + descriptor.entityHint +
+                    " entity_type=" + entityType);
+        }
+    }
+
     static bool parseStartConditionStepIdField(
         const nlohmann::json& scid,
         int& outStepId);
@@ -17278,6 +20274,14 @@ namespace {
         bool requireDetectionTimeInVideo = false;
     };
 
+    static bool usesDirectChatIdentityContinuity_(
+        const OpenAIVisionPromptOptions_& options)
+    {
+        return options.modality == OpenAIVisionModality_::Video &&
+            options.directChatFlow &&
+            !options.useTemporalDeltaContract;
+    }
+
     struct OpenAIVisionRequestBuild_ {
         nlohmann::json body = nlohmann::json::object();
         std::string cacheKey;
@@ -17678,6 +20682,8 @@ namespace {
 
     static std::string buildOpenAIVisionCacheVariant_(const OpenAIVisionPromptOptions_& options)
     {
+        const bool directChatIdentityContinuity =
+            usesDirectChatIdentityContinuity_(options);
         std::string variant =
             (options.modality == OpenAIVisionModality_::Video) ? "video" : "image";
         variant += options.jobMode ? "_job" : "_direct";
@@ -17685,6 +20691,7 @@ namespace {
             variant += "_mosaic";
         }
         if (options.hasTemporal) variant += "_temporal";
+        if (directChatIdentityContinuity && !options.hasTemporal) variant += "_idmem";
         if (options.useTemporalDeltaContract) variant += "_delta";
         if (options.hasFaceReferences) variant += "_face";
         if (options.hasLegacySingleFaceReference) variant += "_legacy_face";
@@ -17802,6 +20809,8 @@ namespace {
         const OpenAIVisionPromptOptions_& options,
         const std::string& cacheVariant)
     {
+        const bool allowIdentityPatch =
+            options.hasTemporal || usesDirectChatIdentityContinuity_(options);
         if (options.useTemporalDeltaContract) {
             nlohmann::json properties = {
                 { "answer", makeNullableStringSchema_() },
@@ -17911,14 +20920,16 @@ namespace {
             "alert_region_ids"
         });
 
-        if (options.hasTemporal) {
+        if (allowIdentityPatch) {
             properties["identity_patch"] =
                 makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityPatchItems_));
+            required.push_back("identity_patch");
+        }
+        if (options.hasTemporal) {
             properties["observations"] =
                 makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxObservationItems_));
             properties["unknown_reasons"] =
                 makeNullableObjectArraySchema_(static_cast<int>(kStructuredVisionMaxUnknownReasonItems_));
-            required.push_back("identity_patch");
             required.push_back("observations");
             required.push_back("unknown_reasons");
         }
@@ -18160,6 +21171,8 @@ namespace {
         const std::string& startConditionText,
         const PromptVideoMosaicBundle_* mosaicBundle = nullptr)
     {
+        const bool directChatIdentityContinuity =
+            usesDirectChatIdentityContinuity_(options);
         std::ostringstream prompt;
         if (options.jobMode) {
             prompt << "JOB STEP MODE (AUTOMATION):\n";
@@ -18191,7 +21204,14 @@ namespace {
             prompt << "- Use temporal context for identity continuity and cumulative interpretation only when explicitly allowed.\n\n";
         }
         else {
-            prompt << "- Refer only to what is visible in this sampled video evidence.\n\n";
+            prompt << "- Refer only to what is visible in this sampled video evidence.\n";
+            if (directChatIdentityContinuity) {
+                prompt << "- If DIRECT_CHAT_IDENTITY_MEMORY_JSON is present, use it only to match currently visible targets to prior entities from this same chat session.\n";
+                prompt << "- Do not use prior memory for duration, counts, absence tracking, or temporal operator reasoning.\n\n";
+            }
+            else {
+                prompt << "\n";
+            }
         }
 
         if (options.useTemporalDeltaContract) {
@@ -18237,6 +21257,10 @@ namespace {
         }
         else {
             prompt << "- Evaluate the conditions below using only this sampled video evidence.\n";
+            if (directChatIdentityContinuity) {
+                prompt << "- If a clearly visible target directly supports the answer, you may emit one identity_patch item for that target so chat identity memory can persist it.\n";
+                prompt << "- Reuse a prior entity_id only when the current visible target clearly matches DIRECT_CHAT_IDENTITY_MEMORY_JSON.\n";
+            }
             prompt << "- If not confident, keep booleans false.\n\n";
         }
 
@@ -18261,10 +21285,40 @@ namespace {
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
                 prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+                if (options.directChatFlow) {
+                    prompt << "- If this batch contains a newly seen entity that directly satisfies the user's positive search target or answer, emit one identity_patch item for that entity so later rounds can refer to the same target.\n";
+                    prompt << "- In temporal chat video search, use identity_patch to seed continuity for the first clearly visible positive target even when that entity was not already in prior memory.\n";
+                }
                 prompt << "- Do not repeat the same event in observations just because later frames still show the entity in the middle of that same action.\n";
                 prompt << "- If you need to mention that later frame, keep the same observation as continuity using continuation=true and counts_as_new_event=false.\n";
                 prompt << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch.\n";
+                prompt << "- portrait_crop is not required for every round, but for the first clearly visible positive tracked target in this chat it should be present whenever the target is localizable enough for backend memory.\n";
+                if (options.directChatFlow) {
+                    prompt << "- When the first relevant positive target in temporal chat is visible, do not leave identity_patch empty, and include portrait_crop or context_bbox_norm_in_cell whenever localization is feasible so backend memory can preserve an identity card for later recall.\n";
+                }
+                prompt << "- If the same tracked entity is already known from prior rounds, omit portrait_crop unless this batch provides a materially clearer crop than before.\n";
+                prompt << "- Never emit portrait_crop just to repeat an already adequate portrait for the same tracked entity.\n";
+                prompt << "- When a visible entity is clearly localizable in the current mosaic cell, include portrait_crop inside identity_patch instead of omitting it.\n";
+                prompt << "- portrait_crop should be an object with kind, confidence, and bbox_norm_in_cell where bbox_norm_in_cell has x,y,w,h normalized to the current cell (0..1).\n";
+                prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; if the face is not clearly localizable, still provide context_bbox_norm_in_cell for a body/context crop.\n";
+                prompt << "- For non-person entities, use portrait_crop.kind=full_object and make bbox_norm_in_cell cover the whole visible target whenever the object is localizable.\n";
+                prompt << "- Never invent a crop for a tiny, blurred, occluded, or uncertain target.\n";
             }
+        }
+        else if (directChatIdentityContinuity) {
+            prompt << "- In direct chat identity continuity mode, do not leave identity_patch empty when a clearly visible positive target directly supports the answer or clearly matches prior memory.\n";
+            prompt << "- identity_patch must contain JSON objects only.\n";
+            prompt << "- Do not emit absent/not_visible continuity patches in this mode.\n";
+            prompt << "- When possible, include frame_ref for the representative evidence frame of that visible target.\n";
+            prompt << "- When a visible positive target supports the answer, prefer including identity_signature_traits with 2-8 durable target-centric cues so the chat identity card can preserve those characteristics.\n";
+            prompt << "- portrait_crop is not required for every round, but it should be included whenever that visible positive target is localizable enough for backend memory.\n";
+            prompt << "- If the same tracked entity already has an adequate portrait in prior chat memory, omit portrait_crop unless this batch provides a materially clearer crop than before.\n";
+            prompt << "- Never emit portrait_crop just to repeat an already adequate portrait for the same tracked entity.\n";
+            prompt << "- When a visible entity is clearly localizable in the current mosaic cell and it directly supports the answer, include portrait_crop or context_bbox_norm_in_cell inside identity_patch so backend memory can preserve an identity card.\n";
+            prompt << "- portrait_crop should be an object with kind, confidence, and bbox_norm_in_cell where bbox_norm_in_cell has x,y,w,h normalized to the current cell (0..1).\n";
+            prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; otherwise still provide context_bbox_norm_in_cell for a body/context crop.\n";
+            prompt << "- For non-person entities, use portrait_crop.kind=full_object and make bbox_norm_in_cell cover the whole visible target whenever the object is localizable.\n";
+            prompt << "- Never invent a crop for a tiny, blurred, occluded, or uncertain target.\n";
         }
         if (options.hasFaceReferences) {
             if (options.useTemporalDeltaContract) {
@@ -18441,6 +21495,8 @@ namespace {
     static std::string buildOpenAIVisionFallbackSchemaText_(
         const OpenAIVisionPromptOptions_& options)
     {
+        const bool allowIdentityPatch =
+            options.hasTemporal || usesDirectChatIdentityContinuity_(options);
         std::ostringstream prompt;
         if (options.useTemporalDeltaContract) {
             prompt << "RESPONSE FORMAT (RAW JSON ONLY, TEMPORAL DELTA CONTRACT):\n";
@@ -18490,9 +21546,11 @@ namespace {
         prompt << "- start_condition_step_id: integer or null\n";
         prompt << "- alert_region_ids: array of strings or null (max " <<
             kStructuredVisionMaxAlertRegionIds_ << " items)\n";
-        if (options.hasTemporal) {
+        if (allowIdentityPatch) {
             prompt << "- identity_patch: array or null (max " <<
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
+        }
+        if (options.hasTemporal) {
             prompt << "- observations: array or null (max " <<
                 kStructuredVisionMaxObservationItems_ << " items)\n";
             prompt << "- unknown_reasons: array or null (max " <<
@@ -18514,7 +21572,18 @@ namespace {
             prompt << "- detection_time_in_video must use MM:SS only; do not use HH:MM:SS.\n";
         }
         if (options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics) {
-            prompt << "- Within temporal observation/event objects, prefer frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer}.\n";
+            if (allowIdentityPatch) {
+                prompt << "- Within identity_patch objects, prefer frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer} for the representative evidence frame.\n";
+            }
+            if (options.hasTemporal) {
+                prompt << "- Within temporal observation/event objects, prefer frame_ref: {\"mosaic_index\": integer, \"cell_index\": integer}.\n";
+            }
+        }
+        if (usesDirectChatIdentityContinuity_(options) && !options.hasTemporal) {
+            prompt << "- In direct chat identity continuity mode, if a clearly visible positive target directly supports the answer or clearly matches prior memory, emit one identity_patch item for that target and do not leave identity_patch empty.\n";
+            prompt << "- Do not emit absent/not_visible continuity patches in this mode.\n";
+            prompt << "- Prefer including identity_signature_traits for that target so the chat identity card can surface the main characteristics.\n";
+            prompt << "- When a visible target is clearly localizable, include portrait_crop with kind, confidence, and bbox_norm_in_cell, plus context_bbox_norm_in_cell when helpful.\n";
         }
         prompt << "- Keep answer short and factual.\n";
         prompt << "- No markdown, no code fences, no extra keys.\n";
@@ -21957,6 +25026,18 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             hit.alertCondition = true;
         }
         hit.hasMatch = hitHasStructuredMatch_(hit);
+        if (!cameraStyleFlow) {
+            ensureFallbackIdentityPortraitCandidatesForChatHit_(
+                hit,
+                promptSections.rawPrompt,
+                promptSections.basePrompt,
+                promptSections.temporalStaticJson,
+                promptSections.temporalRuntimeJson,
+                &frames,
+                videoPackagingMode,
+                camLogId,
+                "callOpenAIVisionVideoSegment_");
+        }
         return hit;
     }
     catch (const CoreModelLeaseAborted&) {
@@ -27567,6 +30648,7 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
     if (videos.empty()) {
         return result;
     }
+    ensureChatTemporalVisualState_(chatTemporalState.visualState);
 
     const std::vector<std::size_t> orderedIndices =
         buildChatTemporalExecutionOrder_(videos, routerResult);
@@ -27675,30 +30757,15 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
         const std::string roundDecisionNow =
             temporal::decisionAnchorUtc(nowIsoForInference, roundEndTs);
 
-        temporal::applyRound(
-            chatTemporalState.state,
+        (void)applyChatIdentityContinuityRound_(
+            hit,
             chatTemporalState.planEnvelope,
-            hit.identityPatch,
-            hit.observations,
-            hit.temporalEvidenceCandidates,
             roundDecisionNow,
-            hit.answer,
-            hit.unknownReasons,
-            hit.segmentStartTs,
-            hit.segmentEndTs,
-            hit.faceIdentityMatches
-        );
-
-        const nlohmann::json candidateDecisions =
-            temporal::extractLastRoundCandidateDecisions(chatTemporalState.state);
-        if (candidateDecisions.is_array() && !candidateDecisions.empty()) {
-            Logger::instance().logDebug(
-                "agent",
-                "analyzeVideosWithOpenAISequentialTemporalChat_: candidate decisions camera_id=" +
-                std::to_string(segment.cameraId) +
-                " decisions=" + candidateDecisions.dump()
-            );
-        }
+            /*allowTemporalObservations=*/true,
+            chatTemporalState.state,
+            chatTemporalState.visualState,
+            "agent",
+            "analyzeVideosWithOpenAISequentialTemporalChat_");
 
         const temporal::EvalResult eval = temporal::evaluate(
             chatTemporalState.state,

@@ -114,6 +114,7 @@
     <ClInclude Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\OperationTaskState.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\PromptBuilder.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\RoutingLexicon.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\SkillRegistry.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\SkillTypes.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.h" />
@@ -125,6 +126,7 @@
     <ClInclude Include="..\Perceptrum\orchestrator\skills\EditCameraAgentSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\EditCameraSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\EditCamerasBatchSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\EditJobSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.h" />
@@ -157,6 +159,7 @@
     <ClCompile Include="..\Perceptrum\orchestrator\LocalLlmRuntimeManager.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\OperationTaskState.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\PromptBuilder.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\RoutingLexicon.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\SkillRegistry.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraAgentSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\CreateCameraSkill.cpp" />
@@ -167,6 +170,7 @@
     <ClCompile Include="..\Perceptrum\orchestrator\skills\EditCameraAgentSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\EditCameraSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\EditCamerasBatchSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\EditJobSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.cpp" />

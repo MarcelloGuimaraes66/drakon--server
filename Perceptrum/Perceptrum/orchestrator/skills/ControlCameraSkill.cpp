@@ -10,6 +10,7 @@
 #include "../OperationTaskState.h"
 #include "../ProgressUtils.h"
 #include "../PromptBuilder.h"
+#include "../RoutingLexicon.h"
 #include "shared/AgentAuthoringShared.h"
 
 namespace chatv2 {
@@ -25,9 +26,10 @@ std::string safeText_(const json& value, const char* key)
 
 std::string normalizedAction_(std::string value)
 {
-    value = shared::lowerAscii(shared::trimText(std::move(value)));
-    if (value == "start" || value == "stop") {
-        return value;
+    const RoutingLexiconSignals signals = detectRoutingLexiconSignals(value);
+    const std::string runtimeAction = runtimeActionFromRoutingSignals(signals);
+    if (!runtimeAction.empty()) {
+        return runtimeAction;
     }
     return "";
 }

@@ -89,6 +89,12 @@ import {
   deriveHandleFromEmail,
   normalizeUserHandleInput,
 } from "./userHandle";
+import {
+  getCentralAccountDeletionPreview,
+  getLocalAccountDeletionPreview,
+  purgeCentralAccountData,
+  purgeLocalAccountData,
+} from "./accountDeletion";
 
 // AI agent descriptions mapping
 const ALGORITHM_DESCRIPTIONS: Record<string, string> = {
@@ -5802,6 +5808,37 @@ async function ensureSchema(db: D1Database): Promise<void> {
         }
       };
 
+      const getPgColumnDataType = async (
+        tableName: string,
+        columnName: string
+      ): Promise<string> => {
+        if (!isPgLike) return "";
+        try {
+          const row = await db.prepare(
+            `SELECT data_type
+               FROM information_schema.columns
+              WHERE table_schema = current_schema()
+                AND table_name = ?
+                AND column_name = ?
+              LIMIT 1`
+          )
+            .bind(tableName, columnName)
+            .first();
+          return String((row as any)?.data_type || "").trim().toLowerCase();
+        } catch {
+          return "";
+        }
+      };
+
+      const isPgTextLikeType = (dataType: string): boolean => {
+        return (
+          dataType.includes("text") ||
+          dataType.includes("character") ||
+          dataType.includes("json") ||
+          dataType.includes("uuid")
+        );
+      };
+
       if (await tableExists("chat_messages")) {
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN progress_json TEXT`);
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN usage_recorded_at TEXT`);
@@ -5917,6 +5954,11 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON local_users(pairing_client_id)
       `).run();
 
+      const localUsersCreatedAtType = await getPgColumnDataType(
+        "local_users",
+        "created_at"
+      );
+
       await db.prepare(
         isPgLike
           ? `
@@ -5936,8 +5978,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
                 THEN CONCAT('local:', id::text)
               ELSE pairing_client_id
             END,
-            created_at = COALESCE(created_at, CURRENT_TIMESTAMP::text),
-            updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP::text)
+            created_at = COALESCE(created_at, ${isPgTextLikeType(localUsersCreatedAtType) ? "CURRENT_TIMESTAMP::text" : "CURRENT_TIMESTAMP"}),
+            updated_at = COALESCE(updated_at, ${isPgTextLikeType(localUsersCreatedAtType) ? "CURRENT_TIMESTAMP::text" : "CURRENT_TIMESTAMP"})
       `
           : `
         UPDATE local_users
@@ -6261,6 +6303,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           last_compacted_message_id INTEGER NOT NULL DEFAULT 0,
           token_estimate INTEGER NOT NULL DEFAULT 0,
           compacted_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TEXT NOT NULL,
           PRIMARY KEY (user_id, session_id)
         )
@@ -6271,9 +6314,15 @@ async function ensureSchema(db: D1Database): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_chat_session_contexts_user_updated
         ON chat_session_contexts(user_id, updated_at DESC)
       `).run();
+      await addColumnIfMissing(`ALTER TABLE chat_session_contexts ADD COLUMN created_at TEXT`);
       await addColumnIfMissing(
         `ALTER TABLE chat_session_contexts ADD COLUMN task_state_json TEXT NOT NULL DEFAULT '{}'`
       );
+      await db.prepare(
+        `UPDATE chat_session_contexts
+         SET created_at = COALESCE(created_at, updated_at, compacted_at, CURRENT_TIMESTAMP)
+         WHERE created_at IS NULL OR TRIM(created_at) = ''`
+      ).run();
 
       await db.prepare(
         isPgLike
@@ -6965,15 +7014,26 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ).run();
       }
 
+      const appUsersCreatedAtType = await getPgColumnDataType(
+        "app_users",
+        "created_at"
+      );
+
       if (isPgLike) {
         await db.prepare(
-          `UPDATE app_users
+          isPgTextLikeType(appUsersCreatedAtType)
+            ? `UPDATE app_users
            SET created_at = COALESCE(NULLIF(BTRIM(created_at), ''), NULLIF(BTRIM(updated_at), ''), CURRENT_TIMESTAMP::text),
                updated_at = COALESCE(NULLIF(BTRIM(updated_at), ''), NULLIF(BTRIM(created_at), ''), CURRENT_TIMESTAMP::text)
            WHERE created_at IS NULL
               OR BTRIM(created_at) = ''
               OR updated_at IS NULL
               OR BTRIM(updated_at) = ''`
+            : `UPDATE app_users
+           SET created_at = COALESCE(created_at, updated_at, CURRENT_TIMESTAMP),
+               updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+           WHERE created_at IS NULL
+              OR updated_at IS NULL`
         ).run();
       } else {
         await db.prepare(
@@ -9160,6 +9220,174 @@ function normalizeChatTaskState(value: unknown) {
   };
 }
 
+function normalizeChatVideoScopeMemory(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const cameraIds = normalizePositiveIntegerArray(source.camera_ids, 12);
+  const cameraNames = Array.isArray(source.camera_names)
+    ? Array.from(
+        new Set(
+          source.camera_names
+            .filter((item) => typeof item === "string")
+            .map((item) => String(item).trim())
+            .filter(Boolean)
+        )
+      ).slice(0, 12)
+    : [];
+  const query = normalizeText(source.query).slice(0, 300);
+  const updatedAt = normalizeText(source.updated_at).slice(0, 64);
+  const timeWindowMinutes = clampInteger(source.time_window_minutes_before_now);
+  const allCameras = Boolean(source.all_cameras);
+
+  if (cameraIds.length === 0 && cameraNames.length === 0 && !allCameras) {
+    return null;
+  }
+
+  return {
+    camera_ids: cameraIds,
+    camera_names: cameraNames,
+    all_cameras: allCameras,
+    time_window_minutes_before_now: timeWindowMinutes,
+    ...(query ? { query } : {}),
+    ...(updatedAt ? { updated_at: updatedAt } : {}),
+  };
+}
+
+async function persistChatVideoScopeMemory(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  scopeInput: {
+    camera_ids?: unknown;
+    camera_names?: unknown;
+    all_cameras?: unknown;
+    time_window_minutes_before_now?: unknown;
+    query?: unknown;
+  }
+) {
+  const scope = normalizeChatVideoScopeMemory({
+    camera_ids: scopeInput.camera_ids,
+    camera_names: scopeInput.camera_names,
+    all_cameras: scopeInput.all_cameras,
+    time_window_minutes_before_now: scopeInput.time_window_minutes_before_now,
+    query: scopeInput.query,
+    updated_at: new Date().toISOString(),
+  });
+  if (!scope) {
+    return;
+  }
+
+  const contextRow = await db
+    .prepare(
+      `SELECT compact_context_json, task_state_json, last_compacted_message_id, token_estimate
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+    .bind(userId, chatSessionId)
+    .first();
+
+  let compactContext = buildDefaultChatCompactContext();
+  let taskState = buildDefaultChatTaskState();
+  let lastCompactedMessageId = 0;
+  let tokenEstimate = 0;
+
+  if (contextRow && typeof (contextRow as any).compact_context_json === "string") {
+    try {
+      compactContext = normalizeChatCompactContext(
+        JSON.parse(String((contextRow as any).compact_context_json || "{}"))
+      );
+    } catch {
+      compactContext = buildDefaultChatCompactContext();
+    }
+    lastCompactedMessageId = Number((contextRow as any).last_compacted_message_id || 0);
+    tokenEstimate = Number((contextRow as any).token_estimate || 0);
+  }
+
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      taskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      taskState = buildDefaultChatTaskState();
+    }
+  }
+
+  const existingSessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+  const singleCameraName =
+    Array.isArray(scope.camera_names) && scope.camera_names.length === 1
+      ? normalizeText(scope.camera_names[0])
+      : "";
+
+  const nextTaskState = normalizeChatTaskState({
+    ...taskState,
+    session_entities: {
+      ...existingSessionEntities,
+      last_video_scope: scope,
+      ...(singleCameraName ? { last_camera_name: singleCameraName } : {}),
+    },
+  });
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT INTO chat_session_contexts (
+         user_id,
+         session_id,
+         compact_context_json,
+         task_state_json,
+         last_compacted_message_id,
+         token_estimate,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, session_id) DO UPDATE SET
+         compact_context_json = excluded.compact_context_json,
+         task_state_json = excluded.task_state_json,
+         last_compacted_message_id = excluded.last_compacted_message_id,
+         token_estimate = excluded.token_estimate,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      userId,
+      chatSessionId,
+      JSON.stringify(compactContext),
+      JSON.stringify(nextTaskState),
+      lastCompactedMessageId,
+      tokenEstimate,
+      now,
+      now
+    )
+    .run();
+}
+
+async function safePersistChatVideoScopeMemory(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  scopeInput: {
+    camera_ids?: unknown;
+    camera_names?: unknown;
+    all_cameras?: unknown;
+    time_window_minutes_before_now?: unknown;
+    query?: unknown;
+  }
+) {
+  try {
+    await persistChatVideoScopeMemory(db, userId, chatSessionId, scopeInput);
+  } catch (error) {
+    console.error("[CHAT VIDEO SCOPE] Failed to persist chat video scope memory:", error);
+  }
+}
+
 type ChatCameraRegistrationMetadata = {
   type: "camera_registration_draft";
   status: "awaiting_confirmation" | "registered";
@@ -9714,6 +9942,18 @@ function safeChatContextMessageContent(content: unknown): string {
   if (!normalized) return "";
   const maxChars = 700;
   return normalized.length > maxChars ? `${normalized.slice(0, maxChars - 3).trimEnd()}...` : normalized;
+}
+
+function safeChatContextCameraSelection(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  try {
+    return normalizeChatVideoScopeMemory(JSON.parse(value));
+  } catch {
+    return null;
+  }
 }
 
 type ChatModelRuntimeConfig = {
@@ -15533,6 +15773,41 @@ app.patch("/api/identity/handle", async (c) => {
   });
 });
 
+app.get("/api/identity/account/preview", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  try {
+    const preview = await getCentralAccountDeletionPreview(
+      c.env.DB,
+      verified.claims.public_id
+    );
+    return c.json({ preview });
+  } catch (error) {
+    console.error("[IDENTITY] Failed to build account deletion preview:", error);
+    return c.json({ error: "Failed to load central account deletion preview." }, 500);
+  }
+});
+
+app.delete("/api/identity/account", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  try {
+    const result = await purgeCentralAccountData(c.env.DB, verified.claims.public_id);
+    return c.json({ success: true, result });
+  } catch (error) {
+    console.error("[IDENTITY] Failed to delete central account:", error);
+    return c.json({ error: "Failed to delete central identity account." }, 500);
+  }
+});
+
 app.post("/api/find-share-users/resolve", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
 
@@ -16492,6 +16767,228 @@ app.get("/api/auth/me", async (c) => {
   });
 });
 
+app.get("/api/account/deletion-preview", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const user = c.get("user")!;
+  const localIdentity =
+    user.auth_provider === "local"
+      ? await findLocalUserIdentityCache(c.env.DB, {
+          email: user.email,
+          serverPublicId: user.id,
+        })
+      : null;
+  const appUserState = await getAppUserCentralIdentityState(c.env.DB, user.id);
+  const localServerPublicId =
+    normalizeText((localIdentity as any)?.server_public_id) ||
+    normalizeText(appUserState?.publicId) ||
+    null;
+  const hasCentralLink = Boolean(localServerPublicId);
+
+  const localPreview = await getLocalAccountDeletionPreview(c.env.DB, {
+    appUserId: user.id,
+    email: user.email,
+    localUserId: Number((localIdentity as any)?.id || 0) || null,
+    localServerPublicId,
+  });
+
+  const remote = {
+    configured: isCentralIdentityClientConfigured(c.env),
+    linked: hasCentralLink,
+    unavailable_reason: null as string | null,
+    preview: {
+      already_deleted: false,
+      total_records: 0,
+      sections: [] as Array<{ key: string; count: number }>,
+    },
+  };
+
+  if (hasCentralLink) {
+    if (!isCentralIdentityClientConfigured(c.env)) {
+      remote.unavailable_reason = "Central identity server is not configured.";
+    } else {
+      try {
+        const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+        const remoteResult = await callCentralIdentityAuthorizedEndpoint(
+          c.env,
+          "/api/identity/account/preview",
+          {
+            method: "GET",
+            token: centralContext.grantToken,
+          }
+        );
+
+        if (!remoteResult.response.ok) {
+          remote.unavailable_reason = normalizeResponseErrorMessage(
+            remoteResult.data,
+            "Failed to load central account deletion preview."
+          );
+        } else {
+          remote.preview = remoteResult.data?.preview || remote.preview;
+        }
+      } catch (error) {
+        console.error("[ACCOUNT DELETE] Failed to load central preview:", error);
+        remote.unavailable_reason =
+          normalizeText((error as any)?.message) ||
+          "Unable to reach the central identity server.";
+      }
+    }
+  }
+
+  return c.json({
+    confirmation_email: user.email,
+    requires_password: user.auth_provider === "local",
+    local: localPreview,
+    remote,
+  });
+});
+
+app.delete("/api/account", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      confirm_email?: string;
+      confirmation_text?: string;
+      password?: string;
+    }>()
+    .catch(() => null);
+
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const normalizedConfirmEmail = normalizeEmail(
+    typeof body.confirm_email === "string" ? body.confirm_email : ""
+  );
+  if (!normalizedConfirmEmail || normalizedConfirmEmail !== normalizeEmail(user.email)) {
+    return c.json({ error: "Confirmation email does not match the signed-in account." }, 400);
+  }
+
+  const confirmationText = normalizeText(body.confirmation_text).toUpperCase();
+  if (confirmationText !== "DELETE") {
+    return c.json({ error: 'Confirmation text must be "DELETE".' }, 400);
+  }
+
+  const localIdentity =
+    user.auth_provider === "local"
+      ? await findLocalUserIdentityCache(c.env.DB, {
+          email: user.email,
+          serverPublicId: user.id,
+        })
+      : null;
+  const appUserState = await getAppUserCentralIdentityState(c.env.DB, user.id);
+  const localUserId = Number((localIdentity as any)?.id || 0) || null;
+  const localServerPublicId =
+    normalizeText((localIdentity as any)?.server_public_id) ||
+    normalizeText(appUserState?.publicId) ||
+    null;
+  const hasCentralLink = Boolean(localServerPublicId);
+
+  if (user.auth_provider === "local") {
+    const password = typeof body.password === "string" ? body.password : "";
+    const passwordHash = normalizeText((localIdentity as any)?.password_hash);
+    if (!password || !passwordHash) {
+      return c.json({ error: "Password confirmation is required." }, 400);
+    }
+
+    const passwordMatches = await bcrypt.compare(password, passwordHash);
+    if (!passwordMatches) {
+      return c.json({ error: "Password confirmation failed." }, 401);
+    }
+  }
+
+  let remoteResult: Record<string, unknown> | null = null;
+  if (hasCentralLink) {
+    if (!isCentralIdentityClientConfigured(c.env)) {
+      return c.json({ error: "Central identity server is not configured." }, 503);
+    }
+
+    let centralContext: CentralUserRelayContext;
+    try {
+      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            normalizeText((error as any)?.message) ||
+            "Unable to resolve central identity credentials for this account.",
+        },
+        409
+      );
+    }
+
+    try {
+      const centralDelete = await callCentralIdentityAuthorizedEndpoint(
+        c.env,
+        "/api/identity/account",
+        {
+          method: "DELETE",
+          token: centralContext.grantToken,
+        }
+      );
+
+      if (!centralDelete.response.ok) {
+        return c.json(
+          {
+            error: normalizeResponseErrorMessage(
+              centralDelete.data,
+              "Failed to delete the account on the central identity server."
+            ),
+          },
+          (centralDelete.response.status || 502) as any
+        );
+      }
+
+      remoteResult = (centralDelete.data?.result || centralDelete.data) as Record<string, unknown>;
+    } catch (error) {
+      console.error("[ACCOUNT DELETE] Failed to delete account on central server:", error);
+      return c.json({ error: "Unable to reach the central identity server." }, 502);
+    }
+  }
+
+  try {
+    const localResult = await purgeLocalAccountData(c.env.DB, c.env.R2_BUCKET, {
+      appUserId: user.id,
+      email: user.email,
+      localUserId,
+      localServerPublicId,
+    });
+    const countTableRows = async (tableName: string) => {
+      try {
+        const row = await c.env.DB
+          .prepare(`SELECT COUNT(*) AS count FROM ${tableName}`)
+          .first();
+        const count = Number((row as any)?.count || 0);
+        return Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+      } catch {
+        return 0;
+      }
+    };
+    const remainingAppUsers = await countTableRows("app_users");
+    const remainingLocalUsers = await countTableRows("local_users");
+    const shouldClearDesktopStorageRoot =
+      remainingAppUsers === 0 && remainingLocalUsers === 0;
+
+    await clearLocalSession(c);
+    await clearGoogleSession(c);
+
+    return c.json({
+      success: true,
+      redirect_path: "/login?accountDeleted=1",
+      local_result: localResult,
+      remote_result: remoteResult,
+      desktop_cleanup: {
+        clear_storage_root: shouldClearDesktopStorageRoot,
+      },
+    });
+  } catch (error) {
+    console.error("[ACCOUNT DELETE] Failed to delete local account data:", error);
+    return c.json({ error: "Failed to delete local account data." }, 500);
+  }
+});
+
 app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
@@ -16642,88 +17139,107 @@ app.post("/api/sessions", async (c) => {
         : await resolveExistingGoogleAppUser(c.env.DB, googleUser);
     const googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
 
-    if (googleIntent === "signup" && isCentralIdentityClientConfigured(c.env)) {
+    const requireCentralGoogleSync = googleIntent === "signup";
+    if (isCentralIdentityClientConfigured(c.env)) {
       if (!googleUser.google_id_token) {
-        clearGoogleOAuthFlowCookies(c);
-        return c.json({ error: "Google login could not be verified for central identity." }, 502);
-      }
-
-      let centralGoogleResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>>;
-      try {
-        centralGoogleResult = await callCentralIdentityEndpoint(
-          c.env,
-          "/api/identity/google-upsert",
-          {
-            id_token: googleUser.google_id_token,
-            country_code: requestedCountryCode,
-            handle: googleProfile.handle,
+        if (requireCentralGoogleSync) {
+          clearGoogleOAuthFlowCookies(c);
+          return c.json({ error: "Google login could not be verified for central identity." }, 502);
+        }
+        console.warn(
+          "[GOOGLE LOGIN] Skipping central Google sync because the Google id_token is unavailable for an existing account login."
+        );
+      } else {
+        let centralGoogleResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null =
+          null;
+        try {
+          centralGoogleResult = await callCentralIdentityEndpoint(
+            c.env,
+            "/api/identity/google-upsert",
+            {
+              id_token: googleUser.google_id_token,
+              country_code: requestedCountryCode,
+              handle: googleProfile.handle,
+            }
+          );
+        } catch (error) {
+          console.error("[GOOGLE LOGIN] Central Google sync request failed:", error);
+          if (requireCentralGoogleSync) {
+            clearGoogleOAuthFlowCookies(c);
+            return c.json({ error: "Unable to reach the central identity server." }, 502);
           }
-        );
-      } catch (error) {
-        console.error("[GOOGLE LOGIN] Central Google sync request failed:", error);
-        clearGoogleOAuthFlowCookies(c);
-        return c.json({ error: "Unable to reach the central identity server." }, 502);
-      }
+        }
 
-      if (!centralGoogleResult.response.ok || !centralGoogleResult.verifiedGrant) {
-        console.error(
-          "[GOOGLE LOGIN] Central Google sync rejected the login:",
-          centralGoogleResult.response.status,
-          centralGoogleResult.data
-        );
-        clearGoogleOAuthFlowCookies(c);
-        return c.json(
-          {
-            error: normalizeResponseErrorMessage(
-              centralGoogleResult.data,
-              "Failed to sync Google account with the central identity server."
-            ),
-          },
-          (centralGoogleResult.response.status || 502) as any
-        );
-      }
+        if (centralGoogleResult) {
+          if (!centralGoogleResult.response.ok || !centralGoogleResult.verifiedGrant) {
+            console.error(
+              "[GOOGLE LOGIN] Central Google sync rejected the login:",
+              centralGoogleResult.response.status,
+              centralGoogleResult.data
+            );
+            if (requireCentralGoogleSync) {
+              clearGoogleOAuthFlowCookies(c);
+              return c.json(
+                {
+                  error: normalizeResponseErrorMessage(
+                    centralGoogleResult.data,
+                    "Failed to sync Google account with the central identity server."
+                  ),
+                },
+                (centralGoogleResult.response.status || 502) as any
+              );
+            }
+          } else {
+            const remoteCountryCode = normalizeCountryCode(
+              centralGoogleResult.data?.user?.country_code,
+              null
+            );
+            const remoteHandle = normalizeUserHandleInput(centralGoogleResult.data?.user?.handle);
+            effectiveGoogleCountryCode = remoteCountryCode || effectiveGoogleCountryCode;
 
-      const remoteCountryCode = normalizeCountryCode(
-        centralGoogleResult.data?.user?.country_code,
-        null
-      );
-      const remoteHandle = normalizeUserHandleInput(centralGoogleResult.data?.user?.handle);
-      effectiveGoogleCountryCode = remoteCountryCode || effectiveGoogleCountryCode;
+            await ensureAppUserRow(c.env.DB, {
+              id: canonicalUserId,
+              email: googleUser.email,
+              auth_provider: "google",
+              country_code: effectiveGoogleCountryCode || null,
+              handle: remoteHandle || googleProfile.handle || null,
+            });
+            if (remoteHandle) {
+              await updateAppUserHandle(c.env.DB, canonicalUserId, remoteHandle);
+            }
+            await updateAppUserCentralIdentityState(c.env.DB, {
+              appUserId: canonicalUserId,
+              email: googleUser.email,
+              authProvider: "google",
+              verifiedGrant: centralGoogleResult.verifiedGrant,
+              deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+                centralGoogleResult.data?.device_session
+              ),
+            });
+            await syncLegacyLocalUserGrantCacheFromGrant(c.env.DB, {
+              email: googleUser.email,
+              verifiedGrant: centralGoogleResult.verifiedGrant,
+            });
 
-      await ensureAppUserRow(c.env.DB, {
-        id: canonicalUserId,
-        email: googleUser.email,
-        auth_provider: "google",
-        country_code: effectiveGoogleCountryCode || null,
-        handle: remoteHandle || googleProfile.handle || null,
-      });
-      if (remoteHandle) {
-        await updateAppUserHandle(c.env.DB, canonicalUserId, remoteHandle);
-      }
-      await updateAppUserCentralIdentityState(c.env.DB, {
-        appUserId: canonicalUserId,
-        email: googleUser.email,
-        authProvider: "google",
-        verifiedGrant: centralGoogleResult.verifiedGrant,
-        deviceSession: normalizeCentralIdentityDeviceSessionPayload(
-          centralGoogleResult.data?.device_session
-        ),
-      });
-      await syncLegacyLocalUserGrantCacheFromGrant(c.env.DB, {
-        email: googleUser.email,
-        verifiedGrant: centralGoogleResult.verifiedGrant,
-      });
-
-      if (!centralGoogleResult.verifiedGrant.claims.login_allowed) {
-        clearGoogleOAuthFlowCookies(c);
-        return c.json(
-          {
-            error:
-              centralGoogleResult.verifiedGrant.claims.reason ||
-              "This account is not allowed to log in.",
-          },
-          403
-        );
+            if (!centralGoogleResult.verifiedGrant.claims.login_allowed) {
+              if (requireCentralGoogleSync) {
+                clearGoogleOAuthFlowCookies(c);
+                return c.json(
+                  {
+                    error:
+                      centralGoogleResult.verifiedGrant.claims.reason ||
+                      "This account is not allowed to log in.",
+                  },
+                  403
+                );
+              }
+              console.warn(
+                "[GOOGLE LOGIN] Central Google sync marked the existing account as not allowed to log in:",
+                centralGoogleResult.verifiedGrant.claims.reason || "unknown"
+              );
+            }
+          }
+        }
       }
     }
 
@@ -18299,24 +18815,64 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
   const hasCameras = cameraIds.length > 0;
 
   // Compute enabled agents per camera (one query)
-  const enabledAgentsMap: Record<number, { count: number; types: string[] }> = {};
+  const enabledAgentsMap: Record<number, {
+    count: number;
+    types: string[];
+    agents: Array<{
+      id: number;
+      algorithm_type: string;
+      display_name: string;
+    }>;
+  }> = {};
   if (hasCameras) {
     const placeholders = cameraIds.map(() => "?").join(",");
     const { results: agentStats } = await c.env.DB.prepare(
-      `SELECT camera_id, COUNT(*) AS enabled_count, GROUP_CONCAT(algorithm_type) AS enabled_types
-       FROM camera_algorithms
-       WHERE camera_id IN (${placeholders}) AND is_enabled = 1
-       GROUP BY camera_id`
+      `SELECT ca.id,
+              ca.camera_id,
+              ca.algorithm_type,
+              ca.config_json
+       FROM camera_algorithms ca
+       JOIN cameras c
+         ON c.id = ca.camera_id
+       WHERE c.user_id = ?
+         AND ca.camera_id IN (${placeholders})
+         AND ca.is_enabled = 1
+       ORDER BY ca.camera_id ASC, ca.updated_at DESC, ca.id DESC`
     )
-      .bind(...cameraIds)
+      .bind(user.id, ...cameraIds)
       .all();
 
     for (const row of (agentStats || [])) {
       const r = row as any;
-      enabledAgentsMap[r.camera_id] = {
-        count: r.enabled_count || 0,
-        types: r.enabled_types ? r.enabled_types.split(",") : [],
+      const cameraId = Number(r.camera_id);
+      if (!Number.isInteger(cameraId) || cameraId <= 0) continue;
+
+      const rawAlgorithmType = normalizeCameraStartSummaryText(r.algorithm_type);
+      const normalizedAlgorithmType = rawAlgorithmType.toLowerCase();
+      const displayName = normalizedAlgorithmType.startsWith("custom_")
+        ? getCustomCameraAgentDisplayName(r)
+        : ALGORITHM_DISPLAY_NAMES[normalizedAlgorithmType] ||
+          humanizeAlgorithmTypeLabel(normalizedAlgorithmType) ||
+          rawAlgorithmType ||
+          "Agent";
+
+      const current = enabledAgentsMap[cameraId] || {
+        count: 0,
+        types: [],
+        agents: [],
       };
+
+      current.count += 1;
+      if (normalizedAlgorithmType && !current.types.includes(normalizedAlgorithmType)) {
+        current.types.push(normalizedAlgorithmType);
+      }
+      current.agents.push({
+        id: Number(r.id) || 0,
+        algorithm_type: normalizedAlgorithmType || rawAlgorithmType || "agent",
+        display_name: displayName,
+      });
+
+      enabledAgentsMap[cameraId] = current;
     }
   }
 
@@ -18384,6 +18940,7 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
     perCamera[c.id] = {
       enabled_agents_count: enabledAgentsMap[c.id]?.count || 0,
       enabled_agents_types: enabledAgentsMap[c.id]?.types || [],
+      enabled_agents: enabledAgentsMap[c.id]?.agents || [],
       last_started_at: lastStartedMap[c.id] || null,
       last_error_at: lastErrorMap[c.id] || null,
       detections_24h: detectionStatsMap[c.id]?.count_24h || 0,
@@ -20703,120 +21260,136 @@ async function startJobForUser(
   userId: string,
   jobId: number
 ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
-  if (!Number.isInteger(jobId) || jobId <= 0) {
-    return { statusCode: 400, body: { error: "Invalid job id" } };
-  }
-
-  const job = await env.DB.prepare(
-    `SELECT
-       j.*,
-       jrs.status AS runtime_status
-     FROM jobs j
-     LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
-     WHERE j.id = ? AND j.user_id = ?
-     LIMIT 1`
-  )
-    .bind(jobId, userId)
-    .first();
-
-  if (!job) {
-    return { statusCode: 404, body: { error: "Job not found" } };
-  }
-
-  const jobData = job as any;
-  if (jobData.runtime_status === "running") {
-    return { statusCode: 200, body: { ok: true, already_running: true, status: "running" } };
-  }
-
-  if (jobData.runtime_status === "stopping") {
-    return { statusCode: 409, body: { error: "Job is currently stopping" } };
-  }
-
-  const { results: stepRows } = await env.DB.prepare(
-    `SELECT id
-     FROM job_steps
-     WHERE job_id = ?
-     ORDER BY step_order ASC`
-  )
-    .bind(jobId)
-    .all();
-
-  if (!stepRows || stepRows.length === 0) {
-    return {
-      statusCode: 400,
-      body: { error: "Job must have at least one step before it can be started." },
-    };
-  }
-
-  for (const row of stepRows) {
-    const stepId = Number((row as any)?.id);
-    if (!Number.isInteger(stepId) || stepId <= 0) {
-      return { statusCode: 400, body: { error: "Job step is invalid." } };
+  try {
+    if (!Number.isInteger(jobId) || jobId <= 0) {
+      return { statusCode: 400, body: { error: "Invalid job id" } };
     }
 
-    const [targetsResult, agentsResult] = await Promise.all([
-      env.DB.prepare(
-        `SELECT camera_id
-         FROM job_step_targets
-         WHERE step_id = ?`
-      )
-        .bind(stepId)
-        .all(),
-      env.DB.prepare(
-        `SELECT camera_id
-         FROM job_step_agents
-         WHERE step_id = ?
-           AND is_active = 1`
-      )
-        .bind(stepId)
-        .all(),
-    ]);
+    const job = await env.DB.prepare(
+      `SELECT
+         j.*,
+         jrs.status AS runtime_status
+       FROM jobs j
+       LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
+       WHERE j.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+      .bind(jobId, userId)
+      .first();
 
-    const targets = (targetsResult.results || [])
-      .map((target: any) => Number(target.camera_id))
-      .filter((cameraIdValue: number) => Number.isInteger(cameraIdValue));
-    const agentCameraIds = new Set(
-      (agentsResult.results || [])
-        .map((agent: any) =>
-          agent.camera_id === null || agent.camera_id === undefined ? null : Number(agent.camera_id)
-        )
-    );
-    const hasDefaultAgent = agentCameraIds.has(null);
-    const allTargetsAssigned = targets.length > 0 && targets.every((cameraIdValue: number) => cameraIdValue > 0);
-    const allTargetsHaveAgents =
-      allTargetsAssigned &&
-      targets.every((cameraIdValue: number) => hasDefaultAgent || agentCameraIds.has(cameraIdValue));
+    if (!job) {
+      return { statusCode: 404, body: { error: "Job not found" } };
+    }
 
-    if (!allTargetsHaveAgents) {
+    const jobData = job as any;
+    if (jobData.runtime_status === "running") {
       return {
-        statusCode: 400,
-        body: {
-          error: "All steps must have at least one target and an active agent before the job can be started.",
-        },
+        statusCode: 200,
+        body: { ok: true, already_running: true, status: "running" },
       };
     }
-  }
 
-  const providerRequirements = await loadJobInferenceProviderRequirements(env.DB, jobId);
-  if (providerRequirements.requiresOpenAi) {
-    const openAiKey = await getUserOpenAIApiKey(env.DB, userId);
-    if (!openAiKey) {
-      return { statusCode: 400, body: buildOpenAiKeyRequiredErrorBody() as Record<string, unknown> };
+    if (jobData.runtime_status === "stopping") {
+      return { statusCode: 409, body: { error: "Job is currently stopping" } };
     }
-  }
-  if (providerRequirements.requiresZAi) {
-    const zAiKey = await getUserZAIApiKey(env.DB, userId);
-    if (!zAiKey) {
-      return { statusCode: 400, body: buildZAiKeyRequiredErrorBody() as Record<string, unknown> };
+
+    const { results: stepRows } = await env.DB.prepare(
+      `SELECT id
+       FROM job_steps
+       WHERE job_id = ?
+       ORDER BY step_order ASC`
+    )
+      .bind(jobId)
+      .all();
+
+    if (!stepRows || stepRows.length === 0) {
+      return {
+        statusCode: 400,
+        body: { error: "Job must have at least one step before it can be started." },
+      };
     }
-  }
 
-  const startResult = await enqueueManualJobStart(env, jobData);
-  if (!startResult.ok) {
-    return { statusCode: 500, body: { error: startResult.error || "Failed to start job" } };
-  }
+    for (const row of stepRows) {
+      const stepId = Number((row as any)?.id);
+      if (!Number.isInteger(stepId) || stepId <= 0) {
+        return { statusCode: 400, body: { error: "Job step is invalid." } };
+      }
 
-  return { statusCode: 200, body: { ok: true } };
+      const [targetsResult, agentsResult] = await Promise.all([
+        env.DB.prepare(
+          `SELECT camera_id
+           FROM job_step_targets
+           WHERE step_id = ?`
+        )
+          .bind(stepId)
+          .all(),
+        env.DB.prepare(
+          `SELECT camera_id
+           FROM job_step_agents
+           WHERE step_id = ?
+             AND is_active = 1`
+        )
+          .bind(stepId)
+          .all(),
+      ]);
+
+      const targets = (targetsResult.results || [])
+        .map((target: any) => Number(target.camera_id))
+        .filter((cameraIdValue: number) => Number.isInteger(cameraIdValue));
+      const agentCameraIds = new Set(
+        (agentsResult.results || [])
+          .map((agent: any) =>
+            agent.camera_id === null || agent.camera_id === undefined ? null : Number(agent.camera_id)
+          )
+      );
+      const hasDefaultAgent = agentCameraIds.has(null);
+      const allTargetsAssigned =
+        targets.length > 0 && targets.every((cameraIdValue: number) => cameraIdValue > 0);
+      const allTargetsHaveAgents =
+        allTargetsAssigned &&
+        targets.every((cameraIdValue: number) => hasDefaultAgent || agentCameraIds.has(cameraIdValue));
+
+      if (!allTargetsHaveAgents) {
+        return {
+          statusCode: 400,
+          body: {
+            error: "All steps must have at least one target and an active agent before the job can be started.",
+          },
+        };
+      }
+    }
+
+    const providerRequirements = await loadJobInferenceProviderRequirements(env.DB, jobId);
+    if (providerRequirements.requiresOpenAi) {
+      const openAiKey = await getUserOpenAIApiKey(env.DB, userId);
+      if (!openAiKey) {
+        return {
+          statusCode: 400,
+          body: buildOpenAiKeyRequiredErrorBody() as Record<string, unknown>,
+        };
+      }
+    }
+    if (providerRequirements.requiresZAi) {
+      const zAiKey = await getUserZAIApiKey(env.DB, userId);
+      if (!zAiKey) {
+        return {
+          statusCode: 400,
+          body: buildZAiKeyRequiredErrorBody() as Record<string, unknown>,
+        };
+      }
+    }
+
+    const startResult = await enqueueManualJobStart(env, jobData);
+    if (!startResult.ok) {
+      return { statusCode: 500, body: { error: startResult.error || "Failed to start job" } };
+    }
+
+    return { statusCode: 200, body: { ok: true } };
+  } catch (error) {
+    const message = normalizeText((error as any)?.message || error) || "Failed to start job";
+    console.error(`[JOB START] Unexpected error for job ${jobId}:`, error);
+    return { statusCode: 500, body: { error: message } };
+  }
 }
 
 async function stopJobForUser(
@@ -29656,6 +30229,7 @@ app.post("/api/agent/hit-media", async (c) => {
   }
 
   const uploaded: Array<{ media_type: string; key: string; url: string; time_in_video?: string }> = [];
+  const safeUserId = sanitizeStoragePathSegment(userId, "user");
 
   // Process images
   for (let i = 0; i < images.length; i++) {
@@ -29688,7 +30262,7 @@ app.post("/api/agent/hit-media", async (c) => {
 
       // Create unique R2 key
       const uuid = generateUUID();
-      const key = `hit_media/${userId}/sessions/${body.chat_session_id}/camera_${body.camera_id}/${uuid}_${safeTime}.jpg`;
+      const key = `hit_media/${safeUserId}/sessions/${body.chat_session_id}/camera_${body.camera_id}/${uuid}_${safeTime}.jpg`;
 
       // Upload to R2
       await c.env.R2_BUCKET.put(key, bytes, {
@@ -29750,7 +30324,7 @@ app.post("/api/agent/hit-media", async (c) => {
 
       // Create unique R2 key
       const uuid = generateUUID();
-      const key = `hit_media/${userId}/sessions/${body.chat_session_id}/camera_${body.camera_id}/${uuid}_${safeTime}.mp4`;
+      const key = `hit_media/${safeUserId}/sessions/${body.chat_session_id}/camera_${body.camera_id}/${uuid}_${safeTime}.mp4`;
 
       // Upload to R2
       await c.env.R2_BUCKET.put(key, bytes, {
@@ -29970,6 +30544,7 @@ app.post("/api/agent/hit-images", async (c) => {
 
   const uploaded: Array<{ key: string; url: string; time_in_video?: string }> = [];
   const now = Date.now();
+  const safeUserId = sanitizeStoragePathSegment(userId, "user");
 
   for (let i = 0; i < body.images.length; i++) {
     const img = body.images[i];
@@ -29993,7 +30568,7 @@ app.post("/api/agent/hit-images", async (c) => {
         : 'na';
 
       // Create unique R2 key
-      const key = `hits/user_${userId}/cam_${body.camera_id}/chat_${body.chat_session_id}/${now}_${i}_${safeTime}.jpg`;
+      const key = `hits/user_${safeUserId}/cam_${body.camera_id}/chat_${body.chat_session_id}/${now}_${i}_${safeTime}.jpg`;
 
       // Upload to R2
       await c.env.R2_BUCKET.put(key, bytes, {
@@ -30086,7 +30661,8 @@ app.post("/api/agent/thumbnails", async (c) => {
 
   // Create unique filename with timestamp to avoid caching issues
   const timestamp = Date.now();
-  const filename = `user_${userId}_camera_${body.camera_id}_${timestamp}.jpg`;
+  const safeUserId = sanitizeStoragePathSegment(userId, "user");
+  const filename = `user_${safeUserId}_camera_${body.camera_id}_${timestamp}.jpg`;
 
   // Upload new thumbnail to R2
   await c.env.R2_BUCKET.put(`thumbs/${filename}`, bytes, {
@@ -31442,7 +32018,7 @@ app.get("/api/agent/chat-context", async (c) => {
   }
 
   const recentMessagesResult = await c.env.DB.prepare(
-    `SELECT id, role, content, message_type, created_at, updated_at
+    `SELECT id, role, content, message_type, camera_selection_json, created_at, updated_at
      FROM chat_messages
      WHERE user_id = ?
        AND session_id = ?
@@ -31459,13 +32035,17 @@ app.get("/api/agent/chat-context", async (c) => {
   const recentTurns = ((recentMessagesResult.results || []) as any[])
     .slice()
     .reverse()
-    .map((row) => ({
-      message_id: Number(row.id || 0),
-      role: String(row.role || ""),
-      message_type: typeof row.message_type === "string" ? row.message_type : "",
-      created_at: typeof row.created_at === "string" ? row.created_at : "",
-      content: safeChatContextMessageContent(row.content),
-    }))
+    .map((row) => {
+      const cameraSelection = safeChatContextCameraSelection((row as any).camera_selection_json);
+      return {
+        message_id: Number(row.id || 0),
+        role: String(row.role || ""),
+        message_type: typeof row.message_type === "string" ? row.message_type : "",
+        created_at: typeof row.created_at === "string" ? row.created_at : "",
+        ...(cameraSelection ? { camera_selection: cameraSelection } : {}),
+        content: safeChatContextMessageContent(row.content),
+      };
+    })
     .filter((row) => row.role && row.content);
   const recentTokenEstimate = recentTurns.reduce(
     (total, row) => total + Math.ceil(String(row.content || "").length / 4) + 8,
@@ -31726,6 +32306,14 @@ app.post("/api/agent/chat-router-result", async (c) => {
 
   const cameraIdsStr = camera_ids && camera_ids.length > 0 ? camera_ids.join(",") : null;
 
+  await safePersistChatVideoScopeMemory(c.env.DB, String(userId), chat_session_id, {
+    camera_ids,
+    camera_names,
+    all_cameras,
+    time_window_minutes_before_now,
+    query,
+  });
+
   // Find and update the pending pre_answer message
   const pendingMessage = await c.env.DB.prepare(
     `SELECT * FROM chat_messages
@@ -31899,8 +32487,10 @@ app.post("/api/agent/chat-response", async (c) => {
       providedModelTotal === undefined || providedModelTotal === null
         ? model_prompt_tokens + model_output_tokens
         : toNonNegativeInt(providedModelTotal);
+    const query = normalizeText(body.original_query || body.query).slice(0, 300);
     const vision_hits = Array.isArray(body.vision_hits) ? body.vision_hits : [];
     const hit_images = Array.isArray(body.hit_images) ? body.hit_images : undefined;
+    const identity_cards = Array.isArray(body.identity_cards) ? body.identity_cards : [];
 
     // Extra fields from EXE that we ignore (but don't cause errors):
     // - original_query, query, start_timestamp, end_timestamp, search_paths, status
@@ -31912,6 +32502,7 @@ app.post("/api/agent/chat-response", async (c) => {
       answer_length: answer?.length,
       camera_ids: camera_ids?.length || 0,
       vision_hits_count: vision_hits.length,
+      identity_cards_count: identity_cards.length,
       model_total_tokens,
     });
 
@@ -31967,25 +32558,56 @@ app.post("/api/agent/chat-response", async (c) => {
 
     console.log("[CHAT RESPONSE] Session verified:", chat_session_id);
 
-    // Build camera_selection_json if we have camera data
-    const cameraSelectionJson = camera_ids
-      ? JSON.stringify({
-          camera_ids,
-          camera_names: camera_names || [],
-          all_cameras,
-          time_window_minutes_before_now,
-          vision_hits,
-          hit_images: hit_images || undefined,
-        })
+    // Build camera_selection_json if we have any structured assistant payload.
+    const hasStructuredSelectionPayload =
+      (Array.isArray(camera_ids) && camera_ids.length > 0) ||
+      vision_hits.length > 0 ||
+      (Array.isArray(hit_images) && hit_images.length > 0) ||
+      identity_cards.length > 0;
+
+    const cameraSelectionPayload: Record<string, unknown> = {};
+    if (Array.isArray(camera_ids) && camera_ids.length > 0) {
+      cameraSelectionPayload.camera_ids = camera_ids;
+    }
+    if (Array.isArray(camera_names) && camera_names.length > 0) {
+      cameraSelectionPayload.camera_names = camera_names;
+    }
+    if (all_cameras) {
+      cameraSelectionPayload.all_cameras = all_cameras;
+    }
+    if (time_window_minutes_before_now > 0) {
+      cameraSelectionPayload.time_window_minutes_before_now = time_window_minutes_before_now;
+    }
+    if (vision_hits.length > 0) {
+      cameraSelectionPayload.vision_hits = vision_hits;
+    }
+    if (Array.isArray(hit_images) && hit_images.length > 0) {
+      cameraSelectionPayload.hit_images = hit_images;
+    }
+    if (identity_cards.length > 0) {
+      cameraSelectionPayload.identity_cards = identity_cards;
+    }
+
+    const cameraSelectionJson = hasStructuredSelectionPayload
+      ? JSON.stringify(cameraSelectionPayload)
       : null;
 
     const cameraIdsStr = camera_ids && camera_ids.length > 0 ? camera_ids.join(",") : null;
     const tokensUsed = model_total_tokens || (model_prompt_tokens + model_output_tokens);
 
+    await safePersistChatVideoScopeMemory(c.env.DB, String(userId), chat_session_id, {
+      camera_ids,
+      camera_names,
+      all_cameras,
+      time_window_minutes_before_now,
+      query,
+    });
+
     console.log("[CHAT RESPONSE] Built message data:", {
       cameraIdsStr,
       tokensUsed,
       has_camera_selection: !!cameraSelectionJson,
+      has_identity_cards: identity_cards.length > 0,
     });
 
     const getRouterTokenUsageBeforeMessage = async (beforeMessageId?: number | null) => {
@@ -32204,6 +32826,17 @@ app.post("/api/agent/chat-response", async (c) => {
         
         console.log("[CHAT RESPONSE] ✓ Tokens deducted");
       } else {
+        const normalizedAnswer = String(answer || "").trim().toLowerCase();
+        const isInternalNoFramesFallback =
+          normalizedAnswer.includes("stored video/frames in the requested time window") ||
+          normalizedAnswer.includes("videos/frames armazenados no intervalo de tempo solicitado");
+        if (isInternalNoFramesFallback) {
+          console.log(
+            "[CHAT RESPONSE] Ignoring internal no-frames fallback because no final_answer_pending message exists"
+          );
+          return c.json({ ok: true, ignored: true, reason: "no_pending_final_for_no_frames" });
+        }
+
         console.log("[CHAT RESPONSE] WARNING: No final_answer_pending message found! Creating new final message instead.");
         console.log("[CHAT RESPONSE] Executing INSERT for new final message...");
         
@@ -32843,6 +33476,7 @@ app.post("/api/agent/events", async (c) => {
       return { bytes, contentType, extension };
     };
     let temporalAlbumWon = false;
+    const safeUserId = sanitizeStoragePathSegment(userId, "user");
 
     // Non-temporal detections keep the legacy video-first path.
     if (details.video_mp4_base64 && !prefersTemporalAlbum) {
@@ -32858,7 +33492,7 @@ app.post("/api/agent/events", async (c) => {
         }
 
         // Create filename with timestamp
-        const filename = `user_${userId}_camera_${cameraId}_${Date.now()}.mp4`;
+        const filename = `user_${safeUserId}_camera_${cameraId}_${Date.now()}.mp4`;
         videoKey = filename;
         mediaType = "video";
 
@@ -32898,7 +33532,7 @@ app.post("/api/agent/events", async (c) => {
         }
 
         // Create filename with timestamp
-        const filename = `user_${userId}_camera_${cameraId}_${Date.now()}.jpg`;
+        const filename = `user_${safeUserId}_camera_${cameraId}_${Date.now()}.jpg`;
         imageKey = filename;
         mediaType = "image";
 
@@ -32999,7 +33633,7 @@ app.post("/api/agent/events", async (c) => {
 
         try {
           const { bytes, contentType, extension } = decodeBase64Image(entryImageBase64);
-          const filename = `user_${userId}_camera_${cameraId}_group_${Date.now()}_${index}${extension}`;
+          const filename = `user_${safeUserId}_camera_${cameraId}_group_${Date.now()}_${index}${extension}`;
           await c.env.R2_BUCKET.put(`detections/${filename}`, bytes, {
             httpMetadata: { contentType },
           });
@@ -33107,7 +33741,7 @@ app.post("/api/agent/events", async (c) => {
           bytes[i] = binaryString.charCodeAt(i);
         }
 
-        const filename = `user_${userId}_camera_${cameraId}_${Date.now()}.mp4`;
+        const filename = `user_${safeUserId}_camera_${cameraId}_${Date.now()}.mp4`;
         videoKey = filename;
         mediaType = "video";
 
@@ -33141,7 +33775,7 @@ app.post("/api/agent/events", async (c) => {
           bytes[i] = binaryString.charCodeAt(i);
         }
 
-        const filename = `user_${userId}_camera_${cameraId}_${Date.now()}.jpg`;
+        const filename = `user_${safeUserId}_camera_${cameraId}_${Date.now()}.jpg`;
         imageKey = filename;
         mediaType = "image";
 
@@ -37410,6 +38044,428 @@ app.post("/api/jobs", anyAuthMiddleware, async (c) => {
   };
 
   return c.json({ job: jobWithSchedule }, 201);
+});
+
+type JobUpdateBody = {
+  name?: string;
+  description?: string;
+  start_at?: string | null;
+  end_at?: string | null;
+  status?: string;
+  schedule_mode?: string;
+  active_from?: string | null;
+  active_until?: string | null;
+  schedule_days?: Array<{
+    day_name: string;
+    day_of_week?: number;
+    day_of_month?: number;
+    month_of_year?: number;
+    windows: Array<{ start_time: string; end_time: string }>;
+  }>;
+  weekly_schedule?: any;
+};
+
+async function updateJobForUser(
+  env: Env,
+  userId: string,
+  id: string,
+  body: JobUpdateBody
+): Promise<{ statusCode: number; body: any }> {
+  const job = await env.DB.prepare(
+    "SELECT * FROM jobs WHERE id = ? AND user_id = ?"
+  )
+    .bind(id, userId)
+    .first();
+
+  if (!job) {
+    return { statusCode: 404, body: { error: "Job not found" } };
+  }
+
+  if (body.status === "scheduled") {
+    const userOpenAiApiKey = await getUserOpenAIApiKey(env.DB, userId);
+    if (!userOpenAiApiKey) {
+      return { statusCode: 400, body: buildOpenAiKeyRequiredErrorBody() };
+    }
+  }
+
+  const now = new Date().toISOString();
+  const todayDate = now.split("T")[0];
+  const currentJob = job as any;
+  const globalTimezone = await resolveUserGlobalTimezone(env.DB, userId);
+  const newScheduleMode = body.schedule_mode || currentJob.schedule_mode;
+  const isRecurringMode = ["weekly", "monthly", "yearly"].includes(newScheduleMode);
+  const isModeChanging = body.schedule_mode && body.schedule_mode !== currentJob.schedule_mode;
+
+  const deleteScheduleData = async () => {
+    await env.DB.prepare("DELETE FROM job_schedule_windows WHERE job_id = ?").bind(id).run();
+    await env.DB.prepare("DELETE FROM job_schedule_days WHERE job_id = ?").bind(id).run();
+  };
+
+  const convertLegacySchedule = (schedule: any, _mode: string): JobUpdateBody["schedule_days"] => {
+    const result: JobUpdateBody["schedule_days"] = [];
+    const dayMap: Record<string, { dayOfWeek: number; dayName: string }> = {
+      sunday: { dayOfWeek: 0, dayName: "Sunday" },
+      monday: { dayOfWeek: 1, dayName: "Monday" },
+      tuesday: { dayOfWeek: 2, dayName: "Tuesday" },
+      wednesday: { dayOfWeek: 3, dayName: "Wednesday" },
+      thursday: { dayOfWeek: 4, dayName: "Thursday" },
+      friday: { dayOfWeek: 5, dayName: "Friday" },
+      saturday: { dayOfWeek: 6, dayName: "Saturday" },
+    };
+
+    const dayKeys = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    for (const dayKey of dayKeys) {
+      const daySchedule = schedule[dayKey];
+      if (daySchedule && daySchedule.enabled && Array.isArray(daySchedule.windows) && daySchedule.windows.length > 0) {
+        const { dayOfWeek, dayName } = dayMap[dayKey];
+        result.push({
+          day_name: dayName,
+          day_of_week: dayOfWeek,
+          windows: daySchedule.windows.map((w: any) => ({
+            start_time: w.start || w.start_time,
+            end_time: w.end || w.end_time,
+          })),
+        });
+      }
+    }
+    return result;
+  };
+
+  const insertScheduleData = async (scheduleDays: JobUpdateBody["schedule_days"], scheduleMode: string) => {
+    let daySortOrder = 0;
+    for (const day of scheduleDays || []) {
+      const dayResult = await env.DB.prepare(
+        `INSERT INTO job_schedule_days (job_id, schedule_mode, day_name, day_of_week, day_of_month, month_of_year, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          id,
+          scheduleMode,
+          day.day_name,
+          day.day_of_week ?? null,
+          day.day_of_month ?? null,
+          day.month_of_year ?? null,
+          daySortOrder++,
+          now,
+          now
+        )
+        .run();
+
+      const scheduleDayId = dayResult.meta.last_row_id;
+
+      let windowSortOrder = 0;
+      for (const window of day.windows) {
+        await env.DB.prepare(
+          `INSERT INTO job_schedule_windows (job_id, schedule_day_id, start_time, end_time, is_enabled, sort_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 1, ?, ?, ?)`
+        )
+          .bind(id, scheduleDayId, window.start_time, window.end_time, windowSortOrder++, now, now)
+          .run();
+      }
+    }
+  };
+
+  const numericJobId = Number(id);
+  if (Number.isInteger(numericJobId) && numericJobId > 0) {
+    const jobUsesCoreModel = await jobHasCoreModelConfigured(env.DB, userId, numericJobId);
+    const recurringScheduleMode = normalizeRecurringScheduleMode(newScheduleMode);
+    const scheduleFieldsTouched =
+      body.schedule_mode !== undefined ||
+      body.schedule_days !== undefined ||
+      body.weekly_schedule !== undefined ||
+      body.active_from !== undefined ||
+      body.active_until !== undefined;
+    if (jobUsesCoreModel && recurringScheduleMode && scheduleFieldsTouched) {
+      const scheduleDaysFromBody =
+        Array.isArray(body.schedule_days) && body.schedule_days.length > 0
+          ? body.schedule_days.map((day) => ({
+              day_of_week: day.day_of_week,
+              day_of_month: day.day_of_month,
+              month_of_year: day.month_of_year,
+              windows: Array.isArray(day.windows)
+                ? day.windows.map((window) => ({
+                    start_time: window.start_time,
+                    end_time: window.end_time,
+                  }))
+                : [],
+            }))
+          : null;
+      const scheduleDaysFromLegacy =
+        !scheduleDaysFromBody && body.weekly_schedule
+          ? (convertLegacySchedule(body.weekly_schedule, recurringScheduleMode) || []).map((day) => ({
+              day_of_week: day.day_of_week,
+              day_of_month: day.day_of_month,
+              month_of_year: day.month_of_year,
+              windows: Array.isArray(day.windows)
+                ? day.windows.map((window) => ({
+                    start_time: window.start_time,
+                    end_time: window.end_time,
+                  }))
+                : [],
+            }))
+          : null;
+
+      const candidateActiveFrom = isModeChanging
+        ? recurringScheduleMode
+          ? body.active_from || currentJob.active_from || todayDate
+          : null
+        : body.active_from !== undefined
+        ? body.active_from
+        : currentJob.active_from;
+      const candidateActiveUntil = isModeChanging
+        ? body.active_until ?? currentJob.active_until ?? null
+        : body.active_until !== undefined
+        ? body.active_until
+        : currentJob.active_until;
+
+      let candidateSchedule: RecurringScheduleShape | null = null;
+      if (scheduleDaysFromBody || scheduleDaysFromLegacy) {
+        candidateSchedule = buildRecurringScheduleFromInput({
+          job_id: numericJobId,
+          job_name: String(currentJob.name || ""),
+          schedule_mode: recurringScheduleMode,
+          timezone: globalTimezone,
+          active_from: candidateActiveFrom,
+          active_until: candidateActiveUntil,
+          schedule_days: scheduleDaysFromBody || scheduleDaysFromLegacy || [],
+        });
+      } else {
+        const existingRecurringSchedule = await loadRecurringScheduleForJob(
+          env.DB,
+          userId,
+          numericJobId
+        );
+        if (
+          existingRecurringSchedule &&
+          existingRecurringSchedule.schedule_mode === recurringScheduleMode
+        ) {
+          candidateSchedule = buildRecurringScheduleFromInput({
+            job_id: numericJobId,
+            job_name: String(currentJob.name || ""),
+            schedule_mode: recurringScheduleMode,
+            timezone: globalTimezone,
+            active_from: candidateActiveFrom,
+            active_until: candidateActiveUntil,
+            schedule_days: buildRecurringScheduleDaysInputFromSchedule(existingRecurringSchedule),
+          });
+        }
+      }
+
+      if (candidateSchedule) {
+        const scheduleConflict = await findCoreScheduleConflictForCandidate(
+          env.DB,
+          userId,
+          candidateSchedule,
+          numericJobId
+        );
+        if (scheduleConflict) {
+          return {
+            statusCode: 409,
+            body: buildCoreModelScheduleConflictErrorBody(
+              scheduleConflict.job_name,
+              scheduleConflict.job_id
+            ),
+          };
+        }
+      }
+    }
+  }
+
+  if (isModeChanging) {
+    await deleteScheduleData();
+
+    if (newScheduleMode === "one_shot") {
+      await env.DB.prepare(
+        `UPDATE jobs
+         SET schedule_mode = 'one_shot',
+              start_at = ?,
+              end_at = ?,
+              timezone = ?,
+              active_from = NULL,
+              active_until = NULL,
+              updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`
+      )
+        .bind(body.start_at || null, body.end_at || null, globalTimezone, id, userId)
+        .run();
+    } else {
+      const activeFrom = body.active_from || currentJob.active_from || todayDate;
+      const activeUntil = body.active_until ?? currentJob.active_until ?? null;
+
+      await env.DB.prepare(
+        `UPDATE jobs
+         SET schedule_mode = ?,
+              start_at = NULL,
+              end_at = NULL,
+              timezone = ?,
+              active_from = ?,
+              active_until = ?,
+              updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`
+      )
+        .bind(newScheduleMode, globalTimezone, activeFrom, activeUntil, id, userId)
+        .run();
+
+      let scheduleDays = body.schedule_days ?? [];
+      if (scheduleDays.length === 0 && body.weekly_schedule) {
+        scheduleDays = convertLegacySchedule(body.weekly_schedule, newScheduleMode) ?? [];
+      }
+      if (scheduleDays.length > 0) {
+        await insertScheduleData(scheduleDays, newScheduleMode);
+      }
+    }
+  } else if (isRecurringMode) {
+    let scheduleDays = body.schedule_days ?? [];
+    if (scheduleDays.length === 0 && body.weekly_schedule) {
+      scheduleDays = convertLegacySchedule(body.weekly_schedule, newScheduleMode) ?? [];
+    }
+
+    if (scheduleDays.length > 0) {
+      await deleteScheduleData();
+      await insertScheduleData(scheduleDays, newScheduleMode);
+    }
+
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    if (body.name !== undefined) {
+      updates.push("name = ?");
+      values.push(body.name);
+    }
+    if (body.description !== undefined) {
+      updates.push("description = ?");
+      values.push(body.description);
+    }
+    if (body.status !== undefined) {
+      updates.push("status = ?");
+      values.push(body.status);
+    }
+    updates.push("timezone = ?");
+    values.push(globalTimezone);
+    if (body.active_from !== undefined) {
+      updates.push("active_from = ?");
+      values.push(body.active_from);
+    }
+    if (body.active_until !== undefined) {
+      updates.push("active_until = ?");
+      values.push(body.active_until);
+    }
+
+    if (updates.length > 0) {
+      updates.push("updated_at = CURRENT_TIMESTAMP");
+      values.push(id, userId);
+      await env.DB.prepare(
+        `UPDATE jobs SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`
+      )
+        .bind(...values)
+        .run();
+    }
+  } else {
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    Object.entries(body).forEach(([key, value]) => {
+      if (!["weekly_schedule", "schedule_mode", "schedule_days", "timezone"].includes(key)) {
+        updates.push(`${key} = ?`);
+        values.push(value);
+      }
+    });
+    updates.push("timezone = ?");
+    values.push(globalTimezone);
+
+    if (updates.length > 0) {
+      updates.push("updated_at = CURRENT_TIMESTAMP");
+      values.push(id, userId);
+      await env.DB.prepare(
+        `UPDATE jobs SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`
+      )
+        .bind(...values)
+        .run();
+    }
+  }
+
+  const updatedJob = await env.DB.prepare(
+    "SELECT * FROM jobs WHERE id = ? AND user_id = ?"
+  )
+    .bind(id, userId)
+    .first();
+
+  let jobWithSchedule: any = updatedJob;
+
+  if (updatedJob && ["weekly", "monthly", "yearly"].includes((updatedJob as any).schedule_mode)) {
+    const { results: days } = await env.DB.prepare(
+      `SELECT id, day_name, day_of_week, day_of_month, month_of_year, sort_order
+       FROM job_schedule_days WHERE job_id = ? ORDER BY sort_order ASC`
+    )
+      .bind(id)
+      .all();
+
+    const scheduleData = await Promise.all(
+      (days || []).map(async (day: any) => {
+        const { results: windows } = await env.DB.prepare(
+          `SELECT start_time, end_time, is_enabled FROM job_schedule_windows
+           WHERE schedule_day_id = ? ORDER BY sort_order ASC`
+        )
+          .bind(day.id)
+          .all();
+
+        return {
+          day_name: day.day_name,
+          day_of_week: day.day_of_week,
+          day_of_month: day.day_of_month,
+          month_of_year: day.month_of_year,
+          windows: (windows || []).map((w: any) => ({
+            start_time: w.start_time,
+            end_time: w.end_time,
+          })),
+        };
+      })
+    );
+
+    const summaryParts: string[] = [];
+    for (const day of scheduleData) {
+      const windowStrs = day.windows.map((w: any) => `${w.start_time}â€“${w.end_time}`).join(", ");
+      summaryParts.push(`${day.day_name} ${windowStrs}`);
+    }
+    const mode = (updatedJob as any).schedule_mode;
+    const modeLabel = mode.charAt(0).toUpperCase() + mode.slice(1);
+    const scheduleSummary = `${modeLabel}: ${summaryParts.join("; ")}`;
+
+    jobWithSchedule = {
+      ...updatedJob,
+      schedule_days: scheduleData,
+      schedule_summary: scheduleSummary,
+    };
+  }
+
+  return { statusCode: 200, body: { job: jobWithSchedule } };
+}
+
+app.put("/api/agent/jobs/:id", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const id = c.req.param("id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<JobUpdateBody>().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const result = await updateJobForUser(c.env, pairing.userId, id, body);
+  return c.json(result.body, result.statusCode as any);
 });
 
 app.put("/api/jobs/:id", anyAuthMiddleware, async (c) => {

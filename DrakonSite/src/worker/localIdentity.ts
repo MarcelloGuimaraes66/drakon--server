@@ -432,6 +432,9 @@ export async function migrateLegacyLocalUserIdToCanonicalId(
 
   try {
     await db.prepare("BEGIN IMMEDIATE").run();
+    // This migration temporarily moves child user_id references before the parent app_users id.
+    // Deferring FK enforcement keeps the migration atomic without violating immediate constraints.
+    await db.prepare("PRAGMA defer_foreign_keys = ON").run();
 
     const identityColumns = await listSqliteIdentityColumns(db);
     for (const ref of identityColumns) {

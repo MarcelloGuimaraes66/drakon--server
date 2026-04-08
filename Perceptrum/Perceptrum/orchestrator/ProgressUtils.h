@@ -175,6 +175,16 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Enviando o comando para iniciar ou parar o job.";
             }
         }
+        else if (skill == "edit_job") {
+            if (phase == "routing" || phase == "resolving_target") {
+                update.headline = "Localizando o job";
+                update.detail = "Conferindo qual job corresponde ao pedido antes de aplicar a edicao.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Aplicando a edicao";
+                update.detail = "Enviando as alteracoes do job para o runtime.";
+            }
+        }
         else if (skill == "general_answer") {
             if (phase == "routing") {
                 update.headline = "Entendendo sua pergunta";
@@ -397,6 +407,16 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "applying_action") {
                 update.headline = "Applying the action";
                 update.detail = "Sending the command to start or stop the job.";
+            }
+        }
+        else if (skill == "edit_job") {
+            if (phase == "routing" || phase == "resolving_target") {
+                update.headline = "Resolving the job";
+                update.detail = "Checking which job matches your request before applying the edit.";
+            }
+            else if (phase == "applying_action") {
+                update.headline = "Applying the edit";
+                update.detail = "Sending the requested job changes to the runtime.";
             }
         }
         else if (skill == "general_answer") {

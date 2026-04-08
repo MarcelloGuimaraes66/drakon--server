@@ -12,6 +12,7 @@
 #include "OperationTaskState.h"
 #include "ProgressUtils.h"
 #include "PromptBuilder.h"
+#include "RoutingLexicon.h"
 #include "../core/AgentCore.h"
 #include "../logging/Logging.h"
 #include "HttpUtils.h"
@@ -437,6 +438,7 @@ int progressStepCountForSkill_(const std::string& skillName)
     if (skillName == "explain_app") return 4;
     if (skillName == "control_camera") return 3;
     if (skillName == "control_job") return 3;
+    if (skillName == "edit_job") return 3;
     if (skillName == "create_cameras_batch") return 3;
     if (skillName == "edit_cameras_batch") return 3;
     if (skillName == "scan_network") return 3;
@@ -606,6 +608,86 @@ std::string normalizeSemanticToken_(std::string value)
     value = lowerAsciiCopy_(trimCopy_(std::move(value)));
     std::replace(value.begin(), value.end(), ' ', '_');
     return value;
+}
+
+SkillSelection applyRoutingLexiconCorrections_(
+    SkillSelection selection,
+    const std::string& userMessage,
+    const nlohmann::json& conversationContext)
+{
+    if (selection.continueActiveTask) {
+        return selection;
+    }
+
+    const std::string normalizedMessage = lowerAsciiCopy_(userMessage);
+    if (isInstructionalIntent_(normalizedMessage)) {
+        return selection;
+    }
+
+    const RoutingLexiconSignals signals = detectRoutingLexiconSignals(userMessage);
+    const std::string runtimeAction = runtimeActionFromRoutingSignals(signals);
+
+    auto ensureArgumentsObject = [&]() -> nlohmann::json& {
+        if (!selection.arguments.is_object()) {
+            selection.arguments = nlohmann::json::object();
+        }
+        return selection.arguments;
+    };
+
+    auto forceSelection = [&](const std::string& skillName,
+                              const std::string& entity,
+                              const std::string& intent) {
+        selection.selectedSkill = skillName;
+        selection.mode = "operate";
+        selection.entity = entity;
+        selection.intent = intent;
+        selection.operationType = skillName;
+        selection.groundingRequired = false;
+        selection.confidence = (std::max)(selection.confidence, 0.88);
+        selection.reason = "routing_lexicon_override";
+        ensureArgumentsObject()["operation_type"] = skillName;
+    };
+
+    if (signals.mentionsCameraAgent &&
+        (signals.wantsCreate || signals.wantsEdit || signals.mentionsStep)) {
+        if (signals.wantsEdit) {
+            forceSelection("edit_camera_agent", "camera_agent", "update");
+        }
+        else {
+            forceSelection("create_camera_agent", "camera_agent", "create");
+        }
+        return selection;
+    }
+
+    if (signals.mentionsJob) {
+        if (!runtimeAction.empty()) {
+            forceSelection("control_job", "job", "update");
+            ensureArgumentsObject()["runtime_action"] = runtimeAction;
+            return selection;
+        }
+        if (signals.wantsEdit) {
+            forceSelection("edit_job", "job", "update");
+            return selection;
+        }
+        if (signals.wantsCreate) {
+            forceSelection("create_job", "job", "create");
+            return selection;
+        }
+    }
+
+    if (signals.mentionsCamera && !signals.mentionsJob && !signals.mentionsCameraAgent) {
+        if (!runtimeAction.empty()) {
+            forceSelection("control_camera", "camera", "update");
+            ensureArgumentsObject()["runtime_action"] = runtimeAction;
+            return selection;
+        }
+        if (signals.wantsEdit) {
+            forceSelection("edit_camera", "camera", "update");
+            return selection;
+        }
+    }
+
+    return selection;
 }
 
 SkillSelection finalizeSelectionLanguages_(SkillSelection selection)
@@ -790,6 +872,9 @@ std::string skillFromSemanticSelection_(
     if (selection.selectedSkill == "control_job") {
         return "control_job";
     }
+    if (selection.selectedSkill == "edit_job") {
+        return "edit_job";
+    }
 
     if (selection.continueActiveTask) {
         const std::string activeTask = activeOperationTaskType(conversationContext);
@@ -832,6 +917,9 @@ std::string skillFromSemanticSelection_(
     }
     if (entity == "job" && intent == "update" && hasRuntimeAction) {
         return "control_job";
+    }
+    if (entity == "job" && intent == "update") {
+        return "edit_job";
     }
     if (entity == "job" && (mode == "operate" || intent == "create" || intent == "continue")) {
         return "create_job";
@@ -881,6 +969,7 @@ bool shouldSemanticSkillOverrideSelected_(
         semanticSkill == "create_camera_agent" ||
         semanticSkill == "create_job" ||
         semanticSkill == "control_job" ||
+        semanticSkill == "edit_job" ||
         semanticSkill == "scan_network" ||
         semanticSkill == "read_state" ||
         semanticSkill == "video_search";
@@ -888,6 +977,7 @@ bool shouldSemanticSkillOverrideSelected_(
 
 SkillSelection applySemanticSelectionPlan_(
     SkillSelection selection,
+    const std::string& userMessage,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext)
 {
@@ -896,6 +986,7 @@ SkillSelection applySemanticSelectionPlan_(
     selection.intent = normalizeSemanticToken_(selection.intent);
     selection.operationType = normalizeSemanticToken_(selection.operationType);
     selection.operationPhase = normalizeSemanticToken_(selection.operationPhase);
+    selection = applyRoutingLexiconCorrections_(std::move(selection), userMessage, conversationContext);
 
     if (hasUploadedMedia_(payload)) {
         selection.selectedSkill = "video_search";
@@ -946,6 +1037,7 @@ SkillSelection applySemanticSelectionPlan_(
          selection.selectedSkill == "create_camera_agent" ||
          selection.selectedSkill == "create_job" ||
          selection.selectedSkill == "control_job" ||
+         selection.selectedSkill == "edit_job" ||
          selection.selectedSkill == "scan_network")) {
         selection.operationType = selection.selectedSkill;
     }
@@ -963,7 +1055,8 @@ SkillSelection applySemanticSelectionPlan_(
         }
         else if (selection.selectedSkill == "edit_camera" ||
                  selection.selectedSkill == "edit_camera_agent" ||
-                 selection.selectedSkill == "edit_cameras_batch") {
+                 selection.selectedSkill == "edit_cameras_batch" ||
+                 selection.selectedSkill == "edit_job") {
             selection.intent = selection.continueActiveTask ? "continue" : "update";
         }
         else if (selection.selectedSkill == "scan_network") {
@@ -993,6 +1086,7 @@ SkillSelection applySemanticSelectionPlan_(
             selection.selectedSkill == "create_camera_agent" ||
             selection.selectedSkill == "create_job" ||
             selection.selectedSkill == "control_job" ||
+            selection.selectedSkill == "edit_job" ||
             selection.selectedSkill == "scan_network" ||
             selection.selectedSkill == "video_search") {
             selection.mode = "operate";
@@ -1213,6 +1307,243 @@ std::string activeTaskTypeForContext_(const nlohmann::json& conversationContext)
 std::string activeTaskLanguageForContext_(const nlohmann::json& conversationContext)
 {
     return activeOperationTaskLanguage(conversationContext);
+}
+
+nlohmann::json sanitizeVideoRoutingScope_(const nlohmann::json& source)
+{
+    nlohmann::json sanitized = nlohmann::json::object();
+    if (!source.is_object()) {
+        return sanitized;
+    }
+
+    if (source.contains("camera_ids") && source["camera_ids"].is_array()) {
+        nlohmann::json cameraIds = nlohmann::json::array();
+        for (const auto& item : source["camera_ids"]) {
+            if (!item.is_number_integer()) {
+                continue;
+            }
+            const int cameraId = item.get<int>();
+            if (cameraId <= 0) {
+                continue;
+            }
+            cameraIds.push_back(cameraId);
+            if (cameraIds.size() >= 8) {
+                break;
+            }
+        }
+        if (!cameraIds.empty()) {
+            sanitized["camera_ids"] = std::move(cameraIds);
+        }
+    }
+
+    if (source.contains("camera_names") && source["camera_names"].is_array()) {
+        nlohmann::json cameraNames = nlohmann::json::array();
+        for (const auto& item : source["camera_names"]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            const std::string value = truncateForContext_(item.get<std::string>(), 120);
+            if (value.empty()) {
+                continue;
+            }
+            cameraNames.push_back(value);
+            if (cameraNames.size() >= 8) {
+                break;
+            }
+        }
+        if (!cameraNames.empty()) {
+            sanitized["camera_names"] = std::move(cameraNames);
+        }
+    }
+
+    if (source.contains("all_cameras") && source["all_cameras"].is_boolean()) {
+        sanitized["all_cameras"] = source["all_cameras"].get<bool>();
+    }
+
+    if (source.contains("time_window_minutes_before_now") &&
+        source["time_window_minutes_before_now"].is_number_integer()) {
+        sanitized["time_window_minutes_before_now"] = std::max(
+            0,
+            source["time_window_minutes_before_now"].get<int>());
+    }
+
+    if (source.contains("query") && source["query"].is_string()) {
+        const std::string query = truncateForContext_(source["query"].get<std::string>(), 240);
+        if (!query.empty()) {
+            sanitized["query"] = query;
+        }
+    }
+
+    if (source.contains("updated_at") && source["updated_at"].is_string()) {
+        const std::string updatedAt = truncateForContext_(source["updated_at"].get<std::string>(), 64);
+        if (!updatedAt.empty()) {
+            sanitized["updated_at"] = updatedAt;
+        }
+    }
+
+    return sanitized;
+}
+
+std::string videoRoutingScopeKey_(const nlohmann::json& scope)
+{
+    if (!scope.is_object()) {
+        return "";
+    }
+
+    std::vector<std::string> parts;
+    if (scope.contains("camera_ids") && scope["camera_ids"].is_array()) {
+        std::ostringstream ids;
+        bool first = true;
+        for (const auto& item : scope["camera_ids"]) {
+            if (!item.is_number_integer()) {
+                continue;
+            }
+            if (!first) {
+                ids << ",";
+            }
+            ids << item.get<int>();
+            first = false;
+        }
+        if (!first) {
+            parts.push_back("ids:" + ids.str());
+        }
+    }
+
+    if (scope.contains("camera_names") && scope["camera_names"].is_array()) {
+        std::ostringstream names;
+        bool first = true;
+        for (const auto& item : scope["camera_names"]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            if (!first) {
+                names << "|";
+            }
+            names << lowerAsciiCopy_(item.get<std::string>());
+            first = false;
+        }
+        if (!first) {
+            parts.push_back("names:" + names.str());
+        }
+    }
+
+    if (scope.contains("all_cameras") && scope["all_cameras"].is_boolean()) {
+        parts.push_back(std::string("all:") + (scope["all_cameras"].get<bool>() ? "1" : "0"));
+    }
+
+    if (parts.empty()) {
+        return "";
+    }
+
+    std::ostringstream joined;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
+            joined << ";";
+        }
+        joined << parts[i];
+    }
+    return joined.str();
+}
+
+nlohmann::json buildVideoRoutingContext_(const nlohmann::json& conversationContext)
+{
+    nlohmann::json routingContext = nlohmann::json::object();
+    if (!conversationContext.is_object()) {
+        return routingContext;
+    }
+
+    const nlohmann::json taskState = taskStateFromConversationContext(conversationContext);
+    if (taskState.contains("session_entities") && taskState["session_entities"].is_object()) {
+        const auto& sessionEntities = taskState["session_entities"];
+        nlohmann::json lastScope = sanitizeVideoRoutingScope_(
+            sessionEntities.value("last_video_scope", nlohmann::json::object()));
+        if (lastScope.empty() &&
+            sessionEntities.contains("last_camera_name") &&
+            sessionEntities["last_camera_name"].is_string()) {
+            const std::string lastCameraName = truncateForContext_(
+                sessionEntities["last_camera_name"].get<std::string>(),
+                120);
+            if (!lastCameraName.empty()) {
+                lastScope["camera_names"] = nlohmann::json::array({ lastCameraName });
+            }
+        }
+        if (!lastScope.empty()) {
+            routingContext["last_video_scope"] = lastScope;
+        }
+    }
+
+    std::vector<std::string> seenScopeKeys;
+    nlohmann::json recentScopes = nlohmann::json::array();
+    if (conversationContext.contains("recent_turns") && conversationContext["recent_turns"].is_array()) {
+        const auto& recentTurns = conversationContext["recent_turns"];
+        nlohmann::json recentTurnsForRouter = nlohmann::json::array();
+        const std::size_t excerptStart = recentTurns.size() > 6 ? recentTurns.size() - 6 : 0;
+        for (std::size_t i = excerptStart; i < recentTurns.size(); ++i) {
+            const auto& turn = recentTurns[i];
+            if (!turn.is_object()) {
+                continue;
+            }
+            const std::string content = truncateForContext_(
+                turn.value("content", std::string()),
+                240);
+            if (content.empty()) {
+                continue;
+            }
+            nlohmann::json item = {
+                { "role", turn.value("role", std::string()) },
+                { "content", content },
+            };
+            const std::string messageType = turn.value("message_type", std::string());
+            if (!messageType.empty()) {
+                item["message_type"] = messageType;
+            }
+            recentTurnsForRouter.push_back(std::move(item));
+        }
+        if (!recentTurnsForRouter.empty()) {
+            routingContext["recent_turns"] = std::move(recentTurnsForRouter);
+        }
+
+        for (auto it = recentTurns.rbegin(); it != recentTurns.rend(); ++it) {
+            if (!it->is_object() || !it->contains("camera_selection")) {
+                continue;
+            }
+            nlohmann::json scope = sanitizeVideoRoutingScope_((*it)["camera_selection"]);
+            if (scope.empty()) {
+                continue;
+            }
+            const std::string scopeKey = videoRoutingScopeKey_(scope);
+            if (scopeKey.empty() ||
+                std::find(seenScopeKeys.begin(), seenScopeKeys.end(), scopeKey) != seenScopeKeys.end()) {
+                continue;
+            }
+            seenScopeKeys.push_back(scopeKey);
+            recentScopes.push_back(std::move(scope));
+            if (recentScopes.size() >= 3) {
+                break;
+            }
+        }
+    }
+
+    if (!recentScopes.empty()) {
+        if (!routingContext.contains("last_video_scope")) {
+            routingContext["last_video_scope"] = recentScopes[0];
+        }
+        routingContext["recent_camera_scopes"] = std::move(recentScopes);
+    }
+
+    const nlohmann::json compactContext = normalizeCompactConversationContext_(
+        conversationContext.value("compact_context", nlohmann::json::object()));
+    const std::string summary = compactContext.value("summary", std::string());
+    if (!summary.empty()) {
+        routingContext["compact_summary"] = summary;
+    }
+    if (compactContext.contains("selected_entities") &&
+        compactContext["selected_entities"].is_array() &&
+        !compactContext["selected_entities"].empty()) {
+        routingContext["selected_entities"] = compactContext["selected_entities"];
+    }
+
+    return routingContext;
 }
 
 bool isLikelyShortTaskContinuation_(const std::string& userMessage)
@@ -1464,7 +1795,18 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
         }
     }
 
-    SkillRunResult result = registry_.execute(selection.selectedSkill, agent, payload, selection);
+    nlohmann::json effectivePayload = payload;
+    if (!effectivePayload.is_object()) {
+        effectivePayload = nlohmann::json::object();
+    }
+    if (selection.selectedSkill == "video_search") {
+        const nlohmann::json videoRoutingContext = buildVideoRoutingContext_(conversationContext);
+        if (videoRoutingContext.is_object() && !videoRoutingContext.empty()) {
+            effectivePayload["video_routing_context"] = videoRoutingContext;
+        }
+    }
+
+    SkillRunResult result = registry_.execute(selection.selectedSkill, agent, effectivePayload, selection);
     if (result.status == SkillExecutionStatus::Delegated) {
         return;
     }
@@ -1771,7 +2113,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         normalizeConversationContextForPrompt_(conversationContext);
 
     auto finalizeForcedSelection = [&](SkillSelection forcedSelection) -> SkillSelection {
-        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), payload, conversationContext);
+        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), userMessage, payload, conversationContext);
         forcedSelection = applyReplyLanguageHints_(forcedSelection, payload, userMessage, conversationContext);
         if (llm.isConfigured() &&
             (queryLanguageSource != "detected" ||
@@ -1787,7 +2129,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         }
         forcedSelection = applyReplyLanguageHints_(forcedSelection, payload, userMessage, conversationContext);
         forcedSelection = finalizeSelectionLanguages_(std::move(forcedSelection));
-        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), payload, conversationContext);
+        forcedSelection = applySemanticSelectionPlan_(std::move(forcedSelection), userMessage, payload, conversationContext);
         return forcedSelection;
     };
 
@@ -1817,6 +2159,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
                 "job_steps",
                 "job_orchestration"
             }) },
+            { "routing_lexicon", routingLexicon() },
             {
                 "uploaded_image_present",
                 hasPayloadObject &&
@@ -1842,7 +2185,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             userMessage,
             requestContext,
             registry_.definitions());
-        selection = applySemanticSelectionPlan_(std::move(selection), payload, conversationContext);
+        selection = applySemanticSelectionPlan_(std::move(selection), userMessage, payload, conversationContext);
         selection = applyReplyLanguageHints_(selection, payload, userMessage, conversationContext);
         if (queryLanguageSource != "detected" ||
             shouldDetectReplyLanguageForSelection_(selection)) {
@@ -1857,7 +2200,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         }
         selection = applyReplyLanguageHints_(selection, payload, userMessage, conversationContext);
         selection = finalizeSelectionLanguages_(std::move(selection));
-        selection = applySemanticSelectionPlan_(std::move(selection), payload, conversationContext);
+        selection = applySemanticSelectionPlan_(std::move(selection), userMessage, payload, conversationContext);
         if (!selection.selectedSkill.empty() &&
             selection.selectedSkill != "general_answer" &&
             !registry_.hasSkill(selection.selectedSkill)) {
@@ -1901,7 +2244,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
     }
 
     if (!heuristic.selectedSkill.empty()) {
-        SkillSelection rewritten = applySemanticSelectionPlan_(heuristic, payload, conversationContext);
+        SkillSelection rewritten = applySemanticSelectionPlan_(heuristic, userMessage, payload, conversationContext);
         rewritten = applyReplyLanguageHints_(rewritten, payload, userMessage, conversationContext);
         if (llm.isConfigured() &&
             (queryLanguageSource != "detected" ||
@@ -1917,7 +2260,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         }
         rewritten = applyReplyLanguageHints_(rewritten, payload, userMessage, conversationContext);
         rewritten = finalizeSelectionLanguages_(std::move(rewritten));
-        rewritten = applySemanticSelectionPlan_(std::move(rewritten), payload, conversationContext);
+        rewritten = applySemanticSelectionPlan_(std::move(rewritten), userMessage, payload, conversationContext);
         return rewritten;
     }
 
@@ -1928,7 +2271,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
     fallback.replyPreview = llm.isConfigured()
         ? "Vou responder diretamente."
         : "Vou responder usando a skill de ajuda do aplicativo.";
-    fallback = applySemanticSelectionPlan_(std::move(fallback), payload, conversationContext);
+    fallback = applySemanticSelectionPlan_(std::move(fallback), userMessage, payload, conversationContext);
     fallback = applyReplyLanguageHints_(fallback, payload, userMessage, conversationContext);
     if (llm.isConfigured() &&
         (queryLanguageSource != "detected" ||
@@ -1942,7 +2285,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
         }
     }
     fallback = applyReplyLanguageHints_(fallback, payload, userMessage, conversationContext);
-    fallback = applySemanticSelectionPlan_(std::move(fallback), payload, conversationContext);
+    fallback = applySemanticSelectionPlan_(std::move(fallback), userMessage, payload, conversationContext);
     if (fallback.selectedSkill == "general_answer" &&
         shouldPreferGroundedExplainApp_(userMessage, payload)) {
         fallback.selectedSkill = "explain_app";
@@ -2152,7 +2495,7 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
         sanitized.end());
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
-        { std::regex("\\b(read_state|video_search|create_camera|control_camera|create_job|control_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(read_state|video_search|create_camera|control_camera|create_job|control_job|edit_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(create_cameras_batch|edit_cameras_batch)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },

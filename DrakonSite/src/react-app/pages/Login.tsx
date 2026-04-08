@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@getmocha/users-service/react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { Loader2, Eye, EyeOff, Search, Globe } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import BrandLogo from "@/react-app/components/BrandLogo";
@@ -45,6 +45,7 @@ function GoogleIcon({ className = "w-5 h-5" }: { className?: string }) {
 export default function Login() {
   const { user, isPending, redirectToLogin } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const { t, i18n } = useTranslation();
   const layoutContentRef = useRef<HTMLDivElement | null>(null);
   const hasDedicatedLoginWordmark = Boolean(
@@ -273,6 +274,7 @@ export default function Login() {
       : signupBlockingReasons.length === 0;
   const isGoogleSignupBlocked =
     activeTab === "signup" && (!agreeTerms || !hasSelectedCountry);
+  const accountDeleted = new URLSearchParams(location.search).get("accountDeleted") === "1";
 
   const handleLocalSignup = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -511,6 +513,12 @@ export default function Login() {
                 </h2>
               </div>
 
+              {accountDeleted && (
+                <div className="rounded-2xl border border-emerald-500/35 bg-emerald-500/8 px-4 py-3 text-sm text-emerald-200">
+                  {t("login.accountDeleted")}
+                </div>
+              )}
+
               {error && (
                 <div className="rounded-2xl border border-red-500/35 bg-red-500/8 px-4 py-3 text-sm text-red-300">
                   {error}
@@ -624,6 +632,12 @@ export default function Login() {
                   {t("login.createAccount")}
                 </h2>
               </div>
+
+              {accountDeleted && (
+                <div className="rounded-2xl border border-emerald-500/35 bg-emerald-500/8 px-4 py-3 text-sm text-emerald-200">
+                  {t("login.accountDeleted")}
+                </div>
+              )}
 
               {error && (
                 <div className="rounded-2xl border border-red-500/35 bg-red-500/8 px-4 py-3 text-sm text-red-300">
