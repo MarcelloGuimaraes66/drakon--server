@@ -14,6 +14,7 @@ import type {
   CameraImportCandidate,
   CameraImportPreview,
   CameraImportRequiredField,
+  CameraImportSharedDefaults,
 } from "@/shared/cameraImport";
 
 type CameraBulkImportModalProps = {
@@ -35,7 +36,7 @@ type ImportStage =
   | "error";
 
 type PreviewCommandStatusResponse = {
-  command_id: number;
+  command_id?: number | null;
   status: string;
   file_name?: string | null;
   source_format?: string | null;
@@ -47,13 +48,15 @@ type PreviewCommandStatusResponse = {
 };
 
 type UploadPreviewResponse = {
-  command_id: number;
+  command_id?: number | null;
   status: string;
   file_name?: string | null;
   source_format?: string | null;
   total_rows_detected?: number | null;
   rows_sent_to_llm?: number | null;
   global_warnings?: string[];
+  preview?: CameraImportPreview | null;
+  error?: string | null;
 };
 
 type UploadMeta = {
@@ -64,12 +67,22 @@ type UploadMeta = {
   global_warnings: string[];
 };
 
+type SharedDefaultsFormState = {
+  manufacturer: string;
+  username: string;
+  password: string;
+  rtsp_port: string;
+};
+
 const REQUIRED_FIELD_LABELS: Record<CameraImportRequiredField, string> = {
   ip_address: "IP address",
   username: "Username",
   password: "Password",
   manufacturer: "Manufacturer",
 };
+
+const CAMERA_IMPORT_POLL_INTERVAL_MS = 1800;
+const CAMERA_IMPORT_POLL_TIMEOUT_MS = 90_000;
 
 function humanizeFieldLabel(field: string) {
   if (field in REQUIRED_FIELD_LABELS) {
@@ -104,6 +117,12 @@ function formatCandidateAddress(candidate: CameraImportCandidate) {
     .join(", ");
 }
 
+function normalizeCommandId(value: unknown) {
+  const numericValue =
+    typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isInteger(numericValue) && numericValue > 0 ? numericValue : null;
+}
+
 async function parseApiError(response: Response, fallback: string) {
   const responseText = await response.text();
 
@@ -124,6 +143,66 @@ async function parseApiError(response: Response, fallback: string) {
   return fallback;
 }
 
+function buildSharedDefaultsPayload(
+  state: SharedDefaultsFormState
+): CameraImportSharedDefaults | null {
+  const payload: CameraImportSharedDefaults = {};
+
+  if (state.manufacturer.trim()) {
+    payload.manufacturer = state.manufacturer.trim();
+  }
+  if (state.username.trim()) {
+    payload.username = state.username.trim();
+  }
+  if (state.password.trim()) {
+    payload.password = state.password.trim();
+  }
+  if (state.rtsp_port.trim()) {
+    payload.rtsp_port = state.rtsp_port.trim();
+  }
+
+  return Object.keys(payload).length > 0 ? payload : null;
+}
+
+function hasSharedDefaultForField(
+  field: CameraImportRequiredField,
+  sharedDefaults: CameraImportSharedDefaults | null
+) {
+  if (!sharedDefaults) {
+    return false;
+  }
+
+  if (field === "manufacturer") {
+    return Boolean(sharedDefaults.manufacturer);
+  }
+  if (field === "username") {
+    return Boolean(sharedDefaults.username);
+  }
+  if (field === "password") {
+    return Boolean(sharedDefaults.password);
+  }
+
+  return false;
+}
+
+function getRemainingMissingFields(
+  candidate: CameraImportCandidate,
+  sharedDefaults: CameraImportSharedDefaults | null
+) {
+  return candidate.missing_fields.filter(
+    (field) => !hasSharedDefaultForField(field, sharedDefaults)
+  );
+}
+
+function getSharedDefaultAppliedFields(
+  candidate: CameraImportCandidate,
+  sharedDefaults: CameraImportSharedDefaults | null
+) {
+  return candidate.missing_fields.filter((field) =>
+    hasSharedDefaultForField(field, sharedDefaults)
+  );
+}
+
 export default function CameraBulkImportModal({
   isOpen,
   onClose,
@@ -137,6 +216,12 @@ export default function CameraBulkImportModal({
   const [preview, setPreview] = useState<CameraImportPreview | null>(null);
   const [applyResult, setApplyResult] = useState<CameraImportApplyResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sharedDefaultsForm, setSharedDefaultsForm] = useState<SharedDefaultsFormState>({
+    manufacturer: "",
+    username: "",
+    password: "",
+    rtsp_port: "",
+  });
 
   const resetState = () => {
     setSelectedFile(null);
@@ -146,6 +231,12 @@ export default function CameraBulkImportModal({
     setPreview(null);
     setApplyResult(null);
     setError(null);
+    setSharedDefaultsForm({
+      manufacturer: "",
+      username: "",
+      password: "",
+      rtsp_port: "",
+    });
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -165,9 +256,18 @@ export default function CameraBulkImportModal({
 
     let cancelled = false;
     let timeoutId: number | null = null;
+    const pollingStartedAt = Date.now();
 
     const pollCommandStatus = async () => {
       try {
+        if (Date.now() - pollingStartedAt >= CAMERA_IMPORT_POLL_TIMEOUT_MS) {
+          setError(
+            "The local import assistant took too long to finish this preview. Please try again."
+          );
+          setStage("error");
+          return;
+        }
+
         const response = await fetch(`/api/camera-imports/${previewCommandId}`, {
           credentials: "include",
         });
@@ -197,7 +297,7 @@ export default function CameraBulkImportModal({
           return;
         }
 
-        if (normalizedStatus === "failed") {
+        if (normalizedStatus === "failed" || normalizedStatus === "cancelled") {
           setError(data.error || "The local import assistant could not normalize this file.");
           setStage("error");
           return;
@@ -205,7 +305,7 @@ export default function CameraBulkImportModal({
 
         timeoutId = window.setTimeout(() => {
           void pollCommandStatus();
-        }, 1800);
+        }, CAMERA_IMPORT_POLL_INTERVAL_MS);
       } catch (pollError) {
         if (cancelled) {
           return;
@@ -236,19 +336,36 @@ export default function CameraBulkImportModal({
     );
   }, [preview?.global_warnings, uploadMeta?.global_warnings]);
 
-  const readyCandidates = preview?.candidates.filter((candidate) => candidate.can_create) || [];
+  const sharedDefaults = useMemo(
+    () => buildSharedDefaultsPayload(sharedDefaultsForm),
+    [sharedDefaultsForm]
+  );
+
+  const readyCandidates =
+    preview?.candidates.filter(
+      (candidate) => getRemainingMissingFields(candidate, sharedDefaults).length === 0
+    ) || [];
   const incompleteCandidates =
-    preview?.candidates.filter((candidate) => !candidate.can_create) || [];
+    preview?.candidates.filter(
+      (candidate) => getRemainingMissingFields(candidate, sharedDefaults).length > 0
+    ) || [];
 
   const missingFieldSummaryLines = useMemo(() => {
     if (!preview) {
       return [];
     }
 
-    return Object.entries(preview.missing_field_summary || {})
+    const summary: Record<string, number> = {};
+    preview.candidates.forEach((candidate) => {
+      getRemainingMissingFields(candidate, sharedDefaults).forEach((field) => {
+        summary[field] = (summary[field] || 0) + 1;
+      });
+    });
+
+    return Object.entries(summary)
       .sort((left, right) => right[1] - left[1])
       .map(([field, count]) => `${humanizeFieldLabel(field)} missing in ${count} row(s)`);
-  }, [preview]);
+  }, [preview, sharedDefaults]);
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const nextFile = event.target.files?.[0] || null;
@@ -259,6 +376,12 @@ export default function CameraBulkImportModal({
     setPreview(null);
     setApplyResult(null);
     setError(null);
+    setSharedDefaultsForm({
+      manufacturer: "",
+      username: "",
+      password: "",
+      rtsp_port: "",
+    });
   };
 
   const handlePreviewRequest = async () => {
@@ -293,6 +416,8 @@ export default function CameraBulkImportModal({
       }
 
       const data = (await response.json()) as UploadPreviewResponse;
+      const nextCommandId = normalizeCommandId(data.command_id);
+      const normalizedStatus = String(data.status || "pending").trim().toLowerCase();
 
       setUploadMeta({
         file_name: data.file_name || selectedFile.name,
@@ -303,7 +428,36 @@ export default function CameraBulkImportModal({
           typeof data.rows_sent_to_llm === "number" ? data.rows_sent_to_llm : null,
         global_warnings: Array.isArray(data.global_warnings) ? data.global_warnings : [],
       });
-      setPreviewCommandId(data.command_id);
+
+      if (data.preview) {
+        setPreview(data.preview);
+      }
+
+      if (normalizedStatus === "failed") {
+        throw new Error(
+          data.error || "The local import assistant could not normalize this file."
+        );
+      }
+
+      if (normalizedStatus === "completed") {
+        if (!nextCommandId) {
+          throw new Error(
+            "The local import assistant completed the preview but did not return a valid import session id."
+          );
+        }
+
+        setPreviewCommandId(nextCommandId);
+        setStage("ready");
+        return;
+      }
+
+      if (!nextCommandId) {
+        throw new Error(
+          "The local import assistant did not return a valid import session id."
+        );
+      }
+
+      setPreviewCommandId(nextCommandId);
       setStage("polling");
     } catch (requestError) {
       setError(
@@ -326,6 +480,12 @@ export default function CameraBulkImportModal({
     try {
       const response = await fetch(`/api/camera-imports/${previewCommandId}/apply`, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          shared_defaults: sharedDefaults || undefined,
+        }),
         credentials: "include",
       });
 
@@ -510,7 +670,7 @@ export default function CameraBulkImportModal({
                   <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-4">
                     <p className="text-xs uppercase tracking-wide text-emerald-200/80">Ready</p>
                     <p className="mt-1 text-2xl font-semibold text-emerald-100">
-                      {preview.ready_count}
+                      {readyCandidates.length}
                     </p>
                   </div>
                   <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
@@ -518,7 +678,7 @@ export default function CameraBulkImportModal({
                       Need review
                     </p>
                     <p className="mt-1 text-2xl font-semibold text-amber-100">
-                      {preview.incomplete_count}
+                      {incompleteCandidates.length}
                     </p>
                   </div>
                   <div className="rounded-2xl border border-sky-500/20 bg-sky-500/10 p-4">
@@ -562,11 +722,89 @@ export default function CameraBulkImportModal({
                   </div>
                 )}
 
+                <div className="rounded-2xl border border-blue-500/20 bg-blue-500/10 p-5">
+                  <div className="flex items-start gap-3">
+                    <Sparkles className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-200" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-blue-100">
+                        Shared defaults for sparse files
+                      </p>
+                      <p className="mt-1 text-sm text-blue-50/85">
+                        If the spreadsheet omits repeated credentials, manufacturer, or RTSP
+                        port, enter the shared value once here. It will only be applied to rows
+                        where that field is still blank.
+                      </p>
+                      <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                        <label className="space-y-2 text-sm">
+                          <span className="text-blue-50/90">Manufacturer</span>
+                          <input
+                            type="text"
+                            value={sharedDefaultsForm.manufacturer}
+                            onChange={(event) =>
+                              setSharedDefaultsForm((current) => ({
+                                ...current,
+                                manufacturer: event.target.value,
+                              }))
+                            }
+                            className="w-full rounded-xl border border-blue-400/20 bg-gray-950/70 px-3 py-2.5 text-sm text-gray-100 outline-none transition focus:border-blue-300"
+                            placeholder="Example: Hikvision"
+                          />
+                        </label>
+                        <label className="space-y-2 text-sm">
+                          <span className="text-blue-50/90">Username</span>
+                          <input
+                            type="text"
+                            value={sharedDefaultsForm.username}
+                            onChange={(event) =>
+                              setSharedDefaultsForm((current) => ({
+                                ...current,
+                                username: event.target.value,
+                              }))
+                            }
+                            className="w-full rounded-xl border border-blue-400/20 bg-gray-950/70 px-3 py-2.5 text-sm text-gray-100 outline-none transition focus:border-blue-300"
+                            placeholder="Example: admin"
+                          />
+                        </label>
+                        <label className="space-y-2 text-sm">
+                          <span className="text-blue-50/90">Password</span>
+                          <input
+                            type="text"
+                            value={sharedDefaultsForm.password}
+                            onChange={(event) =>
+                              setSharedDefaultsForm((current) => ({
+                                ...current,
+                                password: event.target.value,
+                              }))
+                            }
+                            className="w-full rounded-xl border border-blue-400/20 bg-gray-950/70 px-3 py-2.5 text-sm text-gray-100 outline-none transition focus:border-blue-300"
+                            placeholder="Shared password"
+                          />
+                        </label>
+                        <label className="space-y-2 text-sm">
+                          <span className="text-blue-50/90">RTSP port</span>
+                          <input
+                            type="text"
+                            value={sharedDefaultsForm.rtsp_port}
+                            onChange={(event) =>
+                              setSharedDefaultsForm((current) => ({
+                                ...current,
+                                rtsp_port: event.target.value,
+                              }))
+                            }
+                            className="w-full rounded-xl border border-blue-400/20 bg-gray-950/70 px-3 py-2.5 text-sm text-gray-100 outline-none transition focus:border-blue-300"
+                            placeholder="554"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 {incompleteCandidates.length > 0 && (
                   <div className="rounded-2xl border border-red-500/20 bg-red-500/10 p-5 text-sm text-red-100">
                     <p className="font-medium">
-                      Rows missing IP address, username, password, or manufacturer will stay out of
-                      the import.
+                      Rows still missing IP address, username, password, or manufacturer after
+                      shared defaults will stay out of the import.
                     </p>
                     <p className="mt-1 text-red-100/80">
                       The preview below shows exactly which field is still missing for each row.
@@ -606,6 +844,15 @@ export default function CameraBulkImportModal({
                 <div className="space-y-3">
                   {preview.candidates.map((candidate) => {
                     const addressText = formatCandidateAddress(candidate);
+                    const remainingMissingFields = getRemainingMissingFields(
+                      candidate,
+                      sharedDefaults
+                    );
+                    const sharedDefaultAppliedFields = getSharedDefaultAppliedFields(
+                      candidate,
+                      sharedDefaults
+                    );
+                    const effectiveCanCreate = remainingMissingFields.length === 0;
 
                     return (
                       <div
@@ -620,12 +867,16 @@ export default function CameraBulkImportModal({
                               </p>
                               <span
                                 className={`rounded-full px-2.5 py-1 text-xs font-medium ${
-                                  candidate.can_create
+                                  effectiveCanCreate
                                     ? "bg-emerald-500/15 text-emerald-200"
                                     : "bg-red-500/15 text-red-200"
                                 }`}
                               >
-                                {candidate.can_create ? "Ready to create" : "Needs required fields"}
+                                {effectiveCanCreate
+                                  ? sharedDefaultAppliedFields.length > 0
+                                    ? "Ready with shared defaults"
+                                    : "Ready to create"
+                                  : "Needs required fields"}
                               </span>
                               {candidate.address_was_defaulted && (
                                 <span className="rounded-full bg-sky-500/15 px-2.5 py-1 text-xs font-medium text-sky-200">
@@ -665,16 +916,34 @@ export default function CameraBulkImportModal({
                           </div>
                         )}
 
-                        {candidate.missing_fields.length > 0 && (
+                        {remainingMissingFields.length > 0 && (
                           <div className="mt-3">
                             <p className="mb-2 text-xs font-medium uppercase tracking-wide text-red-200/80">
                               Missing required fields
                             </p>
                             <div className="flex flex-wrap gap-2">
-                              {candidate.missing_fields.map((field) => (
+                              {remainingMissingFields.map((field) => (
                                 <span
                                   key={field}
                                   className="rounded-full bg-red-500/15 px-2.5 py-1 text-xs font-medium text-red-100"
+                                >
+                                  {humanizeFieldLabel(field)}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {sharedDefaultAppliedFields.length > 0 && (
+                          <div className="mt-3">
+                            <p className="mb-2 text-xs font-medium uppercase tracking-wide text-blue-200/80">
+                              Shared defaults to apply
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {sharedDefaultAppliedFields.map((field) => (
+                                <span
+                                  key={`${candidate.source_index}-shared-${field}`}
+                                  className="rounded-full bg-blue-500/15 px-2.5 py-1 text-xs font-medium text-blue-100"
                                 >
                                   {humanizeFieldLabel(field)}
                                 </span>
@@ -724,7 +993,9 @@ export default function CameraBulkImportModal({
                   need attention.
                 </>
               ) : (
-                <>Internal required fields: IP address, username, password, and manufacturer.</>
+                <>
+                  Internal required fields: IP address, username, password, and manufacturer.
+                </>
               )}
             </div>
 

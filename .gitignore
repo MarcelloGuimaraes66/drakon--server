@@ -41,6 +41,7 @@ tmp-video-frames/
 tmp_drakon_db_snapshot/
 tmp_runtime_backups/
 tmp_perceptrum_trace/
+tmp_runtime_stage/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

@@ -54,6 +54,55 @@ bool isValidStartMode_(const std::string& value)
         value == "custom";
 }
 
+bool hasDecisionConstraint_(const json& value, const std::string& expected)
+{
+    const json constraints = value.value("decision", json::object()).value("constraints", json::array());
+    if (!constraints.is_array()) {
+        return false;
+    }
+
+    const std::string normalizedExpected = lowerAscii(normalizeInlineWhitespace(expected));
+    for (const auto& item : constraints) {
+        if (!item.is_string()) {
+            continue;
+        }
+        if (lowerAscii(normalizeInlineWhitespace(item.get<std::string>())) == normalizedExpected) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ensureDecisionConstraint_(json& value, const std::string& constraint)
+{
+    if (hasDecisionConstraint_(value, constraint)) {
+        return;
+    }
+
+    if (!value.contains("decision") || !value["decision"].is_object()) {
+        value["decision"] = json::object();
+    }
+    if (!value["decision"].contains("constraints") || !value["decision"]["constraints"].is_array()) {
+        value["decision"]["constraints"] = json::array();
+    }
+    value["decision"]["constraints"].push_back(normalizeInlineWhitespace(constraint));
+}
+
+bool isExplicitCreateJobSelection_(const SkillSelection& selection)
+{
+    if (lowerAscii(normalizeInlineWhitespace(selection.selectedSkill)) != "create_job") {
+        return false;
+    }
+
+    const std::string reason = lowerAscii(normalizeInlineWhitespace(selection.reason));
+    if (reason == "explicit_job_creation_action_request") {
+        return true;
+    }
+    return reason == "routing_lexicon_override" &&
+        lowerAscii(normalizeInlineWhitespace(selection.entity)) == "job" &&
+        lowerAscii(normalizeInlineWhitespace(selection.intent)) == "create";
+}
+
 json normalizeReferenceRef_(const json& value, bool allowTraits)
 {
     json normalized = json::object();
@@ -546,6 +595,11 @@ json normalizeInferenceGroup_(const json& value)
         normalized["target_slot_keys"] = targetSlotKeys;
     }
 
+    const std::string sourceTargetSlotKey = slugifyKey(text_(value, "source_target_slot_key"), "");
+    if (!sourceTargetSlotKey.empty()) {
+        normalized["source_target_slot_key"] = sourceTargetSlotKey;
+    }
+
     const std::string inputType = lowerAscii(text_(value, "input_type"));
     if (!inputType.empty()) {
         normalized["input_type"] = inputType == "image" ? "image" : "video";
@@ -729,6 +783,81 @@ bool targetRequiresPhysicalCamera_(const json& step, const json& target)
     }
 
     return lowerAscii(text_(target, "input_type")) != "image";
+}
+
+bool snapshotHasPromptContract_(const json& value)
+{
+    return !text_(value, "prompt_template").empty() &&
+        !text_(value, "alert_condition").empty();
+}
+
+bool agentSpecHasAnalysis_(const json& agent)
+{
+    if (!text_(agent, "goal_summary").empty()) {
+        return true;
+    }
+    if (snapshotHasPromptContract_(agent.value("agent_patch", json::object()))) {
+        return true;
+    }
+    if (snapshotHasPromptContract_(agent.value("compiled_snapshot", json::object()))) {
+        return true;
+    }
+    return false;
+}
+
+bool inferenceGroupHasAnalysis_(const json& step)
+{
+    const json inferenceGroup = step.value("inference_group", json::object());
+    return snapshotHasPromptContract_(inferenceGroup.value("shared_agent_patch", json::object())) ||
+        snapshotHasPromptContract_(inferenceGroup.value("compiled_snapshot", json::object()));
+}
+
+std::string resolveInferenceGroupSourceLocalSlotKey_(const json& step)
+{
+    const auto isKnownTargetSlot = [&](const std::string& candidate) -> bool {
+        if (candidate.empty()) {
+            return false;
+        }
+        for (const auto& target : step.value("targets", json::array())) {
+            if (slugifyKey(text_(target, "slot_key"), "") == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const json inferenceGroup = step.value("inference_group", json::object());
+    const std::string explicitSource =
+        slugifyKey(text_(inferenceGroup, "source_target_slot_key"), "");
+    if (isKnownTargetSlot(explicitSource)) {
+        return explicitSource;
+    }
+
+    for (const auto& slotValue : inferenceGroup.value("target_slot_keys", json::array())) {
+        if (!slotValue.is_string()) {
+            continue;
+        }
+        const std::string candidate = slugifyKey(slotValue.get<std::string>(), "");
+        if (isKnownTargetSlot(candidate)) {
+            return candidate;
+        }
+    }
+
+    for (const auto& agent : step.value("agents", json::array())) {
+        const std::string candidate = slugifyKey(text_(agent, "camera_slot_key"), "");
+        if (isKnownTargetSlot(candidate)) {
+            return candidate;
+        }
+    }
+
+    for (const auto& target : step.value("targets", json::array())) {
+        const std::string candidate = slugifyKey(text_(target, "slot_key"), "");
+        if (isKnownTargetSlot(candidate)) {
+            return candidate;
+        }
+    }
+
+    return "";
 }
 
 json mergeObjectShallow_(const json& baseValue, const json& incomingValue)
@@ -1003,6 +1132,10 @@ json normalizeRouterCreateJobDraft(const SkillSelection& selection)
         normalized = mergeJobBlueprint(normalized, selection.draftPatch);
         touched = true;
     }
+    if (isExplicitCreateJobSelection_(selection)) {
+        ensureDecisionConstraint_(normalized, "force_job_artifact");
+        touched = true;
+    }
     return touched ? normalized : defaultJobBlueprint();
 }
 
@@ -1031,6 +1164,9 @@ json extractJobBlueprintDraft(
         "Use execution_mode=camera_agent only when one camera is enough and no recurring schedule or multi-step orchestration is required.\n"
         "Use execution_mode=single_step_job when the user needs a scheduled task but the workflow fits in one step.\n"
         "Use execution_mode=multi_step_job when there are dependencies, start conditions, knowledge sharing, validation, or a final decision step.\n"
+        "If the user explicitly asks to create a job, task, tarefa, or workflow, keep a real job artifact and do not collapse it into execution_mode=camera_agent, even when the workflow is simple.\n"
+        "When the user does not explicitly ask for a job/task/workflow, camera_agent is allowed only for a direct unscheduled analysis without start/stop windows, active time ranges, or cross-camera sequencing.\n"
+        "Mentions of schedule, start time, stop time, active window, elapsed time, or sequence across different cameras require a real job artifact.\n"
         "Do not use inference groups unless the shared targets can run with input_type=image.\n"
         "If the workflow needs video analysis, keep execution.mode=per_target_agents.\n"
         "Collector or analysis-only agents that only feed knowledge into another step should use alert_policy=never.\n"
@@ -1039,6 +1175,7 @@ json extractJobBlueprintDraft(
         "Use output_contract.schema when the downstream step needs a structured JSON contract.\n"
         "Use camera selectors when the user names cameras directly or by scene.\n"
         "Use step.start_condition to describe positive, negative, sequential, time, elapsed, or custom starts.\n"
+        "Preserve explicit technical execution settings from the user. When the user gives input_type, run_every, inference_model, model_fps, video_packaging_mode, running_resolution, only_capture_on_motion, or use_temporal_context, copy them into agent_patch or inference_group.shared_agent_patch instead of dropping them.\n"
         "job.schedule.mode must be weekly, monthly, yearly, or none.\n"
         "If the user did not give any schedule for a real job, keep schedule.mode=none and leave schedule_days empty.\n"
         "Return this shape:\n"
@@ -1061,8 +1198,8 @@ json extractJobBlueprintDraft(
         "}"
         "]"
         "}\n"
-        "Example for a scheduled single-step task:\n"
-        "{\"decision\":{\"execution_mode\":\"single_step_job\"},\"job\":{\"name\":\"Patio noturno\",\"schedule\":{\"mode\":\"weekly\",\"schedule_days\":[{\"day_name\":\"Monday\",\"day_of_week\":1,\"windows\":[{\"start_time\":\"22:00\",\"end_time\":\"23:59\"}]}]}},\"steps\":[{\"step_key\":\"patio_monitor\",\"name\":\"Monitor patio\",\"role\":\"decision\",\"timeout_seconds\":120,\"targets\":[{\"slot_key\":\"patio\",\"camera_selector\":{\"name\":\"patio\"},\"input_type\":\"video\"}],\"agents\":[{\"destination_type\":\"step_camera\",\"camera_slot_key\":\"patio\",\"goal_summary\":\"alertar se alguem entrar no patio fora do horario\",\"alert_policy\":\"local\",\"output_contract\":{\"format\":\"json_object\",\"downstream_safe\":true,\"schema\":{\"result\":\"boolean\",\"reason\":\"string\"}},\"agent_patch\":{}}]}]}\n"
+        "Example for a scheduled single-step task with shared image analysis:\n"
+        "{\"decision\":{\"execution_mode\":\"single_step_job\"},\"job\":{\"name\":\"Patio noturno\",\"schedule\":{\"mode\":\"weekly\",\"schedule_days\":[{\"day_name\":\"Monday\",\"day_of_week\":1,\"windows\":[{\"start_time\":\"22:00\",\"end_time\":\"23:59\"}]}]}},\"steps\":[{\"step_key\":\"patio_monitor\",\"name\":\"Monitor patio\",\"role\":\"decision\",\"timeout_seconds\":120,\"execution\":{\"mode\":\"inference_group_image\",\"reason\":\"shared image analysis\"},\"targets\":[{\"slot_key\":\"patio_norte\",\"camera_selector\":{\"name\":\"patio norte\"},\"input_type\":\"image\"},{\"slot_key\":\"patio_sul\",\"camera_selector\":{\"name\":\"patio sul\"},\"input_type\":\"image\"}],\"agents\":[{\"destination_type\":\"step_default\",\"goal_summary\":\"alertar se houver pessoa no patio fora do horario\",\"alert_policy\":\"local\",\"output_contract\":{\"format\":\"json_object\",\"downstream_safe\":true,\"schema\":{\"result\":\"boolean\",\"reason\":\"string\"}},\"agent_patch\":{\"input_type\":\"image\",\"run_every\":10}}],\"inference_group\":{\"enabled\":true,\"shared_agent_patch\":{\"input_type\":\"image\",\"run_every\":10}}}]}\n"
         "Example for direct camera-agent fallback:\n"
         "{\"decision\":{\"execution_mode\":\"camera_agent\",\"reason\":\"single unscheduled camera request\"},\"steps\":[{\"step_key\":\"camera_direct\",\"name\":\"Camera Direct\",\"role\":\"decision\",\"timeout_seconds\":120,\"targets\":[{\"slot_key\":\"portao\",\"camera_selector\":{\"name\":\"portao\"},\"input_type\":\"video\"}],\"agents\":[{\"destination_type\":\"camera\",\"camera_slot_key\":\"portao\",\"goal_summary\":\"alertar quando uma pessoa entrar pela garagem\",\"alert_policy\":\"local\",\"output_contract\":{\"format\":\"json_object\",\"downstream_safe\":true,\"schema\":{\"result\":\"boolean\",\"answer\":\"string\"}},\"agent_patch\":{},\"face_target_refs\":[],\"drakon_find_target_refs\":[]}]}]}\n"
         "Example for the varanda to estacionamento flow in 2 minutes:\n"
@@ -1179,9 +1316,12 @@ json chooseJobTopology(const json& value)
     }
 
     std::string executionMode = lowerAscii(text_(blueprint.value("decision", json::object()), "execution_mode"));
+    const bool forceJobArtifact = hasDecisionConstraint_(blueprint, "force_job_artifact");
+    bool upgradedFromCameraAgent = false;
     if (executionMode.empty()) {
         if (!hasSchedule && steps.size() == 1 && steps[0].value("targets", json::array()).size() == 1 && !hasDependencies && !hasKnowledgeSharing) {
-            executionMode = "camera_agent";
+            executionMode = forceJobArtifact ? "single_step_job" : "camera_agent";
+            upgradedFromCameraAgent = forceJobArtifact;
         }
         else if (steps.size() <= 1) {
             executionMode = "single_step_job";
@@ -1190,9 +1330,16 @@ json chooseJobTopology(const json& value)
             executionMode = "multi_step_job";
         }
     }
+    else if (forceJobArtifact && executionMode == "camera_agent") {
+        executionMode = steps.size() <= 1 ? "single_step_job" : "multi_step_job";
+        upgradedFromCameraAgent = true;
+    }
 
     blueprint["decision"]["execution_mode"] = executionMode;
-    if (text_(blueprint.value("decision", json::object()), "reason").empty()) {
+    if (upgradedFromCameraAgent) {
+        blueprint["decision"]["reason"] = "explicit job request preserved as job artifact";
+    }
+    else if (text_(blueprint.value("decision", json::object()), "reason").empty()) {
         if (executionMode == "camera_agent") {
             blueprint["decision"]["reason"] = "single unscheduled camera request";
         }
@@ -1298,13 +1445,29 @@ std::vector<std::string> collectMissingJobFields(const json& blueprint)
         }
 
         const json agents = step.value("agents", json::array());
-        if (agents.empty() && step.value("execution", json::object()).value("mode", std::string()) != "inference_group_image") {
+        const bool isGroupStep =
+            step.value("execution", json::object()).value("mode", std::string()) == "inference_group_image";
+        if (isGroupStep) {
+            if (!inferenceGroupHasAnalysis_(step)) {
+                bool sawUsableAgent = false;
+                for (const auto& agent : agents) {
+                    if (agentSpecHasAnalysis_(agent)) {
+                        sawUsableAgent = true;
+                        break;
+                    }
+                }
+                if (!sawUsableAgent) {
+                    missing.push_back("analysis");
+                }
+            }
+            continue;
+        }
+
+        if (agents.empty()) {
             missing.push_back("analysis");
         }
         for (const auto& agent : agents) {
-            const json patch = agent.value("agent_patch", json::object());
-            if (text_(agent, "goal_summary").empty() &&
-                (text_(patch, "prompt_template").empty() || text_(patch, "alert_condition").empty())) {
+            if (!agentSpecHasAnalysis_(agent)) {
                 missing.push_back("analysis");
             }
         }
@@ -1492,10 +1655,11 @@ json compileBlueprintToInstallRequest(const json& value)
 
         const std::string executionMode = lowerAscii(text_(step.value("execution", json::object()), "mode"));
         if (executionMode == "inference_group_image") {
-            const json compiledGroupSnapshot = step.value("inference_group", json::object()).value("compiled_snapshot", json::object());
+            const json inferenceGroup = step.value("inference_group", json::object());
+            const json compiledGroupSnapshot = inferenceGroup.value("compiled_snapshot", json::object());
             if (compiledGroupSnapshot.is_object() && !compiledGroupSnapshot.empty()) {
                 json targetSlotKeys = json::array();
-                const json explicitTargets = step.value("inference_group", json::object()).value("target_slot_keys", json::array());
+                const json explicitTargets = inferenceGroup.value("target_slot_keys", json::array());
                 if (explicitTargets.is_array() && !explicitTargets.empty()) {
                     for (const auto& slotValue : explicitTargets) {
                         if (!slotValue.is_string()) {
@@ -1518,25 +1682,89 @@ json compileBlueprintToInstallRequest(const json& value)
                     }
                 }
 
-                snapshotStep["inference_groups"] = json::array({
-                    json::object({
-                        { "id", stepKey + "_group" },
-                        { "name", text_(step, "name").empty() ? stepKey : text_(step, "name") },
-                        { "target_slot_keys", targetSlotKeys },
-                        { "agent_key", "custom_template" },
-                        { "input_type", lowerAscii(text_(compiledGroupSnapshot, "input_type")) == "image" ? "image" : "video" },
-                        { "video_packaging_mode", text_(compiledGroupSnapshot, "video_packaging_mode") },
-                        { "prompt_template", text_(compiledGroupSnapshot, "prompt_template") },
-                        { "alert_condition", text_(compiledGroupSnapshot, "alert_condition") },
-                        { "negative_condition", text_(compiledGroupSnapshot, "negative_condition") },
-                        { "priority_level", role == "decision" ? "HIGH" : "MEDIUM" },
-                        { "inference_model", text_(compiledGroupSnapshot, "inference_model") },
-                        { "model_fps", intField_(compiledGroupSnapshot, "model_fps", 1) },
-                        { "run_every", intField_(compiledGroupSnapshot, "run_every", 60) },
-                        { "running_resolution", intField_(compiledGroupSnapshot, "running_resolution", 640) },
-                        { "only_capture_on_motion", boolField_(compiledGroupSnapshot, "only_capture_on_motion", true) },
-                    })
+                const std::string sourceLocalSlotKey = resolveInferenceGroupSourceLocalSlotKey_(step);
+                std::string sourceGlobalSlotKey = sourceLocalSlotKey.empty()
+                    ? std::string()
+                    : globalSlotByLocalKey[stepKey + ":" + sourceLocalSlotKey];
+                if (sourceGlobalSlotKey.empty() && !targetSlotKeys.empty() && targetSlotKeys[0].is_string()) {
+                    sourceGlobalSlotKey = targetSlotKeys[0].get<std::string>();
+                }
+
+                const std::string groupAgentKey = stepKey.empty()
+                    ? "shared_group_agent"
+                    : stepKey + "_shared_agent";
+
+                json sourceAgentSnapshot = json::object();
+                for (const auto& agent : step.value("agents", json::array())) {
+                    const json compiledSnapshot = agent.value("compiled_snapshot", json::object());
+                    if (!compiledSnapshot.is_object() || compiledSnapshot.empty()) {
+                        continue;
+                    }
+                    const std::string candidateLocalSlotKey = slugifyKey(text_(agent, "camera_slot_key"), "");
+                    if (!sourceLocalSlotKey.empty() && candidateLocalSlotKey == sourceLocalSlotKey) {
+                        sourceAgentSnapshot = compiledSnapshot;
+                        break;
+                    }
+                    if (sourceAgentSnapshot.empty()) {
+                        sourceAgentSnapshot = compiledSnapshot;
+                    }
+                }
+                if (sourceAgentSnapshot.empty()) {
+                    sourceAgentSnapshot = compiledGroupSnapshot;
+                }
+                if (sourceAgentSnapshot.is_object() && !sourceAgentSnapshot.empty()) {
+                    sourceAgentSnapshot["agent_key"] = groupAgentKey;
+                    if (text_(sourceAgentSnapshot, "display_name").empty()) {
+                        sourceAgentSnapshot["display_name"] =
+                            text_(step, "name").empty() ? stepKey : text_(step, "name");
+                    }
+                    if (text_(sourceAgentSnapshot, "summary").empty()) {
+                        std::string summary;
+                        for (const auto& agent : step.value("agents", json::array())) {
+                            summary = text_(agent, "goal_summary");
+                            if (!summary.empty()) {
+                                break;
+                            }
+                        }
+                        if (summary.empty()) {
+                            summary = text_(step, "name");
+                        }
+                        if (!summary.empty()) {
+                            sourceAgentSnapshot["summary"] = summary;
+                        }
+                    }
+
+                    json groupSourceAgent = json::object({
+                        { "agent_snapshot", sourceAgentSnapshot },
+                    });
+                    if (!sourceGlobalSlotKey.empty()) {
+                        groupSourceAgent["camera_slot_key"] = sourceGlobalSlotKey;
+                    }
+                    snapshotStep["agents"] = json::array({ groupSourceAgent });
+                }
+
+                json groupSnapshot = json::object({
+                    { "id", stepKey + "_group" },
+                    { "name", text_(step, "name").empty() ? stepKey : text_(step, "name") },
+                    { "target_slot_keys", targetSlotKeys },
+                    { "agent_key", groupAgentKey },
+                    { "input_type", lowerAscii(text_(compiledGroupSnapshot, "input_type")) == "image" ? "image" : "video" },
+                    { "video_packaging_mode", text_(compiledGroupSnapshot, "video_packaging_mode") },
+                    { "prompt_template", text_(compiledGroupSnapshot, "prompt_template") },
+                    { "alert_condition", text_(compiledGroupSnapshot, "alert_condition") },
+                    { "negative_condition", text_(compiledGroupSnapshot, "negative_condition") },
+                    { "priority_level", role == "decision" ? "HIGH" : "MEDIUM" },
+                    { "inference_model", text_(compiledGroupSnapshot, "inference_model") },
+                    { "model_fps", intField_(compiledGroupSnapshot, "model_fps", 1) },
+                    { "run_every", intField_(compiledGroupSnapshot, "run_every", 60) },
+                    { "running_resolution", intField_(compiledGroupSnapshot, "running_resolution", 640) },
+                    { "only_capture_on_motion", boolField_(compiledGroupSnapshot, "only_capture_on_motion", true) },
                 });
+                if (!sourceGlobalSlotKey.empty()) {
+                    groupSnapshot["source_target_slot_key"] = sourceGlobalSlotKey;
+                }
+
+                snapshotStep["inference_groups"] = json::array({ groupSnapshot });
             }
         }
         else {

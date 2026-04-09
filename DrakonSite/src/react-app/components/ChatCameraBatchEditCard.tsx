@@ -10,6 +10,9 @@ type Props = {
 };
 
 function humanizeFieldLabel(field: string) {
+  if (field === "ip_address" || field === "normalize_ip_address_format") {
+    return "IP Address";
+  }
   return field
     .replace(/_/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());

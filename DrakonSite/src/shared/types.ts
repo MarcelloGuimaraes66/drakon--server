@@ -27,6 +27,7 @@ export const CreateCameraSchema = z.object({
 export const UpdateCameraSchema = z.object({
   name: z.string().optional(),
   ip_address: z.string().optional(),
+  normalize_ip_address_format: z.boolean().optional(),
   rtsp_port: z.string().optional(),
   manufacturer: z.string().optional(),
   username: z.string().optional(),

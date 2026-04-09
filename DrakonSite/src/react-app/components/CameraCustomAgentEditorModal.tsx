@@ -19,6 +19,11 @@ import {
   shouldShowCoreModelNotice,
 } from "@/react-app/utils/coreModelNotice";
 import { isGeneratedCustomAgentName } from "@/react-app/utils/chatUtils";
+import {
+  fetchSavedAgentLibrary,
+  getSavedAgentLibraryOptionLabel,
+  type SavedAgentLibraryEntry,
+} from "@/react-app/utils/savedAgentLibrary";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 
 export type ToastVariant = "default" | "destructive";
@@ -93,13 +98,6 @@ export interface CameraCustomAgentRow {
   analysis_regions?: unknown;
   config_json?: unknown;
 }
-
-type OwnedAgentTemplate = CameraCustomAgentRow & {
-  camera_id: number;
-  camera_name: string;
-  display_name: string;
-  updated_at: string | null;
-};
 
 export type CameraAgentEditorTarget = {
   type: "camera" | "step_default" | "step_camera";
@@ -771,10 +769,10 @@ export default function CameraCustomAgentEditorModal({
   const [enhancingPrompt, setEnhancingPrompt] = useState(false);
   const [suggestion, setSuggestion] = useState<PromptEnhanceSuggestion | null>(null);
   const [saving, setSaving] = useState(false);
-  const [templateAgents, setTemplateAgents] = useState<OwnedAgentTemplate[]>([]);
+  const [templateAgents, setTemplateAgents] = useState<SavedAgentLibraryEntry[]>([]);
   const [templateAgentsLoading, setTemplateAgentsLoading] = useState(false);
   const [templateAgentsError, setTemplateAgentsError] = useState<string | null>(null);
-  const [selectedTemplateAgentId, setSelectedTemplateAgentId] = useState("");
+  const [selectedTemplateAgentKey, setSelectedTemplateAgentKey] = useState("");
 
   const previewRef = useRef<HTMLDivElement | null>(null);
   const [snapshotMeta, setSnapshotMeta] = useState<{ thumbnail_url: string | null; last_thumbnail_update: string | null }>({
@@ -829,10 +827,10 @@ export default function CameraCustomAgentEditorModal({
   };
   const canLoadSavedAgentTemplate = !isOnboardingOpen;
   const selectedTemplateAgent = useMemo(() => {
-    const templateId = Number(selectedTemplateAgentId);
-    if (!Number.isInteger(templateId) || templateId <= 0) return null;
-    return templateAgents.find((agent) => agent.id === templateId) || null;
-  }, [selectedTemplateAgentId, templateAgents]);
+    const templateKey = selectedTemplateAgentKey.trim();
+    if (!templateKey) return null;
+    return templateAgents.find((agent) => agent.library_key === templateKey) || null;
+  }, [selectedTemplateAgentKey, templateAgents]);
 
   const polygonCount = polygonRegions.length;
   const snapshotRefreshBlocked =
@@ -1082,86 +1080,23 @@ export default function CameraCustomAgentEditorModal({
       setTemplateAgents([]);
       setTemplateAgentsLoading(false);
       setTemplateAgentsError(null);
-      setSelectedTemplateAgentId("");
+      setSelectedTemplateAgentKey("");
       return;
     }
 
     let cancelled = false;
     setTemplateAgentsLoading(true);
     setTemplateAgentsError(null);
-    setSelectedTemplateAgentId("");
+    setSelectedTemplateAgentKey("");
 
     void (async () => {
       try {
-        const response = await fetch("/api/custom-agents/library");
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw new Error(data?.error || "Failed to load your saved agents");
-        }
-
-        const rows = Array.isArray(data?.agents) ? data.agents : [];
-        const normalized = rows
-          .map((rawRow: unknown) => {
-            const row =
-              rawRow && typeof rawRow === "object"
-                ? (rawRow as Record<string, unknown>)
-                : null;
-            if (!row) return null;
-
-            const id = Number(row?.id);
-            const sourceCameraId = Number(row?.camera_id);
-            if (!Number.isInteger(id) || id <= 0) return null;
-            if (!Number.isInteger(sourceCameraId) || sourceCameraId <= 0) return null;
-
-            const configJson =
-              row?.config_json &&
-              typeof row.config_json === "object" &&
-              !Array.isArray(row.config_json)
-                ? row.config_json
-                : {};
-            const draftAgent: CameraCustomAgentRow = {
-              id,
-              algorithm_type: String(row?.algorithm_type || ""),
-              is_enabled: normalizeBool(row?.is_enabled, true),
-              input_type: String(row?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video",
-              video_packaging_mode: normalizeVideoPackagingMode(row?.video_packaging_mode),
-              inference_model: normalizeInferenceModel(row?.inference_model),
-              model_fps: Number.isFinite(Number(row?.model_fps))
-                ? Number(row.model_fps)
-                : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
-              run_every: normalizeRunEverySeconds(row?.run_every, 60),
-              running_resolution: normalizeRunningResolution(row?.running_resolution),
-              only_capture_on_motion: normalizeBool(row?.only_capture_on_motion, true),
-              prompt_template: String(row?.prompt_template || ""),
-              alert_condition: String(row?.alert_condition || ""),
-              negative_condition: String(row?.negative_condition || ""),
-              face_target_ids: normalizeFaceTargetIds(row?.face_target_ids),
-              negative_reference_images: normalizeNegativeImages(row?.negative_reference_images),
-              analysis_regions: Array.isArray(row?.analysis_regions) ? row.analysis_regions : [],
-              config_json: configJson,
-            };
-
-            return {
-              ...draftAgent,
-              camera_id: sourceCameraId,
-              camera_name:
-                typeof row?.camera_name === "string" && row.camera_name.trim()
-                  ? row.camera_name.trim()
-                  : `Camera #${sourceCameraId}`,
-              display_name: getDisplayNameFromAgent(draftAgent) || `Agent ${id}`,
-              updated_at:
-                typeof row?.updated_at === "string" && row.updated_at.trim()
-                  ? row.updated_at.trim()
-                  : null,
-            } as OwnedAgentTemplate;
-          })
-          .filter(Boolean) as OwnedAgentTemplate[];
-
+        const savedAgents = await fetchSavedAgentLibrary();
         if (!cancelled) {
-          setTemplateAgents(normalized);
+          setTemplateAgents(savedAgents);
         }
       } catch (error) {
-        console.error("Failed to load owned custom agents:", error);
+        console.error("Failed to load saved agent library:", error);
         if (!cancelled) {
           setTemplateAgents([]);
           setTemplateAgentsError(
@@ -1852,9 +1787,27 @@ export default function CameraCustomAgentEditorModal({
 
     await initialize(
       {
-        ...selectedTemplateAgent,
+        id: selectedTemplateAgent.id,
+        algorithm_type: selectedTemplateAgent.algorithm_type || selectedTemplateAgent.agent_key,
+        is_enabled: selectedTemplateAgent.is_enabled ? 1 : 0,
+        input_type: selectedTemplateAgent.input_type,
+        video_packaging_mode: selectedTemplateAgent.video_packaging_mode,
+        inference_model: selectedTemplateAgent.inference_model,
+        model_fps:
+          selectedTemplateAgent.model_fps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+        run_every: selectedTemplateAgent.run_every ?? 60,
+        running_resolution: selectedTemplateAgent.running_resolution,
+        only_capture_on_motion: selectedTemplateAgent.only_capture_on_motion,
+        prompt_template: selectedTemplateAgent.prompt_template,
+        alert_condition: selectedTemplateAgent.alert_condition,
+        negative_condition: selectedTemplateAgent.negative_condition,
         face_target_ids: faceIds,
         negative_reference_images: [],
+        analysis_regions: selectedTemplateAgent.analysis_regions,
+        config_json: {
+          display_name: selectedTemplateAgent.display_name,
+          summary: selectedTemplateAgent.summary,
+        },
       },
       { loadMode: "template" }
     );
@@ -2024,8 +1977,8 @@ export default function CameraCustomAgentEditorModal({
                     Load
                   </span>
                   <select
-                    value={selectedTemplateAgentId}
-                    onChange={(e) => setSelectedTemplateAgentId(e.target.value)}
+                    value={selectedTemplateAgentKey}
+                    onChange={(e) => setSelectedTemplateAgentKey(e.target.value)}
                     disabled={templateAgentsLoading || saving || enhancingPrompt}
                     title={
                       templateAgentsError ||
@@ -2043,8 +1996,8 @@ export default function CameraCustomAgentEditorModal({
                         : "Saved agents"}
                     </option>
                     {templateAgents.map((agent) => (
-                      <option key={`saved-agent-${agent.id}`} value={agent.id}>
-                        {`${agent.display_name} - ${agent.camera_name}`}
+                      <option key={agent.library_key} value={agent.library_key}>
+                        {getSavedAgentLibraryOptionLabel(agent)}
                       </option>
                     ))}
                   </select>

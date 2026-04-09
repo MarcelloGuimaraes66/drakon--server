@@ -14,6 +14,7 @@ import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCr
 import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
 import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import ChatJobCreatedCard from "@/react-app/components/ChatJobCreatedCard";
 import ChatIdentityCardsPanel from "@/react-app/components/ChatIdentityCardsPanel";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
 import CameraCustomAgentEditorModal, {
@@ -34,17 +35,18 @@ import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lu
 import {
   type CameraAgentFormRequestMessageMetadata,
   type CameraEditFormRequestMessageMetadata,
-   extractCameraAgentCreationResultFromMessage,
-   extractCameraAgentEditContextFromMessage,
-   extractIdentityCardsFromMessage,
-   extractHitMediaFromMessage,
-   extractCameraAgentFormRequestFromMessage,
-   extractCameraAgentUpdateResultFromMessage,
-   extractCameraEditFormRequestFromMessage,
+  extractCameraAgentCreationResultFromMessage,
+  extractCameraAgentEditContextFromMessage,
+  extractIdentityCardsFromMessage,
+  extractHitMediaFromMessage,
+  extractCameraAgentFormRequestFromMessage,
+  extractCameraAgentUpdateResultFromMessage,
+  extractCameraEditFormRequestFromMessage,
   extractCameraNetworkScanFromMessage,
   extractCameraBatchEditDraftFromMessage,
   extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
+  extractJobCreationResultFromMessage,
   applyCameraEditDraftToCamera,
   buildCameraAgentDraftForEditor,
   extractChatProgressFromMessage,
@@ -793,6 +795,7 @@ export default function Chat() {
     const cameraBatchEditDraft = extractCameraBatchEditDraftFromMessage(message);
     const cameraAgentFormRequest = extractCameraAgentFormRequestFromMessage(message);
     const cameraAgentCreationResult = extractCameraAgentCreationResultFromMessage(message);
+    const jobCreationResult = extractJobCreationResultFromMessage(message);
     const cameraAgentEditContext = extractCameraAgentEditContextFromMessage(message);
     const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
@@ -845,6 +848,8 @@ export default function Chat() {
         <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
       ) : cameraAgentUpdateResult ? (
         <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+      ) : jobCreationResult ? (
+        <ChatJobCreatedCard metadata={jobCreationResult} />
       ) : cameraAgentCreationResult ? (
         <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
       ) : cameraEditFormRequest ? (

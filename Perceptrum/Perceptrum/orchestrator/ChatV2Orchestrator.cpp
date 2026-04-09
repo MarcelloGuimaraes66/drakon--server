@@ -353,6 +353,101 @@ bool isVideoObservationRequest_(const std::string& normalized)
     return hasObservationCue_(normalized) || hasTimeWindowCue_(normalized);
 }
 
+bool hasCameraBatchScopeCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "all cameras", "all the cameras", "every camera", "every cameras",
+        "multiple cameras", "many cameras", "several cameras", "those cameras",
+        "these cameras", "cameras that", "cameras with", "cameras where",
+        "cameras whose", "camera ids", "camera names", "batch", "in batch",
+        "todas as cameras", "todas cameras", "todas as camaras", "todas camaras",
+        "varias cameras", "varias camaras", "algumas cameras", "cameras que",
+        "cameras com", "cameras onde", "cameras cujo", "cameras cujos",
+        "em lote", "lote"
+    });
+}
+
+bool hasCameraInventoryAnalysisCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "which cameras", "what cameras", "what camera", "how many cameras",
+        "list cameras", "show cameras", "find cameras", "find camera",
+        "camera list", "camera lists", "camera inventory", "camera inventories",
+        "camera status", "camera statuses", "camera audit", "camera audits",
+        "camera audits", "camera match", "camera matches", "camera filter",
+        "camera filters", "ip wrong", "wrong ip", "malformed ip",
+        "incorrect ip", "invalid ip", "leading zero", "leading zeros",
+        "zero a esquerda", "ip errado", "ip incorreto", "ip invalido",
+        "terminacao de ip", "termina em", "final do ip", "sufixo do ip",
+        "ip ending", "ip ends", "ip suffix", "offline cameras", "online cameras",
+        "cameras offline", "cameras online", "cameras sem agente",
+        "cameras without agent", "cameras with no agent",
+        "quais cameras", "que cameras", "quantas cameras", "listar cameras",
+        "mostre as cameras", "mostrar cameras", "ache as cameras",
+        "camera tem", "cameras tem", "camera com", "cameras com"
+    });
+}
+
+bool shouldUseReadStateForCameraInventory_(
+    const std::string& normalized,
+    const RoutingLexiconSignals& signals)
+{
+    if (!signals.mentionsCamera || signals.mentionsJob || signals.mentionsCameraAgent) {
+        return false;
+    }
+
+    if (signals.wantsCreate || signals.wantsEdit || signals.wantsStart || signals.wantsStop) {
+        return false;
+    }
+
+    if (signals.wantsRead) {
+        return true;
+    }
+
+    if (hasCameraInventoryAnalysisCue_(normalized)) {
+        return true;
+    }
+
+    return normalized.find('?') != std::string::npos &&
+        containsAny_(normalized, {
+            "camera", "cameras", "camara", "camaras"
+        });
+}
+
+bool shouldUseEditCamerasBatch_(
+    const SkillSelection& selection,
+    const std::string& normalized,
+    const RoutingLexiconSignals& signals)
+{
+    if (selection.selectedSkill == "edit_cameras_batch" ||
+        selection.operationType == "edit_cameras_batch") {
+        return true;
+    }
+
+    if (selection.arguments.is_object()) {
+        if (selection.arguments.contains("camera_ids") &&
+            selection.arguments["camera_ids"].is_array() &&
+            selection.arguments["camera_ids"].size() > 1) {
+            return true;
+        }
+        if (selection.arguments.contains("target_scope") &&
+            selection.arguments["target_scope"].is_object() &&
+            !selection.arguments["target_scope"].empty()) {
+            return true;
+        }
+    }
+
+    if (!signals.mentionsCamera || signals.mentionsJob || signals.mentionsCameraAgent) {
+        return false;
+    }
+
+    if (!signals.wantsEdit) {
+        return false;
+    }
+
+    return hasCameraBatchScopeCue_(normalized);
+}
+
 bool isCameraCreationHelpRequest_(const std::string& normalized)
 {
     return isInstructionalIntent_(normalized) &&
@@ -626,12 +721,25 @@ SkillSelection applyRoutingLexiconCorrections_(
 
     const RoutingLexiconSignals signals = detectRoutingLexiconSignals(userMessage);
     const std::string runtimeAction = runtimeActionFromRoutingSignals(signals);
+    const bool selectionPrefersCreateJob =
+        selection.selectedSkill == "create_job" ||
+        selection.operationType == "create_job" ||
+        selection.intent == "create";
+    const bool selectionPrefersEditJob =
+        selection.selectedSkill == "edit_job" ||
+        selection.operationType == "edit_job";
 
     auto ensureArgumentsObject = [&]() -> nlohmann::json& {
         if (!selection.arguments.is_object()) {
             selection.arguments = nlohmann::json::object();
         }
         return selection.arguments;
+    };
+
+    auto clearRuntimeActionArgument = [&]() {
+        if (selection.arguments.is_object()) {
+            selection.arguments.erase("runtime_action");
+        }
     };
 
     auto forceSelection = [&](const std::string& skillName,
@@ -660,17 +768,23 @@ SkillSelection applyRoutingLexiconCorrections_(
     }
 
     if (signals.mentionsJob) {
-        if (!runtimeAction.empty()) {
-            forceSelection("control_job", "job", "update");
-            ensureArgumentsObject()["runtime_action"] = runtimeAction;
-            return selection;
-        }
-        if (signals.wantsEdit) {
+        // Authoring requests often mention schedule cadence ("run every 10s")
+        // while still asking to create or edit a job artifact. Keep those
+        // requests in the job-authoring flow instead of treating them as a
+        // runtime start/stop command for an existing job.
+        if (signals.wantsEdit || selectionPrefersEditJob) {
+            clearRuntimeActionArgument();
             forceSelection("edit_job", "job", "update");
             return selection;
         }
-        if (signals.wantsCreate) {
+        if (signals.wantsCreate || selectionPrefersCreateJob) {
+            clearRuntimeActionArgument();
             forceSelection("create_job", "job", "create");
+            return selection;
+        }
+        if (!runtimeAction.empty()) {
+            forceSelection("control_job", "job", "update");
+            ensureArgumentsObject()["runtime_action"] = runtimeAction;
             return selection;
         }
     }
@@ -682,7 +796,25 @@ SkillSelection applyRoutingLexiconCorrections_(
             return selection;
         }
         if (signals.wantsEdit) {
-            forceSelection("edit_camera", "camera", "update");
+            if (shouldUseEditCamerasBatch_(selection, normalizedMessage, signals)) {
+                forceSelection("edit_cameras_batch", "camera", "update");
+            }
+            else {
+                forceSelection("edit_camera", "camera", "update");
+            }
+            return selection;
+        }
+        if (shouldUseReadStateForCameraInventory_(normalizedMessage, signals)) {
+            selection.selectedSkill = "read_state";
+            selection.mode = "read";
+            selection.entity = "state";
+            selection.intent = "read";
+            selection.operationType.clear();
+            selection.groundingRequired = false;
+            selection.confidence = (std::max)(selection.confidence, 0.9);
+            selection.reason = "camera_inventory_read_request";
+            selection.replyPreview = "Vou analisar o estado atual das cameras.";
+            clearRuntimeActionArgument();
             return selection;
         }
     }
@@ -2525,6 +2657,26 @@ void ChatV2Orchestrator::recordRoutingTelemetry_(
         payload.is_object() ? payload.value("command_id", -1) : -1;
     const std::string originalQuery =
         payload.is_object() ? payload.value("query", std::string()) : std::string();
+    const auto compactText = [](const std::string& value, std::size_t maxLen) {
+        std::string compact = std::regex_replace(value, std::regex("\\s+"), " ");
+        compact = trimCopy_(compact);
+        if (compact.size() > maxLen) {
+            compact = compact.substr(0, maxLen - 3) + "...";
+        }
+        return compact;
+    };
+
+    Logger::instance().logDebug(
+        "agent",
+        "ChatV2Orchestrator::recordRoutingTelemetry_: session=" +
+        std::to_string(chatSessionId) +
+        " command=" + std::to_string(commandId) +
+        " mode=" + routingMode +
+        " skill=" + (selection.selectedSkill.empty() ? std::string("unavailable") : selection.selectedSkill) +
+        " confidence=" + std::to_string(selection.confidence) +
+        " reason=" + compactText(selection.reason, 160) +
+        " query=\"" + compactText(originalQuery, 220) + "\""
+    );
 
     nlohmann::json metadata = {
         { "chat_mode", payload.is_object() ? payload.value("chat_mode", std::string()) : std::string() },

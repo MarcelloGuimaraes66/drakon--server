@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
-import { Camera, FileUp, Play, Plus, Square, Wifi } from "lucide-react";
+import { Camera, FileUp, Pencil, Play, Plus, Square, Trash2, Wifi } from "lucide-react";
 import CameraStartAttentionToast from "@/react-app/components/CameraStartAttentionToast";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
+import CameraDirectoryControls from "@/react-app/components/CameraDirectoryControls";
 import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
@@ -14,6 +15,7 @@ import CameraEditorModal, {
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { useCameraDirectory } from "@/react-app/hooks/useCameraDirectory";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { getCameraConnectionState, isCameraServiceRunning } from "@/react-app/lib/cameraStatus";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
@@ -102,14 +104,19 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const refreshDashboardSummary = useCallback(() => {
     dashboardSummaryStore.refresh();
   }, []);
-
-  const sortedCameras = useMemo(
-    () =>
-      [...cameras].sort(
-        (a, b) => (b.is_service_running ?? 0) - (a.is_service_running ?? 0)
-      ),
-    [cameras]
-  );
+  const {
+    activeTab,
+    setActiveTab,
+    activeSearchTerm,
+    setActiveSearchTerm,
+    activeIndexKey,
+    setActiveIndexKey,
+    activeIndexCounts,
+    filteredCameras,
+    totalCameraCount,
+    hasFiltersApplied,
+    tabCounts,
+  } = useCameraDirectory(cameras);
   const existingCameraNames = useMemo(
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
@@ -389,6 +396,11 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
           ? { thumbnail_url: null, last_thumbnail_update: null }
           : {}),
       });
+
+      if (result.nextRunning === 1) {
+        setActiveTab("online");
+      }
+
       refreshDashboardSummary();
       void refreshCameras();
     } catch (error) {
@@ -398,59 +410,123 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     }
   };
 
+  const emptyStateTitle =
+    totalCameraCount === 0
+      ? t("dashboard.noCameras")
+      : hasFiltersApplied
+      ? t("cameraDirectory.noMatches", {
+          defaultValue: "No cameras match this view",
+        })
+      : activeTab === "online"
+      ? t("cameraDirectory.noOnlineCameras", {
+          defaultValue: "No online cameras",
+        })
+      : t("cameraDirectory.noOfflineCameras", {
+          defaultValue: "No offline cameras",
+        });
+
+  const emptyStateDescription =
+    totalCameraCount === 0
+      ? t("dashboard.noCamerasDesc")
+      : hasFiltersApplied
+      ? t("cameraDirectory.noMatchesDesc", {
+          defaultValue: "Try another search or initial filter.",
+        })
+      : activeTab === "online"
+      ? t("cameraDirectory.noOnlineCamerasDesc", {
+          defaultValue: "Start an offline camera to move it here.",
+        })
+      : t("cameraDirectory.noOfflineCamerasDesc", {
+          defaultValue: "Stopped cameras stay here until they are started again.",
+        });
+
   return (
     <>
       <div className="max-w-7xl">
         <div className="mb-6 md:mb-8">
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4 md:mb-0">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-100">Cameras</h1>
-              <p className="mt-1.5 text-sm text-gray-400">Manage your security cameras</p>
-            </div>
-            <div className="flex w-full flex-col gap-3 md:w-auto md:flex-row md:items-center">
-              <button
-                onClick={openDiscoveryModal}
-                data-onboarding-target={ONBOARDING_TARGETS.camerasScanNetwork}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
-              >
-                <Wifi className="h-4 w-4" />
-                Scan Network
-              </button>
-              <button
-                onClick={openImportModal}
-                data-onboarding-target={ONBOARDING_TARGETS.camerasImport}
-                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
-              >
-                <FileUp className="h-4 w-4" />
-                Import Cameras
-              </button>
-              <button
-                onClick={openAddModal}
-                data-onboarding-target={ONBOARDING_TARGETS.camerasRegister}
-                className="w-full md:w-auto flex items-center justify-center gap-2 px-5 py-3 md:py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 min-h-[44px] md:min-h-0"
-              >
-                <Plus className="w-5 h-5" />
-                {t("common.registerCamera")}
-              </button>
-            </div>
+          <div>
+            <h1 className="text-2xl font-bold text-gray-100">{t("cameras.title")}</h1>
+            <p className="mt-1.5 text-sm text-gray-400">{t("cameras.subtitle")}</p>
           </div>
+        </div>
+
+        <div className="mb-6 md:mb-8">
+          <CameraDirectoryControls
+            activeTab={activeTab}
+            activeSearchTerm={activeSearchTerm}
+            activeIndexKey={activeIndexKey}
+            activeIndexCounts={activeIndexCounts}
+            tabCounts={tabCounts}
+            searchInputId="cameras-search"
+            onTabChange={setActiveTab}
+            onSearchChange={setActiveSearchTerm}
+            onIndexChange={setActiveIndexKey}
+            actions={
+              <>
+                <button
+                  onClick={openDiscoveryModal}
+                  data-onboarding-target={ONBOARDING_TARGETS.camerasScanNetwork}
+                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
+                >
+                  <Wifi className="h-4 w-4" />
+                  Scan Network
+                </button>
+                <button
+                  onClick={openImportModal}
+                  data-onboarding-target={ONBOARDING_TARGETS.camerasImport}
+                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
+                >
+                  <FileUp className="h-4 w-4" />
+                  Import Cameras
+                </button>
+                <button
+                  onClick={openAddModal}
+                  data-onboarding-target={ONBOARDING_TARGETS.camerasRegister}
+                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-blue-500 px-5 py-2.5 text-sm font-medium text-white transition-colors shadow-lg shadow-blue-500/30 hover:bg-blue-600"
+                >
+                  <Plus className="w-5 h-5" />
+                  {t("common.registerCamera")}
+                </button>
+              </>
+            }
+          />
         </div>
 
         <div className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl overflow-hidden">
           <div className="overflow-x-auto -mx-4 md:mx-0">
-            <table className="w-full min-w-[640px]">
+            <table className="w-full min-w-[920px] table-fixed">
+              <colgroup>
+                <col className="w-[38%]" />
+                <col className="w-[12%]" />
+                <col className="w-[11%]" />
+                <col className="w-[14%]" />
+                <col className="w-[11%]" />
+                <col className="w-[14%]" />
+              </colgroup>
               <thead className="bg-gray-800/50 border-b border-gray-700">
                 <tr>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Name</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">IP Address</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Manufacturer</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Description</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Status</th>
-                  <th className="px-6 py-4 text-right text-sm font-semibold text-gray-300">Actions</th>
+                  <th className="px-4 py-4 text-left text-sm font-semibold text-gray-300">
+                    {t("cameras.name")}
+                  </th>
+                  <th className="px-4 py-4 text-left text-sm font-semibold text-gray-300">
+                    {t("cameras.ipAddress")}
+                  </th>
+                  <th className="px-4 py-4 text-left text-sm font-semibold text-gray-300">
+                    {t("cameras.manufacturer")}
+                  </th>
+                  <th className="px-4 py-4 text-left text-sm font-semibold text-gray-300">
+                    {t("cameras.description")}
+                  </th>
+                  <th className="px-4 py-4 text-left text-sm font-semibold text-gray-300">
+                    {t("cameras.status")}
+                  </th>
+                  <th className="px-4 py-4 text-right text-sm font-semibold text-gray-300">
+                    {t("cameras.actions")}
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800">
-                {sortedCameras.map((camera) => {
+                {filteredCameras.map((camera) => {
                   const connectionState = getCameraConnectionState(camera);
                   const isRunning = isCameraServiceRunning(camera);
                   const isReconnecting = connectionState === "reconnecting";
@@ -458,17 +534,19 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
                   return (
                   <tr key={camera.id} className="hover:bg-gray-800/30 transition-colors">
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-gray-800 rounded-lg flex items-center justify-center">
-                          <Camera className="w-5 h-5 text-gray-500" />
+                    <td className="px-4 py-4">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-gray-800">
+                          <Camera className="h-5 w-5 text-gray-500" />
                         </div>
-                        <span className="font-medium text-gray-200">{camera.name}</span>
+                        <span className="truncate font-medium text-gray-200" title={camera.name || undefined}>
+                          {camera.name}
+                        </span>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-gray-400">{camera.ip_address || "-"}</td>
-                    <td className="px-6 py-4 text-gray-400">{camera.manufacturer || "-"}</td>
-                    <td className="px-6 py-4 text-gray-400 max-w-xs">
+                    <td className="px-4 py-4 text-gray-400 whitespace-nowrap">{camera.ip_address || "-"}</td>
+                    <td className="px-4 py-4 text-gray-400 whitespace-nowrap">{camera.manufacturer || "-"}</td>
+                    <td className="px-4 py-4 text-gray-400">
                       {camera.description ? (
                         <div className="truncate" title={camera.description}>
                           {camera.description}
@@ -477,7 +555,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                         "-"
                       )}
                     </td>
-                    <td className="px-6 py-4">
+                    <td className="px-4 py-4 whitespace-nowrap">
                       <span
                         className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
                           isOnline
@@ -486,63 +564,75 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                             ? "bg-amber-500/10 text-amber-300"
                             : "bg-red-500/10 text-red-400"
                         }`}
-                      >
-                        <Wifi className="w-3 h-3" />
-                        {isOnline ? "Online" : isReconnecting ? "Reconnecting" : "Offline"}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-right">
-                      <div className="flex items-center justify-end gap-2">
+                        >
+                          <Wifi className="w-3 h-3" />
+                          {isOnline
+                            ? t("dashboard.online")
+                            : isReconnecting
+                            ? "Reconnecting"
+                            : t("dashboard.offline")}
+                        </span>
+                      </td>
+                    <td className="px-4 py-4 text-right">
+                      <div className="flex items-center justify-end gap-1.5">
                         <button
                           onClick={() => handleToggleService(camera)}
                           disabled={pendingCameraIds.has(camera.id)}
                           aria-busy={pendingCameraIds.has(camera.id)}
-                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                          title={isRunning ? t("dashboard.stop") : t("dashboard.start")}
+                          aria-label={isRunning ? t("dashboard.stop") : t("dashboard.start")}
+                          className={`inline-flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
                             isRunning
                               ? "text-red-400 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                               : "text-green-400 hover:bg-green-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                           }`}
                         >
                           {pendingCameraIds.has(camera.id) ? (
-                            t("common.loading")
+                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
                           ) : isRunning ? (
-                            <>
-                              <Square className="w-4 h-4" />
-                              {t("dashboard.stop")}
-                            </>
+                            <Square className="h-4 w-4" />
                           ) : (
-                            <>
-                              <Play className="w-4 h-4" />
-                              {t("dashboard.start")}
-                            </>
+                            <Play className="h-4 w-4" />
                           )}
                         </button>
                         <button
                           onClick={() => openEditModal(camera)}
-                          className="px-3 py-1.5 text-sm text-blue-400 hover:bg-blue-500/10 rounded-lg transition-colors"
+                          title={t("dashboard.edit")}
+                          aria-label={t("dashboard.edit")}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-blue-400 transition-colors hover:bg-blue-500/10"
                         >
-                          Edit
+                          <Pencil className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => handleDelete(camera.id)}
-                          className="px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                          title={t("cameras.delete")}
+                          aria-label={t("cameras.delete")}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-red-400 transition-colors hover:bg-red-500/10"
                         >
-                          Delete
+                          <Trash2 className="h-4 w-4" />
                         </button>
                       </div>
                     </td>
                   </tr>
                 )})}
+                {filteredCameras.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-12">
+                      <div className="text-center">
+                        <Camera className="mx-auto mb-4 h-12 w-12 text-gray-600" />
+                        <h3 className="mb-2 text-lg font-semibold text-gray-300">
+                          {emptyStateTitle}
+                        </h3>
+                        <p className="mx-auto max-w-2xl text-sm text-gray-500">
+                          {emptyStateDescription}
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
-
-          {cameras.length === 0 && (
-            <div className="text-center py-12 md:py-16">
-              <Camera className="w-12 md:w-16 h-12 md:h-16 text-gray-600 mx-auto mb-4" />
-              <p className="text-sm md:text-base text-gray-500">No cameras added yet</p>
-            </div>
-          )}
         </div>
       </div>
 

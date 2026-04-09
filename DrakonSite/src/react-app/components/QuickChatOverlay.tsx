@@ -13,6 +13,7 @@ import ChatCameraAgentCreatedCard from "@/react-app/components/ChatCameraAgentCr
 import ChatCameraAgentEditContextCard from "@/react-app/components/ChatCameraAgentEditContextCard";
 import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUpdatedCard";
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
+import ChatJobCreatedCard from "@/react-app/components/ChatJobCreatedCard";
 import ChatIdentityCardsPanel from "@/react-app/components/ChatIdentityCardsPanel";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
@@ -52,6 +53,7 @@ import {
   extractCameraBatchEditDraftFromMessage,
   extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
+  extractJobCreationResultFromMessage,
   applyCameraEditDraftToCamera,
   buildCameraAgentDraftForEditor,
   extractIdentityCardsFromMessage,
@@ -584,6 +586,7 @@ export default function QuickChatOverlay() {
     const cameraBatchEditDraft = extractCameraBatchEditDraftFromMessage(message);
     const cameraAgentFormRequest = extractCameraAgentFormRequestFromMessage(message);
     const cameraAgentCreationResult = extractCameraAgentCreationResultFromMessage(message);
+    const jobCreationResult = extractJobCreationResultFromMessage(message);
     const cameraAgentEditContext = extractCameraAgentEditContextFromMessage(message);
     const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
@@ -633,6 +636,8 @@ export default function QuickChatOverlay() {
         <ChatCameraAgentEditContextCard metadata={cameraAgentEditContext} />
       ) : cameraAgentUpdateResult ? (
         <ChatCameraAgentUpdatedCard metadata={cameraAgentUpdateResult} />
+      ) : jobCreationResult ? (
+        <ChatJobCreatedCard metadata={jobCreationResult} />
       ) : cameraAgentCreationResult ? (
         <ChatCameraAgentCreatedCard metadata={cameraAgentCreationResult} />
       ) : cameraEditFormRequest ? (

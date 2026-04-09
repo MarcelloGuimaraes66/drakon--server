@@ -169,6 +169,30 @@ export interface CameraAgentCreationResultMessageMetadata {
   created_destinations: CameraAgentCreationDestinationMetadata[];
 }
 
+export interface JobCreationStepMessageMetadata {
+  step_index: number;
+  step_name?: string | null;
+  step_key?: string | null;
+  role?: string | null;
+  execution_mode?: string | null;
+  input_type?: string | null;
+  run_every_seconds?: number;
+  target_count: number;
+  target_preview_labels: string[];
+  remaining_target_count?: number;
+}
+
+export interface JobCreationResultMessageMetadata {
+  type: "job_creation_result";
+  status: "created";
+  language?: string;
+  job_id?: number;
+  job_name?: string | null;
+  step_count: number;
+  target_count: number;
+  steps: JobCreationStepMessageMetadata[];
+}
+
 export interface CameraAgentEditContextMessageMetadata {
   type: "camera_agent_edit_context";
   status: "awaiting_changes";
@@ -1287,6 +1311,100 @@ export function extractCameraAgentCreationResultFromMessage(
     agent_name:
       typeof parsed.agent_name === "string" ? parsed.agent_name : undefined,
     created_destinations: createdDestinations,
+  };
+}
+
+export function extractJobCreationResultFromMessage(
+  message: ChatMessage
+): JobCreationResultMessageMetadata | null {
+  const parsed = parseMessageCameraSelectionJson(message);
+  if (!parsed) {
+    return null;
+  }
+
+  if (parsed.type !== "job_creation_result" || parsed.status !== "created") {
+    return null;
+  }
+
+  const jobId = Number(parsed.job_id);
+  const stepCount = Number(parsed.step_count);
+  const targetCount = Number(parsed.target_count);
+
+  const steps = Array.isArray(parsed.steps)
+    ? parsed.steps
+        .map((entry: unknown): JobCreationStepMessageMetadata | null => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null;
+          }
+
+          const row = entry as Record<string, unknown>;
+          const stepIndex = Number(row.step_index);
+          const targetStepCount = Number(row.target_count);
+          const runEverySeconds = Number(row.run_every_seconds);
+          const remainingTargetCount = Number(row.remaining_target_count);
+          const previewLabels = Array.isArray(row.target_preview_labels)
+            ? row.target_preview_labels
+                .map((item: unknown) => (typeof item === "string" ? item.trim() : ""))
+                .filter((item: string) => item.length > 0)
+            : [];
+
+          if (!Number.isInteger(stepIndex) || stepIndex <= 0) {
+            return null;
+          }
+
+          return {
+            step_index: stepIndex,
+            step_name:
+              typeof row.step_name === "string" ? row.step_name : undefined,
+            step_key:
+              typeof row.step_key === "string" ? row.step_key : undefined,
+            role: typeof row.role === "string" ? row.role : undefined,
+            execution_mode:
+              typeof row.execution_mode === "string"
+                ? row.execution_mode
+                : undefined,
+            input_type:
+              typeof row.input_type === "string" ? row.input_type : undefined,
+            run_every_seconds:
+              Number.isInteger(runEverySeconds) && runEverySeconds > 0
+                ? runEverySeconds
+                : undefined,
+            target_count:
+              Number.isInteger(targetStepCount) && targetStepCount >= 0
+                ? targetStepCount
+                : previewLabels.length,
+            target_preview_labels: previewLabels,
+            remaining_target_count:
+              Number.isInteger(remainingTargetCount) && remainingTargetCount > 0
+                ? remainingTargetCount
+                : undefined,
+          };
+        })
+        .filter(
+          (
+            entry: JobCreationStepMessageMetadata | null
+          ): entry is JobCreationStepMessageMetadata => entry !== null
+        )
+    : [];
+
+  if (steps.length === 0 && (!Number.isInteger(jobId) || jobId <= 0)) {
+    return null;
+  }
+
+  return {
+    type: "job_creation_result",
+    status: "created",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    job_id: Number.isInteger(jobId) && jobId > 0 ? jobId : undefined,
+    job_name:
+      typeof parsed.job_name === "string" ? parsed.job_name : undefined,
+    step_count:
+      Number.isInteger(stepCount) && stepCount > 0 ? stepCount : steps.length,
+    target_count:
+      Number.isInteger(targetCount) && targetCount >= 0
+        ? targetCount
+        : steps.reduce((sum, step) => sum + step.target_count, 0),
+    steps,
   };
 }
 

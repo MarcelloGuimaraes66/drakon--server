@@ -29299,7 +29299,10 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             }
         }
 
-        if (snapshotDataUrl.empty() && cameraId > 0) {
+        // If a fresh snapshot is optional, only reuse an already-running session snapshot.
+        // Avoid blocking the design command on an on-demand capture path that can consume most
+        // of the backend wait window and trigger avoidable timeouts.
+        if (snapshotDataUrl.empty() && cameraId > 0 && requireSnapshot) {
             if (!payload.contains("camera_payload") || !payload["camera_payload"].is_object()) {
                 if (requireSnapshot) {
                     fail("snapshot required, but camera_payload is missing");

@@ -23,6 +23,15 @@ const resources = {
       // AI Agents
       "aiAgents.title": "AI Agents",
       "aiAgents.subtitle": "Monitor and manage your AI agents",
+      "cameraDirectory.searchLabel": "Search cameras",
+      "cameraDirectory.searchPlaceholder": "Search {{status}} cameras...",
+      "cameraDirectory.filterByInitial": "Filter by initial",
+      "cameraDirectory.noMatches": "No cameras match this view",
+      "cameraDirectory.noMatchesDesc": "Try another search or initial filter.",
+      "cameraDirectory.noOnlineCameras": "No online cameras",
+      "cameraDirectory.noOnlineCamerasDesc": "Start an offline camera to move it here.",
+      "cameraDirectory.noOfflineCameras": "No offline cameras",
+      "cameraDirectory.noOfflineCamerasDesc": "Stopped cameras stay here until they are started again.",
 
       // Dashboard
       "dashboard.title": "Camera Dashboard",
@@ -709,6 +718,15 @@ const resources = {
   },
   pt: {
     translation: {
+      "cameraDirectory.searchLabel": "Buscar cameras",
+      "cameraDirectory.searchPlaceholder": "Buscar cameras {{status}}...",
+      "cameraDirectory.filterByInitial": "Filtrar por inicial",
+      "cameraDirectory.noMatches": "Nenhuma camera corresponde a esta visualizacao",
+      "cameraDirectory.noMatchesDesc": "Tente outra busca ou outro filtro inicial.",
+      "cameraDirectory.noOnlineCameras": "Nenhuma camera online",
+      "cameraDirectory.noOnlineCamerasDesc": "Inicie uma camera offline para move-la para esta aba.",
+      "cameraDirectory.noOfflineCameras": "Nenhuma camera offline",
+      "cameraDirectory.noOfflineCamerasDesc": "Cameras paradas ficam aqui ate serem iniciadas novamente.",
       "nav.dashboard": "Painel",
       "nav.aiAgents": "Agentes de IA",
       "nav.cameras": "Câmeras",

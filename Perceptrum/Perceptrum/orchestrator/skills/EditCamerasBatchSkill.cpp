@@ -318,6 +318,22 @@ nlohmann::json normalizePatchFieldValue_(
         return nullptr;
     }
 
+    if (key == "normalize_ip_address_format") {
+        if (value.is_boolean()) {
+            return value.get<bool>() ? nlohmann::json(true) : nlohmann::json(nullptr);
+        }
+        if (value.is_number_integer()) {
+            return value.get<int>() != 0 ? nlohmann::json(true) : nlohmann::json(nullptr);
+        }
+        if (value.is_string()) {
+            const std::string normalized = lowerAsciiCopy_(trimCopy_(value.get<std::string>()));
+            if (normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "sim") {
+                return true;
+            }
+        }
+        return nullptr;
+    }
+
     return nullptr;
 }
 
@@ -922,6 +938,8 @@ nlohmann::json extractBatchEditDraft_(
         "If the request does not match any camera in camera_inventory, set selection_status=\"not_found\".\n"
         "If the scope is grounded, set selection_status=\"resolved\".\n"
         "camera_patch contains only the new values the user wants to apply.\n"
+        "If the user wants to normalize each selected camera's current IP format, such as removing leading zeros from 192.168.6.02 to 192.168.6.2, set camera_patch.normalize_ip_address_format=true.\n"
+        "Use normalize_ip_address_format only for canonicalizing each selected camera's existing IP. Do not invent a shared replacement ip_address for that case.\n"
         "Use clear_fields for intentional removals only.\n"
         "Never invent camera IDs, credentials, IPs, addresses, or settings.\n"
         "Return JSON only with this shape:\n"
@@ -934,9 +952,9 @@ nlohmann::json extractBatchEditDraft_(
         "\"clear_fields\":[\"subtype\"]"
         "}\n"
         "Valid selection_status values are: resolved, missing_scope, needs_clarification, not_found.\n"
-        "Valid camera_patch fields are: name, ip_address, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess.\n"
+        "Valid camera_patch fields are: name, ip_address, normalize_ip_address_format, rtsp_port, manufacturer, username, password, channel, subtype, connection_method, description, street, number, city, state, zip_code, country, retention_days, webcam_index, allowpublicaccess.\n"
         "Valid clear_fields values are: ip_address, rtsp_port, manufacturer, username, password, channel, subtype, description, street, number, city, state, zip_code, country, webcam_index.\n"
-        "Do not emit empty strings, nulls, placeholders, or unsupported fields.\n";
+        "Do not emit false, empty strings, nulls, placeholders, or unsupported fields.\n";
 
     nlohmann::json promptPayload = {
         { "reply_language", replyLanguage },

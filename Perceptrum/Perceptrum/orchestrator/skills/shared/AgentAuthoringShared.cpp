@@ -1112,7 +1112,7 @@ nlohmann::json designAgentSnapshot(
         designRequest.dump(),
         agent.getExeToken(),
         {},
-        30000);
+        70000);
     if (!response.ok()) {
         outError = parseErrorMessage(response);
         return nlohmann::json::object();

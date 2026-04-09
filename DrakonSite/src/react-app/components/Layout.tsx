@@ -91,6 +91,52 @@ function formatSidebarBadgeCount(count?: number) {
   return count > 99 ? "99+" : String(count);
 }
 
+type ApiKeyPromptStatus = {
+  hasOpenAiKey: boolean | null;
+  hasZAiKey: boolean | null;
+  hasAnyApiKey: boolean | null;
+  hasConfirmedNoApiKeys: boolean;
+};
+
+async function readApiKeyPromptStatus(): Promise<ApiKeyPromptStatus | null> {
+  const readHasKey = async (url: string): Promise<boolean | null> => {
+    try {
+      const response = await fetch(url, { credentials: "include" });
+      if (!response.ok) {
+        return null;
+      }
+
+      const data = await response.json().catch(() => ({}));
+      return Boolean((data as { has_key?: unknown }).has_key);
+    } catch {
+      return null;
+    }
+  };
+
+  const [hasOpenAiKey, hasZAiKey] = await Promise.all([
+    readHasKey("/api/openai-settings"),
+    readHasKey("/api/zai-settings"),
+  ]);
+
+  if (hasOpenAiKey === null && hasZAiKey === null) {
+    return null;
+  }
+
+  const hasAnyApiKey =
+    hasOpenAiKey === true || hasZAiKey === true
+      ? true
+      : hasOpenAiKey === false && hasZAiKey === false
+      ? false
+      : null;
+
+  return {
+    hasOpenAiKey,
+    hasZAiKey,
+    hasAnyApiKey,
+    hasConfirmedNoApiKeys: hasOpenAiKey === false && hasZAiKey === false,
+  };
+}
+
 export default function Layout({ children }: LayoutProps) {
   const { t, i18n } = useTranslation();
   const { user, logout } = useAuth();
@@ -336,47 +382,79 @@ export default function Layout({ children }: LayoutProps) {
 
     let cancelled = false;
 
-    const checkOpenAiSettings = async () => {
-      try {
-        const [openAiResponse, zAiResponse] = await Promise.all([
-          fetch("/api/openai-settings"),
-          fetch("/api/zai-settings"),
-        ]);
-        if (!openAiResponse.ok && !zAiResponse.ok) return;
-        const openAiData = openAiResponse.ok
-          ? await openAiResponse.json().catch(() => ({}))
-          : {};
-        const zAiData = zAiResponse.ok
-          ? await zAiResponse.json().catch(() => ({}))
-          : {};
-        if (cancelled) return;
-        setShowOpenAiKeyPrompt(!openAiData?.has_key);
-        setShowZAiKeyPrompt(!zAiData?.has_key);
-      } catch {
-        // Ignore transient errors; this check should never block UI.
+    const syncApiKeyPrompts = async () => {
+      const promptStatus = await readApiKeyPromptStatus();
+      if (cancelled || !promptStatus) return;
+
+      if (promptStatus.hasAnyApiKey) {
+        setShowOpenAiKeyPrompt(false);
+        setShowZAiKeyPrompt(false);
+        return;
       }
+
+      if (!promptStatus.hasConfirmedNoApiKeys) {
+        return;
+      }
+
+      // Keep a single initial prompt visible when no providers are configured.
+      setShowOpenAiKeyPrompt(true);
+      setShowZAiKeyPrompt(false);
     };
 
-    void checkOpenAiSettings();
+    void syncApiKeyPrompts();
     return () => {
       cancelled = true;
     };
   }, [isSettingsRoute, user?.id]);
 
   useEffect(() => {
-    const onOpenAiKeyRequired = () => {
+    let cancelled = false;
+
+    const syncPromptForMissingProvider = async (provider: "openai" | "zai") => {
       if (isSettingsRoute) {
         setShowOpenAiKeyPrompt(false);
-        return;
-      }
-      setShowOpenAiKeyPrompt(true);
-    };
-    const onZAiKeyRequired = () => {
-      if (isSettingsRoute) {
         setShowZAiKeyPrompt(false);
         return;
       }
+
+      const promptStatus = await readApiKeyPromptStatus();
+      if (cancelled || !promptStatus) return;
+
+      if (promptStatus.hasAnyApiKey) {
+        setShowOpenAiKeyPrompt(false);
+        setShowZAiKeyPrompt(false);
+        return;
+      }
+
+      if (!promptStatus.hasConfirmedNoApiKeys) {
+        return;
+      }
+
+      if (provider === "openai") {
+        setShowOpenAiKeyPrompt(true);
+        setShowZAiKeyPrompt(false);
+        return;
+      }
+
+      setShowOpenAiKeyPrompt(false);
       setShowZAiKeyPrompt(true);
+    };
+
+    const onOpenAiKeyRequired = () => {
+      if (isSettingsRoute) {
+        setShowOpenAiKeyPrompt(false);
+        setShowZAiKeyPrompt(false);
+        return;
+      }
+      void syncPromptForMissingProvider("openai");
+    };
+    const onZAiKeyRequired = () => {
+      if (isSettingsRoute) {
+        setShowOpenAiKeyPrompt(false);
+        setShowZAiKeyPrompt(false);
+        return;
+      }
+      void syncPromptForMissingProvider("zai");
     };
     window.addEventListener(
       getBrandWindowEventName("openAiKeyRequired"),
@@ -387,6 +465,7 @@ export default function Layout({ children }: LayoutProps) {
       onZAiKeyRequired as EventListener
     );
     return () => {
+      cancelled = true;
       window.removeEventListener(
         getBrandWindowEventName("openAiKeyRequired"),
         onOpenAiKeyRequired as EventListener

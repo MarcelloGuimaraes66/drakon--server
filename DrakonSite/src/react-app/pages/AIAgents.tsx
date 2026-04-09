@@ -1,7 +1,8 @@
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef, useMemo, useEffect } from "react";
 import { Link, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
+import CameraDirectoryControls from "@/react-app/components/CameraDirectoryControls";
 import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
@@ -9,6 +10,10 @@ import CameraEditorModal, {
   type CameraEditorDraft,
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
+import {
+  getCameraDirectoryTab,
+  useCameraDirectory,
+} from "@/react-app/hooks/useCameraDirectory";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
@@ -54,11 +59,9 @@ function AIAgentsContent() {
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast, pushToast } = useEvents();
-  
+
   // Use unified dashboard summary hook - gets cameras from centralized polling
-  const { cameras } = useDashboardSummary();
-  const isLoading = cameras.length === 0;
-  const [searchTerm, setSearchTerm] = useState("");
+  const { cameras, lastUpdatedAt } = useDashboardSummary();
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -67,11 +70,21 @@ function AIAgentsContent() {
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const editRequestCameraId = useRef<number | null>(null);
+  const {
+    activeTab,
+    setActiveTab,
+    activeSearchTerm,
+    setActiveSearchTerm,
+    activeIndexKey,
+    setActiveIndexKey,
+    activeIndexCounts,
+    filteredCameras,
+    totalCameraCount,
+    hasFiltersApplied,
+    tabCounts,
+  } = useCameraDirectory(cameras);
+  const hasLoaded = lastUpdatedAt !== null;
 
-  const normalizedSearch = searchTerm.trim().toLowerCase();
-  const filteredCameras = normalizedSearch
-    ? cameras.filter((camera) => camera.name?.toLowerCase().includes(normalizedSearch))
-    : cameras;
   useThumbnailPolling(cameras, (updates) => {
     for (const update of updates) {
       dashboardSummaryStore.patchCameraLocal(update.camera_id, {
@@ -80,17 +93,27 @@ function AIAgentsContent() {
       });
     }
   });
-  const sortedFilteredCameras = useMemo(
-    () =>
-      [...filteredCameras].sort(
-        (a, b) => (b.is_service_running ?? 0) - (a.is_service_running ?? 0)
-      ),
-    [filteredCameras]
-  );
   const existingCameraNames = useMemo(
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
   );
+
+  useEffect(() => {
+    if (!isOnboardingOpen || onboardingStepId !== "ai-agents-camera-start") {
+      return;
+    }
+
+    if (typeof tutorialCameraId !== "number" || tutorialCameraId <= 0) {
+      return;
+    }
+
+    const tutorialCamera = cameras.find((camera) => camera.id === tutorialCameraId);
+    if (!tutorialCamera) {
+      return;
+    }
+
+    setActiveTab(getCameraDirectoryTab(tutorialCamera));
+  }, [cameras, isOnboardingOpen, onboardingStepId, setActiveTab, tutorialCameraId]);
 
   const updatePendingCameraState = (cameraId: number, isPending: boolean) => {
     setPendingCameraIds((current) => {
@@ -145,6 +168,10 @@ function AIAgentsContent() {
           ? { thumbnail_url: null, last_thumbnail_update: null }
           : {}),
       });
+
+      if (result.nextRunning === 1) {
+        setActiveTab("online");
+      }
 
       dashboardSummaryStore.refresh();
     } catch (error) {
@@ -365,59 +392,87 @@ function AIAgentsContent() {
     );
   };
 
+  const emptyStateTitle =
+    totalCameraCount === 0
+      ? t("dashboard.noCameras")
+      : hasFiltersApplied
+      ? t("cameraDirectory.noMatches", {
+          defaultValue: "No cameras match this view",
+        })
+      : activeTab === "online"
+      ? t("cameraDirectory.noOnlineCameras", {
+          defaultValue: "No online cameras",
+        })
+      : t("cameraDirectory.noOfflineCameras", {
+          defaultValue: "No offline cameras",
+        });
+
+  const emptyStateDescription =
+    totalCameraCount === 0
+      ? t("dashboard.noCamerasDesc")
+      : hasFiltersApplied
+      ? t("cameraDirectory.noMatchesDesc", {
+          defaultValue: "Try another search or initial filter.",
+        })
+      : activeTab === "online"
+      ? t("cameraDirectory.noOnlineCamerasDesc", {
+          defaultValue: "Start an offline camera to move it here.",
+        })
+      : t("cameraDirectory.noOfflineCamerasDesc", {
+          defaultValue: "Stopped cameras stay here until they are started again.",
+        });
+
 
 
   return (
     <>
       <div className="space-y-5">
         {/* Header */}
-        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr),auto] xl:items-start">
-          <div className="min-w-0">
-            <h1 className="text-2xl font-bold text-gray-100">
-              {t("aiAgents.title")}
-            </h1>
-            <p className="mt-1.5 text-sm text-gray-400">
-              {t("aiAgents.subtitle")}
-            </p>
-          </div>
-          <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end">
-            <button
-              onClick={openDiscoveryModal}
-              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
-            >
-              <Wifi className="h-4 w-4" />
-              Scan Network
-            </button>
-            <button
-              onClick={openImportModal}
-              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
-            >
-              <FileUp className="h-4 w-4" />
-              Import Cameras
-            </button>
-
-            <div className="w-full sm:min-w-[260px] xl:w-72">
-              <label className="sr-only" htmlFor="ai-agents-search">
-                Search cameras
-              </label>
-              <input
-                id="ai-agents-search"
-                type="text"
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-                placeholder="Search cameras..."
-                className="w-full bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
-              />
-            </div>
-          </div>
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold text-gray-100">
+            {t("aiAgents.title")}
+          </h1>
+          <p className="mt-1.5 text-sm text-gray-400">
+            {t("aiAgents.subtitle")}
+          </p>
         </div>
 
+        <CameraDirectoryControls
+          activeTab={activeTab}
+          activeSearchTerm={activeSearchTerm}
+          activeIndexKey={activeIndexKey}
+          activeIndexCounts={activeIndexCounts}
+          tabCounts={tabCounts}
+          searchInputId="ai-agents-search"
+          onTabChange={setActiveTab}
+          onSearchChange={setActiveSearchTerm}
+          onIndexChange={setActiveIndexKey}
+          actions={
+            <>
+              <button
+                onClick={openDiscoveryModal}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-2.5 text-sm font-medium text-cyan-100 transition-colors hover:border-cyan-400/40 hover:bg-cyan-500/20"
+              >
+                <Wifi className="h-4 w-4" />
+                Scan Network
+              </button>
+              <button
+                onClick={openImportModal}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-gray-700 bg-gray-900/60 px-4 py-2.5 text-sm font-medium text-gray-100 transition-colors hover:border-blue-500/40 hover:bg-gray-800"
+              >
+                <FileUp className="h-4 w-4" />
+                Import Cameras
+              </button>
+            </>
+          }
+        />
+
         {/* Camera grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+        <div className="grid grid-cols-1 items-start gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-3">
           {/* Add camera card */}
           <button
             onClick={openAddModal}
-            className="group relative bg-gradient-to-br from-gray-800/50 to-gray-900/50 dark:from-gray-800/50 dark:to-gray-900/50 backdrop-blur-sm border-2 border-dashed border-gray-700 hover:border-blue-500/50 rounded-2xl p-6 md:p-8 transition-all duration-300 hover:shadow-lg hover:shadow-blue-500/20 flex flex-col items-center justify-center min-h-[200px] md:min-h-[280px]"
+            className="group relative flex h-[200px] self-start flex-col items-center justify-center rounded-2xl border-2 border-dashed border-gray-700 bg-gradient-to-br from-gray-800/50 to-gray-900/50 p-6 backdrop-blur-sm transition-all duration-300 hover:border-blue-500/50 hover:shadow-lg hover:shadow-blue-500/20 dark:from-gray-800/50 dark:to-gray-900/50 md:h-[280px] md:p-8"
           >
             <div className="w-12 md:w-16 h-12 md:h-16 bg-gray-800 group-hover:bg-blue-500/10 rounded-2xl flex items-center justify-center mb-3 md:mb-4 transition-colors">
               <Plus className="w-6 md:w-8 h-6 md:h-8 text-gray-500 group-hover:text-blue-400 transition-colors" />
@@ -428,7 +483,7 @@ function AIAgentsContent() {
           </button>
 
           {/* Camera cards */}
-          {sortedFilteredCameras.map((camera) => {
+          {filteredCameras.map((camera) => {
             const connectionState = getCameraConnectionState(camera);
             const isRunning = isCameraServiceRunning(camera);
             const isOnline = isCameraOnline(camera);
@@ -526,7 +581,11 @@ function AIAgentsContent() {
                       : "text-red-400"
                   }`}
                 >
-                  {isOnline ? "Online" : isReconnecting ? "Reconnecting" : "Offline"}
+                  {isOnline
+                    ? t("dashboard.online")
+                    : isReconnecting
+                    ? "Reconnecting"
+                    : t("dashboard.offline")}
                 </p>
 
                 {/* Actions */}
@@ -536,27 +595,26 @@ function AIAgentsContent() {
               </div>
             </div>
           )})}
-        </div>
 
-        {/* Empty state */}
-        {!isLoading && cameras.length === 0 && (
-          <div className="text-center py-12 md:py-16">
-            <Camera className="w-12 md:w-16 h-12 md:h-16 text-gray-600 mx-auto mb-4" />
-            <h3 className="text-lg md:text-xl font-semibold text-gray-300 mb-2">
-              {t("dashboard.noCameras")}
-            </h3>
-            <p className="text-sm md:text-base text-gray-500 mb-6 px-4">
-              {t("dashboard.noCamerasDesc")}
-            </p>
-            <button
-              onClick={openAddModal}
-              className="inline-flex items-center gap-2 px-6 py-3 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors min-h-[44px]"
-            >
-              <Plus className="w-5 h-5" />
-              {t("common.registerCamera")}
-            </button>
-          </div>
-        )}
+          {hasLoaded && filteredCameras.length === 0 && (
+            <div className="col-span-full rounded-2xl border border-gray-800/60 bg-gray-950/40 px-6 py-10 text-center">
+              <Camera className="mx-auto mb-4 h-12 w-12 text-gray-600" />
+              <h3 className="mb-2 text-lg font-semibold text-gray-300">{emptyStateTitle}</h3>
+              <p className="mx-auto max-w-2xl text-sm text-gray-500">
+                {emptyStateDescription}
+              </p>
+              {totalCameraCount === 0 ? (
+                <button
+                  onClick={openAddModal}
+                  className="mt-6 inline-flex min-h-[44px] items-center gap-2 rounded-lg bg-blue-500 px-6 py-3 font-medium text-white transition-colors hover:bg-blue-600"
+                >
+                  <Plus className="h-5 w-5" />
+                  {t("common.registerCamera")}
+                </button>
+              ) : null}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Billing required modal */}

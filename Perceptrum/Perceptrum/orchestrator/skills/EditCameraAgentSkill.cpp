@@ -1404,7 +1404,7 @@ SkillRunResult EditCameraAgentSkill::execute(
             designRequest.dump(),
             agent.getExeToken(),
             {},
-            30000);
+            70000);
         if (!designResponse.ok()) {
             result.answer = language == "pt"
                 ? "Nao consegui analisar o snapshot da camera para sugerir o poligono. Detalhe: " + parseErrorMessage_(designResponse)

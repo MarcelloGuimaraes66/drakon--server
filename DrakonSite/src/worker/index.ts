@@ -37,6 +37,7 @@ import type {
   CameraImportApplyResult,
   CameraImportCandidate,
   CameraImportPreview,
+  CameraImportSharedDefaults,
 } from "@/shared/cameraImport";
 import type {
   CameraBatchEditApplyResult,
@@ -51,6 +52,9 @@ import {
   normalizeCountryCode,
 } from "@/shared/brazilStates";
 import {
+  buildCameraImportPreviewFromParsedFile,
+  normalizeCameraImportSharedDefaults,
+  normalizeCameraIpAddressValue,
   normalizeImportedPreview,
   parseCameraImportFile,
 } from "./cameraImport";
@@ -6599,6 +6603,17 @@ async function ensureSchema(db: D1Database): Promise<void> {
           last_error TEXT
         )
       `).run();
+
+      if (await tableExists("jobs")) {
+        await addColumnIfMissing(
+          `ALTER TABLE jobs ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`
+        );
+        await db.prepare(`
+          UPDATE jobs
+             SET is_active = COALESCE(is_active, 1)
+           WHERE is_active IS NULL
+        `).run();
+      }
 
       if (await tableExists("job_step_agents")) {
         await addColumnIfMissing(
@@ -13269,7 +13284,7 @@ async function createCameraForUser(
       cameraName,
       connectionMethod === "WEBCAM"
         ? ""
-        : normalizeCameraTransportField(input.ip_address) ?? "",
+        : normalizeCameraIpAddressValue(input.ip_address),
       connectionMethod === "WEBCAM"
         ? null
         : normalizeOptionalCameraField(input.rtsp_port),
@@ -13365,6 +13380,10 @@ async function updateCameraForUser(
 
   const data: any = { ...input };
   const existingCam: any = camera;
+  const shouldNormalizeIpAddressFormat =
+    data.normalize_ip_address_format === true &&
+    !Object.prototype.hasOwnProperty.call(data, "ip_address");
+  delete data.normalize_ip_address_format;
   const requestedConnectionMethod =
     typeof data.connection_method === "string" ? data.connection_method : null;
   const effectiveConnectionMethod =
@@ -13419,7 +13438,7 @@ async function updateCameraForUser(
       values.push(value);
     } else if (key === "ip_address") {
       updates.push(`${key} = ?`);
-      values.push(normalizeCameraTransportField(value) ?? "");
+      values.push(normalizeCameraIpAddressValue(value));
     } else if (key === "name") {
       let normalizedName = typeof value === "string" ? value.trim() : "";
       if (existingCam.connection_method === "WEBCAM") {
@@ -13473,6 +13492,15 @@ async function updateCameraForUser(
       values.push(value);
     }
   });
+
+  if (shouldNormalizeIpAddressFormat) {
+    const currentIpAddress = normalizeOptionalCameraField(existingCam.ip_address) || "";
+    const normalizedIpAddress = normalizeCameraIpAddressValue(currentIpAddress);
+    if (normalizedIpAddress !== currentIpAddress) {
+      updates.push("ip_address = ?");
+      values.push(normalizedIpAddress);
+    }
+  }
 
   updates.push("state_code = ?");
   values.push(normalizedGeo.stateCode);
@@ -13675,25 +13703,49 @@ async function enrichChatCameraBatchEditPatchBody(
 }
 
 function buildChatCameraBatchEditChanges(
-  patchBody: Record<string, unknown>
+  patchBody: Record<string, unknown>,
+  language: string
 ): CameraBatchEditChange[] {
+  const isPt = normalizeSupportedChatLanguage(language, "en") === "pt";
+
   return Object.entries(patchBody)
-    .filter(([field]) => field !== "country_code")
-    .map(([field, value]) => ({
-      field,
-      mode:
-        (value === "" && CHAT_CAMERA_BATCH_EDIT_CLEARABLE_FIELDS.has(field)) ||
-        (value === null && field === "webcam_index")
-          ? "clear"
-          : "set",
-      value:
-        typeof value === "string" ||
-        typeof value === "number" ||
-        typeof value === "boolean" ||
-        value === null
-          ? value
-          : null,
-    }));
+    .filter(([field, value]) => {
+      if (field === "country_code") {
+        return false;
+      }
+      if (field === "normalize_ip_address_format") {
+        return (
+          value === true &&
+          !Object.prototype.hasOwnProperty.call(patchBody, "ip_address")
+        );
+      }
+      return true;
+    })
+    .map(([field, value]) => {
+      if (field === "normalize_ip_address_format") {
+        return {
+          field: "ip_address",
+          mode: "set" as const,
+          value: isPt ? "Remover zeros a esquerda" : "Remove leading zeros",
+        };
+      }
+
+      return {
+        field,
+        mode:
+          (value === "" && CHAT_CAMERA_BATCH_EDIT_CLEARABLE_FIELDS.has(field)) ||
+          (value === null && field === "webcam_index")
+            ? "clear"
+            : "set",
+        value:
+          typeof value === "string" ||
+          typeof value === "number" ||
+          typeof value === "boolean" ||
+          value === null
+            ? value
+            : null,
+      };
+    });
 }
 
 function buildChatCameraBatchEditValidationErrors(
@@ -13746,6 +13798,22 @@ function buildChatCameraBatchEditChangedFields(
       const currentCountryCode = normalizeCountryCode(camera.country_code, null) || "";
       if ((normalizedGeo.countryCode || "") !== currentCountryCode) {
         changedFields.push(field);
+      }
+      return;
+    }
+
+    if (field === "normalize_ip_address_format") {
+      if (
+        value !== true ||
+        Object.prototype.hasOwnProperty.call(patchBody, "ip_address")
+      ) {
+        return;
+      }
+
+      const currentIpAddress = normalizeOptionalCameraField(camera.ip_address) || "";
+      const normalizedIpAddress = normalizeCameraIpAddressValue(currentIpAddress);
+      if (normalizedIpAddress !== currentIpAddress) {
+        changedFields.push("ip_address");
       }
       return;
     }
@@ -13855,7 +13923,7 @@ async function buildChatCameraBatchEditPreview(
       ready_count: 0,
       blocked_count: 0,
       unchanged_count: 0,
-      changes: buildChatCameraBatchEditChanges(patchBody),
+      changes: buildChatCameraBatchEditChanges(patchBody, language),
       global_warnings: [
         isPt
           ? "Nenhuma camera foi selecionada para este preview de edicao em lote."
@@ -13950,7 +14018,7 @@ async function buildChatCameraBatchEditPreview(
     ready_count: readyCount,
     blocked_count: blockedCount,
     unchanged_count: unchangedCount,
-    changes: buildChatCameraBatchEditChanges(patchBody),
+    changes: buildChatCameraBatchEditChanges(patchBody, language),
     global_warnings: Array.from(new Set(globalWarnings)),
     targets,
   };
@@ -14240,7 +14308,7 @@ async function buildChatCameraBatchPreview(
       source_row_number: null,
       source_values: collectChatBatchSourceValues(mergedValues),
       name: normalizeChatBatchCameraText(mergedValues.name),
-      ip_address: normalizeChatBatchCameraText(mergedValues.ip_address),
+      ip_address: normalizeCameraIpAddressValue(mergedValues.ip_address),
       rtsp_port: normalizeChatBatchCameraText(mergedValues.rtsp_port),
       manufacturer: normalizeChatBatchCameraText(mergedValues.manufacturer),
       username: normalizeChatBatchCameraText(mergedValues.username),
@@ -16633,24 +16701,66 @@ app.post("/api/auth/local/login", async (c) => {
       throw new Error("Failed to reload the local user after login.");
     }
 
-    const appUserId = resolveCanonicalAppUserIdFromLocalUserRow(refreshedLocalUser as any);
+    let effectiveLocalUser = refreshedLocalUser as any;
+    if (isCentralIdentityClientConfigured(c.env)) {
+      let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
+      try {
+        centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/migrate-login", {
+          email,
+          password,
+          handle: deriveHandleFromEmail(email),
+          country_code: normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+        });
+      } catch (error) {
+        console.error("[AUTH] Central migrate-login request failed during local login:", error);
+      }
+
+      if (centralResult?.response.ok && centralResult.verifiedGrant) {
+        const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
+          email,
+          passwordHash: String((refreshedLocalUser as any).password_hash || ""),
+          countryCode:
+            normalizeCountryCode(centralResult.data?.user?.country_code, null) ||
+            normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+          locale: normalizeOptionalLocale((refreshedLocalUser as any).locale),
+          serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
+          verifiedGrant: centralResult.verifiedGrant,
+          deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+            centralResult.data?.device_session
+          ),
+        });
+        effectiveLocalUser =
+          (await c.env.DB
+            .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+            .bind(synced.localUserId)
+            .first()) || effectiveLocalUser;
+      } else if (centralResult) {
+        console.error(
+          "[AUTH] Central migrate-login rejected local login session refresh:",
+          centralResult.response.status,
+          centralResult.data
+        );
+      }
+    }
+
+    const appUserId = resolveCanonicalAppUserIdFromLocalUserRow(effectiveLocalUser as any);
 
     await ensureAppUserRow(c.env.DB, {
       id: appUserId,
-      email: (refreshedLocalUser as any).email,
+      email: (effectiveLocalUser as any).email,
       auth_provider: "local",
-      country_code: (refreshedLocalUser as any).country_code || null,
-      locale: (refreshedLocalUser as any).locale || null,
+      country_code: (effectiveLocalUser as any).country_code || null,
+      locale: (effectiveLocalUser as any).locale || null,
     });
 
-    await createLocalAuthSession(c, Number((refreshedLocalUser as any).id || 0));
+    await createLocalAuthSession(c, Number((effectiveLocalUser as any).id || 0));
 
     return c.json({
       success: true,
       user: {
         id: appUserId,
-        email: (refreshedLocalUser as any).email,
-        country_code: (refreshedLocalUser as any).country_code,
+        email: (effectiveLocalUser as any).email,
+        country_code: (effectiveLocalUser as any).country_code,
       },
     });
   } catch (error) {
@@ -20599,60 +20709,78 @@ app.post("/api/camera-imports/preview", anyAuthMiddleware, async (c) => {
     return c.json({ error: "A file is required for import preview" }, 400);
   }
 
-  const pairing = await c.env.DB
-    .prepare(
-      `SELECT id
-       FROM exe_pairings
-       WHERE user_id = ? AND status = 'connected'
-       ORDER BY last_seen_at DESC
-       LIMIT 1`
-    )
-    .bind(user.id)
-    .first();
-  if (!pairing) {
-    return c.json(
-      {
-        error:
-          "No EXE connected. Camera import preview requires the desktop agent online so the file can be normalized.",
-      },
-      409
-    );
-  }
-
   try {
     const parsedFile = await parseCameraImportFile(fileValue);
     const userCountryCode =
       normalizeCountryCode((user as any)?.country_code, null) || "BR";
+    const preview = buildCameraImportPreviewFromParsedFile(parsedFile, userCountryCode);
     const now = new Date().toISOString();
     const payload = {
       ...parsedFile,
       user_country_code: userCountryCode,
     };
+    const resultPayload = {
+      preview,
+      processor: "direct_local_preview",
+    };
 
     const insertResult = await c.env.DB
       .prepare(
-        `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-         VALUES (?, NULL, 'camera_import_preview', ?, 'pending', ?, ?)`
+        `INSERT INTO commands (
+          user_id,
+          camera_id,
+          command_type,
+          payload,
+          result,
+          status,
+          created_at,
+          updated_at
+        )
+         VALUES (?, NULL, 'camera_import_preview', ?, ?, 'completed', ?, ?)`
       )
-      .bind(user.id, JSON.stringify(payload), now, now)
+      .bind(
+        user.id,
+        JSON.stringify(payload),
+        JSON.stringify(resultPayload),
+        now,
+        now
+      )
       .run();
 
     const commandId = Number(insertResult.meta.last_row_id || 0);
-    if (!Number.isInteger(commandId) || commandId <= 0) {
+    let resolvedCommandId = commandId;
+    if (!Number.isInteger(resolvedCommandId) || resolvedCommandId <= 0) {
+      const insertedCommand = await c.env.DB
+        .prepare(
+          `SELECT id
+             FROM commands
+            WHERE user_id = ?
+              AND command_type = 'camera_import_preview'
+              AND created_at = ?
+            ORDER BY id DESC
+            LIMIT 1`
+        )
+        .bind(user.id, now)
+        .first();
+      resolvedCommandId = Number((insertedCommand as any)?.id || 0);
+    }
+
+    if (!Number.isInteger(resolvedCommandId) || resolvedCommandId <= 0) {
       return c.json({ error: "Failed to create camera import preview command" }, 500);
     }
 
     return c.json(
       {
-        command_id: commandId,
-        status: "pending",
+        command_id: resolvedCommandId,
+        status: "completed",
         file_name: parsedFile.file_name,
         source_format: parsedFile.source_format,
         total_rows_detected: parsedFile.total_rows_detected,
         rows_sent_to_llm: parsedFile.rows.length,
         global_warnings: parsedFile.global_warnings,
+        preview,
       },
-      202
+      200
     );
   } catch (error) {
     const message =
@@ -20757,9 +20885,23 @@ app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) =>
     return c.json(result.apply);
   }
 
+  const requestBody =
+    c.req
+      .header("content-type")
+      ?.toLowerCase()
+      .includes("application/json")
+    ? ((await c.req.json().catch(() => null)) as {
+        shared_defaults?: CameraImportSharedDefaults;
+      } | null)
+    : null;
+  const sharedDefaults = normalizeCameraImportSharedDefaults(
+    requestBody?.shared_defaults || null
+  );
   const userCountryCode =
     normalizeCountryCode((user as any)?.country_code, null) || "BR";
-  const normalizedPreview = normalizeImportedPreview(preview, userCountryCode);
+  const normalizedPreview = normalizeImportedPreview(preview, userCountryCode, {
+    sharedDefaults,
+  });
   const applyResult = await applyNormalizedCameraImportPreviewForUser(
     c.env.DB,
     user.id,
@@ -22481,11 +22623,76 @@ app.get("/api/custom-agents/library", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
 
   try {
-    const agents = await listOwnedCustomCameraAgents(c.env.DB, user.id);
+    const inventory = await listEditableAgentInventoryForUser(c.env.DB, user.id);
+    const agents = inventory.map((entry) => {
+      const locationLabel =
+        entry.location_type === "camera"
+          ? entry.camera_name || (entry.camera_id ? `Camera #${entry.camera_id}` : "AI Agent")
+          : [
+              entry.job_name || (entry.job_id ? `Job #${entry.job_id}` : "Job"),
+              entry.step_title || (entry.step_id ? `Step #${entry.step_id}` : "Step"),
+              entry.location_type === "step_camera"
+                ? entry.camera_name ||
+                  entry.slot_label ||
+                  (entry.camera_id ? `Camera #${entry.camera_id}` : "Target camera")
+                : "Default step agent",
+            ].join(" / ");
+
+      return {
+        library_key: `${entry.location_type}:${entry.agent_id}`,
+        source_type: entry.location_type === "camera" ? "camera_custom" : "job_step",
+        location_type: entry.location_type,
+        id: entry.agent_id,
+        agent_key: entry.agent_key,
+        algorithm_type: entry.agent_key,
+        display_name: entry.display_name,
+        summary: entry.summary,
+        prompt_template: entry.prompt_template,
+        alert_condition: entry.alert_condition,
+        negative_condition: entry.negative_condition,
+        input_type: entry.snapshot.input_type,
+        video_packaging_mode: entry.snapshot.video_packaging_mode || null,
+        inference_model: entry.snapshot.inference_model || null,
+        model_fps:
+          typeof entry.snapshot.model_fps === "number" && Number.isFinite(entry.snapshot.model_fps)
+            ? entry.snapshot.model_fps
+            : null,
+        run_every:
+          typeof entry.snapshot.run_every === "number" && Number.isFinite(entry.snapshot.run_every)
+            ? entry.snapshot.run_every
+            : null,
+        running_resolution:
+          typeof entry.snapshot.running_resolution === "number" &&
+          Number.isFinite(entry.snapshot.running_resolution)
+            ? entry.snapshot.running_resolution
+            : null,
+        only_capture_on_motion: entry.snapshot.only_capture_on_motion === true,
+        use_temporal_context: entry.snapshot.use_temporal_context !== false,
+        face_target_ids: Array.isArray(entry.face_target_ids) ? entry.face_target_ids : [],
+        analysis_regions: Array.isArray(entry.analysis_regions) ? entry.analysis_regions : [],
+        negative_reference_images: [],
+        is_enabled: entry.is_enabled,
+        camera_id: entry.camera_id,
+        camera_name: entry.camera_name,
+        step_id: entry.step_id,
+        step_title: entry.step_title,
+        job_id: entry.job_id,
+        job_name: entry.job_name,
+        target_id: entry.target_id,
+        slot_key: entry.slot_key,
+        slot_label: entry.slot_label,
+        location_label: locationLabel,
+        updated_at: null,
+        config_json: {
+          display_name: entry.display_name,
+          summary: entry.summary,
+        },
+      };
+    });
     return c.json({ agents });
   } catch (error) {
-    console.error("Failed to load owned custom agents:", error);
-    return c.json({ error: "Failed to load owned custom agents" }, 500);
+    console.error("Failed to load saved agent library:", error);
+    return c.json({ error: "Failed to load saved agent library" }, 500);
   }
 });
 
@@ -34610,7 +34817,7 @@ app.get("/api/agent/orchestrator/state", async (c) => {
          j.name,
          j.schedule_mode,
          j.status,
-         j.is_active,
+         COALESCE(j.is_active, 1) AS is_active,
          j.timezone,
          j.start_at,
          j.end_at,
@@ -34961,6 +35168,20 @@ app.post("/api/agent/orchestrator/telemetry", async (c) => {
     )
     .run();
 
+  const queryPreview =
+    typeof body.user_query === "string"
+      ? body.user_query.replace(/\s+/g, " ").trim().slice(0, 240)
+      : "";
+  const selectionReason =
+    typeof body.selection_reason === "string" ? body.selection_reason.trim().slice(0, 180) : "";
+  const selectionSource =
+    typeof body.selection_source === "string" ? body.selection_source.trim().slice(0, 40) : "";
+  console.log(
+    `[CHAT ROUTING TELEMETRY] session=${body.chat_session_id ?? "null"} mode=${routingMode} ` +
+      `skill=${selectedSkill} confidence=${confidence.toFixed(2)} source=${selectionSource || "unknown"} ` +
+      `reason=${selectionReason || "n/a"} query=${JSON.stringify(queryPreview)}`
+  );
+
   return c.json({ ok: true });
 });
 
@@ -35071,7 +35292,7 @@ app.get("/api/agent/jobs", async (c) => {
        j.name,
        j.description,
        j.status,
-       j.is_active,
+       COALESCE(j.is_active, 1) AS is_active,
        j.schedule_mode,
        j.timezone,
        j.created_at,
@@ -35818,7 +36039,7 @@ app.post("/api/agent/agent-design", async (c) => {
     c.env.DB,
     pairing.userId,
     commandId,
-    25000,
+    65000,
     500
   );
   if (!terminalResult) {

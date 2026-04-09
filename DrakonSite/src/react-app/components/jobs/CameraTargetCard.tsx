@@ -56,11 +56,17 @@ export default function CameraTargetCard({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <div className={`truncate font-semibold text-gray-100 ${isCompact ? "text-[13px]" : "text-[15px]"}`}>{title}</div>
-                {badges ? <div className="flex flex-wrap gap-2">{badges}</div> : null}
-              </div>
-              {subtitle ? <div className={`mt-1 text-gray-400 ${isCompact ? "text-[9px]" : "text-[11px]"}`}>{subtitle}</div> : null}
+              <div className={`truncate font-semibold text-gray-100 ${isCompact ? "text-[13px]" : "text-[15px]"}`}>{title}</div>
+              {badges ? (
+                <div className={`mt-1.5 flex flex-wrap items-center ${isCompact ? "gap-1.5" : "gap-2"}`}>
+                  {badges}
+                </div>
+              ) : null}
+              {subtitle ? (
+                <div className={`text-gray-400 ${badges ? "mt-1.5" : "mt-1"} ${isCompact ? "text-[9px]" : "text-[11px]"}`}>
+                  {subtitle}
+                </div>
+              ) : null}
             </div>
             {topRight ? <div className="shrink-0">{topRight}</div> : null}
           </div>

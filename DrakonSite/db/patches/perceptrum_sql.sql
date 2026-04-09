@@ -1013,7 +1013,8 @@ CREATE TABLE public.jobs (
     schedule_mode text,
     timezone text,
     active_from date,
-    active_until date
+    active_until date,
+    is_active integer DEFAULT 1 NOT NULL
 );
 
 

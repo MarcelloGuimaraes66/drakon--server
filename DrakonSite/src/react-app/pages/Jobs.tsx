@@ -65,6 +65,11 @@ import {
   getCoreModelNoticeCopy,
   shouldShowCoreModelNotice,
 } from "@/react-app/utils/coreModelNotice";
+import {
+  fetchSavedAgentLibrary,
+  getSavedAgentLibraryOptionLabel,
+  type SavedAgentLibraryEntry,
+} from "@/react-app/utils/savedAgentLibrary";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import { brand } from "@/shared/brand";
 
@@ -884,6 +889,49 @@ const getTargetDisplayName = (target: Partial<Target> | null | undefined): strin
   }
 
   return "Unassigned camera slot";
+};
+
+const normalizeCameraSearchText = (value: string): string =>
+  value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+const tokenizeCameraSearch = (value: string): string[] =>
+  normalizeCameraSearchText(value)
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+const getCameraSearchRank = (camera: { id: number; name: string }, query: string): number => {
+  const normalizedQuery = normalizeCameraSearchText(query.trim());
+  if (!normalizedQuery) return 0;
+
+  const tokens = tokenizeCameraSearch(query);
+  if (tokens.length === 0) return 0;
+
+  const normalizedName = normalizeCameraSearchText(camera.name);
+  const cameraId = String(camera.id);
+  const haystack = `${normalizedName} ${cameraId}`;
+
+  if (!tokens.every((token) => haystack.includes(token))) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  if (normalizedName === normalizedQuery || cameraId === normalizedQuery) {
+    return 0;
+  }
+
+  if (normalizedName.startsWith(normalizedQuery) || cameraId.startsWith(normalizedQuery)) {
+    return 1;
+  }
+
+  const nameParts = normalizedName.split(/[^a-z0-9]+/).filter(Boolean);
+  if (tokens.every((token) => nameParts.some((part) => part.startsWith(token)))) {
+    return 2;
+  }
+
+  return 3;
 };
 
 interface InferenceGroup {
@@ -4056,6 +4104,7 @@ function StepCard({
   const [pipelineTargetsByStepId, setPipelineTargetsByStepId] = useState<Record<string, Target[]>>({});
   const [startConditionStepTargets, setStartConditionStepTargets] = useState<Target[]>([]);
   const [showTargetSelect, setShowTargetSelect] = useState(false);
+  const [targetPickerQuery, setTargetPickerQuery] = useState("");
   const [isTargetMultiSelect, setIsTargetMultiSelect] = useState(false);
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<number>>(new Set());
   const [showGroupModal, setShowGroupModal] = useState(false);
@@ -4099,6 +4148,7 @@ function StepCard({
     sourceCameraId: null,
   });
   const agentFormRef = useRef<HTMLDivElement | null>(null);
+  const targetPickerInputRef = useRef<HTMLInputElement | null>(null);
   const [highlightAgentForm, setHighlightAgentForm] = useState(false);
   const agentFormHighlightTimerRef = useRef<number | null>(null);
   const openAgentEditorForTargetRef = useRef<
@@ -4150,9 +4200,39 @@ function StepCard({
     return next;
   }, [targets, activeAgentByCameraId]);
 
+  useEffect(() => {
+    if (!showTargetSelect) return;
+    const focusTimer = window.setTimeout(() => {
+      targetPickerInputRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(focusTimer);
+  }, [showTargetSelect]);
+
+  const closeTargetPicker = () => {
+    setShowTargetSelect(false);
+    setTargetPickerQuery("");
+  };
+
+  const toggleTargetPicker = () => {
+    setShowTargetSelect((current) => {
+      const next = !current;
+      if (next) {
+        setIsTargetMultiSelect(false);
+        setSelectedTargetIds(new Set());
+      }
+      if (!next) {
+        setTargetPickerQuery("");
+      }
+      return next;
+    });
+  };
+
   const toggleTargetMultiSelect = () => {
     setIsTargetMultiSelect((prev) => {
       const next = !prev;
+      if (next) {
+        closeTargetPicker();
+      }
       if (!next) {
         setSelectedTargetIds(new Set());
       }
@@ -4333,6 +4413,10 @@ function StepCard({
   
   const [agentForm, setAgentForm] = useState<AgentFormState>(buildEmptyAgentForm);
   const [showPromptEditor, setShowPromptEditor] = useState(false);
+  const [savedAgentLibrary, setSavedAgentLibrary] = useState<SavedAgentLibraryEntry[]>([]);
+  const [savedAgentLibraryLoading, setSavedAgentLibraryLoading] = useState(false);
+  const [savedAgentLibraryError, setSavedAgentLibraryError] = useState<string | null>(null);
+  const [selectedSavedAgentLibraryKey, setSelectedSavedAgentLibraryKey] = useState("");
   const [promptEditorInputTypeDraft, setPromptEditorInputTypeDraft] =
     useState<TargetInputType>("video");
   const [promptEditorDraft, setPromptEditorDraft] = useState<PromptEditorFields>({
@@ -5210,6 +5294,46 @@ function StepCard({
     };
   };
 
+  useEffect(() => {
+    if (!showPromptEditor) {
+      setSavedAgentLibrary([]);
+      setSavedAgentLibraryLoading(false);
+      setSavedAgentLibraryError(null);
+      setSelectedSavedAgentLibraryKey("");
+      return;
+    }
+
+    let cancelled = false;
+    setSavedAgentLibraryLoading(true);
+    setSavedAgentLibraryError(null);
+    setSelectedSavedAgentLibraryKey("");
+
+    void (async () => {
+      try {
+        const agents = await fetchSavedAgentLibrary();
+        if (!cancelled) {
+          setSavedAgentLibrary(agents);
+        }
+      } catch (error) {
+        console.error("Failed to load saved agent library:", error);
+        if (!cancelled) {
+          setSavedAgentLibrary([]);
+          setSavedAgentLibraryError(
+            error instanceof Error ? error.message : "Failed to load your saved agents"
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setSavedAgentLibraryLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showPromptEditor]);
+
   const fetchLatestAgentForPromptEditor = async (cameraId: number): Promise<Agent | null> => {
     if (!Number.isInteger(cameraId) || cameraId <= 0) return null;
     try {
@@ -5668,7 +5792,6 @@ function StepCard({
         await fetchStepData();
         setExpandedTargetId(null);
         setClonePickerTargetId(null);
-        setShowTargetSelect(false);
       }
     } catch (error) {
       console.error("Failed to add target:", error);
@@ -6591,6 +6714,8 @@ function StepCard({
     cameraId?: number | null;
     formState?: AgentFormState;
     targetAgent?: Agent | null;
+    inputTypeOverride?: TargetInputType | null;
+    skipActiveAgentRefresh?: boolean;
   }) => {
     const selectedCameraIdRaw =
       options?.cameraId === undefined ? agentFormCameraId : options.cameraId;
@@ -6602,15 +6727,21 @@ function StepCard({
       selectedCameraId === null
         ? null
         : targets.find((target) => target.camera_id === selectedCameraId) || null;
-    const initialPromptEditorInputType = selectedPromptTarget
-      ? normalizeTargetInputType(
-          targetInputTypes[selectedPromptTarget.id] ?? selectedPromptTarget.input_type
-        )
-      : "video";
+    const requestedInputTypeOverride =
+      options?.inputTypeOverride == null
+        ? null
+        : normalizeTargetInputType(options.inputTypeOverride);
+    const initialPromptEditorInputType =
+      requestedInputTypeOverride ||
+      (selectedPromptTarget
+        ? normalizeTargetInputType(
+            targetInputTypes[selectedPromptTarget.id] ?? selectedPromptTarget.input_type
+          )
+        : "video");
     const sourceForm = options?.formState ?? agentForm;
     let targetAgent =
       options?.targetAgent === undefined ? getEditingCameraAgent() : options.targetAgent;
-    if (selectedCameraId !== null) {
+    if (selectedCameraId !== null && options?.skipActiveAgentRefresh !== true) {
       const latestAgent = await fetchLatestAgentForPromptEditor(selectedCameraId);
       if (latestAgent) {
         targetAgent = latestAgent;
@@ -6713,7 +6844,132 @@ function StepCard({
       } finally {
         setPromptEditorSnapshotLoading(false);
       }
-    })();
+      })();
+  };
+
+  const buildAgentFormFromSavedLibraryEntry = (
+    template: SavedAgentLibraryEntry,
+    fallbackForm: AgentFormState
+  ): { form: AgentFormState; inputType: TargetInputType } => {
+    const requestedFaceTargetIds = Array.isArray(template.face_target_ids)
+      ? Array.from(
+          new Set(
+            template.face_target_ids
+              .map((value) => Number(value))
+              .filter((value) => Number.isInteger(value) && value > 0)
+          )
+        )
+      : [];
+    const normalizedFaceTargetIds =
+      faceTargetsLibrary.length > 0
+        ? requestedFaceTargetIds.filter((id) =>
+            faceTargetsLibrary.some((target) => target.id === id)
+          )
+        : requestedFaceTargetIds;
+    const normalizedPromptFields = normalizePromptEditorFields({
+      prompt_template: template.prompt_template,
+      alert_condition: template.alert_condition,
+      negative_condition: template.negative_condition,
+    });
+    const execution = applyAgentExecutionConstraints(
+      normalizeTargetInputType(template.input_type || "video"),
+      normalizeAgentInferenceModel(template.inference_model),
+      normalizeAgentRunEverySeconds(template.run_every, fallbackForm.run_every),
+      normalizeAgentInferenceModel(template.inference_model) === "core"
+        ? normalizeAgentRunningResolution(
+            template.running_resolution,
+            DEFAULT_CORE_RUNNING_RESOLUTION
+          )
+        : null,
+      normalizeAgentModelFps(template.model_fps, fallbackForm.model_fps)
+    );
+    const analysisRegions = normalizeAnalysisRegionsForForm(
+      template.analysis_regions,
+      normalizedPromptFields,
+      normalizedFaceTargetIds,
+      []
+    ).map((region) => ({
+      ...region,
+      prompt_core: normalizedPromptFields.prompt_template,
+      alert_condition: normalizedPromptFields.alert_condition,
+      negative_condition: normalizedPromptFields.negative_condition,
+      face_target_ids: normalizedFaceTargetIds,
+      negative_image_ids: [],
+      context_padding_pct: 0,
+    }));
+    const displayName =
+      template.display_name.trim() ||
+      template.agent_key.trim() ||
+      fallbackForm.agent_key.trim() ||
+      "Saved agent";
+    const summary =
+      template.summary.trim() ||
+      normalizedPromptFields.alert_condition ||
+      fallbackForm.alert_condition.trim();
+
+    return {
+      inputType: execution.inputType,
+      form: {
+        ...fallbackForm,
+        agent_key: displayName,
+        stored_agent_key:
+          template.agent_key.trim() ||
+          template.algorithm_type.trim() ||
+          fallbackForm.stored_agent_key,
+        prompt_template: normalizedPromptFields.prompt_template,
+        alert_condition: normalizedPromptFields.alert_condition,
+        negative_condition: normalizedPromptFields.negative_condition,
+        params: JSON.stringify({
+          ...parseAgentParamsObject(fallbackForm.params),
+          display_name: displayName,
+          summary,
+        }),
+        inference_model: execution.inferenceModel,
+        model_fps: execution.modelFps,
+        run_every: execution.runEvery,
+        running_resolution: execution.runningResolution,
+        video_packaging_mode: normalizeAgentVideoPackagingMode(
+          template.video_packaging_mode
+        ),
+        only_capture_on_motion: normalizeAgentOnlyCaptureOnMotion(
+          template.only_capture_on_motion
+        ),
+        use_temporal_context: normalizeAgentUseTemporalContext(
+          template.use_temporal_context
+        ),
+        face_target_ids: normalizedFaceTargetIds,
+        negative_reference_images: [],
+        analysis_regions: analysisRegions,
+      },
+    };
+  };
+
+  const handleLoadSavedAgentLibraryEntry = async () => {
+    if (!selectedSavedAgentLibraryEntry) {
+      onShowToast("Select one of your saved agents first", "warning");
+      return;
+    }
+
+    const { form, inputType } = buildAgentFormFromSavedLibraryEntry(
+      selectedSavedAgentLibraryEntry,
+      agentForm
+    );
+
+    setAgentForm(form);
+    setPromptEnhanceSuggestion(null);
+
+    await openPromptEditor({
+      cameraId: agentFormCameraId,
+      formState: form,
+      targetAgent: null,
+      inputTypeOverride: inputType,
+      skipActiveAgentRefresh: true,
+    });
+
+    onShowToast(
+      "Template loaded. Negative reference images need to be uploaded again after the first save.",
+      "info"
+    );
   };
 
   useEffect(() => {
@@ -7608,6 +7864,11 @@ function StepCard({
         targetInputTypes[promptEditorTarget.id] ?? promptEditorTarget.input_type
       )
     : "video";
+  const selectedSavedAgentLibraryEntry = useMemo(() => {
+    const selectedKey = selectedSavedAgentLibraryKey.trim();
+    if (!selectedKey) return null;
+    return savedAgentLibrary.find((agent) => agent.library_key === selectedKey) || null;
+  }, [savedAgentLibrary, selectedSavedAgentLibraryKey]);
   const getRunEveryOptionLabel = (seconds: AgentRunEverySeconds): string => {
     return seconds === 10
       ? t("jobs.runEveryOption.seconds10")
@@ -7668,6 +7929,36 @@ function StepCard({
   const availableCameras = cameras.filter(
     (cam) => !targets.some((t) => t.camera_id === cam.id)
   );
+  const availableCameraSearchResults = useMemo(() => {
+    const query = targetPickerQuery.trim();
+    return [...availableCameras]
+      .map((camera) => ({
+        camera,
+        rank: getCameraSearchRank(camera, query),
+      }))
+      .filter((entry) => Number.isFinite(entry.rank))
+      .sort((left, right) => {
+        if (left.rank !== right.rank) {
+          return left.rank - right.rank;
+        }
+        return (
+          left.camera.name.localeCompare(right.camera.name, stepLocale, {
+            numeric: true,
+            sensitivity: "base",
+          }) || left.camera.id - right.camera.id
+        );
+      })
+      .map((entry) => entry.camera);
+  }, [availableCameras, stepLocale, targetPickerQuery]);
+  const targetPickerHasQuery = targetPickerQuery.trim().length > 0;
+  const targetPickerResultCount = availableCameraSearchResults.length;
+  const readyTargetCount = targets.filter(
+    (target) =>
+      isAssignedTarget(target) &&
+      (activeAgentByCameraId.has(target.camera_id) || !!defaultAgent)
+  ).length;
+  const pendingTargetCount = Math.max(0, targets.length - readyTargetCount);
+  const groupedTargetCount = groupedTargetIds.size;
   const selectedTargetsForGroup = targets.filter((target) => selectedTargetIds.has(target.id));
   const editingGroup = editingGroupId
     ? inferenceGroups.find((group) => group.id === editingGroupId)
@@ -7925,21 +8216,26 @@ function StepCard({
         <Repeat className="h-4 w-4" />
         {t("jobs.knowledgeSharing", { defaultValue: "Compartilhamento de conhecimento" })}
       </button>
-      <button
-        type="button"
-        onClick={() => setShowAlertForm((current) => !current)}
-        disabled={!isReady}
-        className={`${stepActionBaseClass} ${
-          !isReady
-            ? "cursor-not-allowed border-gray-800 bg-gray-900/60 text-gray-600"
-            : showAlertForm
-            ? stepActionActiveClass
-            : stepActionIdleClass
-        }`}
-      >
-        <AlertCircle className="h-4 w-4" />
-        {t("jobs.addAlert")}
-      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowAlertForm((current) => !current)}
+                        className={`${stepActionBaseClass} ${
+                          showAlertForm
+                            ? stepActionActiveClass
+                            : stepActionIdleClass
+                        }`}
+                        title={
+                          !isReady
+                            ? t("jobs.alertRuleReadyHint", {
+                                defaultValue:
+                                  "You can configure alerts now. They will become effective once the step is fully ready.",
+                              })
+                            : t("jobs.addAlert")
+                        }
+                      >
+                        <AlertCircle className="h-4 w-4" />
+                        {t("jobs.addAlert")}
+                      </button>
       <div className="col-span-2">
         <button
           type="button"
@@ -8114,6 +8410,25 @@ function StepCard({
       )
     : "video";
   const inspectedCanToggleCaptureMode = !!inspectedTargetAgent;
+  const cameraSettingsSectionClass =
+    "rounded-[24px] border border-gray-800/80 bg-[linear-gradient(180deg,rgba(17,24,39,0.34),rgba(2,6,23,0.78))] p-4 shadow-[0_22px_60px_-50px_rgba(0,0,0,0.95)] sm:p-5";
+  const cameraSettingsInsetClass =
+    "rounded-[20px] border border-gray-800/80 bg-gray-950/72 p-4";
+  const inspectedAgentSummaryText = inspectedEffectiveAgent
+    ? inspectedTargetAgent
+      ? getAgentDisplayName(inspectedTargetAgent)
+      : `${t("jobs.usingDefault")}: ${getAgentDisplayName(inspectedEffectiveAgent)}`
+    : t("jobs.notConfigured");
+  const inspectedAgentSummaryTone = !inspectedEffectiveAgent
+    ? "text-red-400"
+    : inspectedTargetAgent
+      ? "text-green-400"
+      : "text-yellow-400";
+  const inspectedAgentStatusClass = !inspectedEffectiveAgent
+    ? "border-red-400/25 bg-red-500/10 text-red-200"
+    : inspectedTargetAgent
+      ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200"
+      : "border-amber-400/25 bg-amber-500/12 text-amber-200";
 
   return (
     <StepFlowCard
@@ -8129,107 +8444,294 @@ function StepCard({
       onDelete={handleDeleteStep}
     >
       <div className={isCompactFlow ? "space-y-2.5" : "space-y-3"}>
-          {/* Targets Section */}
-          <div className={`rounded-[20px] border border-gray-800/80 bg-gray-950/55 ${isCompactFlow ? "p-3" : "p-3.5"}`}>
-            <div className={`flex items-center justify-between ${isCompactFlow ? "mb-2.5" : "mb-3"}`}>
-              <h5 className={`${isCompactFlow ? "text-[13px]" : "text-sm"} font-medium text-gray-300`}>{t("jobs.targets")}</h5>
-              <span className="text-xs uppercase tracking-[0.22em] text-gray-500">
-                {targets.length}
-              </span>
-            </div>
-            {isTargetMultiSelect ? (
-            <div className="mb-3 flex flex-wrap gap-2">
+        {/* Targets Section */}
+        <div className={`rounded-[20px] border border-gray-800/80 bg-gray-950/55 ${isCompactFlow ? "p-3" : "p-3.5"}`}>
+          <div className={`flex flex-col gap-3 ${isCompactFlow ? "mb-2.5" : "mb-3"}`}>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h5 className={`${isCompactFlow ? "text-[13px]" : "text-sm"} font-medium text-gray-300`}>
+                    {t("jobs.targets")}
+                  </h5>
+                  <span className="inline-flex items-center rounded-full border border-gray-800 bg-gray-900/80 px-2.5 py-1 text-[11px] font-medium text-gray-300">
+                    {targets.length}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs leading-5 text-gray-500">
+                  {t("jobs.targetPickerSummary", {
+                    defaultValue: "{{configured}} added / {{available}} available to add",
+                    configured: targets.length,
+                    available: availableCameras.length,
+                  })}
+                </p>
+              </div>
               <button
                 type="button"
-                onClick={toggleTargetMultiSelect}
-                className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
-                  isTargetMultiSelect
-                    ? "bg-blue-500/20 border-blue-400/40 text-blue-200"
-                    : "bg-gray-800/70 border-gray-700 text-gray-200 hover:bg-gray-800"
+                onClick={toggleTargetPicker}
+                disabled={!showTargetSelect && availableCameras.length === 0}
+                className={`inline-flex items-center justify-center gap-2 rounded-full border px-3 py-2 text-xs font-medium transition-colors ${
+                  !showTargetSelect && availableCameras.length === 0
+                    ? "cursor-not-allowed border-gray-800 bg-gray-900/50 text-gray-600"
+                    : showTargetSelect
+                    ? "border-blue-400/30 bg-blue-500/12 text-blue-100 hover:bg-blue-500/18"
+                    : "border-gray-700 bg-gray-900/70 text-gray-200 hover:border-gray-600 hover:bg-gray-800"
                 }`}
               >
-                <span className="w-4 h-4 rounded border border-current flex items-center justify-center">
-                  <Check className="w-3 h-3" />
-                </span>
-                {isTargetMultiSelect ? t("jobs.exitSelection") : t("jobs.selectMultiple")}
-              </button>
-              {isTargetMultiSelect && (
-                <button
-                  type="button"
-                  onClick={openGroupModal}
-                  disabled={selectedTargetIds.size < 2 || savingInferenceGroups}
-                  className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
-                    selectedTargetIds.size < 2 || savingInferenceGroups
-                      ? "bg-blue-500/10 border-blue-400/20 text-blue-200/50 cursor-not-allowed"
-                      : "bg-blue-600/60 border-blue-400/60 text-blue-100 hover:bg-blue-600/80"
-                  }`}
-                >
-                  <LayoutGrid className="w-4 h-4" />
-                  {t("jobs.createGroup")}
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={handleSelectAllTargets}
-                className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
-                disabled={targets.length === 0}
-              >
-                <span className="w-4 h-4 rounded border border-current flex items-center justify-center">
-                  <Check className="w-3 h-3" />
-                </span>
-                {t("jobs.selectAll")}
-              </button>
-              <button
-                type="button"
-                onClick={handleClearTargetSelection}
-                className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
-                disabled={selectedTargetIds.size === 0}
-              >
-                <X className="w-4 h-4" />
-                {t("jobs.clear")}
+                {showTargetSelect ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                {showTargetSelect
+                  ? t("jobs.closeCameraPicker", { defaultValue: "Close picker" })
+                  : t("jobs.addTarget")}
               </button>
             </div>
-            ) : null}
 
-            {showTargetSelect && availableCameras.length > 0 && (
-              <div className="mb-3 rounded-2xl border border-gray-800/80 bg-gray-900/80 p-3">
-                <p className="mb-2 text-[11px] uppercase tracking-[0.18em] text-gray-500">{t("jobs.selectCamera")}:</p>
-                <div className="flex flex-wrap gap-2">
-                  {availableCameras.map((camera) => (
-                    <button
-                      key={camera.id}
-                      onClick={() => handleAddTarget(camera.id)}
-                      className="rounded-full border border-gray-700 bg-gray-800 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-700"
-                    >
-                      {camera.name}
-                    </button>
-                  ))}
+            {targets.length > 0 ? (
+              <div className="grid grid-cols-3 gap-2">
+                <div className="rounded-2xl border border-emerald-400/15 bg-emerald-500/[0.08] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-[0.16em] text-emerald-200/70">
+                    {t("jobs.readyShort", { defaultValue: "OK" })}
+                  </div>
+                  <div className="mt-1 text-sm font-semibold text-emerald-100">{readyTargetCount}</div>
+                </div>
+                <div className="rounded-2xl border border-amber-400/15 bg-amber-500/[0.08] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-[0.16em] text-amber-200/70">
+                    {t("jobs.setupShort", { defaultValue: "Setup" })}
+                  </div>
+                  <div className="mt-1 text-sm font-semibold text-amber-100">{pendingTargetCount}</div>
+                </div>
+                <div className="rounded-2xl border border-blue-400/15 bg-blue-500/[0.08] px-3 py-2.5">
+                  <div className="text-[10px] uppercase tracking-[0.16em] text-blue-200/70">
+                    {t("jobs.groupedCameras", { defaultValue: "Grouped" })}
+                  </div>
+                  <div className="mt-1 text-sm font-semibold text-blue-100">{groupedTargetCount}</div>
                 </div>
               </div>
-            )}
+            ) : null}
+          </div>
 
-            {targets.length === 0 ? (
-              <div className="space-y-3">
-                <p className="text-xs text-gray-500">{t("jobs.noTargets")}</p>
-                <button
-                  type="button"
-                  onClick={() => setShowTargetSelect((current) => !current)}
-                  disabled={availableCameras.length === 0}
-                  className={`w-full rounded-[16px] border border-dashed px-3 py-3 text-sm font-medium transition-colors ${
-                    availableCameras.length === 0
-                      ? "cursor-not-allowed border-gray-800 bg-gray-900/50 text-gray-600"
-                      : showTargetSelect
-                      ? "border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
-                      : "border-gray-700 bg-gray-900/70 text-gray-300 hover:border-gray-600 hover:bg-gray-800"
-                  }`}
-                >
-                  <span className="inline-flex items-center gap-2">
-                    {showTargetSelect ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-                    {showTargetSelect ? t("jobs.cancel") : t("jobs.addTarget")}
-                  </span>
-                </button>
+          {isTargetMultiSelect ? (
+            <div className="mb-3 rounded-2xl border border-blue-500/20 bg-blue-500/[0.06] p-3">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-xs leading-5 text-blue-100/80">
+                    {t("jobs.targetSelectionSummary", {
+                      defaultValue: "{{selected}} selected for grouping",
+                      selected: selectedTargetIds.size,
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={toggleTargetMultiSelect}
+                    className="inline-flex items-center gap-2 rounded-full border border-blue-400/30 bg-blue-500/14 px-3 py-1.5 text-xs text-blue-100 transition-colors hover:bg-blue-500/20"
+                  >
+                    <span className="flex h-4 w-4 items-center justify-center rounded border border-current">
+                      <Check className="h-3 w-3" />
+                    </span>
+                    {t("jobs.exitSelection")}
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={openGroupModal}
+                    disabled={selectedTargetIds.size < 2 || savingInferenceGroups}
+                    className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition-colors ${
+                      selectedTargetIds.size < 2 || savingInferenceGroups
+                        ? "cursor-not-allowed border-blue-400/20 bg-blue-500/10 text-blue-200/50"
+                        : "border-blue-400/60 bg-blue-600/60 text-blue-100 hover:bg-blue-600/80"
+                    }`}
+                  >
+                    <LayoutGrid className="h-4 w-4" />
+                    {t("jobs.createGroup")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSelectAllTargets}
+                    className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
+                    disabled={targets.length === 0}
+                  >
+                    <span className="flex h-4 w-4 items-center justify-center rounded border border-current">
+                      <Check className="h-3 w-3" />
+                    </span>
+                    {t("jobs.selectAll")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleClearTargetSelection}
+                    className="flex items-center gap-2 rounded-full border border-gray-700 bg-gray-800/70 px-3 py-1.5 text-xs text-gray-200 transition-colors hover:bg-gray-800"
+                    disabled={selectedTargetIds.size === 0}
+                  >
+                    <X className="h-4 w-4" />
+                    {t("jobs.clear")}
+                  </button>
+                </div>
               </div>
-            ) : (
+            </div>
+          ) : null}
+
+          {showTargetSelect ? (
+            <div className="mb-3 overflow-hidden rounded-[22px] border border-blue-500/20 bg-[linear-gradient(180deg,rgba(30,41,59,0.92),rgba(15,23,42,0.78))]">
+              <div className="border-b border-blue-500/10 px-3.5 py-3">
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-blue-100/70">
+                        {t("jobs.selectCamera")}:
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-gray-400">
+                        {t("jobs.targetPickerHint", {
+                          defaultValue: "Search by camera name and add new targets without leaving this step.",
+                        })}
+                      </p>
+                    </div>
+                    <span className="inline-flex shrink-0 items-center rounded-full border border-blue-400/20 bg-blue-500/10 px-2.5 py-1 text-[11px] font-medium text-blue-100">
+                      {targetPickerHasQuery
+                        ? t("jobs.targetPickerMatches", {
+                            defaultValue: "{{count}} matches",
+                            count: targetPickerResultCount,
+                          })
+                        : t("jobs.targetPickerAvailable", {
+                            defaultValue: "{{count}} available",
+                            count: availableCameras.length,
+                          })}
+                    </span>
+                  </div>
+
+                  <label className="relative block">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+                    <input
+                      ref={targetPickerInputRef}
+                      type="text"
+                      value={targetPickerQuery}
+                      onChange={(event) => setTargetPickerQuery(event.target.value)}
+                      placeholder={t("jobs.searchTargetsPlaceholder", {
+                        defaultValue: "Search camera by name or ID",
+                      })}
+                      className="w-full rounded-2xl border border-gray-700 bg-gray-950/85 py-3 pl-10 pr-10 text-sm text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
+                    />
+                    {targetPickerQuery ? (
+                      <button
+                        type="button"
+                        onClick={() => setTargetPickerQuery("")}
+                        className="absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-gray-700 bg-gray-900/80 text-gray-400 transition-colors hover:border-gray-600 hover:text-gray-200"
+                        title={t("jobs.clearSearch", { defaultValue: "Clear search" })}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    ) : null}
+                  </label>
+
+                  <div className="flex flex-wrap gap-2 text-[11px]">
+                    <span className="inline-flex items-center rounded-full border border-gray-700 bg-gray-900/70 px-2.5 py-1 text-gray-300">
+                      {t("jobs.targetPickerAddedCount", {
+                        defaultValue: "{{count}} already in this step",
+                        count: targets.length,
+                      })}
+                    </span>
+                    {!targetPickerHasQuery && availableCameras.length > 8 ? (
+                      <span className="inline-flex items-center rounded-full border border-gray-700 bg-gray-900/70 px-2.5 py-1 text-gray-400">
+                        {t("jobs.targetPickerSearchHint", {
+                          defaultValue: "Use search to jump directly to a camera.",
+                        })}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+
+              <div className="max-h-[320px] space-y-2 overflow-y-auto px-3.5 py-3">
+                {availableCameras.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/70 px-4 py-4">
+                    <p className="text-sm font-medium text-gray-200">
+                      {t("jobs.targetPickerEmptyAllUsed", {
+                        defaultValue: "All cameras are already in this step.",
+                      })}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-gray-500">
+                      {t("jobs.targetPickerEmptyAllUsedHint", {
+                        defaultValue:
+                          "Remove a target or swap a camera in settings if you need a different assignment.",
+                      })}
+                    </p>
+                  </div>
+                ) : targetPickerResultCount === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-gray-700 bg-gray-950/70 px-4 py-4">
+                    <p className="text-sm font-medium text-gray-200">
+                      {t("jobs.targetPickerNoResults", {
+                        defaultValue: "No camera found for this search.",
+                      })}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-gray-500">
+                      {t("jobs.targetPickerNoResultsHint", {
+                        defaultValue: "Try part of the name, building, corridor, or camera ID.",
+                      })}
+                    </p>
+                  </div>
+                ) : (
+                  availableCameraSearchResults.map((camera) => {
+                    const cameraRunning = camera.is_service_running === 1;
+                    return (
+                      <button
+                        type="button"
+                        key={camera.id}
+                        onClick={() => void handleAddTarget(camera.id)}
+                        title={camera.name}
+                        className="group w-full rounded-2xl border border-gray-800/80 bg-gray-950/82 px-3.5 py-3 text-left transition-colors hover:border-blue-400/30 hover:bg-blue-500/[0.08]"
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className="mt-0.5 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-gray-800 bg-gray-900 text-gray-300 transition-colors group-hover:border-blue-400/30 group-hover:text-blue-100">
+                            <Camera className="h-4 w-4" />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="break-words text-sm font-medium leading-5 text-gray-100">
+                              {camera.name}
+                            </div>
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                              <span className="inline-flex items-center rounded-full border border-gray-800 bg-gray-900/80 px-2.5 py-1 text-gray-400">
+                                #{camera.id}
+                              </span>
+                              <span
+                                className={`inline-flex items-center rounded-full border px-2.5 py-1 ${
+                                  cameraRunning
+                                    ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200"
+                                    : "border-gray-700 bg-gray-900/70 text-gray-400"
+                                }`}
+                              >
+                                {cameraRunning
+                                  ? t("jobs.cameraRunning", { defaultValue: "Running" })
+                                  : t("jobs.cameraStopped", { defaultValue: "Stopped" })}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-blue-400/20 bg-blue-500/10 text-blue-100 transition-colors group-hover:border-blue-400/40 group-hover:bg-blue-500/20">
+                            <Plus className="h-4 w-4" />
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          ) : null}
+
+          {targets.length === 0 ? (
+            <div className="rounded-[18px] border border-dashed border-gray-800 bg-gray-900/40 px-4 py-5 text-center">
+              <p className="text-sm font-medium text-gray-200">
+                {t("jobs.emptyTargetsTitle", {
+                  defaultValue: "No cameras added to this step yet.",
+                })}
+              </p>
+              <p className="mt-1 text-xs leading-5 text-gray-500">
+                {availableCameras.length > 0
+                  ? t("jobs.emptyTargetsHint", {
+                      defaultValue: "Open the picker above to search and add the first cameras.",
+                    })
+                  : t("jobs.emptyTargetsNoAvailableHint", {
+                      defaultValue: "There are no cameras available to add right now.",
+                    })}
+              </p>
+            </div>
+          ) : (
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[11px] text-gray-500">
@@ -8294,11 +8796,13 @@ function StepCard({
                       thumbnailUrl={null}
                       badges={
                         <>
-                          <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold ${targetSetupClass}`}>
+                          <span
+                            className={`inline-flex items-center whitespace-nowrap rounded-full border px-2.5 py-1 text-[10px] font-semibold leading-none ${targetSetupClass}`}
+                          >
                             {targetSetupLabel}
                           </span>
                           {isGrouped ? (
-                            <span className="inline-flex rounded-full border border-blue-400/30 bg-blue-500/18 px-2 py-0.5 text-[10px] font-medium text-blue-100">
+                            <span className="inline-flex items-center whitespace-nowrap rounded-full border border-blue-400/30 bg-blue-500/18 px-2.5 py-1 text-[10px] font-medium leading-none text-blue-100">
                               {t("jobs.inferenceGroups")}
                             </span>
                           ) : null}
@@ -8379,20 +8883,6 @@ function StepCard({
                   );
                 })}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowTargetSelect((current) => !current)}
-                  className={`w-full rounded-[16px] border border-dashed px-3 py-3 text-sm font-medium transition-colors ${
-                    showTargetSelect
-                      ? "border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
-                      : "border-gray-700 bg-gray-900/70 text-gray-300 hover:border-gray-600 hover:bg-gray-800"
-                  }`}
-                >
-                  <span className="inline-flex items-center gap-2">
-                    {showTargetSelect ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-                    {showTargetSelect ? t("jobs.cancel") : t("jobs.addTarget")}
-                  </span>
-                </button>
                 {defaultAgent && (
                   <div className="mt-2 p-2 bg-blue-900/20 rounded border border-blue-800">
                     <p className="text-xs text-blue-400">
@@ -8462,12 +8952,17 @@ function StepCard({
                             {group.targetIds.map((targetId) => {
                               const target = targets.find((t) => t.id === targetId);
                               if (!target) return null;
+                              const targetLabel =
+                                target.camera_name || `Camera ${target.camera_id}`;
                               return (
                                 <span
                                   key={targetId}
-                                  className="rounded-full border border-blue-400/20 bg-blue-900/40 px-2.5 py-1 text-xs text-blue-100"
+                                  title={targetLabel}
+                                  className="inline-flex min-w-0 max-w-full items-center rounded-full border border-blue-400/20 bg-blue-900/40 px-3 py-1.5 text-xs font-medium text-blue-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
                                 >
-                                  {target.camera_name || `Camera ${target.camera_id}`}
+                                  <span className="min-w-0 truncate whitespace-nowrap">
+                                    {targetLabel}
+                                  </span>
                                 </span>
                               );
                             })}
@@ -8475,7 +8970,12 @@ function StepCard({
                           <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
                             {t("jobs.unifiedAgent")}
                           </div>
-                          <div className="text-sm text-blue-100">{group.agentKey}</div>
+                          <div
+                            title={group.agentKey}
+                            className="min-w-0 text-sm leading-6 text-blue-100 break-words [overflow-wrap:anywhere]"
+                          >
+                            {group.agentKey}
+                          </div>
                           <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
                             {t("jobs.inputType")}
                           </div>
@@ -8554,7 +9054,7 @@ function StepCard({
                         <span>{t("jobs.onlyCaptureMotion")}</span>
                       </label>
                     </div>
-                    {JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED && (
+                    {/* {JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED && (
                       <div>
                         <label className="block text-xs text-gray-400 mb-1">
                           {t("jobs.useTemporalContext")}
@@ -8579,7 +9079,7 @@ function StepCard({
                           </span>
                         </label>
                       </div>
-                    )}
+                    )} */}
                     <div className="flex gap-2">
                       <button
                         onClick={handleSaveAgent}
@@ -8669,7 +9169,56 @@ function StepCard({
                             {t("jobs.promptEditor.subtitle")}
                           </p>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center justify-end gap-2">
+                          <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                            <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                              Load
+                            </span>
+                            <select
+                              value={selectedSavedAgentLibraryKey}
+                              onChange={(e) => setSelectedSavedAgentLibraryKey(e.target.value)}
+                              disabled={savedAgentLibraryLoading || enhancingPrompt}
+                              title={
+                                savedAgentLibraryError ||
+                                "Load one of your saved agents. Negative reference images need to be re-uploaded after the first save."
+                              }
+                              className="w-[210px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                            >
+                              <option value="">
+                                {savedAgentLibraryLoading
+                                  ? "Loading saved agents..."
+                                  : savedAgentLibraryError
+                                  ? "Failed to load agents"
+                                  : savedAgentLibrary.length === 0
+                                  ? "No saved agents"
+                                  : "Saved agents"}
+                              </option>
+                              {savedAgentLibrary.map((agent) => (
+                                <option key={agent.library_key} value={agent.library_key}>
+                                  {getSavedAgentLibraryOptionLabel(agent)}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              onClick={() => void handleLoadSavedAgentLibraryEntry()}
+                              disabled={
+                                !selectedSavedAgentLibraryEntry ||
+                                savedAgentLibraryLoading ||
+                                enhancingPrompt
+                              }
+                              title="Load this saved agent into the current draft"
+                              className={`rounded px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                                !selectedSavedAgentLibraryEntry ||
+                                savedAgentLibraryLoading ||
+                                enhancingPrompt
+                                  ? "cursor-not-allowed bg-gray-700 text-gray-500"
+                                  : "bg-blue-600 text-white hover:bg-blue-500"
+                              }`}
+                            >
+                              {savedAgentLibraryLoading ? "..." : "Use"}
+                            </button>
+                          </div>
                           <select
                             value={normalizeAgentInferenceModel(agentForm.inference_model)}
                             onChange={(e) => {
@@ -8878,7 +9427,7 @@ function StepCard({
                                 </select>
                               </div>
                             ) : null}
-                            {JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED ? (
+                            {/* {JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED ? (
                               <div className="space-y-2">
                                 <label className="block text-sm font-semibold text-gray-100">
                                   {t("jobs.useTemporalContext")}
@@ -8907,7 +9456,7 @@ function StepCard({
                                   </span>
                                 </label>
                               </div>
-                            ) : null}
+                            ) : null} */}
                             <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
                               <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
                                 <div className="flex items-center gap-2">
@@ -10222,28 +10771,35 @@ function StepCard({
                       {t("jobs.inheritedParameters")}
                     </label>
                     {selectedGroupSourceOption ? (
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                      <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.sourceCamera")}</div>
-                          <div className="text-gray-100">{selectedGroupSourceOption.cameraLabel}</div>
+                          <div className="min-w-0 break-words [overflow-wrap:anywhere] text-gray-100">
+                            {selectedGroupSourceOption.cameraLabel}
+                          </div>
                         </div>
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.agentKey")}</div>
-                          <div className="text-gray-100">{selectedGroupSourceOption.agentKey}</div>
+                          <div
+                            title={selectedGroupSourceOption.agentKey}
+                            className="min-w-0 break-words [overflow-wrap:anywhere] text-gray-100"
+                          >
+                            {selectedGroupSourceOption.agentKey}
+                          </div>
                         </div>
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.aiAgentTier")}</div>
                           <div className="text-gray-100 capitalize">{selectedGroupSourceOption.inferenceModel}</div>
                         </div>
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.priority")}</div>
                           <div className="text-gray-100">{selectedGroupSourceOption.priorityLevel}</div>
                         </div>
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.runEvery")}</div>
                           <div className="text-gray-100">{formatAgentRunEveryLabel(selectedGroupSourceOption.runEvery)}</div>
                         </div>
-                        <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                        <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                           <div className="text-[10px] uppercase tracking-widest text-gray-400">{t("jobs.captureMode")}</div>
                           <div className="text-gray-100">
                             {selectedGroupSourceOption.onlyCaptureOnMotion
@@ -10252,7 +10808,7 @@ function StepCard({
                           </div>
                         </div>
                         {selectedGroupSourceOption.inputType === "video" ? (
-                          <div className="px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
+                          <div className="min-w-0 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-sm">
                             <div className="text-[10px] uppercase tracking-widest text-gray-400">Video packaging</div>
                             <div className="text-gray-100">
                               {getAgentVideoPackagingModeLabel(
@@ -10782,10 +11338,16 @@ function StepCard({
             </div>
 
             {!isReady ? (
-              <p className="text-xs text-gray-500">
-                {t("jobs.validation.stepNotReady")}
-              </p>
-            ) : showAlertForm ? (
+              <div className="rounded-2xl border border-amber-400/20 bg-amber-500/[0.06] px-3 py-2.5">
+                <p className="text-xs leading-5 text-amber-100/80">
+                  {t("jobs.alertRuleReadyHint", {
+                    defaultValue:
+                      "You can configure alerts now. They will become effective once the step is fully ready.",
+                  })}
+                </p>
+              </div>
+            ) : null}
+            {showAlertForm ? (
               <div className="space-y-3">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">
@@ -10911,273 +11473,387 @@ function StepCard({
           </div>
           ) : null}
 
-          {inspectedTarget ? (
-            <div className="fixed inset-0 z-[65] flex items-center justify-center px-4 py-6">
+          {inspectedTarget && typeof document !== "undefined"
+            ? createPortal(
+            <div className="fixed inset-0 z-[85] flex items-start justify-center px-4 py-6">
               <button
                 type="button"
                 className="absolute inset-0 bg-black/55 backdrop-blur-sm"
                 onClick={() => setExpandedTargetId(null)}
                 aria-label={t("jobs.closeCameraConfig", { defaultValue: "Close camera config" })}
               />
-              <div className="relative z-10 w-full max-w-[640px] max-h-[calc(100vh-32px)] overflow-y-auto rounded-[28px] border border-gray-800/80 bg-gray-900 shadow-[0_40px_120px_-64px_rgba(0,0,0,1)]">
-                <div className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-gray-800/80 bg-gray-900/95 px-5 py-4 backdrop-blur">
-                  <div className="min-w-0">
-                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-                      {t("jobs.cameraSettings", { defaultValue: "Camera settings" })}
+              <div className="relative z-10 w-[min(96vw,1080px)] max-h-[calc(100vh-32px)] overflow-y-auto rounded-[30px] border border-gray-800/80 bg-gray-900 shadow-[0_40px_120px_-64px_rgba(0,0,0,1)]">
+                <div className="sticky top-0 z-10 border-b border-gray-800/80 bg-gray-900/95 backdrop-blur">
+                  <div className="flex items-start justify-between gap-4 px-5 py-4 sm:px-6 sm:py-5">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                        {t("jobs.cameraSettings", { defaultValue: "Camera settings" })}
+                      </div>
+                      <h4 className="mt-2 break-words text-xl font-semibold leading-tight text-gray-100 sm:text-[1.75rem]">
+                        {getTargetDisplayName(inspectedTarget)}
+                      </h4>
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${inspectedTargetAssigned && inspectedEffectiveAgent ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200" : "border-amber-400/25 bg-amber-500/12 text-amber-200"}`}>
+                          {inspectedTargetAssigned && inspectedEffectiveAgent
+                            ? t("jobs.readyShort", { defaultValue: "OK" })
+                            : t("jobs.setupShort", { defaultValue: "Setup" })}
+                        </span>
+                        <span className="inline-flex items-center rounded-full border border-gray-800 bg-gray-950/70 px-2.5 py-1 text-[11px] text-gray-300">
+                          {inspectedInputType === "image" ? t("jobs.image") : t("jobs.video")}
+                        </span>
+                        <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium ${inspectedAgentStatusClass}`}>
+                          {!inspectedEffectiveAgent
+                            ? t("jobs.notConfigured")
+                            : inspectedTargetAgent
+                              ? "Direct agent"
+                              : t("jobs.usingDefault")}
+                        </span>
+                      </div>
+                      <p className="mt-3 max-w-2xl text-sm leading-6 text-gray-400">
+                        {t("jobs.cameraSettingsHint", {
+                          defaultValue:
+                            "Adjust the assigned camera, capture mode, and clone an agent from another camera in this step.",
+                        })}
+                      </p>
                     </div>
-                    <h4 className="mt-2 truncate text-xl font-semibold text-gray-100">
-                      {getTargetDisplayName(inspectedTarget)}
-                    </h4>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${inspectedTargetAssigned && inspectedEffectiveAgent ? "border-emerald-400/25 bg-emerald-500/12 text-emerald-200" : "border-amber-400/25 bg-amber-500/12 text-amber-200"}`}>
-                        {inspectedTargetAssigned && inspectedEffectiveAgent
-                          ? t("jobs.readyShort", { defaultValue: "OK" })
-                          : t("jobs.setupShort", { defaultValue: "Setup" })}
-                      </span>
-                      <span className="inline-flex rounded-full border border-gray-800 bg-gray-950/70 px-2.5 py-1 text-[11px] text-gray-300">
-                        {inspectedInputType === "image" ? t("jobs.image") : t("jobs.video")}
-                      </span>
-                    </div>
-                    <p className="mt-3 text-sm text-gray-400">
-                      {t("jobs.cameraSettingsHint", {
-                        defaultValue:
-                          "Adjust the assigned camera, capture mode, and clone an agent from another camera in this step.",
-                      })}
-                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setExpandedTargetId(null)}
+                      className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-gray-800 bg-gray-950/70 text-gray-400 transition-colors hover:border-gray-700 hover:text-gray-100"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedTargetId(null)}
-                    className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-gray-800 bg-gray-950/70 text-gray-400 transition-colors hover:border-gray-700 hover:text-gray-100"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
                 </div>
 
-                <div className="space-y-4 px-5 py-5">
-                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
-                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-                      {t("jobs.targetCamera", { defaultValue: "Target camera" })}
-                    </div>
-                    <p className="mt-1 text-sm text-gray-400">
-                      {inspectedTargetAssigned
-                        ? "You can switch this slot to another camera that is not already used in the same step."
-                        : "This slot was imported from the Hub without a camera. Pick one when you are ready."}
-                    </p>
-                    <div className="mt-3 flex flex-col gap-3 sm:flex-row">
-                      <select
-                        value={targetCameraDraft}
-                        onChange={(e) => setTargetCameraDraft(e.target.value)}
-                        className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
-                      >
-                        <option value="">{t("jobs.selectTargetCamera", { defaultValue: "Select target camera" })}</option>
-                        {inspectedAvailableCameras.map((camera) => (
-                          <option key={`${inspectedTarget.id}-${camera.id}`} value={camera.id}>
-                            {camera.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        disabled={
-                          assigningTargetIds.has(inspectedTarget.id) ||
-                          !targetCameraDraft ||
-                          Number(targetCameraDraft) === inspectedTarget.camera_id
-                        }
-                        onClick={() => void handleAssignTargetCamera(inspectedTarget, Number(targetCameraDraft))}
-                        className={`inline-flex items-center justify-center rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
-                          assigningTargetIds.has(inspectedTarget.id) ||
-                          !targetCameraDraft ||
-                          Number(targetCameraDraft) === inspectedTarget.camera_id
-                            ? "cursor-not-allowed bg-gray-800 text-gray-500"
-                            : "bg-blue-600 text-white hover:bg-blue-500"
-                        }`}
-                      >
-                        {assigningTargetIds.has(inspectedTarget.id)
-                          ? "Saving..."
-                          : inspectedTargetAssigned
-                          ? "Update Camera"
-                          : "Assign Camera"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/55 p-4">
-                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-                      {t("jobs.aiAgent")}
-                    </div>
-                    <div className="mt-2 text-sm leading-6">
-                      {inspectedEffectiveAgent ? (
-                        <span className={inspectedTargetAgent ? "text-green-400" : "text-yellow-400"}>
-                          {inspectedTargetAgent
-                            ? getAgentDisplayName(inspectedTargetAgent)
-                            : `${t("jobs.usingDefault")}: ${getAgentDisplayName(inspectedEffectiveAgent)}`}
-                        </span>
-                      ) : (
-                        <span className="text-red-400">{t("jobs.notConfigured")}</span>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
-                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-                      {t("jobs.captureMode")}
-                    </div>
-                    <p className="mt-1 text-sm text-gray-400">
-                      {inspectedCanToggleCaptureMode
-                        ? t("jobs.captureModeDescription", {
-                            defaultValue: "Choose when this camera should capture frames for the agent.",
-                          })
-                        : t("jobs.captureModeRequiresAgent", {
-                            defaultValue: "Configure an agent first to change capture mode.",
-                          })}
-                    </p>
-                    <label
-                      className={`mt-3 flex items-start gap-3 rounded-2xl border border-gray-800 bg-gray-950/70 px-4 py-3 text-sm ${
-                        inspectedCanToggleCaptureMode ? "text-gray-200" : "text-gray-500"
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={inspectedCaptureOnMotion}
-                        onChange={(e) =>
-                          handleOnlyCaptureOnMotionChange(
-                            inspectedTarget,
-                            inspectedTargetAgent,
-                            e.target.checked
-                          )
-                        }
-                        disabled={!inspectedCanToggleCaptureMode || savingOnlyCaptureOnMotion.has(inspectedTarget.id)}
-                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-blue-500 disabled:opacity-50"
-                      />
-                      <span className="leading-6">{t("jobs.onlyCaptureMotion")}</span>
-                    </label>
-                  </div>
-
-                  <div className="rounded-[22px] border border-gray-800/80 bg-gray-950/60 p-4">
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="min-w-0">
-                        <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
-                          {t("jobs.clone")}
+                <div className="grid gap-4 px-5 py-5 sm:px-6 sm:py-6 lg:grid-cols-2">
+                  <div className={`${cameraSettingsSectionClass} lg:col-span-2`}>
+                    <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                            {t("jobs.targetCamera", { defaultValue: "Target camera" })}
+                          </div>
+                          <p className="mt-1 max-w-[38rem] text-sm leading-6 text-gray-400">
+                            {inspectedTargetAssigned
+                              ? "You can switch this slot to another camera that is not already used in the same step."
+                              : "This slot was imported from the Hub without a camera. Pick one when you are ready."}
+                          </p>
                         </div>
-                        <div className="mt-1 text-sm leading-6 text-gray-400">
-                          {inspectedCloneCandidates.length > 0
-                            ? t("jobs.cloneConfiguredAgentsHint", {
-                                defaultValue: "Copy an agent from another camera in this step.",
-                              })
-                            : t("jobs.noConfiguredAgentInOtherTargets")}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (inspectedCloneCandidates.length === 0) {
-                            onShowToast(t("jobs.noConfiguredAgentInOtherTargets"), "info");
-                            return;
-                          }
-
-                          if (inspectedCloneCandidates.length === 1) {
-                            requestCloneAgentFromCamera(inspectedTarget, inspectedCloneCandidates[0].cameraId);
-                            return;
-                          }
-
-                          setClonePickerTargetId((current) =>
-                            current === inspectedTarget.id ? null : inspectedTarget.id
-                          );
-                          setCloneSourceByTarget((prev) => {
-                            const currentSource = prev[inspectedTarget.id];
-                            if (
-                              currentSource &&
-                              inspectedCloneCandidates.some(
-                                (candidate) => candidate.cameraId === currentSource
-                              )
-                            ) {
-                              return prev;
-                            }
-                            return {
-                              ...prev,
-                              [inspectedTarget.id]: inspectedCloneCandidates[0].cameraId,
-                            };
-                          });
-                        }}
-                        disabled={inspectedIsCloning}
-                        className={`inline-flex items-center justify-center gap-2 rounded-full px-3 py-2 text-xs font-medium transition-colors ${
-                          inspectedIsCloning
-                            ? "cursor-wait bg-gray-800 text-gray-500"
-                            : "bg-gray-700 text-gray-100 hover:bg-gray-600"
-                        }`}
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                        {t("jobs.clone")}
-                      </button>
-                    </div>
-
-                    <div className="mt-3 flex justify-end">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          navigate(
-                            `/hub?type=agent&installTarget=step&stepId=${step.id}&cameraId=${inspectedTarget.camera_id}&returnTo=${encodeURIComponent(
-                              `/jobs?job=${step.job_id}`
-                            )}`
-                          )
-                        }
-                        className="inline-flex items-center justify-center gap-2 rounded-full bg-orange-500/10 px-3 py-2 text-xs font-medium text-orange-100 transition-colors hover:bg-orange-500/15"
-                      >
-                        <Sparkles className="h-3.5 w-3.5" />
-                        Use Hub Agent
-                      </button>
-                    </div>
-
-                    {clonePickerTargetId === inspectedTarget.id && inspectedCloneCandidates.length > 1 ? (
-                      <div className="mt-4 space-y-3 rounded-2xl border border-gray-800/80 bg-gray-950/80 p-3">
-                        <select
-                          value={inspectedCloneSourceCameraId ?? ""}
-                          onChange={(e) =>
-                            setCloneSourceByTarget((prev) => ({
-                              ...prev,
-                              [inspectedTarget.id]: Number(e.target.value),
-                            }))
-                          }
-                          className="w-full rounded-2xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                        <span
+                          className={`inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium ${
+                            inspectedTargetAssigned
+                              ? "border-blue-400/25 bg-blue-500/12 text-blue-100"
+                              : "border-amber-400/25 bg-amber-500/12 text-amber-200"
+                          }`}
                         >
-                          {inspectedCloneCandidates.map((candidate) => (
-                            <option key={`${inspectedTarget.id}-${candidate.cameraId}`} value={candidate.cameraId}>
-                              {candidate.cameraName} - {getAgentDisplayName(candidate.agent)}
-                            </option>
-                          ))}
-                        </select>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (inspectedCloneSourceCameraId == null) return;
-                              requestCloneAgentFromCamera(inspectedTarget, inspectedCloneSourceCameraId);
-                            }}
-                            disabled={inspectedIsCloning || inspectedCloneSourceCameraId == null}
-                            className={`rounded-full border border-gray-700 px-3 py-2 text-xs ${
-                              inspectedIsCloning || inspectedCloneSourceCameraId == null
-                                ? "cursor-not-allowed bg-gray-800 text-gray-500"
-                                : "bg-gray-700 text-gray-200 hover:bg-gray-600"
-                            }`}
+                          {inspectedTargetAssigned ? "Assigned" : "Needs camera"}
+                        </span>
+                      </div>
+
+                      <div className="grid gap-3 lg:grid-cols-[minmax(240px,0.92fr)_minmax(360px,1.08fr)]">
+                        <div className={cameraSettingsInsetClass}>
+                          <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                            Current camera
+                          </div>
+                          <div className="mt-2 break-words text-sm font-medium leading-6 text-gray-100">
+                            {getTargetDisplayName(inspectedTarget)}
+                          </div>
+                          <div className="mt-1 text-xs leading-5 text-gray-500">
+                            {inspectedTargetAssigned
+                              ? "Camera linked to this step target."
+                              : "No camera linked to this step target yet."}
+                          </div>
+                        </div>
+
+                        <label className={`${cameraSettingsInsetClass} block`}>
+                          <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                            Select camera
+                          </span>
+                          <select
+                            value={targetCameraDraft}
+                            onChange={(e) => setTargetCameraDraft(e.target.value)}
+                            className="mt-2 w-full rounded-2xl border border-gray-700 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
                           >
-                            {t("jobs.clone")}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setClonePickerTargetId(null)}
-                            className="rounded-full border border-gray-700 p-2 text-gray-300 transition-colors hover:bg-gray-700 hover:text-gray-100"
-                            title={t("jobs.closeClonePicker")}
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </button>
+                            <option value="">{t("jobs.selectTargetCamera", { defaultValue: "Select target camera" })}</option>
+                            {inspectedAvailableCameras.map((camera) => (
+                              <option key={`${inspectedTarget.id}-${camera.id}`} value={camera.id}>
+                                {camera.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          disabled={
+                            assigningTargetIds.has(inspectedTarget.id) ||
+                            !targetCameraDraft ||
+                            Number(targetCameraDraft) === inspectedTarget.camera_id
+                          }
+                          onClick={() => void handleAssignTargetCamera(inspectedTarget, Number(targetCameraDraft))}
+                          className={`inline-flex w-full items-center justify-center rounded-2xl px-4 py-3 text-sm font-semibold transition-colors sm:w-auto ${
+                            assigningTargetIds.has(inspectedTarget.id) ||
+                            !targetCameraDraft ||
+                            Number(targetCameraDraft) === inspectedTarget.camera_id
+                              ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                              : "bg-blue-600 text-white hover:bg-blue-500"
+                          }`}
+                        >
+                          {assigningTargetIds.has(inspectedTarget.id)
+                            ? "Saving..."
+                            : inspectedTargetAssigned
+                            ? "Update Camera"
+                            : "Assign Camera"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className={cameraSettingsSectionClass}>
+                    <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                            {t("jobs.aiAgent")}
+                          </div>
+                          <p className="mt-1 text-sm leading-6 text-gray-400">
+                            {!inspectedEffectiveAgent
+                              ? "No agent is configured for this camera yet."
+                              : inspectedTargetAgent
+                              ? "This camera has its own active agent configuration."
+                              : "This camera is inheriting the default agent for the step."}
+                          </p>
+                        </div>
+                        <span className={`inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium ${inspectedAgentStatusClass}`}>
+                          {!inspectedEffectiveAgent
+                            ? t("jobs.notConfigured")
+                            : inspectedTargetAgent
+                              ? "Assigned"
+                              : t("jobs.usingDefault")}
+                        </span>
+                      </div>
+
+                      <div className={cameraSettingsInsetClass}>
+                        <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                          {inspectedTargetAgent ? "Configured agent" : "Current source"}
+                        </div>
+                        <div className={`mt-2 break-words text-base font-semibold leading-6 ${inspectedAgentSummaryTone}`}>
+                          {inspectedAgentSummaryText}
                         </div>
                       </div>
-                    ) : null}
+                    </div>
+                  </div>
+
+                  <div className={cameraSettingsSectionClass}>
+                    <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                            {t("jobs.captureMode")}
+                          </div>
+                          <p className="mt-1 text-sm leading-6 text-gray-400">
+                            {inspectedCanToggleCaptureMode
+                              ? t("jobs.captureModeDescription", {
+                                  defaultValue: "Choose when this camera should capture frames for the agent.",
+                                })
+                              : t("jobs.captureModeRequiresAgent", {
+                                  defaultValue: "Configure an agent first to change capture mode.",
+                                })}
+                          </p>
+                        </div>
+                        <span
+                          className={`inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium ${
+                            inspectedCanToggleCaptureMode
+                              ? "border-blue-400/25 bg-blue-500/12 text-blue-100"
+                              : "border-gray-700 bg-gray-800/80 text-gray-400"
+                          }`}
+                        >
+                          {inspectedCanToggleCaptureMode ? "Available" : "Locked"}
+                        </span>
+                      </div>
+
+                      <label
+                        className={`${cameraSettingsInsetClass} flex items-start gap-3 sm:items-center ${
+                          inspectedCanToggleCaptureMode ? "text-gray-200" : "text-gray-500"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={inspectedCaptureOnMotion}
+                          onChange={(e) =>
+                            handleOnlyCaptureOnMotionChange(
+                              inspectedTarget,
+                              inspectedTargetAgent,
+                              e.target.checked
+                            )
+                          }
+                          disabled={!inspectedCanToggleCaptureMode || savingOnlyCaptureOnMotion.has(inspectedTarget.id)}
+                          className="mt-1 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-blue-500 disabled:opacity-50 sm:mt-0"
+                        />
+                        <div className="min-w-0">
+                          <div className={`text-sm font-medium ${inspectedCanToggleCaptureMode ? "text-gray-100" : "text-gray-500"}`}>
+                            {t("jobs.onlyCaptureMotion")}
+                          </div>
+                          <div className="mt-1 text-xs leading-5 text-gray-500">
+                            {inspectedCanToggleCaptureMode
+                              ? "Only capture frames when motion is detected to reduce idle processing."
+                              : "This control becomes available after an active agent is configured for the camera."}
+                          </div>
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className={`${cameraSettingsSectionClass} lg:col-span-2`}>
+                    <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                            {t("jobs.clone")}
+                          </div>
+                          <div className="mt-1 text-sm leading-6 text-gray-400">
+                            {inspectedCloneCandidates.length > 0
+                              ? t("jobs.cloneConfiguredAgentsHint", {
+                                  defaultValue: "Copy an agent from another camera in this step.",
+                                })
+                              : t("jobs.noConfiguredAgentInOtherTargets")}
+                          </div>
+                        </div>
+                        <span
+                          className={`inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium ${
+                            inspectedCloneCandidates.length > 0
+                              ? "border-blue-400/25 bg-blue-500/12 text-blue-100"
+                              : "border-gray-700 bg-gray-800/80 text-gray-400"
+                          }`}
+                        >
+                          {inspectedCloneCandidates.length > 0
+                            ? `${inspectedCloneCandidates.length} ${inspectedCloneCandidates.length === 1 ? "source" : "sources"}`
+                            : "No sources"}
+                        </span>
+                      </div>
+
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (inspectedCloneCandidates.length === 0) {
+                              onShowToast(t("jobs.noConfiguredAgentInOtherTargets"), "info");
+                              return;
+                            }
+
+                            if (inspectedCloneCandidates.length === 1) {
+                              requestCloneAgentFromCamera(inspectedTarget, inspectedCloneCandidates[0].cameraId);
+                              return;
+                            }
+
+                            setClonePickerTargetId((current) =>
+                              current === inspectedTarget.id ? null : inspectedTarget.id
+                            );
+                            setCloneSourceByTarget((prev) => {
+                              const currentSource = prev[inspectedTarget.id];
+                              if (
+                                currentSource &&
+                                inspectedCloneCandidates.some(
+                                  (candidate) => candidate.cameraId === currentSource
+                                )
+                              ) {
+                                return prev;
+                              }
+                              return {
+                                ...prev,
+                                [inspectedTarget.id]: inspectedCloneCandidates[0].cameraId,
+                              };
+                            });
+                          }}
+                          disabled={inspectedIsCloning}
+                          className={`inline-flex w-full items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
+                            inspectedIsCloning
+                              ? "cursor-wait bg-gray-800 text-gray-500"
+                              : "bg-gray-700 text-gray-100 hover:bg-gray-600"
+                          }`}
+                        >
+                          <Copy className="h-4 w-4" />
+                          {t("jobs.clone")}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            navigate(
+                              `/hub?type=agent&installTarget=step&stepId=${step.id}&cameraId=${inspectedTarget.camera_id}&returnTo=${encodeURIComponent(
+                                `/jobs?job=${step.job_id}`
+                              )}`
+                            )
+                          }
+                          className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-orange-500/10 px-4 py-3 text-sm font-semibold text-orange-100 transition-colors hover:bg-orange-500/15"
+                        >
+                          <Sparkles className="h-4 w-4" />
+                          Use Hub Agent
+                        </button>
+                      </div>
+
+                      {clonePickerTargetId === inspectedTarget.id && inspectedCloneCandidates.length > 1 ? (
+                        <div className={`${cameraSettingsInsetClass} space-y-3`}>
+                          <div>
+                            <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                              {t("jobs.sourceCamera")}
+                            </div>
+                            <p className="mt-1 text-xs leading-5 text-gray-500">
+                              Pick which configured camera should be used as the source.
+                            </p>
+                          </div>
+                          <select
+                            value={inspectedCloneSourceCameraId ?? ""}
+                            onChange={(e) =>
+                              setCloneSourceByTarget((prev) => ({
+                                ...prev,
+                                [inspectedTarget.id]: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full rounded-2xl border border-gray-700 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
+                          >
+                            {inspectedCloneCandidates.map((candidate) => (
+                              <option key={`${inspectedTarget.id}-${candidate.cameraId}`} value={candidate.cameraId}>
+                                {candidate.cameraName} - {getAgentDisplayName(candidate.agent)}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="flex flex-wrap items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (inspectedCloneSourceCameraId == null) return;
+                                requestCloneAgentFromCamera(inspectedTarget, inspectedCloneSourceCameraId);
+                              }}
+                              disabled={inspectedIsCloning || inspectedCloneSourceCameraId == null}
+                              className={`rounded-2xl px-4 py-2.5 text-xs font-semibold transition-colors ${
+                                inspectedIsCloning || inspectedCloneSourceCameraId == null
+                                  ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                                  : "bg-blue-600 text-white hover:bg-blue-500"
+                              }`}
+                            >
+                              {t("jobs.clone")}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setClonePickerTargetId(null)}
+                              className="rounded-2xl border border-gray-700 p-2.5 text-gray-300 transition-colors hover:bg-gray-700 hover:text-gray-100"
+                              title={t("jobs.closeClonePicker")}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
+            </div>,
+            document.body
           ) : null}
       </div>
     </StepFlowCard>

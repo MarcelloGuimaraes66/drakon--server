@@ -45,6 +45,16 @@ export interface CameraImportCandidate {
   address_was_defaulted: boolean;
 }
 
+export interface CameraImportSharedDefaults {
+  manufacturer?: string;
+  username?: string;
+  password?: string;
+  rtsp_port?: string;
+  connection_method?: "RTSP" | "HTTP" | "ONVIF";
+  channel?: string;
+  subtype?: string;
+}
+
 export interface CameraImportPreview {
   file_name: string;
   file_extension: string;

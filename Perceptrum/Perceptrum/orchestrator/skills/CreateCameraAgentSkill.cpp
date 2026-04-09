@@ -3389,7 +3389,7 @@ SkillRunResult CreateCameraAgentSkill::execute(
         designRequest.dump(),
         agent.getExeToken(),
         {},
-        30000);
+        70000);
     if (!designResponse.ok()) {
         result.answer = buildFailureAnswer_(language, parseErrorMessage_(designResponse));
         result.metadata["task_state"] = buildTaskState_(
