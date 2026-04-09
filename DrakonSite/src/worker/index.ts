@@ -24593,6 +24593,8 @@ type ReportEvidenceCandidate = {
   caption?: string;
   detected_at?: string | null;
   download_path: string;
+  local_path?: string;
+  source_label?: string;
 };
 
 type ReportBuildContext = {
@@ -26823,6 +26825,14 @@ function normalizeReportEvidenceCandidates(value: unknown): ReportEvidenceCandid
           ? row.detected_at.trim()
           : null,
       download_path: downloadPath,
+      local_path:
+        typeof row.local_path === "string" && row.local_path.trim()
+          ? row.local_path.trim()
+          : undefined,
+      source_label:
+        typeof row.source_label === "string" && row.source_label.trim()
+          ? normalizeReportText(row.source_label, 180)
+          : undefined,
     });
 
     if (normalized.length >= 12) {
@@ -26838,6 +26848,34 @@ function reportJsonStringify(value: unknown, fallback: string): string {
     return JSON.stringify(value);
   } catch {
     return fallback;
+  }
+}
+
+function formatReportIssuedAtLabel(
+  generatedAt: string,
+  timezoneInput: string | null | undefined,
+  language: string
+): string {
+  const parsedDate = new Date(generatedAt);
+  if (!Number.isFinite(parsedDate.getTime())) {
+    return generatedAt;
+  }
+
+  const locale = language.startsWith("pt")
+    ? "pt-BR"
+    : language.startsWith("es")
+    ? "es-ES"
+    : "en-US";
+  const timeZone = normalizeTimezoneInput(timezoneInput) || DEFAULT_GLOBAL_TIMEZONE;
+
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      dateStyle: "long",
+      timeStyle: "short",
+    }).format(parsedDate);
+  } catch {
+    return parsedDate.toISOString();
   }
 }
 
@@ -26890,6 +26928,8 @@ async function collectReportEvidenceAssets(
       caption: candidate.caption || null,
       detected_at: candidate.detected_at || null,
       download_url: downloadUrl,
+      local_path: candidate.local_path || null,
+      source_label: candidate.source_label || null,
     });
 
     if (
@@ -26906,6 +26946,10 @@ async function collectReportEvidenceAssets(
         caption: candidate.caption,
         bytes,
         contentType,
+        downloadUrl,
+        localPath: candidate.local_path,
+        detectedAt: candidate.detected_at || undefined,
+        sourceLabel: candidate.source_label,
       });
       continue;
     }
@@ -26916,6 +26960,9 @@ async function collectReportEvidenceAssets(
         caption: candidate.caption,
         downloadUrl,
         filename: candidate.filename,
+        localPath: candidate.local_path,
+        detectedAt: candidate.detected_at || undefined,
+        sourceLabel: candidate.source_label,
       });
     }
   }
@@ -27784,6 +27831,7 @@ async function buildReportContext(params: {
         detected_at: detection.detected_at,
         download_path:
           typeof detection.image_download_path === "string" ? detection.image_download_path : "",
+        source_label: detection.camera_name || detection.algo_type || undefined,
       });
     }
     if (typeof detection.video_key === "string" && detection.video_key) {
@@ -27798,6 +27846,7 @@ async function buildReportContext(params: {
         detected_at: detection.detected_at,
         download_path:
           typeof detection.video_download_path === "string" ? detection.video_download_path : "",
+        source_label: detection.camera_name || detection.algo_type || undefined,
       });
     }
   }
@@ -27815,6 +27864,7 @@ async function buildReportContext(params: {
         detected_at: alert.created_at,
         download_path:
           typeof alert.image_download_path === "string" ? alert.image_download_path : "",
+        source_label: alert.camera_name || alert.event_type || undefined,
       });
     }
     if (typeof alert.video_key === "string" && alert.video_key) {
@@ -27829,6 +27879,7 @@ async function buildReportContext(params: {
         detected_at: alert.created_at,
         download_path:
           typeof alert.video_download_path === "string" ? alert.video_download_path : "",
+        source_label: alert.camera_name || alert.event_type || undefined,
       });
     }
   }
@@ -35953,11 +36004,87 @@ app.post("/api/agent/reports/create", async (c) => {
     origin
   );
 
+  const rollupStatus =
+    (context as any)?.rollup_status &&
+    typeof (context as any).rollup_status === "object" &&
+    !Array.isArray((context as any).rollup_status)
+      ? ((context as any).rollup_status as ReportRollupStatus)
+      : {
+          camera_daily_rollups: "empty",
+          job_daily_rollups: "empty",
+          agent_daily_rollups: "empty",
+        };
+
   const generatedAt =
     normalizeReportText((context as any)?.generated_at, 80) || new Date().toISOString();
   const requestedQuery =
     normalizeReportText((context as any)?.requested_query, 1800) ||
     normalizeReportText(body?.query, 1800);
+  const issuerRow = await c.env.DB
+    .prepare("SELECT handle, email, timezone_iana FROM app_users WHERE id = ? LIMIT 1")
+    .bind(pairing.userId)
+    .first();
+  const issuedByHandle =
+    normalizeUserHandleInput((issuerRow as any)?.handle) ||
+    deriveHandleFromEmail(typeof (issuerRow as any)?.email === "string" ? (issuerRow as any).email : "") ||
+    "user";
+  const issuedAtLabel = formatReportIssuedAtLabel(
+    generatedAt,
+    typeof (issuerRow as any)?.timezone_iana === "string" ? (issuerRow as any).timezone_iana : null,
+    reportReplyLanguage
+  );
+  const scopeObject =
+    (context as any)?.scope && typeof (context as any).scope === "object"
+      ? ((context as any).scope as Record<string, unknown>)
+      : {};
+  const docxContext = {
+    applicationName: brand.displayName,
+    reportId,
+    replyLanguage: reportReplyLanguage,
+    issuedByHandle,
+    issuedAtLabel,
+    scopeLabel: normalizeReportText(scopeObject.label, 180) || undefined,
+    scopeStartAt:
+      typeof scopeObject.start_at === "string" && scopeObject.start_at.trim()
+        ? scopeObject.start_at
+        : undefined,
+    scopeEndAt:
+      typeof scopeObject.end_at === "string" && scopeObject.end_at.trim()
+        ? scopeObject.end_at
+        : undefined,
+    focus: Array.isArray(scopeObject.focus)
+      ? scopeObject.focus
+          .map((entry) => normalizeReportText(entry, 80))
+          .filter((entry) => entry.length > 0)
+      : [],
+    rollupStatus,
+    topFindings: Array.isArray((context as any)?.top_findings_seed)
+      ? ((context as any).top_findings_seed as unknown[])
+          .map((entry) => normalizeReportText(entry, 220))
+          .filter((entry) => entry.length > 0)
+      : [],
+    limitations: Array.isArray((context as any)?.limitations)
+      ? ((context as any).limitations as unknown[])
+          .map((entry) => normalizeReportText(entry, 320))
+          .filter((entry) => entry.length > 0)
+      : [],
+    currentState:
+      (context as any)?.current_state && typeof (context as any).current_state === "object"
+        ? ((context as any).current_state as Record<string, unknown>)
+        : {},
+    history:
+      (context as any)?.history && typeof (context as any).history === "object"
+        ? ((context as any).history as Record<string, unknown>)
+        : {},
+    comparisons:
+      (context as any)?.comparisons && typeof (context as any).comparisons === "object"
+        ? ((context as any).comparisons as Record<string, unknown>)
+        : {},
+    chatDiscussion:
+      (context as any)?.chat_discussion && typeof (context as any).chat_discussion === "object"
+        ? ((context as any).chat_discussion as Record<string, unknown>)
+        : {},
+  };
   const docFilename = buildReportDownloadFilename(title, "docx");
   const docStorageKey = buildReportStorageKey(pairing.userId, chatSessionId, reportId, docFilename);
   const docBytes = await buildReportDocxBuffer({
@@ -35970,6 +36097,7 @@ app.post("/api/agent/reports/create", async (c) => {
     sections,
     images: evidenceAssets.imageEvidence,
     videos: evidenceAssets.videoEvidence,
+    context: docxContext,
   });
 
   await c.env.R2_BUCKET.put(docStorageKey, docBytes, {
@@ -35994,17 +36122,6 @@ app.post("/api/agent/reports/create", async (c) => {
       },
     });
   }
-
-  const rollupStatus =
-    (context as any)?.rollup_status &&
-    typeof (context as any).rollup_status === "object" &&
-    !Array.isArray((context as any).rollup_status)
-      ? ((context as any).rollup_status as ReportRollupStatus)
-      : {
-          camera_daily_rollups: "empty",
-          job_daily_rollups: "empty",
-          agent_daily_rollups: "empty",
-        };
 
   const sanitizedContext = sanitizeReportValue({
     ...(context as any),
