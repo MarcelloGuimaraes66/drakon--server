@@ -128,6 +128,7 @@
     <ClInclude Include="..\Perceptrum\orchestrator\skills\EditCamerasBatchSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\EditJobSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.h" />
+    <ClInclude Include="..\Perceptrum\orchestrator\skills\GenerateReportSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\shared\AgentAuthoringShared.h" />
@@ -172,6 +173,7 @@
     <ClCompile Include="..\Perceptrum\orchestrator\skills\EditCamerasBatchSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\EditJobSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ExplainAppSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\orchestrator\skills\GenerateReportSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ReadStateSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\ScanNetworkSkill.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\shared\AgentAuthoringShared.cpp" />

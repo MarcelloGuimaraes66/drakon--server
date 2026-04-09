@@ -11,6 +11,7 @@
 #include "skills/EditCamerasBatchSkill.h"
 #include "skills/EditJobSkill.h"
 #include "skills/ExplainAppSkill.h"
+#include "skills/GenerateReportSkill.h"
 #include "skills/ReadStateSkill.h"
 #include "skills/ScanNetworkSkill.h"
 #include "skills/VideoSearchSkill.h"
@@ -32,6 +33,7 @@ SkillRegistry::SkillRegistry()
     registerSkill(std::make_unique<CreateCameraAgentSkill>());
     registerSkill(std::make_unique<EditCameraAgentSkill>());
     registerSkill(std::make_unique<ReadStateSkill>());
+    registerSkill(std::make_unique<GenerateReportSkill>());
     registerSkill(std::make_unique<ScanNetworkSkill>());
 }
 

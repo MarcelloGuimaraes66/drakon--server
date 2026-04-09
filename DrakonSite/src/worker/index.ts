@@ -99,6 +99,11 @@ import {
   purgeCentralAccountData,
   purgeLocalAccountData,
 } from "./accountDeletion";
+import {
+  buildReportDocxBuffer,
+  type ReportDocxImageEvidence,
+  type ReportDocxVideoEvidence,
+} from "./reporting/reportDocx";
 
 // AI agent descriptions mapping
 const ALGORITHM_DESCRIPTIONS: Record<string, string> = {
@@ -7003,6 +7008,97 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await addColumnIfMissing(`ALTER TABLE agent_error_logs ADD COLUMN operation TEXT`);
       await addColumnIfMissing(`ALTER TABLE agent_error_logs ADD COLUMN context_json TEXT`);
 
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS report_documents (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          chat_session_id INTEGER,
+          report_kind TEXT NOT NULL,
+          requested_query TEXT NOT NULL DEFAULT '',
+          reply_language TEXT NOT NULL DEFAULT 'en',
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL DEFAULT '',
+          doc_storage_key TEXT NOT NULL,
+          evidence_storage_key TEXT,
+          rollup_status_json TEXT NOT NULL DEFAULT '{}',
+          stats_json TEXT NOT NULL DEFAULT '[]',
+          context_json TEXT NOT NULL DEFAULT '{}',
+          sections_json TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+      `).run();
+
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS camera_daily_rollups (
+          user_id TEXT NOT NULL,
+          rollup_date TEXT NOT NULL,
+          camera_id INTEGER NOT NULL,
+          samples_count INTEGER NOT NULL DEFAULT 0,
+          start_count INTEGER NOT NULL DEFAULT 0,
+          stop_count INTEGER NOT NULL DEFAULT 0,
+          connection_failures INTEGER NOT NULL DEFAULT 0,
+          reconnect_count INTEGER NOT NULL DEFAULT 0,
+          avg_actual_fps REAL,
+          avg_expected_fps REAL,
+          avg_last_frame_age_ms REAL,
+          max_last_frame_age_ms BIGINT,
+          avg_queue_depth REAL,
+          max_queue_depth INTEGER,
+          detection_count INTEGER NOT NULL DEFAULT 0,
+          alert_count INTEGER NOT NULL DEFAULT 0,
+          outage_minutes_estimate REAL NOT NULL DEFAULT 0,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, rollup_date, camera_id)
+        )
+      `).run();
+
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS job_daily_rollups (
+          user_id TEXT NOT NULL,
+          rollup_date TEXT NOT NULL,
+          job_id INTEGER NOT NULL,
+          run_count INTEGER NOT NULL DEFAULT 0,
+          completed_run_count INTEGER NOT NULL DEFAULT 0,
+          stopped_run_count INTEGER NOT NULL DEFAULT 0,
+          blocked_run_count INTEGER NOT NULL DEFAULT 0,
+          step_started_count INTEGER NOT NULL DEFAULT 0,
+          step_completed_count INTEGER NOT NULL DEFAULT 0,
+          step_skipped_count INTEGER NOT NULL DEFAULT 0,
+          alert_count INTEGER NOT NULL DEFAULT 0,
+          error_count INTEGER NOT NULL DEFAULT 0,
+          total_runtime_seconds REAL NOT NULL DEFAULT 0,
+          avg_runtime_seconds REAL NOT NULL DEFAULT 0,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, rollup_date, job_id)
+        )
+      `).run();
+
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS agent_daily_rollups (
+          user_id TEXT NOT NULL,
+          rollup_date TEXT NOT NULL,
+          agent_scope_type TEXT NOT NULL,
+          agent_id INTEGER NOT NULL,
+          camera_id INTEGER,
+          job_id INTEGER,
+          step_id INTEGER,
+          run_count INTEGER NOT NULL DEFAULT 0,
+          detection_count INTEGER NOT NULL DEFAULT 0,
+          alert_count INTEGER NOT NULL DEFAULT 0,
+          error_count INTEGER NOT NULL DEFAULT 0,
+          avg_runtime_seconds REAL NOT NULL DEFAULT 0,
+          payload_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, rollup_date, agent_scope_type, agent_id)
+        )
+      `).run();
+
       await db.prepare(
         `UPDATE app_users
          SET timezone_iana = COALESCE(NULLIF(TRIM(timezone_iana), ''), 'UTC'),
@@ -7118,6 +7214,34 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_agent_error_logs_user_exe_occurred
         ON agent_error_logs(user_id, exe_id, occurred_at)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_report_documents_user_created
+        ON report_documents(user_id, created_at DESC)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_report_documents_user_session_created
+        ON report_documents(user_id, chat_session_id, created_at DESC)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_camera_daily_rollups_user_date_camera
+        ON camera_daily_rollups(user_id, rollup_date, camera_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_job_daily_rollups_user_date_job
+        ON job_daily_rollups(user_id, rollup_date, job_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_agent_daily_rollups_user_date_agent
+        ON agent_daily_rollups(user_id, rollup_date, agent_scope_type, agent_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_agent_daily_rollups_user_job
+        ON agent_daily_rollups(user_id, job_id, rollup_date)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_agent_daily_rollups_user_camera
+        ON agent_daily_rollups(user_id, camera_id, rollup_date)
       `).run();
       
       await db.prepare(`
@@ -17706,7 +17830,13 @@ app.get("/api/media-download/*", anyAuthMiddleware, async (c) => {
     if (!headers.get("content-type")) {
       const ext = String(filename.split(".").pop() || "").toLowerCase();
       const contentType =
-        ext === "mp4"
+        ext === "docx"
+          ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          : ext === "zip"
+          ? "application/zip"
+          : ext === "json"
+          ? "application/json"
+          : ext === "mp4"
           ? "video/mp4"
           : ext === "png"
           ? "image/png"
@@ -17725,6 +17855,111 @@ app.get("/api/media-download/*", anyAuthMiddleware, async (c) => {
     console.error("Failed to download media from R2:", error);
     return c.json({ error: "Failed to download media" }, 500);
   }
+});
+
+app.get("/api/reports/:id/download", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+  const user = c.get("user");
+  const reportId = normalizeReportText(c.req.param("id"), 120);
+
+  if (!user?.id || !reportId) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const row = await c.env.DB
+    .prepare(
+      `SELECT title, doc_storage_key
+       FROM report_documents
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`
+    )
+    .bind(reportId, user.id)
+    .first();
+
+  if (!row) {
+    return c.json({ error: "Report not found" }, 404);
+  }
+
+  const storageKey = normalizeReportText((row as any)?.doc_storage_key, 320);
+  if (!storageKey) {
+    return c.json({ error: "Document is unavailable" }, 404);
+  }
+
+  const object = await c.env.R2_BUCKET.get(storageKey);
+  if (!object) {
+    return c.json({ error: "Document not found" }, 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "no-cache");
+  headers.set(
+    "content-disposition",
+    `attachment; filename="${buildReportDownloadFilename(
+      normalizeReportText((row as any)?.title, 180) || "report",
+      "docx"
+    ).replace(/["\r\n]/g, "_")}"`
+  );
+  if (!headers.get("content-type")) {
+    headers.set(
+      "content-type",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    );
+  }
+
+  return c.body(object.body, { headers });
+});
+
+app.get("/api/reports/:id/evidence", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+  const user = c.get("user");
+  const reportId = normalizeReportText(c.req.param("id"), 120);
+
+  if (!user?.id || !reportId) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const row = await c.env.DB
+    .prepare(
+      `SELECT title, evidence_storage_key
+       FROM report_documents
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`
+    )
+    .bind(reportId, user.id)
+    .first();
+
+  if (!row) {
+    return c.json({ error: "Report not found" }, 404);
+  }
+
+  const storageKey = normalizeReportText((row as any)?.evidence_storage_key, 320);
+  if (!storageKey) {
+    return c.json({ error: "Evidence package not found" }, 404);
+  }
+
+  const object = await c.env.R2_BUCKET.get(storageKey);
+  if (!object) {
+    return c.json({ error: "Evidence package not found" }, 404);
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "no-cache");
+  headers.set(
+    "content-disposition",
+    `attachment; filename="${buildReportDownloadFilename(
+      `${normalizeReportText((row as any)?.title, 160) || "report"}-evidence`,
+      "zip"
+    ).replace(/["\r\n]/g, "_")}"`
+  );
+  if (!headers.get("content-type")) {
+    headers.set("content-type", "application/zip");
+  }
+
+  return c.body(object.body, { headers });
 });
 
 // Job alert clips (local disk)
@@ -24330,6 +24565,3410 @@ const sanitizeStoragePathSegment = (value: unknown, fallback = "na"): string => 
   return token.replace(/[^a-zA-Z0-9._-]/g, "_");
 };
 
+type ReportRollupAvailability = "ready" | "empty";
+
+type ReportRollupStatus = {
+  camera_daily_rollups: ReportRollupAvailability;
+  job_daily_rollups: ReportRollupAvailability;
+  agent_daily_rollups: ReportRollupAvailability;
+};
+
+type ReportKind =
+  | "general"
+  | "current_state"
+  | "history"
+  | "camera_health"
+  | "job_activity"
+  | "agent_activity"
+  | "detections_alerts"
+  | "chat_discussion"
+  | "system_activity"
+  | "comparison";
+
+type ReportEvidenceCandidate = {
+  kind: "image" | "video";
+  storage_key: string;
+  filename: string;
+  title: string;
+  caption?: string;
+  detected_at?: string | null;
+  download_path: string;
+};
+
+type ReportBuildContext = {
+  report_id: string;
+  report_kind: ReportKind;
+  title: string;
+  reply_language: string;
+  requested_query: string;
+  generated_at: string;
+  scope: {
+    start_at: string;
+    end_at: string;
+    time_window_hours: number;
+    label: string;
+    focus: string[];
+  };
+  stats: Record<string, number | string>;
+  current_state: Record<string, unknown>;
+  history: Record<string, unknown>;
+  comparisons: Record<string, unknown>;
+  chat_discussion: Record<string, unknown>;
+  evidence_candidates: ReportEvidenceCandidate[];
+  top_findings_seed: string[];
+  summary_seed: string;
+  limitations: string[];
+  rollup_status: ReportRollupStatus;
+  phase2_ready: boolean;
+};
+
+type ReportSectionPayload = {
+  heading: string;
+  paragraphs: string[];
+  bullets: string[];
+};
+
+type ReportStatPayload = {
+  label: string;
+  value: string;
+};
+
+function normalizeReportText(value: unknown, maxLength = 400): string {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, Math.max(0, maxLength));
+}
+
+function reportQueryIncludesAny(query: string, needles: readonly string[]): boolean {
+  return needles.some((needle) => needle && query.includes(needle));
+}
+
+function reportLanguageIsPt(language: string): boolean {
+  return language.trim().toLowerCase().startsWith("pt");
+}
+
+function inferReportKindFromQuery(queryInput: string): { kind: ReportKind; focus: string[] } {
+  const query = queryInput.trim().toLowerCase();
+  const focus = new Set<string>();
+
+  if (reportQueryIncludesAny(query, ["camera", "cameras", "câmera", "câmeras", "rtsp"])) {
+    focus.add("cameras");
+  }
+  if (reportQueryIncludesAny(query, ["job", "jobs", "tarefa", "tarefas", "workflow"])) {
+    focus.add("jobs");
+  }
+  if (reportQueryIncludesAny(query, ["agent", "agents", "agente", "agentes"])) {
+    focus.add("agents");
+  }
+  if (reportQueryIncludesAny(query, ["alert", "alerts", "alerta", "alertas", "detection", "detections", "detec", "evento", "eventos"])) {
+    focus.add("detections");
+  }
+  if (reportQueryIncludesAny(query, ["chat", "conversa", "debate", "discussion", "discussao", "discussão"])) {
+    focus.add("chat");
+  }
+  if (reportQueryIncludesAny(query, ["host", "system", "sistema", "atividade", "activity", "performance", "desempenho"])) {
+    focus.add("system");
+  }
+
+  if (reportQueryIncludesAny(query, ["compar", "compare", "ranking", "mais estavel", "mais estável", "menos estavel", "menos estável"])) {
+    return { kind: "comparison", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["historico", "histórico", "history", "logs", "timeline", "auditoria", "audit"])) {
+    return { kind: "history", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["agora", "now", "current", "atual", "momento"])) {
+    return { kind: "current_state", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["camera", "cameras", "câmera", "câmeras", "rtsp", "offline", "estavel", "estável", "reconnect"])) {
+    return { kind: "camera_health", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["job", "jobs", "tarefa", "tarefas", "workflow"])) {
+    return { kind: "job_activity", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["agent", "agents", "agente", "agentes"])) {
+    return { kind: "agent_activity", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["alert", "alerts", "alerta", "alertas", "detection", "detections", "detec"])) {
+    return { kind: "detections_alerts", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["chat", "conversa", "debate", "discussion", "discussao", "discussão"])) {
+    return { kind: "chat_discussion", focus: Array.from(focus) };
+  }
+  if (reportQueryIncludesAny(query, ["system", "sistema", "host", "process", "performance", "desempenho"])) {
+    return { kind: "system_activity", focus: Array.from(focus) };
+  }
+
+  return { kind: "general", focus: Array.from(focus) };
+}
+
+function inferReportTimeWindow(queryInput: string, language: string) {
+  const query = queryInput.trim().toLowerCase();
+  let hours = 24 * 7;
+
+  const numericMatch = query.match(/(\d{1,3})\s*(hora|horas|hour|hours|dia|dias|day|days|semana|semanas|week|weeks|mes|meses|month|months)/i);
+  if (numericMatch) {
+    const value = Number(numericMatch[1]);
+    const unit = numericMatch[2].toLowerCase();
+    if (Number.isFinite(value) && value > 0) {
+      if (unit.startsWith("hora") || unit.startsWith("hour")) {
+        hours = value;
+      } else if (unit.startsWith("dia") || unit.startsWith("day")) {
+        hours = value * 24;
+      } else if (unit.startsWith("semana") || unit.startsWith("week")) {
+        hours = value * 24 * 7;
+      } else if (unit.startsWith("mes") || unit.startsWith("month")) {
+        hours = value * 24 * 30;
+      }
+    }
+  } else if (reportQueryIncludesAny(query, ["agora", "now", "today", "hoje"])) {
+    hours = 24;
+  } else if (reportQueryIncludesAny(query, ["ontem", "yesterday"])) {
+    hours = 48;
+  } else if (reportQueryIncludesAny(query, ["semana", "week"])) {
+    hours = 24 * 7;
+  } else if (reportQueryIncludesAny(query, ["mes", "mês", "month"])) {
+    hours = 24 * 30;
+  } else if (reportQueryIncludesAny(query, ["ano", "year"])) {
+    hours = 24 * 90;
+  }
+
+  hours = Math.max(1, Math.min(24 * 90, Math.trunc(hours)));
+
+  const endDate = new Date();
+  const startDate = new Date(endDate.getTime() - hours * 60 * 60 * 1000);
+  const isPt = reportLanguageIsPt(language);
+  const label =
+    hours < 24
+      ? isPt
+        ? `ultimas ${hours} horas`
+        : `last ${hours} hours`
+      : hours % 24 === 0
+      ? isPt
+        ? `ultimos ${Math.round(hours / 24)} dias`
+        : `last ${Math.round(hours / 24)} days`
+      : isPt
+      ? `ultimas ${hours} horas`
+      : `last ${hours} hours`;
+
+  return {
+    hours,
+    startAt: startDate.toISOString(),
+    endAt: endDate.toISOString(),
+    startDateKey: startDate.toISOString().slice(0, 10),
+    endDateKey: endDate.toISOString().slice(0, 10),
+    label,
+  };
+}
+
+function buildReportTitle(query: string, kind: ReportKind, language: string): string {
+  const trimmedQuery = normalizeReportText(query, 120);
+  if (trimmedQuery) {
+    if (reportLanguageIsPt(language)) {
+      return `Relatorio: ${trimmedQuery}`;
+    }
+    return `Report: ${trimmedQuery}`;
+  }
+
+  const titles: Record<ReportKind, { pt: string; en: string }> = {
+    general: { pt: "Relatorio geral do sistema", en: "General system report" },
+    current_state: { pt: "Relatorio do estado atual", en: "Current state report" },
+    history: { pt: "Relatorio historico", en: "Historical report" },
+    camera_health: { pt: "Relatorio de saude das cameras", en: "Camera health report" },
+    job_activity: { pt: "Relatorio de atividade dos jobs", en: "Job activity report" },
+    agent_activity: { pt: "Relatorio de atividade dos agentes", en: "Agent activity report" },
+    detections_alerts: { pt: "Relatorio de deteccoes e alertas", en: "Detections and alerts report" },
+    chat_discussion: { pt: "Relatorio da conversa", en: "Discussion report" },
+    system_activity: { pt: "Relatorio de atividade do sistema", en: "System activity report" },
+    comparison: { pt: "Relatorio comparativo", en: "Comparison report" },
+  };
+
+  return reportLanguageIsPt(language) ? titles[kind].pt : titles[kind].en;
+}
+
+function normalizeReportFilenameStem(value: string): string {
+  const base = sanitizeStoragePathSegment(value.toLowerCase().replace(/\s+/g, "-"), "report");
+  return base.replace(/_+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "report";
+}
+
+function buildReportDownloadFilename(title: string, extension: "docx" | "zip"): string {
+  return `${normalizeReportFilenameStem(title)}.${extension}`;
+}
+
+function buildReportStorageKey(
+  userId: string,
+  chatSessionId: number,
+  reportId: string,
+  filename: string
+): string {
+  const safeUserId = sanitizeStoragePathSegment(userId, "user");
+  const safeSessionId = sanitizeStoragePathSegment(chatSessionId, "session");
+  const safeReportId = sanitizeStoragePathSegment(reportId, "report");
+  const safeFilename = sanitizeStoragePathSegment(filename, "report");
+  return `reports/${safeUserId}/${safeSessionId}/${safeReportId}/${safeFilename}`;
+}
+
+function buildMediaDownloadPathFromStorageKey(storageKey: string): string {
+  const encoded = storageKey
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `/api/media-download/${encoded}`;
+}
+
+function buildReportDownloadPath(reportId: string): string {
+  return `/api/reports/${encodeURIComponent(reportId)}/download`;
+}
+
+function buildReportEvidenceDownloadPath(reportId: string): string {
+  return `/api/reports/${encodeURIComponent(reportId)}/evidence`;
+}
+
+function buildAbsoluteDownloadUrl(origin: string, downloadPath: string): string {
+  return new URL(downloadPath, origin).toString();
+}
+
+function normalizeDetectionStorageKey(kind: "image" | "video", value: unknown): string {
+  const raw = normalizeReportText(value, 260);
+  if (!raw) return "";
+  if (raw.includes("/")) return raw;
+  return kind === "video" ? `detections_videos/${raw}` : `detections/${raw}`;
+}
+
+function sanitizeReportSecretText(value: string): string {
+  const maskedRtsp = maskRtspSensitiveInfo(value);
+  return maskedRtsp
+    .replace(/(api[_-]?key|token|secret|authorization|password|senha)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~-]+\b/gi, "Bearer [redacted]");
+}
+
+function sanitizeReportValue(value: unknown, depth = 0): unknown {
+  if (depth >= 4) {
+    return "[truncated]";
+  }
+  if (typeof value === "string") {
+    return sanitizeReportSecretText(value).slice(0, 600);
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value === null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 12).map((entry) => sanitizeReportValue(entry, depth + 1));
+  }
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>).slice(0, 24)) {
+    if (/(api[_-]?key|token|secret|password|senha|authorization)/i.test(key)) {
+      output[key] = "[redacted]";
+      continue;
+    }
+    output[key] = sanitizeReportValue(entry, depth + 1);
+  }
+  return output;
+}
+
+async function loadChatContextSnapshotForReport(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  beforeMessageIdRaw: number
+): Promise<Record<string, unknown>> {
+  const beforeMessageId =
+    Number.isInteger(beforeMessageIdRaw) && beforeMessageIdRaw > 0
+      ? beforeMessageIdRaw
+      : Number.MAX_SAFE_INTEGER;
+
+  const contextRow = await db
+    .prepare(
+      `SELECT *
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+    .bind(userId, chatSessionId)
+    .first();
+
+  let compactContext = buildDefaultChatCompactContext();
+  let taskState = buildDefaultChatTaskState();
+  let lastCompactedMessageId = 0;
+  let tokenEstimate = 0;
+
+  if (contextRow && typeof (contextRow as any).compact_context_json === "string") {
+    try {
+      compactContext = normalizeChatCompactContext(
+        JSON.parse(String((contextRow as any).compact_context_json || "{}"))
+      );
+    } catch {
+      compactContext = buildDefaultChatCompactContext();
+    }
+    lastCompactedMessageId = Number((contextRow as any).last_compacted_message_id || 0);
+    tokenEstimate = Number((contextRow as any).token_estimate || 0);
+  }
+
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      taskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      taskState = buildDefaultChatTaskState();
+    }
+  }
+
+  const recentMessagesResult = await db
+    .prepare(
+      `SELECT id, role, content, message_type, camera_selection_json, created_at, updated_at
+       FROM chat_messages
+       WHERE user_id = ?
+         AND session_id = ?
+         AND id > ?
+         AND id < ?
+         AND role IN ('user', 'assistant')
+         AND COALESCE(is_pending, 0) = 0
+       ORDER BY id DESC
+       LIMIT 18`
+    )
+    .bind(userId, chatSessionId, Math.max(0, lastCompactedMessageId), beforeMessageId)
+    .all();
+
+  const recentTurns = ((recentMessagesResult.results || []) as any[])
+    .slice()
+    .reverse()
+    .map((row) => {
+      const cameraSelection = safeChatContextCameraSelection((row as any).camera_selection_json);
+      return {
+        message_id: Number((row as any).id || 0),
+        role: String((row as any).role || ""),
+        message_type:
+          typeof (row as any).message_type === "string" ? (row as any).message_type : "",
+        created_at: typeof (row as any).created_at === "string" ? (row as any).created_at : "",
+        ...(cameraSelection ? { camera_selection: cameraSelection } : {}),
+        content: safeChatContextMessageContent((row as any).content),
+      };
+    })
+    .filter((row) => row.role && row.content);
+
+  return {
+    chat_session_id: chatSessionId,
+    context_before_message_id: beforeMessageId === Number.MAX_SAFE_INTEGER ? null : beforeMessageId,
+    compact_context: compactContext,
+    task_state: taskState,
+    last_compacted_message_id: lastCompactedMessageId,
+    token_estimate: tokenEstimate,
+    recent_turns: recentTurns,
+    updated_at:
+      typeof (contextRow as any)?.updated_at === "string" ? (contextRow as any).updated_at : null,
+  };
+}
+
+type ReportAgentScopeType = "camera_algorithm" | "job_step_agent";
+
+type ReportAgentRollupMeta = {
+  agent_scope_type: ReportAgentScopeType;
+  agent_id: number;
+  agent_name: string;
+  camera_id: number | null;
+  job_id: number | null;
+  step_id: number | null;
+  signal_keys: string[];
+  inference_model: string | null;
+  model_fps: number;
+  run_every_seconds: number;
+  is_enabled: boolean;
+};
+
+type ReportCameraRollupAggregate = {
+  camera_id: number;
+  samples_count: number;
+  start_count: number;
+  stop_count: number;
+  connection_failures: number;
+  reconnect_count: number;
+  avg_actual_fps: number | null;
+  avg_expected_fps: number | null;
+  avg_last_frame_age_ms: number | null;
+  max_last_frame_age_ms: number | null;
+  avg_queue_depth: number | null;
+  max_queue_depth: number | null;
+  detection_count: number;
+  alert_count: number;
+  outage_minutes_estimate: number;
+};
+
+type ReportJobRollupAggregate = {
+  job_id: number;
+  run_count: number;
+  completed_run_count: number;
+  stopped_run_count: number;
+  blocked_run_count: number;
+  step_started_count: number;
+  step_completed_count: number;
+  step_skipped_count: number;
+  alert_count: number;
+  error_count: number;
+  total_runtime_seconds: number;
+  avg_runtime_seconds: number;
+};
+
+type ReportAgentRollupAggregate = {
+  agent_scope_type: ReportAgentScopeType;
+  agent_id: number;
+  run_count: number;
+  detection_count: number;
+  alert_count: number;
+  error_count: number;
+  avg_runtime_seconds: number;
+};
+
+type ReportCameraRollupAccumulator = ReportCameraRollupAggregate & {
+  rollup_date: string;
+  payload_json: Record<string, unknown>;
+  created_at: string;
+};
+
+type ReportJobRollupAccumulator = ReportJobRollupAggregate & {
+  rollup_date: string;
+  payload_json: Record<string, unknown>;
+  created_at: string;
+};
+
+type ReportAgentRollupAccumulator = ReportAgentRollupAggregate & {
+  rollup_date: string;
+  camera_id: number | null;
+  job_id: number | null;
+  step_id: number | null;
+  payload_json: Record<string, unknown>;
+  created_at: string;
+};
+
+function reportToCount(value: unknown): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.trunc(numeric)) : 0;
+}
+
+function reportToFiniteNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function reportRoundNumber(value: number, digits = 2): number {
+  if (!Number.isFinite(value)) return 0;
+  const factor = 10 ** Math.max(0, digits);
+  return Math.round(value * factor) / factor;
+}
+
+function reportParseUtcDateKey(dateKey: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const parsed = new Date(Date.UTC(year, monthIndex, day, 0, 0, 0, 0));
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function buildReportDateKeysInclusive(startDateKey: string, endDateKey: string): string[] {
+  const start = reportParseUtcDateKey(startDateKey);
+  const end = reportParseUtcDateKey(endDateKey);
+  if (!start || !end) return [];
+
+  const startMs = start.getTime();
+  const endMs = end.getTime();
+  const [fromMs, toMs] = startMs <= endMs ? [startMs, endMs] : [endMs, startMs];
+  const keys: string[] = [];
+
+  for (let cursorMs = fromMs; cursorMs <= toMs; cursorMs += 24 * 60 * 60 * 1000) {
+    keys.push(new Date(cursorMs).toISOString().slice(0, 10));
+  }
+
+  return keys;
+}
+
+function buildReportDayBoundsUtc(dateKey: string): {
+  startAt: string;
+  endAt: string;
+  startMs: number;
+  endMs: number;
+} | null {
+  const start = reportParseUtcDateKey(dateKey);
+  if (!start) return null;
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return {
+    startAt: start.toISOString(),
+    endAt: end.toISOString(),
+    startMs: start.getTime(),
+    endMs: end.getTime(),
+  };
+}
+
+function reportDateKeyFromIso(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "";
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return "";
+  return new Date(parsed).toISOString().slice(0, 10);
+}
+
+function reportNormalizeSignalKey(value: unknown): string {
+  return normalizeReportText(value, 120).toLowerCase();
+}
+
+function reportCompositeKey(...parts: Array<string | number | null | undefined>): string {
+  return parts.map((part) => String(part ?? "")).join("|");
+}
+
+function reportExtractJobId(details: Record<string, unknown> | null | undefined): number {
+  if (!details) return 0;
+  return reportToCount((details as any).job_id ?? (details as any).job?.id ?? (details as any).jobId);
+}
+
+function reportExtractStepId(details: Record<string, unknown> | null | undefined): number {
+  if (!details) return 0;
+  return reportToCount((details as any).step_id ?? (details as any).step?.id ?? (details as any).stepId);
+}
+
+function reportExtractCameraId(
+  details: Record<string, unknown> | null | undefined,
+  fallback?: unknown
+): number {
+  if (!details) {
+    return reportToCount(fallback);
+  }
+  return reportToCount(
+    (details as any).camera_id ??
+      (details as any).camera?.id ??
+      (details as any).cameraId ??
+      fallback
+  );
+}
+
+function reportExtractAlertSignalKey(details: Record<string, unknown> | null | undefined): string {
+  if (!details) return "";
+  return reportNormalizeSignalKey(
+    (details as any).algo_type ??
+      (details as any).algoType ??
+      (details as any).agent_key ??
+      (details as any).agentKey ??
+      (details as any).algorithm_type ??
+      (details as any).algorithmType
+  );
+}
+
+function pushReportMapArray<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const existing = map.get(key);
+  if (existing) {
+    existing.push(value);
+    return;
+  }
+  map.set(key, [value]);
+}
+
+function buildReportCameraAgentMetas(cameraAgentRows: any[]): ReportAgentRollupMeta[] {
+  const metas: ReportAgentRollupMeta[] = [];
+  for (const row of cameraAgentRows) {
+    const agentId = reportToCount((row as any).id);
+    const cameraId = reportToCount((row as any).camera_id);
+    if (agentId <= 0 || cameraId <= 0) continue;
+    const config = parseJsonObject((row as any).config_json);
+    const agentName =
+      normalizeReportText((config as any).display_name, 120) ||
+      humanizeAlgorithmTypeLabel(normalizeReportText((row as any).algorithm_type, 120)) ||
+      `Camera agent ${agentId}`;
+    const signalKeys = Array.from(
+      new Set(
+        [
+          reportNormalizeSignalKey((config as any).display_name),
+          reportNormalizeSignalKey((config as any).displayName),
+          reportNormalizeSignalKey((row as any).algorithm_type),
+        ].filter((entry) => entry.length > 0)
+      )
+    );
+    metas.push({
+      agent_scope_type: "camera_algorithm",
+      agent_id: agentId,
+      agent_name: agentName,
+      camera_id: cameraId,
+      job_id: null,
+      step_id: null,
+      signal_keys: signalKeys,
+      inference_model: normalizeReportText((row as any).inference_model, 60) || null,
+      model_fps: reportToCount((row as any).model_fps),
+      run_every_seconds: reportToCount((row as any).run_every),
+      is_enabled: Number((row as any).is_enabled || 0) === 1,
+    });
+  }
+  return metas;
+}
+
+function buildReportStepAgentMetas(stepAgentRows: any[]): ReportAgentRollupMeta[] {
+  const metas: ReportAgentRollupMeta[] = [];
+  for (const row of stepAgentRows) {
+    const agentId = reportToCount((row as any).id);
+    const stepId = reportToCount((row as any).step_id);
+    if (agentId <= 0 || stepId <= 0) continue;
+    const signalKeys = Array.from(
+      new Set(
+        [
+          reportNormalizeSignalKey((row as any).agent_key),
+          reportNormalizeSignalKey((row as any).step_name),
+        ].filter((entry) => entry.length > 0)
+      )
+    );
+    metas.push({
+      agent_scope_type: "job_step_agent",
+      agent_id: agentId,
+      agent_name: normalizeReportText((row as any).agent_key, 120) || `Step agent ${agentId}`,
+      camera_id: reportToCount((row as any).camera_id) || null,
+      job_id: reportToCount((row as any).job_id) || null,
+      step_id: stepId,
+      signal_keys: signalKeys,
+      inference_model: normalizeReportText((row as any).inference_model, 60) || null,
+      model_fps: reportToCount((row as any).model_fps),
+      run_every_seconds: 0,
+      is_enabled: Number((row as any).is_active || 0) === 1,
+    });
+  }
+  return metas;
+}
+
+function matchReportCameraAgentMeta(
+  cameraAgentsByCameraId: Map<number, ReportAgentRollupMeta[]>,
+  cameraId: number,
+  signalKeyInput: unknown
+): ReportAgentRollupMeta | null {
+  if (!Number.isInteger(cameraId) || cameraId <= 0) return null;
+  const candidates = cameraAgentsByCameraId.get(cameraId) || [];
+  if (candidates.length === 0) return null;
+  const signalKey = reportNormalizeSignalKey(signalKeyInput);
+  const exactMatches = signalKey
+    ? candidates.filter((candidate) => candidate.signal_keys.includes(signalKey))
+    : [];
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length === 0 && candidates.length === 1) return candidates[0];
+  return null;
+}
+
+function matchReportStepAgentsForRun(
+  stepAgentsByStepId: Map<number, ReportAgentRollupMeta[]>,
+  stepId: number,
+  cameraId: number | null,
+  jobId: number | null
+): ReportAgentRollupMeta[] {
+  if (!Number.isInteger(stepId) || stepId <= 0) return [];
+  const candidates = stepAgentsByStepId.get(stepId) || [];
+  return candidates.filter((candidate) => {
+    const cameraMatches =
+      candidate.camera_id === null
+        ? true
+        : cameraId !== null && Number.isInteger(cameraId) && candidate.camera_id === cameraId;
+    const jobMatches =
+      candidate.job_id === null
+        ? true
+        : jobId !== null && Number.isInteger(jobId) && candidate.job_id === jobId;
+    return cameraMatches && jobMatches;
+  });
+}
+
+function matchReportStepAgentMetaForAlert(
+  stepAgentsByStepId: Map<number, ReportAgentRollupMeta[]>,
+  stepId: number,
+  cameraId: number | null,
+  jobId: number | null,
+  signalKeyInput: unknown
+): ReportAgentRollupMeta | null {
+  const candidates = matchReportStepAgentsForRun(stepAgentsByStepId, stepId, cameraId, jobId);
+  if (candidates.length === 0) return null;
+  const signalKey = reportNormalizeSignalKey(signalKeyInput);
+  const exactMatches = signalKey
+    ? candidates.filter((candidate) => candidate.signal_keys.includes(signalKey))
+    : [];
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length === 0 && candidates.length === 1) return candidates[0];
+  return null;
+}
+
+function resolveReportAgentMetaFromError(params: {
+  sourceId: unknown;
+  context: Record<string, unknown>;
+  cameraAgentById: Map<number, ReportAgentRollupMeta>;
+  stepAgentById: Map<number, ReportAgentRollupMeta>;
+  cameraAgentsByCameraId: Map<number, ReportAgentRollupMeta[]>;
+  stepAgentsByStepId: Map<number, ReportAgentRollupMeta[]>;
+}): ReportAgentRollupMeta | null {
+  const sourceIdText = normalizeReportText(params.sourceId, 128);
+  const numericSourceId = /^\d+$/.test(sourceIdText) ? Number(sourceIdText) : 0;
+  const sourceType = reportNormalizeSignalKey(
+    (params.context as any).source_type ?? (params.context as any).sourceType
+  );
+  const explicitCameraAlgorithmId = reportToCount(
+    (params.context as any).camera_algorithm_id ??
+      (params.context as any).cameraAlgorithmId ??
+      (params.context as any).algorithm_id ??
+      (params.context as any).algorithmId
+  );
+  const explicitStepAgentId = reportToCount(
+    (params.context as any).step_agent_id ?? (params.context as any).stepAgentId
+  );
+  const genericAgentId = reportToCount(
+    (params.context as any).agent_id ?? (params.context as any).agentId
+  );
+
+  if (sourceType === "camera_algorithm") {
+    return (
+      params.cameraAgentById.get(explicitCameraAlgorithmId) ||
+      params.cameraAgentById.get(numericSourceId) ||
+      params.cameraAgentById.get(genericAgentId) ||
+      null
+    );
+  }
+
+  if (sourceType === "job_step_agent") {
+    return (
+      params.stepAgentById.get(explicitStepAgentId) ||
+      params.stepAgentById.get(numericSourceId) ||
+      params.stepAgentById.get(genericAgentId) ||
+      null
+    );
+  }
+
+  if (explicitCameraAlgorithmId > 0 && params.cameraAgentById.has(explicitCameraAlgorithmId)) {
+    return params.cameraAgentById.get(explicitCameraAlgorithmId) || null;
+  }
+  if (explicitStepAgentId > 0 && params.stepAgentById.has(explicitStepAgentId)) {
+    return params.stepAgentById.get(explicitStepAgentId) || null;
+  }
+
+  if (genericAgentId > 0) {
+    const cameraMeta = params.cameraAgentById.get(genericAgentId) || null;
+    const stepMeta = params.stepAgentById.get(genericAgentId) || null;
+    if (cameraMeta && !stepMeta) return cameraMeta;
+    if (stepMeta && !cameraMeta) return stepMeta;
+  }
+
+  if (numericSourceId > 0) {
+    const cameraMeta = params.cameraAgentById.get(numericSourceId) || null;
+    const stepMeta = params.stepAgentById.get(numericSourceId) || null;
+    if (cameraMeta && !stepMeta) return cameraMeta;
+    if (stepMeta && !cameraMeta) return stepMeta;
+  }
+
+  const stepId = reportExtractStepId(params.context);
+  const jobId = reportExtractJobId(params.context) || null;
+  const cameraId = reportExtractCameraId(params.context) || null;
+  const signalKey = reportExtractAlertSignalKey(params.context);
+  const stepMatch = matchReportStepAgentMetaForAlert(
+    params.stepAgentsByStepId,
+    stepId,
+    cameraId,
+    jobId,
+    signalKey
+  );
+  if (stepMatch) return stepMatch;
+  return matchReportCameraAgentMeta(params.cameraAgentsByCameraId, cameraId || 0, signalKey);
+}
+
+function updateReportRunningAverage(
+  existingAverage: number | null,
+  existingSamples: number,
+  nextSample: number | null
+): number | null {
+  if (nextSample === null) return existingAverage;
+  if (!Number.isFinite(existingAverage as number) || existingAverage === null || existingSamples <= 0) {
+    return reportRoundNumber(nextSample, 2);
+  }
+  return reportRoundNumber(
+    (existingAverage * existingSamples + nextSample) / (existingSamples + 1),
+    2
+  );
+}
+
+function mergeReportRunningMax(
+  existingValue: number | null,
+  nextValue: number | null
+): number | null {
+  if (nextValue === null) return existingValue;
+  if (existingValue === null || !Number.isFinite(existingValue)) {
+    return Math.max(0, Math.trunc(nextValue));
+  }
+  return Math.max(existingValue, Math.max(0, Math.trunc(nextValue)));
+}
+
+function createReportCameraRollupAccumulator(
+  dateKey: string,
+  cameraId: number,
+  nowIso: string,
+  existingRow?: any
+): ReportCameraRollupAccumulator {
+  return {
+    rollup_date: dateKey,
+    camera_id: cameraId,
+    samples_count: reportToCount((existingRow as any)?.samples_count),
+    start_count: 0,
+    stop_count: 0,
+    connection_failures: 0,
+    reconnect_count: reportToCount((existingRow as any)?.reconnect_count),
+    avg_actual_fps: reportToFiniteNumber((existingRow as any)?.avg_actual_fps),
+    avg_expected_fps: reportToFiniteNumber((existingRow as any)?.avg_expected_fps),
+    avg_last_frame_age_ms: reportToFiniteNumber((existingRow as any)?.avg_last_frame_age_ms),
+    max_last_frame_age_ms: reportToFiniteNumber((existingRow as any)?.max_last_frame_age_ms),
+    avg_queue_depth: reportToFiniteNumber((existingRow as any)?.avg_queue_depth),
+    max_queue_depth: reportToFiniteNumber((existingRow as any)?.max_queue_depth),
+    detection_count: 0,
+    alert_count: 0,
+    outage_minutes_estimate: 0,
+    payload_json:
+      existingRow && typeof (existingRow as any).payload_json === "string"
+        ? parseJsonObject((existingRow as any).payload_json)
+        : {},
+    created_at:
+      typeof (existingRow as any)?.created_at === "string" && String((existingRow as any).created_at).trim()
+        ? String((existingRow as any).created_at)
+        : nowIso,
+  };
+}
+
+function createReportJobRollupAccumulator(
+  dateKey: string,
+  jobId: number,
+  nowIso: string,
+  existingRow?: any
+): ReportJobRollupAccumulator {
+  return {
+    rollup_date: dateKey,
+    job_id: jobId,
+    run_count: 0,
+    completed_run_count: 0,
+    stopped_run_count: 0,
+    blocked_run_count: 0,
+    step_started_count: 0,
+    step_completed_count: 0,
+    step_skipped_count: 0,
+    alert_count: 0,
+    error_count: 0,
+    total_runtime_seconds: 0,
+    avg_runtime_seconds: 0,
+    payload_json:
+      existingRow && typeof (existingRow as any).payload_json === "string"
+        ? parseJsonObject((existingRow as any).payload_json)
+        : {},
+    created_at:
+      typeof (existingRow as any)?.created_at === "string" && String((existingRow as any).created_at).trim()
+        ? String((existingRow as any).created_at)
+        : nowIso,
+  };
+}
+
+function createReportAgentRollupAccumulator(
+  dateKey: string,
+  meta: ReportAgentRollupMeta,
+  nowIso: string,
+  existingRow?: any
+): ReportAgentRollupAccumulator {
+  return {
+    rollup_date: dateKey,
+    agent_scope_type: meta.agent_scope_type,
+    agent_id: meta.agent_id,
+    camera_id: meta.camera_id,
+    job_id: meta.job_id,
+    step_id: meta.step_id,
+    run_count: 0,
+    detection_count: 0,
+    alert_count: 0,
+    error_count: 0,
+    avg_runtime_seconds: reportToFiniteNumber((existingRow as any)?.avg_runtime_seconds) || 0,
+    payload_json:
+      existingRow && typeof (existingRow as any).payload_json === "string"
+        ? parseJsonObject((existingRow as any).payload_json)
+        : {},
+    created_at:
+      typeof (existingRow as any)?.created_at === "string" && String((existingRow as any).created_at).trim()
+        ? String((existingRow as any).created_at)
+        : nowIso,
+  };
+}
+
+async function loadReportCameraRollupAggregates(
+  db: D1Database,
+  userId: string,
+  startDateKey: string,
+  endDateKey: string
+): Promise<Map<number, ReportCameraRollupAggregate>> {
+  const rows = await db
+    .prepare(
+      `SELECT
+         camera_id,
+         COALESCE(SUM(samples_count), 0) AS samples_count,
+         COALESCE(SUM(start_count), 0) AS start_count,
+         COALESCE(SUM(stop_count), 0) AS stop_count,
+         COALESCE(SUM(connection_failures), 0) AS connection_failures,
+         COALESCE(SUM(reconnect_count), 0) AS reconnect_count,
+         CASE WHEN COALESCE(SUM(samples_count), 0) > 0
+           THEN SUM(COALESCE(avg_actual_fps, 0) * samples_count) / SUM(samples_count)
+           ELSE NULL
+         END AS avg_actual_fps,
+         CASE WHEN COALESCE(SUM(samples_count), 0) > 0
+           THEN SUM(COALESCE(avg_expected_fps, 0) * samples_count) / SUM(samples_count)
+           ELSE NULL
+         END AS avg_expected_fps,
+         CASE WHEN COALESCE(SUM(samples_count), 0) > 0
+           THEN SUM(COALESCE(avg_last_frame_age_ms, 0) * samples_count) / SUM(samples_count)
+           ELSE NULL
+         END AS avg_last_frame_age_ms,
+         MAX(max_last_frame_age_ms) AS max_last_frame_age_ms,
+         CASE WHEN COALESCE(SUM(samples_count), 0) > 0
+           THEN SUM(COALESCE(avg_queue_depth, 0) * samples_count) / SUM(samples_count)
+           ELSE NULL
+         END AS avg_queue_depth,
+         MAX(max_queue_depth) AS max_queue_depth,
+         COALESCE(SUM(detection_count), 0) AS detection_count,
+         COALESCE(SUM(alert_count), 0) AS alert_count,
+         COALESCE(SUM(outage_minutes_estimate), 0) AS outage_minutes_estimate
+       FROM camera_daily_rollups
+       WHERE user_id = ?
+         AND rollup_date >= ?
+         AND rollup_date <= ?
+       GROUP BY camera_id`
+    )
+    .bind(userId, startDateKey, endDateKey)
+    .all();
+
+  const map = new Map<number, ReportCameraRollupAggregate>();
+  for (const row of (rows.results || []) as any[]) {
+    const cameraId = reportToCount((row as any).camera_id);
+    if (cameraId <= 0) continue;
+    map.set(cameraId, {
+      camera_id: cameraId,
+      samples_count: reportToCount((row as any).samples_count),
+      start_count: reportToCount((row as any).start_count),
+      stop_count: reportToCount((row as any).stop_count),
+      connection_failures: reportToCount((row as any).connection_failures),
+      reconnect_count: reportToCount((row as any).reconnect_count),
+      avg_actual_fps: reportToFiniteNumber((row as any).avg_actual_fps),
+      avg_expected_fps: reportToFiniteNumber((row as any).avg_expected_fps),
+      avg_last_frame_age_ms: reportToFiniteNumber((row as any).avg_last_frame_age_ms),
+      max_last_frame_age_ms: reportToFiniteNumber((row as any).max_last_frame_age_ms),
+      avg_queue_depth: reportToFiniteNumber((row as any).avg_queue_depth),
+      max_queue_depth: reportToFiniteNumber((row as any).max_queue_depth),
+      detection_count: reportToCount((row as any).detection_count),
+      alert_count: reportToCount((row as any).alert_count),
+      outage_minutes_estimate: reportRoundNumber(
+        reportToFiniteNumber((row as any).outage_minutes_estimate) || 0,
+        2
+      ),
+    });
+  }
+  return map;
+}
+
+async function loadReportJobRollupAggregates(
+  db: D1Database,
+  userId: string,
+  startDateKey: string,
+  endDateKey: string
+): Promise<Map<number, ReportJobRollupAggregate>> {
+  const rows = await db
+    .prepare(
+      `SELECT
+         job_id,
+         COALESCE(SUM(run_count), 0) AS run_count,
+         COALESCE(SUM(completed_run_count), 0) AS completed_run_count,
+         COALESCE(SUM(stopped_run_count), 0) AS stopped_run_count,
+         COALESCE(SUM(blocked_run_count), 0) AS blocked_run_count,
+         COALESCE(SUM(step_started_count), 0) AS step_started_count,
+         COALESCE(SUM(step_completed_count), 0) AS step_completed_count,
+         COALESCE(SUM(step_skipped_count), 0) AS step_skipped_count,
+         COALESCE(SUM(alert_count), 0) AS alert_count,
+         COALESCE(SUM(error_count), 0) AS error_count,
+         COALESCE(SUM(total_runtime_seconds), 0) AS total_runtime_seconds,
+         CASE WHEN COALESCE(SUM(run_count), 0) > 0
+           THEN SUM(total_runtime_seconds) / SUM(run_count)
+           ELSE 0
+         END AS avg_runtime_seconds
+       FROM job_daily_rollups
+       WHERE user_id = ?
+         AND rollup_date >= ?
+         AND rollup_date <= ?
+       GROUP BY job_id`
+    )
+    .bind(userId, startDateKey, endDateKey)
+    .all();
+
+  const map = new Map<number, ReportJobRollupAggregate>();
+  for (const row of (rows.results || []) as any[]) {
+    const jobId = reportToCount((row as any).job_id);
+    if (jobId <= 0) continue;
+    map.set(jobId, {
+      job_id: jobId,
+      run_count: reportToCount((row as any).run_count),
+      completed_run_count: reportToCount((row as any).completed_run_count),
+      stopped_run_count: reportToCount((row as any).stopped_run_count),
+      blocked_run_count: reportToCount((row as any).blocked_run_count),
+      step_started_count: reportToCount((row as any).step_started_count),
+      step_completed_count: reportToCount((row as any).step_completed_count),
+      step_skipped_count: reportToCount((row as any).step_skipped_count),
+      alert_count: reportToCount((row as any).alert_count),
+      error_count: reportToCount((row as any).error_count),
+      total_runtime_seconds: reportRoundNumber(
+        reportToFiniteNumber((row as any).total_runtime_seconds) || 0,
+        2
+      ),
+      avg_runtime_seconds: reportRoundNumber(
+        reportToFiniteNumber((row as any).avg_runtime_seconds) || 0,
+        2
+      ),
+    });
+  }
+  return map;
+}
+
+async function loadReportAgentRollupAggregates(
+  db: D1Database,
+  userId: string,
+  startDateKey: string,
+  endDateKey: string
+): Promise<Map<string, ReportAgentRollupAggregate>> {
+  const rows = await db
+    .prepare(
+      `SELECT
+         agent_scope_type,
+         agent_id,
+         COALESCE(SUM(run_count), 0) AS run_count,
+         COALESCE(SUM(detection_count), 0) AS detection_count,
+         COALESCE(SUM(alert_count), 0) AS alert_count,
+         COALESCE(SUM(error_count), 0) AS error_count,
+         AVG(COALESCE(avg_runtime_seconds, 0)) AS avg_runtime_seconds
+       FROM agent_daily_rollups
+       WHERE user_id = ?
+         AND rollup_date >= ?
+         AND rollup_date <= ?
+       GROUP BY agent_scope_type, agent_id`
+    )
+    .bind(userId, startDateKey, endDateKey)
+    .all();
+
+  const map = new Map<string, ReportAgentRollupAggregate>();
+  for (const row of (rows.results || []) as any[]) {
+    const scopeTypeRaw = normalizeReportText((row as any).agent_scope_type, 40);
+    const scopeType =
+      scopeTypeRaw === "camera_algorithm" || scopeTypeRaw === "job_step_agent"
+        ? (scopeTypeRaw as ReportAgentScopeType)
+        : null;
+    const agentId = reportToCount((row as any).agent_id);
+    if (!scopeType || agentId <= 0) continue;
+    map.set(reportCompositeKey(scopeType, agentId), {
+      agent_scope_type: scopeType,
+      agent_id: agentId,
+      run_count: reportToCount((row as any).run_count),
+      detection_count: reportToCount((row as any).detection_count),
+      alert_count: reportToCount((row as any).alert_count),
+      error_count: reportToCount((row as any).error_count),
+      avg_runtime_seconds: reportRoundNumber(
+        reportToFiniteNumber((row as any).avg_runtime_seconds) || 0,
+        2
+      ),
+    });
+  }
+  return map;
+}
+
+async function populateReportDailyRollups(params: {
+  db: D1Database;
+  userId: string;
+  startDateKey: string;
+  endDateKey: string;
+  cameraAgentRows: any[];
+  stepAgentRows: any[];
+}): Promise<void> {
+  const dateKeys = buildReportDateKeysInclusive(params.startDateKey, params.endDateKey);
+  if (dateKeys.length === 0) return;
+
+  const startBounds = buildReportDayBoundsUtc(dateKeys[0]);
+  const endBounds = buildReportDayBoundsUtc(dateKeys[dateKeys.length - 1]);
+  if (!startBounds || !endBounds) return;
+
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.parse(nowIso);
+  const currentDateKey = dateKeys[dateKeys.length - 1];
+  const dateKeySet = new Set(dateKeys);
+  const dayBoundsByKey = new Map<string, NonNullable<ReturnType<typeof buildReportDayBoundsUtc>>>();
+  for (const dateKey of dateKeys) {
+    const bounds = buildReportDayBoundsUtc(dateKey);
+    if (bounds) {
+      dayBoundsByKey.set(dateKey, bounds);
+    }
+  }
+
+  const cameraAgentMetas = buildReportCameraAgentMetas(params.cameraAgentRows);
+  const stepAgentMetas = buildReportStepAgentMetas(params.stepAgentRows);
+  const cameraAgentById = new Map<number, ReportAgentRollupMeta>();
+  const stepAgentById = new Map<number, ReportAgentRollupMeta>();
+  const cameraAgentsByCameraId = new Map<number, ReportAgentRollupMeta[]>();
+  const stepAgentsByStepId = new Map<number, ReportAgentRollupMeta[]>();
+  const agentMetaByScopedId = new Map<string, ReportAgentRollupMeta>();
+
+  for (const meta of cameraAgentMetas) {
+    cameraAgentById.set(meta.agent_id, meta);
+    agentMetaByScopedId.set(reportCompositeKey(meta.agent_scope_type, meta.agent_id), meta);
+    pushReportMapArray(cameraAgentsByCameraId, meta.camera_id || 0, meta);
+  }
+  for (const meta of stepAgentMetas) {
+    stepAgentById.set(meta.agent_id, meta);
+    agentMetaByScopedId.set(reportCompositeKey(meta.agent_scope_type, meta.agent_id), meta);
+    pushReportMapArray(stepAgentsByStepId, meta.step_id || 0, meta);
+  }
+
+  const [
+    existingCameraRollupsResult,
+    existingJobRollupsResult,
+    existingAgentRollupsResult,
+    cameraIdsResult,
+    jobIdsResult,
+    commandsResult,
+    detectionsResult,
+    eventsResult,
+    errorLogsResult,
+    latestCameraResult,
+  ] = await Promise.all([
+    params.db
+      .prepare(
+        `SELECT *
+         FROM camera_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(params.userId, params.startDateKey, params.endDateKey)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT *
+         FROM job_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(params.userId, params.startDateKey, params.endDateKey)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT *
+         FROM agent_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(params.userId, params.startDateKey, params.endDateKey)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id
+         FROM cameras
+         WHERE user_id = ?
+         ORDER BY id ASC`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id
+         FROM jobs
+         WHERE user_id = ?
+         ORDER BY id ASC`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT camera_id, command_type, created_at
+         FROM commands
+         WHERE user_id = ?
+           AND camera_id IS NOT NULL
+           AND command_type IN ('start_camera', 'stop_camera')
+           AND created_at >= ?
+           AND created_at < ?`
+      )
+      .bind(params.userId, startBounds.startAt, endBounds.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT camera_id, algo_type, detected_at
+         FROM detections
+         WHERE user_id = ?
+           AND detected_at >= ?
+           AND detected_at < ?`
+      )
+      .bind(params.userId, startBounds.startAt, endBounds.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id, camera_id, event_type, details_json, created_at
+         FROM events
+         WHERE user_id = ?
+           AND created_at >= ?
+           AND created_at < ?
+           AND event_type IN (
+             'camera_connection_failed',
+             'camera_started',
+             'camera_online',
+             'job_started',
+             'job_stopped',
+             'job_failed',
+             'job_completed',
+             'job_staled',
+             'job_start_blocked',
+             'job_step_started',
+             'job_step_completed',
+             'job_step_skipped',
+             'job_alert_triggered',
+             'ai_detection'
+           )
+         ORDER BY created_at ASC, id ASC`
+      )
+      .bind(params.userId, startBounds.startAt, endBounds.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT source_id, context_json, occurred_at
+         FROM agent_error_logs
+         WHERE user_id = ?
+           AND occurred_at >= ?
+           AND occurred_at < ?
+         ORDER BY occurred_at ASC`
+      )
+      .bind(params.userId, startBounds.startAt, endBounds.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT
+           camera_id,
+           sampled_at,
+           updated_at,
+           actual_fps,
+           expected_fps,
+           last_frame_age_ms,
+           queue_depth,
+           reconnect_count
+         FROM open_monitor_camera_latest
+         WHERE user_id = ?`
+      )
+      .bind(params.userId)
+      .all(),
+  ]);
+
+  const cameraRollups = new Map<string, ReportCameraRollupAccumulator>();
+  const jobRollups = new Map<string, ReportJobRollupAccumulator>();
+  const agentRollups = new Map<string, ReportAgentRollupAccumulator>();
+
+  for (const row of (existingCameraRollupsResult.results || []) as any[]) {
+    const dateKey = normalizeReportText((row as any).rollup_date, 10);
+    const cameraId = reportToCount((row as any).camera_id);
+    if (!dateKeySet.has(dateKey) || cameraId <= 0) continue;
+    cameraRollups.set(
+      reportCompositeKey(dateKey, cameraId),
+      createReportCameraRollupAccumulator(dateKey, cameraId, nowIso, row)
+    );
+  }
+
+  for (const row of (existingJobRollupsResult.results || []) as any[]) {
+    const dateKey = normalizeReportText((row as any).rollup_date, 10);
+    const jobId = reportToCount((row as any).job_id);
+    if (!dateKeySet.has(dateKey) || jobId <= 0) continue;
+    jobRollups.set(
+      reportCompositeKey(dateKey, jobId),
+      createReportJobRollupAccumulator(dateKey, jobId, nowIso, row)
+    );
+  }
+
+  for (const row of (existingAgentRollupsResult.results || []) as any[]) {
+    const dateKey = normalizeReportText((row as any).rollup_date, 10);
+    const scopeTypeRaw = normalizeReportText((row as any).agent_scope_type, 40);
+    const scopeType =
+      scopeTypeRaw === "camera_algorithm" || scopeTypeRaw === "job_step_agent"
+        ? (scopeTypeRaw as ReportAgentScopeType)
+        : null;
+    const agentId = reportToCount((row as any).agent_id);
+    if (!dateKeySet.has(dateKey) || !scopeType || agentId <= 0) continue;
+    const meta = agentMetaByScopedId.get(reportCompositeKey(scopeType, agentId));
+    if (!meta) continue;
+    agentRollups.set(
+      reportCompositeKey(dateKey, scopeType, agentId),
+      createReportAgentRollupAccumulator(dateKey, meta, nowIso, row)
+    );
+  }
+
+  const ensureCameraRollup = (dateKey: string, cameraId: number): ReportCameraRollupAccumulator => {
+    const key = reportCompositeKey(dateKey, cameraId);
+    const existing = cameraRollups.get(key);
+    if (existing) return existing;
+    const created = createReportCameraRollupAccumulator(dateKey, cameraId, nowIso);
+    cameraRollups.set(key, created);
+    return created;
+  };
+
+  const ensureJobRollup = (dateKey: string, jobId: number): ReportJobRollupAccumulator => {
+    const key = reportCompositeKey(dateKey, jobId);
+    const existing = jobRollups.get(key);
+    if (existing) return existing;
+    const created = createReportJobRollupAccumulator(dateKey, jobId, nowIso);
+    jobRollups.set(key, created);
+    return created;
+  };
+
+  const ensureAgentRollup = (
+    dateKey: string,
+    meta: ReportAgentRollupMeta
+  ): ReportAgentRollupAccumulator => {
+    const key = reportCompositeKey(dateKey, meta.agent_scope_type, meta.agent_id);
+    const existing = agentRollups.get(key);
+    if (existing) return existing;
+    const created = createReportAgentRollupAccumulator(dateKey, meta, nowIso);
+    agentRollups.set(key, created);
+    return created;
+  };
+
+  for (const row of (cameraIdsResult.results || []) as any[]) {
+    const cameraId = reportToCount((row as any).id);
+    if (cameraId > 0) {
+      ensureCameraRollup(currentDateKey, cameraId);
+    }
+  }
+
+  for (const row of (jobIdsResult.results || []) as any[]) {
+    const jobId = reportToCount((row as any).id);
+    if (jobId > 0) {
+      ensureJobRollup(currentDateKey, jobId);
+    }
+  }
+
+  for (const meta of [...cameraAgentMetas, ...stepAgentMetas]) {
+    ensureAgentRollup(currentDateKey, meta);
+  }
+
+  for (const row of (commandsResult.results || []) as any[]) {
+    const dateKey = reportDateKeyFromIso((row as any).created_at);
+    if (!dateKeySet.has(dateKey)) continue;
+    const cameraId = reportToCount((row as any).camera_id);
+    if (cameraId <= 0) continue;
+    const commandType = normalizeReportText((row as any).command_type, 80).toLowerCase();
+    const cameraRollup = ensureCameraRollup(dateKey, cameraId);
+    if (commandType === "start_camera") cameraRollup.start_count += 1;
+    if (commandType === "stop_camera") cameraRollup.stop_count += 1;
+  }
+
+  for (const row of (detectionsResult.results || []) as any[]) {
+    const dateKey = reportDateKeyFromIso((row as any).detected_at);
+    if (!dateKeySet.has(dateKey)) continue;
+    const cameraId = reportToCount((row as any).camera_id);
+    if (cameraId > 0) {
+      ensureCameraRollup(dateKey, cameraId).detection_count += 1;
+      const matchedAgent = matchReportCameraAgentMeta(
+        cameraAgentsByCameraId,
+        cameraId,
+        (row as any).algo_type
+      );
+      if (matchedAgent) {
+        ensureAgentRollup(dateKey, matchedAgent).detection_count += 1;
+      }
+    }
+  }
+
+  const cameraOutageEvents = new Map<string, Array<{ event_type: string; at_ms: number }>>();
+  const jobRuntimeEvents = new Map<string, Array<{ event_type: string; at_ms: number }>>();
+
+  for (const row of (eventsResult.results || []) as any[]) {
+    const createdAt = typeof (row as any).created_at === "string" ? (row as any).created_at : "";
+    const dateKey = reportDateKeyFromIso(createdAt);
+    if (!dateKeySet.has(dateKey)) continue;
+    const details = parseJsonObject((row as any).details_json);
+    const eventType = normalizeReportText((row as any).event_type, 80).toLowerCase();
+    const createdAtMs = Date.parse(createdAt);
+    const cameraId = reportToCount((row as any).camera_id) || reportExtractCameraId(details);
+    const jobId = reportExtractJobId(details) || null;
+    const stepId = reportExtractStepId(details) || null;
+
+    if (cameraId > 0) {
+      const cameraRollup = ensureCameraRollup(dateKey, cameraId);
+      if (eventType === "camera_connection_failed") {
+        cameraRollup.connection_failures += 1;
+      }
+      if (eventType === "job_alert_triggered" || eventType === "ai_detection") {
+        cameraRollup.alert_count += 1;
+      }
+      if (
+        Number.isFinite(createdAtMs) &&
+        (eventType === "camera_connection_failed" ||
+          eventType === "camera_started" ||
+          eventType === "camera_online")
+      ) {
+        pushReportMapArray(cameraOutageEvents, reportCompositeKey(dateKey, cameraId), {
+          event_type: eventType,
+          at_ms: createdAtMs,
+        });
+      }
+    }
+
+    if (jobId && jobId > 0) {
+      const jobRollup = ensureJobRollup(dateKey, jobId);
+      if (eventType === "job_started") jobRollup.run_count += 1;
+      if (eventType === "job_completed") jobRollup.completed_run_count += 1;
+      if (eventType === "job_stopped") jobRollup.stopped_run_count += 1;
+      if (eventType === "job_start_blocked") jobRollup.blocked_run_count += 1;
+      if (eventType === "job_step_started") jobRollup.step_started_count += 1;
+      if (eventType === "job_step_completed") jobRollup.step_completed_count += 1;
+      if (eventType === "job_step_skipped") jobRollup.step_skipped_count += 1;
+      if (eventType === "job_alert_triggered") jobRollup.alert_count += 1;
+      if (eventType === "job_failed" || eventType === "job_staled") jobRollup.error_count += 1;
+
+      if (
+        Number.isFinite(createdAtMs) &&
+        (eventType === "job_started" ||
+          eventType === "job_stopped" ||
+          eventType === "job_failed" ||
+          eventType === "job_completed" ||
+          eventType === "job_staled")
+      ) {
+        pushReportMapArray(jobRuntimeEvents, reportCompositeKey(dateKey, jobId), {
+          event_type: eventType,
+          at_ms: createdAtMs,
+        });
+      }
+    }
+
+    if (eventType === "job_step_started" && stepId && stepId > 0) {
+      const matches = matchReportStepAgentsForRun(stepAgentsByStepId, stepId, cameraId || null, jobId);
+      for (const match of matches) {
+        ensureAgentRollup(dateKey, match).run_count += 1;
+      }
+    }
+
+    if (eventType === "job_alert_triggered") {
+      const matchedStepAgent =
+        stepId && stepId > 0
+          ? matchReportStepAgentMetaForAlert(
+              stepAgentsByStepId,
+              stepId,
+              cameraId || null,
+              jobId,
+              reportExtractAlertSignalKey(details)
+            )
+          : null;
+      if (matchedStepAgent) {
+        ensureAgentRollup(dateKey, matchedStepAgent).alert_count += 1;
+      } else if (cameraId > 0) {
+        const matchedCameraAgent = matchReportCameraAgentMeta(
+          cameraAgentsByCameraId,
+          cameraId,
+          reportExtractAlertSignalKey(details)
+        );
+        if (matchedCameraAgent) {
+          ensureAgentRollup(dateKey, matchedCameraAgent).alert_count += 1;
+        }
+      }
+    }
+
+    if (eventType === "ai_detection" && cameraId > 0) {
+      const matchedCameraAgent = matchReportCameraAgentMeta(
+        cameraAgentsByCameraId,
+        cameraId,
+        reportExtractAlertSignalKey(details)
+      );
+      if (matchedCameraAgent) {
+        ensureAgentRollup(dateKey, matchedCameraAgent).alert_count += 1;
+      }
+    }
+  }
+
+  for (const row of (errorLogsResult.results || []) as any[]) {
+    const dateKey = reportDateKeyFromIso((row as any).occurred_at);
+    if (!dateKeySet.has(dateKey)) continue;
+    const context = parseJsonObject((row as any).context_json);
+    const matchedAgent = resolveReportAgentMetaFromError({
+      sourceId: (row as any).source_id,
+      context,
+      cameraAgentById,
+      stepAgentById,
+      cameraAgentsByCameraId,
+      stepAgentsByStepId,
+    });
+    const jobId = reportExtractJobId(context) || matchedAgent?.job_id || null;
+    if (jobId && jobId > 0) {
+      ensureJobRollup(dateKey, jobId).error_count += 1;
+    }
+    if (matchedAgent) {
+      ensureAgentRollup(dateKey, matchedAgent).error_count += 1;
+    }
+  }
+
+  for (const row of (latestCameraResult.results || []) as any[]) {
+    const sampleIso =
+      typeof (row as any).sampled_at === "string" && String((row as any).sampled_at).trim()
+        ? String((row as any).sampled_at)
+        : typeof (row as any).updated_at === "string"
+        ? String((row as any).updated_at)
+        : "";
+    const dateKey = reportDateKeyFromIso(sampleIso);
+    if (!dateKeySet.has(dateKey)) continue;
+    const cameraId = reportToCount((row as any).camera_id);
+    if (cameraId <= 0) continue;
+
+    const cameraRollup = ensureCameraRollup(dateKey, cameraId);
+    if (cameraRollup.samples_count > 0) continue;
+
+    cameraRollup.samples_count = 1;
+    cameraRollup.avg_actual_fps = reportToFiniteNumber((row as any).actual_fps);
+    cameraRollup.avg_expected_fps = reportToFiniteNumber((row as any).expected_fps);
+    cameraRollup.avg_last_frame_age_ms = reportToFiniteNumber((row as any).last_frame_age_ms);
+    cameraRollup.max_last_frame_age_ms = reportToFiniteNumber((row as any).last_frame_age_ms);
+    cameraRollup.avg_queue_depth = reportToFiniteNumber((row as any).queue_depth);
+    cameraRollup.max_queue_depth = reportToFiniteNumber((row as any).queue_depth);
+    cameraRollup.payload_json = {
+      ...cameraRollup.payload_json,
+      bootstrap_sample: true,
+      last_sampled_at: sampleIso || null,
+      last_reconnect_total: reportToCount((row as any).reconnect_count),
+    };
+  }
+
+  for (const [key, entries] of cameraOutageEvents.entries()) {
+    const [dateKey, cameraIdRaw] = key.split("|");
+    const bounds = dayBoundsByKey.get(dateKey);
+    const cameraId = reportToCount(cameraIdRaw);
+    if (!bounds || cameraId <= 0) continue;
+
+    const effectiveDayEndMs = Math.min(bounds.endMs, nowMs);
+    let outageStartedAtMs: number | null = null;
+    let totalOutageMs = 0;
+
+    for (const entry of entries) {
+      const atMs = Math.min(Math.max(entry.at_ms, bounds.startMs), effectiveDayEndMs);
+      if (entry.event_type === "camera_connection_failed") {
+        if (outageStartedAtMs === null) {
+          outageStartedAtMs = atMs;
+        }
+        continue;
+      }
+
+      if (
+        (entry.event_type === "camera_started" || entry.event_type === "camera_online") &&
+        outageStartedAtMs !== null
+      ) {
+        if (atMs > outageStartedAtMs) {
+          totalOutageMs += atMs - outageStartedAtMs;
+        }
+        outageStartedAtMs = null;
+      }
+    }
+
+    if (outageStartedAtMs !== null && effectiveDayEndMs > outageStartedAtMs) {
+      totalOutageMs += effectiveDayEndMs - outageStartedAtMs;
+    }
+
+    ensureCameraRollup(dateKey, cameraId).outage_minutes_estimate = reportRoundNumber(
+      totalOutageMs / 60_000,
+      2
+    );
+  }
+
+  for (const [key, entries] of jobRuntimeEvents.entries()) {
+    const [dateKey, jobIdRaw] = key.split("|");
+    const bounds = dayBoundsByKey.get(dateKey);
+    const jobId = reportToCount(jobIdRaw);
+    if (!bounds || jobId <= 0) continue;
+
+    const effectiveDayEndMs = Math.min(bounds.endMs, nowMs);
+    let activeStartedAtMs: number | null = null;
+    let totalRuntimeMs = 0;
+
+    for (const entry of entries) {
+      const atMs = Math.min(Math.max(entry.at_ms, bounds.startMs), effectiveDayEndMs);
+      if (entry.event_type === "job_started") {
+        if (activeStartedAtMs !== null && atMs > activeStartedAtMs) {
+          totalRuntimeMs += atMs - activeStartedAtMs;
+        }
+        activeStartedAtMs = atMs;
+        continue;
+      }
+
+      if (activeStartedAtMs !== null && atMs > activeStartedAtMs) {
+        totalRuntimeMs += atMs - activeStartedAtMs;
+      }
+      activeStartedAtMs = null;
+    }
+
+    if (activeStartedAtMs !== null && effectiveDayEndMs > activeStartedAtMs) {
+      totalRuntimeMs += effectiveDayEndMs - activeStartedAtMs;
+    }
+
+    const jobRollup = ensureJobRollup(dateKey, jobId);
+    jobRollup.total_runtime_seconds = reportRoundNumber(totalRuntimeMs / 1000, 2);
+    jobRollup.avg_runtime_seconds =
+      jobRollup.run_count > 0
+        ? reportRoundNumber(jobRollup.total_runtime_seconds / jobRollup.run_count, 2)
+        : 0;
+  }
+
+  const cameraUpsert = params.db.prepare(
+    `INSERT INTO camera_daily_rollups (
+       user_id,
+       rollup_date,
+       camera_id,
+       samples_count,
+       start_count,
+       stop_count,
+       connection_failures,
+       reconnect_count,
+       avg_actual_fps,
+       avg_expected_fps,
+       avg_last_frame_age_ms,
+       max_last_frame_age_ms,
+       avg_queue_depth,
+       max_queue_depth,
+       detection_count,
+       alert_count,
+       outage_minutes_estimate,
+       payload_json,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, rollup_date, camera_id) DO UPDATE SET
+       samples_count = excluded.samples_count,
+       start_count = excluded.start_count,
+       stop_count = excluded.stop_count,
+       connection_failures = excluded.connection_failures,
+       reconnect_count = excluded.reconnect_count,
+       avg_actual_fps = excluded.avg_actual_fps,
+       avg_expected_fps = excluded.avg_expected_fps,
+       avg_last_frame_age_ms = excluded.avg_last_frame_age_ms,
+       max_last_frame_age_ms = excluded.max_last_frame_age_ms,
+       avg_queue_depth = excluded.avg_queue_depth,
+       max_queue_depth = excluded.max_queue_depth,
+       detection_count = excluded.detection_count,
+       alert_count = excluded.alert_count,
+       outage_minutes_estimate = excluded.outage_minutes_estimate,
+       payload_json = excluded.payload_json,
+       updated_at = excluded.updated_at`
+  );
+
+  for (const rollup of cameraRollups.values()) {
+    const payload = {
+      ...rollup.payload_json,
+      writer_version: 2,
+      source: "phase2_backfill",
+      last_backfilled_at: nowIso,
+    };
+    await cameraUpsert
+      .bind(
+        params.userId,
+        rollup.rollup_date,
+        rollup.camera_id,
+        rollup.samples_count,
+        rollup.start_count,
+        rollup.stop_count,
+        rollup.connection_failures,
+        rollup.reconnect_count,
+        rollup.avg_actual_fps,
+        rollup.avg_expected_fps,
+        rollup.avg_last_frame_age_ms,
+        rollup.max_last_frame_age_ms,
+        rollup.avg_queue_depth,
+        rollup.max_queue_depth,
+        rollup.detection_count,
+        rollup.alert_count,
+        rollup.outage_minutes_estimate,
+        reportJsonStringify(payload, "{}"),
+        rollup.created_at,
+        nowIso
+      )
+      .run();
+  }
+
+  const jobUpsert = params.db.prepare(
+    `INSERT INTO job_daily_rollups (
+       user_id,
+       rollup_date,
+       job_id,
+       run_count,
+       completed_run_count,
+       stopped_run_count,
+       blocked_run_count,
+       step_started_count,
+       step_completed_count,
+       step_skipped_count,
+       alert_count,
+       error_count,
+       total_runtime_seconds,
+       avg_runtime_seconds,
+       payload_json,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, rollup_date, job_id) DO UPDATE SET
+       run_count = excluded.run_count,
+       completed_run_count = excluded.completed_run_count,
+       stopped_run_count = excluded.stopped_run_count,
+       blocked_run_count = excluded.blocked_run_count,
+       step_started_count = excluded.step_started_count,
+       step_completed_count = excluded.step_completed_count,
+       step_skipped_count = excluded.step_skipped_count,
+       alert_count = excluded.alert_count,
+       error_count = excluded.error_count,
+       total_runtime_seconds = excluded.total_runtime_seconds,
+       avg_runtime_seconds = excluded.avg_runtime_seconds,
+       payload_json = excluded.payload_json,
+       updated_at = excluded.updated_at`
+  );
+
+  for (const rollup of jobRollups.values()) {
+    const payload = {
+      ...rollup.payload_json,
+      writer_version: 2,
+      source: "phase2_backfill",
+      last_backfilled_at: nowIso,
+    };
+    await jobUpsert
+      .bind(
+        params.userId,
+        rollup.rollup_date,
+        rollup.job_id,
+        rollup.run_count,
+        rollup.completed_run_count,
+        rollup.stopped_run_count,
+        rollup.blocked_run_count,
+        rollup.step_started_count,
+        rollup.step_completed_count,
+        rollup.step_skipped_count,
+        rollup.alert_count,
+        rollup.error_count,
+        rollup.total_runtime_seconds,
+        rollup.avg_runtime_seconds,
+        reportJsonStringify(payload, "{}"),
+        rollup.created_at,
+        nowIso
+      )
+      .run();
+  }
+
+  const agentUpsert = params.db.prepare(
+    `INSERT INTO agent_daily_rollups (
+       user_id,
+       rollup_date,
+       agent_scope_type,
+       agent_id,
+       camera_id,
+       job_id,
+       step_id,
+       run_count,
+       detection_count,
+       alert_count,
+       error_count,
+       avg_runtime_seconds,
+       payload_json,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, rollup_date, agent_scope_type, agent_id) DO UPDATE SET
+       camera_id = excluded.camera_id,
+       job_id = excluded.job_id,
+       step_id = excluded.step_id,
+       run_count = excluded.run_count,
+       detection_count = excluded.detection_count,
+       alert_count = excluded.alert_count,
+       error_count = excluded.error_count,
+       avg_runtime_seconds = excluded.avg_runtime_seconds,
+       payload_json = excluded.payload_json,
+       updated_at = excluded.updated_at`
+  );
+
+  for (const rollup of agentRollups.values()) {
+    const meta = agentMetaByScopedId.get(
+      reportCompositeKey(rollup.agent_scope_type, rollup.agent_id)
+    );
+    const payload = {
+      ...rollup.payload_json,
+      writer_version: 2,
+      source: "phase2_backfill",
+      last_backfilled_at: nowIso,
+      agent_name: meta?.agent_name || null,
+      signal_keys: meta?.signal_keys || [],
+    };
+    await agentUpsert
+      .bind(
+        params.userId,
+        rollup.rollup_date,
+        rollup.agent_scope_type,
+        rollup.agent_id,
+        rollup.camera_id,
+        rollup.job_id,
+        rollup.step_id,
+        rollup.run_count,
+        rollup.detection_count,
+        rollup.alert_count,
+        rollup.error_count,
+        rollup.avg_runtime_seconds,
+        reportJsonStringify(payload, "{}"),
+        rollup.created_at,
+        nowIso
+      )
+      .run();
+  }
+}
+
+async function recordCameraDailyRollupSampleFromOpenMonitor(params: {
+  db: D1Database;
+  userId: string;
+  clientId: string;
+  exeId: string;
+  cameraId: number;
+  sampledAt: string;
+  actualFps: number | null;
+  expectedFps: number | null;
+  lastFrameAgeMs: number | null;
+  queueDepth: number | null;
+  reconnectTotal: number;
+}): Promise<void> {
+  if (!Number.isInteger(params.cameraId) || params.cameraId <= 0) return;
+  const rollupDate = reportDateKeyFromIso(params.sampledAt);
+  if (!rollupDate) return;
+
+  const nowIso = new Date().toISOString();
+  const existingRow = await params.db
+    .prepare(
+      `SELECT *
+       FROM camera_daily_rollups
+       WHERE user_id = ?
+         AND rollup_date = ?
+         AND camera_id = ?
+       LIMIT 1`
+    )
+    .bind(params.userId, rollupDate, params.cameraId)
+    .first();
+
+  const previousSamples = reportToCount((existingRow as any)?.samples_count);
+  const nextSamples = previousSamples + 1;
+  const previousPayload =
+    existingRow && typeof (existingRow as any).payload_json === "string"
+      ? parseJsonObject((existingRow as any).payload_json)
+      : {};
+  const previousReconnectTotal = reportToCount((previousPayload as any).last_reconnect_total);
+  const reconnectDelta =
+    previousSamples > 0 ? Math.max(0, params.reconnectTotal - previousReconnectTotal) : 0;
+  const nextReconnectCount = reportToCount((existingRow as any)?.reconnect_count) + reconnectDelta;
+  const createdAt =
+    typeof (existingRow as any)?.created_at === "string" && String((existingRow as any).created_at).trim()
+      ? String((existingRow as any).created_at)
+      : nowIso;
+
+  const payload = {
+    ...previousPayload,
+    writer_version: 2,
+    source: "open_monitor_incremental",
+    bootstrap_sample: false,
+    last_reconnect_total: params.reconnectTotal,
+    last_sampled_at: params.sampledAt,
+    last_open_monitor_client_id: params.clientId,
+    last_open_monitor_exe_id: params.exeId,
+    last_incremental_update_at: nowIso,
+  };
+
+  await params.db
+    .prepare(
+      `INSERT INTO camera_daily_rollups (
+         user_id,
+         rollup_date,
+         camera_id,
+         samples_count,
+         start_count,
+         stop_count,
+         connection_failures,
+         reconnect_count,
+         avg_actual_fps,
+         avg_expected_fps,
+         avg_last_frame_age_ms,
+         max_last_frame_age_ms,
+         avg_queue_depth,
+         max_queue_depth,
+         detection_count,
+         alert_count,
+         outage_minutes_estimate,
+         payload_json,
+         created_at,
+         updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, rollup_date, camera_id) DO UPDATE SET
+         samples_count = excluded.samples_count,
+         reconnect_count = excluded.reconnect_count,
+         avg_actual_fps = excluded.avg_actual_fps,
+         avg_expected_fps = excluded.avg_expected_fps,
+         avg_last_frame_age_ms = excluded.avg_last_frame_age_ms,
+         max_last_frame_age_ms = excluded.max_last_frame_age_ms,
+         avg_queue_depth = excluded.avg_queue_depth,
+         max_queue_depth = excluded.max_queue_depth,
+         payload_json = excluded.payload_json,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      params.userId,
+      rollupDate,
+      params.cameraId,
+      nextSamples,
+      reportToCount((existingRow as any)?.start_count),
+      reportToCount((existingRow as any)?.stop_count),
+      reportToCount((existingRow as any)?.connection_failures),
+      nextReconnectCount,
+      updateReportRunningAverage(
+        reportToFiniteNumber((existingRow as any)?.avg_actual_fps),
+        previousSamples,
+        params.actualFps
+      ),
+      updateReportRunningAverage(
+        reportToFiniteNumber((existingRow as any)?.avg_expected_fps),
+        previousSamples,
+        params.expectedFps
+      ),
+      updateReportRunningAverage(
+        reportToFiniteNumber((existingRow as any)?.avg_last_frame_age_ms),
+        previousSamples,
+        params.lastFrameAgeMs
+      ),
+      mergeReportRunningMax(
+        reportToFiniteNumber((existingRow as any)?.max_last_frame_age_ms),
+        params.lastFrameAgeMs
+      ),
+      updateReportRunningAverage(
+        reportToFiniteNumber((existingRow as any)?.avg_queue_depth),
+        previousSamples,
+        params.queueDepth
+      ),
+      mergeReportRunningMax(
+        reportToFiniteNumber((existingRow as any)?.max_queue_depth),
+        params.queueDepth
+      ),
+      reportToCount((existingRow as any)?.detection_count),
+      reportToCount((existingRow as any)?.alert_count),
+      reportRoundNumber(reportToFiniteNumber((existingRow as any)?.outage_minutes_estimate) || 0, 2),
+      reportJsonStringify(payload, "{}"),
+      createdAt,
+      nowIso
+    )
+    .run();
+}
+
+async function buildReportRollupStatus(
+  db: D1Database,
+  userId: string,
+  startDateKey: string,
+  endDateKey: string
+): Promise<ReportRollupStatus> {
+  const [cameraRow, jobRow, agentRow] = await Promise.all([
+    db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM camera_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(userId, startDateKey, endDateKey)
+      .first(),
+    db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM job_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(userId, startDateKey, endDateKey)
+      .first(),
+    db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM agent_daily_rollups
+         WHERE user_id = ?
+           AND rollup_date >= ?
+           AND rollup_date <= ?`
+      )
+      .bind(userId, startDateKey, endDateKey)
+      .first(),
+  ]);
+
+  const availability = (row: unknown): ReportRollupAvailability =>
+    Number((row as any)?.total || 0) > 0 ? "ready" : "empty";
+
+  return {
+    camera_daily_rollups: availability(cameraRow),
+    job_daily_rollups: availability(jobRow),
+    agent_daily_rollups: availability(agentRow),
+  };
+}
+
+function buildFallbackReportSectionsFromContext(
+  context: ReportBuildContext
+): ReportSectionPayload[] {
+  const sections: ReportSectionPayload[] = [];
+  const currentState = context.current_state as Record<string, unknown>;
+  const history = context.history as Record<string, unknown>;
+  const comparisons = context.comparisons as Record<string, unknown>;
+
+  sections.push({
+    heading: reportLanguageIsPt(context.reply_language) ? "Resumo executivo" : "Executive summary",
+    paragraphs: [context.summary_seed],
+    bullets: context.top_findings_seed.slice(0, 6),
+  });
+
+  sections.push({
+    heading: reportLanguageIsPt(context.reply_language) ? "Estado atual" : "Current state",
+    paragraphs: [
+      reportLanguageIsPt(context.reply_language)
+        ? `Cameras totais: ${String(currentState.cameras_total || 0)}. Cameras em execucao: ${String(currentState.cameras_running || 0)}. Jobs em execucao: ${String(currentState.jobs_running || 0)}.`
+        : `Total cameras: ${String(currentState.cameras_total || 0)}. Running cameras: ${String(currentState.cameras_running || 0)}. Running jobs: ${String(currentState.jobs_running || 0)}.`,
+    ],
+    bullets: [],
+  });
+
+  const cameraComparison = Array.isArray(comparisons.cameras)
+    ? (comparisons.cameras as Array<Record<string, unknown>>)
+    : [];
+  if (cameraComparison.length > 0) {
+    sections.push({
+      heading: reportLanguageIsPt(context.reply_language)
+        ? "Comparativo de cameras"
+        : "Camera comparison",
+      paragraphs: [],
+      bullets: cameraComparison.slice(0, 5).map((camera) => {
+        const name = normalizeReportText(camera.camera_name, 80) || `Camera ${camera.camera_id}`;
+        const score = String(camera.stability_score ?? "");
+        const reconnects = String(camera.reconnect_count ?? 0);
+        return reportLanguageIsPt(context.reply_language)
+          ? `${name}: estabilidade ${score}, reconnects ${reconnects}.`
+          : `${name}: stability ${score}, reconnects ${reconnects}.`;
+      }),
+    });
+  }
+
+  const recentEvents = Array.isArray(history.recent_events)
+    ? (history.recent_events as Array<Record<string, unknown>>)
+    : [];
+  if (recentEvents.length > 0) {
+    sections.push({
+      heading: reportLanguageIsPt(context.reply_language) ? "Eventos recentes" : "Recent events",
+      paragraphs: [],
+      bullets: recentEvents.slice(0, 6).map((event) => {
+        const eventType = normalizeReportText(event.event_type, 60);
+        const message = normalizeReportText(event.message, 140);
+        return `${eventType}: ${message}`;
+      }),
+    });
+  }
+
+  if (context.limitations.length > 0) {
+    sections.push({
+      heading: reportLanguageIsPt(context.reply_language) ? "Limitacoes" : "Limitations",
+      paragraphs: [],
+      bullets: context.limitations.slice(0, 6),
+    });
+  }
+
+  return sections;
+}
+
+function normalizeReportSectionsPayload(value: unknown): ReportSectionPayload[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+      const row = entry as Record<string, unknown>;
+      const heading = normalizeReportText(row.heading, 120);
+      const paragraphs = Array.isArray(row.paragraphs)
+        ? row.paragraphs
+            .map((item) => normalizeReportText(item, 600))
+            .filter((item) => item.length > 0)
+            .slice(0, 8)
+        : [];
+      const bullets = Array.isArray(row.bullets)
+        ? row.bullets
+            .map((item) => normalizeReportText(item, 240))
+            .filter((item) => item.length > 0)
+            .slice(0, 10)
+        : [];
+      if (!heading && paragraphs.length === 0 && bullets.length === 0) {
+        return null;
+      }
+      return {
+        heading,
+        paragraphs,
+        bullets,
+      } satisfies ReportSectionPayload;
+    })
+    .filter((entry): entry is ReportSectionPayload => entry !== null);
+}
+
+function normalizeReportStatsPayload(value: unknown): ReportStatPayload[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+      const row = entry as Record<string, unknown>;
+      const label = normalizeReportText(row.label, 80);
+      const statValue = normalizeReportText(row.value, 120);
+      if (!label || !statValue) {
+        return null;
+      }
+      return {
+        label,
+        value: statValue,
+      } satisfies ReportStatPayload;
+    })
+    .filter((entry): entry is ReportStatPayload => entry !== null);
+}
+
+function buildFallbackReportStatsFromContext(
+  context: ReportBuildContext
+): ReportStatPayload[] {
+  const isPt = reportLanguageIsPt(context.reply_language);
+  const stats = context.stats && typeof context.stats === "object"
+    ? (context.stats as Record<string, number | string>)
+    : {};
+
+  const definitions: Array<{ key: string; pt: string; en: string }> = [
+    { key: "cameras_total", pt: "Cameras totais", en: "Total cameras" },
+    { key: "cameras_running", pt: "Cameras em execucao", en: "Running cameras" },
+    { key: "jobs_total", pt: "Jobs totais", en: "Total jobs" },
+    { key: "jobs_running", pt: "Jobs em execucao", en: "Running jobs" },
+    { key: "enabled_camera_agents", pt: "Agentes de camera ativos", en: "Enabled camera agents" },
+    { key: "enabled_step_agents", pt: "Agentes de step ativos", en: "Enabled step agents" },
+    { key: "detections_in_window", pt: "Deteccoes no periodo", en: "Detections in window" },
+    { key: "alerts_in_window", pt: "Alertas no periodo", en: "Alerts in window" },
+    { key: "commands_in_window", pt: "Comandos no periodo", en: "Commands in window" },
+    { key: "agent_errors_in_window", pt: "Erros de agentes", en: "Agent errors" },
+    { key: "evidence_images", pt: "Imagens anexadas", en: "Attached images" },
+    { key: "evidence_videos", pt: "Videos anexados", en: "Attached videos" },
+    { key: "report_window_hours", pt: "Janela do relatorio (h)", en: "Report window (h)" },
+  ];
+
+  return definitions
+    .map((definition) => {
+      const rawValue = stats[definition.key];
+      if (
+        rawValue === undefined ||
+        rawValue === null ||
+        (typeof rawValue === "string" && !rawValue.trim())
+      ) {
+        return null;
+      }
+
+      return {
+        label: isPt ? definition.pt : definition.en,
+        value: typeof rawValue === "number" ? String(rawValue) : normalizeReportText(rawValue, 120),
+      } satisfies ReportStatPayload;
+    })
+    .filter((entry): entry is ReportStatPayload => Boolean(entry?.label) && Boolean(entry?.value));
+}
+
+function normalizeReportEvidenceCandidates(value: unknown): ReportEvidenceCandidate[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const normalized: ReportEvidenceCandidate[] = [];
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+
+    const row = entry as Record<string, unknown>;
+    const kind = row.kind === "video" ? "video" : row.kind === "image" ? "image" : null;
+    if (!kind) {
+      continue;
+    }
+
+    const storageKey = normalizeDetectionStorageKey(kind, row.storage_key);
+    if (!storageKey) {
+      continue;
+    }
+
+    const fallbackFilename =
+      storageKey.split("/").pop()?.trim() ||
+      `evidence-${kind}-${crypto.randomUUID()}.${kind === "video" ? "mp4" : "jpg"}`;
+    const filename = sanitizeStoragePathSegment(
+      normalizeReportText(row.filename, 140) || fallbackFilename,
+      fallbackFilename
+    );
+    const downloadPath =
+      typeof row.download_path === "string" && row.download_path.trim()
+        ? row.download_path.trim()
+        : buildMediaDownloadPathFromStorageKey(storageKey);
+
+    normalized.push({
+      kind,
+      storage_key: storageKey,
+      filename,
+      title:
+        normalizeReportText(row.title, 180) ||
+        (kind === "video" ? "Report evidence video" : "Report evidence image"),
+      caption: normalizeReportText(row.caption, 240) || undefined,
+      detected_at:
+        typeof row.detected_at === "string" && row.detected_at.trim()
+          ? row.detected_at.trim()
+          : null,
+      download_path: downloadPath,
+    });
+
+    if (normalized.length >= 12) {
+      break;
+    }
+  }
+
+  return normalized;
+}
+
+function reportJsonStringify(value: unknown, fallback: string): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return fallback;
+  }
+}
+
+async function collectReportEvidenceAssets(
+  bucket: R2Bucket,
+  candidates: readonly ReportEvidenceCandidate[],
+  origin: string
+): Promise<{
+  imageEvidence: ReportDocxImageEvidence[];
+  videoEvidence: ReportDocxVideoEvidence[];
+  zipBytes: Uint8Array | null;
+  zipFileCount: number;
+}> {
+  const JSZip = (await import("jszip")).default;
+  const zip = new JSZip();
+  const imageEvidence: ReportDocxImageEvidence[] = [];
+  const videoEvidence: ReportDocxVideoEvidence[] = [];
+  const manifest: Array<Record<string, unknown>> = [];
+  let zipFileCount = 0;
+
+  for (const candidate of candidates.slice(0, 10)) {
+    const object = await bucket.get(candidate.storage_key);
+    if (!object) {
+      continue;
+    }
+
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    if (bytes.length === 0) {
+      continue;
+    }
+
+    const contentType =
+      typeof (object as any)?.httpMetadata?.contentType === "string"
+        ? String((object as any).httpMetadata.contentType)
+        : candidate.kind === "video"
+        ? "video/mp4"
+        : candidate.filename.toLowerCase().endsWith(".png")
+        ? "image/png"
+        : "image/jpeg";
+
+    const folder = candidate.kind === "video" ? "videos" : "images";
+    zip.file(`${folder}/${candidate.filename}`, bytes);
+    zipFileCount += 1;
+
+    const downloadUrl = buildAbsoluteDownloadUrl(origin, candidate.download_path);
+    manifest.push({
+      kind: candidate.kind,
+      filename: candidate.filename,
+      title: candidate.title,
+      caption: candidate.caption || null,
+      detected_at: candidate.detected_at || null,
+      download_url: downloadUrl,
+    });
+
+    if (
+      candidate.kind === "image" &&
+      imageEvidence.length < 4 &&
+      (contentType === "image/jpeg" ||
+        contentType === "image/jpg" ||
+        contentType === "image/png" ||
+        contentType === "image/gif")
+    ) {
+      imageEvidence.push({
+        filename: candidate.filename,
+        title: candidate.title,
+        caption: candidate.caption,
+        bytes,
+        contentType,
+      });
+      continue;
+    }
+
+    if (candidate.kind === "video" && videoEvidence.length < 6) {
+      videoEvidence.push({
+        title: candidate.title,
+        caption: candidate.caption,
+        downloadUrl,
+        filename: candidate.filename,
+      });
+    }
+  }
+
+  if (manifest.length === 0) {
+    return {
+      imageEvidence,
+      videoEvidence,
+      zipBytes: null,
+      zipFileCount: 0,
+    };
+  }
+
+  zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+
+  return {
+    imageEvidence,
+    videoEvidence,
+    zipBytes: await zip.generateAsync({
+      type: "uint8array",
+      compression: "DEFLATE",
+    }),
+    zipFileCount,
+  };
+}
+
+async function buildReportContext(params: {
+  db: D1Database;
+  userId: string;
+  clientId: string;
+  exeId: string;
+  chatSessionId: number;
+  beforeMessageId: number;
+  query: string;
+  replyLanguage: string;
+}): Promise<ReportBuildContext> {
+  const requestedQuery = normalizeReportText(params.query, 1800);
+  const replyLanguage = normalizeSupportedChatLanguage(params.replyLanguage, "en");
+  const kindInfo = inferReportKindFromQuery(requestedQuery);
+  const timeWindow = inferReportTimeWindow(requestedQuery, replyLanguage);
+  const reportId = crypto.randomUUID();
+  const generatedAt = new Date().toISOString();
+  const isPt = reportLanguageIsPt(replyLanguage);
+
+  const [cameraAgentsResult, stepAgentsResult] = await Promise.all([
+    params.db
+      .prepare(
+        `SELECT
+           ca.id,
+           ca.camera_id,
+           c.name AS camera_name,
+           ca.algorithm_type,
+           ca.config_json,
+           ca.is_enabled,
+           ca.inference_model,
+           ca.model_fps,
+           ca.run_every,
+           ca.updated_at
+         FROM camera_algorithms ca
+         JOIN cameras c ON c.id = ca.camera_id
+         WHERE c.user_id = ?
+           AND ca.algorithm_type LIKE 'custom_%'
+         ORDER BY ca.updated_at DESC, ca.id DESC
+         LIMIT 60`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT
+           jsa.id,
+           jsa.step_id,
+           jsa.camera_id,
+           js.name AS step_name,
+           j.id AS job_id,
+           j.name AS job_name,
+           jsa.agent_key,
+           jsa.inference_model,
+           jsa.model_fps,
+           jsa.is_active,
+           jsa.updated_at
+         FROM job_step_agents jsa
+         JOIN job_steps js ON js.id = jsa.step_id
+         JOIN jobs j ON j.id = js.job_id
+         WHERE j.user_id = ?
+         ORDER BY jsa.updated_at DESC, jsa.id DESC
+         LIMIT 60`
+      )
+      .bind(params.userId)
+      .all(),
+  ]);
+
+  const cameraAgentRows = (cameraAgentsResult.results || []) as any[];
+  const stepAgentRows = (stepAgentsResult.results || []) as any[];
+
+  await populateReportDailyRollups({
+    db: params.db,
+    userId: params.userId,
+    startDateKey: timeWindow.startDateKey,
+    endDateKey: timeWindow.endDateKey,
+    cameraAgentRows,
+    stepAgentRows,
+  });
+
+  const rollupStatus = await buildReportRollupStatus(
+    params.db,
+    params.userId,
+    timeWindow.startDateKey,
+    timeWindow.endDateKey
+  );
+
+  const [
+    chatDiscussion,
+    cameraRowsResult,
+    recentEventsResult,
+    recentCommandsResult,
+    recentDetectionsResult,
+    recentAlertRowsResult,
+    errorLogsResult,
+    jobsResult,
+    stepLatestResult,
+    hostLatestRow,
+    processLatestRow,
+    detectionCountRow,
+    alertCountRow,
+    commandCountRow,
+    errorCountRow,
+  ] = await Promise.all([
+    loadChatContextSnapshotForReport(
+      params.db,
+      params.userId,
+      params.chatSessionId,
+      params.beforeMessageId
+    ),
+    params.db
+      .prepare(
+        `SELECT
+           c.id,
+           c.name,
+           c.connection_method,
+           c.ip_address,
+           c.is_service_running,
+           c.updated_at,
+           oml.actual_fps,
+           oml.expected_fps,
+           oml.last_frame_age_ms,
+           oml.queue_depth,
+           oml.reconnect_count,
+           oml.consumer_count,
+           oml.updated_at AS metrics_updated_at
+         FROM cameras c
+         LEFT JOIN open_monitor_camera_latest oml
+           ON oml.user_id = c.user_id
+          AND oml.camera_id = c.id
+         WHERE c.user_id = ?
+         ORDER BY c.name ASC, c.id ASC`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id, camera_id, event_type, message, details_json, created_at
+         FROM events
+         WHERE user_id = ?
+           AND created_at >= ?
+           AND created_at <= ?
+         ORDER BY created_at DESC
+         LIMIT 80`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id, command_type, status, created_at, camera_id, payload
+         FROM commands
+         WHERE user_id = ?
+           AND created_at >= ?
+           AND created_at <= ?
+         ORDER BY created_at DESC
+         LIMIT 60`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT id, camera_id, camera_name, algo_type, detected_at, media_type, image_key, video_key, event_id
+         FROM detections
+         WHERE user_id = ?
+           AND detected_at >= ?
+           AND detected_at <= ?
+         ORDER BY detected_at DESC
+         LIMIT 24`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT
+           e.id,
+           e.camera_id,
+           e.event_type,
+           e.message,
+           e.details_json,
+           e.created_at,
+           c.name AS camera_name
+         FROM events e
+         LEFT JOIN cameras c ON c.id = e.camera_id
+         WHERE e.user_id = ?
+           AND e.created_at >= ?
+           AND e.created_at <= ?
+           AND e.event_type IN ('job_alert_triggered', 'ai_detection')
+         ORDER BY e.created_at DESC
+         LIMIT 24`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT source_id, level, message, flow, function_name, operation, context_json, occurred_at
+         FROM agent_error_logs
+         WHERE user_id = ?
+           AND occurred_at >= ?
+           AND occurred_at <= ?
+         ORDER BY occurred_at DESC
+         LIMIT 40`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT
+           j.id,
+           j.name,
+           j.is_active,
+           (
+             SELECT jrs.status
+             FROM job_runtime_states jrs
+             WHERE jrs.user_id = j.user_id
+               AND jrs.job_id = j.id
+             ORDER BY COALESCE(jrs.updated_at, jrs.last_event_at_utc, jrs.created_at) DESC
+             LIMIT 1
+           ) AS runtime_status,
+           (
+             SELECT jrs.started_at_utc
+             FROM job_runtime_states jrs
+             WHERE jrs.user_id = j.user_id
+               AND jrs.job_id = j.id
+             ORDER BY COALESCE(jrs.updated_at, jrs.last_event_at_utc, jrs.created_at) DESC
+             LIMIT 1
+           ) AS runtime_started_at
+         FROM jobs j
+         WHERE j.user_id = ?
+         ORDER BY j.name ASC, j.id ASC`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT
+           oml.job_id,
+           oml.step_id,
+           oml.status,
+           oml.queue_depth,
+           oml.retry_count,
+           oml.timeout_count,
+           oml.error_count,
+           oml.updated_at,
+           js.name AS step_name,
+           j.name AS job_name
+         FROM open_monitor_job_step_latest oml
+         LEFT JOIN job_steps js ON js.id = oml.step_id
+         LEFT JOIN jobs j ON j.id = oml.job_id
+         WHERE oml.user_id = ?
+         ORDER BY oml.updated_at DESC, oml.error_count DESC
+         LIMIT 24`
+      )
+      .bind(params.userId)
+      .all(),
+    params.db
+      .prepare(
+        `SELECT *
+         FROM open_monitor_host_latest
+         WHERE user_id = ?
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      )
+      .bind(params.userId)
+      .first(),
+    params.db
+      .prepare(
+        `SELECT *
+         FROM open_monitor_process_latest
+         WHERE user_id = ?
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      )
+      .bind(params.userId)
+      .first(),
+    params.db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM detections
+         WHERE user_id = ?
+           AND detected_at >= ?
+           AND detected_at <= ?`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .first(),
+    params.db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM events
+         WHERE user_id = ?
+           AND created_at >= ?
+           AND created_at <= ?
+           AND event_type IN ('job_alert_triggered', 'ai_detection')`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .first(),
+    params.db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM commands
+         WHERE user_id = ?
+           AND created_at >= ?
+           AND created_at <= ?`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .first(),
+    params.db
+      .prepare(
+        `SELECT COUNT(*) AS total
+         FROM agent_error_logs
+         WHERE user_id = ?
+           AND occurred_at >= ?
+           AND occurred_at <= ?`
+      )
+      .bind(params.userId, timeWindow.startAt, timeWindow.endAt)
+      .first(),
+  ]);
+
+  const cameraRows = (cameraRowsResult.results || []) as any[];
+  const recentEventsRows = (recentEventsResult.results || []) as any[];
+  const recentCommandsRows = (recentCommandsResult.results || []) as any[];
+  const recentDetectionsRows = (recentDetectionsResult.results || []) as any[];
+  const recentAlertRows = (recentAlertRowsResult.results || []) as any[];
+  const errorLogRows = (errorLogsResult.results || []) as any[];
+  const jobsRows = (jobsResult.results || []) as any[];
+  const stepLatestRows = (stepLatestResult.results || []) as any[];
+
+  const cameraStatsById = new Map<
+    number,
+    {
+      start_count: number;
+      stop_count: number;
+      detection_count: number;
+      alert_count: number;
+      connection_failures: number;
+      last_failure_at: string | null;
+      last_online_at: string | null;
+      last_detected_at: string | null;
+    }
+  >();
+  const jobStatsById = new Map<
+    number,
+    {
+      started_count: number;
+      stopped_count: number;
+      blocked_count: number;
+      alert_count: number;
+      step_completed_count: number;
+      step_skipped_count: number;
+      last_event_at: string | null;
+    }
+  >();
+  const agentSignalCounts = new Map<string, { detections: number; alerts: number }>();
+  const errorCountBySourceId = new Map<string, number>();
+  const toCount = (value: unknown): number => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.max(0, Math.trunc(numeric)) : 0;
+  };
+
+  const ensureCameraStats = (cameraId: number) => {
+    const existing = cameraStatsById.get(cameraId);
+    if (existing) return existing;
+    const created = {
+      start_count: 0,
+      stop_count: 0,
+      detection_count: 0,
+      alert_count: 0,
+      connection_failures: 0,
+      last_failure_at: null as string | null,
+      last_online_at: null as string | null,
+      last_detected_at: null as string | null,
+    };
+    cameraStatsById.set(cameraId, created);
+    return created;
+  };
+
+  const ensureJobStats = (jobId: number) => {
+    const existing = jobStatsById.get(jobId);
+    if (existing) return existing;
+    const created = {
+      started_count: 0,
+      stopped_count: 0,
+      blocked_count: 0,
+      alert_count: 0,
+      step_completed_count: 0,
+      step_skipped_count: 0,
+      last_event_at: null as string | null,
+    };
+    jobStatsById.set(jobId, created);
+    return created;
+  };
+
+  const rememberSignal = (signalKeyInput: unknown, kind: "detections" | "alerts") => {
+    const signalKey = normalizeReportText(signalKeyInput, 120).toLowerCase();
+    if (!signalKey) return;
+    const current = agentSignalCounts.get(signalKey) || { detections: 0, alerts: 0 };
+    current[kind] += 1;
+    agentSignalCounts.set(signalKey, current);
+  };
+
+  for (const row of recentCommandsRows) {
+    const cameraId = Number((row as any).camera_id || 0);
+    if (cameraId <= 0) continue;
+    const stats = ensureCameraStats(cameraId);
+    const commandType = normalizeReportText((row as any).command_type, 80).toLowerCase();
+    if (commandType === "start_camera") stats.start_count += 1;
+    if (commandType === "stop_camera") stats.stop_count += 1;
+  }
+
+  for (const row of recentDetectionsRows) {
+    const cameraId = Number((row as any).camera_id || 0);
+    if (cameraId > 0) {
+      const stats = ensureCameraStats(cameraId);
+      stats.detection_count += 1;
+      stats.last_detected_at =
+        typeof (row as any).detected_at === "string" ? (row as any).detected_at : stats.last_detected_at;
+    }
+    rememberSignal((row as any).algo_type, "detections");
+  }
+
+  for (const row of recentAlertRows) {
+    const cameraId = Number((row as any).camera_id || 0);
+    if (cameraId > 0) {
+      const stats = ensureCameraStats(cameraId);
+      stats.alert_count += 1;
+    }
+    const details = parseJsonObject((row as any).details_json);
+    rememberSignal(
+      (details as any).algo_type ??
+        (details as any).algoType ??
+        (details as any).agent_key ??
+        (details as any).agentKey,
+      "alerts"
+    );
+    const jobId = Number((details as any).job_id || 0);
+    if (jobId > 0) {
+      const stats = ensureJobStats(jobId);
+      stats.alert_count += 1;
+      stats.last_event_at =
+        typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_event_at;
+    }
+  }
+
+  for (const row of recentEventsRows) {
+    const cameraId = Number((row as any).camera_id || 0);
+    const eventType = normalizeReportText((row as any).event_type, 80).toLowerCase();
+    if (cameraId > 0) {
+      const stats = ensureCameraStats(cameraId);
+      if (eventType === "camera_connection_failed") {
+        stats.connection_failures += 1;
+        stats.last_failure_at =
+          typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_failure_at;
+      }
+      if (eventType === "camera_started" || eventType === "camera_online") {
+        stats.last_online_at =
+          typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_online_at;
+      }
+    }
+
+    const details = parseJsonObject((row as any).details_json);
+    const jobId = Number((details as any).job_id || 0);
+    if (jobId > 0) {
+      const stats = ensureJobStats(jobId);
+      if (eventType === "job_started") stats.started_count += 1;
+      if (eventType === "job_stopped") stats.stopped_count += 1;
+      if (eventType === "job_start_blocked") stats.blocked_count += 1;
+      if (eventType === "job_step_completed") stats.step_completed_count += 1;
+      if (eventType === "job_step_skipped") stats.step_skipped_count += 1;
+      stats.last_event_at =
+        typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_event_at;
+    }
+  }
+
+  for (const row of errorLogRows) {
+    const sourceId = normalizeReportText((row as any).source_id, 120);
+    if (!sourceId) continue;
+    errorCountBySourceId.set(sourceId, (errorCountBySourceId.get(sourceId) || 0) + 1);
+  }
+
+  const cameraNameById = new Map<number, string>();
+  for (const row of cameraRows) {
+    const cameraId = Number((row as any).id || 0);
+    const cameraName = normalizeReportText((row as any).name, 120);
+    if (cameraId > 0 && cameraName) {
+      cameraNameById.set(cameraId, cameraName);
+    }
+  }
+
+  let cameraRollupAggregates = new Map<number, ReportCameraRollupAggregate>();
+  let jobRollupAggregates = new Map<number, ReportJobRollupAggregate>();
+  let agentRollupAggregates = new Map<string, ReportAgentRollupAggregate>();
+
+  if (
+    rollupStatus.camera_daily_rollups === "ready" ||
+    rollupStatus.job_daily_rollups === "ready" ||
+    rollupStatus.agent_daily_rollups === "ready"
+  ) {
+    [cameraRollupAggregates, jobRollupAggregates, agentRollupAggregates] = await Promise.all([
+      loadReportCameraRollupAggregates(
+        params.db,
+        params.userId,
+        timeWindow.startDateKey,
+        timeWindow.endDateKey
+      ),
+      loadReportJobRollupAggregates(
+        params.db,
+        params.userId,
+        timeWindow.startDateKey,
+        timeWindow.endDateKey
+      ),
+      loadReportAgentRollupAggregates(
+        params.db,
+        params.userId,
+        timeWindow.startDateKey,
+        timeWindow.endDateKey
+      ),
+    ]);
+  }
+
+  const cameraComparison = cameraRows
+    .map((row) => {
+      const cameraId = Number((row as any).id || 0);
+      const stats = cameraStatsById.get(cameraId) || ensureCameraStats(cameraId);
+      const rollup = cameraRollupAggregates.get(cameraId);
+      const reconnectCount = rollup ? reportToCount(rollup.reconnect_count) : toCount((row as any).reconnect_count);
+      const lastFrameAgeMs = rollup?.max_last_frame_age_ms !== null && rollup?.max_last_frame_age_ms !== undefined
+        ? reportToCount(rollup.max_last_frame_age_ms)
+        : toCount((row as any).last_frame_age_ms);
+      const queueDepthRaw =
+        rollup?.avg_queue_depth !== null && rollup?.avg_queue_depth !== undefined
+          ? Number(rollup.avg_queue_depth)
+          : Number((row as any).queue_depth || 0);
+      const actualFpsRaw =
+        rollup?.avg_actual_fps !== null && rollup?.avg_actual_fps !== undefined
+          ? Number(rollup.avg_actual_fps)
+          : Number((row as any).actual_fps || 0);
+      const expectedFpsRaw =
+        rollup?.avg_expected_fps !== null && rollup?.avg_expected_fps !== undefined
+          ? Number(rollup.avg_expected_fps)
+          : Number((row as any).expected_fps || 0);
+      const actualFps = Number.isFinite(actualFpsRaw) ? actualFpsRaw : 0;
+      const expectedFps = Number.isFinite(expectedFpsRaw) ? expectedFpsRaw : 0;
+      const connectionFailures = rollup ? reportToCount(rollup.connection_failures) : stats.connection_failures;
+      const startCount = rollup ? reportToCount(rollup.start_count) : stats.start_count;
+      const stopCount = rollup ? reportToCount(rollup.stop_count) : stats.stop_count;
+      const detectionCount = rollup ? reportToCount(rollup.detection_count) : stats.detection_count;
+      const alertCount = rollup ? reportToCount(rollup.alert_count) : stats.alert_count;
+      const outageMinutes = rollup ? Number(rollup.outage_minutes_estimate || 0) : 0;
+      const fpsPenalty =
+        expectedFps > 0 && actualFps > 0 && actualFps < expectedFps
+          ? Math.round(((expectedFps - actualFps) / expectedFps) * 15)
+          : 0;
+      const stabilityScore = Math.max(
+        0,
+        100 -
+          reconnectCount * 6 -
+          connectionFailures * 8 -
+          stopCount * 3 -
+          Math.min(20, Math.round(lastFrameAgeMs / 1000)) -
+          Math.max(0, Math.round(queueDepthRaw) - 1) * 2 -
+          fpsPenalty -
+          Math.min(24, Math.round(outageMinutes / 10))
+      );
+      return {
+        camera_id: cameraId,
+        camera_name: normalizeReportText((row as any).name, 120) || `Camera ${cameraId}`,
+        is_running: Number((row as any).is_service_running || 0) === 1,
+        actual_fps: Number.isFinite(actualFps) ? Number(actualFps.toFixed(2)) : 0,
+        expected_fps: Number.isFinite(expectedFps) ? Number(expectedFps.toFixed(2)) : 0,
+        reconnect_count: reconnectCount,
+        connection_failures: connectionFailures,
+        last_frame_age_ms: lastFrameAgeMs,
+        queue_depth: Number.isFinite(queueDepthRaw) ? Number(queueDepthRaw.toFixed(2)) : 0,
+        start_count: startCount,
+        stop_count: stopCount,
+        detection_count: detectionCount,
+        alert_count: alertCount,
+        outage_minutes_estimate: reportRoundNumber(outageMinutes, 2),
+        last_failure_at: stats.last_failure_at,
+        last_online_at: stats.last_online_at,
+        last_detected_at: stats.last_detected_at,
+        stability_score: stabilityScore,
+        data_source: rollup ? "camera_daily_rollups" : "events_and_live_state",
+      };
+    })
+    .sort((left, right) => Number((left as any).stability_score || 0) - Number((right as any).stability_score || 0))
+    .slice(0, 12);
+
+  const stepLatestByJob = new Map<number, { error_count: number; queue_depth: number; retry_count: number; timeout_count: number }>();
+  for (const row of stepLatestRows) {
+    const jobId = Number((row as any).job_id || 0);
+    if (jobId <= 0) continue;
+    const current = stepLatestByJob.get(jobId) || {
+      error_count: 0,
+      queue_depth: 0,
+      retry_count: 0,
+      timeout_count: 0,
+    };
+    current.error_count += toCount((row as any).error_count);
+    current.queue_depth += toCount((row as any).queue_depth);
+    current.retry_count += toCount((row as any).retry_count);
+    current.timeout_count += toCount((row as any).timeout_count);
+    stepLatestByJob.set(jobId, current);
+  }
+
+  const jobComparison = jobsRows
+    .map((row) => {
+      const jobId = Number((row as any).id || 0);
+      const stats = jobStatsById.get(jobId) || ensureJobStats(jobId);
+      const rollup = jobRollupAggregates.get(jobId);
+      const stepState = stepLatestByJob.get(jobId) || {
+        error_count: 0,
+        queue_depth: 0,
+        retry_count: 0,
+        timeout_count: 0,
+      };
+      const runCount = rollup ? reportToCount(rollup.run_count) : stats.started_count;
+      const completedRunCount = rollup ? reportToCount(rollup.completed_run_count) : 0;
+      const stoppedCount = rollup ? reportToCount(rollup.stopped_run_count) : stats.stopped_count;
+      const blockedCount = rollup ? reportToCount(rollup.blocked_run_count) : stats.blocked_count;
+      const alertCount = rollup ? reportToCount(rollup.alert_count) : stats.alert_count;
+      const stepStartedCount = rollup ? reportToCount(rollup.step_started_count) : 0;
+      const stepCompletedCount = rollup ? reportToCount(rollup.step_completed_count) : stats.step_completed_count;
+      const stepSkippedCount = rollup ? reportToCount(rollup.step_skipped_count) : stats.step_skipped_count;
+      const historicalErrorCount = rollup ? reportToCount(rollup.error_count) : 0;
+      const totalRuntimeSeconds = rollup ? Number(rollup.total_runtime_seconds || 0) : 0;
+      const avgRuntimeSeconds = rollup ? Number(rollup.avg_runtime_seconds || 0) : 0;
+      const activityScore =
+        runCount * 4 +
+        stepCompletedCount * 2 +
+        alertCount * 3 -
+        blockedCount * 2 -
+        (stepState.error_count + historicalErrorCount) * 2;
+      return {
+        job_id: jobId,
+        job_name: normalizeReportText((row as any).name, 120) || `Job ${jobId}`,
+        runtime_status:
+          normalizeReportText((row as any).runtime_status, 40) ||
+          (Number((row as any).is_active || 0) === 1 ? "configured" : "inactive"),
+        run_count: runCount,
+        completed_run_count: completedRunCount,
+        stopped_count: stoppedCount,
+        blocked_count: blockedCount,
+        alert_count: alertCount,
+        step_started_count: stepStartedCount,
+        step_completed_count: stepCompletedCount,
+        step_skipped_count: stepSkippedCount,
+        historical_error_count: historicalErrorCount,
+        total_runtime_seconds: reportRoundNumber(totalRuntimeSeconds, 2),
+        avg_runtime_seconds: reportRoundNumber(avgRuntimeSeconds, 2),
+        current_error_count: stepState.error_count,
+        current_queue_depth: stepState.queue_depth,
+        current_retry_count: stepState.retry_count,
+        current_timeout_count: stepState.timeout_count,
+        last_event_at: stats.last_event_at,
+        activity_score: activityScore,
+        data_source: rollup ? "job_daily_rollups" : "events_and_live_state",
+      };
+    })
+    .sort((left, right) => Number((right as any).activity_score || 0) - Number((left as any).activity_score || 0))
+    .slice(0, 12);
+
+  const agentComparison = [
+    ...cameraAgentRows.map((row) => {
+      const config = parseJsonObject((row as any).config_json);
+      const signalKey = (
+        normalizeReportText((config as any).display_name, 120) ||
+        normalizeReportText((row as any).algorithm_type, 120)
+      ).toLowerCase();
+      const signals = agentSignalCounts.get(signalKey) || { detections: 0, alerts: 0 };
+      const errorCount = errorCountBySourceId.get(String((row as any).id || "")) || 0;
+      const rollup = agentRollupAggregates.get(
+        reportCompositeKey("camera_algorithm", Number((row as any).id || 0))
+      );
+      const detectionCount = rollup ? reportToCount(rollup.detection_count) : signals.detections;
+      const alertCount = rollup ? reportToCount(rollup.alert_count) : signals.alerts;
+      const resolvedErrorCount = rollup ? reportToCount(rollup.error_count) : errorCount;
+      const runCount = rollup ? reportToCount(rollup.run_count) : 0;
+      const agentName =
+        normalizeReportText((config as any).display_name, 120) ||
+        humanizeAlgorithmTypeLabel(normalizeReportText((row as any).algorithm_type, 120)) ||
+        `Camera agent ${Number((row as any).id || 0)}`;
+      return {
+        agent_scope_type: "camera_algorithm",
+        agent_id: Number((row as any).id || 0),
+        agent_name: agentName,
+        camera_id: Number((row as any).camera_id || 0) || null,
+        camera_name: normalizeReportText((row as any).camera_name, 120) || null,
+        job_id: null,
+        job_name: null,
+        step_id: null,
+        step_name: null,
+        is_enabled: Number((row as any).is_enabled || 0) === 1,
+        inference_model: normalizeReportText((row as any).inference_model, 60) || null,
+        model_fps: toCount((row as any).model_fps),
+        run_every_seconds: toCount((row as any).run_every),
+        run_count: runCount,
+        detection_count: detectionCount,
+        alert_count: alertCount,
+        error_count: resolvedErrorCount,
+        avg_runtime_seconds: rollup ? reportRoundNumber(rollup.avg_runtime_seconds, 2) : 0,
+        activity_score: detectionCount * 2 + alertCount * 3 - resolvedErrorCount * 2,
+        data_source: rollup ? "agent_daily_rollups" : "events_and_live_state",
+      };
+    }),
+    ...stepAgentRows.map((row) => {
+      const signalKey = normalizeReportText((row as any).agent_key, 120).toLowerCase();
+      const signals = agentSignalCounts.get(signalKey) || { detections: 0, alerts: 0 };
+      const errorCount = errorCountBySourceId.get(String((row as any).id || "")) || 0;
+      const rollup = agentRollupAggregates.get(
+        reportCompositeKey("job_step_agent", Number((row as any).id || 0))
+      );
+      const detectionCount = rollup ? reportToCount(rollup.detection_count) : signals.detections;
+      const alertCount = rollup ? reportToCount(rollup.alert_count) : signals.alerts;
+      const resolvedErrorCount = rollup ? reportToCount(rollup.error_count) : errorCount;
+      const runCount = rollup ? reportToCount(rollup.run_count) : 0;
+      return {
+        agent_scope_type: "job_step_agent",
+        agent_id: Number((row as any).id || 0),
+        agent_name:
+          normalizeReportText((row as any).agent_key, 120) || `Step agent ${Number((row as any).id || 0)}`,
+        camera_id: Number((row as any).camera_id || 0) || null,
+        camera_name: cameraNameById.get(Number((row as any).camera_id || 0)) || null,
+        job_id: Number((row as any).job_id || 0) || null,
+        job_name: normalizeReportText((row as any).job_name, 120) || null,
+        step_id: Number((row as any).step_id || 0) || null,
+        step_name: normalizeReportText((row as any).step_name, 120) || null,
+        is_enabled: Number((row as any).is_active || 0) === 1,
+        inference_model: normalizeReportText((row as any).inference_model, 60) || null,
+        model_fps: toCount((row as any).model_fps),
+        run_every_seconds: 0,
+        run_count: runCount,
+        detection_count: detectionCount,
+        alert_count: alertCount,
+        error_count: resolvedErrorCount,
+        avg_runtime_seconds: rollup ? reportRoundNumber(rollup.avg_runtime_seconds, 2) : 0,
+        activity_score: detectionCount * 2 + alertCount * 3 - resolvedErrorCount * 2,
+        data_source: rollup ? "agent_daily_rollups" : "events_and_live_state",
+      };
+    }),
+  ]
+    .sort((left, right) => Number((right as any).activity_score || 0) - Number((left as any).activity_score || 0))
+    .slice(0, 12);
+
+  const sanitizedRecentEvents = recentEventsRows.slice(0, 24).map((row) => ({
+    id: Number((row as any).id || 0),
+    camera_id: Number((row as any).camera_id || 0) || null,
+    event_type: normalizeReportText((row as any).event_type, 80),
+    message: sanitizeReportSecretText(normalizeReportText((row as any).message, 220)),
+    created_at: typeof (row as any).created_at === "string" ? (row as any).created_at : null,
+    details: sanitizeReportValue(parseJsonObject((row as any).details_json)),
+  }));
+
+  const sanitizedRecentCommands = recentCommandsRows.slice(0, 24).map((row) => ({
+    id: Number((row as any).id || 0),
+    command_type: normalizeReportText((row as any).command_type, 80),
+    status: normalizeReportText((row as any).status, 40),
+    created_at: typeof (row as any).created_at === "string" ? (row as any).created_at : null,
+    camera_id: Number((row as any).camera_id || 0) || null,
+    payload: sanitizeReportValue(parseCommandJsonColumn((row as any).payload)),
+  }));
+
+  const sanitizedRecentDetections = recentDetectionsRows.slice(0, 16).map((row) => {
+    const imageKey = normalizeDetectionStorageKey("image", (row as any).image_key);
+    const videoKey = normalizeDetectionStorageKey("video", (row as any).video_key);
+    return {
+      id: Number((row as any).id || 0),
+      camera_id: Number((row as any).camera_id || 0) || null,
+      camera_name: normalizeReportText((row as any).camera_name, 120),
+      algo_type: normalizeReportText((row as any).algo_type, 120),
+      detected_at: typeof (row as any).detected_at === "string" ? (row as any).detected_at : null,
+      media_type: normalizeReportText((row as any).media_type, 30),
+      image_key: imageKey || null,
+      video_key: videoKey || null,
+      image_download_path: imageKey ? buildMediaDownloadPathFromStorageKey(imageKey) : null,
+      video_download_path: videoKey ? buildMediaDownloadPathFromStorageKey(videoKey) : null,
+    };
+  });
+
+  const sanitizedRecentAlerts = recentAlertRows.slice(0, 16).map((row) => {
+    const details = parseJsonObject((row as any).details_json);
+    const imageKey = normalizeDetectionStorageKey(
+      "image",
+      (details as any).image_key ?? (details as any).imageKey
+    );
+    const videoKey = normalizeDetectionStorageKey(
+      "video",
+      (details as any).video_key ?? (details as any).videoKey
+    );
+    return {
+      id: Number((row as any).id || 0),
+      camera_id: Number((row as any).camera_id || 0) || null,
+      camera_name:
+        normalizeReportText((details as any).camera_name, 120) ||
+        normalizeReportText((row as any).camera_name, 120),
+      event_type: normalizeReportText((row as any).event_type, 80),
+      algo_type:
+        normalizeReportText(
+          (details as any).algo_type ??
+            (details as any).algoType ??
+            (details as any).agent_key ??
+            (details as any).agentKey,
+          120
+        ) || null,
+      message: sanitizeReportSecretText(normalizeReportText((row as any).message, 220)),
+      created_at: typeof (row as any).created_at === "string" ? (row as any).created_at : null,
+      details: sanitizeReportValue(details),
+      image_key: imageKey || null,
+      video_key: videoKey || null,
+      image_download_path: imageKey ? buildMediaDownloadPathFromStorageKey(imageKey) : null,
+      video_download_path: videoKey ? buildMediaDownloadPathFromStorageKey(videoKey) : null,
+    };
+  });
+
+  const sanitizedErrorLogs = errorLogRows.slice(0, 20).map((row) => ({
+    source_id: normalizeReportText((row as any).source_id, 120),
+    level: normalizeReportText((row as any).level, 40),
+    message: sanitizeReportSecretText(normalizeReportText((row as any).message, 240)),
+    flow: normalizeReportText((row as any).flow, 80) || null,
+    function_name: normalizeReportText((row as any).function_name, 120) || null,
+    operation: normalizeReportText((row as any).operation, 120) || null,
+    occurred_at: typeof (row as any).occurred_at === "string" ? (row as any).occurred_at : null,
+    context: sanitizeReportValue(parseJsonObject((row as any).context_json)),
+  }));
+
+  const evidenceMap = new Map<string, ReportEvidenceCandidate>();
+  const addEvidence = (candidate: ReportEvidenceCandidate | null) => {
+    if (!candidate || !candidate.storage_key) return;
+    if (evidenceMap.has(candidate.storage_key)) return;
+    evidenceMap.set(candidate.storage_key, candidate);
+  };
+
+  for (const detection of sanitizedRecentDetections) {
+    if (typeof detection.image_key === "string" && detection.image_key) {
+      addEvidence({
+        kind: "image",
+        storage_key: detection.image_key,
+        filename: detection.image_key.split("/").pop() || "evidence.jpg",
+        title: detection.camera_name
+          ? `${detection.camera_name} - ${detection.algo_type || "detection"}`
+          : detection.algo_type || "Detection image",
+        caption: detection.detected_at || undefined,
+        detected_at: detection.detected_at,
+        download_path:
+          typeof detection.image_download_path === "string" ? detection.image_download_path : "",
+      });
+    }
+    if (typeof detection.video_key === "string" && detection.video_key) {
+      addEvidence({
+        kind: "video",
+        storage_key: detection.video_key,
+        filename: detection.video_key.split("/").pop() || "evidence.mp4",
+        title: detection.camera_name
+          ? `${detection.camera_name} - ${detection.algo_type || "detection"}`
+          : detection.algo_type || "Detection video",
+        caption: detection.detected_at || undefined,
+        detected_at: detection.detected_at,
+        download_path:
+          typeof detection.video_download_path === "string" ? detection.video_download_path : "",
+      });
+    }
+  }
+
+  for (const alert of sanitizedRecentAlerts) {
+    if (typeof alert.image_key === "string" && alert.image_key) {
+      addEvidence({
+        kind: "image",
+        storage_key: alert.image_key,
+        filename: alert.image_key.split("/").pop() || "alert.jpg",
+        title: alert.camera_name
+          ? `${alert.camera_name} - ${alert.event_type || "alert"}`
+          : alert.event_type || "Alert image",
+        caption: alert.created_at || undefined,
+        detected_at: alert.created_at,
+        download_path:
+          typeof alert.image_download_path === "string" ? alert.image_download_path : "",
+      });
+    }
+    if (typeof alert.video_key === "string" && alert.video_key) {
+      addEvidence({
+        kind: "video",
+        storage_key: alert.video_key,
+        filename: alert.video_key.split("/").pop() || "alert.mp4",
+        title: alert.camera_name
+          ? `${alert.camera_name} - ${alert.event_type || "alert"}`
+          : alert.event_type || "Alert video",
+        caption: alert.created_at || undefined,
+        detected_at: alert.created_at,
+        download_path:
+          typeof alert.video_download_path === "string" ? alert.video_download_path : "",
+      });
+    }
+  }
+
+  const evidenceCandidates = Array.from(evidenceMap.values()).slice(0, 10);
+  const camerasRunning = cameraRows.filter((row) => Number((row as any).is_service_running || 0) === 1).length;
+  const jobsRunning = jobsRows.filter(
+    (row) => normalizeReportText((row as any).runtime_status, 40).toLowerCase() === "running"
+  ).length;
+  const enabledCameraAgents = cameraAgentRows.filter((row) => Number((row as any).is_enabled || 0) === 1).length;
+  const enabledStepAgents = stepAgentRows.filter((row) => Number((row as any).is_active || 0) === 1).length;
+  const detectionsInWindow = toCount((detectionCountRow as any)?.total);
+  const alertsInWindow = toCount((alertCountRow as any)?.total);
+  const commandsInWindow = toCount((commandCountRow as any)?.total);
+  const errorsInWindow = toCount((errorCountRow as any)?.total);
+
+  const topCamera = cameraComparison[0] as Record<string, unknown> | undefined;
+  const topJob = jobComparison[0] as Record<string, unknown> | undefined;
+  const topAgent = agentComparison[0] as Record<string, unknown> | undefined;
+  const topFindingsSeed = [
+    topCamera
+      ? isPt
+        ? `${String(topCamera.camera_name || "Camera")} concentra o maior sinal de instabilidade no recorte atual.`
+        : `${String(topCamera.camera_name || "Camera")} concentrates the strongest instability signal in the selected window.`
+      : "",
+    topJob
+      ? isPt
+        ? `${String(topJob.job_name || "Job")} aparece como o job com maior atividade recente.`
+        : `${String(topJob.job_name || "Job")} appears as the job with the highest recent activity.`
+      : "",
+    topAgent
+      ? isPt
+        ? `${String(topAgent.agent_name || "Agent")} aparece com o maior volume recente de deteccoes, alertas ou erros.`
+        : `${String(topAgent.agent_name || "Agent")} shows the highest recent volume of detections, alerts, or errors.`
+      : "",
+  ].filter((entry) => entry.length > 0);
+
+  const limitations = [
+    rollupStatus.camera_daily_rollups === "empty" ||
+    rollupStatus.job_daily_rollups === "empty" ||
+    rollupStatus.agent_daily_rollups === "empty"
+      ? isPt
+        ? "Alguns comparativos deste recorte precisaram combinar rollups diarios com telemetria atual e eventos disponiveis no periodo, porque ainda nao havia linhas persistidas para todas as dimensoes."
+        : "Some comparisons in this window had to combine daily rollups with current telemetry and the available events in the selected period because persisted rows were not available for every dimension."
+      : "",
+    isPt
+      ? "As evidencias visuais dependem dos artefatos que ainda estao disponiveis no storage."
+      : "Visual evidence depends on the artifacts that are still available in storage.",
+  ].filter((entry) => entry.length > 0);
+
+  const summarySeed = isPt
+    ? `Janela analisada: ${timeWindow.label}. Cameras: ${cameraRows.length} totais, ${camerasRunning} em execucao. Jobs: ${jobsRows.length} totais, ${jobsRunning} em execucao. Deteccoes: ${detectionsInWindow}. Alertas: ${alertsInWindow}. Erros de agentes: ${errorsInWindow}.`
+    : `Analyzed window: ${timeWindow.label}. Cameras: ${cameraRows.length} total, ${camerasRunning} running. Jobs: ${jobsRows.length} total, ${jobsRunning} running. Detections: ${detectionsInWindow}. Alerts: ${alertsInWindow}. Agent errors: ${errorsInWindow}.`;
+
+  return {
+    report_id: reportId,
+    report_kind: kindInfo.kind,
+    title: buildReportTitle(requestedQuery, kindInfo.kind, replyLanguage),
+    reply_language: replyLanguage,
+    requested_query: requestedQuery,
+    generated_at: generatedAt,
+    scope: {
+      start_at: timeWindow.startAt,
+      end_at: timeWindow.endAt,
+      time_window_hours: timeWindow.hours,
+      label: timeWindow.label,
+      focus: kindInfo.focus,
+    },
+    stats: {
+      cameras_total: cameraRows.length,
+      cameras_running: camerasRunning,
+      jobs_total: jobsRows.length,
+      jobs_running: jobsRunning,
+      enabled_camera_agents: enabledCameraAgents,
+      enabled_step_agents: enabledStepAgents,
+      detections_in_window: detectionsInWindow,
+      alerts_in_window: alertsInWindow,
+      commands_in_window: commandsInWindow,
+      agent_errors_in_window: errorsInWindow,
+      evidence_images: evidenceCandidates.filter((candidate) => candidate.kind === "image").length,
+      evidence_videos: evidenceCandidates.filter((candidate) => candidate.kind === "video").length,
+      report_window_hours: timeWindow.hours,
+    },
+    current_state: {
+      cameras_total: cameraRows.length,
+      cameras_running: camerasRunning,
+      jobs_total: jobsRows.length,
+      jobs_running: jobsRunning,
+      enabled_camera_agents: enabledCameraAgents,
+      enabled_step_agents: enabledStepAgents,
+      host_latest: sanitizeReportValue(hostLatestRow),
+      process_latest: sanitizeReportValue(processLatestRow),
+      camera_snapshots: cameraComparison.slice(0, 8),
+      running_jobs: jobsRows
+        .filter(
+          (row) => normalizeReportText((row as any).runtime_status, 40).toLowerCase() === "running"
+        )
+        .slice(0, 8)
+        .map((row) => ({
+          job_id: Number((row as any).id || 0),
+          job_name: normalizeReportText((row as any).name, 120),
+          runtime_status: normalizeReportText((row as any).runtime_status, 40),
+          runtime_started_at:
+            typeof (row as any).runtime_started_at === "string" ? (row as any).runtime_started_at : null,
+        })),
+      step_snapshots: stepLatestRows.slice(0, 12).map((row) => ({
+        job_id: Number((row as any).job_id || 0),
+        job_name: normalizeReportText((row as any).job_name, 120),
+        step_id: Number((row as any).step_id || 0),
+        step_name: normalizeReportText((row as any).step_name, 120),
+        status: normalizeReportText((row as any).status, 40),
+        queue_depth: toCount((row as any).queue_depth),
+        error_count: toCount((row as any).error_count),
+        retry_count: toCount((row as any).retry_count),
+        timeout_count: toCount((row as any).timeout_count),
+        updated_at: typeof (row as any).updated_at === "string" ? (row as any).updated_at : null,
+      })),
+    },
+    history: {
+      recent_events: sanitizedRecentEvents,
+      recent_commands: sanitizedRecentCommands,
+      recent_detections: sanitizedRecentDetections,
+      recent_alerts: sanitizedRecentAlerts,
+      error_logs: sanitizedErrorLogs,
+    },
+    comparisons: {
+      cameras: cameraComparison,
+      jobs: jobComparison,
+      agents: agentComparison,
+    },
+    chat_discussion: chatDiscussion,
+    evidence_candidates: evidenceCandidates,
+    top_findings_seed: topFindingsSeed,
+    summary_seed: summarySeed,
+    limitations,
+    rollup_status: rollupStatus,
+    phase2_ready: true,
+  };
+}
+
 const buildFaceTargetStorageKey = (userId: string, targetId: number, mimeType: string): string => {
   const extMap: Record<string, string> = {
     "image/jpeg": "jpg",
@@ -28586,6 +32225,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
       "create_job",
       "create_camera_agent",
       "read_state",
+      "generate_report",
     ],
   };
   if (currentUserMessageId > 0) {
@@ -31427,6 +35067,24 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
         )
         .run();
 
+      try {
+        await recordCameraDailyRollupSampleFromOpenMonitor({
+          db: c.env.DB,
+          userId: pairing.userId,
+          clientId: pairing.clientId,
+          exeId: pairing.exeId,
+          cameraId,
+          sampledAt,
+          actualFps: openMonitorToFiniteNumber(cameraPayload.actual_fps),
+          expectedFps: openMonitorToFiniteNumber(cameraPayload.expected_fps),
+          lastFrameAgeMs: openMonitorToFiniteNumber(cameraPayload.last_frame_age_ms),
+          queueDepth: openMonitorToFiniteNumber(cameraPayload.queue_depth),
+          reconnectTotal: openMonitorToNonNegativeInt(cameraPayload.reconnect_count),
+        });
+      } catch (error) {
+        console.error("[OPEN MONITOR] Failed to update camera daily rollup sample:", error);
+      }
+
       upserted += 1;
     } catch (error) {
       console.error("[OPEN MONITOR] Failed to persist camera snapshot:", error);
@@ -32140,6 +35798,293 @@ app.post("/api/agent/chat-progress", async (c) => {
   });
 
   return c.json({ ok: true });
+});
+
+app.post("/api/agent/reports/build-context", async (c) => {
+  await ensureSchema(c.env.DB);
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    chat_session_id?: number;
+    context_before_message_id?: number;
+    query?: string;
+    reply_language?: string;
+  }>();
+
+  const chatSessionId = Number(body?.chat_session_id || 0);
+  if (!Number.isInteger(chatSessionId) || chatSessionId <= 0) {
+    return c.json({ error: "chat_session_id is required" }, 400);
+  }
+
+  const session = await c.env.DB
+    .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(chatSessionId, pairing.userId)
+    .first();
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  const context = await buildReportContext({
+    db: c.env.DB,
+    userId: pairing.userId,
+    clientId: pairing.clientId,
+    exeId: pairing.exeId,
+    chatSessionId,
+    beforeMessageId: Number(body?.context_before_message_id || 0),
+    query: typeof body?.query === "string" ? body.query : "",
+    replyLanguage: typeof body?.reply_language === "string" ? body.reply_language : "en",
+  });
+
+  return c.json(context);
+});
+
+app.post("/api/agent/reports/create", async (c) => {
+  await ensureSchema(c.env.DB);
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    chat_session_id?: number;
+    context_before_message_id?: number;
+    query?: string;
+    reply_language?: string;
+    title?: string;
+    summary?: string;
+    sections?: unknown;
+    stats?: unknown;
+    context?: unknown;
+  }>();
+
+  const chatSessionId = Number(body?.chat_session_id || 0);
+  if (!Number.isInteger(chatSessionId) || chatSessionId <= 0) {
+    return c.json({ error: "chat_session_id is required" }, 400);
+  }
+
+  const session = await c.env.DB
+    .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(chatSessionId, pairing.userId)
+    .first();
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  if (!c.env.R2_BUCKET || typeof c.env.R2_BUCKET.put !== "function") {
+    return c.json({ error: "R2 bucket is not configured" }, 500);
+  }
+
+  const replyLanguage = normalizeSupportedChatLanguage(body?.reply_language, "en");
+  const providedContext =
+    body?.context && typeof body.context === "object" && !Array.isArray(body.context)
+      ? (body.context as ReportBuildContext)
+      : null;
+
+  const context = providedContext ||
+    (await buildReportContext({
+      db: c.env.DB,
+      userId: pairing.userId,
+      clientId: pairing.clientId,
+      exeId: pairing.exeId,
+      chatSessionId,
+      beforeMessageId: Number(body?.context_before_message_id || 0),
+      query: typeof body?.query === "string" ? body.query : "",
+      replyLanguage,
+    }));
+
+  const reportId =
+    normalizeReportText((context as any)?.report_id, 120) || crypto.randomUUID();
+  const reportKind = normalizeReportText((context as any)?.report_kind, 80) || "general";
+  const reportReplyLanguage = normalizeSupportedChatLanguage(
+    (context as any)?.reply_language,
+    replyLanguage
+  );
+  const title =
+    normalizeReportText(body?.title, 180) ||
+    normalizeReportText((context as any)?.title, 180) ||
+    buildReportTitle(
+      normalizeReportText((context as any)?.requested_query, 120) ||
+        normalizeReportText(body?.query, 120),
+      reportKind as ReportKind,
+      reportReplyLanguage
+    );
+  const summary =
+    normalizeReportText(body?.summary, 2400) ||
+    normalizeReportText((context as any)?.summary_seed, 2400) ||
+    normalizeReportText((context as any)?.requested_query, 2400);
+
+  const sectionsFromBody = normalizeReportSectionsPayload(body?.sections);
+  const sections =
+    sectionsFromBody.length > 0
+      ? sectionsFromBody
+      : buildFallbackReportSectionsFromContext(context).slice(0, 8);
+  const statsFromBody = normalizeReportStatsPayload(body?.stats);
+  const stats =
+    statsFromBody.length > 0
+      ? statsFromBody
+      : buildFallbackReportStatsFromContext(context).slice(0, 10);
+
+  const evidenceCandidates = normalizeReportEvidenceCandidates(
+    (context as any)?.evidence_candidates
+  );
+  const origin = new URL(c.req.url).origin;
+  const evidenceAssets = await collectReportEvidenceAssets(
+    c.env.R2_BUCKET,
+    evidenceCandidates,
+    origin
+  );
+
+  const generatedAt =
+    normalizeReportText((context as any)?.generated_at, 80) || new Date().toISOString();
+  const requestedQuery =
+    normalizeReportText((context as any)?.requested_query, 1800) ||
+    normalizeReportText(body?.query, 1800);
+  const docFilename = buildReportDownloadFilename(title, "docx");
+  const docStorageKey = buildReportStorageKey(pairing.userId, chatSessionId, reportId, docFilename);
+  const docBytes = await buildReportDocxBuffer({
+    title,
+    generatedAt,
+    reportKind,
+    requestedQuery,
+    summary,
+    stats,
+    sections,
+    images: evidenceAssets.imageEvidence,
+    videos: evidenceAssets.videoEvidence,
+  });
+
+  await c.env.R2_BUCKET.put(docStorageKey, docBytes, {
+    httpMetadata: {
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    },
+  });
+
+  let evidenceStorageKey: string | null = null;
+  let evidenceFilename: string | null = null;
+  if (evidenceAssets.zipBytes && evidenceAssets.zipFileCount > 0) {
+    evidenceFilename = buildReportDownloadFilename(`${title}-evidence`, "zip");
+    evidenceStorageKey = buildReportStorageKey(
+      pairing.userId,
+      chatSessionId,
+      reportId,
+      evidenceFilename
+    );
+    await c.env.R2_BUCKET.put(evidenceStorageKey, evidenceAssets.zipBytes, {
+      httpMetadata: {
+        contentType: "application/zip",
+      },
+    });
+  }
+
+  const rollupStatus =
+    (context as any)?.rollup_status &&
+    typeof (context as any).rollup_status === "object" &&
+    !Array.isArray((context as any).rollup_status)
+      ? ((context as any).rollup_status as ReportRollupStatus)
+      : {
+          camera_daily_rollups: "empty",
+          job_daily_rollups: "empty",
+          agent_daily_rollups: "empty",
+        };
+
+  const sanitizedContext = sanitizeReportValue({
+    ...(context as any),
+    title,
+    summary_seed: summary,
+    reply_language: reportReplyLanguage,
+    evidence_candidates: evidenceCandidates,
+  });
+  const now = new Date().toISOString();
+
+  await c.env.DB
+    .prepare(
+      `INSERT INTO report_documents (
+        id,
+        user_id,
+        chat_session_id,
+        report_kind,
+        requested_query,
+        reply_language,
+        title,
+        summary,
+        doc_storage_key,
+        evidence_storage_key,
+        rollup_status_json,
+        stats_json,
+        context_json,
+        sections_json,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      reportId,
+      pairing.userId,
+      chatSessionId,
+      reportKind,
+      requestedQuery,
+      reportReplyLanguage,
+      title,
+      summary,
+      docStorageKey,
+      evidenceStorageKey,
+      reportJsonStringify(rollupStatus, "{}"),
+      reportJsonStringify(stats, "[]"),
+      reportJsonStringify(sanitizedContext, "{}"),
+      reportJsonStringify(sections, "[]"),
+      now,
+      now
+    )
+    .run();
+
+  const messageMetadata = {
+    type: "report_document",
+    status: "generated",
+    language: reportReplyLanguage,
+    report_id: reportId,
+    report_kind: reportKind,
+    title,
+    summary,
+    generated_at: generatedAt,
+    download_path: buildReportDownloadPath(reportId),
+    download_filename: docFilename,
+    evidence_download_path: evidenceStorageKey ? buildReportEvidenceDownloadPath(reportId) : null,
+    evidence_filename: evidenceFilename,
+    stats,
+    rollup_status: rollupStatus,
+    image_count: evidenceAssets.imageEvidence.length,
+    video_count: evidenceAssets.videoEvidence.length,
+    evidence_file_count: evidenceAssets.zipFileCount,
+    phase2_ready: Boolean((context as any)?.phase2_ready),
+  };
+
+  return c.json({
+    ok: true,
+    report_id: reportId,
+    title,
+    summary,
+    generated_at: generatedAt,
+    message_metadata: messageMetadata,
+  });
 });
 
 app.get("/api/agent/chat-context", async (c) => {

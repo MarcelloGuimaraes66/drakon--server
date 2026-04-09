@@ -16,6 +16,7 @@ import ChatCameraAgentUpdatedCard from "@/react-app/components/ChatCameraAgentUp
 import ChatCameraDiscoveryCard from "@/react-app/components/ChatCameraDiscoveryCard";
 import ChatJobCreatedCard from "@/react-app/components/ChatJobCreatedCard";
 import ChatIdentityCardsPanel from "@/react-app/components/ChatIdentityCardsPanel";
+import ChatReportDocumentCard from "@/react-app/components/ChatReportDocumentCard";
 import CameraEditorModal, { type CameraEditorCamera } from "@/react-app/components/CameraEditorModal";
 import CameraCustomAgentEditorModal, {
   type CameraAgentEditorTarget,
@@ -47,6 +48,7 @@ import {
   extractCameraBatchRegistrationDraftFromMessage,
   extractCameraRegistrationDraftFromMessage,
   extractJobCreationResultFromMessage,
+  extractReportDocumentFromMessage,
   applyCameraEditDraftToCamera,
   buildCameraAgentDraftForEditor,
   extractChatProgressFromMessage,
@@ -800,12 +802,15 @@ export default function Chat() {
     const cameraAgentUpdateResult = extractCameraAgentUpdateResultFromMessage(message);
     const cameraEditFormRequest = extractCameraEditFormRequestFromMessage(message);
     const cameraNetworkScan = extractCameraNetworkScanFromMessage(message);
+    const reportDocument = extractReportDocumentFromMessage(message);
     const identityCards = extractIdentityCardsFromMessage(message);
     const cameraLabel = message.camera_ids ? `Camera #${message.camera_ids}` : null;
     const revealId = getAssistantRevealId(message);
     const shouldAnimateReveal = CHAT_VISUAL_TYPING_ENABLED && activeRevealId === revealId;
     const workflowSupplementalContent =
-      cameraRegistrationDraft ? (
+      reportDocument ? (
+        <ChatReportDocumentCard metadata={reportDocument} />
+      ) : cameraRegistrationDraft ? (
         <ChatCameraRegistrationCard
           messageId={message.id}
           metadata={cameraRegistrationDraft}

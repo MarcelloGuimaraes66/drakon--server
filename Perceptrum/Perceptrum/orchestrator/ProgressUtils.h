@@ -123,6 +123,24 @@ inline ChatProgressUpdate makeProgressUpdate(
                 update.detail = "Organizando gravadores, canais detectados e cameras avulsas para o chat.";
             }
         }
+        else if (skill == "generate_report") {
+            if (phase == "routing") {
+                update.headline = "Entendendo o relatorio";
+                update.detail = "Identificando o escopo e os dados que precisam entrar no documento.";
+            }
+            else if (phase == "collecting_context") {
+                update.headline = "Coletando contexto";
+                update.detail = "Lendo estado atual, historico, deteccoes, alertas, jobs, agentes e conversa.";
+            }
+            else if (phase == "drafting_report") {
+                update.headline = "Montando a analise";
+                update.detail = "Organizando os pontos principais, comparativos e secoes do relatorio.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Gerando o documento";
+                update.detail = "Finalizando o DOCX e preparando os downloads no chat.";
+            }
+        }
         else if (skill == "create_cameras_batch") {
             if (phase == "routing") {
                 update.headline = "Entendendo o lote de cameras";
@@ -355,6 +373,24 @@ inline ChatProgressUpdate makeProgressUpdate(
             else if (phase == "finalizing") {
                 update.headline = "Summarizing what was found";
                 update.detail = "Organizing recorders, detected channels, and standalone cameras for chat.";
+            }
+        }
+        else if (skill == "generate_report") {
+            if (phase == "routing") {
+                update.headline = "Understanding the report";
+                update.detail = "Identifying the scope and which data should go into the document.";
+            }
+            else if (phase == "collecting_context") {
+                update.headline = "Collecting context";
+                update.detail = "Reading current state, history, detections, alerts, jobs, agents, and chat context.";
+            }
+            else if (phase == "drafting_report") {
+                update.headline = "Drafting the analysis";
+                update.detail = "Organizing the key findings, comparisons, and report sections.";
+            }
+            else if (phase == "finalizing") {
+                update.headline = "Generating the document";
+                update.detail = "Finalizing the DOCX and preparing the downloads in chat.";
             }
         }
         else if (skill == "create_cameras_batch") {

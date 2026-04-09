@@ -193,6 +193,38 @@ export interface JobCreationResultMessageMetadata {
   steps: JobCreationStepMessageMetadata[];
 }
 
+export interface ReportDocumentStatMetadata {
+  label: string;
+  value: string;
+}
+
+export interface ReportDocumentRollupStatusMetadata {
+  camera_daily_rollups?: "ready" | "empty";
+  job_daily_rollups?: "ready" | "empty";
+  agent_daily_rollups?: "ready" | "empty";
+}
+
+export interface ReportDocumentMessageMetadata {
+  type: "report_document";
+  status: "generated";
+  language?: string;
+  report_id?: string;
+  report_kind?: string;
+  title: string;
+  summary?: string;
+  generated_at?: string;
+  download_path: string;
+  download_filename?: string;
+  evidence_download_path?: string | null;
+  evidence_filename?: string | null;
+  stats: ReportDocumentStatMetadata[];
+  rollup_status?: ReportDocumentRollupStatusMetadata;
+  image_count?: number;
+  video_count?: number;
+  evidence_file_count?: number;
+  phase2_ready?: boolean;
+}
+
 export interface CameraAgentEditContextMessageMetadata {
   type: "camera_agent_edit_context";
   status: "awaiting_changes";
@@ -1405,6 +1437,95 @@ export function extractJobCreationResultFromMessage(
         ? targetCount
         : steps.reduce((sum, step) => sum + step.target_count, 0),
     steps,
+  };
+}
+
+export function extractReportDocumentFromMessage(
+  message: ChatMessage
+): ReportDocumentMessageMetadata | null {
+  const parsed = parseMessageCameraSelectionJson(message);
+  if (!parsed) {
+    return null;
+  }
+
+  if (parsed.type !== "report_document" || parsed.status !== "generated") {
+    return null;
+  }
+
+  const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+  const downloadPath =
+    typeof parsed.download_path === "string" ? parsed.download_path.trim() : "";
+  if (!title || !downloadPath) {
+    return null;
+  }
+
+  const stats = Array.isArray(parsed.stats)
+    ? parsed.stats
+        .map((entry: unknown): ReportDocumentStatMetadata | null => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null;
+          }
+          const row = entry as Record<string, unknown>;
+          const label = typeof row.label === "string" ? row.label.trim() : "";
+          const value = typeof row.value === "string" ? row.value.trim() : "";
+          if (!label || !value) {
+            return null;
+          }
+          return { label, value };
+        })
+        .filter(
+          (entry: ReportDocumentStatMetadata | null): entry is ReportDocumentStatMetadata =>
+            entry !== null
+        )
+    : [];
+
+  const rawRollupStatus =
+    parsed.rollup_status && typeof parsed.rollup_status === "object" && !Array.isArray(parsed.rollup_status)
+      ? (parsed.rollup_status as Record<string, unknown>)
+      : null;
+  const rollupStatus: ReportDocumentRollupStatusMetadata | undefined = rawRollupStatus
+    ? {
+        camera_daily_rollups:
+          rawRollupStatus.camera_daily_rollups === "ready" ? "ready" : "empty",
+        job_daily_rollups:
+          rawRollupStatus.job_daily_rollups === "ready" ? "ready" : "empty",
+        agent_daily_rollups:
+          rawRollupStatus.agent_daily_rollups === "ready" ? "ready" : "empty",
+      }
+    : undefined;
+
+  const imageCount = Number(parsed.image_count);
+  const videoCount = Number(parsed.video_count);
+  const evidenceFileCount = Number(parsed.evidence_file_count);
+
+  return {
+    type: "report_document",
+    status: "generated",
+    language: typeof parsed.language === "string" ? parsed.language : undefined,
+    report_id: typeof parsed.report_id === "string" ? parsed.report_id : undefined,
+    report_kind: typeof parsed.report_kind === "string" ? parsed.report_kind : undefined,
+    title,
+    summary: typeof parsed.summary === "string" ? parsed.summary : undefined,
+    generated_at:
+      typeof parsed.generated_at === "string" ? parsed.generated_at : undefined,
+    download_path: downloadPath,
+    download_filename:
+      typeof parsed.download_filename === "string" ? parsed.download_filename : undefined,
+    evidence_download_path:
+      typeof parsed.evidence_download_path === "string"
+        ? parsed.evidence_download_path
+        : null,
+    evidence_filename:
+      typeof parsed.evidence_filename === "string" ? parsed.evidence_filename : undefined,
+    stats,
+    rollup_status: rollupStatus,
+    image_count: Number.isInteger(imageCount) && imageCount >= 0 ? imageCount : undefined,
+    video_count: Number.isInteger(videoCount) && videoCount >= 0 ? videoCount : undefined,
+    evidence_file_count:
+      Number.isInteger(evidenceFileCount) && evidenceFileCount >= 0
+        ? evidenceFileCount
+        : undefined,
+    phase2_ready: parsed.phase2_ready === true,
   };
 }
 

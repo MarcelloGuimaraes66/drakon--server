@@ -340,6 +340,28 @@ bool hasTimeWindowCue_(const std::string& normalized)
     });
 }
 
+bool hasReportCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "report", "reports", "relatorio", "relatorios", "relatÃ³rio", "relatÃ³rios",
+        "document", "documento", "doc", "docx", "download", "export", "exportar",
+        "history", "historico", "histÃ³rico", "comparison", "comparativo", "compare",
+        "ranking", "timeline", "logs", "log", "audit", "auditoria"
+    });
+}
+
+bool isReportGenerationRequest_(const std::string& normalized)
+{
+    return hasReportCue_(normalized) &&
+        !isInstructionalIntent_(normalized) &&
+        containsAny_(normalized, {
+            "generate", "gerar", "gera", "gere", "build", "prepare", "preparar",
+            "create", "criar", "export", "exportar", "download", "document", "documento",
+            "doc", "docx", "report", "relatorio", "relatÃ³rio", "history", "historico",
+            "histÃ³rico", "comparison", "comparativo", "timeline", "logs", "audit", "auditoria"
+        });
+}
+
 bool isVideoObservationRequest_(const std::string& normalized)
 {
     if (hasConnectionConfigCue_(normalized)) {
@@ -538,6 +560,7 @@ int progressStepCountForSkill_(const std::string& skillName)
     if (skillName == "edit_cameras_batch") return 3;
     if (skillName == "scan_network") return 3;
     if (skillName == "read_state") return 3;
+    if (skillName == "generate_report") return 4;
     if (skillName == "general_answer") return 2;
     return 1;
 }
@@ -545,6 +568,28 @@ int progressStepCountForSkill_(const std::string& skillName)
 SkillSelection rewriteInstructionalSelection_(SkillSelection selection, const std::string& userMessage)
 {
     const std::string normalized = lowerAsciiCopy_(userMessage);
+    if ((selection.selectedSkill == "video_search" ||
+         selection.selectedSkill == "general_answer" ||
+         selection.selectedSkill == "explain_app" ||
+         selection.selectedSkill == "read_state" ||
+         selection.selectedSkill == "scan_network") &&
+        isReportGenerationRequest_(normalized)) {
+        selection.selectedSkill = "generate_report";
+        selection.confidence = std::max(selection.confidence, 0.99);
+        selection.reason = "explicit_report_generation_request";
+        selection.replyPreview = "Vou preparar o relatorio.";
+        selection.mode = "operate";
+        selection.entity = "report";
+        selection.intent = "create";
+        selection.operationType = "generate_report";
+        selection.operationPhase = "collecting_context";
+        if (selection.taskGoal.empty()) {
+            selection.taskGoal = "generate a report";
+        }
+        selection.arguments = nlohmann::json::object();
+        return selection;
+    }
+
     if ((selection.selectedSkill == "video_search" ||
          selection.selectedSkill == "general_answer" ||
          selection.selectedSkill == "explain_app" ||
@@ -1017,6 +1062,9 @@ std::string skillFromSemanticSelection_(
 
     const std::string operationType = trimCopy_(selection.operationType);
     if (!operationType.empty()) {
+        if (operationType == "generate_report") {
+            return "generate_report";
+        }
         return operationType;
     }
 
@@ -1031,6 +1079,9 @@ std::string skillFromSemanticSelection_(
 
     if (entity == "video" || intent == "inspect") {
         return "video_search";
+    }
+    if (entity == "report") {
+        return "generate_report";
     }
     if (entity == "state" || mode == "read" || intent == "read") {
         return "read_state";
@@ -1103,6 +1154,7 @@ bool shouldSemanticSkillOverrideSelected_(
         semanticSkill == "control_job" ||
         semanticSkill == "edit_job" ||
         semanticSkill == "scan_network" ||
+        semanticSkill == "generate_report" ||
         semanticSkill == "read_state" ||
         semanticSkill == "video_search";
 }
@@ -1170,6 +1222,7 @@ SkillSelection applySemanticSelectionPlan_(
          selection.selectedSkill == "create_job" ||
          selection.selectedSkill == "control_job" ||
          selection.selectedSkill == "edit_job" ||
+         selection.selectedSkill == "generate_report" ||
          selection.selectedSkill == "scan_network")) {
         selection.operationType = selection.selectedSkill;
     }
@@ -1193,6 +1246,9 @@ SkillSelection applySemanticSelectionPlan_(
         }
         else if (selection.selectedSkill == "scan_network") {
             selection.intent = "inspect";
+        }
+        else if (selection.selectedSkill == "generate_report") {
+            selection.intent = "create";
         }
         else if (selection.selectedSkill == "explain_app") {
             selection.intent = "explain";
@@ -1219,6 +1275,7 @@ SkillSelection applySemanticSelectionPlan_(
             selection.selectedSkill == "create_job" ||
             selection.selectedSkill == "control_job" ||
             selection.selectedSkill == "edit_job" ||
+            selection.selectedSkill == "generate_report" ||
             selection.selectedSkill == "scan_network" ||
             selection.selectedSkill == "video_search") {
             selection.mode = "operate";
@@ -1921,7 +1978,8 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
                 progressStepCount));
 
         if (selection.selectedSkill == "explain_app" ||
-            selection.selectedSkill == "read_state")
+            selection.selectedSkill == "read_state" ||
+            selection.selectedSkill == "generate_report")
         {
             pauseForProgressVisibility();
         }
@@ -2627,7 +2685,7 @@ std::string ChatV2Orchestrator::sanitizeUserFacingAnswer_(const std::string& ans
         sanitized.end());
 
     const std::vector<std::pair<std::regex, std::string>> replacements = {
-        { std::regex("\\b(read_state|video_search|create_camera|control_camera|create_job|control_job|edit_job|create_camera_agent|edit_camera_agent|scan_network|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
+        { std::regex("\\b(read_state|video_search|create_camera|control_camera|create_job|control_job|edit_job|create_camera_agent|edit_camera_agent|scan_network|generate_report|explain_app|chatv2)\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(create_cameras_batch|edit_cameras_batch)\\b", std::regex::icase), "assistant" },
         { std::regex("\\bskills?\\b", std::regex::icase), "assistant" },
         { std::regex("\\b(database|db|backend|endpoint|payload|json|orchestrator|router|llama(?:\\.cpp|-server)?|gguf|codebase|source code|internal tool|internal tools|runtime manager)\\b", std::regex::icase), "" },

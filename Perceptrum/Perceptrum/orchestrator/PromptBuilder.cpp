@@ -109,7 +109,7 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Do not map unsupported Latin-script languages into a nearby supported UI language.\n"
         << "Return a semantic plan plus the best executable skill.\n"
         << "mode must be one of: answer, operate, clarify, read.\n"
-        << "entity must be one of: camera, camera_agent, job, state, app_help, video, general.\n"
+        << "entity must be one of: camera, camera_agent, job, state, report, app_help, video, general.\n"
         << "intent must be one of: create, update, explain, inspect, read, continue, unknown.\n"
         << "continue_active_task is true only when the message should stay inside the active multi-turn operation.\n"
         << "grounding_required is true when the answer should be grounded in the app knowledge base instead of a free-form direct answer.\n"
@@ -127,6 +127,8 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Use edit_job only when the user wants you to rename, reschedule, update, reconfigure, or otherwise edit one existing job now.\n"
         << "Use create_camera_agent only when the user wants you to create or configure a camera agent now.\n"
         << "Use edit_camera_agent only when the user wants you to edit, update, disable, enable, rename, reconfigure, review in the form, or otherwise change one existing camera agent or step agent now.\n"
+        << "Use generate_report when the user wants a downloadable report or document about what is happening now, what already happened, chat discussion context, detections, alerts, jobs, agents, logs, or comparisons across these areas.\n"
+        << "When the user asks for a document, DOCX, export, historical report, diagnostic report, comparison report, or says 'generate a report about this', prefer generate_report over read_state.\n"
         << "When the user wants an AI agent created now, choose create_camera_agent even if destination, camera, step, or watchlist details are still missing.\n"
         << "Do not downgrade create_camera_agent requests into explain_app just because the user described the desired detection in natural language instead of naming alert_condition or prompt fields.\n"
         << "Use read_state when the user wants to read, list, count, audit, compare, filter, or identify current cameras, jobs, agents, balances, settings, or configs.\n"
@@ -246,6 +248,9 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "- user_message=\"procure cameras na minha rede para mim\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"discover cameras on the local network\", reply_language=\"pt\"\n"
         << "- user_message=\"quero cadastrar cameras mas nao sei os ips\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"scan the local network before camera registration\", reply_language=\"pt\"\n"
         << "- user_message=\"me ajuda a importar as cameras da rede sem eu saber os hosts\" => selected_skill=\"scan_network\", mode=\"operate\", entity=\"camera\", intent=\"inspect\", grounding_required=false, arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", arguments.task_goal=\"discover cameras and recorders on the local network before import\", reply_language=\"pt\"\n"
+        << "- user_message=\"gera um relatorio docx sobre o que esta acontecendo agora\" => selected_skill=\"generate_report\", mode=\"operate\", entity=\"report\", intent=\"create\", arguments.operation_type=\"generate_report\", arguments.operation_phase=\"collecting_context\", arguments.task_goal=\"generate a current-state report\", reply_language=\"pt\"\n"
+        << "- user_message=\"quero um relatorio comparando quais cameras ficam mais offline\" => selected_skill=\"generate_report\", mode=\"operate\", entity=\"report\", intent=\"create\", arguments.operation_type=\"generate_report\", arguments.operation_phase=\"collecting_context\", arguments.task_goal=\"generate a comparison report about camera stability\", reply_language=\"pt\"\n"
+        << "- user_message=\"export a report about detections and alerts from this week\" => selected_skill=\"generate_report\", mode=\"operate\", entity=\"report\", intent=\"create\", arguments.operation_type=\"generate_report\", arguments.operation_phase=\"collecting_context\", arguments.task_goal=\"generate a detections and alerts report\", reply_language=\"en\"\n"
         << "- user_message=\"usa o mesmo endereco da anterior\" while active_task.type=create_camera => continue_active_task=true, selected_skill=\"create_camera\", mode=\"operate\", entity=\"camera\", intent=\"continue\"\n"
         << "- user_message=\"troca para 192.168.0.30\" while active_task.type=edit_camera => continue_active_task=true, selected_skill=\"edit_camera\", mode=\"operate\", entity=\"camera\", intent=\"continue\", arguments.operation_type=\"edit_camera\", arguments.operation_phase=\"editing_target\"\n"
         << "- user_message=\"How do I create an agent?\" => selected_skill=\"explain_app\", mode=\"answer\", entity=\"app_help\", intent=\"explain\", grounding_required=true, arguments.topic=\"camera_agents\", arguments.supporting_topics=[\"job_steps\"], reply_language=\"en\"\n"
@@ -360,7 +365,7 @@ std::string buildUserFacingAnswerSystemPrompt()
         << "Use correct punctuation, grammar, and natural wording.\n"
         << "Keep the answer concise, helpful, and product-focused.\n"
         << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or runtime wiring.\n"
-        << "Never mention internal skill names such as video_search, explain_app, read_state, create_camera, create_job, create_camera_agent, or chatv2.\n"
+        << "Never mention internal skill names such as video_search, explain_app, read_state, generate_report, create_camera, create_job, create_camera_agent, or chatv2.\n"
         << "Do not say that a response came from a skill, database, endpoint, or internal tool.\n"
         << "Do not invent live state or product capabilities that are not present in the draft.\n"
         << "Output only the final Markdown answer for the user.\n";
@@ -412,7 +417,7 @@ std::string buildDirectAnswerSystemPrompt()
         << "Keep the answer concise, helpful, and product-focused.\n"
         << "If the user asks for live account, camera, job, or agent state that would require inspection, do not invent it. Explain what can be checked instead.\n"
         << "Never mention internal implementation details such as source code, codebase, database, DB, backend, endpoint, router, payload, JSON, orchestrator, llama.cpp, llama-server, GGUF, or runtime wiring.\n"
-        << "Never mention internal skill names such as video_search, explain_app, read_state, create_camera, create_job, create_camera_agent, or chatv2.\n"
+        << "Never mention internal skill names such as video_search, explain_app, read_state, generate_report, create_camera, create_job, create_camera_agent, or chatv2.\n"
         << "Output only the final Markdown answer for the user.\n";
     return out.str();
 }

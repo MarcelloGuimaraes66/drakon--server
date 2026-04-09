@@ -219,6 +219,7 @@
     <ClInclude Include="orchestrator\skills\EditCamerasBatchSkill.h" />
     <ClInclude Include="orchestrator\skills\EditJobSkill.h" />
     <ClInclude Include="orchestrator\skills\ExplainAppSkill.h" />
+    <ClInclude Include="orchestrator\skills\GenerateReportSkill.h" />
     <ClInclude Include="orchestrator\skills\ReadStateSkill.h" />
     <ClInclude Include="orchestrator\skills\ScanNetworkSkill.h" />
     <ClInclude Include="orchestrator\skills\shared\AgentAuthoringShared.h" />
@@ -267,6 +268,7 @@
     <ClCompile Include="orchestrator\skills\EditCamerasBatchSkill.cpp" />
     <ClCompile Include="orchestrator\skills\EditJobSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ExplainAppSkill.cpp" />
+    <ClCompile Include="orchestrator\skills\GenerateReportSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ReadStateSkill.cpp" />
     <ClCompile Include="orchestrator\skills\ScanNetworkSkill.cpp" />
     <ClCompile Include="orchestrator\skills\shared\AgentAuthoringShared.cpp" />
