@@ -78,6 +78,7 @@ public:
     //void setOwner(AgentCore* owner) { owner_ = owner; }
 
     void setOwner(AgentCore* owner);
+    void setDirectServiceRequested(bool requested);
 
 
     void updateAlgorithms(std::vector<AlgorithmConfig> algos);
@@ -98,6 +99,7 @@ private:
     void captureLoop_();
     // Futuro:
     void inferenceLoop_();
+    std::string currentStartOrigin_() const;
 
     CameraConfig config_;
 
@@ -106,6 +108,7 @@ private:
 
     std::atomic<bool> running_{ false };
     std::atomic<bool> streamOnline_{ false };
+    std::atomic<bool> directServiceRequested_{ false };
     std::thread        captureThread_;
     std::thread     inferenceThread_;
 

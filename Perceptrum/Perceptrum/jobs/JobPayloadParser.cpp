@@ -20,6 +20,15 @@ static std::string safeString(const json& j, const char* k, const std::string& d
     return def;
 }
 
+static std::string safeJsonText(const json& j, const char* k, const std::string& def = "") {
+    if (!j.contains(k) || j[k].is_null()) return def;
+    if (j[k].is_string()) return j[k].get<std::string>();
+    if (j[k].is_object() || j[k].is_array() || j[k].is_boolean() || j[k].is_number()) {
+        return j[k].dump();
+    }
+    return def;
+}
+
 static std::string trimCopy_(std::string s) {
     auto is_space = [](unsigned char c) { return std::isspace(c); };
     while (!s.empty() && is_space((unsigned char)s.front())) s.erase(s.begin());
@@ -607,12 +616,12 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
     {
         const json& j = p["job"];
         out.job.id = j.value("id", -1);
-        out.job.user_id = j.value("user_id", "");
-        out.job.name = j.value("name", "");
+        out.job.user_id = safeString(j, "user_id");
+        out.job.name = safeString(j, "name");
         //out.job.description = j.value("description", "");
         out.job.description = safeString(j, "description");
-        out.job.timezone = j.value("timezone", "UTC");
-        out.job.schedule_mode = j.value("schedule_mode", "");
+        out.job.timezone = safeString(j, "timezone", "UTC");
+        out.job.schedule_mode = safeString(j, "schedule_mode");
         //out.job.active_from = j.value("active_from", "");
         out.job.active_from = safeString(j, "active_from");
         //out.job.active_until = j.value("active_until", "");
@@ -624,11 +633,11 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
 
     if (p.contains("trigger") && p["trigger"].is_object()) {
         out.trigger.raw = p["trigger"];
-        out.trigger.trigger_type = p["trigger"].value("trigger_type", "");
-        out.trigger.timezone = p["trigger"].value("timezone", out.job.timezone);
-        out.trigger.local_date = p["trigger"].value("local_date", "");
-        out.trigger.local_time = p["trigger"].value("local_time", "");
-        out.trigger.triggered_at_utc = p["trigger"].value("triggered_at_utc", "");
+        out.trigger.trigger_type = safeString(p["trigger"], "trigger_type");
+        out.trigger.timezone = safeString(p["trigger"], "timezone", out.job.timezone);
+        out.trigger.local_date = safeString(p["trigger"], "local_date");
+        out.trigger.local_time = safeString(p["trigger"], "local_time");
+        out.trigger.triggered_at_utc = safeString(p["trigger"], "triggered_at_utc");
     }
 
     if (p.contains("all_camera_ids") && p["all_camera_ids"].is_array()) {
@@ -669,7 +678,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
             const json& st = s["step"];
             step.id = st.value("id", -1);
             step.step_order = st.value("step_order", 0);
-            step.name = st.value("name", "");
+            step.name = safeString(st, "name");
             step.timeout_seconds = st.value("timeout_seconds", 0);
             step.input_from_step_id = optInt(st, "input_from_step_id");
             step.input_inject_key = safeString(st, "input_inject_key", "");
@@ -969,7 +978,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                 JobTarget tgt;
                 tgt.id = t.value("id", -1);
                 tgt.camera_id = t.value("camera_id", -1);
-                tgt.camera_name = t.value("camera_name", "");
+                tgt.camera_name = safeString(t, "camera_name");
                 if (tgt.camera_id >= 0) step.targets.push_back(std::move(tgt));
             }
         }
@@ -979,11 +988,11 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
             for (auto& a : s["agents"]) {
                 JobAgentDef ag;
                 ag.id = a.value("id", -1);
-                ag.agent_key = a.value("agent_key", "");
-                ag.prompt_template = a.value("prompt_template", "");
+                ag.agent_key = safeString(a, "agent_key");
+                ag.prompt_template = safeString(a, "prompt_template");
                 ag.priority_level = safeString(a, "priority_level", "");
-                ag.params_json = a.value("params", "{}");
-                ag.input_schema_json = a.value("input_schema", "{}");
+                ag.params_json = safeJsonText(a, "params", "{}");
+                ag.input_schema_json = safeJsonText(a, "input_schema", "{}");
                 ag.input_type = normalizeInputTypeValue(
                     safeString(a, "input_type", safeString(a, "inputType", "video"))
                 );
@@ -1092,13 +1101,13 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
             for (auto& ar : s["alerts"]) {
                 JobAlertRule r;
                 r.id = ar.value("id", -1);
-                r.condition_expr = ar.value("condition_expr", "true");
-                r.channel = ar.value("channel", "");
-                r.channel_params = ar.value("channel_params", "{}");
-                r.message_template = ar.value("message_template", "");
+                r.condition_expr = safeString(ar, "condition_expr", "true");
+                r.channel = safeString(ar, "channel");
+                r.channel_params = safeJsonText(ar, "channel_params", "{}");
+                r.message_template = safeString(ar, "message_template");
 
-                r.telegram_bot_token = ar.value("telegram_bot_token", "");
-                r.telegram_chat_id = ar.value("telegram_chat_id", "");
+                r.telegram_bot_token = safeString(ar, "telegram_bot_token");
+                r.telegram_chat_id = safeString(ar, "telegram_chat_id");
                 step.alerts.push_back(std::move(r));
             }
         }

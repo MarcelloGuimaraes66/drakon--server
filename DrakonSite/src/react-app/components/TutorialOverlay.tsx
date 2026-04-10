@@ -744,17 +744,24 @@ export default function TutorialOverlay() {
     return null;
   };
 
-  const waitForTargetMatch = async <TElement extends HTMLElement>(
+  const waitForTargetMatchOrDisappear = async <TElement extends HTMLElement>(
     selector: string,
     predicate: (element: TElement) => boolean,
+    initialElementSeen: boolean,
     timeoutMs = TARGET_POLL_TIMEOUT_MS
-  ): Promise<TElement | null> => {
+  ): Promise<TElement | "disappeared" | null> => {
     const startedAt = Date.now();
+    let hasObservedElement = initialElementSeen;
 
     while (Date.now() - startedAt < timeoutMs) {
       const element = document.querySelector<TElement>(selector);
-      if (element && predicate(element)) {
-        return element;
+      if (element) {
+        hasObservedElement = true;
+        if (predicate(element)) {
+          return element;
+        }
+      } else if (hasObservedElement) {
+        return "disappeared";
       }
 
       await new Promise((resolve) => setTimeout(resolve, TARGET_POLL_INTERVAL_MS));
@@ -828,13 +835,14 @@ export default function TutorialOverlay() {
 
       if (startButton?.dataset.cameraRunning !== "true") {
         startButton?.click();
-        const runningButton = await waitForTargetMatch<HTMLButtonElement>(
+        const startResult = await waitForTargetMatchOrDisappear<HTMLButtonElement>(
           selector,
           (element) => element.dataset.cameraRunning === "true",
+          Boolean(startButton),
           6000
         );
 
-        if (!runningButton) {
+        if (!startResult) {
           return;
         }
       }

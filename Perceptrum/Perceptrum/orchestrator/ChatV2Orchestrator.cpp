@@ -321,6 +321,14 @@ bool hasObservationCue_(const std::string& normalized)
     });
 }
 
+bool hasQuickPresenceCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "tem alguem", "ha alguem", "existe alguem",
+        "tem pessoa", "ha pessoa", "existe pessoa"
+    });
+}
+
 bool hasVideoMediumCue_(const std::string& normalized)
 {
     return containsAny_(normalized, {
@@ -410,6 +418,14 @@ bool hasCameraInventoryAnalysisCue_(const std::string& normalized)
     });
 }
 
+bool hasCameraLiveStateCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "status", "online", "offline", "service", "running", "active",
+        "estado", "rodando", "ativo", "ativa", "em execucao"
+    });
+}
+
 bool shouldUseReadStateForCameraInventory_(
     const std::string& normalized,
     const RoutingLexiconSignals& signals)
@@ -419,6 +435,20 @@ bool shouldUseReadStateForCameraInventory_(
     }
 
     if (signals.wantsCreate || signals.wantsEdit || signals.wantsStart || signals.wantsStop) {
+        return false;
+    }
+
+    // Footage questions should stay on the video path even if they mention a
+    // camera and end with a question mark.
+    const bool looksLikeFootageObservation =
+        hasVideoMediumCue_(normalized) &&
+        (hasObservationCue_(normalized) ||
+         hasQuickPresenceCue_(normalized) ||
+         hasTimeWindowCue_(normalized)) &&
+        !hasConnectionConfigCue_(normalized) &&
+        !hasCameraInventoryAnalysisCue_(normalized) &&
+        !hasCameraLiveStateCue_(normalized);
+    if (looksLikeFootageObservation) {
         return false;
     }
 
@@ -1573,6 +1603,267 @@ nlohmann::json sanitizeVideoRoutingScope_(const nlohmann::json& source)
     return sanitized;
 }
 
+std::string sanitizeVideoRoutingImageUrl_(const std::string& raw)
+{
+    const std::string value = truncateForContext_(raw, 600);
+    if (value.empty()) {
+        return std::string();
+    }
+    const std::string lower = lowerAsciiCopy_(value);
+    if (lower.rfind("data:", 0) == 0) {
+        return std::string();
+    }
+    return value;
+}
+
+nlohmann::json sanitizeVideoRoutingIdentityCard_(const nlohmann::json& source)
+{
+    nlohmann::json sanitized = nlohmann::json::object();
+    if (!source.is_object()) {
+        return sanitized;
+    }
+
+    const auto copyStringField = [&](const char* key, std::size_t maxChars) {
+        if (key == nullptr || !source.contains(key) || !source[key].is_string()) {
+            return;
+        }
+        const std::string value = truncateForContext_(source[key].get<std::string>(), maxChars);
+        if (!value.empty()) {
+            sanitized[key] = value;
+        }
+    };
+    const auto copyStringArrayField = [&](const char* key, std::size_t maxItems, std::size_t maxChars) {
+        if (key == nullptr || !source.contains(key) || !source[key].is_array()) {
+            return;
+        }
+        nlohmann::json values = nlohmann::json::array();
+        std::vector<std::string> seen;
+        for (const auto& item : source[key]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            const std::string value = truncateForContext_(item.get<std::string>(), maxChars);
+            if (value.empty() ||
+                std::find(seen.begin(), seen.end(), value) != seen.end())
+            {
+                continue;
+            }
+            seen.push_back(value);
+            values.push_back(value);
+            if (values.size() >= maxItems) {
+                break;
+            }
+        }
+        if (!values.empty()) {
+            sanitized[key] = std::move(values);
+        }
+    };
+
+    copyStringField("card_id", 160);
+    copyStringField("entity_id", 120);
+    copyStringField("entity_type", 64);
+    copyStringField("display_name", 160);
+    copyStringField("known_name", 160);
+    copyStringField("description", 320);
+    copyStringField("identity_signature_summary", 320);
+    copyStringArrayField("aliases", 8, 120);
+    copyStringArrayField("identity_signature_traits", 8, 120);
+    copyStringArrayField("key_traits", 8, 120);
+    copyStringArrayField("stable_attributes", 8, 120);
+
+    if (source.contains("resolved_identity") && source["resolved_identity"].is_object()) {
+        nlohmann::json resolvedIdentity = nlohmann::json::object();
+        const auto& resolvedSource = source["resolved_identity"];
+        if (resolvedSource.contains("target_name") && resolvedSource["target_name"].is_string()) {
+            const std::string value = truncateForContext_(resolvedSource["target_name"].get<std::string>(), 160);
+            if (!value.empty()) resolvedIdentity["target_name"] = value;
+        }
+        if (resolvedSource.contains("target_description") && resolvedSource["target_description"].is_string()) {
+            const std::string value =
+                truncateForContext_(resolvedSource["target_description"].get<std::string>(), 240);
+            if (!value.empty()) resolvedIdentity["target_description"] = value;
+        }
+        if (resolvedSource.contains("source") && resolvedSource["source"].is_string()) {
+            const std::string value = truncateForContext_(resolvedSource["source"].get<std::string>(), 64);
+            if (!value.empty()) resolvedIdentity["source"] = value;
+        }
+        if (resolvedSource.contains("target_id") && resolvedSource["target_id"].is_number_integer()) {
+            const int targetId = resolvedSource["target_id"].get<int>();
+            if (targetId > 0) resolvedIdentity["target_id"] = targetId;
+        }
+        if (!resolvedIdentity.empty()) {
+            sanitized["resolved_identity"] = std::move(resolvedIdentity);
+        }
+    }
+
+    if (source.contains("primary_portrait") && source["primary_portrait"].is_object()) {
+        const auto& portraitSource = source["primary_portrait"];
+        nlohmann::json portrait = nlohmann::json::object();
+        if (portraitSource.contains("asset_id") && portraitSource["asset_id"].is_string()) {
+            const std::string value = truncateForContext_(portraitSource["asset_id"].get<std::string>(), 160);
+            if (!value.empty()) portrait["asset_id"] = value;
+        }
+        if (portraitSource.contains("portrait_kind") && portraitSource["portrait_kind"].is_string()) {
+            const std::string value =
+                truncateForContext_(portraitSource["portrait_kind"].get<std::string>(), 64);
+            if (!value.empty()) portrait["portrait_kind"] = value;
+        }
+        if (portraitSource.contains("timestamp_utc_iso") && portraitSource["timestamp_utc_iso"].is_string()) {
+            const std::string value =
+                truncateForContext_(portraitSource["timestamp_utc_iso"].get<std::string>(), 64);
+            if (!value.empty()) portrait["timestamp_utc_iso"] = value;
+        }
+        if (portraitSource.contains("camera_name") && portraitSource["camera_name"].is_string()) {
+            const std::string value =
+                truncateForContext_(portraitSource["camera_name"].get<std::string>(), 120);
+            if (!value.empty()) portrait["camera_name"] = value;
+        }
+        if (portraitSource.contains("camera_id") && portraitSource["camera_id"].is_number_integer()) {
+            const int cameraId = portraitSource["camera_id"].get<int>();
+            if (cameraId > 0) portrait["camera_id"] = cameraId;
+        }
+        if (portraitSource.contains("image_url") && portraitSource["image_url"].is_string()) {
+            const std::string imageUrl =
+                sanitizeVideoRoutingImageUrl_(portraitSource["image_url"].get<std::string>());
+            if (!imageUrl.empty()) portrait["image_url"] = imageUrl;
+        }
+        if (!portrait.empty()) {
+            sanitized["primary_portrait"] = std::move(portrait);
+        }
+    }
+
+    if (source.contains("portrait_url") && source["portrait_url"].is_string()) {
+        const std::string portraitUrl =
+            sanitizeVideoRoutingImageUrl_(source["portrait_url"].get<std::string>());
+        if (!portraitUrl.empty()) {
+            sanitized["portrait_url"] = portraitUrl;
+        }
+    }
+
+    return sanitized;
+}
+
+nlohmann::json sanitizeVideoRoutingLastPositiveHit_(const nlohmann::json& source)
+{
+    nlohmann::json sanitized = nlohmann::json::object();
+    if (!source.is_object()) {
+        return sanitized;
+    }
+
+    const auto copyStringField = [&](const char* key, std::size_t maxChars) {
+        if (key == nullptr || !source.contains(key) || !source[key].is_string()) {
+            return;
+        }
+        const std::string value = truncateForContext_(source[key].get<std::string>(), maxChars);
+        if (!value.empty()) {
+            sanitized[key] = value;
+        }
+    };
+    const auto copyStringArrayField = [&](const char* key, std::size_t maxItems, std::size_t maxChars) {
+        if (key == nullptr || !source.contains(key) || !source[key].is_array()) {
+            return;
+        }
+        nlohmann::json values = nlohmann::json::array();
+        std::vector<std::string> seen;
+        for (const auto& item : source[key]) {
+            if (!item.is_string()) {
+                continue;
+            }
+            const std::string value = truncateForContext_(item.get<std::string>(), maxChars);
+            if (value.empty() ||
+                std::find(seen.begin(), seen.end(), value) != seen.end())
+            {
+                continue;
+            }
+            seen.push_back(value);
+            values.push_back(value);
+            if (values.size() >= maxItems) {
+                break;
+            }
+        }
+        if (!values.empty()) {
+            sanitized[key] = std::move(values);
+        }
+    };
+    const auto copyIntegerArrayField = [&](const char* key, std::size_t maxItems) {
+        if (key == nullptr || !source.contains(key) || !source[key].is_array()) {
+            return;
+        }
+        nlohmann::json values = nlohmann::json::array();
+        for (const auto& item : source[key]) {
+            if (!item.is_number_integer()) {
+                continue;
+            }
+            const int value = item.get<int>();
+            if (value <= 0) {
+                continue;
+            }
+            values.push_back(value);
+            if (values.size() >= maxItems) {
+                break;
+            }
+        }
+        if (!values.empty()) {
+            sanitized[key] = std::move(values);
+        }
+    };
+
+    copyIntegerArrayField("camera_ids", 8);
+    copyStringArrayField("camera_names", 8, 120);
+    if (source.contains("all_cameras") && source["all_cameras"].is_boolean()) {
+        sanitized["all_cameras"] = source["all_cameras"].get<bool>();
+    }
+    if (source.contains("time_window_minutes_before_now") &&
+        source["time_window_minutes_before_now"].is_number_integer())
+    {
+        sanitized["time_window_minutes_before_now"] =
+            (std::max)(0, source["time_window_minutes_before_now"].get<int>());
+    }
+    if (source.contains("camera_id") && source["camera_id"].is_number_integer()) {
+        const int cameraId = source["camera_id"].get<int>();
+        if (cameraId > 0) sanitized["camera_id"] = cameraId;
+    }
+
+    copyStringField("camera_name", 120);
+    copyStringField("query", 240);
+    copyStringField("segment_start_ts", 64);
+    copyStringField("segment_end_ts", 64);
+    copyStringField("event_timestamp_utc_iso", 64);
+    copyStringField("event_timestamp_local_iso", 64);
+    copyStringField("primary_identity_card_id", 160);
+    copyStringField("display_name", 160);
+    copyStringField("updated_at", 64);
+    copyStringArrayField("detection_time_in_video", 4, 64);
+    copyStringArrayField("matched_entity_ids", 8, 120);
+
+    if (source.contains("identity_cards") && source["identity_cards"].is_array()) {
+        nlohmann::json cards = nlohmann::json::array();
+        for (const auto& item : source["identity_cards"]) {
+            nlohmann::json card = sanitizeVideoRoutingIdentityCard_(item);
+            if (card.empty()) {
+                continue;
+            }
+            cards.push_back(std::move(card));
+            if (cards.size() >= 3) {
+                break;
+            }
+        }
+        if (!cards.empty()) {
+            sanitized["identity_cards"] = std::move(cards);
+        }
+    }
+
+    if (source.contains("portrait_url") && source["portrait_url"].is_string()) {
+        const std::string portraitUrl =
+            sanitizeVideoRoutingImageUrl_(source["portrait_url"].get<std::string>());
+        if (!portraitUrl.empty()) {
+            sanitized["portrait_url"] = portraitUrl;
+        }
+    }
+
+    return sanitized;
+}
+
 std::string videoRoutingScopeKey_(const nlohmann::json& scope)
 {
     if (!scope.is_object()) {
@@ -1658,6 +1949,11 @@ nlohmann::json buildVideoRoutingContext_(const nlohmann::json& conversationConte
         }
         if (!lastScope.empty()) {
             routingContext["last_video_scope"] = lastScope;
+        }
+        nlohmann::json lastPositiveHit = sanitizeVideoRoutingLastPositiveHit_(
+            sessionEntities.value("last_positive_hit", nlohmann::json::object()));
+        if (!lastPositiveHit.empty()) {
+            routingContext["last_positive_hit"] = std::move(lastPositiveHit);
         }
     }
 
@@ -1988,6 +2284,18 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
     nlohmann::json effectivePayload = payload;
     if (!effectivePayload.is_object()) {
         effectivePayload = nlohmann::json::object();
+    }
+    if (!selection.replyLanguage.empty()) {
+        effectivePayload["reply_language"] = selection.replyLanguage;
+        effectivePayload["language"] = selection.replyLanguage;
+    }
+    else if (queryLanguageSourceFromPayload_(payload) != "detected") {
+        if (effectivePayload.contains("reply_language")) {
+            effectivePayload.erase("reply_language");
+        }
+        if (effectivePayload.contains("language")) {
+            effectivePayload.erase("language");
+        }
     }
     if (selection.selectedSkill == "video_search") {
         const nlohmann::json videoRoutingContext = buildVideoRoutingContext_(conversationContext);
@@ -2328,6 +2636,13 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             buildActiveBatchContinuationSelection_(conversationContext));
     }
 
+    if (!heuristic.selectedSkill.empty() &&
+        (heuristic.reason == "uploaded_media_requires_video_search" ||
+         heuristic.reason == "prefer_identity_recall"))
+    {
+        return finalizeForcedSelection(heuristic);
+    }
+
     if (llm.isConfigured()) {
         nlohmann::json requestContext = {
             { "chat_session_id", hasPayloadObject ? payload.value("chat_session_id", -1) : -1 },
@@ -2500,6 +2815,19 @@ SkillSelection ChatV2Orchestrator::chooseHeuristicSkill_(
         selection.mode = "operate";
         selection.entity = "video";
         selection.intent = "inspect";
+        return selection;
+    }
+
+    if (payload.is_object() &&
+        payload.value("prefer_identity_recall", false))
+    {
+        selection.selectedSkill = "video_search";
+        selection.confidence = 0.98;
+        selection.reason = "prefer_identity_recall";
+        selection.replyPreview = "Vou recuperar a identidade mais relevante desta conversa.";
+        selection.mode = "read";
+        selection.entity = "identity";
+        selection.intent = "recall";
         return selection;
     }
 
@@ -2840,30 +3168,30 @@ bool ChatV2Orchestrator::finalizeAsChatMessage_(
         return false;
     }
 
-    nlohmann::json routerResult = {
+    nlohmann::json responseBody = {
         { "chat_session_id", chatSessionId },
         { "command_id", commandId },
         { "original_query", originalQuery },
-        { "camera_ids", nlohmann::json::array() },
-        { "camera_names", nlohmann::json::array() },
-        { "all_cameras", false },
-        { "time_window_minutes_before_now", 0 },
         { "answer", result.answer },
+        { "response_type", "final" },
         { "model_prompt_tokens", 0 },
         { "model_output_tokens", 0 },
         { "model_total_tokens", 0 },
     };
+    if (!selection.replyLanguage.empty()) {
+        responseBody["reply_language"] = selection.replyLanguage;
+    }
     if (result.metadata.is_object() &&
         result.metadata.contains("message_metadata") &&
         result.metadata["message_metadata"].is_object()) {
-        routerResult["message_metadata"] = result.metadata["message_metadata"];
+        responseBody["message_metadata"] = result.metadata["message_metadata"];
     }
 
     const std::string url =
-        agent.getBackendBaseUrl() + "/api/agent/chat-router-result?client_id=" + agent.getClientId();
+        agent.getBackendBaseUrl() + "/api/agent/chat-response?client_id=" + agent.getClientId();
     const HttpResponse response = postJson(
         url,
-        routerResult.dump(),
+        responseBody.dump(),
         agent.getExeToken());
 
     Logger::instance().logDebug(

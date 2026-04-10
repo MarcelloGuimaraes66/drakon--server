@@ -182,6 +182,16 @@ interface SubmitCameraBatchEditOptions {
   sourceMessageId: number;
 }
 
+export interface UpdateIdentityCardOptions {
+  entity_id: string;
+  entity_type?: string;
+  target_name?: string;
+  physical_traits?: string[];
+  save_as_face_target?: boolean;
+  portrait_data_url?: string | null;
+  card_snapshot?: Record<string, unknown> | null;
+}
+
 export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSessionConfig) {
   const disableWebSocket = import.meta.env.VITE_DISABLE_WS === "true";
   const [isLoading, setIsLoading] = useState(false);
@@ -750,6 +760,65 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     [sessionId, upsertMessages]
   );
 
+  const updateIdentityCard = useCallback(
+    async ({
+      entity_id,
+      entity_type,
+      target_name,
+      physical_traits,
+      save_as_face_target,
+      portrait_data_url,
+      card_snapshot,
+    }: UpdateIdentityCardOptions) => {
+      if (!sessionId) {
+        throw new Error("No active chat session.");
+      }
+      if (!String(entity_id || "").trim()) {
+        throw new Error("entity_id is required.");
+      }
+
+      setError(null);
+      setWarning(null);
+
+      try {
+        const response = await fetch(`/api/chat/sessions/${sessionId}/identity-cards/upsert`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            entity_id: String(entity_id).trim(),
+            entity_type: typeof entity_type === "string" ? entity_type.trim() : undefined,
+            target_name: typeof target_name === "string" ? target_name.trim() : undefined,
+            physical_traits: Array.isArray(physical_traits) ? physical_traits : [],
+            save_as_face_target: save_as_face_target === true,
+            portrait_data_url: typeof portrait_data_url === "string" ? portrait_data_url : null,
+            card_snapshot: card_snapshot && typeof card_snapshot === "object" ? card_snapshot : null,
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          if (Array.isArray((data as any)?.messages)) {
+            upsertMessages((data as any).messages);
+          }
+          const errorText =
+            typeof (data as any)?.error === "string"
+              ? (data as any).error
+              : "Failed to update identity card";
+          setError(errorText);
+          throw new Error(errorText);
+        }
+
+        if (Array.isArray((data as any)?.messages)) {
+          upsertMessages((data as any).messages);
+        }
+      } catch (err) {
+        console.error("Failed to update identity card:", err);
+        throw err;
+      }
+    },
+    [sessionId, upsertMessages]
+  );
+
   const cancelMessage = useCallback(async ({ reason = "manual" }: CancelMessageOptions = {}) => {
     if (!sessionId) return;
 
@@ -816,6 +885,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     submitCameraRegistration,
     submitCameraBatchRegistration,
     submitCameraBatchEdit,
+    updateIdentityCard,
     cancelMessage,
     clearError,
     clearWarning,

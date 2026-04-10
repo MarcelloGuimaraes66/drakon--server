@@ -84,9 +84,9 @@ export async function toggleCameraService({
 }: ToggleCameraServiceOptions): Promise<ToggleCameraServiceResult> {
   const nextRunning: 0 | 1 = isRunning ? 0 : 1;
 
-  await setCameraServiceRunning(cameraId, nextRunning);
-
   if (!isRunning) {
+    await setCameraServiceRunning(cameraId, nextRunning);
+
     const response = await fetch(`/api/cameras/${cameraId}/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -111,27 +111,20 @@ export async function toggleCameraService({
     };
   }
 
-  const response = await fetch("/api/commands", {
+  const response = await fetch(`/api/cameras/${cameraId}/stop`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      camera_id: cameraId,
-      command_type: "stop_camera",
-      payload: JSON.stringify({ camera_id: cameraId }),
-    }),
     credentials: "include",
   });
 
   const payload = await readResponsePayload(response);
   if (!response.ok) {
-    await rollbackCameraServiceRunning(cameraId, 1);
     throw new Error(getErrorMessage(payload, "Failed to stop camera"));
   }
 
   return {
     nextRunning,
     agentsDisabledNoSubscription: false,
-    cameraName: null,
+    cameraName: getOptionalString(payload.camera_name),
     runningAnalytics: [],
   };
 }

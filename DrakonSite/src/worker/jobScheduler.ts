@@ -2958,45 +2958,11 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                 }
 
                 // Get all distinct camera IDs from job step targets
-                const { results: targetRows } = await env.DB.prepare(
-                  `SELECT DISTINCT jst.camera_id
-                   FROM job_step_targets jst
-                   JOIN job_steps js ON jst.step_id = js.id
-                   WHERE js.job_id = ?`
-                ).bind(j.id).all();
-
-                const allCameraIds = (targetRows || []).map((row: any) => row.camera_id);
-                let filteredCameraIds: number[] = [];
-
-                if (allCameraIds.length > 0) {
-                  // Filter to running cameras only
-                  const placeholders = allCameraIds.map(() => "?").join(", ");
-                  const { results: runningCameras } = await env.DB.prepare(
-                    `SELECT id FROM cameras 
-                     WHERE user_id = ? AND id IN (${placeholders}) AND is_service_running = 1`
-                  ).bind(j.user_id, ...allCameraIds).all();
-
-                  const runningCameraIds = (runningCameras || []).map((row: any) => row.id);
-
-                  if (runningCameraIds.length > 0) {
-                    // Exclude cameras with enabled AI agents
-                    const runningPlaceholders = runningCameraIds.map(() => "?").join(", ");
-                    const { results: agentCameras } = await env.DB.prepare(
-                      `SELECT DISTINCT camera_id FROM camera_algorithms
-                       WHERE camera_id IN (${runningPlaceholders}) AND is_enabled = 1`
-                    ).bind(...runningCameraIds).all();
-
-                    const camerasWithAgents = new Set((agentCameras || []).map((row: any) => row.camera_id));
-                    filteredCameraIds = runningCameraIds.filter((cameraId: number) => !camerasWithAgents.has(cameraId));
-                  }
-                }
-
                 // Build job_stop payload
                 const jobStopPayload = {
                   job: { id: j.id, name: j.name },
                   requested_at_utc: nowUtc,
                   reason: "schedule_window_end",
-                  camera_ids: filteredCameraIds,
                 };
 
                 // Enqueue job_stop command
@@ -3009,16 +2975,6 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                   nowUtc,
                   nowUtc
                 ).run();
-
-                // Update cameras table for filtered cameras
-                if (filteredCameraIds.length > 0) {
-                  const cameraPlaceholders = filteredCameraIds.map(() => "?").join(", ");
-                  await env.DB.prepare(
-                    `UPDATE cameras 
-                     SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP
-                     WHERE user_id = ? AND id IN (${cameraPlaceholders})`
-                  ).bind(j.user_id, ...filteredCameraIds).run();
-                }
 
                 // Upsert job_runtime_states to 'stopping'
                 await env.DB.prepare(
@@ -3039,7 +2995,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                   nowUtc
                 ).run();
 
-                console.log(`[JOB SCHEDULER] Enqueued job_stop for job ${j.id} (${j.name}), stopped ${filteredCameraIds.length} cameras`);
+                console.log(`[JOB SCHEDULER] Enqueued job_stop for job ${j.id} (${j.name})`);
 
               } catch (err) {
                 console.error(`[JOB SCHEDULER] Error stopping job ${j.id}:`, err);

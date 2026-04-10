@@ -610,6 +610,10 @@ function detectChatMessageLanguageRobust(
     "camera", "cameras", "explica", "ajuda", "configuracao", "chave", "parear",
     "funciona", "cadastrar", "cadastre", "adicionar", "adicione", "escanear",
     "escaneie", "scaneie", "rede", "quais", "diga", "estao", "presentes",
+    "procura", "procure", "buscar", "busque", "busca", "pesquise", "pesquisa",
+    "veja", "ve", "traga", "mostre", "mostra", "quem", "pessoa", "pessoas",
+    "essa", "esse", "dessa", "desse", "sobre", "sabemos", "alguma", "existe",
+    "ultimo", "minuto",
   ]);
   scores.fr += scoreLanguageTokens(tokens, [
     "comment", "quand", "paiement", "abonnement", "explique", "aide",
@@ -649,6 +653,101 @@ function detectChatMessageLanguageRobust(
   }
 
   return { language: bestLanguage ?? fallback, source: "detected" };
+}
+
+function extractReplyLanguageFromChatTaskState(
+  taskStateInput: unknown
+): string {
+  const taskState = normalizeChatTaskState(taskStateInput);
+  const candidateValues: unknown[] = [];
+  const activeTask =
+    taskState.active_task && typeof taskState.active_task === "object"
+      ? (taskState.active_task as Record<string, unknown>)
+      : null;
+  if (activeTask) {
+    candidateValues.push(activeTask.reply_language, activeTask.language);
+  }
+  if (Array.isArray(taskState.recent_tasks)) {
+    for (const item of taskState.recent_tasks.slice(0, 4)) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const recentTask = item as Record<string, unknown>;
+      candidateValues.push(recentTask.reply_language, recentTask.language);
+    }
+  }
+
+  for (const value of candidateValues) {
+    const normalized = normalizeSupportedChatLanguage(value, "");
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+async function resolveChatSessionReplyLanguageHint(
+  db: D1Database,
+  userId: string,
+  sessionId: number,
+  fallbackLanguage: string,
+  options?: {
+    currentMessage?: string | null;
+    taskState?: unknown;
+    excludeMessageId?: number | null;
+  }
+): Promise<string> {
+  const fallback = normalizeSupportedChatLanguage(fallbackLanguage, "en");
+  const currentMessage =
+    typeof options?.currentMessage === "string" ? options.currentMessage : "";
+  if (currentMessage.trim()) {
+    const detected = detectChatMessageLanguageRobust(currentMessage, fallback);
+    if (detected.source === "detected") {
+      return detected.language;
+    }
+  }
+
+  const taskStateLanguage = extractReplyLanguageFromChatTaskState(options?.taskState);
+  if (taskStateLanguage) {
+    return taskStateLanguage;
+  }
+
+  const excludeMessageId =
+    typeof options?.excludeMessageId === "number" && Number.isFinite(options.excludeMessageId)
+      ? Math.trunc(options.excludeMessageId)
+      : 0;
+
+  const query =
+    excludeMessageId > 0
+      ? `SELECT id, content
+         FROM chat_messages
+         WHERE user_id = ? AND session_id = ? AND role = 'user' AND id < ?
+         ORDER BY id DESC
+         LIMIT 6`
+      : `SELECT id, content
+         FROM chat_messages
+         WHERE user_id = ? AND session_id = ? AND role = 'user'
+         ORDER BY id DESC
+         LIMIT 6`;
+
+  const statement =
+    excludeMessageId > 0
+      ? db.prepare(query).bind(userId, sessionId, excludeMessageId)
+      : db.prepare(query).bind(userId, sessionId);
+  const { results } = await statement.all();
+
+  for (const row of results || []) {
+    const content = typeof (row as any)?.content === "string" ? String((row as any).content) : "";
+    if (!content.trim()) {
+      continue;
+    }
+    const detected = detectChatMessageLanguageRobust(content, fallback);
+    if (detected.source === "detected") {
+      return detected.language;
+    }
+  }
+
+  return "";
 }
 
 function buildExeHeartbeatSummary(pairing: any | null) {
@@ -813,6 +912,464 @@ function countTemporalContributingEvents(payloadDetails: any): number {
   }
 
   return seen.size;
+}
+
+type DashboardAlertOriginKind = "job" | "camera_agent";
+
+type DashboardAlertFilters = {
+  q?: string | null;
+  severity?: string | null;
+  origin?: string | null;
+  jobId?: number | null;
+  agentKey?: string | null;
+};
+
+type DashboardAlertPageOptions = DashboardAlertFilters & {
+  beforeId?: number | null;
+  afterId?: number | null;
+  limit?: number | null;
+};
+
+function readDashboardAlertString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+function buildDashboardAlertMediaUrl(value: string | null): string | null {
+  if (!value) return null;
+  if (value.startsWith("http://") || value.startsWith("https://") || value.startsWith("/api/")) {
+    return value;
+  }
+  const filename = value.split(/[\\/]/).pop();
+  return filename ? `/api/detections/${filename}` : null;
+}
+
+function normalizeDashboardAlertText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeDashboardAlertOriginKind(eventType: unknown): DashboardAlertOriginKind | null {
+  const normalizedEventType = String(eventType || "").trim().toLowerCase();
+  if (normalizedEventType === "job_alert_triggered") return "job";
+  if (normalizedEventType === "ai_detection") return "camera_agent";
+  return null;
+}
+
+function resolveDashboardAlertAgentLabel(
+  agentKey: string | null,
+  preferredLabel: string | null,
+): string | null {
+  if (preferredLabel) return preferredLabel;
+  if (!agentKey) return null;
+  const trimmed = agentKey.trim();
+  if (!trimmed) return null;
+  return humanizeAlgorithmTypeLabel(trimmed) || trimmed;
+}
+
+function buildDashboardAlertSearchText(input: {
+  cameraName?: string | null;
+  algoType?: string | null;
+  agentKey?: string | null;
+  agentLabel?: string | null;
+  jobName?: string | null;
+  stepName?: string | null;
+  groupName?: string | null;
+  message?: string | null;
+}) {
+  return normalizeDashboardAlertText(
+    [
+      input.cameraName,
+      input.algoType,
+      input.agentKey,
+      input.agentLabel,
+      input.jobName,
+      input.stepName,
+      input.groupName,
+      input.message,
+    ]
+      .filter((value) => typeof value === "string" && value.trim().length > 0)
+      .join(" "),
+  );
+}
+
+function normalizeDashboardAlertRow(row: any) {
+  let details: Record<string, any> = {};
+  try {
+    const parsed =
+      row?.details_json && typeof row.details_json === "string"
+        ? JSON.parse(row.details_json)
+        : row?.details_json;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      details = parsed as Record<string, any>;
+    }
+  } catch {
+    details = {};
+  }
+
+  const eventType = typeof row?.event_type === "string" ? row.event_type : "";
+  const originKind = normalizeDashboardAlertOriginKind(eventType);
+  const contributingEventsCount = Math.max(
+    0,
+    Number(details?.contributing_events_count) || countTemporalContributingEvents(details),
+  );
+  const groupImageCount = Math.max(
+    0,
+    Number(details?.group_image_count) ||
+      (Array.isArray(details?.group_image_urls) ? details.group_image_urls.length : 0),
+  );
+  details.contributing_events_count = contributingEventsCount;
+  details.group_image_count = groupImageCount;
+
+  const directVideoUrl = readDashboardAlertString(details?.video_url, details?.videoUrl);
+  const directImageUrl = readDashboardAlertString(details?.image_url, details?.imageUrl);
+  const videoKey = readDashboardAlertString(details?.video_key, details?.videoKey);
+  const imageKey = readDashboardAlertString(details?.image_key, details?.imageKey);
+  const mediaType = readDashboardAlertString(details?.media_type, details?.mediaType);
+  const rawAgentKey = readDashboardAlertString(
+    details?.algorithm_type,
+    details?.algorithmType,
+    details?.agent_key,
+    details?.agentKey,
+    details?.algo_type,
+    details?.algoType,
+  );
+  const agentLabel = resolveDashboardAlertAgentLabel(
+    rawAgentKey,
+    readDashboardAlertString(
+      details?.algo_type,
+      details?.algoType,
+      details?.agent_label,
+      details?.agentLabel,
+      details?.display_name,
+      details?.displayName,
+    ),
+  );
+  const algoType = readDashboardAlertString(details?.algo_type, details?.algoType, agentLabel, rawAgentKey);
+  const detectedAt = readDashboardAlertString(
+    details?.timestamp_iso,
+    details?.detected_at,
+    details?.detectedAt,
+    row?.created_at,
+  );
+  const clipPath = readDashboardAlertString(details?.clip_path, details?.clipPath);
+  const imagePath = readDashboardAlertString(details?.image_path, details?.imagePath);
+  const clipUrl = directVideoUrl || buildDashboardAlertMediaUrl(clipPath);
+  const imageUrl = directImageUrl || buildDashboardAlertMediaUrl(imagePath);
+
+  const rawCameraId = Number(row?.camera_id ?? details?.camera_id ?? details?.cameraId);
+  const cameraId = Number.isInteger(rawCameraId) && rawCameraId > 0 ? rawCameraId : null;
+  const cameraName = readDashboardAlertString(details?.camera_name, details?.cameraName, row?.camera_name);
+  const rawJobId = Number(details?.job_id ?? details?.jobId ?? details?.job?.id);
+  const jobId = Number.isInteger(rawJobId) && rawJobId > 0 ? rawJobId : null;
+  const jobName = readDashboardAlertString(details?.job_name, details?.job?.name) || (jobId ? `Job #${jobId}` : null);
+  const rawStepId = Number(
+    details?.step_id ??
+      details?.stepId ??
+      details?.step_order ??
+      details?.stepOrder,
+  );
+  const stepId = Number.isInteger(rawStepId) && rawStepId > 0 ? rawStepId : null;
+  const stepName = readDashboardAlertString(details?.step_name, details?.stepName);
+  const groupName = readDashboardAlertString(details?.group_name, details?.groupName, row?.group_name);
+  const message = typeof row?.message === "string" ? row.message : "";
+  const normalizedPriority =
+    eventType === "job_alert_triggered"
+      ? normalizeJobStepPriorityLevel(
+          details?.priority_level ?? details?.priorityLevel ?? details?.priority,
+        )
+      : null;
+  const searchText = buildDashboardAlertSearchText({
+    cameraName,
+    algoType,
+    agentKey: rawAgentKey,
+    agentLabel,
+    jobName,
+    stepName,
+    groupName,
+    message,
+  });
+
+  return {
+    id: Number(row?.id) || 0,
+    camera_id: cameraId,
+    camera_name: cameraName,
+    event_type: eventType,
+    origin_kind: originKind,
+    algo_type: algoType,
+    agent_key: rawAgentKey,
+    agent_label: agentLabel,
+    job_id: jobId,
+    job_name: jobName,
+    step_id: stepId,
+    step_name: stepName,
+    message,
+    created_at: row?.created_at || null,
+    detected_at: detectedAt,
+    details,
+    priority_level: normalizedPriority,
+    media_type: mediaType,
+    contributing_events_count: contributingEventsCount,
+    group_image_count: groupImageCount,
+    video_key: videoKey,
+    image_key: imageKey,
+    video_url: clipUrl,
+    clip_url: clipUrl,
+    image_url: imageUrl,
+    image_path: imagePath,
+    search_text: searchText,
+  };
+}
+
+function matchesDashboardAlertFilters(alert: any, filters: DashboardAlertFilters): boolean {
+  const severityFilter = String(filters.severity || "").trim().toUpperCase();
+  if (severityFilter && severityFilter !== "ALL") {
+    const normalizedSeverity = normalizeJobStepPriorityLevel(severityFilter);
+    if (!normalizedSeverity || alert?.priority_level !== normalizedSeverity) {
+      return false;
+    }
+  }
+
+  const originFilter = normalizeDashboardAlertText(filters.origin);
+  if (originFilter && originFilter !== "all") {
+    if (originFilter !== "job" && originFilter !== "camera_agent") {
+      return false;
+    }
+    if (String(alert?.origin_kind || "") !== originFilter) {
+      return false;
+    }
+  }
+
+  const normalizedJobId = Number(filters.jobId);
+  if (Number.isInteger(normalizedJobId) && normalizedJobId > 0) {
+    if (Number(alert?.job_id) !== normalizedJobId) {
+      return false;
+    }
+  }
+
+  const normalizedAgentFilter = normalizeDashboardAlertText(filters.agentKey);
+  if (normalizedAgentFilter) {
+    const alertAgentKey = normalizeDashboardAlertText(
+      readDashboardAlertString(alert?.agent_key, alert?.agent_label, alert?.algo_type) || "",
+    );
+    if (!alertAgentKey || alertAgentKey !== normalizedAgentFilter) {
+      return false;
+    }
+  }
+
+  const normalizedSearch = normalizeDashboardAlertText(filters.q);
+  if (normalizedSearch) {
+    const haystack =
+      normalizeDashboardAlertText(String(alert?.search_text || "")) ||
+      buildDashboardAlertSearchText({
+        cameraName: alert?.camera_name,
+        algoType: alert?.algo_type,
+        agentKey: alert?.agent_key,
+        agentLabel: alert?.agent_label,
+        jobName: alert?.job_name,
+        stepName: alert?.step_name,
+        groupName: readDashboardAlertString(alert?.details?.group_name, alert?.details?.groupName),
+        message: alert?.message,
+      });
+    if (!haystack.includes(normalizedSearch)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+async function fetchDashboardAlertsPage(
+  db: D1Database,
+  userId: string,
+  options: DashboardAlertPageOptions,
+) {
+  const requestedLimit = Number(options.limit);
+  const pageLimit =
+    Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.max(1, Math.min(requestedLimit, 100))
+      : 24;
+  const chunkLimit = Math.max(64, pageLimit * 4);
+  const afterId = Number(options.afterId);
+  const normalizedAfterId =
+    Number.isInteger(afterId) && afterId > 0 ? afterId : null;
+  let beforeId = Number(options.beforeId);
+  let normalizedBeforeId =
+    Number.isInteger(beforeId) && beforeId > 0 ? beforeId : null;
+  const matchedAlerts: any[] = [];
+  let exhausted = false;
+
+  while (matchedAlerts.length < pageLimit + 1 && !exhausted) {
+    let query = `SELECT e.id,
+                        e.camera_id,
+                        e.event_type,
+                        e.message,
+                        e.details_json,
+                        e.created_at,
+                        c.name AS camera_name
+                 FROM events e
+                 LEFT JOIN cameras c
+                   ON c.id = e.camera_id
+                  AND c.user_id = e.user_id
+                 WHERE e.user_id = ?
+                   AND e.event_type IN ('job_alert_triggered', 'ai_detection')`;
+    const bindings: unknown[] = [userId];
+
+    if (normalizedAfterId !== null) {
+      query += " AND e.id > ?";
+      bindings.push(normalizedAfterId);
+    }
+
+    if (normalizedBeforeId !== null) {
+      query += " AND e.id < ?";
+      bindings.push(normalizedBeforeId);
+    }
+
+    query += " ORDER BY e.id DESC LIMIT ?";
+    bindings.push(chunkLimit);
+
+    const { results } = await db.prepare(query).bind(...bindings).all();
+    const rows = Array.isArray(results) ? results : [];
+
+    if (!rows.length) {
+      exhausted = true;
+      break;
+    }
+
+    for (const row of rows) {
+      const normalizedAlert = normalizeDashboardAlertRow(row);
+      if (!matchesDashboardAlertFilters(normalizedAlert, options)) {
+        continue;
+      }
+      matchedAlerts.push(normalizedAlert);
+      if (matchedAlerts.length >= pageLimit + 1) {
+        break;
+      }
+    }
+
+    const oldestRowId = Number((rows[rows.length - 1] as any)?.id || 0);
+    if (!Number.isInteger(oldestRowId) || oldestRowId <= 0 || rows.length < chunkLimit) {
+      exhausted = true;
+      break;
+    }
+    normalizedBeforeId = oldestRowId;
+  }
+
+  const hasMore = matchedAlerts.length > pageLimit;
+  const alerts = matchedAlerts.slice(0, pageLimit);
+  const nextCursor =
+    hasMore && alerts.length > 0 ? Number(alerts[alerts.length - 1]?.id) || null : null;
+
+  return {
+    alerts,
+    hasMore,
+    nextCursor,
+  };
+}
+
+async function fetchDashboardAlertFacets(db: D1Database, userId: string) {
+  const [jobFacetResult, agentFacetResult] = await Promise.all([
+    db
+      .prepare(
+        `SELECT DISTINCT
+            COALESCE(
+              json_extract(details_json, '$.job_id'),
+              json_extract(details_json, '$.job.id'),
+              json_extract(details_json, '$.jobId')
+            ) AS job_id,
+            COALESCE(
+              json_extract(details_json, '$.job_name'),
+              json_extract(details_json, '$.job.name'),
+              json_extract(details_json, '$.jobName')
+            ) AS job_name
+         FROM events
+         WHERE user_id = ?
+           AND event_type = 'job_alert_triggered'
+           AND details_json IS NOT NULL`,
+      )
+      .bind(userId)
+      .all(),
+    db
+      .prepare(
+        `SELECT DISTINCT
+            COALESCE(
+              json_extract(details_json, '$.algorithm_type'),
+              json_extract(details_json, '$.algorithmType'),
+              json_extract(details_json, '$.agent_key'),
+              json_extract(details_json, '$.agentKey'),
+              json_extract(details_json, '$.algo_type'),
+              json_extract(details_json, '$.algoType')
+            ) AS agent_key,
+            COALESCE(
+              json_extract(details_json, '$.algo_type'),
+              json_extract(details_json, '$.algoType'),
+              json_extract(details_json, '$.agent_label'),
+              json_extract(details_json, '$.agentLabel'),
+              json_extract(details_json, '$.display_name'),
+              json_extract(details_json, '$.displayName'),
+              json_extract(details_json, '$.agent_key'),
+              json_extract(details_json, '$.agentKey'),
+              json_extract(details_json, '$.algorithm_type'),
+              json_extract(details_json, '$.algorithmType')
+            ) AS agent_label
+         FROM events
+         WHERE user_id = ?
+           AND event_type IN ('job_alert_triggered', 'ai_detection')
+           AND details_json IS NOT NULL`,
+      )
+      .bind(userId)
+      .all(),
+  ]);
+
+  const jobsById = new Map<number, { job_id: number; job_name: string }>();
+  for (const row of jobFacetResult.results || []) {
+    const rawJobId = Number((row as any)?.job_id);
+    const jobId = Number.isInteger(rawJobId) && rawJobId > 0 ? rawJobId : null;
+    const jobName = readDashboardAlertString((row as any)?.job_name) || (jobId ? `Job #${jobId}` : null);
+    if (!jobId || !jobName) continue;
+    if (!jobsById.has(jobId)) {
+      jobsById.set(jobId, { job_id: jobId, job_name: jobName });
+    }
+  }
+
+  const agentsByKey = new Map<string, { agent_key: string; agent_label: string }>();
+  for (const row of agentFacetResult.results || []) {
+    const rawAgentKey = readDashboardAlertString((row as any)?.agent_key);
+    const rawAgentLabel = readDashboardAlertString((row as any)?.agent_label);
+    const normalizedAgentKey = normalizeDashboardAlertText(rawAgentKey || rawAgentLabel || "");
+    if (!normalizedAgentKey) continue;
+    const agentKey = rawAgentKey || rawAgentLabel || normalizedAgentKey;
+    const agentLabel = resolveDashboardAlertAgentLabel(agentKey, rawAgentLabel) || agentKey;
+    if (!agentsByKey.has(normalizedAgentKey)) {
+      agentsByKey.set(normalizedAgentKey, {
+        agent_key: agentKey,
+        agent_label: agentLabel,
+      });
+    }
+  }
+
+  const jobs = Array.from(jobsById.values()).sort((a, b) => {
+    const labelCompare = a.job_name.localeCompare(b.job_name, undefined, { sensitivity: "base" });
+    if (labelCompare !== 0) return labelCompare;
+    return a.job_id - b.job_id;
+  });
+  const agents = Array.from(agentsByKey.values()).sort((a, b) =>
+    a.agent_label.localeCompare(b.agent_label, undefined, { sensitivity: "base" }),
+  );
+
+  return {
+    jobs,
+    agents,
+  };
 }
 
 function normalizeTimezoneInput(value: unknown): string | null {
@@ -6309,6 +6866,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           session_id INTEGER NOT NULL,
           compact_context_json TEXT NOT NULL DEFAULT '{}',
           task_state_json TEXT NOT NULL DEFAULT '{}',
+          agent_temporal_state_json TEXT NOT NULL DEFAULT '{}',
           last_compacted_message_id INTEGER NOT NULL DEFAULT 0,
           token_estimate INTEGER NOT NULL DEFAULT 0,
           compacted_at TEXT,
@@ -6326,6 +6884,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await addColumnIfMissing(`ALTER TABLE chat_session_contexts ADD COLUMN created_at TEXT`);
       await addColumnIfMissing(
         `ALTER TABLE chat_session_contexts ADD COLUMN task_state_json TEXT NOT NULL DEFAULT '{}'`
+      );
+      await addColumnIfMissing(
+        `ALTER TABLE chat_session_contexts ADD COLUMN agent_temporal_state_json TEXT NOT NULL DEFAULT '{}'`
       );
       await db.prepare(
         `UPDATE chat_session_contexts
@@ -9221,6 +9782,15 @@ function buildDefaultChatTaskState() {
   };
 }
 
+function buildDefaultChatAgentTemporalState() {
+  return {
+    plan_envelope: {} as Record<string, unknown>,
+    state: {} as Record<string, unknown>,
+    visual_state: {} as Record<string, unknown>,
+    prompt_hash: "",
+  };
+}
+
 function normalizeChatTaskDraftValue(value: unknown): unknown {
   if (typeof value === "string") {
     return value.trim().slice(0, 500);
@@ -9359,6 +9929,31 @@ function normalizeChatTaskState(value: unknown) {
   };
 }
 
+function normalizeChatAgentTemporalState(value: unknown) {
+  const fallback = buildDefaultChatAgentTemporalState();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+
+  const source = value as Record<string, unknown>;
+  const normalizeObject = (input: unknown) =>
+    input && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>)
+      : ({} as Record<string, unknown>);
+
+  return {
+    plan_envelope: normalizeObject(source.plan_envelope ?? source.planEnvelope),
+    state: normalizeObject(source.state),
+    visual_state: normalizeObject(source.visual_state ?? source.visualState),
+    prompt_hash:
+      typeof source.prompt_hash === "string"
+        ? source.prompt_hash.trim().slice(0, 256)
+        : typeof source.promptHash === "string"
+          ? source.promptHash.trim().slice(0, 256)
+          : "",
+  };
+}
+
 function normalizeChatVideoScopeMemory(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -9395,27 +9990,973 @@ function normalizeChatVideoScopeMemory(value: unknown) {
   };
 }
 
-async function persistChatVideoScopeMemory(
+function foldChatRecallText(value: unknown): string {
+  const text = normalizeText(value);
+  if (!text) return "";
+  try {
+    return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  } catch {
+    return text.toLowerCase();
+  }
+}
+
+const CHAT_IDENTITY_SCENE_CUES = [
+  "background",
+  "scene",
+  "room",
+  "office",
+  "kitchen",
+  "bedroom",
+  "garage",
+  "door",
+  "window",
+  "wall",
+  "desk",
+  "table",
+  "chair",
+  "cabinet",
+  "wardrobe",
+  "closet",
+  "computer",
+  "notebook",
+  "keyboard",
+  "monitor",
+  "ambiente",
+  "fundo",
+  "cozinha",
+  "porta",
+  "janela",
+  "parede",
+  "mesa",
+  "cadeira",
+  "armario",
+  "armário",
+  "escritorio",
+  "escritório",
+  "quarto",
+  "sala",
+];
+
+const CHAT_IDENTITY_POSE_CUES = [
+  "sitting",
+  "seated",
+  "standing",
+  "walking",
+  "running",
+  "typing",
+  "working",
+  "using ",
+  "holding ",
+  "carrying ",
+  "in front of",
+  "next to",
+  "sentado",
+  "sentada",
+  "em pe",
+  "em pé",
+  "andando",
+  "correndo",
+  "digitando",
+  "usando ",
+  "segurando ",
+  "carregando ",
+  "frente a",
+  "ao lado",
+  "perto de",
+];
+
+const CHAT_IDENTITY_PERSON_INTRINSIC_CUES = [
+  "skin",
+  "skin tone",
+  "light skin",
+  "dark skin",
+  "fair skin",
+  "brown skin",
+  "pele",
+  "tom de pele",
+  "hair",
+  "cabelo",
+  "beard",
+  "mustache",
+  "moustache",
+  "barba",
+  "bigode",
+  "tattoo",
+  "tatu",
+  "scar",
+  "cicatriz",
+  "bald",
+  "careca",
+  "calvo",
+  "build",
+  "body build",
+  "body type",
+  "porte fisico",
+  "porte físico",
+  "slim",
+  "thin",
+  "heavyset",
+  "stocky",
+  "magro",
+  "gordo",
+  "stubble",
+  "barba curta",
+  "barba baixa",
+  "barba por fazer",
+  "short beard",
+  "light beard",
+  "jawline",
+  "nose",
+  "eyebrow",
+  "sobrancelha",
+  "nariz",
+];
+
+const CHAT_IDENTITY_PERSON_SECONDARY_CUES = [
+  "hat",
+  "cap",
+  "beanie",
+  "helmet",
+  "glasses",
+  "goggles",
+  "mask",
+  "bracelet",
+  "watch",
+  "necklace",
+  "ring",
+  "earring",
+  "bone",
+  "chapeu",
+  "chapéu",
+  "oculos",
+  "óculos",
+  "brinco",
+  "pulseira",
+  "colar",
+  "anel",
+];
+
+const CHAT_IDENTITY_PERSON_DISCARDED_CUES = [
+  "shirt",
+  "t-shirt",
+  "tshirt",
+  "camisa",
+  "camiseta",
+  "blouse",
+  "jacket",
+  "hoodie",
+  "coat",
+  "pants",
+  "jeans",
+  "shorts",
+  "bermuda",
+  "dress",
+  "skirt",
+  "shoe",
+  "sneaker",
+  "boot",
+  "backpack",
+  "shoulder bag",
+  "purse",
+  "bag",
+  "weapon",
+  "gun",
+  "pistol",
+  "rifle",
+  "knife",
+  "machete",
+  "firearm",
+  "mochila",
+  "bolsa",
+  "arma",
+  "roupa",
+  "tenis",
+  "tênis",
+  "calcado",
+  "calçado",
+];
+
+const CHAT_IDENTITY_GENERIC_OBJECT_CUES = [
+  "box",
+  "package",
+  "bottle",
+  "cup",
+  "phone",
+  "bag",
+  "backpack",
+  "umbrella",
+  "cart",
+  "stroller",
+  "caixa",
+  "pacote",
+  "garrafa",
+  "copo",
+  "celular",
+  "bolsa",
+  "mochila",
+];
+
+function normalizeChatIdentityEntityType(value: unknown): string {
+  return normalizeText(value).toLowerCase();
+}
+
+function chatIdentityTextHasCue(text: string, cues: string[]): boolean {
+  return cues.some((cue) => text.includes(cue));
+}
+
+function isChatIdentitySceneLikeText(value: unknown): boolean {
+  const text = foldChatRecallText(value);
+  return !!text && chatIdentityTextHasCue(text, CHAT_IDENTITY_SCENE_CUES);
+}
+
+function isChatIdentityPoseLikeText(value: unknown): boolean {
+  const text = foldChatRecallText(value);
+  return !!text && chatIdentityTextHasCue(text, CHAT_IDENTITY_POSE_CUES);
+}
+
+function classifyChatIdentityTraitPriority(entityTypeInput: unknown, value: unknown): number {
+  const text = foldChatRecallText(value);
+  if (!text) return 0;
+  if (isChatIdentitySceneLikeText(text) || isChatIdentityPoseLikeText(text)) {
+    return 0;
+  }
+
+  const entityType = normalizeChatIdentityEntityType(entityTypeInput);
+  const personLike =
+    entityType.includes("person") ||
+    entityType.includes("people") ||
+    entityType.includes("human") ||
+    entityType.includes("man") ||
+    entityType.includes("woman");
+  const vehicleLike =
+    entityType.includes("vehicle") ||
+    entityType.includes("car") ||
+    entityType.includes("truck") ||
+    entityType.includes("suv") ||
+    entityType.includes("van") ||
+    entityType.includes("bus") ||
+    entityType.includes("plate");
+
+  if (vehicleLike) {
+    return chatIdentityTextHasCue(text, ["plate", "placa", "dent", "scratch", "rack", "headlight", "taillight"])
+      ? 3
+      : 0;
+  }
+
+  if (personLike) {
+    if (chatIdentityTextHasCue(text, CHAT_IDENTITY_PERSON_DISCARDED_CUES)) {
+      return 0;
+    }
+    if (chatIdentityTextHasCue(text, CHAT_IDENTITY_PERSON_INTRINSIC_CUES)) {
+      return 3;
+    }
+    if (chatIdentityTextHasCue(text, CHAT_IDENTITY_PERSON_SECONDARY_CUES)) {
+      return 2;
+    }
+    if (
+      chatIdentityTextHasCue(text, [
+        "adult",
+        "male",
+        "female",
+        "homem",
+        "mulher",
+        "person",
+        "pessoa",
+        "face",
+        "rosto",
+      ])
+    ) {
+      return 1;
+    }
+    return 0;
+  }
+
+  return chatIdentityTextHasCue(text, CHAT_IDENTITY_GENERIC_OBJECT_CUES) ? 2 : 0;
+}
+
+function sanitizeChatIdentityTraitArray(
+  values: unknown[],
+  entityTypeInput: unknown,
+  maxItems = 8
+): string[] {
+  const seen = new Set<string>();
+  const accepted: Array<{ priority: number; value: string; order: number }> = [];
+  let order = 0;
+
+  values.forEach((value) => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    value.forEach((item) => {
+      if (typeof item !== "string") {
+        return;
+      }
+      const trimmed = normalizeText(item).slice(0, 160);
+      if (!trimmed) {
+        return;
+      }
+      const dedupeKey = foldChatRecallText(trimmed);
+      if (!dedupeKey || seen.has(dedupeKey)) {
+        return;
+      }
+      const priority = classifyChatIdentityTraitPriority(entityTypeInput, trimmed);
+      if (priority <= 0) {
+        return;
+      }
+      seen.add(dedupeKey);
+      accepted.push({ priority, value: trimmed, order: order++ });
+    });
+  });
+
+  return accepted
+    .sort((a, b) => {
+      if (b.priority !== a.priority) {
+        return b.priority - a.priority;
+      }
+      return a.order - b.order;
+    })
+    .slice(0, Math.max(0, Math.floor(maxItems)))
+    .map((item) => item.value);
+}
+
+function sanitizeChatIdentityDescriptionForContext(
+  value: unknown,
+  signatureTraits: string[]
+): string {
+  const curatedFromTraits = signatureTraits.slice(0, 4).join("; ").slice(0, 400);
+  if (curatedFromTraits) {
+    return curatedFromTraits;
+  }
+  const description = normalizeText(value).slice(0, 400);
+  if (!description) {
+    return "";
+  }
+  return isChatIdentitySceneLikeText(description) || isChatIdentityPoseLikeText(description)
+    ? ""
+    : description;
+}
+
+function sanitizeChatIdentityContextTraitArray(value: unknown, maxItems = 4): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const isEligible = (item: string) => {
+    const normalized = foldChatRecallText(item);
+    if (!normalized || isChatIdentitySceneLikeText(normalized) || isChatIdentityPoseLikeText(normalized)) {
+      return false;
+    }
+    return (
+      normalized.includes("occl") ||
+      normalized.includes("blur") ||
+      normalized.includes("profile") ||
+      normalized.includes("partial") ||
+      normalized.includes("cropped") ||
+      normalized.includes("glare") ||
+      normalized.includes("front view") ||
+      normalized.includes("rear view") ||
+      normalized.includes("side view") ||
+      normalized.includes("distante")
+    );
+  };
+  return Array.from(
+    new Set(
+      value
+        .filter((item) => typeof item === "string")
+        .map((item) => normalizeText(item).slice(0, 120))
+        .filter((item) => !!item && isEligible(item))
+    )
+  ).slice(0, Math.max(0, Math.floor(maxItems)));
+}
+
+function normalizeChatStringArrayForContext(
+  value: unknown,
+  maxItems = 8,
+  maxChars = 120
+): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      value
+        .filter((item) => typeof item === "string")
+        .map((item) => normalizeText(item).slice(0, maxChars))
+        .filter(Boolean)
+    )
+  ).slice(0, Math.max(0, Math.floor(maxItems)));
+}
+
+function sanitizeChatExternalUrlForContext(value: unknown, maxChars = 500): string {
+  const text = normalizeText(value);
+  if (!text) return "";
+  if (parseDataUrl(text)) return "";
+  return text.slice(0, maxChars);
+}
+
+function sanitizeChatIdentityPortraitSnapshot(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const snapshot: Record<string, unknown> = {};
+  const assetId = normalizeText(source.asset_id).slice(0, 160);
+  const portraitKind = normalizeText(source.portrait_kind).slice(0, 64);
+  const timestampUtcIso = normalizeText(source.timestamp_utc_iso).slice(0, 64);
+  const cameraId = clampInteger(source.camera_id);
+  const cameraName = normalizeText(source.camera_name).slice(0, 120);
+  const zone = normalizeText(source.zone).slice(0, 120);
+  const imageUrl = sanitizeChatExternalUrlForContext(
+    source.image_url ?? source.image_data_url ?? "",
+    600
+  );
+
+  if (assetId) snapshot.asset_id = assetId;
+  if (portraitKind) snapshot.portrait_kind = portraitKind;
+  if (timestampUtcIso) snapshot.timestamp_utc_iso = timestampUtcIso;
+  if (cameraId > 0) snapshot.camera_id = cameraId;
+  if (cameraName) snapshot.camera_name = cameraName;
+  if (zone) snapshot.zone = zone;
+  if (imageUrl) snapshot.image_url = imageUrl;
+
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function sanitizeChatResolvedIdentitySnapshot(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const snapshot: Record<string, unknown> = {};
+  const targetName = normalizeText(source.target_name).slice(0, 160);
+  const targetDescription = sanitizeChatIdentityDescriptionForContext(source.target_description, []).slice(
+    0,
+    400
+  );
+  const sourceKind = normalizeText(source.source).slice(0, 64);
+  const targetId = clampInteger(source.target_id);
+  const referenceImageUrls = normalizeChatStringArrayForContext(source.reference_image_urls, 6, 500)
+    .map((item) => sanitizeChatExternalUrlForContext(item, 500))
+    .filter(Boolean);
+
+  if (targetName) snapshot.target_name = targetName;
+  if (targetDescription) snapshot.target_description = targetDescription;
+  if (sourceKind) snapshot.source = sourceKind;
+  if (targetId > 0) snapshot.target_id = targetId;
+  if (referenceImageUrls.length > 0) snapshot.reference_image_urls = referenceImageUrls;
+
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function sanitizeChatIdentityCardSnapshot(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const snapshot: Record<string, unknown> = {};
+  const cardId = normalizeText(source.card_id).slice(0, 160);
+  const entityId = normalizeText(source.entity_id).slice(0, 120);
+  const entityType = normalizeText(source.entity_type).slice(0, 64);
+  const normalizedEntityType = normalizeChatIdentityEntityType(entityType);
+  const displayName = normalizeText(source.display_name).slice(0, 160);
+  const knownName = normalizeText(source.known_name).slice(0, 160);
+  const signatureTraits = sanitizeChatIdentityTraitArray(
+    [source.identity_signature_traits, source.key_traits, source.stable_attributes],
+    normalizedEntityType,
+    8
+  );
+  const description = sanitizeChatIdentityDescriptionForContext(
+    source.description,
+    signatureTraits
+  ).slice(0, 400);
+  const signatureSummary = normalizeText(source.identity_signature_summary).slice(0, 400);
+  const portraitUrl = sanitizeChatExternalUrlForContext(source.portrait_url, 600);
+  const aliases = normalizeChatStringArrayForContext(source.aliases, 8, 120);
+  const contextTraits = sanitizeChatIdentityContextTraitArray(source.identity_context_traits, 4);
+  const referenceImageUrls = normalizeChatStringArrayForContext(source.reference_image_urls, 6, 500)
+    .map((item) => sanitizeChatExternalUrlForContext(item, 500))
+    .filter(Boolean);
+  const primaryPortrait = sanitizeChatIdentityPortraitSnapshot(source.primary_portrait);
+  const contextPortrait = sanitizeChatIdentityPortraitSnapshot(source.context_portrait);
+  const resolvedIdentity = sanitizeChatResolvedIdentitySnapshot(source.resolved_identity);
+  const lastSeen =
+    source.last_seen && typeof source.last_seen === "object" && !Array.isArray(source.last_seen)
+      ? (() => {
+          const raw = source.last_seen as Record<string, unknown>;
+          const normalized: Record<string, unknown> = {};
+          const timestampUtcIso = normalizeText(raw.timestamp_utc_iso).slice(0, 64);
+          const cameraId = clampInteger(raw.camera_id);
+          const cameraName = normalizeText(raw.camera_name).slice(0, 120);
+          const zone = normalizeText(raw.zone).slice(0, 120);
+          if (timestampUtcIso) normalized.timestamp_utc_iso = timestampUtcIso;
+          if (cameraId > 0) normalized.camera_id = cameraId;
+          if (cameraName) normalized.camera_name = cameraName;
+          if (zone) normalized.zone = zone;
+          return Object.keys(normalized).length > 0 ? normalized : null;
+        })()
+      : null;
+
+  if (!cardId && !entityId) {
+    return null;
+  }
+
+  if (cardId) snapshot.card_id = cardId;
+  if (entityId) snapshot.entity_id = entityId;
+  if (entityType) snapshot.entity_type = entityType;
+  if (displayName) snapshot.display_name = displayName;
+  if (knownName) snapshot.known_name = knownName;
+  if (description) snapshot.description = description;
+  if (signatureSummary) snapshot.identity_signature_summary = signatureSummary;
+  if (aliases.length > 0) snapshot.aliases = aliases;
+  if (signatureTraits.length > 0) snapshot.identity_signature_traits = signatureTraits;
+  if (contextTraits.length > 0) snapshot.identity_context_traits = contextTraits;
+  if (referenceImageUrls.length > 0) snapshot.reference_image_urls = referenceImageUrls;
+  if (resolvedIdentity) snapshot.resolved_identity = resolvedIdentity;
+  if (primaryPortrait) snapshot.primary_portrait = primaryPortrait;
+  if (contextPortrait) snapshot.context_portrait = contextPortrait;
+  if (portraitUrl) snapshot.portrait_url = portraitUrl;
+  if (lastSeen) snapshot.last_seen = lastSeen;
+  if (typeof source.face_available === "boolean") {
+    snapshot.face_available = source.face_available;
+  }
+
+  return snapshot;
+}
+
+function sanitizeChatLastPositiveHitSummary(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const summary: Record<string, unknown> = {};
+  const cameraId = clampInteger(source.camera_id);
+  const cameraName = normalizeText(source.camera_name).slice(0, 120);
+  const cameraIds = normalizePositiveIntegerArray(source.camera_ids, 12);
+  const cameraNames = normalizeChatStringArrayForContext(source.camera_names, 12, 120);
+  const timeWindowMinutes = clampInteger(source.time_window_minutes_before_now);
+  const query = normalizeText(source.query).slice(0, 300);
+  const segmentStartTs = normalizeText(source.segment_start_ts).slice(0, 64);
+  const segmentEndTs = normalizeText(source.segment_end_ts).slice(0, 64);
+  const eventTimestampUtcIso = normalizeText(source.event_timestamp_utc_iso).slice(0, 64);
+  const eventTimestampLocalIso = normalizeText(source.event_timestamp_local_iso).slice(0, 64);
+  const primaryIdentityCardId = normalizeText(source.primary_identity_card_id).slice(0, 160);
+  const matchedEntityIds = normalizeChatStringArrayForContext(source.matched_entity_ids, 8, 120);
+  const detectionTimeInVideo = normalizeChatStringArrayForContext(
+    source.detection_time_in_video,
+    4,
+    64
+  );
+  const displayName = normalizeText(source.display_name).slice(0, 160);
+  const portraitUrl = sanitizeChatExternalUrlForContext(source.portrait_url, 600);
+  const updatedAt = normalizeText(source.updated_at).slice(0, 64);
+  const identityCards = Array.isArray(source.identity_cards)
+    ? source.identity_cards
+        .map((item) => sanitizeChatIdentityCardSnapshot(item))
+        .filter((item): item is Record<string, unknown> => !!item)
+        .slice(0, 3)
+    : [];
+
+  if (
+    identityCards.length === 0 &&
+    matchedEntityIds.length === 0 &&
+    !primaryIdentityCardId &&
+    !displayName
+  ) {
+    return null;
+  }
+
+  if (cameraId > 0) summary.camera_id = cameraId;
+  if (cameraName) summary.camera_name = cameraName;
+  if (cameraIds.length > 0) summary.camera_ids = cameraIds;
+  if (cameraNames.length > 0) summary.camera_names = cameraNames;
+  if (typeof source.all_cameras === "boolean") {
+    summary.all_cameras = source.all_cameras;
+  }
+  if (timeWindowMinutes > 0) {
+    summary.time_window_minutes_before_now = timeWindowMinutes;
+  }
+  if (query) summary.query = query;
+  if (segmentStartTs) summary.segment_start_ts = segmentStartTs;
+  if (segmentEndTs) summary.segment_end_ts = segmentEndTs;
+  if (eventTimestampUtcIso) summary.event_timestamp_utc_iso = eventTimestampUtcIso;
+  if (eventTimestampLocalIso) summary.event_timestamp_local_iso = eventTimestampLocalIso;
+  if (detectionTimeInVideo.length > 0) {
+    summary.detection_time_in_video = detectionTimeInVideo;
+  }
+  if (matchedEntityIds.length > 0) summary.matched_entity_ids = matchedEntityIds;
+  if (primaryIdentityCardId) summary.primary_identity_card_id = primaryIdentityCardId;
+  if (displayName) summary.display_name = displayName;
+  if (portraitUrl) summary.portrait_url = portraitUrl;
+  if (identityCards.length > 0) summary.identity_cards = identityCards;
+  if (updatedAt) summary.updated_at = updatedAt;
+
+  return summary;
+}
+
+function buildChatLastPositiveHitSummary(input: {
+  query?: unknown;
+  camera_ids?: unknown;
+  camera_names?: unknown;
+  all_cameras?: unknown;
+  time_window_minutes_before_now?: unknown;
+  vision_hits?: unknown;
+  identity_cards?: unknown;
+}): Record<string, unknown> | null {
+  const allCards = Array.isArray(input.identity_cards) ? input.identity_cards : [];
+  const cardsById = new Map<string, Record<string, unknown>>();
+  const cardsByEntityId = new Map<string, Record<string, unknown>>();
+  for (const rawCard of allCards) {
+    const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
+    if (!snapshot) continue;
+    const cardId = normalizeText(snapshot.card_id);
+    const entityId = normalizeText(snapshot.entity_id);
+    if (cardId && !cardsById.has(cardId)) {
+      cardsById.set(cardId, snapshot);
+    }
+    if (entityId && !cardsByEntityId.has(entityId)) {
+      cardsByEntityId.set(entityId, snapshot);
+    }
+  }
+
+  const visionHits = Array.isArray(input.vision_hits) ? input.vision_hits : [];
+  for (const rawHit of visionHits) {
+    if (!rawHit || typeof rawHit !== "object" || Array.isArray(rawHit)) {
+      continue;
+    }
+
+    const hit = rawHit as Record<string, unknown>;
+    const hitCards: Record<string, unknown>[] = [];
+    const seenCardKeys = new Set<string>();
+    const primaryIdentityCardId = normalizeText(hit.primary_identity_card_id).slice(0, 160);
+    const matchedEntityIds = normalizeChatStringArrayForContext(hit.matched_entity_ids, 8, 120);
+
+    const pushCard = (card: Record<string, unknown> | null) => {
+      if (!card) return;
+      const key =
+        normalizeText(card.card_id).slice(0, 160) ||
+        normalizeText(card.entity_id).slice(0, 120) ||
+        JSON.stringify(card);
+      if (!key || seenCardKeys.has(key)) return;
+      seenCardKeys.add(key);
+      hitCards.push(card);
+    };
+
+    if (Array.isArray(hit.identity_cards)) {
+      for (const rawCard of hit.identity_cards) {
+        pushCard(sanitizeChatIdentityCardSnapshot(rawCard));
+      }
+    }
+    if (primaryIdentityCardId && cardsById.has(primaryIdentityCardId)) {
+      pushCard(cardsById.get(primaryIdentityCardId) || null);
+    }
+    for (const entityId of matchedEntityIds) {
+      pushCard(cardsByEntityId.get(entityId) || null);
+    }
+
+    if (hitCards.length === 0 && matchedEntityIds.length === 0 && !primaryIdentityCardId) {
+      continue;
+    }
+
+    const primaryCard =
+      (primaryIdentityCardId &&
+        hitCards.find((card) => normalizeText(card.card_id) === primaryIdentityCardId)) ||
+      hitCards[0] ||
+      null;
+    const displayName = normalizeText(primaryCard?.display_name ?? "").slice(0, 160);
+    const portraitUrl = sanitizeChatExternalUrlForContext(primaryCard?.portrait_url ?? "", 600);
+
+    return sanitizeChatLastPositiveHitSummary({
+      query: input.query,
+      camera_ids: input.camera_ids,
+      camera_names: input.camera_names,
+      all_cameras: input.all_cameras,
+      time_window_minutes_before_now: input.time_window_minutes_before_now,
+      camera_id: hit.camera_id,
+      camera_name: hit.camera_name,
+      segment_start_ts: hit.segment_start_ts,
+      segment_end_ts: hit.segment_end_ts,
+      event_timestamp_utc_iso: hit.event_timestamp_utc_iso,
+      event_timestamp_local_iso: hit.event_timestamp_local_iso,
+      detection_time_in_video: hit.detection_time_in_video,
+      matched_entity_ids: matchedEntityIds,
+      primary_identity_card_id: primaryIdentityCardId,
+      display_name: displayName,
+      portrait_url: portraitUrl,
+      identity_cards: hitCards,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  return null;
+}
+
+function buildChatVideoRoutingContextFromTaskState(
+  taskStateInput: unknown
+): Record<string, unknown> | null {
+  const taskState = normalizeChatTaskState(taskStateInput);
+  const sessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+
+  const routingContext: Record<string, unknown> = {};
+  const lastVideoScope = normalizeChatVideoScopeMemory(sessionEntities.last_video_scope);
+  const lastPositiveHit = sanitizeChatLastPositiveHitSummary(sessionEntities.last_positive_hit);
+
+  if (lastVideoScope) {
+    routingContext.last_video_scope = lastVideoScope;
+  }
+  if (lastPositiveHit) {
+    routingContext.last_positive_hit = lastPositiveHit;
+  }
+
+  return Object.keys(routingContext).length > 0 ? routingContext : null;
+}
+
+function shouldPreferIdentityRecallQuery(queryInput: unknown): boolean {
+  const q = foldChatRecallText(queryInput);
+  if (!q) return false;
+
+  const searchBiasPhrases = [
+    "na camera",
+    "no ultimo",
+    "nos ultimos",
+    "ultimo minuto",
+    "ultimos minutos",
+    "ultimo minuto",
+    "agora",
+    "hoje",
+    "ontem",
+    "esta manha",
+    "essa manha",
+    "today",
+    "yesterday",
+    "right now",
+    "last minute",
+    "last minutes",
+    "camera ",
+    "cameras ",
+    "time window",
+  ];
+  if (searchBiasPhrases.some((phrase) => q.includes(phrase))) {
+    return false;
+  }
+
+  const directRecallPhrases = [
+    "identity card",
+    "identity",
+    "identidade",
+    "cartao",
+    "card",
+    "perfil",
+    "profile",
+    "ficha",
+    "dossie",
+    "dossier",
+    "quem e",
+    "who is",
+    "me fala sobre",
+    "fala sobre",
+    "me diga sobre",
+    "tell me about",
+    "details about",
+    "detalhes sobre",
+  ];
+  if (directRecallPhrases.some((phrase) => q.includes(phrase))) {
+    return true;
+  }
+
+  const deicticPhrases = [
+    "essa pessoa",
+    "dessa pessoa",
+    "esse cara",
+    "desse cara",
+    "esse homem",
+    "essa mulher",
+    "this person",
+    "that person",
+    "this guy",
+    "that guy",
+    "this man",
+    "that man",
+    "this woman",
+    "that woman",
+  ];
+  if (!deicticPhrases.some((phrase) => q.includes(phrase))) {
+    return false;
+  }
+
+  const recallVerbs = [
+    "me mostra",
+    "mostra",
+    "show me",
+    "me fala",
+    "fala sobre",
+    "me diga sobre",
+    "tell me about",
+    "quem e",
+    "who is",
+    "card",
+    "cartao",
+    "identity",
+    "perfil",
+    "profile",
+  ];
+  return recallVerbs.some((phrase) => q.includes(phrase));
+}
+
+function formatChatCameraNamesPreview(cameraNamesInput: unknown): string[] {
+  return normalizeChatStringArrayForContext(cameraNamesInput, 3, 80);
+}
+
+function buildChatVideoAnalysisPendingMessage(
+  languageInput: unknown,
+  options?: { analysisTarget?: unknown }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const analysisTarget = normalizeText(options?.analysisTarget).toLowerCase();
+  const uploadedVideo = analysisTarget === "uploaded_video";
+
+  if (language === "pt") {
+    return uploadedVideo ? "Analisando o video enviado..." : "Analisando a camera...";
+  }
+  if (language === "es") {
+    return uploadedVideo ? "Analizando el video enviado..." : "Analizando la camara...";
+  }
+  if (language === "fr") {
+    return uploadedVideo ? "Analyse de la video envoyee..." : "Analyse de la camera...";
+  }
+  return uploadedVideo ? "Analyzing the uploaded video..." : "Analyzing camera feed...";
+}
+
+function buildChatVideoRouterAckMessage(
+  languageInput: unknown,
+  options?: {
+    analysisTarget?: unknown;
+    cameraNames?: unknown;
+    allCameras?: unknown;
+  }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const analysisTarget = normalizeText(options?.analysisTarget).toLowerCase();
+  const uploadedVideo = analysisTarget === "uploaded_video";
+  const allCameras = Boolean(options?.allCameras);
+  const cameraNames = formatChatCameraNamesPreview(options?.cameraNames);
+  const firstCameraName = cameraNames[0] || "";
+
+  if (language === "pt") {
+    if (uploadedVideo) return "Vou analisar o video enviado agora.";
+    if (allCameras) return "Vou buscar no historico de todas as cameras agora.";
+    if (cameraNames.length === 1) {
+      return `Vou buscar no historico da camera ${firstCameraName} agora.`;
+    }
+    if (cameraNames.length > 1) {
+      return `Vou buscar no historico das cameras ${cameraNames.join(", ")} agora.`;
+    }
+    return "Vou buscar no historico das cameras selecionadas agora.";
+  }
+  if (language === "es") {
+    if (uploadedVideo) return "Voy a analizar el video enviado ahora.";
+    if (allCameras) return "Voy a buscar en el historial de todas las camaras ahora.";
+    if (cameraNames.length === 1) {
+      return `Voy a buscar en el historial de la camara ${firstCameraName} ahora.`;
+    }
+    if (cameraNames.length > 1) {
+      return `Voy a buscar en el historial de las camaras ${cameraNames.join(", ")} ahora.`;
+    }
+    return "Voy a buscar en el historial de las camaras seleccionadas ahora.";
+  }
+  if (language === "fr") {
+    if (uploadedVideo) return "Je vais analyser la video envoyee maintenant.";
+    if (allCameras) return "Je vais chercher dans l'historique de toutes les cameras maintenant.";
+    if (cameraNames.length === 1) {
+      return `Je vais chercher dans l'historique de la camera ${firstCameraName} maintenant.`;
+    }
+    if (cameraNames.length > 1) {
+      return `Je vais chercher dans l'historique des cameras ${cameraNames.join(", ")} maintenant.`;
+    }
+    return "Je vais chercher dans l'historique des cameras selectionnees maintenant.";
+  }
+  if (uploadedVideo) return "I'll analyze the uploaded video now.";
+  if (allCameras) return "I'll search across the history from all cameras now.";
+  if (cameraNames.length === 1) {
+    return `I'll search the history from camera ${firstCameraName} now.`;
+  }
+  if (cameraNames.length > 1) {
+    return `I'll search the history from cameras ${cameraNames.join(", ")} now.`;
+  }
+  return "I'll search the selected camera history now.";
+}
+
+function buildChatVideoRouterClarificationMessage(
+  languageInput: unknown,
+  options?: {
+    cameraIds?: unknown;
+    cameraNames?: unknown;
+    timeWindowMinutes?: unknown;
+  }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const cameraIds = normalizePositiveIntegerArray(options?.cameraIds, 12);
+  const cameraNames = formatChatCameraNamesPreview(options?.cameraNames);
+  const hasCameraSelection = cameraIds.length > 0 || cameraNames.length > 0;
+  const hasTimeWindow = clampInteger(options?.timeWindowMinutes) > 0;
+  const firstCameraName = cameraNames[0] || "";
+
+  if (language === "pt") {
+    if (!hasCameraSelection) {
+      return "Preciso que voce confirme qual camera devo analisar e em qual periodo.";
+    }
+    if (!hasTimeWindow) {
+      return firstCameraName
+        ? `Preciso que voce confirme em qual periodo devo analisar a camera ${firstCameraName}.`
+        : "Preciso que voce confirme em qual periodo devo analisar essa camera.";
+    }
+    return "Preciso de um pouco mais de contexto para procurar no historico de video.";
+  }
+  if (language === "es") {
+    if (!hasCameraSelection) {
+      return "Necesito que confirmes que camara debo analizar y en que periodo.";
+    }
+    if (!hasTimeWindow) {
+      return firstCameraName
+        ? `Necesito que confirmes en que periodo debo analizar la camara ${firstCameraName}.`
+        : "Necesito que confirmes en que periodo debo analizar esa camara.";
+    }
+    return "Necesito un poco mas de contexto para buscar en el historial de video.";
+  }
+  if (language === "fr") {
+    if (!hasCameraSelection) {
+      return "J'ai besoin que vous confirmiez quelle camera je dois analyser et sur quelle periode.";
+    }
+    if (!hasTimeWindow) {
+      return firstCameraName
+        ? `J'ai besoin que vous confirmiez la periode a analyser pour la camera ${firstCameraName}.`
+        : "J'ai besoin que vous confirmiez la periode a analyser pour cette camera.";
+    }
+    return "J'ai besoin d'un peu plus de contexte pour chercher dans l'historique video.";
+  }
+  if (!hasCameraSelection) {
+    return "I need you to confirm which camera I should analyze and for what time window.";
+  }
+  if (!hasTimeWindow) {
+    return firstCameraName
+      ? `I need you to confirm what time window I should analyze for camera ${firstCameraName}.`
+      : "I need you to confirm what time window I should analyze for that camera.";
+  }
+  return "I need a little more context before I search the video history.";
+}
+
+async function persistChatSessionEntitiesMemory(
   db: D1Database,
   userId: string,
   chatSessionId: number,
-  scopeInput: {
-    camera_ids?: unknown;
-    camera_names?: unknown;
-    all_cameras?: unknown;
-    time_window_minutes_before_now?: unknown;
-    query?: unknown;
-  }
+  patch: Record<string, unknown>
 ) {
-  const scope = normalizeChatVideoScopeMemory({
-    camera_ids: scopeInput.camera_ids,
-    camera_names: scopeInput.camera_names,
-    all_cameras: scopeInput.all_cameras,
-    time_window_minutes_before_now: scopeInput.time_window_minutes_before_now,
-    query: scopeInput.query,
-    updated_at: new Date().toISOString(),
-  });
-  if (!scope) {
+  if (!patch || Object.keys(patch).length === 0) {
     return;
   }
 
@@ -9460,17 +11001,12 @@ async function persistChatVideoScopeMemory(
     taskState.session_entities && typeof taskState.session_entities === "object"
       ? (taskState.session_entities as Record<string, unknown>)
       : {};
-  const singleCameraName =
-    Array.isArray(scope.camera_names) && scope.camera_names.length === 1
-      ? normalizeText(scope.camera_names[0])
-      : "";
 
   const nextTaskState = normalizeChatTaskState({
     ...taskState,
     session_entities: {
       ...existingSessionEntities,
-      last_video_scope: scope,
-      ...(singleCameraName ? { last_camera_name: singleCameraName } : {}),
+      ...patch,
     },
   });
 
@@ -9508,6 +11044,39 @@ async function persistChatVideoScopeMemory(
     .run();
 }
 
+async function persistChatVideoScopeMemory(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  scopeInput: {
+    camera_ids?: unknown;
+    camera_names?: unknown;
+    all_cameras?: unknown;
+    time_window_minutes_before_now?: unknown;
+    query?: unknown;
+  }
+) {
+  const scope = normalizeChatVideoScopeMemory({
+    camera_ids: scopeInput.camera_ids,
+    camera_names: scopeInput.camera_names,
+    all_cameras: scopeInput.all_cameras,
+    time_window_minutes_before_now: scopeInput.time_window_minutes_before_now,
+    query: scopeInput.query,
+    updated_at: new Date().toISOString(),
+  });
+  if (!scope) {
+    return;
+  }
+  const singleCameraName =
+    Array.isArray(scope.camera_names) && scope.camera_names.length === 1
+      ? normalizeText(scope.camera_names[0])
+      : "";
+  await persistChatSessionEntitiesMemory(db, userId, chatSessionId, {
+    last_video_scope: scope,
+    ...(singleCameraName ? { last_camera_name: singleCameraName } : {}),
+  });
+}
+
 async function safePersistChatVideoScopeMemory(
   db: D1Database,
   userId: string,
@@ -9524,6 +11093,34 @@ async function safePersistChatVideoScopeMemory(
     await persistChatVideoScopeMemory(db, userId, chatSessionId, scopeInput);
   } catch (error) {
     console.error("[CHAT VIDEO SCOPE] Failed to persist chat video scope memory:", error);
+  }
+}
+
+async function persistChatLastPositiveHitMemory(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  hitSummaryInput: unknown
+) {
+  const hitSummary = sanitizeChatLastPositiveHitSummary(hitSummaryInput);
+  if (!hitSummary) {
+    return;
+  }
+  await persistChatSessionEntitiesMemory(db, userId, chatSessionId, {
+    last_positive_hit: hitSummary,
+  });
+}
+
+async function safePersistChatLastPositiveHitMemory(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  hitSummaryInput: unknown
+) {
+  try {
+    await persistChatLastPositiveHitMemory(db, userId, chatSessionId, hitSummaryInput);
+  } catch (error) {
+    console.error("[CHAT POSITIVE HIT] Failed to persist last positive hit memory:", error);
   }
 }
 
@@ -15087,6 +16684,162 @@ async function resolveAgentPairingForClient(
   };
 }
 
+function readAgentActivityText(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.replace(/\s+/g, " ").trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+function normalizeAgentPositiveIntList(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set<number>();
+  const normalized: number[] = [];
+  for (const entry of value) {
+    const parsed = typeof entry === "number" ? entry : Number(entry);
+    if (!Number.isInteger(parsed) || parsed <= 0 || seen.has(parsed)) {
+      continue;
+    }
+    seen.add(parsed);
+    normalized.push(parsed);
+  }
+  return normalized;
+}
+
+function clampAgentActivityLimit(
+  value: unknown,
+  fallback: number,
+  minValue = 1,
+  maxValue = 40
+): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(minValue, Math.min(maxValue, Math.floor(parsed)));
+}
+
+function parseAgentRouterTimestampToIsoUtc(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const match =
+    /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(trimmed);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+
+  if (
+    !Number.isFinite(date.getTime()) ||
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day ||
+    date.getUTCHours() !== hour ||
+    date.getUTCMinutes() !== minute ||
+    date.getUTCSeconds() !== second
+  ) {
+    return null;
+  }
+
+  return date.toISOString();
+}
+
+function parseAgentActivityTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+
+  let normalized = value.trim();
+  if (!normalized) return null;
+
+  const routerIso = parseAgentRouterTimestampToIsoUtc(normalized);
+  if (routerIso) {
+    normalized = routerIso;
+  } else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(normalized)) {
+    normalized = `${normalized.replace(" ", "T")}Z`;
+  } else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(normalized)) {
+    normalized = `${normalized}Z`;
+  }
+
+  const timestampMs = Date.parse(normalized);
+  return Number.isFinite(timestampMs) ? timestampMs : null;
+}
+
+function buildAgentCameraActivityWhereClause(
+  columnName: string,
+  cameraIds: number[]
+): { sql: string; bindings: number[] } {
+  if (!cameraIds.length) {
+    return { sql: "", bindings: [] };
+  }
+  return {
+    sql: ` AND ${columnName} IN (${cameraIds.map(() => "?").join(", ")})`,
+    bindings: cameraIds,
+  };
+}
+
+function summarizeAgentActivityEventRow(row: any) {
+  let details: Record<string, any> = {};
+  try {
+    const parsed =
+      row?.details_json && typeof row.details_json === "string"
+        ? JSON.parse(row.details_json)
+        : row?.details_json;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      details = parsed as Record<string, any>;
+    }
+  } catch {
+    details = {};
+  }
+
+  return {
+    id: Number(row?.id ?? 0),
+    camera_id:
+      row?.camera_id === null || row?.camera_id === undefined
+        ? null
+        : Number(row.camera_id),
+    camera_name: readAgentActivityText(
+      details?.camera_name,
+      details?.cameraName,
+      row?.camera_name
+    ),
+    event_type: readAgentActivityText(row?.event_type),
+    message: readAgentActivityText(row?.message),
+    created_at: typeof row?.created_at === "string" ? row.created_at : null,
+    timestamp_iso: readAgentActivityText(
+      details?.timestamp_iso,
+      details?.timestampIso,
+      details?.detected_at,
+      details?.detectedAt
+    ),
+    algo_type: readAgentActivityText(
+      details?.algo_type,
+      details?.algoType,
+      details?.algorithm_type,
+      details?.algorithmType,
+      details?.agent_label,
+      details?.agentLabel
+    ),
+    job_name: readAgentActivityText(details?.job_name, details?.job?.name),
+    step_name: readAgentActivityText(details?.step_name, details?.stepName),
+    priority_level: readAgentActivityText(
+      details?.priority_level,
+      details?.priorityLevel,
+      details?.priority
+    ),
+    summary: readAgentActivityText(
+      row?.message,
+      details?.summary,
+      details?.reason,
+      details?.description
+    ),
+  };
+}
+
 function normalizeAgentDesignText(value: unknown, maxLength: number): string {
   if (typeof value !== "string") return "";
   return value.replace(/\s+/g, " ").trim().slice(0, Math.max(0, maxLength));
@@ -19435,91 +21188,7 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
     .bind(user.id)
     .all();
 
-  const recentAlerts = (recentAlertRows || []).map((row: any) => {
-    let details: any = null;
-    try {
-      details = row.details_json ? JSON.parse(row.details_json) : null;
-    } catch {
-      details = null;
-    }
-
-    const readString = (...values: any[]): string | null => {
-      for (const value of values) {
-        if (typeof value === "string") {
-          const trimmed = value.trim();
-          if (trimmed) return trimmed;
-        }
-      }
-      return null;
-    };
-    const buildMediaUrl = (value: string | null): string | null => {
-      if (!value) return null;
-      if (value.startsWith("http://") || value.startsWith("https://") || value.startsWith("/api/")) {
-        return value;
-      }
-      const filename = value.split(/[\\/]/).pop();
-      return filename ? `/api/detections/${filename}` : null;
-    };
-
-    const eventType = typeof row?.event_type === "string" ? row.event_type : "";
-    const contributingEventsCount = Math.max(
-      0,
-      Number(details?.contributing_events_count) || countTemporalContributingEvents(details)
-    );
-    const groupImageCount = Math.max(
-      0,
-      Number(details?.group_image_count) ||
-        (Array.isArray(details?.group_image_urls) ? details.group_image_urls.length : 0)
-    );
-    if (details && typeof details === "object") {
-      details.contributing_events_count = contributingEventsCount;
-      details.group_image_count = groupImageCount;
-    }
-    const directVideoUrl = readString(details?.video_url, details?.videoUrl);
-    const directImageUrl = readString(details?.image_url, details?.imageUrl);
-    const videoKey = readString(details?.video_key, details?.videoKey);
-    const imageKey = readString(details?.image_key, details?.imageKey);
-    const mediaType = readString(details?.media_type, details?.mediaType);
-    const algoType = readString(details?.algo_type, details?.algoType, details?.agent_key, details?.agentKey);
-    const detectedAt = readString(
-      details?.timestamp_iso,
-      details?.detected_at,
-      details?.detectedAt,
-      row?.created_at
-    );
-    const clipPath = readString(details?.clip_path, details?.clipPath);
-    const imagePath = readString(details?.image_path, details?.imagePath);
-
-    const clipUrl = !directVideoUrl ? buildMediaUrl(clipPath) : null;
-    const imageUrl = !directImageUrl ? buildMediaUrl(imagePath) : null;
-
-    return {
-      id: row.id,
-      camera_id: row.camera_id,
-      camera_name: readString(details?.camera_name, details?.cameraName, row?.camera_name),
-      event_type: eventType,
-      algo_type: algoType,
-      message: row.message,
-      created_at: row.created_at,
-      detected_at: detectedAt,
-      details,
-      priority_level:
-        eventType === "job_alert_triggered"
-          ? normalizeJobStepPriorityLevel(
-              details?.priority_level ?? details?.priorityLevel ?? details?.priority
-            )
-          : null,
-      media_type: mediaType,
-      contributing_events_count: contributingEventsCount,
-      group_image_count: groupImageCount,
-      video_key: videoKey,
-      image_key: imageKey,
-      video_url: directVideoUrl || clipUrl,
-      clip_url: clipUrl,
-      image_url: directImageUrl || imageUrl,
-      image_path: imagePath,
-    };
-  });
+  const recentAlerts = (recentAlertRows || []).map((row: any) => normalizeDashboardAlertRow(row));
 
   // Recent job fires (LIMIT 10)
   const { results: recentJobFires } = await c.env.DB.prepare(
@@ -19976,6 +21645,48 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
       "cache-control": "private, no-cache, max-age=0, must-revalidate",
     },
   });
+});
+
+app.get("/api/dashboard-alerts", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+  const user = c.get("user")!;
+  const beforeIdParam = c.req.query("before_id");
+  const afterIdParam = c.req.query("after_id");
+  const jobIdParam = c.req.query("job_id");
+  const limitParam = c.req.query("limit");
+  const includeFacets = c.req.query("include_facets") === "1";
+
+  const beforeId = beforeIdParam ? Number.parseInt(beforeIdParam, 10) : null;
+  const afterId = afterIdParam ? Number.parseInt(afterIdParam, 10) : null;
+  const requestedLimit = limitParam ? Number.parseInt(limitParam, 10) : 24;
+  const limit =
+    Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.max(1, Math.min(requestedLimit, 100))
+      : 24;
+  const jobId = jobIdParam ? Number.parseInt(jobIdParam, 10) : null;
+  const filters: DashboardAlertPageOptions = {
+    q: c.req.query("q"),
+    severity: c.req.query("severity"),
+    origin: c.req.query("origin"),
+    jobId: Number.isInteger(jobId) && jobId !== null && jobId > 0 ? jobId : null,
+    agentKey: c.req.query("agent_key"),
+    beforeId: Number.isInteger(beforeId) && beforeId !== null && beforeId > 0 ? beforeId : null,
+    afterId: Number.isInteger(afterId) && afterId !== null && afterId > 0 ? afterId : null,
+    limit,
+  };
+
+  const page = await fetchDashboardAlertsPage(c.env.DB, user.id, filters);
+  const responseBody: Record<string, unknown> = {
+    alerts: page.alerts,
+    has_more: page.hasMore,
+    next_cursor: page.nextCursor,
+  };
+
+  if (includeFacets) {
+    responseBody.facets = await fetchDashboardAlertFacets(c.env.DB, user.id);
+  }
+
+  return c.json(responseBody);
 });
 
 app.get("/api/open-monitor", anyAuthMiddleware, async (c) => {
@@ -21602,7 +23313,7 @@ async function enqueueStopCameraCommand(
     }
 
     await env.DB.prepare(
-      "UPDATE cameras SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
+      "UPDATE cameras SET is_service_running = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
     )
       .bind(cameraId, userId)
       .run();
@@ -21791,43 +23502,6 @@ async function stopJobForUser(
   const jobData = job as any;
   const now = new Date().toISOString();
 
-  const { results: targetRows } = await env.DB.prepare(
-    `SELECT DISTINCT jst.camera_id
-     FROM job_step_targets jst
-     JOIN job_steps js ON jst.step_id = js.id
-     WHERE js.job_id = ?`
-  )
-    .bind(jobId)
-    .all();
-
-  const allCameraIds = (targetRows || []).map((row: any) => row.camera_id);
-  let filteredCameraIds: number[] = [];
-
-  if (allCameraIds.length > 0) {
-    const placeholders = allCameraIds.map(() => "?").join(", ");
-    const { results: runningCameras } = await env.DB.prepare(
-      `SELECT id FROM cameras 
-       WHERE user_id = ? AND id IN (${placeholders}) AND is_service_running = 1`
-    )
-      .bind(userId, ...allCameraIds)
-      .all();
-
-    const runningCameraIds = (runningCameras || []).map((row: any) => row.id);
-
-    if (runningCameraIds.length > 0) {
-      const runningPlaceholders = runningCameraIds.map(() => "?").join(", ");
-      const { results: agentCameras } = await env.DB.prepare(
-        `SELECT DISTINCT camera_id FROM camera_algorithms
-         WHERE camera_id IN (${runningPlaceholders}) AND is_enabled = 1`
-      )
-        .bind(...runningCameraIds)
-        .all();
-
-      const camerasWithAgents = new Set((agentCameras || []).map((row: any) => row.camera_id));
-      filteredCameraIds = runningCameraIds.filter((cameraIdValue: number) => !camerasWithAgents.has(cameraIdValue));
-    }
-  }
-
   await env.DB.prepare(
     `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
      VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?)`
@@ -21838,23 +23512,11 @@ async function stopJobForUser(
         job: { id: jobData.id, name: jobData.name },
         requested_at_utc: now,
         reason: "user_stop_from_dashboard",
-        camera_ids: filteredCameraIds,
       }),
       now,
       now
     )
     .run();
-
-  if (filteredCameraIds.length > 0) {
-    const cameraPlaceholders = filteredCameraIds.map(() => "?").join(", ");
-    await env.DB.prepare(
-      `UPDATE cameras 
-       SET is_service_running = 0, is_online = 0, updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = ? AND id IN (${cameraPlaceholders})`
-    )
-      .bind(userId, ...filteredCameraIds)
-      .run();
-  }
 
   await env.DB.prepare(
     `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, last_event_at_utc, created_at, updated_at)
@@ -21874,7 +23536,7 @@ async function stopJobForUser(
     .bind(userId, `Job "${jobData.name}" stop requested.`, now, now)
     .run();
 
-  return { statusCode: 200, body: { ok: true, camera_ids: filteredCameraIds } };
+  return { statusCode: 200, body: { ok: true } };
 }
 
 const DEFAULT_WEBCAM_PROBE_INDICES = [0, 1, 2, 3, 4, 5] as const;
@@ -28487,6 +30149,351 @@ async function fetchFaceTargetsForUser(
   });
 }
 
+function normalizeChatIdentityTraitMatchText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeChatIdentityEditTraits(value: unknown): string[] {
+  const parts: string[] = [];
+  const append = (entry: unknown) => {
+    if (typeof entry !== "string") return;
+    entry
+      .split(/[\r\n,;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .forEach((item) => parts.push(item));
+  };
+
+  if (Array.isArray(value)) {
+    value.forEach(append);
+  } else {
+    append(value);
+  }
+
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const part of parts) {
+    const dedupeKey = normalizeChatIdentityTraitMatchText(part);
+    if (!dedupeKey || seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    normalized.push(part.slice(0, 160));
+    if (normalized.length >= 12) break;
+  }
+  return normalized;
+}
+
+function isPhysicalChatIdentityTrait(trait: string): boolean {
+  const normalized = normalizeChatIdentityTraitMatchText(trait);
+  if (!normalized) return false;
+
+  const excludedCues = [
+    "camisa",
+    "camiseta",
+    "shirt",
+    "jaqueta",
+    "jacket",
+    "bone",
+    "hat",
+    "cap",
+    "mochila",
+    "backpack",
+    "bolsa",
+    "bag",
+    "calcado",
+    "shoe",
+    "tenis",
+    "roupa",
+    "clothing",
+    "fundo",
+    "background",
+    "ambiente",
+    "room",
+    "cozinha",
+    "kitchen",
+    "armario",
+    "cabinet",
+    "porta",
+    "door",
+    "parede",
+    "wall",
+    "mesa",
+    "table",
+    "computador",
+    "computer",
+    "teclado",
+    "keyboard",
+    "sentado",
+    "sitting",
+    "frente a",
+    "in front of",
+    "scene",
+  ];
+  if (excludedCues.some((cue) => normalized.includes(cue))) {
+    return false;
+  }
+
+  const physicalCues = [
+    "pele",
+    "skin",
+    "cabelo",
+    "hair",
+    "cachead",
+    "curly",
+    "ondulad",
+    "wavy",
+    "liso",
+    "straight",
+    "crespo",
+    "coily",
+    "curto",
+    "short",
+    "comprido",
+    "longo",
+    "long",
+    "barba",
+    "beard",
+    "stubble",
+    "facial hair",
+    "bigode",
+    "mustache",
+    "moustache",
+    "tatu",
+    "tattoo",
+    "cicatriz",
+    "scar",
+    "oculos",
+    "glasses",
+    "careca",
+    "bald",
+    "calvo",
+    "magro",
+    "slim",
+    "gordo",
+    "heavy",
+    "porte",
+    "build",
+    "fisico",
+    "body",
+    "rosto",
+    "face",
+    "nariz",
+    "nose",
+    "sobrancelha",
+    "eyebrow",
+    "orelha",
+    "ear",
+    "piercing",
+    "brinco",
+    "jewelry",
+    "joia",
+  ];
+  return physicalCues.some((cue) => normalized.includes(cue));
+}
+
+function buildChatIdentityPhysicalTraitDescription(traits: string[]): string {
+  const physicalTraits = traits.filter((trait) => isPhysicalChatIdentityTrait(trait)).slice(0, 6);
+  return physicalTraits.join("; ").slice(0, 600);
+}
+
+function parseChatIdentityCardSnapshot(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function readChatIdentityResolvedTargetId(snapshot: Record<string, unknown> | null): number | null {
+  const resolvedIdentity =
+    snapshot?.resolved_identity &&
+    typeof snapshot.resolved_identity === "object" &&
+    !Array.isArray(snapshot.resolved_identity)
+      ? (snapshot.resolved_identity as Record<string, unknown>)
+      : null;
+  const rawTargetId = Number(resolvedIdentity?.target_id);
+  return Number.isInteger(rawTargetId) && rawTargetId > 0 ? rawTargetId : null;
+}
+
+function readChatIdentityPortraitDataUrl(
+  explicitPortraitDataUrl: unknown,
+  snapshot: Record<string, unknown> | null
+): string | null {
+  const primaryPortrait =
+    snapshot?.primary_portrait &&
+    typeof snapshot.primary_portrait === "object" &&
+    !Array.isArray(snapshot.primary_portrait)
+      ? (snapshot.primary_portrait as Record<string, unknown>)
+      : null;
+  const contextPortrait =
+    snapshot?.context_portrait &&
+    typeof snapshot.context_portrait === "object" &&
+    !Array.isArray(snapshot.context_portrait)
+      ? (snapshot.context_portrait as Record<string, unknown>)
+      : null;
+  const candidates: unknown[] = [
+    explicitPortraitDataUrl,
+    snapshot?.portrait_url,
+    primaryPortrait?.image_data_url,
+    primaryPortrait?.image_url,
+    contextPortrait?.image_data_url,
+    contextPortrait?.image_url,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    if (parseDataUrl(trimmed)) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+function buildChatIdentityUpdatePendingMessage(languageInput: unknown): string {
+  const language = String(languageInput || "en").trim().toLowerCase();
+  if (language.startsWith("pt")) {
+    return "Atualizando card de identidade...";
+  }
+  if (language.startsWith("es")) {
+    return "Actualizando la ficha de identidad...";
+  }
+  if (language.startsWith("fr")) {
+    return "Mise a jour de la fiche d'identite...";
+  }
+  return "Updating identity card...";
+}
+
+function buildChatIdentityUpdateFailureMessage(languageInput: unknown, fallback?: unknown): string {
+  const fallbackMessage = typeof fallback === "string" ? fallback.trim() : "";
+  if (fallbackMessage) return fallbackMessage;
+  const language = String(languageInput || "en").trim().toLowerCase();
+  if (language.startsWith("pt")) {
+    return "Nao consegui atualizar esse card de identidade.";
+  }
+  if (language.startsWith("es")) {
+    return "No pude actualizar esta ficha de identidad.";
+  }
+  if (language.startsWith("fr")) {
+    return "Je n'ai pas pu mettre a jour cette fiche d'identite.";
+  }
+  return "I couldn't update this identity card.";
+}
+
+async function appendFaceTargetImageFromDataUrl(
+  env: Env,
+  userId: string,
+  targetId: number,
+  portraitDataUrl: string
+) {
+  const parsedPortrait = parseDataUrl(portraitDataUrl);
+  if (!parsedPortrait) {
+    throw new Error("A valid portrait image is required.");
+  }
+  if (!String(parsedPortrait.contentType || "").toLowerCase().startsWith("image/")) {
+    throw new Error("Only image portraits can be saved as face targets.");
+  }
+
+  const bytes = base64ToUint8Array(parsedPortrait.base64);
+  if (bytes.byteLength <= 0) {
+    throw new Error("Portrait image is empty.");
+  }
+  if (bytes.byteLength > FACE_TARGET_MAX_UPLOAD_BYTES) {
+    throw new Error("Portrait image is too large. Maximum size is 10MB.");
+  }
+
+  const currentImageCount = await getFaceTargetImageCount(env.DB, targetId);
+  if (currentImageCount >= FACE_TARGET_MAX_IMAGES) {
+    throw new Error(`Maximum ${FACE_TARGET_MAX_IMAGES} images per face target reached.`);
+  }
+
+  const storageKey = buildFaceTargetStorageKey(userId, targetId, parsedPortrait.contentType);
+  await env.R2_BUCKET.put(storageKey, bytes, {
+    httpMetadata: { contentType: parsedPortrait.contentType || "image/jpeg" },
+  });
+  const imageUrl = `/api/face-target-images/${encodeURIComponent(storageKey)}`;
+  const now = new Date().toISOString();
+
+  await env.DB
+    .prepare(
+      `INSERT INTO face_target_images (face_target_id, image_url, created_at, updated_at)
+       VALUES (?, ?, ?, ?)`
+    )
+    .bind(targetId, imageUrl, now, now)
+    .run();
+}
+
+async function upsertManualFaceTargetFromIdentityCard(
+  env: Env,
+  userId: string,
+  name: string,
+  description: string,
+  portraitDataUrl: string | null,
+  snapshot: Record<string, unknown> | null
+) {
+  const existingTargetId = readChatIdentityResolvedTargetId(snapshot);
+  const now = new Date().toISOString();
+
+  if (existingTargetId) {
+    const existingTarget = await env.DB
+      .prepare("SELECT id FROM face_targets WHERE id = ? AND user_id = ?")
+      .bind(existingTargetId, userId)
+      .first();
+
+    if (existingTarget) {
+      await env.DB
+        .prepare(
+          `UPDATE face_targets
+           SET name = ?, description = ?, updated_at = ?
+           WHERE id = ? AND user_id = ?`
+        )
+        .bind(name, description, now, existingTargetId, userId)
+        .run();
+
+      if (portraitDataUrl) {
+        await appendFaceTargetImageFromDataUrl(env, userId, existingTargetId, portraitDataUrl);
+      }
+
+      const targets = await fetchFaceTargetsForUser(env.DB, userId);
+      const target = targets.find((item) => item.id === existingTargetId) || null;
+      if (target) {
+        return target;
+      }
+    }
+  }
+
+  if (!portraitDataUrl) {
+    throw new Error("A face crop is required to save this identity as a reusable face target.");
+  }
+
+  const targetInsert = await env.DB
+    .prepare(
+      `INSERT INTO face_targets (user_id, name, description, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(userId, name, description, now, now)
+    .run();
+
+  const targetId = Number(targetInsert.meta.last_row_id || 0);
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    throw new Error("Failed to create face target.");
+  }
+
+  await appendFaceTargetImageFromDataUrl(env, userId, targetId, portraitDataUrl);
+
+  const targets = await fetchFaceTargetsForUser(env.DB, userId);
+  const target = targets.find((item) => item.id === targetId) || null;
+  if (!target) {
+    throw new Error("Failed to load the saved face target.");
+  }
+  return target;
+}
+
 app.get("/api/face-targets", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   try {
@@ -32011,6 +34018,7 @@ app.post("/api/chat/sessions/:id/camera-batch-edit/confirm", anyAuthMiddleware, 
 app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const sessionId = c.req.param("id");
+  const numericSessionId = Number.parseInt(sessionId, 10);
   const body = await c.req.json<{
     content: string;
     camera_id?: number;
@@ -32145,6 +34153,39 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const queryLanguageInfo = detectChatMessageLanguage(body.content, appLanguage);
   const queryLanguage = queryLanguageInfo.language;
   const queryLanguageSource = queryLanguageInfo.source;
+  let persistedTaskState = buildDefaultChatTaskState();
+  const contextRow = await c.env.DB.prepare(
+    `SELECT task_state_json
+     FROM chat_session_contexts
+     WHERE user_id = ? AND session_id = ?
+     LIMIT 1`
+  )
+    .bind(user.id, sessionId)
+    .first();
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      persistedTaskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      persistedTaskState = buildDefaultChatTaskState();
+    }
+  }
+  const videoRoutingContext = buildChatVideoRoutingContextFromTaskState(persistedTaskState);
+  const preferIdentityRecall = shouldPreferIdentityRecallQuery(body.content);
+  const replyLanguageHint = await resolveChatSessionReplyLanguageHint(
+    c.env.DB,
+    user.id,
+    Number.isInteger(numericSessionId) && numericSessionId > 0 ? numericSessionId : 0,
+    appLanguage,
+    {
+      currentMessage: body.content,
+      taskState: persistedTaskState,
+      excludeMessageId: currentUserMessageId > 0 ? currentUserMessageId : null,
+    }
+  );
+  const effectiveReplyLanguage =
+    queryLanguageSource === "detected" ? queryLanguage : replyLanguageHint;
   const latestConnectedPairing = await c.env.DB.prepare(
     `SELECT *
      FROM exe_pairings
@@ -32252,6 +34293,7 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     app_language: appLanguage,
     query_language: queryLanguage,
     query_language_source: queryLanguageSource,
+    prefer_identity_recall: preferIdentityRecall,
     ui_languages: ["en", "es", "pt", "fr", "zh", "ar"],
     uploaded_image_base64: body.uploaded_image_base64 || null,
     uploaded_video_id: body.uploaded_video_id || null,
@@ -32279,6 +34321,13 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
       "generate_report",
     ],
   };
+  if (effectiveReplyLanguage) {
+    (chatQueryPayload as any).reply_language = effectiveReplyLanguage;
+    (chatQueryPayload as any).language = effectiveReplyLanguage;
+  }
+  if (videoRoutingContext) {
+    (chatQueryPayload as any).video_routing_context = videoRoutingContext;
+  }
   if (currentUserMessageId > 0) {
     (chatQueryPayload as any).context_before_message_id = currentUserMessageId;
   }
@@ -32564,6 +34613,314 @@ app.post("/api/chat/sessions/:sessionId/cancel", anyAuthMiddleware, async (c) =>
     ok: true,
     cancelled: Boolean((pendingAssistantMessages || []).length || activeCommands.length),
     messages: results,
+  });
+});
+
+app.post("/api/chat/sessions/:sessionId/identity-cards/upsert", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+  const user = c.get("user")!;
+  const sessionId = parseInt(c.req.param("sessionId"), 10);
+  const body = (await c.req
+    .json<{
+      entity_id?: unknown;
+      entity_type?: unknown;
+      target_name?: unknown;
+      physical_traits?: unknown;
+      save_as_face_target?: unknown;
+      portrait_data_url?: unknown;
+      card_snapshot?: unknown;
+    }>()
+    .catch(() => ({}))) as {
+      entity_id?: unknown;
+      entity_type?: unknown;
+      target_name?: unknown;
+      physical_traits?: unknown;
+      save_as_face_target?: unknown;
+      portrait_data_url?: unknown;
+      card_snapshot?: unknown;
+    };
+
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    return c.json({ error: "Invalid session id" }, 400);
+  }
+
+  const session = await c.env.DB
+    .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(sessionId, user.id)
+    .first();
+  if (!session) {
+    return c.json({ error: "Chat session not found" }, 404);
+  }
+
+  const languageRow = await c.env.DB
+    .prepare("SELECT language FROM user_preferences WHERE user_id = ? LIMIT 1")
+    .bind(user.id)
+    .first();
+  const appLanguage = normalizeSupportedChatLanguage((languageRow as any)?.language || "en", "en");
+  let persistedTaskState = buildDefaultChatTaskState();
+  const contextRow = await c.env.DB
+    .prepare(
+      `SELECT task_state_json
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+    .bind(user.id, sessionId)
+    .first();
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      persistedTaskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      persistedTaskState = buildDefaultChatTaskState();
+    }
+  }
+  const language =
+    (await resolveChatSessionReplyLanguageHint(c.env.DB, user.id, sessionId, appLanguage, {
+      taskState: persistedTaskState,
+    })) || appLanguage;
+
+  const { results: pendingRows } = await c.env.DB
+    .prepare(
+      `SELECT id
+       FROM chat_messages
+       WHERE user_id = ? AND session_id = ? AND role = 'assistant' AND is_pending = 1
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .bind(user.id, sessionId)
+    .all();
+  if ((pendingRows || []).length > 0) {
+    const busyMessage = language.startsWith("pt")
+      ? "Espere a resposta atual terminar antes de editar esse card de identidade."
+      : language.startsWith("es")
+        ? "Espera a que termine la respuesta actual antes de editar esta ficha de identidad."
+        : language.startsWith("fr")
+          ? "Attendez que la reponse en cours se termine avant de modifier cette fiche d'identite."
+          : "Wait for the current response to finish before editing this identity card.";
+    return c.json({ error: busyMessage }, 409);
+  }
+
+  const latestConnectedPairing = await c.env.DB
+    .prepare(
+      `SELECT *
+       FROM exe_pairings
+       WHERE user_id = ? AND status = 'connected'
+       ORDER BY COALESCE(last_seen_at, paired_at) DESC
+       LIMIT 1`
+    )
+    .bind(user.id)
+    .first();
+  const chatDesktopAgentAvailability = buildChatDesktopAgentAvailability(latestConnectedPairing || null);
+  if (!chatDesktopAgentAvailability.is_available_for_chat) {
+    const desktopAgentStatus =
+      chatDesktopAgentAvailability.chat_effective_status === "stale" ? "stale" : "offline";
+    return c.json(
+      {
+        error: buildChatCancellationMessage(language, desktopAgentStatus),
+        reason: desktopAgentStatus,
+      },
+      409
+    );
+  }
+
+  const cardSnapshot = parseChatIdentityCardSnapshot(body.card_snapshot);
+  const entityId =
+    normalizeText(body.entity_id) ||
+    (typeof cardSnapshot?.entity_id === "string" ? String(cardSnapshot.entity_id).trim() : "");
+  if (!entityId) {
+    return c.json({ error: "entity_id is required" }, 400);
+  }
+
+  const existingResolvedIdentity =
+    cardSnapshot?.resolved_identity &&
+    typeof cardSnapshot.resolved_identity === "object" &&
+    !Array.isArray(cardSnapshot.resolved_identity)
+      ? (cardSnapshot.resolved_identity as Record<string, unknown>)
+      : null;
+  const existingNameCandidates = [
+    typeof cardSnapshot?.known_name === "string" ? String(cardSnapshot.known_name).trim() : "",
+    typeof existingResolvedIdentity?.target_name === "string"
+      ? String(existingResolvedIdentity.target_name).trim()
+      : "",
+    typeof cardSnapshot?.display_name === "string" &&
+    String(cardSnapshot.display_name).trim() !== entityId
+      ? String(cardSnapshot.display_name).trim()
+      : "",
+  ];
+  const derivedExistingName = existingNameCandidates.find(Boolean) || "";
+  const targetName = normalizeText(body.target_name) || derivedExistingName;
+  const entityType =
+    normalizeText(body.entity_type).toLowerCase() ||
+    (typeof cardSnapshot?.entity_type === "string" ? String(cardSnapshot.entity_type).trim().toLowerCase() : "");
+  const physicalTraits = normalizeChatIdentityEditTraits(
+    body.physical_traits ?? cardSnapshot?.identity_signature_traits ?? []
+  );
+  const saveAsFaceTarget =
+    body.save_as_face_target === true ||
+    body.save_as_face_target === 1 ||
+    body.save_as_face_target === "1" ||
+    body.save_as_face_target === "true";
+  const portraitDataUrl = readChatIdentityPortraitDataUrl(body.portrait_data_url, cardSnapshot);
+
+  if (!targetName && physicalTraits.length === 0 && !saveAsFaceTarget) {
+    return c.json({ error: "Provide a name or physical traits to update this identity card." }, 400);
+  }
+  if (saveAsFaceTarget && !targetName) {
+    return c.json({ error: "A name is required to save this identity as a reusable face target." }, 400);
+  }
+  if (saveAsFaceTarget && (!c.env.R2_BUCKET || typeof c.env.R2_BUCKET.put !== "function")) {
+    return c.json({ error: "Face target storage is not configured." }, 500);
+  }
+
+  const targetDescription = buildChatIdentityPhysicalTraitDescription(physicalTraits);
+  let savedFaceTarget:
+    | {
+        id: number;
+        user_id: string;
+        name: string;
+        description: string;
+        created_at: string;
+        updated_at: string;
+        images: FaceTargetImagePayload[];
+        image_count: number;
+      }
+    | null = null;
+
+  try {
+    if (saveAsFaceTarget) {
+      savedFaceTarget = await upsertManualFaceTargetFromIdentityCard(
+        c.env,
+        user.id,
+        targetName,
+        targetDescription,
+        portraitDataUrl,
+        cardSnapshot
+      );
+    }
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message.trim()
+        ? error.message.trim()
+        : "Failed to save reusable face target.";
+    return c.json({ error: message }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const referenceImageUrls = Array.isArray(savedFaceTarget?.images)
+    ? savedFaceTarget!.images
+        .map((image) => (typeof image?.image_url === "string" ? image.image_url.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
+
+  const resolvedIdentity: Record<string, unknown> = {
+    ...(existingResolvedIdentity || {}),
+    source: savedFaceTarget ? "user_confirmed_target_link" : "user_named_identity",
+    confirmed_at_utc: now,
+  };
+  if (targetName) {
+    resolvedIdentity.target_name = targetName;
+  }
+  if (targetDescription) {
+    resolvedIdentity.target_description = targetDescription;
+  }
+  if (savedFaceTarget?.id) {
+    resolvedIdentity.target_id = savedFaceTarget.id;
+  }
+  if (referenceImageUrls.length > 0) {
+    resolvedIdentity.reference_image_urls = referenceImageUrls;
+  }
+
+  const payload = {
+    chat_session_id: sessionId,
+    entity_id: entityId,
+    entity_type: entityType || undefined,
+    reply_language: language,
+    target_name: targetName || undefined,
+    physical_traits: physicalTraits,
+    target_description: targetDescription || undefined,
+    portrait_data_url: portraitDataUrl || undefined,
+    resolved_identity: resolvedIdentity,
+    save_as_face_target: saveAsFaceTarget,
+    card_snapshot: cardSnapshot,
+  };
+
+  const targetClientId =
+    typeof (latestConnectedPairing as any)?.client_id === "string" &&
+    String((latestConnectedPairing as any).client_id).trim()
+      ? String((latestConnectedPairing as any).client_id).trim()
+      : null;
+  const targetExeId =
+    typeof (latestConnectedPairing as any)?.exe_id === "string" &&
+    String((latestConnectedPairing as any).exe_id).trim()
+      ? String((latestConnectedPairing as any).exe_id).trim()
+      : null;
+
+  await c.env.DB
+    .prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         target_client_id,
+         target_exe_id
+       )
+       VALUES (?, NULL, 'chat_identity_upsert', ?, 'pending', ?, ?, ?, ?)`
+    )
+    .bind(
+      user.id,
+      JSON.stringify(payload),
+      now,
+      now,
+      targetClientId,
+      targetExeId
+    )
+    .run();
+
+  await c.env.DB
+    .prepare(
+      `INSERT INTO chat_messages (
+         user_id,
+         session_id,
+         role,
+         content,
+         camera_ids,
+         tokens_used,
+         message_type,
+         is_pending,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'assistant', ?, NULL, 0, 'pre_answer', 1, ?, ?)`
+    )
+    .bind(user.id, sessionId, buildChatIdentityUpdatePendingMessage(language), now, now)
+    .run();
+
+  await c.env.DB
+    .prepare(`UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .bind(sessionId)
+    .run();
+
+  const { results } = await c.env.DB
+    .prepare("SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC")
+    .bind(user.id, sessionId)
+    .all();
+
+  wsHandler.broadcast(sessionId, {
+    type: "message_update",
+    messages: results,
+  });
+
+  return c.json({
+    ok: true,
+    messages: results,
+    saved_face_target: savedFaceTarget,
   });
 });
 
@@ -36262,6 +38619,7 @@ app.get("/api/agent/chat-context", async (c) => {
 
   let compactContext = buildDefaultChatCompactContext();
   let taskState = buildDefaultChatTaskState();
+  let agentTemporalState = buildDefaultChatAgentTemporalState();
   let lastCompactedMessageId = 0;
   let tokenEstimate = 0;
 
@@ -36283,6 +38641,15 @@ app.get("/api/agent/chat-context", async (c) => {
       );
     } catch {
       taskState = buildDefaultChatTaskState();
+    }
+  }
+  if (contextRow && typeof (contextRow as any).agent_temporal_state_json === "string") {
+    try {
+      agentTemporalState = normalizeChatAgentTemporalState(
+        JSON.parse(String((contextRow as any).agent_temporal_state_json || "{}"))
+      );
+    } catch {
+      agentTemporalState = buildDefaultChatAgentTemporalState();
     }
   }
 
@@ -36326,6 +38693,7 @@ app.get("/api/agent/chat-context", async (c) => {
     context_before_message_id: beforeMessageId === Number.MAX_SAFE_INTEGER ? null : beforeMessageId,
     compact_context: compactContext,
     task_state: taskState,
+    agent_temporal_state: agentTemporalState,
     last_compacted_message_id: lastCompactedMessageId,
     token_estimate: tokenEstimate,
     recent_turns: recentTurns,
@@ -36366,6 +38734,7 @@ app.post("/api/agent/chat-context", async (c) => {
     chat_session_id: number;
     compact_context?: unknown;
     task_state?: unknown;
+    agent_temporal_state?: unknown;
     last_compacted_message_id?: number;
     token_estimate?: number;
   }>();
@@ -36385,11 +38754,93 @@ app.post("/api/agent/chat-context", async (c) => {
     return c.json({ error: "Session not found" }, 404);
   }
 
-  const compactContext = normalizeChatCompactContext(body?.compact_context);
-  const taskState = normalizeChatTaskState(body?.task_state);
-  const lastCompactedMessageId = Math.max(0, Number(body?.last_compacted_message_id || 0));
-  const tokenEstimate = Math.max(0, Number(body?.token_estimate || 0));
+  const contextRow = await c.env.DB
+    .prepare(
+      `SELECT compact_context_json,
+              task_state_json,
+              agent_temporal_state_json,
+              last_compacted_message_id,
+              token_estimate,
+              compacted_at,
+              created_at
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+    .bind(userId, chatSessionId)
+    .first();
+
+  let existingCompactContext = buildDefaultChatCompactContext();
+  let existingTaskState = buildDefaultChatTaskState();
+  let existingAgentTemporalState = buildDefaultChatAgentTemporalState();
+  let existingLastCompactedMessageId = 0;
+  let existingTokenEstimate = 0;
+  const existingCompactedAt =
+    typeof (contextRow as any)?.compacted_at === "string" && String((contextRow as any).compacted_at).trim()
+      ? String((contextRow as any).compacted_at).trim()
+      : null;
+  const existingCreatedAt =
+    typeof (contextRow as any)?.created_at === "string" && String((contextRow as any).created_at).trim()
+      ? String((contextRow as any).created_at).trim()
+      : null;
+
+  if (contextRow && typeof (contextRow as any).compact_context_json === "string") {
+    try {
+      existingCompactContext = normalizeChatCompactContext(
+        JSON.parse(String((contextRow as any).compact_context_json || "{}"))
+      );
+    } catch {
+      existingCompactContext = buildDefaultChatCompactContext();
+    }
+    existingLastCompactedMessageId = Math.max(
+      0,
+      Number((contextRow as any).last_compacted_message_id || 0)
+    );
+    existingTokenEstimate = Math.max(0, Number((contextRow as any).token_estimate || 0));
+  }
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      existingTaskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      existingTaskState = buildDefaultChatTaskState();
+    }
+  }
+  if (contextRow && typeof (contextRow as any).agent_temporal_state_json === "string") {
+    try {
+      existingAgentTemporalState = normalizeChatAgentTemporalState(
+        JSON.parse(String((contextRow as any).agent_temporal_state_json || "{}"))
+      );
+    } catch {
+      existingAgentTemporalState = buildDefaultChatAgentTemporalState();
+    }
+  }
+
+  const hasCompactContext = Object.prototype.hasOwnProperty.call(body, "compact_context");
+  const hasTaskState = Object.prototype.hasOwnProperty.call(body, "task_state");
+  const hasAgentTemporalState = Object.prototype.hasOwnProperty.call(body, "agent_temporal_state");
+  const hasLastCompactedMessageId = Object.prototype.hasOwnProperty.call(body, "last_compacted_message_id");
+  const hasTokenEstimate = Object.prototype.hasOwnProperty.call(body, "token_estimate");
+
+  const compactContext = hasCompactContext
+    ? normalizeChatCompactContext(body?.compact_context)
+    : existingCompactContext;
+  const taskState = hasTaskState ? normalizeChatTaskState(body?.task_state) : existingTaskState;
+  const agentTemporalState = hasAgentTemporalState
+    ? normalizeChatAgentTemporalState(body?.agent_temporal_state)
+    : existingAgentTemporalState;
+  const lastCompactedMessageId = hasLastCompactedMessageId
+    ? Math.max(0, Number(body?.last_compacted_message_id || 0))
+    : existingLastCompactedMessageId;
+  const tokenEstimate = hasTokenEstimate
+    ? Math.max(0, Number(body?.token_estimate || 0))
+    : existingTokenEstimate;
   const now = new Date().toISOString();
+  const compactedAt =
+    hasCompactContext || hasLastCompactedMessageId || hasTokenEstimate
+      ? now
+      : existingCompactedAt;
 
   await c.env.DB.prepare(
     `INSERT INTO chat_session_contexts (
@@ -36397,28 +38848,33 @@ app.post("/api/agent/chat-context", async (c) => {
        session_id,
        compact_context_json,
        task_state_json,
+       agent_temporal_state_json,
        last_compacted_message_id,
        token_estimate,
        compacted_at,
+       created_at,
        updated_at
      )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, session_id) DO UPDATE SET
        compact_context_json = excluded.compact_context_json,
        task_state_json = excluded.task_state_json,
+       agent_temporal_state_json = excluded.agent_temporal_state_json,
        last_compacted_message_id = excluded.last_compacted_message_id,
        token_estimate = excluded.token_estimate,
        compacted_at = excluded.compacted_at,
-       updated_at = excluded.updated_at`
+        updated_at = excluded.updated_at`
   )
     .bind(
       userId,
       chatSessionId,
       JSON.stringify(compactContext),
       JSON.stringify(taskState),
+      JSON.stringify(agentTemporalState),
       lastCompactedMessageId,
       tokenEstimate,
-      now,
+      compactedAt,
+      existingCreatedAt || now,
       now
     )
     .run();
@@ -36473,6 +38929,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
     model_prompt_tokens?: number;
     model_output_tokens?: number;
     model_total_tokens?: number;
+    reply_language?: string;
     message_metadata?: unknown;
   }>();
 
@@ -36504,6 +38961,15 @@ app.post("/api/agent/chat-router-result", async (c) => {
   
   // Support both 'query' and 'original_query' field names
   const query = body.original_query || body.query || "";
+  const routerMetadata =
+    body.message_metadata && typeof body.message_metadata === "object" && !Array.isArray(body.message_metadata)
+      ? (body.message_metadata as Record<string, unknown>)
+      : {};
+  const replyLanguage = normalizeSupportedChatLanguage(
+    body.reply_language ?? routerMetadata.reply_language ?? "en",
+    "en"
+  );
+  const analysisTarget = normalizeText(routerMetadata.analysis_target).toLowerCase();
 
   if (!chat_session_id || typeof answer !== "string") {
     return c.json({ error: "chat_session_id and answer are required" }, 400);
@@ -36552,14 +39018,29 @@ app.post("/api/agent/chat-router-result", async (c) => {
 
   // Determine if we actually have frames to analyze
   const hasFramesToAnalyze =
-    !isNoFramesAnswer &&
-    Array.isArray(camera_ids) &&
-    camera_ids.length > 0 &&
-    (time_window_minutes_before_now || 0) > 0;
+    analysisTarget === "uploaded_video" ||
+    (!isNoFramesAnswer &&
+      Array.isArray(camera_ids) &&
+      camera_ids.length > 0 &&
+      (time_window_minutes_before_now || 0) > 0);
+  const routerVisibleMessage = hasFramesToAnalyze
+    ? buildChatVideoRouterAckMessage(replyLanguage, {
+        analysisTarget,
+        cameraNames: camera_names,
+        allCameras: all_cameras,
+      })
+    : buildChatVideoRouterClarificationMessage(replyLanguage, {
+        cameraIds: camera_ids,
+        cameraNames: camera_names,
+        timeWindowMinutes: time_window_minutes_before_now,
+      });
+  const analysisPendingMessage = buildChatVideoAnalysisPendingMessage(replyLanguage, {
+    analysisTarget,
+  });
 
   // Build metadata JSON
   const metadata = {
-    type: "router_ack",
+    type: hasFramesToAnalyze ? "router_ack" : "router_clarification",
     query: query || "",
     camera_ids: camera_ids || [],
     camera_names: camera_names || [],
@@ -36568,6 +39049,9 @@ app.post("/api/agent/chat-router-result", async (c) => {
     tokens_prompt: tokens_prompt || 0,
     tokens_output: tokens_output || 0,
     tokens_total: tokens_total || 0,
+    reply_language: replyLanguage,
+    analysis_target: analysisTarget || "camera_video_search",
+    router_raw_answer: normalizeText(answer).slice(0, 600),
   };
   if (body.message_metadata && typeof body.message_metadata === "object" && !Array.isArray(body.message_metadata)) {
     Object.assign(metadata, body.message_metadata as Record<string, unknown>);
@@ -36593,8 +39077,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
     .first();
 
   if (pendingMessage) {
-    // Update the existing pending message with router answer
-    // If no frames to analyze, this becomes the final message
+    // Update the existing pending message with a deterministic router status message.
     await c.env.DB.prepare(
     `UPDATE chat_messages
      SET content = ?,
@@ -36612,7 +39095,7 @@ app.post("/api/agent/chat-router-result", async (c) => {
      WHERE id = ?`
     )
       .bind(
-        answer,
+        routerVisibleMessage,
         cameraIdsStr,
         JSON.stringify(metadata),
         tokens_total || 0,
@@ -36653,9 +39136,9 @@ app.post("/api/agent/chat-router-result", async (c) => {
     if (hasFramesToAnalyze) {
       await c.env.DB.prepare(
         `INSERT INTO chat_messages (user_id, session_id, role, content, camera_ids, tokens_used, message_type, is_pending, created_at, updated_at)
-         VALUES (?, ?, 'assistant', 'Analyzing camera feed...', NULL, 0, 'final_answer_pending', 1, ?, ?)`
+         VALUES (?, ?, 'assistant', ?, NULL, 0, 'final_answer_pending', 1, ?, ?)`
       )
-        .bind(userId, chat_session_id, now, now)
+        .bind(userId, chat_session_id, analysisPendingMessage, now, now)
         .run();
     }
   }
@@ -36760,6 +39243,10 @@ app.post("/api/agent/chat-response", async (c) => {
     const vision_hits = Array.isArray(body.vision_hits) ? body.vision_hits : [];
     const hit_images = Array.isArray(body.hit_images) ? body.hit_images : undefined;
     const identity_cards = Array.isArray(body.identity_cards) ? body.identity_cards : [];
+    const message_metadata =
+      body.message_metadata && typeof body.message_metadata === "object" && !Array.isArray(body.message_metadata)
+        ? (body.message_metadata as Record<string, unknown>)
+        : null;
 
     // Extra fields from EXE that we ignore (but don't cause errors):
     // - original_query, query, start_timestamp, end_timestamp, search_paths, status
@@ -36832,7 +39319,8 @@ app.post("/api/agent/chat-response", async (c) => {
       (Array.isArray(camera_ids) && camera_ids.length > 0) ||
       vision_hits.length > 0 ||
       (Array.isArray(hit_images) && hit_images.length > 0) ||
-      identity_cards.length > 0;
+      identity_cards.length > 0 ||
+      !!message_metadata;
 
     const cameraSelectionPayload: Record<string, unknown> = {};
     if (Array.isArray(camera_ids) && camera_ids.length > 0) {
@@ -36856,6 +39344,9 @@ app.post("/api/agent/chat-response", async (c) => {
     if (identity_cards.length > 0) {
       cameraSelectionPayload.identity_cards = identity_cards;
     }
+    if (message_metadata) {
+      Object.assign(cameraSelectionPayload, message_metadata);
+    }
 
     const cameraSelectionJson = hasStructuredSelectionPayload
       ? JSON.stringify(cameraSelectionPayload)
@@ -36871,6 +39362,23 @@ app.post("/api/agent/chat-response", async (c) => {
       time_window_minutes_before_now,
       query,
     });
+    const lastPositiveHitSummary = buildChatLastPositiveHitSummary({
+      query,
+      camera_ids,
+      camera_names,
+      all_cameras,
+      time_window_minutes_before_now,
+      vision_hits,
+      identity_cards,
+    });
+    if (lastPositiveHitSummary) {
+      await safePersistChatLastPositiveHitMemory(
+        c.env.DB,
+        String(userId),
+        chat_session_id,
+        lastPositiveHitSummary
+      );
+    }
 
     console.log("[CHAT RESPONSE] Built message data:", {
       cameraIdsStr,
@@ -37095,7 +39603,62 @@ app.post("/api/agent/chat-response", async (c) => {
         
         console.log("[CHAT RESPONSE] ✓ Tokens deducted");
       } else {
-        const normalizedAnswer = String(answer || "").trim().toLowerCase();
+        console.log("[CHAT RESPONSE] No final_answer_pending message found, checking for pending pre_answer...");
+        const pendingPreAnswer = await c.env.DB.prepare(
+          `SELECT * FROM chat_messages
+           WHERE user_id = ? AND session_id = ? AND message_type = 'pre_answer' AND is_pending = 1
+           ORDER BY id DESC LIMIT 1`
+        )
+          .bind(userId, chat_session_id)
+          .first();
+
+        if (pendingPreAnswer) {
+          console.log(
+            "[CHAT RESPONSE] Promoting pending pre_answer message to final, id:",
+            (pendingPreAnswer as any).id
+          );
+
+          await c.env.DB.prepare(
+            `UPDATE chat_messages
+             SET content = ?,
+                 camera_ids = ?,
+                 camera_selection_json = ?,
+                 tokens_used = ?,
+                 model_prompt_tokens = ?,
+                 model_output_tokens = ?,
+                 model_total_tokens = ?,
+                 usage_recorded_at = ?,
+                 message_type = 'final',
+                 is_pending = 0,
+                 progress_json = NULL,
+                 updated_at = ?
+             WHERE id = ?`
+          )
+            .bind(
+              answer,
+              cameraIdsStr,
+              cameraSelectionJson,
+              tokensUsed,
+              model_prompt_tokens,
+              model_output_tokens,
+              model_total_tokens,
+              usageRecordedAt,
+              now,
+              (pendingPreAnswer as any).id
+            )
+            .run();
+
+          const inputTokens = model_prompt_tokens || 0;
+          const outputTokens = model_output_tokens || 0;
+          const totalTokens = tokensUsed || (inputTokens + outputTokens);
+          await deductFromTokenBalances(inputTokens, outputTokens, totalTokens);
+
+          console.log("[CHAT RESPONSE] Promoted pre_answer message to final");
+          console.log("[CHAT RESPONSE] Tokens deducted");
+        }
+
+        if (!pendingPreAnswer) {
+          const normalizedAnswer = String(answer || "").trim().toLowerCase();
         const isInternalNoFramesFallback =
           normalizedAnswer.includes("stored video/frames in the requested time window") ||
           normalizedAnswer.includes("videos/frames armazenados no intervalo de tempo solicitado");
@@ -37142,6 +39705,7 @@ app.post("/api/agent/chat-response", async (c) => {
         await deductFromTokenBalances(inputTokens, outputTokens, totalTokens);
         
         console.log("[CHAT RESPONSE] ✓ Tokens deducted");
+        }
       }
     }
 
@@ -38751,12 +41315,19 @@ app.post("/api/agent/events", async (c) => {
         `[CAMERA STATE] Skipped online state mutation for temporary Drakon Find session on camera ${cameraId}`
       );
     } else {
+      const shouldMarkDirectRunning =
+        eventStartOrigin === "" || eventStartOrigin === "direct";
       await c.env.DB.prepare(
         `UPDATE cameras
-         SET is_online = 1, is_service_running = 1, updated_at = CURRENT_TIMESTAMP
+         SET is_online = 1,
+             is_service_running = CASE
+               WHEN ? = 1 THEN 1
+               ELSE is_service_running
+             END,
+             updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND user_id = ?`
       )
-        .bind(cameraId, userId)
+        .bind(shouldMarkDirectRunning ? 1 : 0, cameraId, userId)
         .run();
     }
   }
@@ -39116,6 +41687,318 @@ app.get("/api/agent/orchestrator/state", async (c) => {
       video_search_core_available: !!userZAiApiKey,
       chatv2_enabled: true,
     },
+  });
+});
+
+app.post("/api/agent/orchestrator/camera-activity", async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req
+    .json<{
+      camera_ids?: unknown;
+      all_cameras?: unknown;
+      time_window_minutes_before_now?: unknown;
+      start_timestamp?: unknown;
+      end_timestamp?: unknown;
+      limit_events?: unknown;
+      limit_detections?: unknown;
+      limit_alerts?: unknown;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const requestedCameraIds = normalizeAgentPositiveIntList(body.camera_ids);
+  const allCameras = body.all_cameras === true;
+  const fallbackWindowMinutes = clampAgentActivityLimit(
+    body.time_window_minutes_before_now,
+    10,
+    1,
+    24 * 60
+  );
+  const limitEvents = clampAgentActivityLimit(body.limit_events, 24, 1, 40);
+  const limitDetections = clampAgentActivityLimit(body.limit_detections, 24, 1, 40);
+  const limitAlerts = clampAgentActivityLimit(body.limit_alerts, 24, 1, 40);
+
+  let startMs =
+    parseAgentActivityTimestampMs(body.start_timestamp) ??
+    Date.now() - fallbackWindowMinutes * 60 * 1000;
+  let endMs =
+    parseAgentActivityTimestampMs(body.end_timestamp) ??
+    Date.now();
+  if (startMs > endMs) {
+    [startMs, endMs] = [endMs, startMs];
+  }
+
+  const startIso = new Date(startMs).toISOString();
+  const endIso = new Date(endMs).toISOString();
+  const durationMinutes = Math.max(1, Math.round((endMs - startMs) / (60 * 1000)));
+
+  let scopeCameraRows: any[] = [];
+  if (allCameras || requestedCameraIds.length > 0) {
+    const cameraBindings: Array<string | number> = [pairing.userId];
+    let cameraQuery =
+      `SELECT id, name, is_online, is_service_running
+       FROM cameras
+       WHERE user_id = ?`;
+    if (!allCameras && requestedCameraIds.length > 0) {
+      cameraQuery += ` AND id IN (${requestedCameraIds.map(() => "?").join(", ")})`;
+      cameraBindings.push(...requestedCameraIds);
+    }
+    cameraQuery += " ORDER BY created_at ASC, id ASC";
+    const cameraQueryResult = await c.env.DB.prepare(cameraQuery)
+      .bind(...cameraBindings)
+      .all();
+    scopeCameraRows = Array.isArray(cameraQueryResult.results)
+      ? cameraQueryResult.results
+      : [];
+  }
+
+  const scopeCameras = scopeCameraRows.map((row: any) => ({
+    id: Number(row?.id ?? 0),
+    name: typeof row?.name === "string" ? row.name : "",
+    is_online: Number(row?.is_online ?? 0) === 1,
+    is_service_running: Number(row?.is_service_running ?? 0) === 1,
+  }));
+  const scopeCameraIds = scopeCameras
+    .map((camera) => camera.id)
+    .filter((cameraId) => Number.isInteger(cameraId) && cameraId > 0);
+
+  if (!scopeCameraIds.length) {
+    return c.json({
+      requested_camera_ids: requestedCameraIds,
+      camera_ids: [],
+      all_cameras: allCameras,
+      cameras: [],
+      window: {
+        start_iso: startIso,
+        end_iso: endIso,
+        duration_minutes: durationMinutes,
+      },
+      counts: {
+        events_total: 0,
+        detections_total: 0,
+        alerts_total: 0,
+        total_items: 0,
+        maybe_incomplete: false,
+        events_by_type: [],
+        detections_by_algo: [],
+        alerts_by_origin: [],
+      },
+      history_available: false,
+      events: [],
+      detections: [],
+      alerts: [],
+    });
+  }
+
+  const eventCandidateLimit = Math.min(250, Math.max(limitEvents * 5, 120));
+  const detectionCandidateLimit = Math.min(250, Math.max(limitDetections * 5, 120));
+  const alertCandidateLimit = Math.min(250, Math.max(limitAlerts * 5, 120));
+
+  const eventWhere = buildAgentCameraActivityWhereClause("e.camera_id", scopeCameraIds);
+  const detectionWhere = buildAgentCameraActivityWhereClause("d.camera_id", scopeCameraIds);
+  const alertWhere = buildAgentCameraActivityWhereClause("e.camera_id", scopeCameraIds);
+
+  const [
+    eventRowsResult,
+    detectionRowsResult,
+    alertRowsResult,
+  ] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT e.id, e.camera_id, e.event_type, e.message, e.details_json, e.created_at, c.name AS camera_name
+       FROM events e
+       LEFT JOIN cameras c ON c.id = e.camera_id
+       WHERE e.user_id = ?${eventWhere.sql}
+       ORDER BY e.id DESC
+       LIMIT ?`
+    )
+      .bind(pairing.userId, ...eventWhere.bindings, eventCandidateLimit)
+      .all(),
+    c.env.DB.prepare(
+      `SELECT d.id, d.camera_id, d.camera_name, d.algo_type, d.detected_at, d.media_type, d.image_key, d.video_key, d.event_id, d.created_at
+       FROM detections d
+       WHERE d.user_id = ?${detectionWhere.sql}
+       ORDER BY d.detected_at DESC, d.id DESC
+       LIMIT ?`
+    )
+      .bind(pairing.userId, ...detectionWhere.bindings, detectionCandidateLimit)
+      .all(),
+    c.env.DB.prepare(
+      `SELECT e.id, e.camera_id, e.event_type, e.message, e.details_json, e.created_at, c.name AS camera_name
+       FROM events e
+       LEFT JOIN cameras c ON c.id = e.camera_id
+       WHERE e.user_id = ?
+         AND e.event_type IN ('job_alert_triggered', 'ai_detection')${alertWhere.sql}
+       ORDER BY e.id DESC
+       LIMIT ?`
+    )
+      .bind(pairing.userId, ...alertWhere.bindings, alertCandidateLimit)
+      .all(),
+  ]);
+
+  const eventRows = Array.isArray(eventRowsResult.results) ? eventRowsResult.results : [];
+  const detectionRows = Array.isArray(detectionRowsResult.results)
+    ? detectionRowsResult.results
+    : [];
+  const alertRows = Array.isArray(alertRowsResult.results) ? alertRowsResult.results : [];
+
+  const filteredEvents = eventRows
+    .map((row: any) => summarizeAgentActivityEventRow(row))
+    .filter((row: any) => {
+      const timestampMs =
+        parseAgentActivityTimestampMs(row.timestamp_iso) ??
+        parseAgentActivityTimestampMs(row.created_at);
+      return timestampMs !== null && timestampMs >= startMs && timestampMs <= endMs;
+    });
+
+  const filteredDetections = detectionRows
+    .map((row: any) => ({
+      id: Number(row?.id ?? 0),
+      camera_id:
+        row?.camera_id === null || row?.camera_id === undefined
+          ? null
+          : Number(row.camera_id),
+      camera_name: readAgentActivityText(row?.camera_name),
+      algo_type: readAgentActivityText(row?.algo_type),
+      detected_at: typeof row?.detected_at === "string" ? row.detected_at : null,
+      created_at: typeof row?.created_at === "string" ? row.created_at : null,
+      event_id:
+        row?.event_id === null || row?.event_id === undefined
+          ? null
+          : Number(row.event_id),
+      media_type: readAgentActivityText(row?.media_type) || "image",
+      has_image: typeof row?.image_key === "string" && row.image_key.trim().length > 0,
+      has_video: typeof row?.video_key === "string" && row.video_key.trim().length > 0,
+    }))
+    .filter((row: any) => {
+      const timestampMs =
+        parseAgentActivityTimestampMs(row.detected_at) ??
+        parseAgentActivityTimestampMs(row.created_at);
+      return timestampMs !== null && timestampMs >= startMs && timestampMs <= endMs;
+    });
+
+  const filteredAlerts = alertRows
+    .map((row: any) => normalizeDashboardAlertRow(row))
+    .map((alert: any) => ({
+      id: Number(alert?.id ?? 0),
+      camera_id:
+        alert?.camera_id === null || alert?.camera_id === undefined
+          ? null
+          : Number(alert.camera_id),
+      camera_name: readAgentActivityText(alert?.camera_name),
+      event_type: readAgentActivityText(alert?.event_type),
+      origin_kind: readAgentActivityText(alert?.origin_kind),
+      algo_type: readAgentActivityText(alert?.algo_type),
+      agent_label: readAgentActivityText(alert?.agent_label),
+      job_name: readAgentActivityText(alert?.job_name),
+      step_name: readAgentActivityText(alert?.step_name),
+      priority_level: readAgentActivityText(alert?.priority_level),
+      message: readAgentActivityText(alert?.message),
+      created_at: typeof alert?.created_at === "string" ? alert.created_at : null,
+      detected_at: typeof alert?.detected_at === "string" ? alert.detected_at : null,
+      contributing_events_count: Number(alert?.contributing_events_count ?? 0) || 0,
+      group_image_count: Number(alert?.group_image_count ?? 0) || 0,
+    }))
+    .filter((row: any) => {
+      const timestampMs =
+        parseAgentActivityTimestampMs(row.detected_at) ??
+        parseAgentActivityTimestampMs(row.created_at);
+      return timestampMs !== null && timestampMs >= startMs && timestampMs <= endMs;
+    });
+
+  const eventWindowMaybeIncomplete =
+    eventRows.length >= eventCandidateLimit &&
+    (() => {
+      const oldest = filteredEvents[filteredEvents.length - 1];
+      const oldestMs =
+        parseAgentActivityTimestampMs(oldest?.timestamp_iso) ??
+        parseAgentActivityTimestampMs(oldest?.created_at);
+      return oldestMs !== null && oldestMs >= startMs;
+    })();
+  const detectionWindowMaybeIncomplete =
+    detectionRows.length >= detectionCandidateLimit &&
+    (() => {
+      const oldest = filteredDetections[filteredDetections.length - 1];
+      const oldestMs =
+        parseAgentActivityTimestampMs(oldest?.detected_at) ??
+        parseAgentActivityTimestampMs(oldest?.created_at);
+      return oldestMs !== null && oldestMs >= startMs;
+    })();
+  const alertWindowMaybeIncomplete =
+    alertRows.length >= alertCandidateLimit &&
+    (() => {
+      const oldest = filteredAlerts[filteredAlerts.length - 1];
+      const oldestMs =
+        parseAgentActivityTimestampMs(oldest?.detected_at) ??
+        parseAgentActivityTimestampMs(oldest?.created_at);
+      return oldestMs !== null && oldestMs >= startMs;
+    })();
+
+  const buildCountRows = (
+    rows: Array<Record<string, any>>,
+    key: string
+  ): Array<{ key: string; count: number }> => {
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      const label = readAgentActivityText(row?.[key]) || "unknown";
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([label, count]) => ({ key: label, count }));
+  };
+
+  return c.json({
+    requested_camera_ids: requestedCameraIds,
+    camera_ids: scopeCameraIds,
+    all_cameras: allCameras,
+    cameras: scopeCameras,
+    window: {
+      start_iso: startIso,
+      end_iso: endIso,
+      duration_minutes: durationMinutes,
+    },
+    counts: {
+      events_total: filteredEvents.length,
+      detections_total: filteredDetections.length,
+      alerts_total: filteredAlerts.length,
+      total_items:
+        filteredEvents.length + filteredDetections.length + filteredAlerts.length,
+      maybe_incomplete:
+        eventWindowMaybeIncomplete ||
+        detectionWindowMaybeIncomplete ||
+        alertWindowMaybeIncomplete,
+      events_maybe_incomplete: eventWindowMaybeIncomplete,
+      detections_maybe_incomplete: detectionWindowMaybeIncomplete,
+      alerts_maybe_incomplete: alertWindowMaybeIncomplete,
+      events_by_type: buildCountRows(filteredEvents, "event_type"),
+      detections_by_algo: buildCountRows(filteredDetections, "algo_type"),
+      alerts_by_origin: buildCountRows(filteredAlerts, "origin_kind"),
+    },
+    history_available:
+      filteredEvents.length > 0 ||
+      filteredDetections.length > 0 ||
+      filteredAlerts.length > 0,
+    events: filteredEvents.slice(0, limitEvents),
+    detections: filteredDetections.slice(0, limitDetections),
+    alerts: filteredAlerts.slice(0, limitAlerts),
   });
 });
 
@@ -40720,6 +43603,7 @@ app.post("/api/agent/cameras/:cameraId/target_state", async (c) => {
 
   const body = await c.req.json<{
     is_service_running: number | boolean | string;
+    is_online?: number | boolean | string;
     source?: string;
   }>().catch(() => null);
 
@@ -40739,6 +43623,20 @@ app.post("/api/agent/cameras/:cameraId/target_state", async (c) => {
     return c.json({ error: "is_service_running must be 0/1 or boolean" }, 400);
   }
 
+  const rawOnline = body.is_online;
+  const normalizedOnline =
+    typeof rawOnline === "undefined"
+      ? undefined
+      : rawOnline === true || rawOnline === 1 || rawOnline === "1"
+      ? 1
+      : rawOnline === false || rawOnline === 0 || rawOnline === "0"
+      ? 0
+      : null;
+
+  if (normalizedOnline === null) {
+    return c.json({ error: "is_online must be 0/1 or boolean when provided" }, 400);
+  }
+
   // Make sure camera belongs to this user
   const camera = await c.env.DB.prepare(
     `SELECT id FROM cameras WHERE id = ? AND user_id = ?`
@@ -40752,16 +43650,19 @@ app.post("/api/agent/cameras/:cameraId/target_state", async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE cameras
-     SET is_service_running = ?, updated_at = CURRENT_TIMESTAMP
+     SET is_service_running = ?,
+         is_online = COALESCE(?, is_online),
+         updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND user_id = ?`
   )
-    .bind(normalized, cameraId, userId)
+    .bind(normalized, normalizedOnline ?? null, cameraId, userId)
     .run();
 
   return c.json({
     ok: true,
     camera_id: Number(cameraId),
     is_service_running: normalized,
+    is_online: normalizedOnline ?? null,
   });
 });
 
@@ -41282,6 +44183,70 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
     .run();
 
   const commandType = String((existingCommand as any)?.command_type || "");
+  if (commandType === "chat_identity_upsert" && normalizedStatus === "failed") {
+    let payload: Record<string, unknown> | null = null;
+    try {
+      payload =
+        typeof (existingCommand as any)?.payload === "string"
+          ? (JSON.parse(String((existingCommand as any).payload)) as Record<string, unknown>)
+          : null;
+    } catch {
+      payload = null;
+    }
+
+    const chatSessionId = Number(payload?.chat_session_id || 0);
+    if (Number.isInteger(chatSessionId) && chatSessionId > 0) {
+      const languageRow = await c.env.DB
+        .prepare("SELECT language FROM user_preferences WHERE user_id = ? LIMIT 1")
+        .bind(userId)
+        .first();
+      const failureMessage = buildChatIdentityUpdateFailureMessage(
+        normalizeSupportedChatLanguage((languageRow as any)?.language || "en", "en"),
+        body.error
+      );
+
+      const pendingMessage = await c.env.DB
+        .prepare(
+          `SELECT id
+           FROM chat_messages
+           WHERE user_id = ? AND session_id = ? AND role = 'assistant' AND is_pending = 1
+           ORDER BY id DESC
+           LIMIT 1`
+        )
+        .bind(userId, chatSessionId)
+        .first();
+
+      if (pendingMessage) {
+        await c.env.DB
+          .prepare(
+            `UPDATE chat_messages
+             SET content = ?,
+                 message_type = 'final',
+                 is_pending = 0,
+                 progress_json = NULL,
+                 updated_at = ?
+             WHERE id = ?`
+          )
+          .bind(failureMessage, now, Number((pendingMessage as any).id || 0))
+          .run();
+
+        await c.env.DB
+          .prepare(`UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+          .bind(chatSessionId)
+          .run();
+
+        const { results } = await c.env.DB
+          .prepare("SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC")
+          .bind(userId, chatSessionId)
+          .all();
+
+        wsHandler.broadcast(chatSessionId, {
+          type: "message_update",
+          messages: results,
+        });
+      }
+    }
+  }
   if (commandType === "drakon_find_cancel" && normalizedStatus === "completed") {
     const resultObject =
       body.result && typeof body.result === "object" && !Array.isArray(body.result)

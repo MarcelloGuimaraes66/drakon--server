@@ -70,6 +70,7 @@ function AIAgentsContent() {
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const editRequestCameraId = useRef<number | null>(null);
+  const hasAlignedTutorialCameraStartTabRef = useRef(false);
   const {
     activeTab,
     setActiveTab,
@@ -100,6 +101,11 @@ function AIAgentsContent() {
 
   useEffect(() => {
     if (!isOnboardingOpen || onboardingStepId !== "ai-agents-camera-start") {
+      hasAlignedTutorialCameraStartTabRef.current = false;
+      return;
+    }
+
+    if (hasAlignedTutorialCameraStartTabRef.current) {
       return;
     }
 
@@ -113,6 +119,7 @@ function AIAgentsContent() {
     }
 
     setActiveTab(getCameraDirectoryTab(tutorialCamera));
+    hasAlignedTutorialCameraStartTabRef.current = true;
   }, [cameras, isOnboardingOpen, onboardingStepId, setActiveTab, tutorialCameraId]);
 
   const updatePendingCameraState = (cameraId: number, isPending: boolean) => {
@@ -168,10 +175,6 @@ function AIAgentsContent() {
           ? { thumbnail_url: null, last_thumbnail_update: null }
           : {}),
       });
-
-      if (result.nextRunning === 1) {
-        setActiveTab("online");
-      }
 
       dashboardSummaryStore.refresh();
     } catch (error) {

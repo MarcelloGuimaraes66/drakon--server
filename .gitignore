@@ -83,3 +83,5 @@ Perceptrum/.local/
 Perceptrum/Perceptrum/generated/
 Perceptrum/Perceptrum/gcm-diagnose.log
 perceptrum_site*.sqlite
+perceptrum_site*.sqlite-shm
+perceptrum_site*.sqlite-wal

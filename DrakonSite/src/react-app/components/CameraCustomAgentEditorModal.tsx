@@ -178,7 +178,8 @@ type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "li
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
 const DEFAULT_CAMERA_AGENT_INFERENCE_MODEL: CameraAgentInferenceModel = "ultra";
-const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x2";
+const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "frame_sequence";
+const DEFAULT_LIGHT_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x2";
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
@@ -343,6 +344,14 @@ const normalizeVideoPackagingMode = (
   }
   return fallback;
 };
+
+const hasConfiguredVideoPackagingMode = (value: unknown): boolean =>
+  typeof value === "string" && value.trim().length > 0;
+
+const getAutoVideoPackagingModeForModel = (
+  model: CameraAgentInferenceModel
+): CameraVideoPackagingMode =>
+  model === "light" ? DEFAULT_LIGHT_VIDEO_PACKAGING_MODE : DEFAULT_CAMERA_VIDEO_PACKAGING_MODE;
 
 const applyExecutionConstraints = (
   inputType: "video" | "image",
@@ -773,6 +782,7 @@ export default function CameraCustomAgentEditorModal({
   const [templateAgentsLoading, setTemplateAgentsLoading] = useState(false);
   const [templateAgentsError, setTemplateAgentsError] = useState<string | null>(null);
   const [selectedTemplateAgentKey, setSelectedTemplateAgentKey] = useState("");
+  const videoPackagingWasManuallySelectedRef = useRef(false);
 
   const previewRef = useRef<HTMLDivElement | null>(null);
   const [snapshotMeta, setSnapshotMeta] = useState<{ thumbnail_url: string | null; last_thumbnail_update: string | null }>({
@@ -968,6 +978,9 @@ export default function CameraCustomAgentEditorModal({
     const normalizedInputType =
       String(agent?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video";
     const normalizedInferenceModel = normalizeInferenceModel(agent?.inference_model);
+    const hasExplicitVideoPackagingMode = hasConfiguredVideoPackagingMode(
+      agent?.video_packaging_mode
+    );
     const execution = applyExecutionConstraints(
       normalizedInputType,
       normalizedInferenceModel,
@@ -979,7 +992,11 @@ export default function CameraCustomAgentEditorModal({
     setDisplayName(getDisplayNameFromAgent(agent));
     setIsEnabled(normalizeBool(agent?.is_enabled, true));
     setInputType(execution.inputType);
-    setVideoPackagingMode(normalizeVideoPackagingMode(agent?.video_packaging_mode));
+    setVideoPackagingMode(
+      hasExplicitVideoPackagingMode
+        ? normalizeVideoPackagingMode(agent?.video_packaging_mode)
+        : DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
+    );
     setInferenceModel(execution.inferenceModel);
     setRunEvery(execution.runEvery);
     setRunningResolution(execution.runningResolution);
@@ -1015,6 +1032,7 @@ export default function CameraCustomAgentEditorModal({
     setEditingFaceTargetDescription("");
     setSavingFaceTargetId(null);
     setDeletingFaceTargetId(null);
+    videoPackagingWasManuallySelectedRef.current = hasExplicitVideoPackagingMode;
 
     if (safeId) {
       try {
@@ -1147,6 +1165,7 @@ export default function CameraCustomAgentEditorModal({
       setIsEnabled(true);
       setInputType(execution.inputType);
       setVideoPackagingMode("frame_sequence");
+      videoPackagingWasManuallySelectedRef.current = false;
       setInferenceModel(execution.inferenceModel);
       setRunEvery(execution.runEvery);
       setRunningResolution(execution.runningResolution);
@@ -2036,8 +2055,12 @@ export default function CameraCustomAgentEditorModal({
                       runningResolution,
                       modelFps
                     );
+                    const nextVideoPackagingMode = videoPackagingWasManuallySelectedRef.current
+                      ? videoPackagingMode
+                      : getAutoVideoPackagingModeForModel(constrained.inferenceModel);
                     setInferenceModel(constrained.inferenceModel);
                     setInputType(constrained.inputType);
+                    setVideoPackagingMode(nextVideoPackagingMode);
                     setRunEvery(constrained.runEvery);
                     setRunningResolution(constrained.runningResolution);
                     setModelFps(constrained.modelFps);
@@ -2632,11 +2655,12 @@ export default function CameraCustomAgentEditorModal({
                       <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
                       <select
                         value={videoPackagingMode}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          videoPackagingWasManuallySelectedRef.current = true;
                           setVideoPackagingMode(
                             normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
-                          )
-                        }
+                          );
+                        }}
                         className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
                       >
                         <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>

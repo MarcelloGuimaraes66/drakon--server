@@ -29,6 +29,7 @@ export interface HitMediaItem {
 
 export interface ChatIdentityCardPortrait {
   image_url?: string;
+  image_data_url?: string;
   portrait_kind?: string;
   card_role?: string;
   confidence?: number;

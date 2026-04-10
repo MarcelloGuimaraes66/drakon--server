@@ -153,7 +153,7 @@ export default function Chat() {
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
   }, []);
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, submitCameraBatchEdit, cancelMessage } = usePerceptrumChatSession({
+  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, submitCameraBatchEdit, updateIdentityCard, cancelMessage } = usePerceptrumChatSession({
     sessionId: activeSessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
@@ -871,7 +871,13 @@ export default function Chat() {
     const supplementalContent = (
       <>
         {workflowSupplementalContent}
-        {identityCards.length > 0 ? <ChatIdentityCardsPanel cards={identityCards} /> : null}
+        {identityCards.length > 0 ? (
+          <ChatIdentityCardsPanel
+            cards={identityCards}
+            busy={isLoading}
+            onUpdateIdentityCard={updateIdentityCard}
+          />
+        ) : null}
       </>
     );
 

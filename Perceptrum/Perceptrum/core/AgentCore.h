@@ -275,10 +275,10 @@ public:
     bool isCameraStreamOnline(int cameraId) const;
     std::vector<CameraSession::OpenMonitorSnapshot> collectOpenMonitorCameraSnapshots() const;
 
-    // JobRuntime: start/stop cameras using the same logic as start_camera commands.
-    // These are thin wrappers around the existing private helpers.
-    void ensureCameraStartedForJob(int cameraId, const nlohmann::json& startPayload);
-    void stopCameraForJob(int cameraId);
+    // JobRuntime: start/stop cameras using the same transport session while
+    // keeping direct runs isolated from job-owned leases.
+    void ensureCameraStartedForJob(int cameraId, int jobId, int stepId, const nlohmann::json& startPayload);
+    void stopCameraForJob(int cameraId, int jobId, int stepId);
 
     // JobRuntime calls these
     //void jobsCaptureAcquire(int cameraId, int jobId);
@@ -378,6 +378,8 @@ private:
         void release();
     };
 
+    struct ChatTemporalState;
+
     void workerLoop_();
     void processCommand_(const nlohmann::json& cmd);
     void handlePromptEnhanceCommand_(int commandId, const nlohmann::json& payload);
@@ -388,6 +390,7 @@ private:
     void handleDrakonFindStartCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindCancelCommand_(int commandId, const nlohmann::json& payload);
     void handleChatCancelCommand_(int commandId, const nlohmann::json& payload);
+    void handleChatIdentityUpsertCommand_(int commandId, const nlohmann::json& payload);
     DrakonFindInferenceResult runDrakonFindImageInference_(
         int cameraId,
         const std::string& jpegBase64,
@@ -428,6 +431,8 @@ private:
         int commandId,
         const std::string& status,
         const nlohmann::json& resultPayload);
+    bool loadPersistedChatTemporalState_(int chatSessionId, ChatTemporalState& outState);
+    bool persistChatTemporalState_(int chatSessionId, const ChatTemporalState& state);
     CameraConfig buildCameraConfigFromPayload_(int cameraId, const nlohmann::json& payload);
     void startCameraFromPayload_(int cameraId, const nlohmann::json& payload);
     void stopCamera_(int cameraId);
@@ -443,6 +448,8 @@ private:
     // Guard it to avoid iterator invalidation / use-after-free.
     mutable std::mutex             sessionsMu_;
     std::map<int, std::unique_ptr<CameraSession>> sessions_;
+    mutable std::mutex             directServiceMu_;
+    std::unordered_map<int, bool>  directServiceRequestedByCamera_;
 
     //std::unordered_map<int, std::unordered_map<int, int>> jobsCaptureByCamera_;
     struct JobsCaptureState {
@@ -454,6 +461,7 @@ private:
         int requestedTenSecondVideoFps = 0;
         int requestedSixtySecondVideoFps = 0;
     };
+    std::unordered_map<int, std::unordered_map<JobStepKey, int, JobStepKeyHash>> jobSessionRefsByCamera_;
     std::unordered_map<int, std::unordered_map<JobStepKey, JobsCaptureState, JobStepKeyHash>> jobsCaptureByCamera_;
 
     std::unique_ptr<JobRuntime> jobRuntime_;
@@ -468,7 +476,20 @@ private:
     int activeCoreChatPriorityReservations_ = 0;
     //std::unordered_map<int, int> jobsCaptureRefCount_; // cameraId -> count
 
-    void setCameraServiceRunning_(int cameraId, bool running, const std::string& source);
+    void setCameraServiceRunning_(
+        int cameraId,
+        bool running,
+        const std::string& source,
+        std::optional<bool> online = std::nullopt);
+    void setDirectServiceRequested_(int cameraId, bool requested);
+    bool isDirectServiceRequested_(int cameraId) const;
+    bool isDirectServiceStart_(const CameraConfig& cfg) const;
+    void jobsSessionAcquire_(int cameraId, int jobId, int stepId);
+    void jobsSessionRelease_(int cameraId, int jobId, int stepId);
+    bool hasActiveJobSessionConsumersLocked_(int cameraId) const;
+    bool hasActiveJobSessionConsumers_(int cameraId) const;
+    std::vector<int> getActiveJobIdsForCameraLocked_(int cameraId) const;
+    void stopDirectCamera_(int cameraId);
 
     void handleOrchestratorQuery_(const nlohmann::json& payload);
     void handleChatQuery_(const nlohmann::json& payload);

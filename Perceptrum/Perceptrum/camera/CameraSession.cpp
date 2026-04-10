@@ -335,6 +335,47 @@ void CameraSession::setOwner(AgentCore* owner)
     */
 }
 
+void CameraSession::setDirectServiceRequested(bool requested)
+{
+    directServiceRequested_.store(requested, std::memory_order_relaxed);
+}
+
+std::string CameraSession::currentStartOrigin_() const
+{
+    if (directServiceRequested_.load(std::memory_order_relaxed)) {
+        return "direct";
+    }
+
+    if (config_.isDrakonFindTemporarySession || config_.isVideoSearchTemporarySession) {
+        return config_.startOrigin;
+    }
+
+    int camId = 0;
+    try {
+        camId = std::stoi(config_.id);
+    }
+    catch (...) {
+        camId = 0;
+    }
+
+    if (owner_ && camId > 0) {
+        const auto activeJobIds = owner_->getActiveJobIdsForCamera(camId);
+        if (!activeJobIds.empty()) {
+            return "job";
+        }
+    }
+
+    if (config_.startOrigin == "job") {
+        return "job";
+    }
+
+    if (!config_.startOrigin.empty() && config_.startOrigin != "direct") {
+        return config_.startOrigin;
+    }
+
+    return "";
+}
+
 CameraSession::OpenMonitorSnapshot CameraSession::getOpenMonitorSnapshot() const
 {
     OpenMonitorSnapshot snapshot;
@@ -938,6 +979,11 @@ CameraSession::CameraSession(const CameraConfig& cfg,
     buffer_(static_cast<size_t>(cfg.expectedFps * 2)),
     motionDetector_(config_.id, 0.01, std::chrono::seconds(5)),
     frameDiskWriter_(cfg.id, "frames", cfg.storage.storeFrames, std::chrono::milliseconds(1000), std::chrono::seconds(cfg.timeOffsetSeconds), 1.0, cfg.storage.retentionDays, cfg.storage.hydrateExistingSegments),
+    directServiceRequested_(
+        !cfg.isDrakonFindTemporarySession &&
+        !cfg.isVideoSearchTemporarySession &&
+        (cfg.startOrigin.empty() || cfg.startOrigin == "direct")
+    ),
     lastThumbnailSent_(std::chrono::steady_clock::now() - std::chrono::seconds(60))
 {
     frameDiskWriter_.setInferenceCopyEnabledProvider([this]() -> bool {
@@ -2561,8 +2607,9 @@ void CameraSession::captureLoop_() {
                     extraDetails["offline_seconds"] = offlineSeconds;
                 }
             }
-            if (!config_.startOrigin.empty()) {
-                extraDetails["start_origin"] = config_.startOrigin;
+            const std::string runtimeStartOrigin = currentStartOrigin_();
+            if (!runtimeStartOrigin.empty()) {
+                extraDetails["start_origin"] = runtimeStartOrigin;
             }
             if (config_.isDrakonFindTemporarySession) {
                 extraDetails["temporary_session"] = true;
@@ -2615,8 +2662,9 @@ void CameraSession::captureLoop_() {
                 if (reconnectAttempts > 0) {
                     details["reconnect_attempts"] = reconnectAttempts;
                 }
-                if (!config_.startOrigin.empty()) {
-                    details["start_origin"] = config_.startOrigin;
+                const std::string runtimeStartOrigin = currentStartOrigin_();
+                if (!runtimeStartOrigin.empty()) {
+                    details["start_origin"] = runtimeStartOrigin;
                 }
                 if (!activeUrl.empty()) {
                     details["active_rtsp_url"] = activeUrl;
@@ -5309,6 +5357,13 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
 
     {
         std::lock_guard<std::mutex> lock(algorithmsMutex_);
+        config_.enabledAlgorithms.clear();
+        config_.enabledAlgorithms.reserve(algosSnapshot.size());
+        for (const auto& algo : algosSnapshot) {
+            if (!algo.type.empty()) {
+                config_.enabledAlgorithms.push_back(algo.type);
+            }
+        }
         config_.algorithms = algosSnapshot;
         algosSnapshot = config_.algorithms;
     }
@@ -5572,7 +5627,6 @@ bool CameraSession::matchesStartConfig(const CameraConfig& cfg) const
         config_.frameCaptureIntervalSeconds == cfg.frameCaptureIntervalSeconds &&
         config_.analysisSpeed == cfg.analysisSpeed &&
         config_.modelTier == cfg.modelTier &&
-        config_.startOrigin == cfg.startOrigin &&
         config_.isDrakonFindTemporarySession == cfg.isDrakonFindTemporarySession &&
         config_.isVideoSearchTemporarySession == cfg.isVideoSearchTemporarySession &&
         config_.forceVideoRecordingWithoutInference == cfg.forceVideoRecordingWithoutInference;

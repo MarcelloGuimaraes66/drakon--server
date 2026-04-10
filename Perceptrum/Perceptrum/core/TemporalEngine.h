@@ -164,6 +164,163 @@ inline bool traitLooksLikeTransientIdentityContext(const std::string& rawTrait) 
         });
 }
 
+inline bool traitLooksLikePersonIdentityCue(const std::string& rawTrait);
+inline bool traitLooksLikeVehicleIdentityCue(const std::string& rawTrait);
+inline bool traitLooksLikeIdentityCueForEntityType(
+    const std::string& rawEntityType,
+    const std::string& rawTrait);
+
+inline bool traitLooksLikePoseOrActivityContext(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "sitting", "seated", "standing", "walking", "running", "typing",
+                "working", "using ", "holding ", "carrying ", "looking ",
+                "gazing", "facing ", "turned ", "in front of", "next to",
+                "beside", "near ", "at desk", "at table", "on computer",
+                "with keyboard", "with laptop", "with monitor",
+                "sentado", "sentada", "em pe", "em pé", "andando",
+                "correndo", "digitando", "usando ", "segurando ",
+                "carregando ", "olhando ", "virado", "virada",
+                "em frente", "frente a", "ao lado", "perto de",
+                "no computador", "no notebook", "no teclado",
+                "na mesa", "na cadeira"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "sitting", "seated", "standing", "walking", "running", "typing",
+            "working", "holding", "carrying", "looking", "gazing", "facing",
+            "turned", "sentado", "sentada", "andando", "correndo",
+            "digitando", "usando", "segurando", "carregando", "olhando",
+            "virado", "virada", "computador", "notebook", "teclado",
+            "mesa", "cadeira"
+        });
+}
+
+inline bool traitLooksLikePersonIntrinsicPhysicalCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "skin tone", "light skin", "dark skin", "fair skin", "brown skin",
+                "pele", "tom de pele", "cabelo", "hair", "beard", "mustache",
+                "moustache", "barba", "bigode", "tattoo", "tatuagem",
+                "scar", "cicatriz", "bald", "careca", "calvo",
+                "body build", "build", "body type", "porte fisico", "porte físico",
+                "slim", "thin", "heavyset", "stocky", "magro", "gordo",
+                "coily hair", "curly hair", "wavy hair", "straight hair",
+                "cacheado", "ondulado", "crespo", "liso",
+                "short hair", "long hair", "cabelo curto", "cabelo longo",
+                "stubble", "facial hair", "por fazer", "barba curta",
+                "barba baixa", "short beard", "light beard",
+                "jawline", "nose", "eyebrow", "sobrancelha", "nariz"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "pele", "skin", "cabelo", "hair", "beard", "mustache",
+            "moustache", "barba", "bigode", "tattoo", "tatuagem",
+            "scar", "cicatriz", "bald", "careca", "calvo",
+            "build", "slim", "thin", "heavyset", "stocky", "magro",
+            "gordo", "cacheado", "ondulado", "crespo", "liso",
+            "stubble", "nose", "eyebrow", "sobrancelha", "nariz"
+        });
+}
+
+inline bool traitLooksLikePersonSecondaryAttachedIdentityCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "hat", "cap", "beanie", "helmet", "glasses", "goggles",
+                "mask", "bracelet", "watch", "necklace", "ring", "earring",
+                "bone", "chapeu", "chapéu", "oculos", "óculos",
+                "brinco", "pulseira", "colar", "anel"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "hat", "cap", "beanie", "helmet", "glasses", "goggles",
+            "mask", "bracelet", "watch", "necklace", "ring", "earring",
+            "bone", "chapeu", "oculos", "brinco", "pulseira",
+            "colar", "anel"
+        });
+}
+
+inline bool traitLooksLikePersonDiscardableIdentityCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    if (containsAnySubstring(
+            s,
+            {
+                "wearing ", "holding ", "carrying ", "shirt", "t-shirt", "tshirt",
+                "camisa", "camiseta", "blouse", "jacket", "hoodie", "coat",
+                "pants", "jeans", "shorts", "bermuda", "dress", "skirt",
+                "shoe", "sneaker", "boot", "backpack", "shoulder bag",
+                "purse", "bag", "weapon", "gun", "pistol", "rifle", "knife",
+                "machete", "firearm", "roupa", "mochila", "bolsa", "arma",
+                "calcado", "calçado", "tenis", "tênis", "jaqueta"
+            }))
+    {
+        return true;
+    }
+    const std::vector<std::string> tokens = extractWordTokens(s);
+    return tokenListContainsAny(
+        tokens,
+        {
+            "shirt", "camisa", "camiseta", "blouse", "jacket", "hoodie",
+            "coat", "pants", "jeans", "shorts", "bermuda", "dress",
+            "skirt", "shoe", "sneaker", "boot", "backpack", "bag",
+            "purse", "weapon", "gun", "pistol", "rifle", "knife",
+            "machete", "firearm", "roupa", "mochila", "bolsa", "arma",
+            "tenis", "calcado"
+        });
+}
+
+inline int classifyIdentityTraitPriority(
+    const std::string& rawEntityType,
+    const std::string& rawTrait)
+{
+    const std::string trait = trim(rawTrait);
+    if (trait.empty()) return 0;
+    if (traitLooksLikeSceneOrBackgroundContext(trait) ||
+        traitLooksLikePoseOrActivityContext(trait))
+    {
+        return 0;
+    }
+
+    if (entityTypeSuggestsVehicleIdentity(rawEntityType)) {
+        return traitLooksLikeVehicleIdentityCue(trait) ? 3 : 0;
+    }
+
+    if (entityTypeSuggestsPersonIdentity(rawEntityType)) {
+        if (traitLooksLikePersonDiscardableIdentityCue(trait)) return 0;
+        if (traitLooksLikePersonIntrinsicPhysicalCue(trait)) return 3;
+        if (traitLooksLikePersonSecondaryAttachedIdentityCue(trait)) return 2;
+        if (traitLooksLikePersonIdentityCue(trait)) return 1;
+        return 0;
+    }
+
+    return traitLooksLikeIdentityCueForEntityType(rawEntityType, trait) ? 2 : 0;
+}
+
 inline bool traitLooksLikePersonIdentityCue(const std::string& rawTrait) {
     const std::string s = lower(trim(rawTrait));
     if (s.empty()) return false;
@@ -252,25 +409,30 @@ inline json curateIdentitySignatureTraits(
     const json& existingTraits = json::array())
 {
     json curated = json::array();
-    appendUniqueStringsToArray(curated, existingTraits);
-
-    auto appendMatchingTraits = [&](const json& source) {
+    auto appendMatchingTraitsByPriority = [&](const json& source, int minPriority) {
         const json parsed = parseTraitsValue(source);
         if (!parsed.is_array()) return;
         for (const auto& item : parsed) {
             if (!item.is_string()) continue;
             const std::string trait = trim(item.get<std::string>());
             if (trait.empty()) continue;
-            const bool sceneLike = traitLooksLikeSceneOrBackgroundContext(trait);
-            const bool cueLike = traitLooksLikeIdentityCueForEntityType(rawEntityType, trait);
-            if (cueLike && !sceneLike) {
+            const int priority = classifyIdentityTraitPriority(rawEntityType, trait);
+            if (priority >= minPriority) {
                 appendUniqueStringsToArray(curated, trait);
             }
         }
     };
 
-    appendMatchingTraits(stableTraits);
-    if (curated.empty()) appendMatchingTraits(contextTraits);
+    for (int priority = 3; priority >= 2; --priority) {
+        appendMatchingTraitsByPriority(existingTraits, priority);
+        appendMatchingTraitsByPriority(stableTraits, priority);
+        appendMatchingTraitsByPriority(contextTraits, priority);
+    }
+    if (curated.size() < 2) {
+        appendMatchingTraitsByPriority(existingTraits, 1);
+        appendMatchingTraitsByPriority(stableTraits, 1);
+        appendMatchingTraitsByPriority(contextTraits, 1);
+    }
     if (curated.size() > 8) {
         curated.erase(curated.begin() + 8, curated.end());
     }
@@ -285,7 +447,6 @@ inline json curateIdentityContextTraits(
 {
     (void)rawEntityType;
     json curated = json::array();
-    appendUniqueStringsToArray(curated, existingTraits);
 
     auto appendContextTraits = [&](const json& source) {
         const json parsed = parseTraitsValue(source);
@@ -296,18 +457,61 @@ inline json curateIdentityContextTraits(
             if (trait.empty()) continue;
             const bool sceneLike = traitLooksLikeSceneOrBackgroundContext(trait);
             const bool transientLike = traitLooksLikeTransientIdentityContext(trait);
-            if (sceneLike || transientLike) {
+            const bool poseLike = traitLooksLikePoseOrActivityContext(trait);
+            if (!sceneLike && !poseLike && transientLike) {
                 appendUniqueStringsToArray(curated, trait);
             }
         }
     };
 
+    appendContextTraits(existingTraits);
     appendContextTraits(contextTraits);
     if (curated.empty()) appendContextTraits(stableTraits);
     if (curated.size() > 4) {
         curated.erase(curated.begin() + 4, curated.end());
     }
     return curated;
+}
+
+inline std::string buildIdentityDescriptionFromTraits(
+    const json& traits,
+    std::size_t maxItems = 4)
+{
+    const json parsed = parseTraitsValue(traits);
+    if (!parsed.is_array() || parsed.empty()) return std::string();
+    std::ostringstream oss;
+    std::size_t emitted = 0;
+    for (const auto& item : parsed) {
+        if (!item.is_string()) continue;
+        const std::string trait = trim(item.get<std::string>());
+        if (trait.empty()) continue;
+        if (emitted > 0) oss << "; ";
+        oss << trait;
+        ++emitted;
+        if (emitted >= maxItems) break;
+    }
+    return emitted == 0 ? std::string() : oss.str();
+}
+
+inline std::string curateIdentityDescription(
+    const std::string& rawEntityType,
+    const std::string& rawDescription,
+    const json& signatureTraits)
+{
+    (void)rawEntityType;
+    const std::string curatedFromTraits = buildIdentityDescriptionFromTraits(signatureTraits);
+    if (!curatedFromTraits.empty()) {
+        return curatedFromTraits;
+    }
+
+    const std::string description = trim(rawDescription);
+    if (description.empty()) return std::string();
+    if (traitLooksLikeSceneOrBackgroundContext(description) ||
+        traitLooksLikePoseOrActivityContext(description))
+    {
+        return std::string();
+    }
+    return description;
 }
 
 inline std::string buildIdentitySignatureSummary(
@@ -1812,7 +2016,6 @@ inline bool identityFeatureRelationEligibleForSignature(const std::string& rawRe
 
 inline bool identityFeatureCategoryEligibleForContext(const std::string& rawCategory) {
     static const std::unordered_set<std::string> kAllowed = {
-        "pose_or_activity",
         "visibility_condition",
         "continuity_context"
     };
@@ -1821,7 +2024,6 @@ inline bool identityFeatureCategoryEligibleForContext(const std::string& rawCate
 
 inline bool identityFeatureRelationEligibleForContext(const std::string& rawRelation) {
     static const std::unordered_set<std::string> kAllowed = {
-        "pose_or_activity",
         "visibility_condition",
         "continuity_context"
     };
@@ -1830,6 +2032,7 @@ inline bool identityFeatureRelationEligibleForContext(const std::string& rawRela
 
 inline json deriveIdentitySignatureTraitsFromFeatureCandidates(
     const json& value,
+    const std::string& rawEntityType = std::string(),
     std::size_t maxItems = 16)
 {
     const json candidates = parseIdentityFeatureCandidatesValue(value);
@@ -1843,6 +2046,9 @@ inline json deriveIdentitySignatureTraitsFromFeatureCandidates(
         if (!identityFeatureCategoryEligibleForSignature(category) ||
             !identityFeatureRelationEligibleForSignature(relation))
         {
+            continue;
+        }
+        if (classifyIdentityTraitPriority(rawEntityType, text) <= 0) {
             continue;
         }
         appendUniqueStringsToArray(out, text);
@@ -1868,17 +2074,64 @@ inline json deriveIdentityContextTraitsFromFeatureCandidates(
         {
             continue;
         }
+        if (traitLooksLikeSceneOrBackgroundContext(text) ||
+            traitLooksLikePoseOrActivityContext(text) ||
+            !traitLooksLikeTransientIdentityContext(text))
+        {
+            continue;
+        }
         appendUniqueStringsToArray(out, text);
         if (out.size() >= maxItems) break;
     }
     return out;
 }
 
-inline json extractStableTraitsFromNode(const json& node) {
+inline json filterIdentityFeatureCandidatesForMemory(
+    const std::string& rawEntityType,
+    const json& value,
+    std::size_t maxItems = 12)
+{
+    const json candidates = parseIdentityFeatureCandidatesValue(value);
+    json out = json::array();
+    std::unordered_set<std::string> seen;
+    for (const auto& item : candidates) {
+        if (!item.is_object()) continue;
+        const std::string text = trim(strField(item, "text"));
+        const std::string category = normalizeIdentityFeatureEnumToken(strField(item, "category"));
+        const std::string relation = normalizeIdentityFeatureEnumToken(strField(item, "relation_to_target"));
+        if (text.empty()) continue;
+        if (!identityFeatureCategoryEligibleForSignature(category) ||
+            !identityFeatureRelationEligibleForSignature(relation))
+        {
+            continue;
+        }
+        if (classifyIdentityTraitPriority(rawEntityType, text) <= 0) {
+            continue;
+        }
+
+        const std::string dedupeKey = lower(text) + "|" + category + "|" + relation;
+        if (!seen.insert(dedupeKey).second) continue;
+
+        json normalized = json::object();
+        normalized["text"] = text;
+        if (!category.empty()) normalized["category"] = category;
+        if (!relation.empty()) normalized["relation_to_target"] = relation;
+        if (item.contains("confidence") && item["confidence"].is_number()) {
+            normalized["confidence"] = item["confidence"];
+        }
+        out.push_back(std::move(normalized));
+        if (out.size() >= maxItems) break;
+    }
+    return out;
+}
+
+inline json extractStableTraitsFromNode(
+    const json& node,
+    const std::string& rawEntityType = std::string()) {
     if (!node.is_object()) return json::array();
     const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
     const json structuredIdentityTraits =
-        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredCandidates);
+        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredCandidates, rawEntityType);
     if (structuredIdentityTraits.is_array() && !structuredIdentityTraits.empty()) {
         return structuredIdentityTraits;
     }
@@ -1898,7 +2151,10 @@ inline json extractStableTraitsFromNode(const json& node) {
     return out;
 }
 
-inline json extractContextTraitsFromNode(const json& node) {
+inline json extractContextTraitsFromNode(
+    const json& node,
+    const std::string& rawEntityType = std::string()) {
+    (void)rawEntityType;
     if (!node.is_object()) return json::array();
     const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
     const json structuredContextTraits =
@@ -3948,14 +4204,20 @@ inline void upsertIdentityMemory(
     mem["last_seen_ts_utc"] = seenTsUtc;
     if (!trim(zone).empty()) mem["last_seen_zone"] = trim(zone);
 
-    const json structuredIdentityFeatureCandidates =
+    const json rawIdentityFeatureCandidates =
         extractIdentityFeatureCandidatesFromNode(patch);
+    const json structuredIdentityFeatureCandidates =
+        filterIdentityFeatureCandidatesForMemory(
+            entityTypeHint,
+            rawIdentityFeatureCandidates);
     const json derivedIdentitySignatureTraits =
-        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredIdentityFeatureCandidates);
+        deriveIdentitySignatureTraitsFromFeatureCandidates(
+            structuredIdentityFeatureCandidates,
+            entityTypeHint);
     const json derivedIdentityContextTraits =
-        deriveIdentityContextTraitsFromFeatureCandidates(structuredIdentityFeatureCandidates);
-    const json stableTraits = extractStableTraitsFromNode(patch);
-    const json contextTraits = extractContextTraitsFromNode(patch);
+        deriveIdentityContextTraitsFromFeatureCandidates(rawIdentityFeatureCandidates);
+    const json stableTraits = extractStableTraitsFromNode(patch, entityTypeHint);
+    const json contextTraits = extractContextTraitsFromNode(patch, entityTypeHint);
     const json explicitIdentitySignatureTraitsRaw =
         patch.contains("identity_signature_traits")
             ? parseTraitsValue(patch["identity_signature_traits"])
@@ -3965,14 +4227,21 @@ inline void upsertIdentityMemory(
             ? parseTraitsValue(patch["identity_context_traits"])
             : json::array();
     const json explicitIdentitySignatureTraits =
-        (derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty())
-            ? derivedIdentitySignatureTraits
-            : explicitIdentitySignatureTraitsRaw;
+        curateIdentitySignatureTraits(
+            entityTypeHint,
+            stableTraits,
+            contextTraits,
+            (derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty())
+                ? derivedIdentitySignatureTraits
+                : explicitIdentitySignatureTraitsRaw);
     const json explicitIdentityContextTraits =
-        (derivedIdentityContextTraits.is_array() && !derivedIdentityContextTraits.empty())
-            ? derivedIdentityContextTraits
-            : explicitIdentityContextTraitsRaw;
-    const std::string sceneBrief = extractSceneBriefFromNode(patch);
+        curateIdentityContextTraits(
+            entityTypeHint,
+            stableTraits,
+            contextTraits,
+            (derivedIdentityContextTraits.is_array() && !derivedIdentityContextTraits.empty())
+                ? derivedIdentityContextTraits
+                : explicitIdentityContextTraitsRaw);
     const bool hasStructuredIdentitySignature =
         derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty();
     auto signatureSourceIsStructured = [&](const json& node) -> bool {
@@ -3993,129 +4262,142 @@ inline void upsertIdentityMemory(
         }
     };
 
-    json mergedStableAttributes = json::array();
+    json mergedStableAttributesRaw = json::array();
     if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
         mem.contains("stable_attributes"))
     {
-        appendUniqueStringsToArray(mergedStableAttributes, mem["stable_attributes"]);
+        appendUniqueStringsToArray(mergedStableAttributesRaw, mem["stable_attributes"]);
     }
     if (entityState &&
         (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
         entityState->contains("stable_attributes"))
     {
-        appendUniqueStringsToArray(mergedStableAttributes, (*entityState)["stable_attributes"]);
+        appendUniqueStringsToArray(mergedStableAttributesRaw, (*entityState)["stable_attributes"]);
     }
-    appendUniqueTraitsToArray(mergedStableAttributes, stableTraits);
-    if (mergedStableAttributes.size() > 16) {
-        mergedStableAttributes.erase(mergedStableAttributes.begin() + 16, mergedStableAttributes.end());
-    }
-    if (!mergedStableAttributes.empty()) {
-        mem["stable_attributes"] = mergedStableAttributes;
-        if (entityState) (*entityState)["stable_attributes"] = mergedStableAttributes;
+    appendUniqueTraitsToArray(mergedStableAttributesRaw, stableTraits);
+    if (mergedStableAttributesRaw.size() > 16) {
+        mergedStableAttributesRaw.erase(
+            mergedStableAttributesRaw.begin() + 16,
+            mergedStableAttributesRaw.end());
     }
 
-    json mergedKeyTraits = json::array();
+    json mergedKeyTraitsRaw = json::array();
     if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
         mem.contains("key_traits"))
     {
-        appendUniqueTraitsToArray(mergedKeyTraits, mem["key_traits"]);
+        appendUniqueTraitsToArray(mergedKeyTraitsRaw, mem["key_traits"]);
     }
     if (entityState &&
         (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
         entityState->contains("key_traits"))
     {
-        appendUniqueTraitsToArray(mergedKeyTraits, (*entityState)["key_traits"]);
+        appendUniqueTraitsToArray(mergedKeyTraitsRaw, (*entityState)["key_traits"]);
     }
-    appendUniqueTraitsToArray(mergedKeyTraits, stableTraits);
-    if (mergedKeyTraits.size() > 16) {
-        mergedKeyTraits.erase(mergedKeyTraits.begin() + 16, mergedKeyTraits.end());
-    }
-    if (!mergedKeyTraits.empty()) {
-        mem["key_traits"] = mergedKeyTraits;
-        if (entityState) (*entityState)["key_traits"] = mergedKeyTraits;
+    appendUniqueTraitsToArray(mergedKeyTraitsRaw, stableTraits);
+    if (mergedKeyTraitsRaw.size() > 16) {
+        mergedKeyTraitsRaw.erase(mergedKeyTraitsRaw.begin() + 16, mergedKeyTraitsRaw.end());
     }
 
-    if (contextTraits.is_array() && !contextTraits.empty()) {
-        mem["latest_context_traits"] = contextTraits;
-        if (entityState) (*entityState)["latest_context_traits"] = contextTraits;
+    if (explicitIdentityContextTraits.is_array() && !explicitIdentityContextTraits.empty()) {
+        mem["latest_context_traits"] = explicitIdentityContextTraits;
+        if (entityState) (*entityState)["latest_context_traits"] = explicitIdentityContextTraits;
+    } else {
+        mem.erase("latest_context_traits");
+        if (entityState) entityState->erase("latest_context_traits");
     }
-    if (!sceneBrief.empty()) {
-        mem["scene_brief"] = sceneBrief;
-        if (entityState) (*entityState)["scene_brief"] = sceneBrief;
-    }
+    mem.erase("scene_brief");
+    if (entityState) entityState->erase("scene_brief");
 
-    if (structuredIdentityFeatureCandidates.is_array() &&
-        !structuredIdentityFeatureCandidates.empty())
-    {
-        auto mergeIdentityFeatureCandidates = [](json target, const json& source) {
-            if (!target.is_array()) target = json::array();
-            std::unordered_set<std::string> seen;
-            for (const auto& item : target) {
+    auto mergeIdentityFeatureCandidates = [&](json target, const json& source) {
+        if (!target.is_array()) target = json::array();
+        std::unordered_set<std::string> seen;
+        for (const auto& item : target) {
+            if (!item.is_object()) continue;
+            const std::string key =
+                lower(trim(strField(item, "text"))) + "|" +
+                lower(trim(strField(item, "category"))) + "|" +
+                lower(trim(strField(item, "relation_to_target")));
+            if (key == "||") continue;
+            seen.insert(key);
+        }
+
+        const json normalizedSource =
+            filterIdentityFeatureCandidatesForMemory(entityTypeHint, source);
+        if (normalizedSource.is_array()) {
+            for (const auto& item : normalizedSource) {
                 if (!item.is_object()) continue;
                 const std::string key =
                     lower(trim(strField(item, "text"))) + "|" +
                     lower(trim(strField(item, "category"))) + "|" +
                     lower(trim(strField(item, "relation_to_target")));
-                if (key == "||") continue;
-                seen.insert(key);
+                if (key == "||" || !seen.insert(key).second) continue;
+                target.push_back(item);
             }
-
-            const json normalizedSource = parseIdentityFeatureCandidatesValue(source);
-            if (normalizedSource.is_array()) {
-                for (const auto& item : normalizedSource) {
-                    if (!item.is_object()) continue;
-                    const std::string key =
-                        lower(trim(strField(item, "text"))) + "|" +
-                        lower(trim(strField(item, "category"))) + "|" +
-                        lower(trim(strField(item, "relation_to_target")));
-                    if (key == "||" || !seen.insert(key).second) continue;
-                    target.push_back(item);
-                }
-            }
-
-            if (target.size() > 12) {
-                target.erase(target.begin() + 12, target.end());
-            }
-            return target;
-        };
-
-        json mergedIdentityFeatureCandidates =
-            mem.contains("identity_feature_candidates")
-                ? mem["identity_feature_candidates"]
-                : json::array();
-        if (entityState && entityState->contains("identity_feature_candidates")) {
-            mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
-                mergedIdentityFeatureCandidates,
-                (*entityState)["identity_feature_candidates"]);
         }
+
+        if (target.size() > 12) {
+            target.erase(target.begin() + 12, target.end());
+        }
+        return target;
+    };
+
+    json mergedIdentityFeatureCandidates = json::array();
+    if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
+        mem.contains("identity_feature_candidates"))
+    {
         mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
             mergedIdentityFeatureCandidates,
-            structuredIdentityFeatureCandidates);
-        if (mergedIdentityFeatureCandidates.is_array() &&
-            !mergedIdentityFeatureCandidates.empty())
-        {
-            mem["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
-            if (entityState) {
-                (*entityState)["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
-            }
+            mem["identity_feature_candidates"]);
+    }
+    if (entityState &&
+        (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
+        entityState->contains("identity_feature_candidates"))
+    {
+        mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
+            mergedIdentityFeatureCandidates,
+            (*entityState)["identity_feature_candidates"]);
+    }
+    mergedIdentityFeatureCandidates = mergeIdentityFeatureCandidates(
+        mergedIdentityFeatureCandidates,
+        structuredIdentityFeatureCandidates);
+    if (mergedIdentityFeatureCandidates.is_array() &&
+        !mergedIdentityFeatureCandidates.empty())
+    {
+        mem["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
+        if (entityState) {
+            (*entityState)["identity_feature_candidates"] = mergedIdentityFeatureCandidates;
         }
+    } else {
+        mem.erase("identity_feature_candidates");
+        if (entityState) entityState->erase("identity_feature_candidates");
     }
 
-    json mergedIdentitySignatureTraits = json::array();
+    json existingIdentitySignatureTraits = json::array();
     if ((!hasStructuredIdentitySignature || trustExistingMemoryIdentity) &&
         mem.contains("identity_signature_traits"))
     {
-        appendUniqueStringsToArray(mergedIdentitySignatureTraits, mem["identity_signature_traits"]);
+        appendUniqueStringsToArray(
+            existingIdentitySignatureTraits,
+            mem["identity_signature_traits"]);
     }
     if (entityState &&
         (!hasStructuredIdentitySignature || trustExistingEntityIdentity) &&
         entityState->contains("identity_signature_traits"))
     {
-        appendUniqueStringsToArray(mergedIdentitySignatureTraits, (*entityState)["identity_signature_traits"]);
+        appendUniqueStringsToArray(
+            existingIdentitySignatureTraits,
+            (*entityState)["identity_signature_traits"]);
     }
-    if (explicitIdentitySignatureTraits.is_array() && !explicitIdentitySignatureTraits.empty()) {
-        appendUniqueStringsToArray(mergedIdentitySignatureTraits, explicitIdentitySignatureTraits);
-    }
+    json identitySignatureSources = json::array();
+    appendUniqueStringsToArray(identitySignatureSources, mergedStableAttributesRaw);
+    appendUniqueStringsToArray(identitySignatureSources, mergedKeyTraitsRaw);
+    appendUniqueStringsToArray(identitySignatureSources, explicitIdentitySignatureTraits);
+    json mergedIdentitySignatureTraits =
+        curateIdentitySignatureTraits(
+            entityTypeHint,
+            identitySignatureSources,
+            explicitIdentityContextTraits,
+            existingIdentitySignatureTraits);
     if (mergedIdentitySignatureTraits.size() > 16) {
         mergedIdentitySignatureTraits.erase(
             mergedIdentitySignatureTraits.begin() + 16,
@@ -4123,9 +4405,13 @@ inline void upsertIdentityMemory(
     }
     if (!mergedIdentitySignatureTraits.empty()) {
         mem["identity_signature_traits"] = mergedIdentitySignatureTraits;
+        mem["stable_attributes"] = mergedIdentitySignatureTraits;
+        mem["key_traits"] = mergedIdentitySignatureTraits;
         updateIdentitySignatureSource(mem);
         if (entityState) {
             (*entityState)["identity_signature_traits"] = mergedIdentitySignatureTraits;
+            (*entityState)["stable_attributes"] = mergedIdentitySignatureTraits;
+            (*entityState)["key_traits"] = mergedIdentitySignatureTraits;
             updateIdentitySignatureSource(*entityState);
         }
         const std::string curatedSummary =
@@ -4133,20 +4419,67 @@ inline void upsertIdentityMemory(
         if (!curatedSummary.empty()) {
             mem["identity_signature_summary"] = curatedSummary;
             if (entityState) (*entityState)["identity_signature_summary"] = curatedSummary;
+        } else {
+            mem.erase("identity_signature_summary");
+            if (entityState) entityState->erase("identity_signature_summary");
+        }
+    } else {
+        mem.erase("identity_signature_traits");
+        mem.erase("stable_attributes");
+        mem.erase("key_traits");
+        mem.erase("identity_signature_summary");
+        mem.erase("identity_signature_source");
+        if (entityState) {
+            entityState->erase("identity_signature_traits");
+            entityState->erase("stable_attributes");
+            entityState->erase("key_traits");
+            entityState->erase("identity_signature_summary");
+            entityState->erase("identity_signature_source");
         }
     }
 
-    json mergedIdentityContextTraits = json::array();
-    if (explicitIdentityContextTraits.is_array() && !explicitIdentityContextTraits.empty()) {
-        appendUniqueStringsToArray(mergedIdentityContextTraits, explicitIdentityContextTraits);
+    const std::string bestDescriptionSource = trim(
+        strField(
+            patch,
+            "description",
+            strField(
+                mem,
+                "description",
+                entityState && entityState->contains("description")
+                    ? strField(*entityState, "description")
+                    : std::string())));
+    const std::string curatedDescription =
+        curateIdentityDescription(
+            entityTypeHint,
+            bestDescriptionSource,
+            mergedIdentitySignatureTraits);
+    if (!curatedDescription.empty()) {
+        mem["description"] = curatedDescription;
+        if (entityState) (*entityState)["description"] = curatedDescription;
     } else {
-        if (mem.contains("identity_context_traits")) {
-            appendUniqueStringsToArray(mergedIdentityContextTraits, mem["identity_context_traits"]);
-        }
-        if (entityState && entityState->contains("identity_context_traits")) {
-            appendUniqueStringsToArray(mergedIdentityContextTraits, (*entityState)["identity_context_traits"]);
-        }
+        mem.erase("description");
+        if (entityState) entityState->erase("description");
     }
+
+    json existingIdentityContextTraits = json::array();
+    if (mem.contains("identity_context_traits")) {
+        appendUniqueStringsToArray(existingIdentityContextTraits, mem["identity_context_traits"]);
+    }
+    if (entityState && entityState->contains("identity_context_traits")) {
+        appendUniqueStringsToArray(existingIdentityContextTraits, (*entityState)["identity_context_traits"]);
+    }
+    if (mem.contains("latest_context_traits")) {
+        appendUniqueStringsToArray(existingIdentityContextTraits, mem["latest_context_traits"]);
+    }
+    if (entityState && entityState->contains("latest_context_traits")) {
+        appendUniqueStringsToArray(existingIdentityContextTraits, (*entityState)["latest_context_traits"]);
+    }
+    json mergedIdentityContextTraits =
+        curateIdentityContextTraits(
+            entityTypeHint,
+            identitySignatureSources,
+            explicitIdentityContextTraits,
+            existingIdentityContextTraits);
     if (mergedIdentityContextTraits.size() > 4) {
         mergedIdentityContextTraits.erase(
             mergedIdentityContextTraits.begin() + 4,
@@ -4155,6 +4488,9 @@ inline void upsertIdentityMemory(
     if (!mergedIdentityContextTraits.empty()) {
         mem["identity_context_traits"] = mergedIdentityContextTraits;
         if (entityState) (*entityState)["identity_context_traits"] = mergedIdentityContextTraits;
+    } else {
+        mem.erase("identity_context_traits");
+        if (entityState) entityState->erase("identity_context_traits");
     }
 
     json mergedReferenceImageUrls = json::array();
@@ -5773,7 +6109,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- For each tracked entity visible in this batch, return identity_patch with entity_id when known, plus entity_key and entity_type whenever they can be inferred from the plan or visible entity, along with a short description, identity_signature_traits, and updated_traits/key_traits.\n"
         << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification, focused on strong physical identity cues only.\n"
         << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n"
-        << "- For a visible person, prioritize identity_signature_traits such as visible skin tone, hair color/style/length, beard or mustache, glasses, hat/cap color and type, upper clothing color/type/pattern/logo, lower clothing color/type, footwear, bag, tattoos, scars, jewelry, and clearly visible carried objects.\n"
+        << "- For a visible person, prioritize identity_signature_traits first around intrinsic physical cues such as visible skin tone, hair color/style/length, beard or mustache, tattoos, scars, body build, baldness, or other stable facial/body markers. Treat glasses or jewelry as secondary target-attached cues. Use clothing, bags, and carried objects only as fallback identity cues when stronger intrinsic traits are not clearly visible.\n"
         << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n"
         << "- identity_context_traits is optional and should contain only a few brief non-identity continuity cues.\n"
         << "- scene_brief is optional and should be a very short scene hint only when useful for continuity.\n"
@@ -5789,7 +6125,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- When the scenario is about entering/leaving places, use entered_zone and left_zone from event_catalog instead of only generic present.\n"
         << "- Do not infer entered_zone just because the entity is already visible in the first frame of the batch; only use entered_zone when the entry is actually visible.\n"
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
-        << "- Keep identity_signature_traits concise (2-8 items) and focused on durable target-centric identity cues: clothing colors/types, accessories, hair, beard, visible skin tone, carried object, build, markings, or vehicle make/model/color/plate fragments when visible.\n"
+        << "- Keep identity_signature_traits concise (2-8 items) and focused on durable target-centric identity cues. For people, prefer skin tone, hair color/style/length, beard or mustache, tattoos, scars, and body build before clothing or surrounding context. Use clothing/accessories only as secondary fallback cues when stronger physical traits are unavailable.\n"
         << "- Do not place background, room layout, furniture, doors, walls, lighting, or surrounding scene details inside identity_signature_traits unless they are physically attached to the target.\n"
         << "- Do not place pose, action, hand state, gaze direction, relation to keyboard/computer/furniture, or scene layout inside identity_signature_traits.\n"
         << "- updated_traits may capture transient cues or scene context for continuity, but they must not replace the stable appearance signature.\n"

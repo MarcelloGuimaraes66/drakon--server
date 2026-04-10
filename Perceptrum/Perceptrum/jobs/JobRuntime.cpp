@@ -3185,7 +3185,12 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                 for (const auto& tgt : step.targets) {
                     auto itP = job->payload.camera_start_payload_by_id.find(tgt.camera_id);
                     if (itP != job->payload.camera_start_payload_by_id.end()) {
-                        owner_->ensureCameraStartedForJob(tgt.camera_id, itP->second);
+                        owner_->ensureCameraStartedForJob(
+                            tgt.camera_id,
+                            job->payload.job.id,
+                            step.id,
+                            itP->second
+                        );
                     }
                 }
             }
@@ -4609,7 +4614,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     }
 
                     if (!usedByOtherRunningStep) {
-                        owner_->stopCameraForJob(camId);
+                        owner_->stopCameraForJob(camId, job->payload.job.id, step.id);
                     }
                 }
             }

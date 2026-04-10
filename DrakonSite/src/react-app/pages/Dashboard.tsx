@@ -4,8 +4,10 @@ import {
   getCameraConnectionState,
   isCameraServiceRunning,
 } from "@/react-app/lib/cameraStatus";
+import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardAlertRefresh } from "@/react-app/hooks/useDashboardAlertRefresh";
+import { useDashboardAlerts } from "@/react-app/hooks/useDashboardAlerts";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import Toast from "@/react-app/components/Toast";
 import ConfirmDialog from "@/react-app/components/ConfirmDialog";
@@ -313,10 +315,15 @@ function DashboardContent() {
   };
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
   const [stoppingJobs, setStoppingJobs] = useState<Set<number>>(new Set());
+  const [stoppingCameras, setStoppingCameras] = useState<Set<number>>(new Set());
   const [expandedJobs, setExpandedJobs] = useState<Set<number>>(new Set());
   const [expandedCameras, setExpandedCameras] = useState<Set<number>>(new Set());
   const [alertsSearchTerm, setAlertsSearchTerm] = useState("");
   const [alertsFilter, setAlertsFilter] = useState("ALL");
+  const [alertsOriginFilter, setAlertsOriginFilter] = useState<"ALL" | "JOB" | "CAMERA_AGENT">("ALL");
+  const [alertsJobFilter, setAlertsJobFilter] = useState("");
+  const [alertsAgentFilter, setAlertsAgentFilter] = useState("");
+  const [debouncedAlertsSearchTerm, setDebouncedAlertsSearchTerm] = useState("");
   const [activeAlert, setActiveAlert] = useState<any | null>(null);
   const [activeAlertGroupKey, setActiveAlertGroupKey] = useState<string | null>(null);
   const [isAlertPanelOpen, setIsAlertPanelOpen] = useState(false);
@@ -337,6 +344,8 @@ function DashboardContent() {
   const [alertPanelFocusTarget, setAlertPanelFocusTarget] = useState<"emitted-alerts" | null>(null);
   const [highlightEmittedAlerts, setHighlightEmittedAlerts] = useState(false);
   const emittedAlertsSectionRef = useRef<HTMLDivElement | null>(null);
+  const alertsGridRef = useRef<HTMLDivElement | null>(null);
+  const loadMoreAlertsRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   const stats = dashboard?.stats;
   const perCamera = dashboard?.perCamera || {};
@@ -859,57 +868,95 @@ function DashboardContent() {
   };
 
   const currentGroupAlbumImage = groupAlbumImages[groupAlbumIndex] || null;
-
-  const recentAlertsFromEvents = Array.isArray(activity?.recentAlerts) ? activity.recentAlerts : [];
-  const hasAiDetectionInEvents = recentAlertsFromEvents.some(
-    (alert: any) => String(alert?.event_type || "").trim().toLowerCase() === "ai_detection"
-  );
-  const recentDetectionFallback = hasAiDetectionInEvents
-    ? []
-    : (Array.isArray(activity?.recentDetections) ? activity.recentDetections : []).map((detection: any) => ({
-        ...detection,
-        event_type: "ai_detection",
-        created_at: detection?.detected_at || detection?.created_at || null,
-      }));
-  const recentAlertsRaw = [...recentAlertsFromEvents, ...recentDetectionFallback]
-    .sort((a: any, b: any) => {
-      const aTime = Date.parse(String(a?.detected_at || a?.created_at || "")) || 0;
-      const bTime = Date.parse(String(b?.detected_at || b?.created_at || "")) || 0;
-      return bTime - aTime;
-    });
-  const recentAlerts = recentAlertsRaw.filter((alert: any) => {
+  const summaryLatestAlertId = Number(
+    Array.isArray(activity?.recentAlerts) ? activity.recentAlerts[0]?.id : 0,
+  ) || 0;
+  const normalizedFilter = alertsFilter === "MEDUIM" ? "MEDIUM" : alertsFilter;
+  const {
+    alerts: dashboardAlerts,
+    jobOptions: alertsJobOptions,
+    agentOptions: alertsAgentOptions,
+    hasMore: hasMoreAlerts,
+    isInitialLoading: isInitialAlertsLoading,
+    isLoadingMore: isLoadingMoreAlerts,
+    isRefreshingNewer: isRefreshingLatestAlerts,
+    error: alertsLoadError,
+    loadMore: loadMoreAlerts,
+  } = useDashboardAlerts({
+    searchTerm: debouncedAlertsSearchTerm,
+    severity: normalizedFilter,
+    origin: alertsOriginFilter,
+    jobId: alertsJobFilter,
+    agentKey: alertsAgentFilter,
+    latestAlertId: summaryLatestAlertId,
+  });
+  const alertFilters = ["ALL", "CRITIC", "HIGH", "MEDUIM", "LOW"];
+  const alertFilterLabels: Record<string, string> = {
+    ALL: t("dashboard.alertFilters.all"),
+    CRITIC: t("dashboard.alertFilters.critic"),
+    HIGH: t("dashboard.alertFilters.high"),
+    MEDUIM: t("dashboard.alertFilters.medium"),
+    LOW: t("dashboard.alertFilters.low"),
+  };
+  const alertsOriginOptions = [
+    { value: "ALL", label: isPortuguese ? "Todas as origens" : "All origins" },
+    { value: "JOB", label: isPortuguese ? "Jobs" : "Jobs" },
+    { value: "CAMERA_AGENT", label: isPortuguese ? "Agentes em cameras" : "Camera agents" },
+  ] as const;
+  const recentAlertsUiCopy = {
+    originLabel: isPortuguese ? "Origem" : "Origin",
+    jobLabel: isPortuguese ? "Job" : "Job",
+    jobAllLabel: isPortuguese ? "Todos os jobs" : "All jobs",
+    agentLabel: isPortuguese ? "Agente" : "Agent",
+    agentAllLabel: isPortuguese ? "Todos os agentes" : "All agents",
+    clearFiltersLabel: isPortuguese ? "Limpar filtros" : "Clear filters",
+    noResultsTitle: isPortuguese ? "Nenhum alerta encontrado" : "No alerts found",
+    noResultsBody: isPortuguese
+      ? "Ajuste a busca ou limpe os filtros para ver mais alertas."
+      : "Adjust the search or clear filters to see more alerts.",
+    loadMoreLabel: isPortuguese ? "Carregando mais alertas..." : "Loading more alerts...",
+    allLoadedLabel: isPortuguese
+      ? "Voce chegou ao alerta mais antigo."
+      : "You've reached the oldest alert.",
+  };
+  const hasStructuredAlertsFilters =
+    alertsOriginFilter !== "ALL" ||
+    alertsJobFilter.trim().length > 0 ||
+    alertsAgentFilter.trim().length > 0 ||
+    alertsSearchTerm.trim().length > 0 ||
+    normalizedFilter !== "ALL";
+  const recentAlerts = dashboardAlerts.filter((alert: any) => {
     const alertId = Number(alert?.id);
     if (!Number.isInteger(alertId) || alertId <= 0) return true;
     return !removedAlertIds.has(alertId);
   });
-  const normalizedAlertsSearch = alertsSearchTerm.trim().toLowerCase();
-  const alertsWithSearch = normalizedAlertsSearch
-    ? recentAlerts.filter((alert: any) => {
-        const details = alert.details || {};
-        return (
-          (alert.camera_name || "").toLowerCase().includes(normalizedAlertsSearch) ||
-          (alert.algo_type || "").toLowerCase().includes(normalizedAlertsSearch) ||
-          (details.job_name || "").toLowerCase().includes(normalizedAlertsSearch) ||
-          (details.step_name || "").toLowerCase().includes(normalizedAlertsSearch) ||
-          (details.agent_key || "").toLowerCase().includes(normalizedAlertsSearch) ||
-          (details.group_name || details.groupName || alert.group_name || "").toLowerCase().includes(normalizedAlertsSearch)
-        );
-      })
-    : recentAlerts;
-  const normalizedFilter = alertsFilter === "MEDUIM" ? "MEDIUM" : alertsFilter;
-  const filteredAlerts =
-    normalizedFilter === "ALL"
-      ? alertsWithSearch
-      : alertsWithSearch.filter((alert: any) => {
-          const rawPriority =
-            alert.priority_level ||
-            alert.details?.priority_level ||
-            "";
-          const normalizedPriority = String(rawPriority).toUpperCase() === "MEDUIM"
-            ? "MEDIUM"
-            : String(rawPriority).toUpperCase();
-          return normalizedPriority === normalizedFilter;
-        });
+
+  useEffect(() => {
+    const debounceTimer = window.setTimeout(() => {
+      setDebouncedAlertsSearchTerm(alertsSearchTerm);
+    }, 250);
+
+    return () => {
+      window.clearTimeout(debounceTimer);
+    };
+  }, [alertsSearchTerm]);
+
+  useEffect(() => {
+    if (alertsOriginFilter === "CAMERA_AGENT" && alertsJobFilter) {
+      setAlertsJobFilter("");
+    }
+  }, [alertsOriginFilter, alertsJobFilter]);
+
+  useEffect(() => {
+    if (alertsOriginFilter === "CAMERA_AGENT" && alertsFilter !== "ALL") {
+      setAlertsFilter("ALL");
+    }
+  }, [alertsOriginFilter, alertsFilter]);
+
+  useEffect(() => {
+    loadMoreAlertsRef.current = loadMoreAlerts;
+  }, [loadMoreAlerts]);
+
   const buildAlertGroups = (alertsList: any[]) => {
     const groupsByKey = new Map<string, { key: string; alerts: any[] }>();
 
@@ -1025,26 +1072,65 @@ function DashboardContent() {
     activeAlertMedia.mediaUrl,
     activeAlertMedia.albumImages,
   );
-  const groupedFilteredAlerts = buildAlertGroups(filteredAlerts);
   const alertsCardsPerView = alertsCompactMode ? 8 : 4;
-  const visibleAlerts = groupedFilteredAlerts.slice(0, alertsCardsPerView);
-  const placeholderCount = Math.max(0, alertsCardsPerView - visibleAlerts.length);
-  const alertsForDisplay = [
-    ...visibleAlerts,
-    ...Array.from({ length: placeholderCount }, () => null),
-    ...groupedFilteredAlerts.slice(alertsCardsPerView),
-  ];
+  const alertsForDisplay =
+    isInitialAlertsLoading && groupedRecentAlerts.length === 0
+      ? Array.from({ length: alertsCardsPerView }, () => null)
+      : groupedRecentAlerts;
+  const showAlertsEmptyState = !isInitialAlertsLoading && groupedRecentAlerts.length === 0;
   const alertsCardMinHeightClass = alertsCompactMode ? "min-h-[320px]" : "min-h-[320px]";
   const alertsCardMediaHeightClass = alertsCompactMode ? "h-[190px]" : "h-[240px]";
   const alertsCardBodyPaddingClass = alertsCompactMode ? "p-2" : "p-3";
-  const alertFilters = ["ALL", "CRITIC", "HIGH", "MEDUIM", "LOW"];
-  const alertFilterLabels: Record<string, string> = {
-    ALL: t("dashboard.alertFilters.all"),
-    CRITIC: t("dashboard.alertFilters.critic"),
-    HIGH: t("dashboard.alertFilters.high"),
-    MEDUIM: t("dashboard.alertFilters.medium"),
-    LOW: t("dashboard.alertFilters.low"),
+
+  const handleClearAlertsFilters = () => {
+    setAlertsSearchTerm("");
+    setDebouncedAlertsSearchTerm("");
+    setAlertsFilter("ALL");
+    setAlertsOriginFilter("ALL");
+    setAlertsJobFilter("");
+    setAlertsAgentFilter("");
   };
+
+  const handleAlertsGridScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const target = event.currentTarget;
+    if (
+      isInitialAlertsLoading ||
+      isLoadingMoreAlerts ||
+      isRefreshingLatestAlerts ||
+      !hasMoreAlerts
+    ) {
+      return;
+    }
+
+    const remainingDistance = target.scrollHeight - target.scrollTop - target.clientHeight;
+    if (remainingDistance <= 320) {
+      void loadMoreAlerts();
+    }
+  };
+
+  useEffect(() => {
+    const container = alertsGridRef.current;
+    if (
+      !container ||
+      isInitialAlertsLoading ||
+      isLoadingMoreAlerts ||
+      isRefreshingLatestAlerts ||
+      !hasMoreAlerts
+    ) {
+      return;
+    }
+
+    if (container.scrollHeight <= container.clientHeight + 120) {
+      void loadMoreAlertsRef.current();
+    }
+  }, [
+    groupedRecentAlerts.length,
+    alertsCompactMode,
+    hasMoreAlerts,
+    isInitialAlertsLoading,
+    isLoadingMoreAlerts,
+    isRefreshingLatestAlerts,
+  ]);
 
   const handleStopJob = async (jobId: number, jobName: string) => {
     setStoppingJobs(prev => new Set(prev).add(jobId));
@@ -1074,6 +1160,46 @@ function DashboardContent() {
       setStoppingJobs(prev => {
         const next = new Set(prev);
         next.delete(jobId);
+        return next;
+      });
+    }
+  };
+
+  const handleStopCamera = async (cameraId: number, fallbackName: string) => {
+    setStoppingCameras((prev) => new Set(prev).add(cameraId));
+
+    try {
+      const result = await toggleCameraService({
+        cameraId,
+        isRunning: true,
+      });
+      const cameraName = result.cameraName || fallbackName || t("dashboard.unknownCamera");
+      setToast({
+        message: t("dashboard.stopCameraRequested", {
+          defaultValue: "Stop requested for {{cameraName}}.",
+          cameraName,
+        }),
+        type: "success",
+      });
+
+      refresh();
+      setTimeout(() => refresh(), 1500);
+      setTimeout(() => refresh(), 3500);
+    } catch (error) {
+      console.error("Failed to stop camera:", error);
+      setToast({
+        message:
+          error instanceof Error
+            ? error.message
+            : t("dashboard.stopCameraFailed", {
+                defaultValue: "Failed to stop camera.",
+              }),
+        type: "error",
+      });
+    } finally {
+      setStoppingCameras((prev) => {
+        const next = new Set(prev);
+        next.delete(cameraId);
         return next;
       });
     }
@@ -1347,6 +1473,7 @@ function DashboardContent() {
                       const cameraStats = perCamera[camera.id] || {};
                       const enabledAgents = Array.isArray(cameraStats.enabled_agents) ? cameraStats.enabled_agents : [];
                       const isExpanded = expandedCameras.has(camera.id);
+                      const isStoppingCamera = stoppingCameras.has(camera.id);
                       const connectionState = getCameraConnectionState(camera);
                       const isOnline = connectionState === "online";
                       const isReconnecting = connectionState === "reconnecting";
@@ -1397,11 +1524,40 @@ function DashboardContent() {
                                 </div>
                               </div>
                             </div>
-                            <div className="flex flex-col items-end gap-1 shrink-0">
-                              <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                                {enabledAgents.length}
-                              </span>
-                              <span className="text-[11px] text-gray-500 uppercase tracking-wide">{t("dashboard.agents")}</span>
+                            <div className="flex flex-col items-end gap-2 shrink-0">
+                              <div className="flex flex-col items-end gap-1">
+                                <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                                  {enabledAgents.length}
+                                </span>
+                                <span className="text-[11px] text-gray-500 uppercase tracking-wide">{t("dashboard.agents")}</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleStopCamera(
+                                    Number(camera.id),
+                                    camera.name || t("dashboard.unknownCamera")
+                                  );
+                                }}
+                                disabled={isStoppingCamera}
+                                className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                                  isStoppingCamera
+                                    ? "cursor-not-allowed border-gray-700 bg-gray-800 text-gray-500"
+                                    : "border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20"
+                                }`}
+                              >
+                                {isStoppingCamera ? (
+                                  <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                  <StopCircle className="w-4 h-4" />
+                                )}
+                                <span>
+                                  {isStoppingCamera
+                                    ? t("dashboard.stoppingCamera", { defaultValue: "Stopping..." })
+                                    : t("dashboard.stopCameraButton", { defaultValue: "Stop" })}
+                                </span>
+                              </button>
                             </div>
                           </div>
 
@@ -1533,53 +1689,158 @@ function DashboardContent() {
             </button>
           </div>
 
-          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div className="relative w-full sm:max-w-xs">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-              <input
-                type="text"
-                value={alertsSearchTerm}
-                onChange={(event) => setAlertsSearchTerm(event.target.value)}
-                placeholder={t("dashboard.searchAlertsPlaceholder")}
-                className="w-full bg-gray-900/60 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
-              />
-            </div>
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              {alertFilters.map((filter) => {
-                const severityClasses = {
-                  ALL: "bg-gray-800 text-gray-300 border-gray-700 hover:border-gray-500",
-                  CRITIC: "bg-red-500/20 text-red-200 border-red-500/40",
-                  HIGH: "bg-orange-500/20 text-orange-200 border-orange-500/40",
-                  MEDUIM: "bg-yellow-500/20 text-yellow-200 border-yellow-500/40",
-                  LOW: "bg-green-500/20 text-green-200 border-green-500/40",
-                } as const;
-                const inactiveClasses = "bg-blue-500/20 text-blue-200 border-blue-500/40";
-                const activeClasses = severityClasses[filter as keyof typeof severityClasses];
+          <div className="mb-4 flex flex-col gap-3">
+            <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+              <div className="relative w-full xl:max-w-sm">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+                <input
+                  type="text"
+                  value={alertsSearchTerm}
+                  onChange={(event) => setAlertsSearchTerm(event.target.value)}
+                  placeholder={t("dashboard.searchAlertsPlaceholder")}
+                  className="w-full bg-gray-900/60 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
+                />
+              </div>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {alertFilters.map((filter) => {
+                  const severityClasses = {
+                    ALL: "bg-gray-800 text-gray-300 border-gray-700 hover:border-gray-500",
+                    CRITIC: "bg-red-500/20 text-red-200 border-red-500/40",
+                    HIGH: "bg-orange-500/20 text-orange-200 border-orange-500/40",
+                    MEDUIM: "bg-yellow-500/20 text-yellow-200 border-yellow-500/40",
+                    LOW: "bg-green-500/20 text-green-200 border-green-500/40",
+                  } as const;
+                  const inactiveClasses = "bg-blue-500/20 text-blue-200 border-blue-500/40";
+                  const activeClasses = severityClasses[filter as keyof typeof severityClasses];
 
                 return (
                   <button
                     key={filter}
                     type="button"
                     onClick={() => setAlertsFilter(filter)}
+                    disabled={alertsOriginFilter === "CAMERA_AGENT" && filter !== "ALL"}
                     className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-colors ${
                       alertsFilter === filter ? activeClasses : inactiveClasses
+                    } ${
+                      alertsOriginFilter === "CAMERA_AGENT" && filter !== "ALL"
+                        ? "cursor-not-allowed opacity-40"
+                        : ""
                     }`}
                   >
                     {alertFilterLabels[filter] ?? filter}
                   </button>
                 );
-              })}
+                })}
+              </div>
             </div>
+
+            <div className="grid grid-cols-1 gap-2 lg:grid-cols-[minmax(0,1fr),minmax(0,1fr),minmax(0,1fr),auto] lg:items-end">
+              <label className="min-w-0">
+                <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-gray-500">
+                  {recentAlertsUiCopy.originLabel}
+                </span>
+                <select
+                  value={alertsOriginFilter}
+                  onChange={(event) =>
+                    setAlertsOriginFilter(event.target.value as "ALL" | "JOB" | "CAMERA_AGENT")
+                  }
+                  className="w-full rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
+                >
+                  {alertsOriginOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="min-w-0">
+                <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-gray-500">
+                  {recentAlertsUiCopy.jobLabel}
+                </span>
+                <select
+                  value={alertsJobFilter}
+                  onChange={(event) => setAlertsJobFilter(event.target.value)}
+                  disabled={alertsOriginFilter === "CAMERA_AGENT"}
+                  className={`w-full rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 ${
+                    alertsOriginFilter === "CAMERA_AGENT" ? "cursor-not-allowed opacity-60" : ""
+                  }`}
+                >
+                  <option value="">{recentAlertsUiCopy.jobAllLabel}</option>
+                  {alertsJobOptions.map((job) => (
+                    <option key={job.job_id} value={job.job_id}>
+                      {job.job_name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="min-w-0">
+                <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-gray-500">
+                  {recentAlertsUiCopy.agentLabel}
+                </span>
+                <select
+                  value={alertsAgentFilter}
+                  onChange={(event) => setAlertsAgentFilter(event.target.value)}
+                  className="w-full rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40"
+                >
+                  <option value="">{recentAlertsUiCopy.agentAllLabel}</option>
+                  {alertsAgentOptions.map((agent) => (
+                    <option key={agent.agent_key} value={agent.agent_key}>
+                      {agent.agent_label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="flex items-center gap-2 lg:justify-end">
+                <button
+                  type="button"
+                  onClick={handleClearAlertsFilters}
+                  disabled={!hasStructuredAlertsFilters}
+                  className="w-full rounded-lg border border-gray-700 px-3 py-2 text-sm text-gray-200 transition-colors hover:border-gray-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40 lg:w-auto"
+                >
+                  {recentAlertsUiCopy.clearFiltersLabel}
+                </button>
+              </div>
+            </div>
+
+            {alertsLoadError && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                {alertsLoadError}
+              </div>
+            )}
           </div>
 
           <div
+            ref={alertsGridRef}
+            onScroll={handleAlertsGridScroll}
             className={`grid pr-1 w-full flex-1 min-h-0 content-start ${
               alertsCompactMode
                 ? "overflow-y-scroll grid-cols-2 xl:grid-cols-4 gap-3"
                 : "overflow-y-auto grid-cols-2 gap-3"
             }`}
           >
-            {alertsForDisplay.map((alertGroup: any, idx: number) => {
+            {showAlertsEmptyState ? (
+              <div className="col-span-full flex min-h-[280px] flex-col items-center justify-center rounded-xl border border-dashed border-gray-700 bg-gray-900/40 px-6 text-center">
+                <AlertCircle className="mb-3 h-8 w-8 text-gray-500" />
+                <h3 className="text-base font-medium text-gray-200">
+                  {recentAlertsUiCopy.noResultsTitle}
+                </h3>
+                <p className="mt-2 max-w-md text-sm text-gray-400">
+                  {recentAlertsUiCopy.noResultsBody}
+                </p>
+                {hasStructuredAlertsFilters && (
+                  <button
+                    type="button"
+                    onClick={handleClearAlertsFilters}
+                    className="mt-4 rounded-full border border-gray-600 px-4 py-2 text-sm text-gray-200 transition-colors hover:border-gray-400 hover:text-white"
+                  >
+                    {recentAlertsUiCopy.clearFiltersLabel}
+                  </button>
+                )}
+              </div>
+            ) : alertsForDisplay.map((alertGroup: any, idx: number) => {
               if (!alertGroup) {
                 return (
                   <div
@@ -1665,9 +1926,11 @@ function DashboardContent() {
               const displayMeta = getAlertDisplayMeta(alert, cameras, alertDisplayOptions);
               const agentLabel = displayMeta.badgeLabel;
               const stepIdValue =
+                alert.step_id ??
                 alertDetails.step_id ??
                 alertDetails.stepId ??
                 alertDetails.step_order;
+              const jobNameLabel = alert.job_name || alertDetails.job_name || null;
               const rawPriority =
                 alert.priority_level ||
                 alertDetails.priority_level ||
@@ -1935,14 +2198,14 @@ function DashboardContent() {
                         {t("jobs.open")}
                       </button>
                     </div>
-                    {isJobAlertCard && (alertDetails.job_name || alertDetails.step_order !== undefined) && (
+                    {isJobAlertCard && (jobNameLabel || stepIdValue !== undefined) && (
                       alertsCompactMode ? (
                         <div className="mt-0.5 space-y-0.5 text-[11px] text-gray-400 relative -top-0.5">
-                          {alertDetails.job_name && (
+                          {jobNameLabel && (
                             <div className="flex items-center gap-2 min-w-0">
                               <Layers className="w-4 h-4 text-gray-500 shrink-0" />
-                              <span className="truncate" title={String(alertDetails.job_name || "")}>
-                                <span className="text-gray-300">{t("dashboard.job")}:</span> {alertDetails.job_name}
+                              <span className="truncate" title={String(jobNameLabel || "")}>
+                                <span className="text-gray-300">{t("dashboard.job")}:</span> {jobNameLabel}
                               </span>
                             </div>
                           )}
@@ -1957,19 +2220,19 @@ function DashboardContent() {
                         </div>
                       ) : (
                         <div className="mt-0.5 flex items-center gap-2 text-[11px] text-gray-400 relative -top-0.5">
-                          {alertDetails.job_name && (
+                          {jobNameLabel && (
                             <>
                               <Layers className="w-4 h-4 text-gray-500" />
-                              <span className="truncate" title={String(alertDetails.job_name || "")}>
-                                <span className="text-gray-300">{t("dashboard.job")}:</span> {alertDetails.job_name}
+                              <span className="truncate" title={String(jobNameLabel || "")}>
+                                <span className="text-gray-300">{t("dashboard.job")}:</span> {jobNameLabel}
                               </span>
                             </>
                           )}
-                          {alertDetails.step_order !== undefined && (
+                          {stepIdValue !== undefined && stepIdValue !== null && (
                             <>
                               <Circle className="w-2.5 h-2.5 text-gray-500" />
-                              <span className="truncate" title={String(alertDetails.step_order)}>
-                                <span className="text-gray-300">{t("dashboard.step")}:</span> {alertDetails.step_order}
+                              <span className="truncate" title={String(stepIdValue)}>
+                                <span className="text-gray-300">{t("dashboard.step")}:</span> {stepIdValue}
                               </span>
                             </>
                           )}
@@ -1980,6 +2243,17 @@ function DashboardContent() {
                 </div>
               );
             })}
+            {!showAlertsEmptyState && (isLoadingMoreAlerts || isRefreshingLatestAlerts) && (
+              <div className="col-span-full flex items-center justify-center gap-2 py-3 text-sm text-gray-400">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span>{recentAlertsUiCopy.loadMoreLabel}</span>
+              </div>
+            )}
+            {!showAlertsEmptyState && !hasMoreAlerts && !isInitialAlertsLoading && groupedRecentAlerts.length > 0 && (
+              <div className="col-span-full pb-2 text-center text-xs text-gray-500">
+                {recentAlertsUiCopy.allLoadedLabel}
+              </div>
+            )}
           </div>
 
           {isGroupAlbumOpen && (
@@ -2530,18 +2804,18 @@ function DashboardContent() {
                       <span>{t("dashboard.job")}</span>
                     </div>
                     <div className="mt-1 text-sm text-gray-100">
-                      {activeAlert?.details?.job_name || "--"}
+                      {activeAlert?.job_name || activeAlert?.details?.job_name || "--"}
                     </div>
                   </div>
                   <div className="bg-gray-800/60 border border-gray-700/60 rounded-xl p-3">
                     <div className="flex items-center gap-2 text-xs text-gray-400">
                       <ChevronRight className="w-4 h-4 text-blue-400" />
                       <span>
-                        {t("dashboard.step")} {activeAlert?.details?.step_order !== undefined ? activeAlert.details.step_order : "--"}
+                        {t("dashboard.step")} {activeAlert?.step_id ?? activeAlert?.details?.step_order ?? "--"}
                       </span>
                     </div>
                     <div className="mt-1 text-sm text-gray-100">
-                      {activeAlert?.details?.step_name || "--"}
+                      {activeAlert?.step_name || activeAlert?.details?.step_name || "--"}
                     </div>
                   </div>
                 </>
@@ -2618,11 +2892,12 @@ function DashboardContent() {
                     groupAlert?.detected_at || groupAlert?.created_at || null,
                   );
                   const groupAlertMetaParts = [
-                    groupAlertDetails?.job_name
-                      ? `${t("dashboard.job")}: ${groupAlertDetails.job_name}`
+                    (groupAlert?.job_name || groupAlertDetails?.job_name)
+                      ? `${t("dashboard.job")}: ${groupAlert?.job_name || groupAlertDetails?.job_name}`
                       : null,
-                    groupAlertDetails?.step_order !== undefined
-                      ? `${t("dashboard.step")}: ${groupAlertDetails.step_order}`
+                    (groupAlert?.step_id ?? groupAlertDetails?.step_order) !== undefined &&
+                    (groupAlert?.step_id ?? groupAlertDetails?.step_order) !== null
+                      ? `${t("dashboard.step")}: ${groupAlert?.step_id ?? groupAlertDetails?.step_order}`
                       : null,
                     groupAlertDetails?.camera_name || groupAlert?.camera_name
                       ? `${t("dashboard.camera")}: ${groupAlertDetails?.camera_name || groupAlert?.camera_name}`

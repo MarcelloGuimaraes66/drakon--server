@@ -397,10 +397,6 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
           : {}),
       });
 
-      if (result.nextRunning === 1) {
-        setActiveTab("online");
-      }
-
       refreshDashboardSummary();
       void refreshCameras();
     } catch (error) {
