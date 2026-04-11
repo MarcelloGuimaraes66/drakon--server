@@ -28,7 +28,10 @@ import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
-import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
+import {
+  PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR,
+  usePerceptrumChatSession,
+} from "@/react-app/hooks/usePerceptrumChatSession";
 import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
 import { ChatMessage, ChatSession } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
@@ -94,7 +97,6 @@ export default function Chat() {
   const { t, i18n } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
-  const billingEnabled = brand.features.billingEnabled;
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -153,12 +155,26 @@ export default function Chat() {
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
   }, []);
 
-  const { isLoading, error, warning, pendingExecutionState, sendMessage, submitCameraRegistration, submitCameraBatchRegistration, submitCameraBatchEdit, updateIdentityCard, cancelMessage } = usePerceptrumChatSession({
+  const {
+    isLoading,
+    error,
+    errorCode,
+    warning,
+    pendingExecutionState,
+    sendMessage,
+    submitCameraRegistration,
+    submitCameraBatchRegistration,
+    submitCameraBatchEdit,
+    updateIdentityCard,
+    cancelMessage,
+  } = usePerceptrumChatSession({
     sessionId: activeSessionId,
     onMessagesUpdate: (updatedMessages) => {
       setMessages(updatedMessages);
     },
   });
+  const showBillingUnlockCta =
+    brand.features.billingEnabled && errorCode === PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR;
 
   const pendingExecutionNotice =
     pendingExecutionState.kind === "offline"
@@ -1168,10 +1184,14 @@ export default function Chat() {
                 {error && (
                   <div className="rounded-[24px] border border-red-500/30 bg-red-500/10 p-4 backdrop-blur-sm">
                     <p className="text-sm text-red-300">{error}</p>
-                    {billingEnabled ? (
-                      <a href="/billing" className="mt-2 inline-block text-sm text-blue-300 hover:underline">
-                        Go to Billing →
-                      </a>
+                    {showBillingUnlockCta ? (
+                      <button
+                        type="button"
+                        onClick={() => navigate("/billing")}
+                        className="mt-3 inline-flex items-center text-sm font-medium text-blue-200 transition-colors hover:text-blue-100"
+                      >
+                        Open Billing
+                      </button>
                     ) : null}
                   </div>
                 )}
@@ -1218,15 +1238,7 @@ export default function Chat() {
                 />
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
                   <span>{`${brand.chatName} can make mistakes. Consider verifying important details.`}</span>
-                  {billingEnabled ? (
-                    <span>
-                      Token usage is tracked in{" "}
-                      <a href="/billing" className="text-blue-300 hover:underline">
-                        Billing
-                      </a>
-                      .
-                    </span>
-                  ) : null}
+                  <span>Chat uses the API key configured for the selected model in Settings.</span>
                 </div>
               </div>
             </div>

@@ -549,7 +549,17 @@ export function EventsProvider({
         if (!Array.isArray(cameraRows)) return;
         camerasRef.current = cameraRows;
 
+        const summaryCameras = dashboardSummaryStore.getCurrent().cameras;
+        const summaryById = new Map<number, any>();
+        summaryCameras.forEach((camera) => {
+          const cameraId = Number(camera?.id);
+          if (Number.isFinite(cameraId)) {
+            summaryById.set(cameraId, camera);
+          }
+        });
+
         const activeCameraIds = new Set<number>();
+        let didChangeCameraState = false;
         let didRecoverCamera = false;
 
         for (const camera of cameraRows) {
@@ -558,7 +568,21 @@ export function EventsProvider({
           activeCameraIds.add(cameraId);
 
           const isOnline = camera?.is_online === 1 || camera?.is_online === true;
+          const isRunning = camera?.is_service_running === 1 || camera?.is_service_running === true;
           const previousIsOnline = previousOnlineStateRef.current.get(cameraId);
+          const summaryCamera = summaryById.get(cameraId);
+          const summaryIsOnline =
+            summaryCamera?.is_online === 1 || summaryCamera?.is_online === true;
+          const summaryIsRunning =
+            summaryCamera?.is_service_running === 1 || summaryCamera?.is_service_running === true;
+
+          if (
+            !summaryCamera ||
+            summaryIsOnline !== isOnline ||
+            summaryIsRunning !== isRunning
+          ) {
+            didChangeCameraState = true;
+          }
 
           if (
             previousIsOnline !== true &&
@@ -600,7 +624,11 @@ export function EventsProvider({
           }
         }
 
-        if (didRecoverCamera) {
+        if (summaryById.size !== activeCameraIds.size) {
+          didChangeCameraState = true;
+        }
+
+        if (didRecoverCamera || didChangeCameraState) {
           dashboardSummaryStore.refresh();
         }
       },

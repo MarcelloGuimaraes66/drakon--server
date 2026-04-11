@@ -144,6 +144,55 @@ static fs::path getInferenceTempDirForCameraId(const std::string& cameraId)
     return base;
 }
 
+static std::string sanitizeCameraAgentEventToken_(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (std::isalnum(ch) != 0) {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+        }
+        else if (ch == '_' || ch == '-') {
+            out.push_back(static_cast<char>(ch));
+        }
+        else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) return "camera_agent";
+    return out;
+}
+
+static std::string buildCameraAgentRunId_(
+    const CameraConfig& config,
+    const AlgorithmConfig& algo)
+{
+    const std::string sessionToken =
+        !config.cameraSessionId.empty()
+            ? config.cameraSessionId
+            : ("camera_" + sanitizeCameraAgentEventToken_(config.id));
+    const std::string algoToken =
+        algo.algorithmId > 0
+            ? std::to_string(algo.algorithmId)
+            : sanitizeCameraAgentEventToken_(algo.type);
+    return sessionToken + ":camera_agent:" + algoToken;
+}
+
+static std::string buildCameraAgentResultEventId_(
+    const std::string& agentRunId,
+    const std::string& eventAtUtc,
+    int frameIndex)
+{
+    const std::string timestampToken = sanitizeCameraAgentEventToken_(
+        eventAtUtc.empty() ? nowUtcIso8601Ms_() : eventAtUtc
+    );
+    std::string eventId = agentRunId + ":result:" + timestampToken;
+    if (frameIndex >= 0) {
+        eventId += ":" + std::to_string(frameIndex);
+    }
+    return eventId;
+}
+
 static int normalizeRecordingProfileFps_(int fps);
 static int captureProfileFpsForSeconds_(
     const std::vector<VideoCaptureProfile>& profiles,
@@ -376,6 +425,47 @@ std::string CameraSession::currentStartOrigin_() const
     return "";
 }
 
+bool CameraSession::shouldPublishDashboardThumbnail_() const
+{
+    if (!owner_) {
+        return false;
+    }
+
+    if (!streamOnline_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    if (config_.isDrakonFindTemporarySession || config_.isVideoSearchTemporarySession) {
+        return false;
+    }
+
+    // Keep persisted dashboard thumbnails tied to the direct service request so
+    // job-only runtime sessions do not overwrite the preview shown in AI Agents.
+    return directServiceRequested_.load(std::memory_order_relaxed);
+}
+
+void CameraSession::maybePublishDashboardThumbnail_(
+    const cv::Mat& frame,
+    std::chrono::steady_clock::time_point now)
+{
+    static const auto kThumbnailInterval = std::chrono::seconds(10);
+
+    if (frame.empty() || !shouldPublishDashboardThumbnail_()) {
+        return;
+    }
+
+    if (lastThumbnailSent_.time_since_epoch().count() == 0) {
+        lastThumbnailSent_ = now - kThumbnailInterval;
+    }
+
+    if ((now - lastThumbnailSent_) < kThumbnailInterval) {
+        return;
+    }
+
+    sendThumbnail_(frame);
+    lastThumbnailSent_ = now;
+}
+
 CameraSession::OpenMonitorSnapshot CameraSession::getOpenMonitorSnapshot() const
 {
     OpenMonitorSnapshot snapshot;
@@ -474,6 +564,236 @@ static std::vector<AlgorithmConfig::AnalysisRegion> collectPolygonRegionsForAlgo
         out.push_back(region);
     }
     return out;
+}
+
+static bool isFrameWindowActiveCamera_(const AlgorithmConfig::FrameWindowNorm& frameWindow)
+{
+    return frameWindow.enabled &&
+        frameWindow.width > 1e-6 &&
+        frameWindow.height > 1e-6 &&
+        (frameWindow.x > 1e-6 ||
+         frameWindow.y > 1e-6 ||
+         frameWindow.width < (1.0 - 1e-6) ||
+         frameWindow.height < (1.0 - 1e-6));
+}
+
+static AlgorithmConfig::FrameWindowNorm resolveFrameWindowForAlgoCamera_(
+    const AlgorithmConfig& algo)
+{
+    for (const auto& region : algo.analysisRegions) {
+        if (isFrameWindowActiveCamera_(region.frameWindowNorm)) {
+            return region.frameWindowNorm;
+        }
+    }
+    return AlgorithmConfig::FrameWindowNorm{};
+}
+
+static cv::Rect frameWindowToRectCamera_(
+    const AlgorithmConfig::FrameWindowNorm& frameWindow,
+    const cv::Size& size)
+{
+    if (size.width <= 0 || size.height <= 0) return cv::Rect();
+    if (!isFrameWindowActiveCamera_(frameWindow)) {
+        return cv::Rect(0, 0, size.width, size.height);
+    }
+
+    const double x1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double y1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double x2Norm = (std::max)(x1Norm, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double y2Norm = (std::max)(y1Norm, (std::min)(1.0, frameWindow.y + frameWindow.height));
+
+    int x1 = static_cast<int>(std::floor(x1Norm * static_cast<double>(size.width)));
+    int y1 = static_cast<int>(std::floor(y1Norm * static_cast<double>(size.height)));
+    int x2 = static_cast<int>(std::ceil(x2Norm * static_cast<double>(size.width)));
+    int y2 = static_cast<int>(std::ceil(y2Norm * static_cast<double>(size.height)));
+
+    x1 = (std::max)(0, (std::min)(size.width - 1, x1));
+    y1 = (std::max)(0, (std::min)(size.height - 1, y1));
+    x2 = (std::max)(x1 + 1, (std::min)(size.width, x2));
+    y2 = (std::max)(y1 + 1, (std::min)(size.height, y2));
+
+    return cv::Rect(x1, y1, x2 - x1, y2 - y1);
+}
+
+static cv::Mat cropFrameToFrameWindowCamera_(
+    const cv::Mat& frame,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow,
+    cv::Rect* outCropRect = nullptr)
+{
+    if (frame.empty()) return cv::Mat();
+    const cv::Rect cropRect = frameWindowToRectCamera_(frameWindow, frame.size());
+    if (outCropRect) *outCropRect = cropRect;
+    if (cropRect.width <= 0 || cropRect.height <= 0) return cv::Mat();
+    return frame(cropRect).clone();
+}
+
+static std::vector<AlgorithmConfig::AnalysisRegionPoint> clipPolygonToFrameWindowCamera_(
+    const std::vector<AlgorithmConfig::AnalysisRegionPoint>& polygon,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow)
+{
+    using Point = AlgorithmConfig::AnalysisRegionPoint;
+    if (!isFrameWindowActiveCamera_(frameWindow) || polygon.size() < 3) {
+        return polygon;
+    }
+
+    const double minX = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double minY = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double maxX = (std::max)(minX, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double maxY = (std::max)(minY, (std::min)(1.0, frameWindow.y + frameWindow.height));
+
+    auto intersectAtX = [](const Point& a, const Point& b, double x) -> Point {
+        const double dx = b.x - a.x;
+        if (std::abs(dx) <= 1e-9) {
+            return Point{ x, a.y };
+        }
+        const double t = (x - a.x) / dx;
+        return Point{ x, a.y + ((b.y - a.y) * t) };
+    };
+    auto intersectAtY = [](const Point& a, const Point& b, double y) -> Point {
+        const double dy = b.y - a.y;
+        if (std::abs(dy) <= 1e-9) {
+            return Point{ a.x, y };
+        }
+        const double t = (y - a.y) / dy;
+        return Point{ a.x + ((b.x - a.x) * t), y };
+    };
+    auto clipEdge = [](const std::vector<Point>& input, const auto& inside, const auto& intersect) {
+        std::vector<Point> output;
+        if (input.empty()) return output;
+        output.reserve(input.size() + 4);
+
+        Point prev = input.back();
+        bool prevInside = inside(prev);
+        for (const auto& curr : input) {
+            const bool currInside = inside(curr);
+            if (currInside) {
+                if (!prevInside) {
+                    output.push_back(intersect(prev, curr));
+                }
+                output.push_back(curr);
+            }
+            else if (prevInside) {
+                output.push_back(intersect(prev, curr));
+            }
+            prev = curr;
+            prevInside = currInside;
+        }
+        return output;
+    };
+
+    std::vector<Point> clipped = polygon;
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.x >= minX; },
+        [&](const Point& a, const Point& b) { return intersectAtX(a, b, minX); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.x <= maxX; },
+        [&](const Point& a, const Point& b) { return intersectAtX(a, b, maxX); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.y >= minY; },
+        [&](const Point& a, const Point& b) { return intersectAtY(a, b, minY); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.y <= maxY; },
+        [&](const Point& a, const Point& b) { return intersectAtY(a, b, maxY); }
+    );
+    return clipped;
+}
+
+static std::vector<AlgorithmConfig::AnalysisRegion> remapRegionsToFrameWindowCamera_(
+    const std::vector<AlgorithmConfig::AnalysisRegion>& regions,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow)
+{
+    if (!isFrameWindowActiveCamera_(frameWindow)) return regions;
+
+    std::vector<AlgorithmConfig::AnalysisRegion> out;
+    out.reserve(regions.size());
+    const double invWidth = frameWindow.width > 1e-6 ? (1.0 / frameWindow.width) : 1.0;
+    const double invHeight = frameWindow.height > 1e-6 ? (1.0 / frameWindow.height) : 1.0;
+
+    for (const auto& region : regions) {
+        AlgorithmConfig::AnalysisRegion next = region;
+        next.frameWindowNorm = AlgorithmConfig::FrameWindowNorm{};
+        if (!next.fullFrame && !next.polygonNorm.empty()) {
+            auto clippedPolygon = clipPolygonToFrameWindowCamera_(next.polygonNorm, frameWindow);
+            if (clippedPolygon.size() < 3) {
+                continue;
+            }
+            for (auto& point : clippedPolygon) {
+                point.x = (std::max)(0.0, (std::min)(1.0, (point.x - frameWindow.x) * invWidth));
+                point.y = (std::max)(0.0, (std::min)(1.0, (point.y - frameWindow.y) * invHeight));
+            }
+            next.polygonNorm = std::move(clippedPolygon);
+        }
+        out.push_back(std::move(next));
+    }
+    return out;
+}
+
+std::string base64_encode(const unsigned char* bytes_to_encode, size_t in_len);
+
+static bool encodeFrameToJpegDataUrlCamera_(
+    const cv::Mat& frame,
+    std::string& outDataUrl)
+{
+    outDataUrl.clear();
+    if (frame.empty()) return false;
+    std::vector<uchar> jpegBytes;
+    if (!cv::imencode(".jpg", frame, jpegBytes) || jpegBytes.empty()) {
+        return false;
+    }
+    outDataUrl =
+        std::string("data:image/jpeg;base64,") +
+        base64_encode(jpegBytes.data(), jpegBytes.size());
+    return !outDataUrl.empty();
+}
+
+static bool buildCroppedClipForFrameWindowCamera_(
+    const std::string& srcClipPath,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow,
+    std::string& outClipPath)
+{
+    outClipPath.clear();
+    if (!isFrameWindowActiveCamera_(frameWindow)) return false;
+
+    cv::VideoCapture cap(srcClipPath);
+    if (!cap.isOpened()) return false;
+
+    cv::Mat firstFrame;
+    if (!cap.read(firstFrame) || firstFrame.empty()) {
+        return false;
+    }
+
+    const cv::Rect cropRect = frameWindowToRectCamera_(frameWindow, firstFrame.size());
+    if (cropRect.width <= 0 || cropRect.height <= 0) return false;
+
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (!std::isfinite(fps) || fps <= 0.0) fps = 10.0;
+
+    const std::string dstClipPath = srcClipPath + ".frame_window.mp4";
+    const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    cv::VideoWriter writer(dstClipPath, fourcc, fps, cropRect.size(), true);
+    if (!writer.isOpened()) return false;
+
+    writer.write(firstFrame(cropRect).clone());
+
+    cv::Mat frame;
+    while (cap.read(frame)) {
+        if (frame.empty()) continue;
+        const cv::Rect frameCropRect = frameWindowToRectCamera_(frameWindow, frame.size());
+        if (frameCropRect.width <= 0 || frameCropRect.height <= 0) continue;
+        writer.write(frame(frameCropRect).clone());
+    }
+
+    writer.release();
+    cap.release();
+    outClipPath = dstClipPath;
+    return true;
 }
 
 static std::vector<cv::Point> regionPolygonToPixelsForCamera_(
@@ -1036,6 +1356,41 @@ void CameraSession::start() {
     );
 
     // Agora usamos o nome que você pediu: base_camera_thread().
+    if (owner_ &&
+        !config_.isDrakonFindTemporarySession &&
+        !config_.isVideoSearchTemporarySession) {
+        try {
+            const int cameraIdValue = std::stoi(config_.id);
+            nlohmann::json details = nlohmann::json::object();
+            if (!config_.cameraSessionId.empty()) {
+                details["camera_session_id"] = config_.cameraSessionId;
+                details["event_id"] = config_.cameraSessionId + ":camera_started";
+            }
+            if (!config_.name.empty()) {
+                details["camera_name"] = config_.name;
+            }
+            const std::string runtimeStartOrigin = currentStartOrigin_();
+            if (!runtimeStartOrigin.empty()) {
+                details["start_origin"] = runtimeStartOrigin;
+            }
+            {
+                std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                if (!config_.enabledAlgorithms.empty()) {
+                    details["enabled_algorithms"] = config_.enabledAlgorithms;
+                }
+            }
+            owner_->postAgentEvent(
+                "camera_started",
+                cameraIdValue,
+                "",
+                "Camera session started.",
+                details
+            );
+        }
+        catch (...) {
+        }
+    }
+
     base_camera_thread();
 }
 
@@ -1164,6 +1519,42 @@ void CameraSession::stop() {
             config_.id,
             "CameraSession::stop(): EXIT"
         );
+
+        if (owner_ &&
+            wasRunning &&
+            !config_.isDrakonFindTemporarySession &&
+            !config_.isVideoSearchTemporarySession) {
+            try {
+                const int cameraIdValue = std::stoi(config_.id);
+                nlohmann::json details = nlohmann::json::object();
+                if (!config_.cameraSessionId.empty()) {
+                    details["camera_session_id"] = config_.cameraSessionId;
+                    details["event_id"] = config_.cameraSessionId + ":camera_stopped";
+                }
+                if (!config_.name.empty()) {
+                    details["camera_name"] = config_.name;
+                }
+                const std::string runtimeStartOrigin = currentStartOrigin_();
+                if (!runtimeStartOrigin.empty()) {
+                    details["start_origin"] = runtimeStartOrigin;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                    if (!config_.enabledAlgorithms.empty()) {
+                        details["enabled_algorithms"] = config_.enabledAlgorithms;
+                    }
+                }
+                owner_->postAgentEvent(
+                    "camera_stopped",
+                    cameraIdValue,
+                    "",
+                    "Camera session stopped.",
+                    details
+                );
+            }
+            catch (...) {
+            }
+        }
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug(
@@ -2583,7 +2974,9 @@ void CameraSession::captureLoop_() {
             int nextRetryDelaySec,
             const std::string& reason)
         {
-            if (!owner_) return;
+            if (!owner_ ||
+                config_.isDrakonFindTemporarySession ||
+                config_.isVideoSearchTemporarySession) return;
 
             nlohmann::json extraDetails = nlohmann::json::object();
             extraDetails["failure_phase"] = phase;
@@ -2610,6 +3003,21 @@ void CameraSession::captureLoop_() {
             const std::string runtimeStartOrigin = currentStartOrigin_();
             if (!runtimeStartOrigin.empty()) {
                 extraDetails["start_origin"] = runtimeStartOrigin;
+            }
+            if (!config_.cameraSessionId.empty()) {
+                extraDetails["camera_session_id"] = config_.cameraSessionId;
+                extraDetails["event_id"] =
+                    config_.cameraSessionId +
+                    ":camera_connection_failed:" +
+                    phase + ":" +
+                    std::to_string(attemptNo) +
+                    (isReminder ? ":reminder" : ":first");
+            }
+            {
+                std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                if (!config_.enabledAlgorithms.empty()) {
+                    extraDetails["enabled_algorithms"] = config_.enabledAlgorithms;
+                }
             }
             if (config_.isDrakonFindTemporarySession) {
                 extraDetails["temporary_session"] = true;
@@ -2653,7 +3061,9 @@ void CameraSession::captureLoop_() {
         auto notifyCameraOnline = [&](const std::string& onlinePhase,
             int reconnectAttempts)
         {
-            if (!owner_ || config_.isDrakonFindTemporarySession) return;
+            if (!owner_ ||
+                config_.isDrakonFindTemporarySession ||
+                config_.isVideoSearchTemporarySession) return;
 
             try {
                 nlohmann::json details = nlohmann::json::object();
@@ -2666,13 +3076,26 @@ void CameraSession::captureLoop_() {
                 if (!runtimeStartOrigin.empty()) {
                     details["start_origin"] = runtimeStartOrigin;
                 }
+                if (!config_.cameraSessionId.empty()) {
+                    details["camera_session_id"] = config_.cameraSessionId;
+                    details["event_id"] =
+                        config_.cameraSessionId + ":" +
+                        (reconnectAttempts > 0 ? "camera_recovered:" : "camera_online:") +
+                        std::to_string(reconnectAttempts);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                    if (!config_.enabledAlgorithms.empty()) {
+                        details["enabled_algorithms"] = config_.enabledAlgorithms;
+                    }
+                }
                 if (!activeUrl.empty()) {
                     details["active_rtsp_url"] = activeUrl;
                 }
 
                 const int cameraIdValue = std::stoi(config_.id);
                 owner_->postAgentEvent(
-                    "camera_online",
+                    reconnectAttempts > 0 ? "camera_recovered" : "camera_online",
                     cameraIdValue,
                     "",
                     reconnectAttempts > 0
@@ -2773,10 +3196,6 @@ void CameraSession::captureLoop_() {
             std::string(config_.storage.storeFrames ? "true" : "false") +
             ", retentionDays=" + std::to_string(config_.storage.retentionDays)
         );
-
-        static constexpr auto kThumbnailInterval = std::chrono::seconds(10);
-
-
 
         bool offline = false;
         auto nextTick = std::chrono::steady_clock::now();
@@ -3056,17 +3475,7 @@ void CameraSession::captureLoop_() {
             }
 
 
-            if (recent) {
-                if (lastThumbnailSent_.time_since_epoch().count() == 0) {
-                    // safety if not initialized
-                    lastThumbnailSent_ = now - kThumbnailInterval;
-                }
-
-                if ((now - lastThumbnailSent_) >= kThumbnailInterval) {
-                    sendThumbnail_(frameMat);
-                    lastThumbnailSent_ = now;
-                }
-            }
+            maybePublishDashboardThumbnail_(frameMat, now);
 
             
 
@@ -3706,6 +4115,9 @@ void sendTokenUsageAsync(
     int totalTokens,
     const std::string& source,
     const std::string& algoType,
+    const std::string& cameraSessionId,
+    int cameraAlgorithmId,
+    const std::string& agentRunId,
     const std::string& clientId,
     const std::string& exeToken,
     const std::string& backendBaseUrl
@@ -4940,6 +5352,9 @@ void sendTokenUsageAsync(
     int totalTokens,
     const std::string& source,
     const std::string& algoType,
+    const std::string& cameraSessionId,
+    int cameraAlgorithmId,
+    const std::string& agentRunId,
     const std::string& clientId,
     const std::string& exeToken,
     const std::string& backendBaseUrl
@@ -4947,7 +5362,8 @@ void sendTokenUsageAsync(
 {
     // Criar a tarefa com cópias dos parâmetros
     auto task = [cameraId, promptTokens, outputTokens, totalTokens,
-        source, algoType, clientId, exeToken, backendBaseUrl]() {
+        source, algoType, cameraSessionId, cameraAlgorithmId, agentRunId,
+        clientId, exeToken, backendBaseUrl]() {
         try {
             nlohmann::json body = {
                 { "camera_id",      cameraId },
@@ -4957,6 +5373,15 @@ void sendTokenUsageAsync(
                 { "source",         source },
                 { "algo_type",      algoType }
             };
+            if (!cameraSessionId.empty()) {
+                body["camera_session_id"] = cameraSessionId;
+            }
+            if (cameraAlgorithmId > 0) {
+                body["camera_algorithm_id"] = cameraAlgorithmId;
+            }
+            if (!agentRunId.empty()) {
+                body["agent_run_id"] = agentRunId;
+            }
 
             std::string url = backendBaseUrl +
                 "/api/agent/token-usage?client_id=" + clientId;
@@ -6145,17 +6570,60 @@ void CameraSession::inferenceLoop_() {
                     }
 
                     bool shouldInfer = true;
-                    std::string inferenceImageDataUrl = baseImageDataUrl;
-                    std::vector<std::string> overlayRegionIds;
-                    std::vector<std::string> motionTriggeredRegionIds;
-
-                    const auto polygonRegions = collectPolygonRegionsForAlgo_(customAlgo);
-                    if (!polygonRegions.empty() && customAlgo.onlyCaptureOnMotion) {
+                    const auto frameWindow = resolveFrameWindowForAlgoCamera_(customAlgo);
+                    const bool hasFrameWindow = isFrameWindowActiveCamera_(frameWindow);
+                    cv::Mat snapshotFrameForAlgo = decodedSnapshotFrame;
+                    if (hasFrameWindow) {
                         if (decodedSnapshotFrame.empty()) {
                             shouldInfer = false;
                             Logger::instance().logDebug(
                                 config_.id,
-                                "inferenceLoop_: image mode failed to decode snapshot for ROI motion algo=" +
+                                "inferenceLoop_: image mode failed to decode snapshot for frame window algo=" +
+                                customAlgo.type
+                            );
+                        }
+                        else {
+                            snapshotFrameForAlgo =
+                                cropFrameToFrameWindowCamera_(decodedSnapshotFrame, frameWindow, nullptr);
+                            if (snapshotFrameForAlgo.empty()) {
+                                shouldInfer = false;
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: image mode crop returned empty frame for algo=" +
+                                    customAlgo.type
+                                );
+                            }
+                        }
+                    }
+
+                    std::string inferenceImageDataUrl = baseImageDataUrl;
+                    std::vector<std::string> overlayRegionIds;
+                    std::vector<std::string> motionTriggeredRegionIds;
+
+                    const auto polygonRegions = remapRegionsToFrameWindowCamera_(
+                        collectPolygonRegionsForAlgo_(customAlgo),
+                        frameWindow
+                    );
+                        std::vector<AlgorithmConfig::AnalysisRegion> motionRegions = polygonRegions;
+                        if (motionRegions.empty() && hasFrameWindow) {
+                            AlgorithmConfig::AnalysisRegion viewportRegion;
+                            viewportRegion.enabled = true;
+                            viewportRegion.fullFrame = false;
+                            viewportRegion.polygonNorm = {
+                                { 0.0, 0.0 },
+                            { 1.0, 0.0 },
+                            { 1.0, 1.0 },
+                            { 0.0, 1.0 }
+                        };
+                        motionRegions.push_back(std::move(viewportRegion));
+                    }
+
+                    if (!motionRegions.empty() && customAlgo.onlyCaptureOnMotion) {
+                        if (snapshotFrameForAlgo.empty()) {
+                            shouldInfer = false;
+                            Logger::instance().logDebug(
+                                config_.id,
+                                "inferenceLoop_: image mode failed to prepare snapshot for ROI motion algo=" +
                                 customAlgo.type
                             );
                         }
@@ -6167,7 +6635,7 @@ void CameraSession::inferenceLoop_() {
                                 if (itPrev != customImagePreviousByAlgo_.end() && !itPrev->second.empty()) {
                                     previousSnapshot = itPrev->second.clone();
                                 }
-                                customImagePreviousByAlgo_[customAlgo.type] = decodedSnapshotFrame.clone();
+                                customImagePreviousByAlgo_[customAlgo.type] = snapshotFrameForAlgo.clone();
                             }
 
                             if (previousSnapshot.empty()) {
@@ -6183,8 +6651,8 @@ void CameraSession::inferenceLoop_() {
                                 std::string motionErr;
                                 if (!detectMotionInAnyRegionFromStillPairCamera_(
                                     previousSnapshot,
-                                    decodedSnapshotFrame,
-                                    polygonRegions,
+                                    snapshotFrameForAlgo,
+                                    motionRegions,
                                     hasRegionMotion,
                                     &motionTriggeredRegionIds,
                                     &motionErr))
@@ -6218,19 +6686,29 @@ void CameraSession::inferenceLoop_() {
                         continue;
                     }
 
+                    if (hasFrameWindow) {
+                        if (!encodeFrameToJpegDataUrlCamera_(snapshotFrameForAlgo, inferenceImageDataUrl)) {
+                            Logger::instance().logDebug(
+                                config_.id,
+                                "inferenceLoop_: failed to encode cropped image for algo=" + customAlgo.type
+                            );
+                            continue;
+                        }
+                    }
+
                     if (!polygonRegions.empty()) {
-                        cv::Mat decoded = decodedSnapshotFrame.empty()
+                        cv::Mat decoded = snapshotFrameForAlgo.empty()
                             ? cv::Mat()
-                            : decodedSnapshotFrame.clone();
+                            : snapshotFrameForAlgo.clone();
                         if (!decoded.empty()) {
                             drawAnalysisOverlaysOnFrameCamera_(decoded, polygonRegions, &overlayRegionIds);
-                            std::vector<uchar> overlayBytes;
-                            if (cv::imencode(".jpg", decoded, overlayBytes) && !overlayBytes.empty()) {
-                                inferenceImageDataUrl =
-                                    std::string("data:image/jpeg;base64,") +
-                                    base64_encode(overlayBytes.data(), overlayBytes.size());
+                            if (!encodeFrameToJpegDataUrlCamera_(decoded, inferenceImageDataUrl)) {
+                                inferenceImageDataUrl.clear();
                             }
                         }
+                    }
+                    if (inferenceImageDataUrl.empty()) {
+                        continue;
                     }
 
                     std::vector<FaceReferenceImage> faceReferences;
@@ -6370,6 +6848,10 @@ void CameraSession::inferenceLoop_() {
                         primaryOutputTokens,
                         primaryTotalTokens
                     );
+                    const int cameraAlgorithmId = customAlgo.algorithmId > 0 ? customAlgo.algorithmId : 0;
+                    const std::string cameraAgentRunId = buildCameraAgentRunId_(config_, customAlgo);
+                    const std::string eventDisplayName =
+                        customAlgo.displayName.empty() ? customAlgo.type : customAlgo.displayName;
 
                     if (!clientId.empty() && !exeToken.empty() && !backendBaseUrl.empty()) {
                         sendTokenUsageAsync(
@@ -6379,6 +6861,9 @@ void CameraSession::inferenceLoop_() {
                             primaryTotalTokens,
                             "agent",
                             customAlgo.type,
+                            config_.cameraSessionId,
+                            cameraAlgorithmId,
+                            cameraAgentRunId,
                             clientId,
                             exeToken,
                             backendBaseUrl
@@ -6485,16 +6970,92 @@ void CameraSession::inferenceLoop_() {
                         }
                     }
 
+                    const std::string cameraAgentEventAtUtc =
+                        !primaryHit.eventTimestampUtcIso.empty()
+                            ? primaryHit.eventTimestampUtcIso
+                            : nowIsoForInference;
+                    const std::string cameraAgentResultEventId =
+                        buildCameraAgentResultEventId_(
+                            cameraAgentRunId,
+                            cameraAgentEventAtUtc,
+                            primaryHit.eventFrameIndex
+                        );
+
+                    if (owner_) {
+                        nlohmann::json cameraAgentResultDetails = nlohmann::json::object();
+                        cameraAgentResultDetails["camera_id"] = cameraIdNumeric;
+                        cameraAgentResultDetails["camera_name"] = config_.name;
+                        cameraAgentResultDetails["source_type"] = "camera_algorithm";
+                        cameraAgentResultDetails["event_id"] = cameraAgentResultEventId;
+                        cameraAgentResultDetails["agent_run_id"] = cameraAgentRunId;
+                        cameraAgentResultDetails["agent_label"] = eventDisplayName;
+                        cameraAgentResultDetails["algorithm_type"] = customAlgo.type;
+                        cameraAgentResultDetails["algo_type"] = customAlgo.type;
+                        cameraAgentResultDetails["input_type"] =
+                            customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType;
+                        cameraAgentResultDetails["inference_model"] = customAlgo.inferenceModel;
+                        cameraAgentResultDetails["model"] = customAlgo.modelName;
+                        cameraAgentResultDetails["answer"] = primaryHit.answer;
+                        cameraAgentResultDetails["decision_source"] = decisionSource;
+                        cameraAgentResultDetails["llm_alert_condition"] = llmAlertCondition;
+                        cameraAgentResultDetails["final_alert_condition"] = finalAlert;
+                        cameraAgentResultDetails["prompt_tokens"] = primaryPromptTokens;
+                        cameraAgentResultDetails["output_tokens"] = primaryOutputTokens;
+                        cameraAgentResultDetails["total_tokens"] = primaryTotalTokens;
+                        cameraAgentResultDetails["event_timestamp_utc"] = cameraAgentEventAtUtc;
+                        if (!config_.cameraSessionId.empty()) {
+                            cameraAgentResultDetails["camera_session_id"] = config_.cameraSessionId;
+                        }
+                        if (cameraAlgorithmId > 0) {
+                            cameraAgentResultDetails["camera_algorithm_id"] = cameraAlgorithmId;
+                            cameraAgentResultDetails["algorithm_id"] = cameraAlgorithmId;
+                        }
+                        if (temporalPlanActive) {
+                            cameraAgentResultDetails["operator_results"] = temporalOperatorResults;
+                            if (!temporalDecisionSummary.empty()) {
+                                cameraAgentResultDetails["temporal_decision_summary"] =
+                                    temporalDecisionSummary;
+                            }
+                        }
+                        owner_->postAgentEvent(
+                            "camera_agent_result",
+                            cameraIdNumeric > 0 ? std::optional<int>(cameraIdNumeric) : std::nullopt,
+                            "",
+                            "Camera AI agent evaluated the current image input.",
+                            cameraAgentResultDetails
+                        );
+                    }
+
                     if (temporalPlanActive && temporalReport && owner_) {
                         nlohmann::json reportDetails = nlohmann::json::object();
                         reportDetails["camera_id"] = cameraIdNumeric;
                         reportDetails["camera_name"] = config_.name;
+                        reportDetails["source_type"] = "camera_algorithm";
+                        reportDetails["event_id"] = cameraAgentResultEventId + ":temporal";
+                        reportDetails["agent_run_id"] = cameraAgentRunId;
+                        reportDetails["agent_label"] = eventDisplayName;
+                        reportDetails["input_type"] =
+                            customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType;
                         reportDetails["algorithm_type"] = customAlgo.type;
+                        reportDetails["algo_type"] = customAlgo.type;
+                        reportDetails["inference_model"] = customAlgo.inferenceModel;
+                        reportDetails["model"] = customAlgo.modelName;
                         reportDetails["operator_results"] = temporalOperatorResults;
                         reportDetails["answer"] = primaryHit.answer;
                         reportDetails["decision_source"] = decisionSource;
                         reportDetails["llm_alert_condition"] = llmAlertCondition;
                         reportDetails["final_alert_condition"] = finalAlert;
+                        reportDetails["prompt_tokens"] = primaryPromptTokens;
+                        reportDetails["output_tokens"] = primaryOutputTokens;
+                        reportDetails["total_tokens"] = primaryTotalTokens;
+                        reportDetails["event_timestamp_utc"] = cameraAgentEventAtUtc;
+                        if (!config_.cameraSessionId.empty()) {
+                            reportDetails["camera_session_id"] = config_.cameraSessionId;
+                        }
+                        if (cameraAlgorithmId > 0) {
+                            reportDetails["camera_algorithm_id"] = cameraAlgorithmId;
+                            reportDetails["algorithm_id"] = cameraAlgorithmId;
+                        }
                         if (!temporalDecisionSummary.empty()) {
                             reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
                         }
@@ -6508,8 +7069,6 @@ void CameraSession::inferenceLoop_() {
                     }
 
                     if (finalAlert) {
-                        const std::string eventDisplayName =
-                            customAlgo.displayName.empty() ? customAlgo.type : customAlgo.displayName;
                         const std::string timestampIso = nowTimestampIso();
 
                         std::vector<std::string> alertRegionIds = primaryHit.alertRegionIds;
@@ -6538,9 +7097,21 @@ void CameraSession::inferenceLoop_() {
                             alertRegionNamesSet.end()
                         );
                         extra["validator_model"] = "";
+                        extra["source_type"] = "camera_algorithm";
+                        extra["event_id"] = cameraAgentResultEventId + ":alert";
                         extra["decision_source"] = decisionSource;
                         extra["llm_alert_condition"] = llmAlertCondition;
                         extra["final_alert_condition"] = finalAlert;
+                        extra["agent_run_id"] = cameraAgentRunId;
+                        extra["agent_label"] = eventDisplayName;
+                        extra["answer"] = primaryHit.answer;
+                        if (!config_.cameraSessionId.empty()) {
+                            extra["camera_session_id"] = config_.cameraSessionId;
+                        }
+                        if (cameraAlgorithmId > 0) {
+                            extra["camera_algorithm_id"] = cameraAlgorithmId;
+                            extra["algorithm_id"] = cameraAlgorithmId;
+                        }
                         if (temporalPlanActive) {
                             extra["temporal_operator_results"] = temporalOperatorResults;
                             if (!temporalDecisionSummary.empty()) {
@@ -6836,6 +7407,9 @@ void CameraSession::inferenceLoop_() {
                             result.totalTokens,
                             "agent",
                             algoTypeForUsage,
+                            config_.cameraSessionId,
+                            0,
+                            "",
                             clientId,
                             exeToken,
                             backendBaseUrl
@@ -7150,16 +7724,92 @@ void CameraSession::inferenceLoop_() {
                             segmentSourceBytes = videoBytes;
                         }
 
+                        const auto frameWindow = resolveFrameWindowForAlgoCamera_(customAlgo);
+                        const bool hasFrameWindow = isFrameWindowActiveCamera_(frameWindow);
+                        std::string croppedSegmentSourcePath;
+                        std::vector<unsigned char> preparedSegmentBytes = segmentSourceBytes;
+                        std::string preparedSegmentPath = segmentSourcePath;
+                        if (hasFrameWindow) {
+                            if (!buildCroppedClipForFrameWindowCamera_(
+                                segmentSourcePath,
+                                frameWindow,
+                                croppedSegmentSourcePath))
+                            {
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: custom video failed to build cropped clip algo=" +
+                                    customAlgo.type + " clip=" + segmentSourcePath
+                                );
+                                continue;
+                            }
+
+                            preparedSegmentPath = croppedSegmentSourcePath;
+                            preparedSegmentBytes.clear();
+                            const auto diskReadStartedAt = std::chrono::steady_clock::now();
+                            std::ifstream croppedClipIfs(preparedSegmentPath, std::ios::binary);
+                            if (!croppedClipIfs) {
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: custom video failed to open cropped clip algo=" +
+                                    customAlgo.type + " clip=" + preparedSegmentPath
+                                );
+                                std::error_code rmEc;
+                                fs::remove(croppedSegmentSourcePath, rmEc);
+                                continue;
+                            }
+                            preparedSegmentBytes.assign(
+                                std::istreambuf_iterator<char>(croppedClipIfs),
+                                std::istreambuf_iterator<char>()
+                            );
+                            recordDiskReadSample(
+                                preparedSegmentBytes.size(),
+                                std::chrono::steady_clock::now() - diskReadStartedAt
+                            );
+                            if (preparedSegmentBytes.empty()) {
+                                Logger::instance().logDebug(
+                                    config_.id,
+                                    "inferenceLoop_: custom video cropped clip is empty algo=" +
+                                    customAlgo.type + " clip=" + preparedSegmentPath
+                                );
+                                std::error_code rmEc;
+                                fs::remove(croppedSegmentSourcePath, rmEc);
+                                continue;
+                            }
+                        }
+
+                        auto cleanupPreparedSegment = [&]() {
+                            if (croppedSegmentSourcePath.empty()) return;
+                            std::error_code rmEc;
+                            fs::remove(croppedSegmentSourcePath, rmEc);
+                            croppedSegmentSourcePath.clear();
+                        };
+
                         const std::vector<AlgorithmConfig::AnalysisRegion> polygonRegions =
-                            collectPolygonRegionsForAlgo_(customAlgo);
+                            remapRegionsToFrameWindowCamera_(
+                                collectPolygonRegionsForAlgo_(customAlgo),
+                                frameWindow
+                            );
+                        std::vector<AlgorithmConfig::AnalysisRegion> motionRegions = polygonRegions;
+                        if (motionRegions.empty() && hasFrameWindow) {
+                            AlgorithmConfig::AnalysisRegion viewportRegion;
+                            viewportRegion.enabled = true;
+                            viewportRegion.fullFrame = false;
+                            viewportRegion.polygonNorm = {
+                                { 0.0, 0.0 },
+                                { 1.0, 0.0 },
+                                { 1.0, 1.0 },
+                                { 0.0, 1.0 }
+                            };
+                            motionRegions.push_back(std::move(viewportRegion));
+                        }
                         std::vector<std::string> motionTriggeredRegionIds;
                         bool shouldInfer = true;
-                        if (!polygonRegions.empty()) {
+                        if (!motionRegions.empty()) {
                             bool hasRegionMotion = false;
                             std::string motionErr;
                             if (!detectMotionInAnyRegionFromClipCamera_(
-                                segmentSourcePath,
-                                polygonRegions,
+                                preparedSegmentPath,
+                                motionRegions,
                                 hasRegionMotion,
                                 &motionTriggeredRegionIds,
                                 &motionErr))
@@ -7181,10 +7831,12 @@ void CameraSession::inferenceLoop_() {
                             }
                         }
                         if (!shouldInfer) {
+                            cleanupPreparedSegment();
                             continue;
                         }
 
                         if (!shouldRunCustomAlgorithmNow_(customAlgo.type, normalizedRunEverySeconds)) {
+                            cleanupPreparedSegment();
                             continue;
                         }
 
@@ -7200,7 +7852,7 @@ void CameraSession::inferenceLoop_() {
                         ensureInferenceInputRecorded();
 
                         EncodedVideoSegment primarySegment;
-                        primarySegment.bytes = segmentSourceBytes;
+                        primarySegment.bytes = preparedSegmentBytes;
                         try {
                             primarySegment.cameraId = std::stoi(config_.id);
                         }
@@ -7208,8 +7860,10 @@ void CameraSession::inferenceLoop_() {
                             primarySegment.cameraId = -1;
                         }
                         primarySegment.cameraName = config_.name;
-                        primarySegment.sourceFilePath = segmentSourcePath;
-                        primarySegment.isTempFile = (!sampledPath.empty() && segmentSourcePath == sampledPath);
+                        primarySegment.sourceFilePath = preparedSegmentPath;
+                        primarySegment.isTempFile =
+                            (!sampledPath.empty() && segmentSourcePath == sampledPath) ||
+                            !croppedSegmentSourcePath.empty();
                         if (!parseSegmentUtcRangeFromClipPathForInference_(
                             fs::path(segmentSourcePath),
                             primarySegment.startTs,
@@ -7225,7 +7879,7 @@ void CameraSession::inferenceLoop_() {
                         std::vector<std::string> overlayRegionIds;
                         if (!polygonRegions.empty()) {
                             if (buildOverlayClipForRegionsCamera_(
-                                segmentSourcePath,
+                                preparedSegmentPath,
                                 polygonRegions,
                                 overlayClipPath,
                                 &overlayRegionIds))
@@ -7564,6 +8218,10 @@ void CameraSession::inferenceLoop_() {
                             primaryOutputTokens,
                             primaryTotalTokens
                         );
+                        const int cameraAlgorithmId = customAlgo.algorithmId > 0 ? customAlgo.algorithmId : 0;
+                        const std::string cameraAgentRunId = buildCameraAgentRunId_(config_, customAlgo);
+                        const std::string eventDisplayName =
+                            customAlgo.displayName.empty() ? customAlgo.type : customAlgo.displayName;
 
                         if (!clientId.empty() && !exeToken.empty() && !backendBaseUrl.empty()) {
                             sendTokenUsageAsync(
@@ -7573,6 +8231,9 @@ void CameraSession::inferenceLoop_() {
                                 primaryTotalTokens,
                                 "agent",
                                 customAlgo.type,
+                                config_.cameraSessionId,
+                                cameraAlgorithmId,
+                                cameraAgentRunId,
                                 clientId,
                                 exeToken,
                                 backendBaseUrl
@@ -7693,17 +8354,133 @@ void CameraSession::inferenceLoop_() {
                             }
                         }
 
+                        const std::string cameraAgentEventAtUtc =
+                            !primaryHit.eventTimestampUtcIso.empty()
+                                ? primaryHit.eventTimestampUtcIso
+                                : temporalDecisionNowIso;
+                        const std::string cameraAgentResultEventId =
+                            buildCameraAgentResultEventId_(
+                                cameraAgentRunId,
+                                cameraAgentEventAtUtc,
+                                primaryHit.eventFrameIndex
+                            );
+                        std::string segmentStartUtc;
+                        std::string segmentEndUtc;
+                        convertCompactLocalTimestampToUtcIsoForInference_(
+                            primarySegment.startTs,
+                            segmentStartUtc
+                        );
+                        convertCompactLocalTimestampToUtcIsoForInference_(
+                            primarySegment.endTs,
+                            segmentEndUtc
+                        );
+
+                        if (owner_) {
+                            nlohmann::json cameraAgentResultDetails = nlohmann::json::object();
+                            cameraAgentResultDetails["camera_id"] = primarySegment.cameraId;
+                            cameraAgentResultDetails["camera_name"] = primarySegment.cameraName;
+                            cameraAgentResultDetails["source_type"] = "camera_algorithm";
+                            cameraAgentResultDetails["event_id"] = cameraAgentResultEventId;
+                            cameraAgentResultDetails["agent_run_id"] = cameraAgentRunId;
+                            cameraAgentResultDetails["agent_label"] = eventDisplayName;
+                            cameraAgentResultDetails["algorithm_type"] = customAlgo.type;
+                            cameraAgentResultDetails["algo_type"] = customAlgo.type;
+                            cameraAgentResultDetails["input_type"] =
+                                customAlgo.inputType.empty() ? std::string("video") : customAlgo.inputType;
+                            cameraAgentResultDetails["video_packaging_mode"] =
+                                customAlgo.videoPackagingMode;
+                            cameraAgentResultDetails["inference_model"] = customAlgo.inferenceModel;
+                            cameraAgentResultDetails["model"] = customAlgo.modelName;
+                            cameraAgentResultDetails["answer"] = primaryHit.answer;
+                            cameraAgentResultDetails["decision_source"] = decisionSource;
+                            cameraAgentResultDetails["llm_alert_condition"] = llmAlertCondition;
+                            cameraAgentResultDetails["final_alert_condition"] = finalAlert;
+                            cameraAgentResultDetails["prompt_tokens"] = primaryPromptTokens;
+                            cameraAgentResultDetails["output_tokens"] = primaryOutputTokens;
+                            cameraAgentResultDetails["total_tokens"] = primaryTotalTokens;
+                            cameraAgentResultDetails["event_timestamp_utc"] = cameraAgentEventAtUtc;
+                            if (!segmentStartUtc.empty()) {
+                                cameraAgentResultDetails["segment_start_utc"] = segmentStartUtc;
+                            }
+                            if (!segmentEndUtc.empty()) {
+                                cameraAgentResultDetails["segment_end_utc"] = segmentEndUtc;
+                            }
+                            if (primaryHit.eventFrameIndex >= 0) {
+                                cameraAgentResultDetails["frame_index"] = primaryHit.eventFrameIndex;
+                            }
+                            if (!primaryHit.eventFrameTimestampInSegment.empty()) {
+                                cameraAgentResultDetails["frame_timestamp_in_segment"] =
+                                    primaryHit.eventFrameTimestampInSegment;
+                            }
+                            if (!primaryHit.eventTimestampName.empty()) {
+                                cameraAgentResultDetails["timestamp_name"] =
+                                    primaryHit.eventTimestampName;
+                            }
+                            if (!config_.cameraSessionId.empty()) {
+                                cameraAgentResultDetails["camera_session_id"] =
+                                    config_.cameraSessionId;
+                            }
+                            if (cameraAlgorithmId > 0) {
+                                cameraAgentResultDetails["camera_algorithm_id"] =
+                                    cameraAlgorithmId;
+                                cameraAgentResultDetails["algorithm_id"] = cameraAlgorithmId;
+                            }
+                            if (temporalPlanActive) {
+                                cameraAgentResultDetails["operator_results"] =
+                                    temporalOperatorResults;
+                                if (!temporalDecisionSummary.empty()) {
+                                    cameraAgentResultDetails["temporal_decision_summary"] =
+                                        temporalDecisionSummary;
+                                }
+                            }
+                            owner_->postAgentEvent(
+                                "camera_agent_result",
+                                primarySegment.cameraId > 0
+                                    ? std::optional<int>(primarySegment.cameraId)
+                                    : std::nullopt,
+                                "",
+                                "Camera AI agent evaluated the current video input.",
+                                cameraAgentResultDetails
+                            );
+                        }
+
                         if (temporalPlanActive && temporalReport && owner_) {
                             nlohmann::json reportDetails = nlohmann::json::object();
                             reportDetails["camera_id"] = primarySegment.cameraId;
                             reportDetails["camera_name"] = primarySegment.cameraName;
+                            reportDetails["source_type"] = "camera_algorithm";
+                            reportDetails["event_id"] = cameraAgentResultEventId + ":temporal";
+                            reportDetails["agent_run_id"] = cameraAgentRunId;
+                            reportDetails["agent_label"] = eventDisplayName;
                             reportDetails["algorithm_type"] = customAlgo.type;
+                            reportDetails["algo_type"] = customAlgo.type;
+                            reportDetails["input_type"] =
+                                customAlgo.inputType.empty() ? std::string("video") : customAlgo.inputType;
                             reportDetails["video_packaging_mode"] = customAlgo.videoPackagingMode;
+                            reportDetails["inference_model"] = customAlgo.inferenceModel;
+                            reportDetails["model"] = customAlgo.modelName;
                             reportDetails["operator_results"] = temporalOperatorResults;
                             reportDetails["answer"] = primaryHit.answer;
                             reportDetails["decision_source"] = decisionSource;
                             reportDetails["llm_alert_condition"] = llmAlertCondition;
                             reportDetails["final_alert_condition"] = finalAlert;
+                            reportDetails["prompt_tokens"] = primaryPromptTokens;
+                            reportDetails["output_tokens"] = primaryOutputTokens;
+                            reportDetails["total_tokens"] = primaryTotalTokens;
+                            reportDetails["event_timestamp_utc"] = cameraAgentEventAtUtc;
+                            if (!segmentStartUtc.empty()) {
+                                reportDetails["segment_start_utc"] = segmentStartUtc;
+                            }
+                            if (!segmentEndUtc.empty()) {
+                                reportDetails["segment_end_utc"] = segmentEndUtc;
+                            }
+                            if (!config_.cameraSessionId.empty()) {
+                                reportDetails["camera_session_id"] = config_.cameraSessionId;
+                            }
+                            if (cameraAlgorithmId > 0) {
+                                reportDetails["camera_algorithm_id"] = cameraAlgorithmId;
+                                reportDetails["algorithm_id"] = cameraAlgorithmId;
+                            }
                             if (!temporalDecisionSummary.empty()) {
                                 reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
                             }
@@ -7717,8 +8494,6 @@ void CameraSession::inferenceLoop_() {
                         }
 
                         if (finalAlert) {
-                            const std::string eventDisplayName =
-                                customAlgo.displayName.empty() ? customAlgo.type : customAlgo.displayName;
                             const std::string timestampIso =
                                 primaryHit.eventTimestampLocalIso.empty()
                                     ? nowTimestampIso()
@@ -7748,9 +8523,21 @@ void CameraSession::inferenceLoop_() {
                                 alertRegionNamesSet.end()
                             );
                             extra["validator_model"] = "";
+                            extra["source_type"] = "camera_algorithm";
+                            extra["event_id"] = cameraAgentResultEventId + ":alert";
                             extra["decision_source"] = decisionSource;
                             extra["llm_alert_condition"] = llmAlertCondition;
                             extra["final_alert_condition"] = finalAlert;
+                            extra["agent_run_id"] = cameraAgentRunId;
+                            extra["agent_label"] = eventDisplayName;
+                            extra["answer"] = primaryHit.answer;
+                            if (!config_.cameraSessionId.empty()) {
+                                extra["camera_session_id"] = config_.cameraSessionId;
+                            }
+                            if (cameraAlgorithmId > 0) {
+                                extra["camera_algorithm_id"] = cameraAlgorithmId;
+                                extra["algorithm_id"] = cameraAlgorithmId;
+                            }
                             if (primaryHit.eventFrameIndex >= 0) {
                                 extra["frame_index"] = primaryHit.eventFrameIndex;
                             }
@@ -7763,6 +8550,12 @@ void CameraSession::inferenceLoop_() {
                             }
                             if (!primaryHit.eventTimestampUtcIso.empty()) {
                                 extra["event_timestamp_utc"] = primaryHit.eventTimestampUtcIso;
+                            }
+                            if (!segmentStartUtc.empty()) {
+                                extra["segment_start_utc"] = segmentStartUtc;
+                            }
+                            if (!segmentEndUtc.empty()) {
+                                extra["segment_end_utc"] = segmentEndUtc;
                             }
                             extra["event_timestamp_source"] =
                                 primaryHit.eventTimestampLocalIso.empty()
@@ -7789,29 +8582,30 @@ void CameraSession::inferenceLoop_() {
                                     config_.id,
                                     "inferenceLoop_: custom alert skipped event because segment bytes are empty"
                                 );
-                                continue;
                             }
+                            else {
+                                std::string videoB64 = base64_encode(
+                                    primarySegment.bytes.data(),
+                                    primarySegment.bytes.size()
+                                );
 
-                            std::string videoB64 = base64_encode(
-                                primarySegment.bytes.data(),
-                                primarySegment.bytes.size()
-                            );
-
-                            owner_->sendAlgoEvent(
-                                config_.id,
-                                config_.name,
-                                eventDisplayName,
-                                timestampIso,
-                                "video",
-                                videoB64,
-                                extra
-                            );
+                                owner_->sendAlgoEvent(
+                                    config_.id,
+                                    config_.name,
+                                    eventDisplayName,
+                                    timestampIso,
+                                    "video",
+                                    videoB64,
+                                    extra
+                                );
+                            }
                         }
 
                         if (!overlayClipPath.empty()) {
                             std::error_code overlayRmEc;
                             fs::remove(overlayClipPath, overlayRmEc);
                         }
+                        cleanupPreparedSegment();
                     }
                 }
 

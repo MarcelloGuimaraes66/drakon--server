@@ -12,6 +12,7 @@
 #include "../HttpUtils.h"
 #include "../OperationTaskState.h"
 #include "../PromptBuilder.h"
+#include "shared/AgentAuthoringShared.h"
 
 namespace chatv2 {
 
@@ -230,6 +231,39 @@ nlohmann::json buildCameraPatchEnvelope_(
     });
 }
 
+nlohmann::json normalizeSourceCameraRef_(const nlohmann::json& value)
+{
+    nlohmann::json normalized = nlohmann::json::object();
+    if (!value.is_object()) {
+        return normalized;
+    }
+
+    int id = 0;
+    if (shared::tryJsonIntField(value, "id", id) && id > 0) {
+        normalized["id"] = id;
+    }
+    for (const auto* field : {
+            "name",
+            "description",
+            "scene_label",
+            "scene_description",
+            "ip_address",
+            "manufacturer",
+            "channel",
+            "subtype",
+            "connection_method",
+        }) {
+        const std::string text = shared::jsonStringField(value, field);
+        if (!text.empty()) {
+            normalized[field] = text;
+        }
+    }
+    if (normalized.contains("connection_method") && normalized["connection_method"].is_string()) {
+        normalized["connection_method"] = upperAsciiCopy_(trimCopy_(normalized["connection_method"].get<std::string>()));
+    }
+    return normalized;
+}
+
 nlohmann::json extractionCameraPatch_(const nlohmann::json& extraction)
 {
     if (!extraction.is_object() ||
@@ -246,6 +280,14 @@ nlohmann::json extractionFieldSources_(const nlohmann::json& extraction)
         return nlohmann::json::object();
     }
     return normalizeCameraFieldSources_(extraction.value("field_sources", nlohmann::json::object()));
+}
+
+nlohmann::json extractionSourceCameraRef_(const nlohmann::json& extraction)
+{
+    if (!extraction.is_object()) {
+        return nlohmann::json::object();
+    }
+    return normalizeSourceCameraRef_(extraction.value("source_camera_ref", nlohmann::json::object()));
 }
 
 void mergeCameraPatchIntoDraft_(
@@ -418,6 +460,28 @@ bool hasCameraValue_(const nlohmann::json& camera, const char* key)
     if (value.is_boolean()) return true;
     if (value.is_number_integer()) return true;
     return !value.is_null();
+}
+
+void mergeCameraDefaultsIntoDraftIfMissing_(
+    nlohmann::json& draft,
+    nlohmann::json& fieldSources,
+    const nlohmann::json& defaults,
+    const std::string& fallbackSource)
+{
+    if (!draft.is_object()) {
+        draft = nlohmann::json::object();
+    }
+    if (!defaults.is_object()) {
+        return;
+    }
+
+    for (auto it = defaults.begin(); it != defaults.end(); ++it) {
+        if (hasCameraValue_(draft, it.key().c_str())) {
+            continue;
+        }
+        draft[it.key()] = it.value();
+        setCameraFieldSource_(fieldSources, it.key(), fallbackSource);
+    }
 }
 
 std::vector<std::string> computeMissingFields_(const nlohmann::json& camera)
@@ -2291,7 +2355,8 @@ nlohmann::json extractCameraDraft_(
     const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext,
-    const SkillSelection& selection)
+    const SkillSelection& selection,
+    const nlohmann::json& authoringContextForPrompt)
 {
     if (!llm.isConfigured()) {
         return nlohmann::json::object();
@@ -2308,6 +2373,7 @@ nlohmann::json extractCameraDraft_(
         "conversation_task_state may include an active create_camera draft from earlier turns.\n"
         "If conversation_task_state.active_task.type is create_camera, treat its draft and missing_fields as the current state unless the user clearly corrects a value.\n"
         "This is a slot-filling task for camera creation. The latest assistant turn may be asking for missing fields.\n"
+        "authoring_context may list existing cameras already available in the workspace. Use it only to disambiguate references the user already made.\n"
         "Short follow-up replies such as numbers, IPs, usernames, passwords, yes/no answers, or manufacturer names can fill the missing slots.\n"
         "Do not treat example values written by the assistant as real user-provided values.\n"
         "If assistant messages contain templates or examples, ignore those values unless the user later repeats or confirms them.\n"
@@ -2321,6 +2387,7 @@ nlohmann::json extractCameraDraft_(
         "If the user mentions a webcam, USB camera, notebook camera, or integrated camera, include connection_method=\"WEBCAM\".\n"
         "If the user clearly says RTSP, HTTP, or ONVIF, include that connection_method.\n"
         "If the user provides an RTSP URL, parse host/IP, port, username, and password when present.\n"
+        "If the user asks to copy, clone, duplicate, or reuse an existing camera as a template, fill source_camera_ref with the existing camera reference and keep camera_patch sparse for the explicit overrides only.\n"
         "The user may send a CEP, ZIP code, or postal code instead of a full address. Capture zip_code when present.\n"
         "If the user sends a free-form address, map it into street, number, city, state, zip_code, and country when possible.\n"
         "Retain channel, subtype, description, retention_days, allowpublicaccess, and webcam_index when the user provided them.\n"
@@ -2333,6 +2400,7 @@ nlohmann::json extractCameraDraft_(
         "field_sources keys must be a subset of camera_patch keys.\n"
         "Return JSON only with this shape:\n"
         "{"
+        "\"source_camera_ref\":{\"id\":123,\"name\":\"camera portao\",\"scene_description\":\"front gate\",\"ip_address\":\"192.168.0.21\",\"manufacturer\":\"Intelbras\"},"
         "\"camera_patch\":{"
         "\"only_the_fields_the_user_actually_provided_or_strongly_implied\":\"value\""
         "},"
@@ -2352,6 +2420,7 @@ nlohmann::json extractCameraDraft_(
         { "compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
         { "conversation_task_state", conversationContext.value("task_state", defaultTaskState_()) },
         { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
+        { "authoring_context", authoringContextForPrompt.is_object() ? authoringContextForPrompt : nlohmann::json::object() },
         { "user_message", userMessage },
     };
 
@@ -2476,7 +2545,12 @@ nlohmann::json normalizeCameraExtractionResult_(const nlohmann::json& extracted)
         }
     }
 
-    return buildCameraPatchEnvelope_(patch, fieldSources);
+    nlohmann::json envelope = buildCameraPatchEnvelope_(patch, fieldSources);
+    const nlohmann::json sourceCameraRef = extractionSourceCameraRef_(extracted);
+    if (!sourceCameraRef.empty()) {
+        envelope["source_camera_ref"] = sourceCameraRef;
+    }
+    return envelope;
 }
 
 nlohmann::json activeCreateCameraDraft_(const nlohmann::json& conversationContext)
@@ -2493,7 +2567,18 @@ nlohmann::json activeCreateCameraDraft_(const nlohmann::json& conversationContex
         return nlohmann::json::object();
     }
 
-    return normalizeCameraFields_(activeTask["draft"], false);
+    nlohmann::json normalized = normalizeCameraFields_(activeTask["draft"], false);
+    const nlohmann::json sourceCameraRef =
+        normalizeSourceCameraRef_(activeTask["draft"].value("source_camera_ref", nlohmann::json::object()));
+    if (!sourceCameraRef.empty()) {
+        normalized["source_camera_ref"] = sourceCameraRef;
+    }
+    const nlohmann::json resolvedSourceCamera =
+        normalizeSourceCameraRef_(activeTask["draft"].value("resolved_source_camera", nlohmann::json::object()));
+    if (!resolvedSourceCamera.empty()) {
+        normalized["resolved_source_camera"] = resolvedSourceCamera;
+    }
+    return normalized;
 }
 
 nlohmann::json activeCreateCameraFieldSources_(const nlohmann::json& conversationContext)
@@ -2752,6 +2837,137 @@ nlohmann::json buildTaskStateForCreateCameraSuccess_(
         });
 }
 
+nlohmann::json safeCopyDefaultsFromSourceCamera_(const nlohmann::json& sourceCamera)
+{
+    nlohmann::json patch = nlohmann::json::object();
+    if (!sourceCamera.is_object()) {
+        return patch;
+    }
+    for (const auto* field : {
+            "manufacturer",
+            "connection_method",
+            "channel",
+            "subtype",
+            "description",
+        }) {
+        const std::string text = jsonStringField_(sourceCamera, field);
+        if (!text.empty()) {
+            patch[field] = field == std::string("connection_method")
+                ? normalizeConnectionMethod_(text)
+                : text;
+        }
+    }
+    return patch;
+}
+
+std::string sourceCameraLabel_(const nlohmann::json& sourceCameraRef)
+{
+    const std::string name = jsonStringField_(sourceCameraRef, "name");
+    if (!name.empty()) {
+        return name;
+    }
+    const std::string scene = jsonStringField_(sourceCameraRef, "scene_description");
+    if (!scene.empty()) {
+        return scene;
+    }
+    const std::string ip = jsonStringField_(sourceCameraRef, "ip_address");
+    if (!ip.empty()) {
+        return ip;
+    }
+    return jsonStringField_(sourceCameraRef, "description");
+}
+
+nlohmann::json buildCreateCameraTaskDraft_(
+    const nlohmann::json& cameraDraft,
+    const nlohmann::json& sourceCameraRef,
+    const nlohmann::json& resolvedSourceCamera)
+{
+    nlohmann::json draft = normalizeCameraFields_(cameraDraft, false);
+    const nlohmann::json normalizedSourceRef = normalizeSourceCameraRef_(sourceCameraRef);
+    if (!normalizedSourceRef.empty()) {
+        draft["source_camera_ref"] = normalizedSourceRef;
+    }
+    const nlohmann::json normalizedResolvedSource = normalizeSourceCameraRef_(resolvedSourceCamera);
+    if (!normalizedResolvedSource.empty()) {
+        draft["resolved_source_camera"] = normalizedResolvedSource;
+    }
+    return draft;
+}
+
+std::string buildSourceCameraNotFoundAnswer_(
+    const std::string& language,
+    const nlohmann::json& sourceCameraRef)
+{
+    const std::string label = sourceCameraLabel_(sourceCameraRef);
+    if (language == "pt") {
+        if (!label.empty()) {
+            return "Nao encontrei a camera existente \"" + label + "\" para usar como base.";
+        }
+        return "Nao encontrei a camera existente que voce quer usar como base.";
+    }
+    if (!label.empty()) {
+        return "I could not find the existing camera \"" + label + "\" to use as the source.";
+    }
+    return "I could not find the existing camera you want to use as the source.";
+}
+
+std::string buildAmbiguousSourceCameraAnswer_(
+    const std::string& language,
+    const nlohmann::json& candidates)
+{
+    std::ostringstream out;
+    out << (language == "pt"
+        ? "Encontrei mais de uma camera possivel para usar como base. Me confirme qual delas voce quer copiar:"
+        : "I found more than one possible camera to use as the source. Confirm which one you want to copy:");
+    int count = 0;
+    for (const auto& candidate : candidates) {
+        out << "\n- " << sourceCameraLabel_(candidate);
+        if (++count >= 5) {
+            break;
+        }
+    }
+    return out.str();
+}
+
+std::string buildSourceCameraContextFailureAnswer_(
+    const std::string& language,
+    const std::string& detail)
+{
+    if (language == "pt") {
+        return detail.empty()
+            ? "Nao consegui consultar as cameras existentes agora."
+            : "Nao consegui consultar as cameras existentes agora. Detalhe: " + detail;
+    }
+    return detail.empty()
+        ? "I could not load the existing cameras right now."
+        : "I could not load the existing cameras right now. Detail: " + detail;
+}
+
+nlohmann::json buildTaskStateForCreateCameraAwaitingSourceCamera_(
+    const nlohmann::json& conversationContext,
+    const nlohmann::json& cameraDraft,
+    const nlohmann::json& fieldSources,
+    const std::string& answerPreview,
+    const std::string& language)
+{
+    const std::vector<std::string> missingFields = computeMissingFields_(cameraDraft);
+    nlohmann::json taskState = buildTaskStateForCreateCameraCollection_(
+        conversationContext,
+        cameraDraft,
+        fieldSources,
+        missingFields,
+        answerPreview,
+        language);
+    if (taskState.contains("active_task") && taskState["active_task"].is_object()) {
+        taskState["active_task"]["phase"] = "awaiting_source_camera";
+        taskState["active_task"]["summary"] =
+            language == "pt" ? "Aguardando camera de origem" : "Waiting for the source camera";
+        taskState["active_task"]["answer_preview"] = trimCopy_(answerPreview);
+        taskState["active_task"]["missing_fields"] = nlohmann::json::array({ "source_camera" });
+    }
+    return taskState;
+}
+
 HttpResponse createCameraViaAgentEndpoint_(
     AgentCore& agent,
     const nlohmann::json& body)
@@ -2788,20 +3004,46 @@ SkillRunResult CreateCameraSkill::execute(
 
     const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
     const std::string replyLanguage = effectiveReplyLanguage_(selection, payload, conversationContext);
+    nlohmann::json authoringContext = nlohmann::json::object();
+    if (payload.is_object() && payload.value("authoring_context_enabled", false)) {
+        const nlohmann::json fetchedAuthoringContext = shared::fetchAuthoringContext(agent, payload);
+        if (fetchedAuthoringContext.value("ok", false)) {
+            authoringContext = fetchedAuthoringContext;
+        }
+    }
+    const nlohmann::json authoringContextForPrompt =
+        authoringContext.is_object() && authoringContext.value("ok", false)
+            ? shared::compactAuthoringContextForPrompt(authoringContext)
+            : nlohmann::json::object();
     const std::string userMessage =
         payload.is_object() ? payload.value("query", std::string()) : std::string();
     const nlohmann::json existingDraft = activeCreateCameraDraft_(conversationContext);
     nlohmann::json cameraFieldSources = activeCreateCameraFieldSources_(conversationContext);
     const nlohmann::json routerDraftPatch =
         normalizeCameraFields_(refineStructuredCameraPatch_(selection.draftPatch), false);
+    nlohmann::json sourceCameraRef =
+        normalizeSourceCameraRef_(existingDraft.value("source_camera_ref", nlohmann::json::object()));
+    const nlohmann::json routerSourceCameraRef =
+        selection.draftPatch.is_object()
+            ? normalizeSourceCameraRef_(selection.draftPatch.value("source_camera_ref", nlohmann::json::object()))
+            : nlohmann::json::object();
+    if (!routerSourceCameraRef.empty()) {
+        sourceCameraRef = routerSourceCameraRef;
+    }
+    nlohmann::json resolvedSourceCamera =
+        normalizeSourceCameraRef_(existingDraft.value("resolved_source_camera", nlohmann::json::object()));
     LocalLlmClient llm;
     configureActionModelClient_(llm, payload);
     const nlohmann::json extractedDraft =
         sanitizeExtractedCameraDraft_(
-            normalizeCameraExtractionResult_(extractCameraDraft_(llm, payload, conversationContext, selection)),
+            normalizeCameraExtractionResult_(extractCameraDraft_(llm, payload, conversationContext, selection, authoringContextForPrompt)),
             userMessage,
             existingDraft,
             conversationContext);
+    const nlohmann::json extractedSourceCameraRef = extractionSourceCameraRef_(extractedDraft);
+    if (!extractedSourceCameraRef.empty()) {
+        sourceCameraRef = extractedSourceCameraRef;
+    }
     const nlohmann::json deterministicDraft =
         deterministicCameraDraft_(
             userMessage,
@@ -2825,6 +3067,75 @@ SkillRunResult CreateCameraSkill::execute(
         cameraFieldSources,
         extractionCameraPatch_(deterministicDraft),
         extractionFieldSources_(deterministicDraft));
+
+    if (sourceCameraRef.empty() && !resolvedSourceCamera.empty()) {
+        sourceCameraRef = resolvedSourceCamera;
+    }
+    if (!sourceCameraRef.empty()) {
+        nlohmann::json cameraInventory = nlohmann::json::object({
+            { "ok", true },
+            { "error", "" },
+            { "cameras", authoringContext.value("cameras", nlohmann::json::array()) },
+        });
+        if (!authoringContext.value("ok", false) ||
+            !cameraInventory.contains("cameras") ||
+            !cameraInventory["cameras"].is_array()) {
+            cameraInventory = shared::fetchCameraInventory(agent, payload);
+        }
+        if (!cameraInventory.value("ok", false)) {
+            result.status = SkillExecutionStatus::Completed;
+            result.answer = buildSourceCameraContextFailureAnswer_(replyLanguage, jsonStringField_(cameraInventory, "error"));
+            result.metadata["field_sources"] = normalizeCameraFieldSources_(cameraFieldSources);
+            result.metadata["task_state"] = buildTaskStateForCreateCameraAwaitingSourceCamera_(
+                conversationContext,
+                buildCreateCameraTaskDraft_(cameraDraft, sourceCameraRef, resolvedSourceCamera),
+                cameraFieldSources,
+                result.answer,
+                replyLanguage);
+            return result;
+        }
+
+        const nlohmann::json sourceCameraResolution =
+            shared::resolveCamera(cameraInventory, sourceCameraRef, resolvedSourceCamera);
+        const std::string sourceCameraStatus = shared::jsonStringField(sourceCameraResolution, "status");
+        if (sourceCameraStatus == "ambiguous") {
+            result.status = SkillExecutionStatus::Completed;
+            result.answer = buildAmbiguousSourceCameraAnswer_(
+                replyLanguage,
+                sourceCameraResolution.value("candidates", nlohmann::json::array()));
+            result.metadata["field_sources"] = normalizeCameraFieldSources_(cameraFieldSources);
+            result.metadata["task_state"] = buildTaskStateForCreateCameraAwaitingSourceCamera_(
+                conversationContext,
+                buildCreateCameraTaskDraft_(cameraDraft, sourceCameraRef, resolvedSourceCamera),
+                cameraFieldSources,
+                result.answer,
+                replyLanguage);
+            return result;
+        }
+        if (sourceCameraStatus == "missing_target" || sourceCameraStatus == "not_found") {
+            result.status = SkillExecutionStatus::Completed;
+            result.answer = buildSourceCameraNotFoundAnswer_(replyLanguage, sourceCameraRef);
+            result.metadata["field_sources"] = normalizeCameraFieldSources_(cameraFieldSources);
+            result.metadata["task_state"] = buildTaskStateForCreateCameraAwaitingSourceCamera_(
+                conversationContext,
+                buildCreateCameraTaskDraft_(cameraDraft, sourceCameraRef, resolvedSourceCamera),
+                cameraFieldSources,
+                result.answer,
+                replyLanguage);
+            return result;
+        }
+        if (sourceCameraStatus == "resolved" &&
+            sourceCameraResolution.contains("item") &&
+            sourceCameraResolution["item"].is_object()) {
+            resolvedSourceCamera = normalizeSourceCameraRef_(sourceCameraResolution["item"]);
+            sourceCameraRef = resolvedSourceCamera;
+            mergeCameraDefaultsIntoDraftIfMissing_(
+                cameraDraft,
+                cameraFieldSources,
+                safeCopyDefaultsFromSourceCamera_(sourceCameraResolution["item"]),
+                "system_default");
+        }
+    }
 
     const nlohmann::json addressPatch =
         normalizeCameraFields_(lookupAddressDraftViaAgentEndpoint_(agent, payload, cameraDraft), false);
@@ -2850,7 +3161,7 @@ SkillRunResult CreateCameraSkill::execute(
         result.metadata["field_sources"] = normalizeCameraFieldSources_(cameraFieldSources);
         result.metadata["task_state"] = buildTaskStateForCreateCameraCollection_(
             conversationContext,
-            cameraDraft,
+            buildCreateCameraTaskDraft_(cameraDraft, sourceCameraRef, resolvedSourceCamera),
             cameraFieldSources,
             missingFields,
             result.answer,
@@ -2877,7 +3188,7 @@ SkillRunResult CreateCameraSkill::execute(
         agent.getClientId());
     result.metadata["task_state"] = buildTaskStateForCreateCameraAwaitingConfirmation_(
         conversationContext,
-        confirmationDraft,
+        buildCreateCameraTaskDraft_(confirmationDraft, sourceCameraRef, resolvedSourceCamera),
         confirmationFieldSources,
         result.answer,
         replyLanguage);

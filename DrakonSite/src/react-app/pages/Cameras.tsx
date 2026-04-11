@@ -16,6 +16,7 @@ import CameraEventToast from "@/react-app/components/CameraEventToast";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
 import { useCameraDirectory } from "@/react-app/hooks/useCameraDirectory";
+import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { getCameraConnectionState, isCameraServiceRunning } from "@/react-app/lib/cameraStatus";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
@@ -696,6 +697,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
 
 export default function Cameras() {
   const [cameras, setCameras] = useState<CameraType[]>([]);
+  const { cameras: dashboardCameras, lastUpdatedAt: dashboardLastUpdatedAt } = useDashboardSummary();
 
   const patchCamera = useCallback((cameraId: number, patch: Partial<CameraType>) => {
     setCameras((current) =>
@@ -725,6 +727,70 @@ export default function Cameras() {
   useEffect(() => {
     void refreshCameras();
   }, [refreshCameras]);
+
+  useEffect(() => {
+    if (dashboardLastUpdatedAt === null || !Array.isArray(dashboardCameras)) {
+      return;
+    }
+
+    setCameras((current) => {
+      if (current.length === 0) {
+        return current;
+      }
+
+      const dashboardCameraById = new Map(
+        dashboardCameras.map((camera) => [camera.id, camera] as const)
+      );
+      let didChange = false;
+
+      const next = current.map((camera) => {
+        const dashboardCamera = dashboardCameraById.get(camera.id);
+        if (!dashboardCamera) {
+          return camera;
+        }
+
+        const nextThumbnailUrl =
+          typeof dashboardCamera.thumbnail_url === "string" && dashboardCamera.thumbnail_url.trim()
+            ? dashboardCamera.thumbnail_url.trim()
+            : null;
+        const nextThumbnailUpdate =
+          typeof dashboardCamera.last_thumbnail_update === "string" &&
+          dashboardCamera.last_thumbnail_update.trim()
+            ? dashboardCamera.last_thumbnail_update.trim()
+            : null;
+        const currentThumbnailUrl =
+          typeof camera.thumbnail_url === "string" && camera.thumbnail_url.trim()
+            ? camera.thumbnail_url.trim()
+            : null;
+        const currentThumbnailUpdate =
+          typeof camera.last_thumbnail_update === "string" && camera.last_thumbnail_update.trim()
+            ? camera.last_thumbnail_update.trim()
+            : null;
+
+        if (
+          camera.is_service_running === dashboardCamera.is_service_running &&
+          camera.is_online === dashboardCamera.is_online &&
+          currentThumbnailUrl === nextThumbnailUrl &&
+          currentThumbnailUpdate === nextThumbnailUpdate
+        ) {
+          return camera;
+        }
+
+        didChange = true;
+        return {
+          ...camera,
+          is_service_running: Number(
+            dashboardCamera.is_service_running ?? camera.is_service_running ?? 0
+          ),
+          is_online: Number(dashboardCamera.is_online ?? camera.is_online ?? 0),
+          thumbnail_url: nextThumbnailUrl ?? undefined,
+          last_thumbnail_update: nextThumbnailUpdate ?? undefined,
+        };
+      });
+
+      return didChange ? next : current;
+    });
+  }, [dashboardCameras, dashboardLastUpdatedAt]);
 
   return (
     <Layout>

@@ -131,6 +131,7 @@ export const UpdatePreferencesSchema = z.object({
 // Billing schema
 export const CreateCheckoutSessionSchema = z.object({
   type: z.enum(["subscription", "credits"]),
+  agent_plan_id: z.enum(["starter", "growth", "scale", "max"]).optional(),
   camera_id: z.number().optional(),
   credits_amount: z.number().optional(),
   plan_tier: z.string().optional(),

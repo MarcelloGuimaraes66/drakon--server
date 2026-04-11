@@ -30,6 +30,14 @@ struct JobPolygonPoint {
     double y = 0.0; // normalized [0..1]
 };
 
+struct JobFrameWindowNorm {
+    bool enabled = false;
+    double x = 0.0;
+    double y = 0.0;
+    double width = 1.0;
+    double height = 1.0;
+};
+
 struct JobAnalysisRegion {
     std::string region_id;
     std::string label;
@@ -45,10 +53,12 @@ struct JobAnalysisRegion {
     std::string negative_condition_text;
     std::vector<int> face_target_ids;
     std::vector<int> negative_image_ids;
+    JobFrameWindowNorm frame_window_norm;
 };
 
 struct JobAgentDef {
     int id = -1;
+    std::string agent_run_id;
     std::string agent_key;
     std::string prompt_template;
     std::string params_json;
@@ -134,6 +144,7 @@ struct JobInferenceGroup {
 
 struct JobStepDef {
     int id = -1;
+    std::string step_run_id;
     int step_order = 0;
     std::string name;
 
@@ -227,6 +238,7 @@ struct JobTriggerSnapshot {
 
 struct JobStartPayload {
     int version = 1;
+    std::string job_run_id;
     JobDefSnapshot job;
     JobTriggerSnapshot trigger;
     std::vector<JobStepDef> steps;

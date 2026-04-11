@@ -1,6 +1,14 @@
-import { useState, useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { X, Trash2, AlertCircle, Loader2 } from "lucide-react";
+import { AlertCircle, CreditCard, Loader2, Trash2, X } from "lucide-react";
+import {
+  FREE_AGENT_INSTANCES,
+  formatAgentInstanceLabel,
+  getAgentBillingPlanFromSubscription,
+  getCurrentAgentInstanceLimit,
+  getPaidAgentInstancesFromSubscription,
+  isLegacyCameraBillingSubscription,
+} from "@/react-app/utils/agentBilling";
 
 interface ActiveCard {
   id: number;
@@ -13,10 +21,11 @@ interface ActiveCard {
 
 interface Subscription {
   id: number;
-  subscription_type: string;
-  camera_id: number;
+  subscription_type?: string;
+  camera_id?: number | null;
   is_active: number;
-  started_at: string;
+  started_at?: string | null;
+  [key: string]: unknown;
 }
 
 interface ManagePlansCardsModalProps {
@@ -25,7 +34,20 @@ interface ManagePlansCardsModalProps {
   onUpdate: () => void;
 }
 
-export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: ManagePlansCardsModalProps) {
+function formatMoney(amount: number, currency = "usd"): string {
+  const normalizedCurrency = currency.toUpperCase();
+  const locale = normalizedCurrency === "BRL" ? "pt-BR" : "en-US";
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency: normalizedCurrency,
+  }).format(amount);
+}
+
+export default function ManagePlansCardsModal({
+  isOpen,
+  onClose,
+  onUpdate,
+}: ManagePlansCardsModalProps) {
   const { t } = useTranslation();
   const [cards, setCards] = useState<ActiveCard[]>([]);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
@@ -36,12 +58,31 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
 
   useEffect(() => {
     if (isOpen) {
-      fetchData();
+      void fetchData();
     }
   }, [isOpen]);
 
+  const currentPlan = useMemo(
+    () => getAgentBillingPlanFromSubscription(subscription as Record<string, unknown> | null),
+    [subscription]
+  );
+  const isLegacyPlan = useMemo(
+    () => isLegacyCameraBillingSubscription(subscription as Record<string, unknown> | null),
+    [subscription]
+  );
+  const paidAgentInstances = useMemo(
+    () => getPaidAgentInstancesFromSubscription(subscription as Record<string, unknown> | null),
+    [subscription]
+  );
+  const totalAgentInstances = useMemo(
+    () => getCurrentAgentInstanceLimit(subscription as Record<string, unknown> | null),
+    [subscription]
+  );
+
   const fetchData = async () => {
     setIsLoading(true);
+    setError(null);
+
     try {
       const [cardsRes, subRes] = await Promise.all([
         fetch("/api/billing/cards"),
@@ -50,15 +91,19 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
 
       if (cardsRes.ok) {
         const cardsData = await cardsRes.json();
-        setCards(cardsData);
+        setCards(Array.isArray(cardsData) ? cardsData : []);
       }
 
       if (subRes.ok) {
         const subData = await subRes.json();
-        setSubscription(subData);
+        if (subData && typeof subData === "object") {
+          setSubscription(subData as Subscription);
+        } else {
+          setSubscription(null);
+        }
       }
-    } catch (error) {
-      console.error("Failed to fetch data:", error);
+    } catch (fetchError) {
+      console.error("Failed to fetch data:", fetchError);
       setError("Failed to load billing information");
     } finally {
       setIsLoading(false);
@@ -77,16 +122,17 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
         headers: { "Content-Type": "application/json" },
       });
 
-      if (response.ok) {
-        setShowCancelConfirm(false);
-        await fetchData();
-        onUpdate();
-      } else {
+      if (!response.ok) {
         const data = await response.json();
         setError(data.error || "Failed to cancel subscription");
+        return;
       }
-    } catch (error) {
-      console.error("Failed to cancel subscription:", error);
+
+      setShowCancelConfirm(false);
+      await fetchData();
+      onUpdate();
+    } catch (cancelError) {
+      console.error("Failed to cancel subscription:", cancelError);
       setError("Failed to cancel subscription");
     } finally {
       setIsLoading(false);
@@ -104,176 +150,178 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
         body: JSON.stringify({ card_id: cardId }),
       });
 
-      if (response.ok) {
-        setCardToRemove(null);
-        await fetchData();
-        onUpdate();
-      } else {
+      if (!response.ok) {
         const data = await response.json();
         setError(data.error || "Failed to remove card");
+        return;
       }
-    } catch (error) {
-      console.error("Failed to remove card:", error);
+
+      setCardToRemove(null);
+      await fetchData();
+      onUpdate();
+    } catch (removeError) {
+      console.error("Failed to remove card:", removeError);
       setError("Failed to remove card");
     } finally {
       setIsLoading(false);
     }
   };
 
-  const getPlanName = (subscriptionType: string) => {
-    if (subscriptionType?.includes("999")) return t("billing.basicPlan");
-    if (subscriptionType?.includes("3999")) return t("billing.standardPlan");
-    if (subscriptionType?.includes("6999")) return t("billing.premiumPlan");
-    return t("billing.currentSubscription");
-  };
-
-  const getPlanPrice = (subscriptionType: string) => {
-    if (subscriptionType?.includes("999")) return "$9.99";
-    if (subscriptionType?.includes("3999")) return "$39.99";
-    if (subscriptionType?.includes("6999")) return "$69.99";
-    return "";
-  };
-
-  const getBrandIcon = (brand: string) => {
-    const brandLower = brand.toLowerCase();
-    if (brandLower === "visa") return "💳";
-    if (brandLower === "mastercard") return "💳";
-    if (brandLower === "amex") return "💳";
-    if (brandLower === "discover") return "💳";
-    return "💳";
-  };
-
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-      <div className="relative w-full max-w-2xl bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto">
-        {/* Header */}
-        <div className="sticky top-0 z-10 flex items-center justify-between p-6 border-b border-gray-800 bg-gray-900">
-          <h2 className="text-xl font-bold text-gray-100">{t("billing.managePlansCards")}</h2>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+      <div className="relative max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-gray-800 bg-gray-900 shadow-2xl">
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-gray-800 bg-gray-900 p-6">
+          <h2 className="text-xl font-bold text-gray-100">
+            {t("billing.managePlansCards")}
+          </h2>
           <button
             onClick={onClose}
-            className="p-2 text-gray-400 hover:text-gray-100 transition-colors rounded-lg hover:bg-gray-800"
+            className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-100"
           >
-            <X className="w-5 h-5" />
+            <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="p-6 space-y-8">
-          {error && (
-            <div className="flex items-center gap-3 p-4 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400">
-              <AlertCircle className="w-5 h-5 flex-shrink-0" />
+        <div className="space-y-8 p-6">
+          {error ? (
+            <div className="flex items-center gap-3 rounded-lg border border-red-500/20 bg-red-500/10 p-4 text-red-400">
+              <AlertCircle className="h-5 w-5 shrink-0" />
               <p className="text-sm">{error}</p>
             </div>
-          )}
+          ) : null}
 
-          {/* Current Subscription Section */}
           <div>
-            <h3 className="text-lg font-semibold text-gray-100 mb-4">{t("billing.currentSubscription")}</h3>
-            {isLoading && !subscription && !cards.length ? (
-              <div className="flex items-center justify-center py-8">
-                <Loader2 className="w-6 h-6 text-blue-500 animate-spin" />
+            <h3 className="mb-4 text-lg font-semibold text-gray-100">
+              {t("billing.currentSubscription")}
+            </h3>
+
+            {isLoading && !subscription && cards.length === 0 ? (
+              <div className="flex justify-center py-8">
+                <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
               </div>
             ) : subscription && subscription.is_active === 1 ? (
-              <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-4">
-                <div className="flex items-start justify-between">
-                  <div>
+              <div className="rounded-2xl border border-gray-700 bg-gray-800/50 p-4">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
                     <p className="text-base font-medium text-gray-100">
-                      {getPlanName(subscription.subscription_type)} – {getPlanPrice(subscription.subscription_type)} {t("billing.perMonth")}
+                      {currentPlan
+                        ? `${currentPlan.name} - ${formatMoney(currentPlan.monthlyPriceUsd, "usd")} ${t("billing.perMonth")}`
+                        : isLegacyPlan
+                        ? "Legacy camera-based subscription"
+                        : "Monthly agent license"}
                     </p>
-                    <p className="text-sm text-gray-400 mt-1">
-                      {t("billing.status")}: <span className="text-green-400 font-medium">{t("billing.active")}</span>
+
+                    <p className="mt-1 text-sm text-gray-400">
+                      {currentPlan
+                        ? `Includes ${formatAgentInstanceLabel(totalAgentInstances)} in parallel (${FREE_AGENT_INSTANCES} free + ${paidAgentInstances} paid).`
+                        : isLegacyPlan
+                        ? "This account is still on the previous camera and model billing structure."
+                        : `The free base still includes ${formatAgentInstanceLabel(FREE_AGENT_INSTANCES)}.`}
+                    </p>
+
+                    <p className="mt-1 text-sm text-gray-400">
+                      {t("billing.status")}:{" "}
+                      <span className="font-medium text-green-400">
+                        {t("billing.active")}
+                      </span>
                     </p>
                   </div>
+
                   <button
                     onClick={() => setShowCancelConfirm(true)}
                     disabled={isLoading}
-                    className="px-4 py-2 text-sm font-medium text-red-400 border border-red-500/30 hover:bg-red-500/10 rounded-lg transition-colors disabled:opacity-50"
+                    className="rounded-lg border border-red-500/30 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/10 disabled:opacity-50"
                   >
                     {t("billing.cancelSubscription")}
                   </button>
                 </div>
               </div>
             ) : (
-              <div className="text-center py-8 text-gray-400 text-sm">
-                {t("billing.noActiveSubscription")}
+              <div className="rounded-2xl border border-gray-800 bg-gray-800/30 px-4 py-6 text-center text-sm text-gray-400">
+                No monthly agent license is active. The free plan still includes 1
+                running agent instance.
               </div>
             )}
           </div>
 
-          {/* Payment Methods Section */}
           <div>
-            <h3 className="text-lg font-semibold text-gray-100 mb-4">{t("billing.paymentMethods")}</h3>
-            {isLoading && !cards.length ? (
-              <div className="flex items-center justify-center py-8">
-                <Loader2 className="w-6 h-6 text-blue-500 animate-spin" />
+            <h3 className="mb-4 text-lg font-semibold text-gray-100">
+              {t("billing.paymentMethods")}
+            </h3>
+
+            {isLoading && cards.length === 0 ? (
+              <div className="flex justify-center py-8">
+                <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
               </div>
             ) : cards.length > 0 ? (
               <div className="space-y-3">
                 {cards.map((card) => (
                   <div
                     key={card.id}
-                    className="bg-gray-800/50 border border-gray-700 rounded-xl p-4 flex items-center justify-between"
+                    className="flex items-center justify-between rounded-2xl border border-gray-700 bg-gray-800/50 p-4"
                   >
                     <div className="flex items-center gap-4">
-                      <div className="w-10 h-10 bg-gray-700 rounded-lg flex items-center justify-center text-xl">
-                        {getBrandIcon(card.brand)}
+                      <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-700 text-gray-200">
+                        <CreditCard className="h-5 w-5" />
                       </div>
                       <div>
-                        <p className="text-sm font-medium text-gray-100 capitalize">
-                          {card.brand} {card.is_default === 1 && (
-                            <span className="ml-2 px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
+                        <p className="text-sm font-medium capitalize text-gray-100">
+                          {card.brand}
+                          {card.is_default === 1 ? (
+                            <span className="ml-2 rounded bg-blue-500/20 px-2 py-0.5 text-xs text-blue-400">
                               {t("billing.default")}
                             </span>
-                          )}
+                          ) : null}
                         </p>
                         <p className="text-xs text-gray-400">
-                          •••• {card.last4} · Exp {card.exp_month}/{card.exp_year}
+                          **** {card.last4} - Exp {card.exp_month}/{card.exp_year}
                         </p>
                       </div>
                     </div>
+
                     <button
                       onClick={() => setCardToRemove(card.id)}
                       disabled={isLoading}
-                      className="p-2 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors disabled:opacity-50"
+                      className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-red-500/10 hover:text-red-400 disabled:opacity-50"
                     >
-                      <Trash2 className="w-4 h-4" />
+                      <Trash2 className="h-4 w-4" />
                     </button>
                   </div>
                 ))}
               </div>
             ) : (
-              <div className="text-center py-8 text-gray-400 text-sm">
+              <div className="rounded-2xl border border-gray-800 bg-gray-800/30 px-4 py-6 text-center text-sm text-gray-400">
                 {t("billing.noSavedCards")}
               </div>
             )}
           </div>
         </div>
 
-        {/* Cancel Subscription Confirmation */}
-        {showCancelConfirm && (
-          <div className="absolute inset-0 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm rounded-2xl">
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 max-w-md w-full">
-              <h3 className="text-lg font-semibold text-gray-100 mb-3">{t("billing.cancelSubscription")}</h3>
-              <p className="text-sm text-gray-400 mb-6">
-                {t("billing.cancelConfirm")}
-              </p>
+        {showCancelConfirm ? (
+          <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/80 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6">
+              <h3 className="mb-3 text-lg font-semibold text-gray-100">
+                {t("billing.cancelSubscription")}
+              </h3>
+              <p className="mb-6 text-sm text-gray-400">{t("billing.cancelConfirm")}</p>
               <div className="flex gap-3">
                 <button
                   onClick={() => setShowCancelConfirm(false)}
                   disabled={isLoading}
-                  className="flex-1 px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+                  className="flex-1 rounded-lg bg-gray-800 px-4 py-2 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700 disabled:opacity-50"
                 >
                   {t("billing.keepSubscription")}
                 </button>
                 <button
-                  onClick={handleCancelSubscription}
+                  onClick={() => void handleCancelSubscription()}
                   disabled={isLoading}
-                  className="flex-1 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
                 >
                   {isLoading ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <Loader2 className="h-4 w-4 animate-spin" />
                       {t("billing.canceling")}
                     </>
                   ) : (
@@ -283,32 +331,33 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
               </div>
             </div>
           </div>
-        )}
+        ) : null}
 
-        {/* Remove Card Confirmation */}
-        {cardToRemove !== null && (
-          <div className="absolute inset-0 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm rounded-2xl">
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 max-w-md w-full">
-              <h3 className="text-lg font-semibold text-gray-100 mb-3">{t("billing.removeCard")}</h3>
-              <p className="text-sm text-gray-400 mb-6">
+        {cardToRemove !== null ? (
+          <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/80 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-md rounded-xl border border-gray-800 bg-gray-900 p-6">
+              <h3 className="mb-3 text-lg font-semibold text-gray-100">
+                {t("billing.removeCard")}
+              </h3>
+              <p className="mb-6 text-sm text-gray-400">
                 {t("billing.removeCardConfirm")}
               </p>
               <div className="flex gap-3">
                 <button
                   onClick={() => setCardToRemove(null)}
                   disabled={isLoading}
-                  className="flex-1 px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+                  className="flex-1 rounded-lg bg-gray-800 px-4 py-2 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700 disabled:opacity-50"
                 >
                   {t("billing.cancel")}
                 </button>
                 <button
-                  onClick={() => handleRemoveCard(cardToRemove)}
+                  onClick={() => void handleRemoveCard(cardToRemove)}
                   disabled={isLoading}
-                  className="flex-1 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
                 >
                   {isLoading ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <Loader2 className="h-4 w-4 animate-spin" />
                       {t("billing.removing")}
                     </>
                   ) : (
@@ -318,7 +367,7 @@ export default function ManagePlansCardsModal({ isOpen, onClose, onUpdate }: Man
               </div>
             </div>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );

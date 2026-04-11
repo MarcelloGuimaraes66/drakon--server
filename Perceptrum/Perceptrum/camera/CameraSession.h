@@ -129,6 +129,8 @@ private:
 
     std::chrono::steady_clock::time_point lastThumbnailSent_{};
 
+    bool shouldPublishDashboardThumbnail_() const;
+    void maybePublishDashboardThumbnail_(const cv::Mat& frame, std::chrono::steady_clock::time_point now);
     void sendThumbnail_(const cv::Mat& frame);
 
     void thumbnailLoop_();

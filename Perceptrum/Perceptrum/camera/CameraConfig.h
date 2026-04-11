@@ -36,12 +36,21 @@ struct AlgorithmConfig {
         double y = 0.0;
     };
 
+    struct FrameWindowNorm {
+        bool enabled = false;
+        double x = 0.0;
+        double y = 0.0;
+        double width = 1.0;
+        double height = 1.0;
+    };
+
     struct AnalysisRegion {
         std::string regionId;
         std::string label;
         bool enabled = true;
         bool fullFrame = true;
         std::vector<AnalysisRegionPoint> polygonNorm;
+        FrameWindowNorm frameWindowNorm;
     };
 
     struct FaceTargetImage {
@@ -104,6 +113,7 @@ struct CameraConfig {
     bool telegramEnabled{ false };
     std::string telegramBotToken;
     std::string telegramChatId;
+    std::string cameraSessionId;
     std::string startOrigin;
     bool isDrakonFindTemporarySession{ false };
     bool isVideoSearchTemporarySession{ false };

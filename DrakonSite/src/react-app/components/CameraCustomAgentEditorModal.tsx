@@ -51,6 +51,13 @@ export interface AnalysisRegionPoint {
   y: number;
 }
 
+export interface FrameWindowNorm {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface AnalysisRegion {
   region_id: string;
   label: string;
@@ -66,6 +73,7 @@ export interface AnalysisRegion {
   negative_condition: string;
   face_target_ids: number[];
   negative_image_ids: number[];
+  frame_window_norm?: FrameWindowNorm | null;
 }
 
 type PromptEditorFields = {
@@ -125,51 +133,37 @@ const ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT = 1080;
 const NEGATIVE_REFERENCE_MAX_IMAGES = 3;
 const FACE_TARGET_MAX_IMAGES = 4;
 const SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
-type RenderedSnapshotBounds = {
-  left: number;
-  top: number;
+const DEFAULT_FRAME_WINDOW: FrameWindowNorm = { x: 0, y: 0, width: 1, height: 1 };
+const FRAME_WINDOW_MAX_ZOOM = 6;
+type PreviewViewportMetrics = {
   width: number;
   height: number;
   naturalWidth: number;
   naturalHeight: number;
 };
 
-const computeContainedImageBounds = (
+const getSafeSnapshotNaturalSize = (
+  naturalWidth: number,
+  naturalHeight: number
+): { width: number; height: number } => ({
+  width: Math.max(1, Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)),
+  height: Math.max(1, Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)),
+});
+
+const buildPreviewViewportMetrics = (
   hostWidth: number,
   hostHeight: number,
   naturalWidth: number,
   naturalHeight: number
-): RenderedSnapshotBounds | null => {
+): PreviewViewportMetrics | null => {
   if (hostWidth <= 1 || hostHeight <= 1) return null;
-
-  const safeNaturalWidth = Math.max(
-    1,
-    Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)
-  );
-  const safeNaturalHeight = Math.max(
-    1,
-    Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)
-  );
-  const imageAspect = safeNaturalWidth / safeNaturalHeight;
-  const hostAspect = hostWidth / hostHeight;
-
-  let width = hostWidth;
-  let height = hostHeight;
-  if (hostAspect > imageAspect) {
-    height = hostHeight;
-    width = height * imageAspect;
-  } else {
-    width = hostWidth;
-    height = width / imageAspect;
-  }
+  const safeNatural = getSafeSnapshotNaturalSize(naturalWidth, naturalHeight);
 
   return {
-    left: (hostWidth - width) / 2,
-    top: (hostHeight - height) / 2,
-    width,
-    height,
-    naturalWidth: safeNaturalWidth,
-    naturalHeight: safeNaturalHeight,
+    width: hostWidth,
+    height: hostHeight,
+    naturalWidth: safeNatural.width,
+    naturalHeight: safeNatural.height,
   };
 };
 type CameraAgentRunEverySeconds = 10 | 60;
@@ -211,6 +205,133 @@ const formatPromptDocumentHeading = (
 ): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
 
 const clamp01 = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+
+const normalizeFrameWindowFromUnknown = (value: unknown): FrameWindowNorm => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+  const row = value as Record<string, unknown>;
+  const width = clamp01(Number(row.width));
+  const height = clamp01(Number(row.height));
+  const nextWidth = width > 0 ? width : 1;
+  const nextHeight = height > 0 ? height : 1;
+  const maxX = Math.max(0, 1 - nextWidth);
+  const maxY = Math.max(0, 1 - nextHeight);
+  return {
+    x: Math.min(maxX, Math.max(0, Number(row.x) || 0)),
+    y: Math.min(maxY, Math.max(0, Number(row.y) || 0)),
+    width: nextWidth,
+    height: nextHeight,
+  };
+};
+
+const isFullFrameWindow = (value: FrameWindowNorm | null | undefined): boolean => {
+  if (!value) return true;
+  return (
+    value.width >= 0.999 &&
+    value.height >= 0.999 &&
+    value.x <= 0.001 &&
+    value.y <= 0.001
+  );
+};
+
+const getFrameWindowPayload = (value: FrameWindowNorm): FrameWindowNorm | null =>
+  isFullFrameWindow(value)
+    ? null
+    : {
+        x: Math.round(clamp01(value.x) * 1000000) / 1000000,
+        y: Math.round(clamp01(value.y) * 1000000) / 1000000,
+        width: Math.round(clamp01(value.width) * 1000000) / 1000000,
+        height: Math.round(clamp01(value.height) * 1000000) / 1000000,
+      };
+
+const buildBaseFrameWindowForViewport = (
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  if (!metrics) return DEFAULT_FRAME_WINDOW;
+  const imageAspect = metrics.naturalWidth / metrics.naturalHeight;
+  const viewportAspect = metrics.width / metrics.height;
+  if (!Number.isFinite(imageAspect) || imageAspect <= 0 || !Number.isFinite(viewportAspect) || viewportAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  const normalizedAspect = viewportAspect / imageAspect;
+  if (!Number.isFinite(normalizedAspect) || normalizedAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  if (normalizedAspect >= 1) {
+    const height = Math.min(1, 1 / normalizedAspect);
+    return {
+      x: 0,
+      y: (1 - height) / 2,
+      width: 1,
+      height,
+    };
+  }
+
+  const width = Math.min(1, normalizedAspect);
+  return {
+    x: (1 - width) / 2,
+    y: 0,
+    width,
+    height: 1,
+  };
+};
+
+const areFrameWindowsClose = (
+  a: FrameWindowNorm | null | undefined,
+  b: FrameWindowNorm | null | undefined,
+  epsilon = 0.0005
+): boolean => {
+  if (!a || !b) return false;
+  return (
+    Math.abs(a.x - b.x) <= epsilon &&
+    Math.abs(a.y - b.y) <= epsilon &&
+    Math.abs(a.width - b.width) <= epsilon &&
+    Math.abs(a.height - b.height) <= epsilon
+  );
+};
+
+const constrainFrameWindow = (
+  candidate: FrameWindowNorm,
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  const base = buildBaseFrameWindowForViewport(metrics);
+  const rawWidth = clamp01(candidate.width) || base.width;
+  const rawHeight = clamp01(candidate.height) || base.height;
+  const zoom = Math.min(
+    FRAME_WINDOW_MAX_ZOOM,
+    Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
+  );
+  const width = base.width / zoom;
+  const height = base.height / zoom;
+  const centerX = clamp01((Number(candidate.x) || 0) + rawWidth / 2);
+  const centerY = clamp01((Number(candidate.y) || 0) + rawHeight / 2);
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  return {
+    x: Math.min(maxX, Math.max(0, centerX - width / 2)),
+    y: Math.min(maxY, Math.max(0, centerY - height / 2)),
+    width,
+    height,
+  };
+};
+
+const extractFrameWindowFromAnalysisRegions = (regionsRaw: unknown): FrameWindowNorm => {
+  if (!Array.isArray(regionsRaw)) return DEFAULT_FRAME_WINDOW;
+  for (const row of regionsRaw) {
+    if (!row || typeof row !== "object") continue;
+    const normalized = normalizeFrameWindowFromUnknown(
+      (row as Record<string, unknown>).frame_window_norm ??
+        (row as Record<string, unknown>).frameWindowNorm
+    );
+    if (!isFullFrameWindow(normalized)) {
+      return normalized;
+    }
+  }
+  return DEFAULT_FRAME_WINDOW;
+};
 
 const normalizeBool = (value: unknown, fallback = false): boolean => {
   if (typeof value === "boolean") return value;
@@ -411,9 +532,13 @@ const sanitizeRegionId = (value: unknown, idx: number): string => {
   return (normalized || `region-${idx + 1}`).slice(0, 64);
 };
 
-const toSvgPoints = (points: AnalysisRegionPoint[]) =>
+const toSvgPoints = (points: AnalysisRegionPoint[], options?: { clamp?: boolean }) =>
   points
-    .map((p) => `${Math.round(clamp01(p.x) * 1000) / 10},${Math.round(clamp01(p.y) * 1000) / 10}`)
+    .map((p) => {
+      const x = options?.clamp === false ? p.x : clamp01(p.x);
+      const y = options?.clamp === false ? p.y : clamp01(p.y);
+      return `${Math.round(x * 1000) / 10},${Math.round(y * 1000) / 10}`;
+    })
     .join(" ");
 
 const buildRectPolygonFromPoints = (a: AnalysisRegionPoint, b: AnalysisRegionPoint): AnalysisRegionPoint[] => {
@@ -486,6 +611,19 @@ const getPolygonCentroid = (polygon: AnalysisRegionPoint[]): AnalysisRegionPoint
     y: clamp01(cy / (6 * area)),
   };
 };
+
+const mapPointToViewport = (
+  point: AnalysisRegionPoint,
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint => ({
+  x: (point.x - frameWindow.x) / Math.max(frameWindow.width, 0.000001),
+  y: (point.y - frameWindow.y) / Math.max(frameWindow.height, 0.000001),
+});
+
+const mapPointsToViewport = (
+  points: AnalysisRegionPoint[],
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint[] => points.map((point) => mapPointToViewport(point, frameWindow));
 
 const parsePromptTemplate = (
   template: string | null | undefined,
@@ -597,6 +735,9 @@ const normalizeRegionsFromApi = (
       negative_condition: fields.negative_condition,
       face_target_ids: faceTargetIds,
       negative_image_ids: negativeImageIds,
+      frame_window_norm: normalizeFrameWindowFromUnknown(
+        row?.frame_window_norm ?? row?.frameWindowNorm
+      ),
     });
   }
   return out;
@@ -606,11 +747,13 @@ const normalizeRegionsForPayload = (
   polygonRegions: AnalysisRegion[],
   fields: PromptEditorFields,
   faceTargetIds: number[],
-  negativeImageIds: number[]
+  negativeImageIds: number[],
+  frameWindow: FrameWindowNorm
 ): AnalysisRegion[] => {
   const normalized = normalizeFields(fields);
   const cleanFaceIds = normalizeFaceTargetIds(faceTargetIds);
   const cleanNegativeIds = Array.from(new Set(negativeImageIds.filter((id) => Number.isInteger(id) && id > 0)));
+  const frameWindowPayload = getFrameWindowPayload(frameWindow);
   const polygons = (Array.isArray(polygonRegions) ? polygonRegions : [])
     .filter((r) => Array.isArray(r.polygon_norm) && r.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS)
     .slice(0, ANALYSIS_REGION_MAX)
@@ -629,6 +772,7 @@ const normalizeRegionsForPayload = (
       negative_condition: normalized.negative_condition,
       face_target_ids: cleanFaceIds,
       negative_image_ids: cleanNegativeIds,
+      frame_window_norm: frameWindowPayload,
     }))
     .filter((r) => r.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS);
 
@@ -650,6 +794,7 @@ const normalizeRegionsForPayload = (
       negative_condition: normalized.negative_condition,
       face_target_ids: cleanFaceIds,
       negative_image_ids: cleanNegativeIds,
+      frame_window_norm: frameWindowPayload,
     },
   ];
 };
@@ -746,6 +891,12 @@ export default function CameraCustomAgentEditorModal({
   const [draftRect, setDraftRect] = useState<{ start: AnalysisRegionPoint; end: AnalysisRegionPoint } | null>(null);
   const [isSizingRect, setIsSizingRect] = useState(false);
   const [dragVertex, setDragVertex] = useState<{ regionId: string; index: number } | null>(null);
+  const [panDrag, setPanDrag] = useState<{
+    button: 0 | 2;
+    startClientX: number;
+    startClientY: number;
+    frameWindow: FrameWindowNorm;
+  } | null>(null);
   const [showRegionDialog, setShowRegionDialog] = useState(false);
   const [regionDialogLabel, setRegionDialogLabel] = useState("");
   const [regionDialogDescription, setRegionDialogDescription] = useState("");
@@ -785,12 +936,16 @@ export default function CameraCustomAgentEditorModal({
   const videoPackagingWasManuallySelectedRef = useRef(false);
 
   const previewRef = useRef<HTMLDivElement | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const snapshotImageRef = useRef<HTMLImageElement | null>(null);
   const [snapshotMeta, setSnapshotMeta] = useState<{ thumbnail_url: string | null; last_thumbnail_update: string | null }>({
     thumbnail_url: null,
     last_thumbnail_update: null,
   });
   const [snapshotNaturalSize, setSnapshotNaturalSize] = useState({ width: 0, height: 0 });
-  const [snapshotRenderBounds, setSnapshotRenderBounds] = useState<RenderedSnapshotBounds | null>(null);
+  const [frameWindow, setFrameWindow] = useState<FrameWindowNorm>(DEFAULT_FRAME_WINDOW);
+  const [previewViewportMetrics, setPreviewViewportMetrics] = useState<PreviewViewportMetrics | null>(null);
+  const [snapshotImageVersion, setSnapshotImageVersion] = useState(0);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [snapshotRequesting, setSnapshotRequesting] = useState(false);
   const [snapshotCooldownUntil, setSnapshotCooldownUntil] = useState(0);
@@ -824,11 +979,45 @@ export default function CameraCustomAgentEditorModal({
         snapshotMeta.last_thumbnail_update ? `?ts=${encodeURIComponent(snapshotMeta.last_thumbnail_update)}` : ""
       }`
     : null;
-  const measureSnapshotRenderBounds = (): RenderedSnapshotBounds | null => {
+
+  useEffect(() => {
+    if (!open || !snapshotUrl) {
+      snapshotImageRef.current = null;
+      setSnapshotNaturalSize({ width: 0, height: 0 });
+      setSnapshotImageVersion((prev) => prev + 1);
+      return;
+    }
+
+    let cancelled = false;
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      if (cancelled) return;
+      snapshotImageRef.current = img;
+      setSnapshotNaturalSize({
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
+      });
+      setSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.onerror = () => {
+      if (cancelled) return;
+      snapshotImageRef.current = null;
+      setSnapshotNaturalSize({ width: 0, height: 0 });
+      setSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.src = snapshotUrl;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, snapshotUrl]);
+
+  const measurePreviewViewportMetrics = (): PreviewViewportMetrics | null => {
     const host = previewRef.current;
     if (!host) return null;
     const rect = host.getBoundingClientRect();
-    return computeContainedImageBounds(
+    return buildPreviewViewportMetrics(
       rect.width,
       rect.height,
       snapshotNaturalSize.width,
@@ -1003,11 +1192,22 @@ export default function CameraCustomAgentEditorModal({
     setModelFps(execution.modelFps);
     setOnlyCaptureOnMotion(normalizeBool(agent?.only_capture_on_motion, true));
     setFields(parsedFields);
+    const normalizedRegions = normalizeRegionsFromApi(
+      agent?.analysis_regions,
+      parsedFields,
+      faceIds,
+      negativeIds
+    );
+
     setSelectedFaceTargetIds(faceIds);
     setNegativeImages(negativeImagesFromAgent);
     setSelectedNegativeImageIds(negativeIds);
-    setPolygonRegions(
-      normalizeRegionsFromApi(agent?.analysis_regions, parsedFields, faceIds, negativeIds)
+    setPolygonRegions(normalizedRegions);
+    setFrameWindow(
+      constrainFrameWindow(
+        extractFrameWindowFromAnalysisRegions(agent?.analysis_regions),
+        previewViewportMetrics
+      )
     );
 
     const id = Number(agent?.id);
@@ -1020,6 +1220,7 @@ export default function CameraCustomAgentEditorModal({
     setDraftRect(null);
     setIsSizingRect(false);
     setDragVertex(null);
+    setPanDrag(null);
     setHoveredRegionId(null);
     setSelectedRegionId(null);
     setSuggestion(null);
@@ -1060,12 +1261,12 @@ export default function CameraCustomAgentEditorModal({
 
   useEffect(() => {
     if (!open || !snapshotUrl) {
-      setSnapshotRenderBounds(null);
+      setPreviewViewportMetrics(null);
       return;
     }
 
     const refreshBounds = () => {
-      setSnapshotRenderBounds(measureSnapshotRenderBounds());
+      setPreviewViewportMetrics(measurePreviewViewportMetrics());
     };
 
     refreshBounds();
@@ -1082,6 +1283,73 @@ export default function CameraCustomAgentEditorModal({
       window.removeEventListener("resize", refreshBounds);
     };
   }, [open, snapshotUrl, snapshotNaturalSize.width, snapshotNaturalSize.height]);
+
+  useEffect(() => {
+    if (!previewViewportMetrics) return;
+    setFrameWindow((prev) => {
+      const next = constrainFrameWindow(prev, previewViewportMetrics);
+      return areFrameWindowsClose(prev, next) ? prev : next;
+    });
+  }, [previewViewportMetrics]);
+
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    const metrics = previewViewportMetrics;
+    const snapshotImage = snapshotImageRef.current;
+    if (!snapshotUrl || !metrics || !snapshotImage) {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    const displayWidth = Math.max(1, Math.round(metrics.width));
+    const displayHeight = Math.max(1, Math.round(metrics.height));
+    const devicePixelRatio =
+      typeof window !== "undefined" && Number.isFinite(window.devicePixelRatio)
+        ? Math.max(1, window.devicePixelRatio)
+        : 1;
+    const backingWidth = Math.max(1, Math.round(displayWidth * devicePixelRatio));
+    const backingHeight = Math.max(1, Math.round(displayHeight * devicePixelRatio));
+
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+
+    const naturalWidth = Math.max(1, snapshotImage.naturalWidth || metrics.naturalWidth);
+    const naturalHeight = Math.max(1, snapshotImage.naturalHeight || metrics.naturalHeight);
+    const sourceX = Math.max(0, Math.min(naturalWidth - 1, frameWindow.x * naturalWidth));
+    const sourceY = Math.max(0, Math.min(naturalHeight - 1, frameWindow.y * naturalHeight));
+    const sourceWidth = Math.max(1, Math.min(naturalWidth - sourceX, frameWindow.width * naturalWidth));
+    const sourceHeight = Math.max(1, Math.min(naturalHeight - sourceY, frameWindow.height * naturalHeight));
+
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(
+      snapshotImage,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      0,
+      0,
+      displayWidth,
+      displayHeight
+    );
+  }, [
+    frameWindow.height,
+    frameWindow.width,
+    frameWindow.x,
+    frameWindow.y,
+    previewViewportMetrics,
+    snapshotImageVersion,
+    snapshotUrl,
+  ]);
 
   useEffect(() => {
     if (polygonRegions.length === 0) {
@@ -1277,23 +1545,84 @@ export default function CameraCustomAgentEditorModal({
 
   const getPointFromMouse = (clientX: number, clientY: number) => {
     const host = previewRef.current;
-    const bounds = measureSnapshotRenderBounds();
+    const bounds = measurePreviewViewportMetrics();
     if (!host || !bounds) return null;
     const rect = host.getBoundingClientRect();
-    const x = clientX - rect.left - bounds.left;
-    const y = clientY - rect.top - bounds.top;
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
     if (x < 0 || y < 0 || x > bounds.width || y > bounds.height) return null;
 
     return {
-      point: { x: clamp01(x / bounds.width), y: clamp01(y / bounds.height) },
+      point: {
+        x: clamp01(frameWindow.x + (x / bounds.width) * frameWindow.width),
+        y: clamp01(frameWindow.y + (y / bounds.height) * frameWindow.height),
+      },
       draw_ref_width: bounds.naturalWidth,
       draw_ref_height: bounds.naturalHeight,
     };
   };
 
+  const setConstrainedFrameWindow = (next: FrameWindowNorm) => {
+    setFrameWindow(constrainFrameWindow(next, previewViewportMetrics));
+  };
+
+  const applyFrameWindowZoom = (nextZoom: number, anchor = { x: 0.5, y: 0.5 }) => {
+    const safeZoom = Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, Number(nextZoom) || 1));
+    const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
+    const nextWidth = baseFrameWindow.width / safeZoom;
+    const nextHeight = baseFrameWindow.height / safeZoom;
+    setConstrainedFrameWindow({
+      x: frameWindow.x + anchor.x * (frameWindow.width - nextWidth),
+      y: frameWindow.y + anchor.y * (frameWindow.height - nextHeight),
+      width: nextWidth,
+      height: nextHeight,
+    });
+  };
+
+  const onPreviewWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    const host = previewRef.current;
+    const bounds = measurePreviewViewportMetrics();
+    if (!host || !bounds || !snapshotUrl) return;
+    const rect = host.getBoundingClientRect();
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+    event.preventDefault();
+    const anchor = { x: localX / bounds.width, y: localY / bounds.height };
+    const baseFrameWindow = buildBaseFrameWindowForViewport(bounds);
+    const currentZoom = Math.min(
+      FRAME_WINDOW_MAX_ZOOM,
+      Math.max(1, baseFrameWindow.width / Math.max(frameWindow.width, 0.000001))
+    );
+    const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
+    applyFrameWindowZoom(nextZoom, anchor);
+  };
+
   const onPreviewMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    const shouldStartPan =
+      snapshotUrl &&
+      (event.button === 2 || (event.button === 0 && !polygonDrawEnabled && !pendingRegionSeed && !isSizingRect));
+    if (shouldStartPan) {
+      if (!snapshotUrl) return;
+      const bounds = measurePreviewViewportMetrics();
+      const host = previewRef.current;
+      if (!bounds || !host) return;
+      const rect = host.getBoundingClientRect();
+      const localX = event.clientX - rect.left;
+      const localY = event.clientY - rect.top;
+      if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+      event.preventDefault();
+      setPanDrag({
+        button: event.button as 0 | 2,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        frameWindow,
+      });
+      return;
+    }
+    if (event.button !== 0) return;
     const pointer = getPointFromMouse(event.clientX, event.clientY);
-    if (dragVertex) return;
+    if (dragVertex || panDrag) return;
 
     if (pendingRegionSeed && !isSizingRect) {
       setIsSizingRect(true);
@@ -1317,6 +1646,19 @@ export default function CameraCustomAgentEditorModal({
   };
 
   const onPreviewMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (panDrag) {
+      const bounds = measurePreviewViewportMetrics();
+      if (!bounds) return;
+      const dx = event.clientX - panDrag.startClientX;
+      const dy = event.clientY - panDrag.startClientY;
+      setConstrainedFrameWindow({
+        x: panDrag.frameWindow.x - (dx / bounds.width) * panDrag.frameWindow.width,
+        y: panDrag.frameWindow.y - (dy / bounds.height) * panDrag.frameWindow.height,
+        width: panDrag.frameWindow.width,
+        height: panDrag.frameWindow.height,
+      });
+      return;
+    }
     const pointer = getPointFromMouse(event.clientX, event.clientY);
     if (dragVertex) {
       if (!pointer) return;
@@ -1364,6 +1706,11 @@ export default function CameraCustomAgentEditorModal({
   };
 
   const onPreviewMouseUp = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (panDrag && event.button === panDrag.button) {
+      setPanDrag(null);
+      return;
+    }
+    if (event.button !== 0) return;
     if (dragVertex) {
       setDragVertex(null);
       return;
@@ -1428,6 +1775,21 @@ export default function CameraCustomAgentEditorModal({
     setRegionDialogAnchor(null);
     showToast("Info", "Click and drag on preview to size polygon", "default");
   };
+
+  const currentZoom = useMemo(
+    () => {
+      const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
+      return Math.min(
+        FRAME_WINDOW_MAX_ZOOM,
+        Math.max(1, baseFrameWindow.width / Math.max(frameWindow.width, 0.000001))
+      );
+    },
+    [frameWindow.width, previewViewportMetrics]
+  );
+  const hasViewportAdjustments = useMemo(() => {
+    const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
+    return !areFrameWindowsClose(frameWindow, baseFrameWindow);
+  }, [frameWindow, previewViewportMetrics]);
 
   const toggleSelectedFaceTarget = (targetId: number) => {
     if (!Number.isInteger(targetId) || targetId <= 0) return;
@@ -1732,7 +2094,8 @@ export default function CameraCustomAgentEditorModal({
               polygonRegions,
               normalized,
               selectedFaceTargetIds,
-              selectedNegativeImageIds
+              selectedNegativeImageIds,
+              frameWindow
             ),
           }),
         }
@@ -1876,7 +2239,8 @@ export default function CameraCustomAgentEditorModal({
       polygonRegions,
       normalized,
       faceIds,
-      selectedNegativeImageIds
+      selectedNegativeImageIds,
+      frameWindow
     );
     const modelFpsForSave =
       supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
@@ -1970,6 +2334,8 @@ export default function CameraCustomAgentEditorModal({
   if (!open) return null;
 
   const draftPoints = draftRect ? buildRectPolygonFromPoints(draftRect.start, draftRect.end) : [];
+  const draftViewportPoints =
+    draftPoints.length >= ANALYSIS_REGION_MIN_POINTS ? mapPointsToViewport(draftPoints, frameWindow) : [];
 
   return (
     <>
@@ -2174,57 +2540,78 @@ export default function CameraCustomAgentEditorModal({
                     </div>
                   </div>
 
-                  <div className="px-3 py-2 text-xs text-gray-400 border-b border-gray-700">
-                    {pendingRegionSeed
-                      ? "Drag on image to size the new polygon."
-                      : polygonDrawEnabled
-                      ? "Click once on image to define polygon name and description."
-                      : polygonCount > 0
-                      ? `${polygonCount} polygon(s) configured. Select one below to manage or delete it.`
-                      : "No polygons configured. Full frame will be used."}
+                  <div className="px-3 py-2 text-xs border-b border-gray-700 flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-gray-400 min-w-0 flex-1">
+                      {pendingRegionSeed
+                        ? "Drag on image to size the new polygon."
+                        : polygonDrawEnabled
+                        ? "Click once on image to define polygon name and description."
+                        : polygonCount > 0
+                        ? `${polygonCount} polygon(s) configured. Select one below to manage or delete it.`
+                        : "No polygons configured. The current preview window will be used."}
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-gray-300">
+                      <button
+                        type="button"
+                        onClick={() => setConstrainedFrameWindow(DEFAULT_FRAME_WINDOW)}
+                        disabled={!snapshotUrl || !hasViewportAdjustments}
+                        className="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-gray-200 disabled:opacity-40"
+                      >
+                        Reset view
+                      </button>
+                      <span className="w-12 text-right tabular-nums">{currentZoom.toFixed(1)}x</span>
+                      <input
+                        type="range"
+                        min={1}
+                        max={FRAME_WINDOW_MAX_ZOOM}
+                        step={0.05}
+                        value={currentZoom}
+                        onChange={(event) => applyFrameWindowZoom(Number(event.target.value))}
+                        disabled={!snapshotUrl}
+                        className="w-28 accent-blue-400 disabled:opacity-40"
+                        aria-label="Preview zoom"
+                      />
+                    </div>
                   </div>
 
                   <div className="relative min-h-0 flex-1 overflow-hidden p-3">
                     {snapshotUrl ? (
                       <div
                         ref={previewRef}
-                        className="relative h-full w-full bg-black/55 border border-gray-700 overflow-hidden"
+                        className={`relative h-full w-full bg-black/55 border border-gray-700 overflow-hidden ${
+                          panDrag ? "cursor-grabbing" : polygonDrawEnabled ? "cursor-crosshair" : "cursor-grab"
+                        }`}
                         onMouseDown={onPreviewMouseDown}
                         onMouseMove={onPreviewMouseMove}
                         onMouseUp={onPreviewMouseUp}
+                        onMouseLeave={() => {
+                          if (panDrag) setPanDrag(null);
+                        }}
+                        onWheel={onPreviewWheel}
+                        onContextMenu={(event) => event.preventDefault()}
                       >
-                        <img
-                          src={snapshotUrl}
-                          alt="snapshot"
-                          className="absolute inset-0 h-full w-full object-contain"
-                          onLoad={(event) => {
-                            const img = event.currentTarget;
-                            setSnapshotNaturalSize({
-                              width: img.naturalWidth || 0,
-                              height: img.naturalHeight || 0,
-                            });
-                          }}
-                        />
-                        {snapshotRenderBounds ? (
-                          <svg
-                            className="absolute"
-                            style={{
-                              left: snapshotRenderBounds.left,
-                              top: snapshotRenderBounds.top,
-                              width: snapshotRenderBounds.width,
-                              height: snapshotRenderBounds.height,
-                            }}
-                            viewBox="0 0 100 100"
-                            preserveAspectRatio="none"
-                          >
+                        {previewViewportMetrics ? (
+                          <>
+                            <canvas
+                              ref={previewCanvasRef}
+                              className="absolute inset-0 h-full w-full select-none"
+                              style={{ pointerEvents: "none" }}
+                              aria-hidden="true"
+                            />
+                            <svg
+                              className="absolute inset-0 h-full w-full"
+                              viewBox="0 0 100 100"
+                              preserveAspectRatio="none"
+                            >
                             {polygonRegions.map((region) => {
                               const points = Array.isArray(region.polygon_norm) ? region.polygon_norm : [];
                               if (points.length < ANALYSIS_REGION_MIN_POINTS) return null;
-                              const centroid = getPolygonCentroid(points);
+                              const viewportPoints = mapPointsToViewport(points, frameWindow);
+                              const centroid = getPolygonCentroid(viewportPoints);
                               return (
                                 <g key={region.region_id}>
                                   <polygon
-                                    points={toSvgPoints(points)}
+                                    points={toSvgPoints(viewportPoints, { clamp: false })}
                                     fill={region.enabled ? "rgba(96,165,250,0.20)" : "rgba(245,158,11,0.20)"}
                                     stroke={
                                       hoveredRegionId === region.region_id || selectedRegionId === region.region_id
@@ -2234,12 +2621,15 @@ export default function CameraCustomAgentEditorModal({
                                     strokeWidth={0.35}
                                     onMouseEnter={() => setHoveredRegionId(region.region_id)}
                                     onMouseDown={(event) => {
+                                      if (event.button !== 0) return;
+                                      if (!polygonDrawEnabled) return;
                                       event.preventDefault();
                                       event.stopPropagation();
                                       setSelectedRegionId(region.region_id);
                                       setHoveredRegionId(region.region_id);
                                     }}
                                     onDoubleClick={(event) => {
+                                      if (!polygonDrawEnabled) return;
                                       event.preventDefault();
                                       event.stopPropagation();
                                       setPolygonRegions((prev) =>
@@ -2261,7 +2651,7 @@ export default function CameraCustomAgentEditorModal({
                                   >
                                     {region.label}
                                   </text>
-                                  {points.map((p, idx) => (
+                                  {viewportPoints.map((p, idx) => (
                                     <circle
                                       key={`${region.region_id}-${idx}`}
                                       cx={p.x * 100}
@@ -2271,6 +2661,8 @@ export default function CameraCustomAgentEditorModal({
                                       stroke="#111827"
                                       strokeWidth={0.2}
                                       onMouseDown={(event) => {
+                                        if (event.button !== 0) return;
+                                        if (!polygonDrawEnabled) return;
                                         event.preventDefault();
                                         event.stopPropagation();
                                         setSelectedRegionId(region.region_id);
@@ -2282,16 +2674,17 @@ export default function CameraCustomAgentEditorModal({
                                 </g>
                               );
                             })}
-                            {draftPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
+                            {draftViewportPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
                               <polygon
-                                points={toSvgPoints(draftPoints)}
+                                points={toSvgPoints(draftViewportPoints, { clamp: false })}
                                 fill="rgba(59,130,246,0.22)"
                                 stroke="rgba(96,165,250,0.95)"
                                 strokeDasharray="2 1"
                                 strokeWidth={0.35}
                               />
                             ) : null}
-                          </svg>
+                            </svg>
+                          </>
                         ) : null}
                       </div>
                     ) : (

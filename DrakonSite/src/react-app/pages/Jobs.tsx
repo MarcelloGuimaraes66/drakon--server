@@ -262,11 +262,14 @@ const hasPolygonPoints = (region: AnalysisRegion | null | undefined): boolean =>
   Array.isArray(region.polygon_norm) &&
   region.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS;
 
-const toSvgPoints = (points: AnalysisRegionPoint[]): string =>
+const toSvgPoints = (points: AnalysisRegionPoint[], options?: { clamp?: boolean }): string =>
   points
     .map(
-      (point) =>
-        `${Math.round(clamp01(point.x) * 1000) / 10},${Math.round(clamp01(point.y) * 1000) / 10}`
+      (point) => {
+        const x = options?.clamp === false ? point.x : clamp01(point.x);
+        const y = options?.clamp === false ? point.y : clamp01(point.y);
+        return `${Math.round(x * 1000) / 10},${Math.round(y * 1000) / 10}`;
+      }
     )
     .join(" ");
 
@@ -318,6 +321,75 @@ const getPolygonCentroid = (polygon: AnalysisRegionPoint[]): AnalysisRegionPoint
   };
 };
 
+const normalizeFrameWindowFromUnknown = (value: unknown): FrameWindowNorm => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { x: 0, y: 0, width: 1, height: 1 };
+  }
+  const row = value as Record<string, unknown>;
+  const width = clamp01(Number(row.width));
+  const height = clamp01(Number(row.height));
+  const nextWidth = width > 0 ? width : 1;
+  const nextHeight = height > 0 ? height : 1;
+  const maxX = Math.max(0, 1 - nextWidth);
+  const maxY = Math.max(0, 1 - nextHeight);
+  return {
+    x: Math.min(maxX, Math.max(0, Number(row.x) || 0)),
+    y: Math.min(maxY, Math.max(0, Number(row.y) || 0)),
+    width: nextWidth,
+    height: nextHeight,
+  };
+};
+
+const isFullFrameWindow = (value: FrameWindowNorm | null | undefined): boolean => {
+  if (!value) return true;
+  return (
+    value.width >= 0.999 &&
+    value.height >= 0.999 &&
+    value.x <= 0.001 &&
+    value.y <= 0.001
+  );
+};
+
+const getFrameWindowPayload = (value: FrameWindowNorm | null | undefined): FrameWindowNorm | null => {
+  if (!value) return null;
+  return isFullFrameWindow(value)
+    ? null
+    : {
+        x: Math.round(clamp01(value.x) * 1000000) / 1000000,
+        y: Math.round(clamp01(value.y) * 1000000) / 1000000,
+        width: Math.round(clamp01(value.width) * 1000000) / 1000000,
+        height: Math.round(clamp01(value.height) * 1000000) / 1000000,
+      };
+};
+
+const extractFrameWindowFromAnalysisRegions = (regionsRaw: unknown): FrameWindowNorm => {
+  if (!Array.isArray(regionsRaw)) return { x: 0, y: 0, width: 1, height: 1 };
+  for (const row of regionsRaw) {
+    if (!row || typeof row !== "object") continue;
+    const normalized = normalizeFrameWindowFromUnknown(
+      (row as Record<string, unknown>).frame_window_norm ??
+        (row as Record<string, unknown>).frameWindowNorm
+    );
+    if (!isFullFrameWindow(normalized)) {
+      return normalized;
+    }
+  }
+  return { x: 0, y: 0, width: 1, height: 1 };
+};
+
+const mapPointToViewport = (
+  point: AnalysisRegionPoint,
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint => ({
+  x: (point.x - frameWindow.x) / Math.max(frameWindow.width, 0.000001),
+  y: (point.y - frameWindow.y) / Math.max(frameWindow.height, 0.000001),
+});
+
+const mapPointsToViewport = (
+  points: AnalysisRegionPoint[],
+  frameWindow: FrameWindowNorm
+): AnalysisRegionPoint[] => points.map((point) => mapPointToViewport(point, frameWindow));
+
 const buildDefaultAnalysisRegion = (
   fields: PromptEditorFields,
   faceTargetIds: number[],
@@ -340,6 +412,7 @@ const buildDefaultAnalysisRegion = (
   negative_image_ids: Array.from(
     new Set(negativeImageIds.filter((id) => Number.isInteger(id) && id > 0))
   ),
+  frame_window_norm: null,
 });
 
 const normalizeAnalysisRegionsForForm = (
@@ -453,6 +526,9 @@ const normalizeAnalysisRegionsForForm = (
           : fallbackFields.negative_condition,
       face_target_ids: regionFaceTargetIds,
       negative_image_ids: regionNegativeImageIds,
+      frame_window_norm: normalizeFrameWindowFromUnknown(
+        row?.frame_window_norm ?? row?.frameWindowNorm
+      ),
     });
   }
   if (regions.length === 0) {
@@ -476,13 +552,17 @@ const normalizeAnalysisRegionsForPayload = (
   regionsRaw: unknown,
   fallbackFields: PromptEditorFields,
   faceTargetIds: number[],
-  negativeImageIds: number[]
+  negativeImageIds: number[],
+  frameWindow?: FrameWindowNorm | null
 ): AnalysisRegion[] => {
   const normalized = normalizeAnalysisRegionsForForm(
     regionsRaw,
     fallbackFields,
     faceTargetIds,
     negativeImageIds
+  );
+  const frameWindowPayload = getFrameWindowPayload(
+    frameWindow ?? extractFrameWindowFromAnalysisRegions(regionsRaw)
   );
 
   return normalized.map((region, index) => {
@@ -522,6 +602,7 @@ const normalizeAnalysisRegionsForPayload = (
             .filter((id) => Number.isInteger(id) && id > 0)
         )
       ),
+      frame_window_norm: frameWindowPayload,
     };
   });
 };
@@ -1312,6 +1393,13 @@ interface AnalysisRegionPoint {
   y: number;
 }
 
+interface FrameWindowNorm {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface AnalysisRegion {
   region_id: string;
   label: string;
@@ -1327,6 +1415,7 @@ interface AnalysisRegion {
   negative_condition: string;
   face_target_ids: number[];
   negative_image_ids: number[];
+  frame_window_norm?: FrameWindowNorm | null;
 }
 
 interface FaceTarget {
@@ -1402,52 +1491,111 @@ const ANALYSIS_REGION_MAX_POINTS = 20;
 const ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH = 1920;
 const ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT = 1080;
 const PROMPT_EDITOR_SNAPSHOT_REFRESH_COOLDOWN_MS = 3000;
+const DEFAULT_FRAME_WINDOW: FrameWindowNorm = { x: 0, y: 0, width: 1, height: 1 };
+const FRAME_WINDOW_MAX_ZOOM = 6;
 
-type RenderedSnapshotBounds = {
-  left: number;
-  top: number;
+type PreviewViewportMetrics = {
   width: number;
   height: number;
   naturalWidth: number;
   naturalHeight: number;
 };
 
-const computeContainedImageBounds = (
+const getSafeSnapshotNaturalSize = (
+  naturalWidth: number,
+  naturalHeight: number
+): { width: number; height: number } => ({
+  width: Math.max(1, Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)),
+  height: Math.max(1, Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)),
+});
+
+const buildPreviewViewportMetrics = (
   hostWidth: number,
   hostHeight: number,
   naturalWidth: number,
   naturalHeight: number
-): RenderedSnapshotBounds | null => {
+): PreviewViewportMetrics | null => {
   if (hostWidth <= 1 || hostHeight <= 1) return null;
-
-  const safeNaturalWidth = Math.max(
-    1,
-    Math.round(Number(naturalWidth) || ANALYSIS_REGION_DEFAULT_DRAW_REF_WIDTH)
-  );
-  const safeNaturalHeight = Math.max(
-    1,
-    Math.round(Number(naturalHeight) || ANALYSIS_REGION_DEFAULT_DRAW_REF_HEIGHT)
-  );
-  const imageAspect = safeNaturalWidth / safeNaturalHeight;
-  const hostAspect = hostWidth / hostHeight;
-
-  let width = hostWidth;
-  let height = hostHeight;
-  if (hostAspect > imageAspect) {
-    height = hostHeight;
-    width = height * imageAspect;
-  } else {
-    width = hostWidth;
-    height = width / imageAspect;
-  }
+  const safeNatural = getSafeSnapshotNaturalSize(naturalWidth, naturalHeight);
 
   return {
-    left: (hostWidth - width) / 2,
-    top: (hostHeight - height) / 2,
+    width: hostWidth,
+    height: hostHeight,
+    naturalWidth: safeNatural.width,
+    naturalHeight: safeNatural.height,
+  };
+};
+
+const buildBaseFrameWindowForViewport = (
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  if (!metrics) return DEFAULT_FRAME_WINDOW;
+  const imageAspect = metrics.naturalWidth / metrics.naturalHeight;
+  const viewportAspect = metrics.width / metrics.height;
+  if (!Number.isFinite(imageAspect) || imageAspect <= 0 || !Number.isFinite(viewportAspect) || viewportAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  const normalizedAspect = viewportAspect / imageAspect;
+  if (!Number.isFinite(normalizedAspect) || normalizedAspect <= 0) {
+    return DEFAULT_FRAME_WINDOW;
+  }
+
+  if (normalizedAspect >= 1) {
+    const height = Math.min(1, 1 / normalizedAspect);
+    return {
+      x: 0,
+      y: (1 - height) / 2,
+      width: 1,
+      height,
+    };
+  }
+
+  const width = Math.min(1, normalizedAspect);
+  return {
+    x: (1 - width) / 2,
+    y: 0,
+    width,
+    height: 1,
+  };
+};
+
+const areFrameWindowsClose = (
+  a: FrameWindowNorm | null | undefined,
+  b: FrameWindowNorm | null | undefined,
+  epsilon = 0.0005
+): boolean => {
+  if (!a || !b) return false;
+  return (
+    Math.abs(a.x - b.x) <= epsilon &&
+    Math.abs(a.y - b.y) <= epsilon &&
+    Math.abs(a.width - b.width) <= epsilon &&
+    Math.abs(a.height - b.height) <= epsilon
+  );
+};
+
+const constrainFrameWindow = (
+  candidate: FrameWindowNorm,
+  metrics: PreviewViewportMetrics | null | undefined
+): FrameWindowNorm => {
+  const base = buildBaseFrameWindowForViewport(metrics);
+  const rawWidth = clamp01(candidate.width) || base.width;
+  const rawHeight = clamp01(candidate.height) || base.height;
+  const zoom = Math.min(
+    FRAME_WINDOW_MAX_ZOOM,
+    Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
+  );
+  const width = base.width / zoom;
+  const height = base.height / zoom;
+  const centerX = clamp01((Number(candidate.x) || 0) + rawWidth / 2);
+  const centerY = clamp01((Number(candidate.y) || 0) + rawHeight / 2);
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  return {
+    x: Math.min(maxX, Math.max(0, centerX - width / 2)),
+    y: Math.min(maxY, Math.max(0, centerY - height / 2)),
     width,
     height,
-    naturalWidth: safeNaturalWidth,
-    naturalHeight: safeNaturalHeight,
   };
 };
 
@@ -4451,13 +4599,21 @@ function StepCard({
     start: AnalysisRegionPoint;
     end: AnalysisRegionPoint;
   } | null>(null);
+  const [promptEditorPanDrag, setPromptEditorPanDrag] = useState<{
+    button: 0 | 2;
+    startClientX: number;
+    startClientY: number;
+    frameWindow: FrameWindowNorm;
+  } | null>(null);
   const [showNewRegionDialog, setShowNewRegionDialog] = useState(false);
   const [newRegionDialogLabel, setNewRegionDialogLabel] = useState("");
   const [newRegionDialogDescription, setNewRegionDialogDescription] = useState("");
   const [newRegionDialogAnchor, setNewRegionDialogAnchor] = useState<AnalysisRegionPoint | null>(null);
   const [analysisRegionsPanelOpen, setAnalysisRegionsPanelOpen] = useState(false);
   const [promptEditorTargetFacesExpanded, setPromptEditorTargetFacesExpanded] = useState(false);
-  const previewCanvasRef = useRef<HTMLDivElement | null>(null);
+  const previewViewportRef = useRef<HTMLDivElement | null>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const promptEditorSnapshotImageRef = useRef<HTMLImageElement | null>(null);
   const [promptEditorSnapshotMeta, setPromptEditorSnapshotMeta] = useState<{
     thumbnail_url: string | null;
     last_thumbnail_update: string | null;
@@ -4469,8 +4625,11 @@ function StepCard({
     width: 0,
     height: 0,
   });
-  const [promptEditorSnapshotRenderBounds, setPromptEditorSnapshotRenderBounds] =
-    useState<RenderedSnapshotBounds | null>(null);
+  const [promptEditorFrameWindow, setPromptEditorFrameWindow] =
+    useState<FrameWindowNorm>(DEFAULT_FRAME_WINDOW);
+  const [promptEditorViewportMetrics, setPromptEditorViewportMetrics] =
+    useState<PreviewViewportMetrics | null>(null);
+  const [promptEditorSnapshotImageVersion, setPromptEditorSnapshotImageVersion] = useState(0);
   const [promptEditorSnapshotLoading, setPromptEditorSnapshotLoading] = useState(false);
   const [promptEditorSnapshotRequesting, setPromptEditorSnapshotRequesting] = useState(false);
   const [promptEditorSnapshotError, setPromptEditorSnapshotError] = useState<string | null>(
@@ -4824,12 +4983,16 @@ function StepCard({
   };
 
   useEffect(() => {
+    const frameWindowPayload = getFrameWindowPayload(promptEditorFrameWindow);
     setAgentForm((prev) => ({
       ...prev,
-      analysis_regions: promptEditorRegions,
+      analysis_regions: promptEditorRegions.map((region) => ({
+        ...region,
+        frame_window_norm: frameWindowPayload,
+      })),
       face_target_ids: collectFaceTargetIdsFromRegions(promptEditorRegions),
     }));
-  }, [promptEditorRegions]);
+  }, [promptEditorFrameWindow, promptEditorRegions]);
 
   const fetchFaceTargetsLibraryData = async () => {
     if (!expanded) return;
@@ -6091,8 +6254,7 @@ function StepCard({
       window.clearTimeout(agentFormHighlightTimerRef.current);
       agentFormHighlightTimerRef.current = null;
     }
-    setShowPromptEditor(false);
-    setPromptEnhanceSuggestion(null);
+    closePromptEditor();
     setAgentFormCameraId(null);
     setAgentForm(buildEmptyAgentForm());
   };
@@ -6676,6 +6838,7 @@ function StepCard({
     setPendingPolygonSeed(null);
     setIsSizingPendingPolygon(false);
     setDraftPolygonRect(null);
+    setPromptEditorPanDrag(null);
     setShowNewRegionDialog(false);
     setNewRegionDialogLabel("");
     setNewRegionDialogDescription("");
@@ -6688,6 +6851,10 @@ function StepCard({
       thumbnail_url: null,
       last_thumbnail_update: null,
     });
+    setPromptEditorSnapshotNaturalSize({ width: 0, height: 0 });
+    setPromptEditorFrameWindow(DEFAULT_FRAME_WINDOW);
+    setPromptEditorViewportMetrics(null);
+    promptEditorSnapshotImageRef.current = null;
     promptEditorSnapshotRefreshInFlightRef.current = false;
     promptEditorSnapshotRetryInFlightRef.current = false;
     clearPromptEditorSnapshotRefreshCooldown();
@@ -6778,6 +6945,12 @@ function StepCard({
       context_padding_pct: 0,
     }));
     const initialActiveRegion = initialRegions[0];
+    const initialFrameWindow = constrainFrameWindow(
+      extractFrameWindowFromAnalysisRegions(
+        targetAgent?.analysis_regions ?? sourceForm.analysis_regions
+      ),
+      promptEditorViewportMetrics
+    );
 
     if (targetAgent && Array.isArray(targetAgent.negative_reference_images)) {
       setAgentForm((prev) => ({
@@ -6796,6 +6969,7 @@ function StepCard({
     setPendingPolygonSeed(null);
     setIsSizingPendingPolygon(false);
     setDraftPolygonRect(null);
+    setPromptEditorPanDrag(null);
     setShowNewRegionDialog(false);
     setNewRegionDialogLabel("");
     setNewRegionDialogDescription("");
@@ -6816,6 +6990,7 @@ function StepCard({
       thumbnail_url: null,
       last_thumbnail_update: null,
     });
+    setPromptEditorFrameWindow(initialFrameWindow);
     promptEditorSnapshotRefreshInFlightRef.current = false;
     promptEditorSnapshotRetryInFlightRef.current = false;
     clearPromptEditorSnapshotRefreshCooldown();
@@ -7067,17 +7242,21 @@ function StepCard({
   };
 
   const getPreviewPointFromClient = (clientX: number, clientY: number) => {
-    const host = previewCanvasRef.current;
-    const bounds = measurePromptEditorSnapshotRenderBounds();
+    const host = previewViewportRef.current;
+    const bounds = measurePromptEditorViewportMetrics();
     if (!host || !bounds) return null;
     const rect = host.getBoundingClientRect();
-    const x = clientX - rect.left - bounds.left;
-    const y = clientY - rect.top - bounds.top;
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
     if (x < 0 || y < 0 || x > bounds.width || y > bounds.height) return null;
     return {
       point: {
-        x: clamp01(x / bounds.width),
-        y: clamp01(y / bounds.height),
+        x: clamp01(
+          promptEditorFrameWindow.x + (x / bounds.width) * promptEditorFrameWindow.width
+        ),
+        y: clamp01(
+          promptEditorFrameWindow.y + (y / bounds.height) * promptEditorFrameWindow.height
+        ),
       } as AnalysisRegionPoint,
       draw_ref_width: bounds.naturalWidth,
       draw_ref_height: bounds.naturalHeight,
@@ -7131,9 +7310,69 @@ function StepCard({
     }));
   };
 
+  const setConstrainedPromptEditorFrameWindow = (next: FrameWindowNorm) => {
+    setPromptEditorFrameWindow(constrainFrameWindow(next, promptEditorViewportMetrics));
+  };
+
+  const applyPromptEditorFrameZoom = (
+    nextZoom: number,
+    anchor = { x: 0.5, y: 0.5 }
+  ) => {
+    const safeZoom = Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, Number(nextZoom) || 1));
+    const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
+    const nextWidth = baseFrameWindow.width / safeZoom;
+    const nextHeight = baseFrameWindow.height / safeZoom;
+    setConstrainedPromptEditorFrameWindow({
+      x: promptEditorFrameWindow.x + anchor.x * (promptEditorFrameWindow.width - nextWidth),
+      y: promptEditorFrameWindow.y + anchor.y * (promptEditorFrameWindow.height - nextHeight),
+      width: nextWidth,
+      height: nextHeight,
+    });
+  };
+
+  const handlePreviewWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    const host = previewViewportRef.current;
+    const bounds = measurePromptEditorViewportMetrics();
+    if (!host || !bounds || !promptEditorSnapshotUrl) return;
+    const rect = host.getBoundingClientRect();
+    const localX = event.clientX - rect.left;
+    const localY = event.clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+    event.preventDefault();
+    const anchor = { x: localX / bounds.width, y: localY / bounds.height };
+    const baseFrameWindow = buildBaseFrameWindowForViewport(bounds);
+    const currentZoom = Math.min(
+      FRAME_WINDOW_MAX_ZOOM,
+      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
+    );
+    const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
+    applyPromptEditorFrameZoom(nextZoom, anchor);
+  };
+
   const handlePreviewMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
     if (!promptEditorSnapshotUrl) return;
     if ((event.target as HTMLElement)?.closest("[data-region-action='true']")) return;
+    const shouldStartPan =
+      event.button === 2 ||
+      (event.button === 0 && !polygonDrawEnabled && !pendingPolygonSeed && !isSizingPendingPolygon);
+    if (shouldStartPan) {
+      const bounds = measurePromptEditorViewportMetrics();
+      const host = previewViewportRef.current;
+      if (!bounds || !host) return;
+      const rect = host.getBoundingClientRect();
+      const localX = event.clientX - rect.left;
+      const localY = event.clientY - rect.top;
+      if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
+      event.preventDefault();
+      setPromptEditorPanDrag({
+        button: event.button as 0 | 2,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        frameWindow: promptEditorFrameWindow,
+      });
+      return;
+    }
+    if (event.button !== 0) return;
     setRegionActionRegionId(null);
     setIsRegionActionHovered(false);
     const pointer = getPreviewPointFromClient(event.clientX, event.clientY);
@@ -7161,8 +7400,31 @@ function StepCard({
   };
 
   const handlePreviewMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (promptEditorPanDrag) {
+      const bounds = measurePromptEditorViewportMetrics();
+      if (!bounds) return;
+      const dx = event.clientX - promptEditorPanDrag.startClientX;
+      const dy = event.clientY - promptEditorPanDrag.startClientY;
+      setConstrainedPromptEditorFrameWindow({
+        x:
+          promptEditorPanDrag.frameWindow.x -
+          (dx / bounds.width) * promptEditorPanDrag.frameWindow.width,
+        y:
+          promptEditorPanDrag.frameWindow.y -
+          (dy / bounds.height) * promptEditorPanDrag.frameWindow.height,
+        width: promptEditorPanDrag.frameWindow.width,
+        height: promptEditorPanDrag.frameWindow.height,
+      });
+      return;
+    }
     const pointer = getPreviewPointFromClient(event.clientX, event.clientY);
-    if (!pointer) return;
+    if (!pointer) {
+      setHoveredPromptRegionId(null);
+      if (!isRegionActionHovered && !showNewRegionDialog) {
+        setRegionActionRegionId(null);
+      }
+      return;
+    }
 
     if (draggingPromptVertex) {
       updatePromptRegionById(draggingPromptVertex.region_id, (region) => {
@@ -7209,6 +7471,11 @@ function StepCard({
   };
 
   const handlePreviewMouseUp = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (promptEditorPanDrag && event.button === promptEditorPanDrag.button) {
+      setPromptEditorPanDrag(null);
+      return;
+    }
+    if (event.button !== 0) return;
     if (draggingPromptVertex) {
       setDraggingPromptVertex(null);
       return;
@@ -7278,6 +7545,9 @@ function StepCard({
   };
 
   const handlePreviewMouseLeave = () => {
+    if (promptEditorPanDrag) {
+      setPromptEditorPanDrag(null);
+    }
     if (!draggingPromptVertex) {
       setHoveredPromptRegionId(null);
     }
@@ -7391,7 +7661,8 @@ function StepCard({
       updatedRegions,
       normalizedDraft,
       agentForm.face_target_ids,
-      extractNegativeImageIdsFromImages(agentForm.negative_reference_images)
+      extractNegativeImageIdsFromImages(agentForm.negative_reference_images),
+      promptEditorFrameWindow
     );
     const normalizedFaceTargetIds = collectFaceTargetIdsFromRegions(normalizedRegions);
     const normalizedNegativeImageIds = extractNegativeImageIdsFromImages(
@@ -7424,7 +7695,7 @@ function StepCard({
     }
 
     setPromptEnhanceSuggestion(null);
-    setShowPromptEditor(false);
+    closePromptEditor();
     onShowToast(t("jobs.promptEditor.toastPromptAndTargetsSaved"), "success");
   };
 
@@ -7448,7 +7719,8 @@ function StepCard({
       promptEditorRegions,
       normalized,
       Array.isArray(agentForm.face_target_ids) ? agentForm.face_target_ids : [],
-      extractNegativeImageIdsFromImages(agentForm.negative_reference_images)
+      extractNegativeImageIdsFromImages(agentForm.negative_reference_images),
+      promptEditorFrameWindow
     );
 
     setEnhancingPrompt(true);
@@ -7746,12 +8018,22 @@ function StepCard({
   const draftPolygonPoints = draftPolygonRect
     ? buildRectPolygonFromPoints(draftPolygonRect.start, draftPolygonRect.end)
     : [];
+  const draftPolygonViewportPoints =
+    draftPolygonPoints.length >= ANALYSIS_REGION_MIN_POINTS
+      ? mapPointsToViewport(draftPolygonPoints, promptEditorFrameWindow)
+      : [];
   const regionActionRegion =
     polygonOnlyRegions.find((region) => region.region_id === regionActionRegionId) ||
     polygonOnlyRegions.find((region) => region.region_id === hoveredPromptRegionId) ||
     null;
   const regionActionCentroid = regionActionRegion
     ? getPolygonCentroid(regionActionRegion.polygon_norm)
+    : null;
+  const regionActionViewportCentroid = regionActionCentroid
+    ? mapPointToViewport(regionActionCentroid, promptEditorFrameWindow)
+    : null;
+  const newRegionDialogAnchorViewport = newRegionDialogAnchor
+    ? mapPointToViewport(newRegionDialogAnchor, promptEditorFrameWindow)
     : null;
   const activePolygonToolbarRegion =
     (activePromptRegion && hasPolygonPoints(activePromptRegion) ? activePromptRegion : null) ||
@@ -7782,11 +8064,47 @@ function StepCard({
           : ""
       }`
     : null;
-  const measurePromptEditorSnapshotRenderBounds = (): RenderedSnapshotBounds | null => {
-    const host = previewCanvasRef.current;
+
+  useEffect(() => {
+    if (!showPromptEditor || !promptEditorSnapshotUrl) {
+      promptEditorSnapshotImageRef.current = null;
+      setPromptEditorSnapshotNaturalSize({ width: 0, height: 0 });
+      setPromptEditorSnapshotImageVersion((prev) => prev + 1);
+      return;
+    }
+
+    let cancelled = false;
+    const img = new Image();
+    img.decoding = "async";
+    img.onload = () => {
+      if (cancelled) return;
+      promptEditorSnapshotImageRef.current = img;
+      setPromptEditorSnapshotNaturalSize({
+        width: img.naturalWidth || 0,
+        height: img.naturalHeight || 0,
+      });
+      setPromptEditorSnapshotError(null);
+      setPromptEditorSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.onerror = () => {
+      if (cancelled) return;
+      promptEditorSnapshotImageRef.current = null;
+      setPromptEditorSnapshotNaturalSize({ width: 0, height: 0 });
+      setPromptEditorSnapshotError("Snapshot unavailable. Try capture preview.");
+      setPromptEditorSnapshotImageVersion((prev) => prev + 1);
+    };
+    img.src = promptEditorSnapshotUrl;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showPromptEditor, promptEditorSnapshotUrl]);
+
+  const measurePromptEditorViewportMetrics = (): PreviewViewportMetrics | null => {
+    const host = previewViewportRef.current;
     if (!host) return null;
     const rect = host.getBoundingClientRect();
-    return computeContainedImageBounds(
+    return buildPreviewViewportMetrics(
       rect.width,
       rect.height,
       promptEditorSnapshotNaturalSize.width,
@@ -7801,18 +8119,29 @@ function StepCard({
     promptEditorSnapshotRetryInFlightRef.current ||
     promptEditorSnapshotRefreshInFlightRef.current ||
     promptEditorSnapshotRefreshCooldownActive;
+  const promptEditorCurrentZoom = useMemo(() => {
+    const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
+    return Math.min(
+      FRAME_WINDOW_MAX_ZOOM,
+      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
+    );
+  }, [promptEditorFrameWindow.width, promptEditorViewportMetrics]);
+  const promptEditorHasViewportAdjustments = useMemo(() => {
+    const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
+    return !areFrameWindowsClose(promptEditorFrameWindow, baseFrameWindow);
+  }, [promptEditorFrameWindow, promptEditorViewportMetrics]);
   useEffect(() => {
     if (!showPromptEditor || !promptEditorSnapshotUrl) {
-      setPromptEditorSnapshotRenderBounds(null);
+      setPromptEditorViewportMetrics(null);
       return;
     }
 
     const refreshBounds = () => {
-      setPromptEditorSnapshotRenderBounds(measurePromptEditorSnapshotRenderBounds());
+      setPromptEditorViewportMetrics(measurePromptEditorViewportMetrics());
     };
 
     refreshBounds();
-    const host = previewCanvasRef.current;
+    const host = previewViewportRef.current;
     if (!host) return;
 
     const observer =
@@ -7829,6 +8158,78 @@ function StepCard({
     promptEditorSnapshotUrl,
     promptEditorSnapshotNaturalSize.width,
     promptEditorSnapshotNaturalSize.height,
+  ]);
+  useEffect(() => {
+    if (!promptEditorViewportMetrics) return;
+    setPromptEditorFrameWindow((prev) => {
+      const next = constrainFrameWindow(prev, promptEditorViewportMetrics);
+      return areFrameWindowsClose(prev, next) ? prev : next;
+    });
+  }, [promptEditorViewportMetrics]);
+
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    const metrics = promptEditorViewportMetrics;
+    const snapshotImage = promptEditorSnapshotImageRef.current;
+    if (!promptEditorSnapshotUrl || !metrics || !snapshotImage) {
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    const displayWidth = Math.max(1, Math.round(metrics.width));
+    const displayHeight = Math.max(1, Math.round(metrics.height));
+    const devicePixelRatio =
+      typeof window !== "undefined" && Number.isFinite(window.devicePixelRatio)
+        ? Math.max(1, window.devicePixelRatio)
+        : 1;
+    const backingWidth = Math.max(1, Math.round(displayWidth * devicePixelRatio));
+    const backingHeight = Math.max(1, Math.round(displayHeight * devicePixelRatio));
+
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+
+    const naturalWidth = Math.max(1, snapshotImage.naturalWidth || metrics.naturalWidth);
+    const naturalHeight = Math.max(1, snapshotImage.naturalHeight || metrics.naturalHeight);
+    const sourceX = Math.max(0, Math.min(naturalWidth - 1, promptEditorFrameWindow.x * naturalWidth));
+    const sourceY = Math.max(0, Math.min(naturalHeight - 1, promptEditorFrameWindow.y * naturalHeight));
+    const sourceWidth = Math.max(
+      1,
+      Math.min(naturalWidth - sourceX, promptEditorFrameWindow.width * naturalWidth)
+    );
+    const sourceHeight = Math.max(
+      1,
+      Math.min(naturalHeight - sourceY, promptEditorFrameWindow.height * naturalHeight)
+    );
+
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(
+      snapshotImage,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      0,
+      0,
+      displayWidth,
+      displayHeight
+    );
+  }, [
+    promptEditorFrameWindow.height,
+    promptEditorFrameWindow.width,
+    promptEditorFrameWindow.x,
+    promptEditorFrameWindow.y,
+    promptEditorSnapshotImageVersion,
+    promptEditorSnapshotUrl,
+    promptEditorViewportMetrics,
   ]);
   const canManageNegativeReferences =
     !!currentPromptCameraAgent &&
@@ -9095,8 +9496,7 @@ function StepCard({
                             window.clearTimeout(agentFormHighlightTimerRef.current);
                             agentFormHighlightTimerRef.current = null;
                           }
-                          setShowPromptEditor(false);
-                          setPromptEnhanceSuggestion(null);
+                          closePromptEditor();
                           setAgentFormCameraId(null);
                         }}
                         className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-sm"
@@ -9858,14 +10258,42 @@ function StepCard({
                                   </div>
                                 ) : null}
                               </div>
-                              <div className="px-3 py-2 border-b border-gray-700/80 text-[11px] text-gray-400">
-                                {pendingPolygonSeed
-                                  ? "Drag on the image to size the new polygon."
-                                  : polygonDrawEnabled
-                                  ? "Click once on image to define polygon name and description."
-                                  : polygonOnlyRegions.length > 0
-                                  ? `${polygonOnlyRegions.length} polygon(s) configured. Use the controls below to select or delete one.`
-                                  : "No polygons configured. Full frame will be used."}
+                              <div className="px-3 py-2 border-b border-gray-700/80 flex flex-wrap items-center justify-between gap-3">
+                                <div className="text-[11px] text-gray-400 min-w-0 flex-1">
+                                  {pendingPolygonSeed
+                                    ? "Drag on the image to size the new polygon."
+                                    : polygonDrawEnabled
+                                    ? "Click once on image to define polygon name and description."
+                                    : polygonOnlyRegions.length > 0
+                                    ? `${polygonOnlyRegions.length} polygon(s) configured. Use the controls below to select or delete one.`
+                                    : "No polygons configured. The current preview window will be used."}
+                                </div>
+                                <div className="flex items-center gap-2 text-[11px] text-gray-300">
+                                  <button
+                                    type="button"
+                                    onClick={() => setConstrainedPromptEditorFrameWindow(DEFAULT_FRAME_WINDOW)}
+                                    disabled={!promptEditorSnapshotUrl || !promptEditorHasViewportAdjustments}
+                                    className="rounded border border-gray-600 bg-gray-800 px-2 py-1 text-gray-200 disabled:opacity-40"
+                                  >
+                                    Reset view
+                                  </button>
+                                  <span className="w-12 text-right tabular-nums">
+                                    {promptEditorCurrentZoom.toFixed(1)}x
+                                  </span>
+                                  <input
+                                    type="range"
+                                    min={1}
+                                    max={FRAME_WINDOW_MAX_ZOOM}
+                                    step={0.05}
+                                    value={promptEditorCurrentZoom}
+                                    onChange={(event) =>
+                                      applyPromptEditorFrameZoom(Number(event.target.value))
+                                    }
+                                    disabled={!promptEditorSnapshotUrl}
+                                    className="w-28 accent-blue-400 disabled:opacity-40"
+                                    aria-label="Preview zoom"
+                                  />
+                                </div>
                               </div>
                               <div
                                 className={`flex-1 bg-gray-900/60 relative p-3 flex items-start justify-center ${
@@ -9876,46 +10304,30 @@ function StepCard({
                               >
                                 {promptEditorSnapshotUrl ? (
                                   <div
-                                    ref={previewCanvasRef}
-                                    className="relative h-[78%] w-[78%] max-h-full max-w-full border border-gray-700 bg-black/25 flex items-center justify-center -mt-1"
+                                    ref={previewViewportRef}
+                                    className={`relative h-[78%] w-[78%] max-h-full max-w-full border border-gray-700 bg-black/25 flex items-center justify-center -mt-1 overflow-hidden ${
+                                      promptEditorPanDrag
+                                        ? "cursor-grabbing"
+                                        : polygonDrawEnabled
+                                        ? "cursor-crosshair"
+                                        : "cursor-grab"
+                                    }`}
                                     onMouseDown={handlePreviewMouseDown}
                                     onMouseMove={handlePreviewMouseMove}
                                     onMouseUp={handlePreviewMouseUp}
                                     onMouseLeave={handlePreviewMouseLeave}
+                                    onWheel={handlePreviewWheel}
+                                    onContextMenu={(event) => event.preventDefault()}
                                   >
-                                    <div className="absolute inset-0 rounded-md overflow-hidden">
-                                      <img
-                                        key={promptEditorSnapshotUrl}
-                                        src={promptEditorSnapshotUrl}
-                                        alt={getPromptEditorCameraName(agentFormCameraId)}
-                                        className="h-full w-full object-contain object-center select-none pointer-events-none"
-                                        draggable={false}
-                                        onLoad={(event) => {
-                                          const img = event.currentTarget;
-                                          setPromptEditorSnapshotNaturalSize({
-                                            width: img.naturalWidth || 0,
-                                            height: img.naturalHeight || 0,
-                                          });
-                                        }}
-                                        onError={() => {
-                                          setPromptEditorSnapshotMeta({
-                                            thumbnail_url: null,
-                                            last_thumbnail_update: null,
-                                          });
-                                          setPromptEditorSnapshotError(
-                                            "Snapshot unavailable. Try capture preview."
-                                          );
-                                        }}
-                                      />
-                                      {promptEditorSnapshotRenderBounds ? (
+                                    <canvas
+                                      ref={previewCanvasRef}
+                                      className="absolute inset-0 h-full w-full select-none"
+                                      style={{ pointerEvents: "none" }}
+                                      aria-hidden="true"
+                                    />
+                                      {promptEditorViewportMetrics ? (
                                         <svg
-                                          className="absolute"
-                                          style={{
-                                            left: promptEditorSnapshotRenderBounds.left,
-                                            top: promptEditorSnapshotRenderBounds.top,
-                                            width: promptEditorSnapshotRenderBounds.width,
-                                            height: promptEditorSnapshotRenderBounds.height,
-                                          }}
+                                          className="absolute inset-0 h-full w-full"
                                           viewBox="0 0 100 100"
                                           preserveAspectRatio="none"
                                         >
@@ -9925,11 +10337,15 @@ function StepCard({
                                             const points = Array.isArray(region.polygon_norm)
                                               ? region.polygon_norm
                                               : [];
-                                            const centroid = getPolygonCentroid(points);
+                                            const viewportPoints = mapPointsToViewport(
+                                              points,
+                                              promptEditorFrameWindow
+                                            );
+                                            const centroid = getPolygonCentroid(viewportPoints);
                                             return (
                                               <g key={region.region_id}>
                                                 <polygon
-                                                  points={toSvgPoints(points)}
+                                                  points={toSvgPoints(viewportPoints, { clamp: false })}
                                                   fill="rgba(0,0,0,0.001)"
                                                   stroke="rgba(0,0,0,0)"
                                                   strokeWidth={4}
@@ -9947,6 +10363,8 @@ function StepCard({
                                                     }
                                                   }}
                                                   onMouseDown={(e) => {
+                                                    if (e.button !== 0) return;
+                                                    if (!polygonDrawEnabled) return;
                                                     e.stopPropagation();
                                                     setActivePromptRegionId(region.region_id);
                                                     setRegionActionRegionId(region.region_id);
@@ -9954,7 +10372,7 @@ function StepCard({
                                                   onClick={(e) => handleAddVertexToRegion(region.region_id, e)}
                                                 />
                                                 <polygon
-                                                  points={toSvgPoints(points)}
+                                                  points={toSvgPoints(viewportPoints, { clamp: false })}
                                                   fill={
                                                     region.enabled === false
                                                       ? "rgba(251,146,60,0.18)"
@@ -9983,16 +10401,18 @@ function StepCard({
                                                   {region.label || "Region"}
                                                 </text>
                                                 {(isActive || isHovered) &&
-                                                  points.map((point, idx) => (
+                                                  viewportPoints.map((point, idx) => (
                                                     <circle
                                                       key={`${region.region_id}-point-${idx}`}
-                                                      cx={clamp01(point.x) * 100}
-                                                      cy={clamp01(point.y) * 100}
+                                                      cx={point.x * 100}
+                                                      cy={point.y * 100}
                                                       r={1.05}
                                                       fill={idx === 0 ? "#34d399" : "#60a5fa"}
                                                       stroke="#0b1220"
                                                       strokeWidth={0.35}
                                                       onMouseDown={(e) => {
+                                                        if (e.button !== 0) return;
+                                                        if (!polygonDrawEnabled) return;
                                                         e.stopPropagation();
                                                         setActivePromptRegionId(region.region_id);
                                                         setRegionActionRegionId(region.region_id);
@@ -10006,9 +10426,11 @@ function StepCard({
                                               </g>
                                             );
                                           })}
-                                          {draftPolygonPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
+                                          {draftPolygonViewportPoints.length >= ANALYSIS_REGION_MIN_POINTS ? (
                                             <polygon
-                                              points={toSvgPoints(draftPolygonPoints)}
+                                              points={toSvgPoints(draftPolygonViewportPoints, {
+                                                clamp: false,
+                                              })}
                                               fill="rgba(16,185,129,0.2)"
                                               stroke="rgba(52,211,153,0.95)"
                                               strokeWidth={0.6}
@@ -10018,8 +10440,7 @@ function StepCard({
                                           ) : null}
                                         </svg>
                                       ) : null}
-                                    </div>
-                                    {regionActionRegion && regionActionCentroid ? (
+                                    {regionActionRegion && regionActionViewportCentroid ? (
                                       <div
                                         data-region-action="true"
                                         className="absolute z-30 rounded border border-gray-600 bg-gray-950/90 px-2 py-1.5 flex items-center gap-2 shadow-lg"
@@ -10028,14 +10449,14 @@ function StepCard({
                                         style={{
                                           left: `${Math.max(
                                             4,
-                                            Math.min(96, regionActionCentroid.x * 100)
+                                            Math.min(96, regionActionViewportCentroid.x * 100)
                                           )}%`,
                                           top: `${Math.max(
                                             4,
-                                            Math.min(96, regionActionCentroid.y * 100)
+                                            Math.min(96, regionActionViewportCentroid.y * 100)
                                           )}%`,
                                           transform:
-                                            regionActionCentroid.y > 0.24
+                                            regionActionViewportCentroid.y > 0.24
                                               ? "translate(-50%, -120%)"
                                               : "translate(-50%, 20%)",
                                         }}
@@ -10069,19 +10490,19 @@ function StepCard({
                                         </button>
                                       </div>
                                     ) : null}
-                                    {showNewRegionDialog && newRegionDialogAnchor ? (
+                                    {showNewRegionDialog && newRegionDialogAnchor && newRegionDialogAnchorViewport ? (
                                       <div
                                         data-region-action="true"
                                         className="absolute z-40 w-64 rounded-lg border border-gray-600 bg-gray-900/95 p-3 shadow-xl"
                                         style={{
-                                          left: `${Math.max(2, Math.min(98, newRegionDialogAnchor.x * 100))}%`,
-                                          top: `${Math.max(2, Math.min(98, newRegionDialogAnchor.y * 100))}%`,
+                                          left: `${Math.max(2, Math.min(98, newRegionDialogAnchorViewport.x * 100))}%`,
+                                          top: `${Math.max(2, Math.min(98, newRegionDialogAnchorViewport.y * 100))}%`,
                                           transform: `translate(${
-                                            newRegionDialogAnchor.x <= 0.7
+                                            newRegionDialogAnchorViewport.x <= 0.7
                                               ? "8px"
                                               : "calc(-100% - 8px)"
                                           }, ${
-                                            newRegionDialogAnchor.y <= 0.28
+                                            newRegionDialogAnchorViewport.y <= 0.28
                                               ? "8px"
                                               : "calc(-100% - 8px)"
                                           })`,

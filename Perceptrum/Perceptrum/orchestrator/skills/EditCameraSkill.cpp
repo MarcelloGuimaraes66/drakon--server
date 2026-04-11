@@ -14,6 +14,7 @@
 #include "../OperationTaskState.h"
 #include "../ProgressUtils.h"
 #include "../PromptBuilder.h"
+#include "shared/AgentAuthoringShared.h"
 
 namespace chatv2 {
 
@@ -587,7 +588,8 @@ std::string normalizeFieldSource_(std::string value)
     value = lowerAsciiCopy_(trimCopy_(std::move(value)));
     if (value == "explicit_user" ||
         value == "implied_user" ||
-        value == "address_lookup") {
+        value == "address_lookup" ||
+        value == "system_default") {
         return value;
     }
     return "";
@@ -809,6 +811,14 @@ bool parseOpenFormField_(const nlohmann::json& value, bool& outValue)
     return parseBoolLoose_(value, outValue);
 }
 
+nlohmann::json extractionSourceCameraRef_(const nlohmann::json& extracted)
+{
+    if (!extracted.is_object()) {
+        return nlohmann::json::object();
+    }
+    return normalizeTargetSelector_(extracted.value("source_camera_ref", nlohmann::json::object()));
+}
+
 nlohmann::json normalizeEditExtractionResult_(const nlohmann::json& extracted)
 {
     nlohmann::json normalized = nlohmann::json::object();
@@ -853,6 +863,11 @@ nlohmann::json normalizeEditExtractionResult_(const nlohmann::json& extracted)
         normalized["clear_fields"] = clearFields;
     }
 
+    const nlohmann::json sourceCameraRef = extractionSourceCameraRef_(extracted);
+    if (!sourceCameraRef.empty()) {
+        normalized["source_camera_ref"] = sourceCameraRef;
+    }
+
     if (extracted.contains("open_form")) {
         bool openForm = false;
         if (parseOpenFormField_(extracted["open_form"], openForm)) {
@@ -877,6 +892,16 @@ nlohmann::json normalizeRouterEditDraft_(const SkillSelection& selection)
         if (!targetSelector.empty()) {
             normalized["target_selector"] = targetSelector;
         }
+    }
+
+    const nlohmann::json sourceCameraRef =
+        raw.contains("source_camera_ref")
+            ? normalizeTargetSelector_(raw["source_camera_ref"])
+            : (selection.draftPatch.is_object()
+                ? normalizeTargetSelector_(selection.draftPatch.value("source_camera_ref", nlohmann::json::object()))
+                : nlohmann::json::object());
+    if (!sourceCameraRef.empty()) {
+        normalized["source_camera_ref"] = sourceCameraRef;
     }
 
     nlohmann::json patchSource = nlohmann::json::object();
@@ -964,6 +989,17 @@ nlohmann::json activeEditDraft_(const nlohmann::json& conversationContext)
         normalized["resolved_camera"] = draft["resolved_camera"];
     }
 
+    if (draft.contains("source_camera_ref")) {
+        const nlohmann::json sourceCameraRef = normalizeTargetSelector_(draft["source_camera_ref"]);
+        if (!sourceCameraRef.empty()) {
+            normalized["source_camera_ref"] = sourceCameraRef;
+        }
+    }
+
+    if (draft.contains("resolved_source_camera") && draft["resolved_source_camera"].is_object()) {
+        normalized["resolved_source_camera"] = draft["resolved_source_camera"];
+    }
+
     if (draft.contains("candidate_cameras") && draft["candidate_cameras"].is_array()) {
         normalized["candidate_cameras"] = draft["candidate_cameras"];
     }
@@ -1015,6 +1051,18 @@ nlohmann::json mergeEditDrafts_(
     }
     if (!targetSelector.empty()) {
         merged["target_selector"] = targetSelector;
+    }
+
+    nlohmann::json sourceCameraRef =
+        normalizeTargetSelector_(baseDraft.value("source_camera_ref", nlohmann::json::object()));
+    const nlohmann::json incomingSourceCameraRef =
+        normalizeTargetSelector_(incomingDraft.value("source_camera_ref", nlohmann::json::object()));
+    const bool incomingHasSourceCameraRef = hasTargetSelector_(incomingSourceCameraRef);
+    if (incomingHasSourceCameraRef) {
+        sourceCameraRef = incomingSourceCameraRef;
+    }
+    if (!sourceCameraRef.empty()) {
+        merged["source_camera_ref"] = sourceCameraRef;
     }
 
     nlohmann::json patch = normalizeCameraPatch_(baseDraft.value("camera_patch", nlohmann::json::object()));
@@ -1087,6 +1135,18 @@ nlohmann::json mergeEditDrafts_(
         else if (baseDraft.contains("candidate_cameras") && baseDraft["candidate_cameras"].is_array()) {
             merged["candidate_cameras"] = baseDraft["candidate_cameras"];
         }
+    }
+
+    if (incomingHasSourceCameraRef) {
+        if (incomingDraft.contains("resolved_source_camera") && incomingDraft["resolved_source_camera"].is_object()) {
+            merged["resolved_source_camera"] = incomingDraft["resolved_source_camera"];
+        }
+    }
+    else if (incomingDraft.contains("resolved_source_camera") && incomingDraft["resolved_source_camera"].is_object()) {
+        merged["resolved_source_camera"] = incomingDraft["resolved_source_camera"];
+    }
+    else if (baseDraft.contains("resolved_source_camera") && baseDraft["resolved_source_camera"].is_object()) {
+        merged["resolved_source_camera"] = baseDraft["resolved_source_camera"];
     }
 
     return merged;
@@ -1178,7 +1238,8 @@ nlohmann::json extractEditDraft_(
     const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext,
-    const SkillSelection& selection)
+    const SkillSelection& selection,
+    const nlohmann::json& authoringContextForPrompt)
 {
     if (!llm.isConfigured()) {
         return nlohmann::json::object();
@@ -1198,14 +1259,17 @@ nlohmann::json extractEditDraft_(
         "target_selector identifies WHICH EXISTING camera the user means right now.\n"
         "camera_patch contains only the NEW values the user wants to apply.\n"
         "If the user says 'change the IP of camera mibo to 192.168.0.22', then target_selector.name='mibo' and camera_patch.ip_address='192.168.0.22'.\n"
+        "If the user asks to make one camera like another existing camera, use source_camera_ref for the existing source camera and keep camera_patch sparse for any explicit overrides on top of that copied base.\n"
         "Do not put the new value inside target_selector unless the user explicitly uses the current value to identify the existing camera.\n"
         "If the user identifies the camera by what it sees, by the location, or by scene cues like pool, garage, front gate, reception, backyard, or sidewalk, prefer target_selector.description for that clue.\n"
+        "authoring_context may list existing cameras already available in the workspace. Use it only to disambiguate which existing camera the user means. Never copy or invent values from it into camera_patch unless the user explicitly asked for that change.\n"
         "Use clear_fields for intentional removals like remove channel, clear subtype, clear description, or blank the street.\n"
         "Set open_form=true only when the user explicitly asks to open, review, inspect, or edit through the form/modal instead of applying directly.\n"
         "If the user says pronouns like 'ela', 'essa camera', or 'a mesma', only rely on the active edit_camera task when it already has a resolved target.\n"
         "Return JSON only with this shape:\n"
         "{"
         "\"target_selector\":{\"id\":123,\"name\":\"mibo\",\"description\":\"pool area\",\"ip_address\":\"192.168.0.21\",\"manufacturer\":\"Intelbras\",\"channel\":\"1\",\"subtype\":\"0\",\"connection_method\":\"RTSP\"},"
+        "\"source_camera_ref\":{\"id\":456,\"name\":\"portao\",\"description\":\"front gate\",\"ip_address\":\"192.168.0.31\",\"manufacturer\":\"Intelbras\"},"
         "\"camera_patch\":{\"ip_address\":\"192.168.0.22\",\"password\":\"nova_senha\",\"description\":\"Recepcao\"},"
         "\"field_sources\":{\"ip_address\":\"explicit_user\",\"password\":\"explicit_user\"},"
         "\"clear_fields\":[\"subtype\"],"
@@ -1226,7 +1290,9 @@ nlohmann::json extractEditDraft_(
         "user_message='abre o formulario da camera mibo para eu revisar' => "
         "{\"target_selector\":{\"name\":\"mibo\"},\"camera_patch\":{},\"field_sources\":{},\"clear_fields\":[],\"open_form\":true}\n"
         "user_message='edite a camera da piscina e mude o nome para Piscina Principal' => "
-        "{\"target_selector\":{\"description\":\"piscina\"},\"camera_patch\":{\"name\":\"Piscina Principal\"},\"field_sources\":{\"name\":\"explicit_user\"},\"clear_fields\":[],\"open_form\":false}\n";
+        "{\"target_selector\":{\"description\":\"piscina\"},\"camera_patch\":{\"name\":\"Piscina Principal\"},\"field_sources\":{\"name\":\"explicit_user\"},\"clear_fields\":[],\"open_form\":false}\n"
+        "user_message='deixe a camera garagem igual a camera portao, mas com nome Garagem 2' => "
+        "{\"target_selector\":{\"name\":\"garagem\"},\"source_camera_ref\":{\"name\":\"portao\"},\"camera_patch\":{\"name\":\"Garagem 2\"},\"field_sources\":{\"name\":\"explicit_user\"},\"clear_fields\":[],\"open_form\":false}\n";
 
     nlohmann::json promptPayload = {
         { "reply_language", replyLanguage },
@@ -1234,6 +1300,7 @@ nlohmann::json extractEditDraft_(
         { "compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
         { "conversation_task_state", conversationContext.value("task_state", defaultOperationTaskState()) },
         { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
+        { "authoring_context", authoringContextForPrompt.is_object() ? authoringContextForPrompt : nlohmann::json::object() },
         { "user_message", userMessage },
     };
 
@@ -1571,6 +1638,52 @@ nlohmann::json buildResolvedCameraDraft_(
         }
     }
     return resolved;
+}
+
+nlohmann::json buildSourceCameraCopyPatch_(
+    const nlohmann::json& sourceCamera,
+    const nlohmann::json& targetCamera,
+    const nlohmann::json& existingPatch,
+    const nlohmann::json& clearFields)
+{
+    nlohmann::json patch = nlohmann::json::object();
+    const auto isClearedField = [&](const std::string& field) -> bool {
+        if (!clearFields.is_array()) {
+            return false;
+        }
+        for (const auto& entry : clearFields) {
+            if (entry.is_string() && entry.get<std::string>() == field) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const auto* field : { "manufacturer", "channel", "subtype", "description" }) {
+        if ((existingPatch.is_object() && existingPatch.contains(field)) || isClearedField(field)) {
+            continue;
+        }
+        const std::string sourceValue = jsonStringField_(sourceCamera, field);
+        if (sourceValue.empty()) {
+            continue;
+        }
+        if (jsonStringField_(targetCamera, field) == sourceValue) {
+            continue;
+        }
+        patch[field] = sourceValue;
+    }
+
+    if ((!existingPatch.is_object() || !existingPatch.contains("connection_method")) &&
+        !isClearedField("connection_method")) {
+        const std::string sourceConnectionMethod =
+            normalizeConnectionMethod_(jsonStringField_(sourceCamera, "connection_method"));
+        if (!sourceConnectionMethod.empty() &&
+            normalizeConnectionMethod_(jsonStringField_(targetCamera, "connection_method")) != sourceConnectionMethod) {
+            patch["connection_method"] = sourceConnectionMethod;
+        }
+    }
+
+    return patch;
 }
 
 nlohmann::json resolveTargetCamera_(
@@ -1913,6 +2026,48 @@ std::string buildCameraNotFoundAnswer_(
     return "I could not safely locate the camera that should be edited. Please confirm the exact name, ID, IP, or a scene/location description.";
 }
 
+std::string buildSourceCameraNotFoundAnswer_(
+    const std::string& language,
+    const nlohmann::json& sourceCameraRef)
+{
+    const std::string label =
+        jsonStringField_(sourceCameraRef, "name").empty()
+            ? jsonStringField_(sourceCameraRef, "ip_address")
+            : jsonStringField_(sourceCameraRef, "name");
+    if (language == "pt") {
+        if (!label.empty()) {
+            return "Nao encontrei a camera \"" + label + "\" para usar como base. Me confirme o nome exato, o ID, o IP ou a cena da camera de origem.";
+        }
+        return "Nao encontrei a camera que voce quer usar como base. Me confirme o nome exato, o ID, o IP ou a cena da camera de origem.";
+    }
+    if (!label.empty()) {
+        return "I could not find the camera \"" + label + "\" to use as the source. Please confirm the exact name, ID, IP, or scene of the source camera.";
+    }
+    return "I could not find the camera you want to use as the source. Please confirm the exact name, ID, IP, or scene of the source camera.";
+}
+
+std::string buildAmbiguousSourceCameraAnswer_(
+    const std::string& language,
+    const nlohmann::json& candidates)
+{
+    std::ostringstream out;
+    if (language == "pt") {
+        out << "Encontrei mais de uma camera possivel para usar como base nessa copia. Confirme qual delas devo usar:\n";
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            out << "\n" << cameraReferenceLine_(candidates[index], index, language);
+        }
+        out << "\n\nPode me responder com o nome exato, o ID, o IP ou uma descricao mais especifica.";
+        return out.str();
+    }
+
+    out << "I found more than one possible camera to use as the source for this copy. Confirm which one I should use:\n";
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        out << "\n" << cameraReferenceLine_(candidates[index], index, language);
+    }
+    out << "\n\nReply with the exact name, ID, IP, or a more specific description.";
+    return out.str();
+}
+
 std::string buildNeedPatchAnswer_(
     const std::string& language,
     const nlohmann::json& camera)
@@ -2069,6 +2224,12 @@ nlohmann::json buildTaskDraft_(
     if (mergedDraft.contains("clear_fields")) {
         draft["clear_fields"] = mergedDraft["clear_fields"];
     }
+    if (mergedDraft.contains("source_camera_ref")) {
+        draft["source_camera_ref"] = mergedDraft["source_camera_ref"];
+    }
+    if (mergedDraft.contains("resolved_source_camera")) {
+        draft["resolved_source_camera"] = mergedDraft["resolved_source_camera"];
+    }
     if (mergedDraft.contains("open_form")) {
         draft["open_form"] = mergedDraft["open_form"];
     }
@@ -2162,6 +2323,36 @@ nlohmann::json buildTaskStateAwaitingPatch_(
             language == "pt" ? "Aguardando campos para editar" : "Waiting for edit details",
             trimCopy_(answer),
             { "camera_patch" },
+            collectedFieldsForEdit_(
+                resolvedCamera,
+                mergedDraft.value("camera_patch", nlohmann::json::object()),
+                mergedDraft.value("clear_fields", nlohmann::json::array())),
+            buildTaskDraft_(mergedDraft, resolvedCamera),
+            mergedDraft.value("field_sources", nlohmann::json::object()),
+            nlohmann::json::object(),
+        });
+}
+
+nlohmann::json buildTaskStateAwaitingSourceCamera_(
+    const nlohmann::json& conversationContext,
+    const nlohmann::json& mergedDraft,
+    const nlohmann::json& resolvedCamera,
+    const std::string& answer,
+    const std::string& language)
+{
+    return upsertActiveOperationTask(
+        conversationContext,
+        OperationTaskDescriptor{
+            "edit_camera",
+            "camera",
+            "update",
+            "collecting_input",
+            "awaiting_source_camera",
+            normalizeAssistantLanguageTag(language),
+            language == "pt" ? "editar uma camera existente" : "edit an existing camera",
+            language == "pt" ? "Aguardando camera de origem" : "Waiting for the source camera",
+            trimCopy_(answer),
+            { "source_camera" },
             collectedFieldsForEdit_(
                 resolvedCamera,
                 mergedDraft.value("camera_patch", nlohmann::json::object()),
@@ -2380,6 +2571,17 @@ SkillRunResult EditCameraSkill::execute(
 
     const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
     const std::string language = effectiveReplyLanguage_(selection, payload, conversationContext);
+    nlohmann::json authoringContext = nlohmann::json::object();
+    if (payload.is_object() && payload.value("authoring_context_enabled", false)) {
+        const nlohmann::json fetchedAuthoringContext = shared::fetchAuthoringContext(agent, payload);
+        if (fetchedAuthoringContext.value("ok", false)) {
+            authoringContext = fetchedAuthoringContext;
+        }
+    }
+    const nlohmann::json authoringContextForPrompt =
+        authoringContext.is_object() && authoringContext.value("ok", false)
+            ? shared::compactAuthoringContextForPrompt(authoringContext)
+            : nlohmann::json::object();
 
     nlohmann::json mergedDraft = mergeEditDrafts_(
         activeEditDraft_(conversationContext),
@@ -2389,7 +2591,7 @@ SkillRunResult EditCameraSkill::execute(
     configureActionModelClient_(llm, payload);
 
     const nlohmann::json extractedDraft =
-        extractEditDraft_(llm, payload, conversationContext, selection);
+        extractEditDraft_(llm, payload, conversationContext, selection, authoringContextForPrompt);
     if (extractedDraft.contains("target_selector") &&
         hasTargetSelector_(extractedDraft["target_selector"])) {
         mergedDraft.erase("target_selector");
@@ -2433,7 +2635,16 @@ SkillRunResult EditCameraSkill::execute(
         buildEditProgress_(language, "resolving_target", 2, 2, 3),
         2500);
 
-    const nlohmann::json inventory = fetchCameraInventory_(agent, payload);
+    nlohmann::json inventory = nlohmann::json::object({
+        { "ok", true },
+        { "error", "" },
+        { "cameras", authoringContext.value("cameras", nlohmann::json::array()) },
+    });
+    if (!authoringContext.value("ok", false) ||
+        !inventory.contains("cameras") ||
+        !inventory["cameras"].is_array()) {
+        inventory = fetchCameraInventory_(agent, payload);
+    }
     if (!inventory.value("ok", false)) {
         result.answer = buildFailureAnswer_(language, jsonStringField_(inventory, "error"));
         result.metadata["task_state"] = buildTaskStateAwaitingTarget_(
@@ -2492,6 +2703,61 @@ SkillRunResult EditCameraSkill::execute(
         }));
 
     const nlohmann::json clearFields = mergedDraft.value("clear_fields", nlohmann::json::array());
+    const nlohmann::json sourceCameraRef =
+        normalizeTargetSelector_(mergedDraft.value("source_camera_ref", nlohmann::json::object()));
+    if (!sourceCameraRef.empty()) {
+        const nlohmann::json sourceResolution =
+            resolveTargetCamera_(inventory, sourceCameraRef, mergedDraft.value("resolved_source_camera", nlohmann::json::object()));
+        const std::string sourceStatus = jsonStringField_(sourceResolution, "status");
+        if (sourceStatus == "ambiguous") {
+            const nlohmann::json candidates = sourceResolution.value("candidates", nlohmann::json::array());
+            result.answer = buildAmbiguousSourceCameraAnswer_(language, candidates);
+            result.metadata["task_state"] = buildTaskStateAwaitingSourceCamera_(
+                conversationContext,
+                mergedDraft,
+                resolvedCamera,
+                result.answer,
+                language);
+            return result;
+        }
+        if (sourceStatus == "not_found" || sourceStatus == "missing_target" ||
+            !sourceResolution.contains("camera") || !sourceResolution["camera"].is_object()) {
+            result.answer = buildSourceCameraNotFoundAnswer_(language, sourceCameraRef);
+            result.metadata["task_state"] = buildTaskStateAwaitingSourceCamera_(
+                conversationContext,
+                mergedDraft,
+                resolvedCamera,
+                result.answer,
+                language);
+            return result;
+        }
+
+        const nlohmann::json resolvedSourceCamera = buildResolvedCameraDraft_(sourceResolution["camera"]);
+        mergedDraft = mergeEditDrafts_(
+            mergedDraft,
+            nlohmann::json::object({
+                { "resolved_source_camera", resolvedSourceCamera },
+            }));
+        const nlohmann::json sourceCopyPatch = buildSourceCameraCopyPatch_(
+            sourceResolution["camera"],
+            resolvedCamera,
+            mergedDraft.value("camera_patch", nlohmann::json::object()),
+            clearFields);
+        if (!sourceCopyPatch.empty()) {
+            patch = mergedDraft.value("camera_patch", nlohmann::json::object());
+            fieldSources = mergedDraft.value("field_sources", nlohmann::json::object());
+            for (auto it = sourceCopyPatch.begin(); it != sourceCopyPatch.end(); ++it) {
+                patch[it.key()] = it.value();
+                if (fieldSource_(fieldSources, it.key()).empty()) {
+                    setFieldSource_(fieldSources, it.key(), "system_default");
+                }
+            }
+            mergedDraft["camera_patch"] = patch;
+            if (!fieldSources.empty()) {
+                mergedDraft["field_sources"] = fieldSources;
+            }
+        }
+    }
     patch = mergedDraft.value("camera_patch", nlohmann::json::object());
 
     if (!hasPatchChanges_(patch, clearFields)) {

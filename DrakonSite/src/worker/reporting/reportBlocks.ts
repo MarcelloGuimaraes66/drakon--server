@@ -52,6 +52,8 @@ export interface ReportDocxContext {
   history?: Record<string, unknown>;
   comparisons?: Record<string, unknown>;
   chatDiscussion?: Record<string, unknown>;
+  details?: Record<string, unknown>;
+  resolvedEntities?: Record<string, unknown>;
 }
 
 export interface ReportDocxInput {
@@ -434,6 +436,304 @@ function buildAgentTable(
   };
 }
 
+function buildJobRunDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Ledger de runs" : "Run ledger",
+    caption: isPt
+      ? "Runs das tarefas com steps, agentes, alertas e identity cards."
+      : "Task runs with steps, agents, alerts, and identity cards.",
+    columns: [
+      { key: "job", label: isPt ? "Tarefa" : "Task", widthWeight: 3.2 },
+      { key: "status", label: isPt ? "Status" : "Status", widthWeight: 1.2, align: "center" },
+      { key: "steps", label: isPt ? "Steps" : "Steps", widthWeight: 1.1, align: "center" },
+      { key: "agents", label: isPt ? "Agentes" : "Agents", widthWeight: 1.1, align: "center" },
+      { key: "alerts", label: isPt ? "Alertas" : "Alerts", widthWeight: 1.1, align: "center" },
+      { key: "identities", label: isPt ? "IDs" : "IDs", widthWeight: 1.0, align: "center" },
+      { key: "duration", label: isPt ? "Dur. (s)" : "Dur. (s)", widthWeight: 1.2, align: "center" },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      job: toDisplayValue(row.job_name, `Job ${toDisplayValue(row.job_id, "")}`),
+      status: toDisplayValue(row.status, "—"),
+      steps: toDisplayValue(row.step_count, "0"),
+      agents: toDisplayValue(row.agent_run_count, "0"),
+      alerts: toDisplayValue(row.alert_count, "0"),
+      identities: toDisplayValue(row.identity_card_count, "0"),
+      duration: toDisplayValue(row.duration_seconds, "—"),
+    })),
+  };
+}
+
+function buildStepRunDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Execucao de steps" : "Step execution",
+    caption: isPt
+      ? "Steps, cameras, agentes e resultados estruturados."
+      : "Steps, cameras, agents, and structured results.",
+    columns: [
+      { key: "step", label: isPt ? "Step" : "Step", widthWeight: 3.2 },
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.2 },
+      { key: "status", label: isPt ? "Status" : "Status", widthWeight: 1.2, align: "center" },
+      { key: "agents", label: isPt ? "Agentes" : "Agents", widthWeight: 1.1, align: "center" },
+      { key: "results", label: isPt ? "Resultados" : "Results", widthWeight: 1.1, align: "center" },
+      { key: "alerts", label: isPt ? "Alertas" : "Alerts", widthWeight: 1.1, align: "center" },
+      { key: "identities", label: isPt ? "IDs" : "IDs", widthWeight: 1.0, align: "center" },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      step: toDisplayValue(row.step_name, `Step ${toDisplayValue(row.step_id, "")}`),
+      camera: toDisplayValue(row.camera_name, "—"),
+      status: toDisplayValue(row.status, "—"),
+      agents: toDisplayValue(row.agent_run_count, "0"),
+      results: toDisplayValue(row.result_count, "0"),
+      alerts: toDisplayValue(row.alert_count, "0"),
+      identities: toDisplayValue(row.identity_card_count, "0"),
+    })),
+  };
+}
+
+function buildStepResultDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Resultados e respostas" : "Results and responses",
+    caption: isPt
+      ? "Saidas estruturadas com modelo, condicao de alerta e preview."
+      : "Structured outputs with model, alert condition, and preview.",
+    columns: [
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.1 },
+      { key: "model", label: isPt ? "Modelo" : "Model", widthWeight: 1.8 },
+      { key: "condition", label: isPt ? "Cond." : "Cond.", widthWeight: 0.9, align: "center" },
+      { key: "confidence", label: isPt ? "Conf." : "Conf.", widthWeight: 1.0, align: "center" },
+      { key: "preview", label: isPt ? "Conteúdo" : "Content", widthWeight: 4.2 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      model: toDisplayValue(row.model, toDisplayValue(row.provider, "—")),
+      condition: boolDisplay(row.alert_condition_true, isPt),
+      confidence: toDisplayValue(row.confidence, "—"),
+      preview: toDisplayValue(row.output_preview, "—"),
+    })),
+  };
+}
+
+function buildCameraAgentRunDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Execucoes de AI agents da camera" : "Camera AI agent runs",
+    caption: isPt
+      ? "Runs por camera com avaliacoes, positivos finais e ultima resposta."
+      : "Per-camera runs with evaluations, final positives, and last response.",
+    columns: [
+      { key: "camera", label: isPt ? "Camera" : "Camera", widthWeight: 1.8 },
+      { key: "agent", label: isPt ? "Agente" : "Agent", widthWeight: 1.8 },
+      { key: "evals", label: isPt ? "Avals." : "Evals.", widthWeight: 0.9, align: "center" },
+      { key: "finals", label: isPt ? "Final+" : "Final+", widthWeight: 0.9, align: "center" },
+      { key: "tokens", label: isPt ? "Tokens" : "Tokens", widthWeight: 1.1, align: "center" },
+      { key: "answer", label: isPt ? "Ultima resposta" : "Last response", widthWeight: 3.9 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      agent: toDisplayValue(row.agent_key, toDisplayValue(row.algorithm_type, "--")),
+      evals: toDisplayValue(row.evaluation_count, "0"),
+      finals: toDisplayValue(row.final_positive_count, "0"),
+      tokens: toDisplayValue(row.total_tokens_total, "0"),
+      answer: toDisplayValue(row.last_answer, "--"),
+    })),
+  };
+}
+
+function buildResponseTimelineTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Timeline de respostas" : "Response timeline",
+    caption: isPt
+      ? "Respostas preservadas por execucao, com estado LLM e decisao final."
+      : "Preserved responses per execution, with LLM state and final decision.",
+    columns: [
+      { key: "time", label: isPt ? "Horario" : "Time", widthWeight: 1.6 },
+      { key: "camera", label: isPt ? "Camera" : "Camera", widthWeight: 1.8 },
+      { key: "agent", label: isPt ? "Agente" : "Agent", widthWeight: 1.5 },
+      { key: "llm", label: "LLM", widthWeight: 0.9, align: "center" },
+      { key: "final", label: isPt ? "Final" : "Final", widthWeight: 0.9, align: "center" },
+      { key: "answer", label: isPt ? "Resposta" : "Response", widthWeight: 4.3 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      time: toDisplayValue(row.event_at, "--"),
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      agent: toDisplayValue(row.agent_key, toDisplayValue(row.status, "--")),
+      llm:
+        row.llm_alert_condition === null || row.llm_alert_condition === undefined
+          ? "--"
+          : boolDisplay(row.llm_alert_condition, isPt),
+      final:
+        row.final_alert_condition === null || row.final_alert_condition === undefined
+          ? "--"
+          : boolDisplay(row.final_alert_condition, isPt),
+      answer: toDisplayValue(row.answer, toDisplayValue(row.status, "--")),
+    })),
+  };
+}
+
+function buildCameraSessionDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Sessoes de câmera" : "Camera sessions",
+    caption: isPt
+      ? "Sessões com alertas, identity cards e incidentes de conectividade."
+      : "Sessions with alerts, identity cards, and connectivity incidents.",
+    columns: [
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.8 },
+      { key: "status", label: isPt ? "Status" : "Status", widthWeight: 1.2, align: "center" },
+      { key: "alerts", label: isPt ? "Alertas" : "Alerts", widthWeight: 1.1, align: "center" },
+      { key: "identities", label: isPt ? "IDs" : "IDs", widthWeight: 1.0, align: "center" },
+      { key: "incidents", label: isPt ? "Incidentes" : "Incidents", widthWeight: 1.2, align: "center" },
+      { key: "recoveries", label: isPt ? "Recups." : "Recovs.", widthWeight: 1.1, align: "center" },
+      { key: "duration", label: isPt ? "Dur. (s)" : "Dur. (s)", widthWeight: 1.2, align: "center" },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      status: toDisplayValue(row.status, "—"),
+      alerts: toDisplayValue(row.alert_count, "0"),
+      identities: toDisplayValue(row.identity_card_count, "0"),
+      incidents: toDisplayValue(row.connectivity_incident_count, "0"),
+      recoveries: toDisplayValue(row.recovered_count, "0"),
+      duration: toDisplayValue(row.duration_seconds, "—"),
+    })),
+  };
+}
+
+function buildAlertDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Ledger de alertas" : "Alert ledger",
+    caption: isPt
+      ? "Alertas com câmera, prioridade, modelo e alert_condition."
+      : "Alerts with camera, priority, model, and alert_condition.",
+    columns: [
+      { key: "time", label: isPt ? "Horário" : "Time", widthWeight: 1.7 },
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.1 },
+      { key: "priority", label: isPt ? "Prioridade" : "Priority", widthWeight: 1.3, align: "center" },
+      { key: "condition", label: isPt ? "Cond." : "Cond.", widthWeight: 0.9, align: "center" },
+      { key: "model", label: isPt ? "Modelo" : "Model", widthWeight: 1.8 },
+      { key: "message", label: isPt ? "Mensagem" : "Message", widthWeight: 3.2 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      time: toDisplayValue(row.created_at),
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      priority: toDisplayValue(row.priority_level, "—"),
+      condition: boolDisplay(row.alert_condition_true, isPt),
+      model: toDisplayValue(row.model, "—"),
+      message: toDisplayValue(row.message, "—"),
+    })),
+  };
+}
+
+function buildIdentityCardDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Identity cards" : "Identity cards",
+    caption: isPt
+      ? "Ocorrências com vínculo de câmera, origem e crop persistido."
+      : "Occurrences with linked camera, source, and persisted crop.",
+    columns: [
+      { key: "time", label: isPt ? "Horário" : "Time", widthWeight: 1.8 },
+      { key: "identity", label: isPt ? "Identidade" : "Identity", widthWeight: 2.6 },
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.1 },
+      { key: "source", label: isPt ? "Origem" : "Source", widthWeight: 1.5, align: "center" },
+      { key: "confidence", label: isPt ? "Conf." : "Conf.", widthWeight: 1.0, align: "center" },
+      { key: "crop", label: isPt ? "Crop" : "Crop", widthWeight: 0.9, align: "center" },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      time: toDisplayValue(row.created_at),
+      identity: toDisplayValue(row.display_name, toDisplayValue(row.identity_card_id, "—")),
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      source: toDisplayValue(row.source_type, "—"),
+      confidence: toDisplayValue(row.confidence, "—"),
+      crop: boolDisplay(Boolean(row.crop_storage_key || row.crop_url), isPt),
+    })),
+  };
+}
+
+function buildConnectivityIncidentDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Conectividade" : "Connectivity",
+    caption: isPt
+      ? "Incidentes de conectividade por camera e fase."
+      : "Connectivity incidents by camera and phase.",
+    columns: [
+      { key: "camera", label: isPt ? "Câmera" : "Camera", widthWeight: 2.4 },
+      { key: "phase", label: isPt ? "Fase" : "Phase", widthWeight: 1.6, align: "center" },
+      { key: "status", label: isPt ? "Status" : "Status", widthWeight: 1.2, align: "center" },
+      { key: "duration", label: isPt ? "Dur. (s)" : "Dur. (s)", widthWeight: 1.1, align: "center" },
+      { key: "started", label: isPt ? "Início" : "Start", widthWeight: 1.8 },
+      { key: "recovered", label: isPt ? "Recup." : "Recovered", widthWeight: 1.8 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      camera: toDisplayValue(row.camera_name, `Camera ${toDisplayValue(row.camera_id, "")}`),
+      phase: toDisplayValue(row.failure_phase, "—"),
+      status: toDisplayValue(row.status, "—"),
+      duration: toDisplayValue(row.duration_seconds, "—"),
+      started: toDisplayValue(row.started_at),
+      recovered: toDisplayValue(row.recovered_at),
+    })),
+  };
+}
+
+function buildStructuredErrorDetailTable(
+  rows: Array<Record<string, unknown>>,
+  isPt: boolean
+): ReportTable | null {
+  if (rows.length === 0) return null;
+  return {
+    title: isPt ? "Erros estruturados" : "Structured errors",
+    caption: isPt
+      ? "Falhas de modelo, API e execucao correlacionadas."
+      : "Correlated model, API, and execution failures.",
+    columns: [
+      { key: "time", label: isPt ? "Horário" : "Time", widthWeight: 1.7 },
+      { key: "provider", label: isPt ? "Provider" : "Provider", widthWeight: 1.4, align: "center" },
+      { key: "model", label: isPt ? "Modelo" : "Model", widthWeight: 1.8 },
+      { key: "flow", label: isPt ? "Fluxo" : "Flow", widthWeight: 1.4, align: "center" },
+      { key: "message", label: isPt ? "Mensagem" : "Message", widthWeight: 3.7 },
+    ],
+    rows: rows.slice(0, 6).map((row) => ({
+      time: toDisplayValue(row.occurred_at),
+      provider: toDisplayValue(row.provider, "—"),
+      model: toDisplayValue(row.model, "—"),
+      flow: toDisplayValue(row.flow, "—"),
+      message: toDisplayValue(row.message, "—"),
+    })),
+  };
+}
+
 function buildRecentActivityTable(
   history: Record<string, unknown> | undefined,
   isPt: boolean
@@ -598,6 +898,12 @@ export function buildReportDocumentModel(input: ReportDocxInput): ReportDocument
   const context = input.context || {};
   const isPt = isPtLanguage(context.replyLanguage);
   const reportKindLabel = humanizeReportKind(input.reportKind, isPt);
+  const reportKindKey = normalizeText(input.reportKind).toLowerCase();
+  const focusSet = new Set(
+    Array.isArray(context.focus)
+      ? context.focus.map((entry) => normalizeText(entry).toLowerCase()).filter(Boolean)
+      : []
+  );
   const metadata = buildMetadataItems(input, isPt);
   const evidence = buildReportEvidenceLayout({
     images: input.images || [],
@@ -607,12 +913,151 @@ export function buildReportDocumentModel(input: ReportDocxInput): ReportDocument
   const kpis = buildKpis(input);
   const comparisonRows = context.comparisons || {};
   const history = context.history;
-  const tables = [
-    buildCameraTable(coerceRows(comparisonRows.cameras), isPt),
-    buildJobTable(coerceRows(comparisonRows.jobs), isPt),
-    buildAgentTable(coerceRows(comparisonRows.agents), isPt),
-    buildRecentActivityTable(history, isPt),
-  ].filter((table): table is ReportTable => Boolean(table));
+  const detailRows = context.details || {};
+  const availableTables = new Map<string, ReportTable>();
+  const registerTable = (key: string, table: ReportTable | null) => {
+    if (table) {
+      availableTables.set(key, table);
+    }
+  };
+
+  registerTable("job_runs", buildJobRunDetailTable(coerceRows(detailRows.job_runs), isPt));
+  registerTable("step_runs", buildStepRunDetailTable(coerceRows(detailRows.step_runs), isPt));
+  registerTable(
+    "camera_agent_runs",
+    buildCameraAgentRunDetailTable(coerceRows(detailRows.camera_agent_runs), isPt)
+  );
+  registerTable(
+    "step_results",
+    buildStepResultDetailTable(coerceRows(detailRows.step_results), isPt)
+  );
+  registerTable(
+    "response_timeline",
+    buildResponseTimelineTable(coerceRows(detailRows.response_timeline), isPt)
+  );
+  registerTable(
+    "camera_sessions",
+    buildCameraSessionDetailTable(coerceRows(detailRows.camera_sessions), isPt)
+  );
+  registerTable("alerts", buildAlertDetailTable(coerceRows(detailRows.alerts), isPt));
+  registerTable(
+    "identity_cards",
+    buildIdentityCardDetailTable(coerceRows(detailRows.identity_cards), isPt)
+  );
+  registerTable(
+    "connectivity",
+    buildConnectivityIncidentDetailTable(coerceRows(detailRows.connectivity_incidents), isPt)
+  );
+  registerTable(
+    "structured_errors",
+    buildStructuredErrorDetailTable(coerceRows(detailRows.structured_errors), isPt)
+  );
+  registerTable("cameras", buildCameraTable(coerceRows(comparisonRows.cameras), isPt));
+  registerTable("jobs", buildJobTable(coerceRows(comparisonRows.jobs), isPt));
+  registerTable("agents", buildAgentTable(coerceRows(comparisonRows.agents), isPt));
+  registerTable("recent_activity", buildRecentActivityTable(history, isPt));
+
+  const isCameraReport = reportKindKey === "camera_health" || focusSet.has("cameras");
+  const isJobReport = reportKindKey === "job_activity" || focusSet.has("jobs");
+  const isAgentReport = reportKindKey === "agent_activity" || focusSet.has("agents");
+  const isAlertReport = reportKindKey === "detections_alerts" || focusSet.has("detections");
+
+  let tableOrder: string[];
+  if (isCameraReport) {
+    tableOrder = [
+      "camera_sessions",
+      "camera_agent_runs",
+      "connectivity",
+      "alerts",
+      "identity_cards",
+      "step_results",
+      "response_timeline",
+      "step_runs",
+      "job_runs",
+      "structured_errors",
+      "cameras",
+      "recent_activity",
+    ];
+  } else if (isJobReport) {
+    tableOrder = [
+      "job_runs",
+      "step_runs",
+      "camera_agent_runs",
+      "step_results",
+      "response_timeline",
+      "alerts",
+      "identity_cards",
+      "structured_errors",
+      "camera_sessions",
+      "jobs",
+      "agents",
+      "recent_activity",
+    ];
+  } else if (isAgentReport) {
+    tableOrder = [
+      "camera_agent_runs",
+      "step_runs",
+      "step_results",
+      "response_timeline",
+      "job_runs",
+      "structured_errors",
+      "alerts",
+      "camera_sessions",
+      "agents",
+      "recent_activity",
+      "jobs",
+    ];
+  } else if (isAlertReport) {
+    tableOrder = [
+      "alerts",
+      "camera_agent_runs",
+      "step_results",
+      "response_timeline",
+      "identity_cards",
+      "camera_sessions",
+      "step_runs",
+      "job_runs",
+      "connectivity",
+      "recent_activity",
+      "cameras",
+    ];
+  } else {
+    tableOrder = [
+      "camera_sessions",
+      "camera_agent_runs",
+      "job_runs",
+      "step_runs",
+      "step_results",
+      "alerts",
+      "identity_cards",
+      "structured_errors",
+      "cameras",
+      "jobs",
+      "agents",
+      "recent_activity",
+    ];
+  }
+
+  const tables: ReportTable[] = [];
+  for (const key of tableOrder) {
+    const table = availableTables.get(key);
+    if (table && !tables.includes(table)) {
+      tables.push(table);
+    }
+    if (tables.length >= 7) {
+      break;
+    }
+  }
+  if (tables.length < 7) {
+    for (const table of availableTables.values()) {
+      if (!tables.includes(table)) {
+        tables.push(table);
+      }
+      if (tables.length >= 7) {
+        break;
+      }
+    }
+  }
 
   const topFindings = Array.isArray(context.topFindings)
     ? context.topFindings.map((entry) => normalizeText(entry)).filter(Boolean).slice(0, 4)

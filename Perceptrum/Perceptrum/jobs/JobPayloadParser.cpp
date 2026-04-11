@@ -450,6 +450,40 @@ static std::vector<JobPolygonPoint> parsePolygonNormFromNode_(const json& holder
     return out;
 }
 
+static JobFrameWindowNorm parseFrameWindowNormFromNode_(const json& holder) {
+    JobFrameWindowNorm out;
+    const json* node = nullptr;
+    if (holder.contains("frame_window_norm") && holder["frame_window_norm"].is_object()) {
+        node = &holder["frame_window_norm"];
+    }
+    else if (holder.contains("frameWindowNorm") && holder["frameWindowNorm"].is_object()) {
+        node = &holder["frameWindowNorm"];
+    }
+    if (!node) return out;
+
+    const auto readCoord = [&](const char* key, double fallback) {
+        if (!node->contains(key) || !(*node)[key].is_number()) return fallback;
+        return clamp01_((*node)[key].get<double>());
+    };
+
+    const double width = readCoord("width", 1.0);
+    const double height = readCoord("height", 1.0);
+    if (width <= 0.0 || height <= 0.0) return out;
+
+    const double maxX = (std::max)(0.0, 1.0 - width);
+    const double maxY = (std::max)(0.0, 1.0 - height);
+    out.x = (std::min)(maxX, (std::max)(0.0, readCoord("x", 0.0)));
+    out.y = (std::min)(maxY, (std::max)(0.0, readCoord("y", 0.0)));
+    out.width = width;
+    out.height = height;
+    out.enabled =
+        out.x > 1e-6 ||
+        out.y > 1e-6 ||
+        out.width < (1.0 - 1e-6) ||
+        out.height < (1.0 - 1e-6);
+    return out;
+}
+
 static std::vector<JobAnalysisRegion> parseAnalysisRegionsFromNode_(
     const json& holder,
     const ParsedPromptTemplateFields_& defaults,
@@ -489,6 +523,7 @@ static std::vector<JobAnalysisRegion> parseAnalysisRegionsFromNode_(
         region.label = safeString(item, "label", "");
         region.enabled = readBoolLikeField(item, { "enabled" }, true);
         region.full_frame = readBoolLikeField(item, { "full_frame", "fullFrame" }, false);
+        region.frame_window_norm = parseFrameWindowNormFromNode_(item);
         region.polygon_norm = parsePolygonNormFromNode_(item);
         if (!region.full_frame && (region.polygon_norm.size() < 3 || region.polygon_norm.size() > 20)) {
             continue;
@@ -609,6 +644,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
 
     JobStartPayload out;
     out.version = p.value("version", 1);
+    out.job_run_id = safeString(p, "job_run_id");
 
     if (!p.contains("job") || !p["job"].is_object()) {
         throw std::runtime_error("job_start payload missing job object");
@@ -677,6 +713,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
         if (s.contains("step") && s["step"].is_object()) {
             const json& st = s["step"];
             step.id = st.value("id", -1);
+            step.step_run_id = safeString(s, "step_run_id", safeString(st, "step_run_id", ""));
             step.step_order = st.value("step_order", 0);
             step.name = safeString(st, "name");
             step.timeout_seconds = st.value("timeout_seconds", 0);
@@ -988,6 +1025,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
             for (auto& a : s["agents"]) {
                 JobAgentDef ag;
                 ag.id = a.value("id", -1);
+                ag.agent_run_id = safeString(a, "agent_run_id");
                 ag.agent_key = safeString(a, "agent_key");
                 ag.prompt_template = safeString(a, "prompt_template");
                 ag.priority_level = safeString(a, "priority_level", "");

@@ -47,8 +47,8 @@ export function useThumbnailPolling(cameras: Camera[], onUpdate: (updates: Thumb
     // a full dashboard refresh.
     pollingManager.register('camera-thumbnails', {
       url: '/api/camera-thumbnails',
-      interval: 10000,
-      jitterMaxMs: 500,
+      interval: 3000,
+      jitterMaxMs: 0,
       onData: (allCameras: Camera[]) => {
         if (!Array.isArray(allCameras)) {
           return;

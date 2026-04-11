@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <initializer_list>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -14,6 +15,7 @@
 #include "../OperationTaskState.h"
 #include "../ProgressUtils.h"
 #include "../PromptBuilder.h"
+#include "shared/AgentAuthoringShared.h"
 
 namespace chatv2 {
 
@@ -37,6 +39,16 @@ std::string lowerAsciiCopy_(std::string value)
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+std::string firstNonEmptyText_(std::initializer_list<std::string> values)
+{
+    for (const auto& value : values) {
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    return "";
 }
 
 std::string upperAsciiCopy_(std::string value)
@@ -728,6 +740,35 @@ nlohmann::json normalizeStepCameraSelector_(const nlohmann::json& value)
         { "target_id", "camera_id" });
 }
 
+nlohmann::json normalizeSourceAgentRef_(const nlohmann::json& value)
+{
+    nlohmann::json normalized = normalizeSelectorObject_(
+        value,
+        {
+            "location_type",
+            "display_name",
+            "summary",
+            "camera_name",
+            "step_title",
+            "job_name",
+            "slot_key",
+            "slot_label",
+            "semantic_hint",
+        },
+        { "agent_id", "camera_id", "step_id", "job_id", "target_id" });
+
+    if (normalized.contains("location_type") && normalized["location_type"].is_string()) {
+        const std::string locationType = lowerAsciiCopy_(trimCopy_(normalized["location_type"].get<std::string>()));
+        if (locationType == "camera" || locationType == "step_default" || locationType == "step_camera") {
+            normalized["location_type"] = locationType;
+        }
+        else {
+            normalized.erase("location_type");
+        }
+    }
+    return normalized;
+}
+
 nlohmann::json normalizeDestinationTypes_(const nlohmann::json& value)
 {
     nlohmann::json normalized = nlohmann::json::array();
@@ -856,6 +897,11 @@ nlohmann::json normalizeAgentExtractionResult_(const nlohmann::json& parsed)
         normalized["step_camera_selector"] = stepCameraSelector;
     }
 
+    const nlohmann::json sourceAgentRef = normalizeSourceAgentRef_(parsed.value("source_agent_ref", nlohmann::json::object()));
+    if (!sourceAgentRef.empty()) {
+        normalized["source_agent_ref"] = sourceAgentRef;
+    }
+
     const nlohmann::json destinations = normalizeDestinationTypes_(parsed.value("destination_types", nlohmann::json::array()));
     if (!destinations.empty()) {
         normalized["destination_types"] = destinations;
@@ -926,6 +972,12 @@ nlohmann::json normalizeRouterCreateAgentDraft_(const SkillSelection& selection)
         normalizeStepCameraSelector_(args.value("step_camera_selector", nlohmann::json::object()));
     if (!stepCameraSelector.empty()) {
         normalized["step_camera_selector"] = stepCameraSelector;
+    }
+
+    const nlohmann::json sourceAgentRef =
+        normalizeSourceAgentRef_(args.value("source_agent_ref", nlohmann::json::object()));
+    if (!sourceAgentRef.empty()) {
+        normalized["source_agent_ref"] = sourceAgentRef;
     }
 
     const nlohmann::json destinations =
@@ -1003,11 +1055,13 @@ nlohmann::json mergeCreateAgentDrafts_(
         "camera_selector",
         "step_selector",
         "step_camera_selector",
+        "source_agent_ref",
         "agent_patch",
         "field_sources",
         "resolved_camera",
         "resolved_step",
         "resolved_step_camera",
+        "resolved_source_agent",
     };
     for (const auto* field : objectFields) {
         if (incomingDraft.contains(field) && incomingDraft[field].is_object()) {
@@ -1052,9 +1106,14 @@ nlohmann::json extractCreateAgentDraft_(
     const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext,
-    const SkillSelection& selection);
+    const SkillSelection& selection,
+    const nlohmann::json& authoringContextForPrompt);
 
 nlohmann::json fetchCameraInventory_(
+    AgentCore& agent,
+    const nlohmann::json& payload);
+
+nlohmann::json fetchAgentInventory_(
     AgentCore& agent,
     const nlohmann::json& payload);
 
@@ -1075,7 +1134,8 @@ nlohmann::json extractCreateAgentDraft_(
     const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext,
-    const SkillSelection& selection)
+    const SkillSelection& selection,
+    const nlohmann::json& authoringContextForPrompt)
 {
     if (!llm.isConfigured()) {
         return nlohmann::json::object();
@@ -1091,6 +1151,7 @@ nlohmann::json extractCreateAgentDraft_(
         "Use the latest user_message plus the active create_camera_agent task in conversation_task_state when present.\n"
         "This is a semantic extraction task, not a delimiter-only parser.\n"
         "Understand natural requests about detecting, recognizing, watching for, tracking, alerting on, creating an AI agent, using an existing face target, using Drakon Find targets, applying the agent on a camera, applying it on a workflow step, or opening the form for review.\n"
+        "authoring_context may list existing cameras, jobs, steps, and agents already available in the workspace. Use it only to disambiguate references the user already made.\n"
         "Never invent camera names, step names, target ids, target names, destinations, polygons, or installation scope that the user did not provide or clearly imply.\n"
         "goal_summary is the user's high-level detection goal in one sentence.\n"
         "If the user only says they want to create or add an agent on a camera or step, but does not say what the agent should analyze, detect, recognize, compare, count, or alert on, goal_summary must stay empty.\n"
@@ -1109,6 +1170,8 @@ nlohmann::json extractCreateAgentDraft_(
         "Do not invent analysis_regions. Leave it empty and set needs_visual_context=true when the design will need a snapshot to suggest a polygon or a region.\n"
         "Use face_target_refs only when the user clearly references one or more existing face targets.\n"
         "Use drakon_find_target_refs only when the user clearly references one or more existing Drakon Find targets.\n"
+        "Use source_agent_ref when the user asks to copy, clone, duplicate, reuse, or use the same settings as an existing agent.\n"
+        "source_agent_ref should identify the existing agent using agent_id, display_name, camera_name, step_title, job_name, slot_key, slot_label, or semantic_hint when the user provided those cues.\n"
         "Set open_form=true only when the user explicitly asks to open, review, inspect, or edit through the form/modal instead of applying directly.\n"
         "If the user says pronouns like 'essa camera', 'essa etapa', 'o mesmo agente', or 'ali', only rely on the active create_camera_agent task when it already has resolved entities.\n"
         "Return JSON only with this shape:\n"
@@ -1117,6 +1180,7 @@ nlohmann::json extractCreateAgentDraft_(
         "\"camera_selector\":{\"id\":123,\"name\":\"portao\",\"scene_label\":\"front_door\",\"scene_description\":\"front gate\",\"description\":\"front gate\",\"ip_address\":\"192.168.0.21\",\"manufacturer\":\"Intelbras\",\"channel\":\"1\",\"subtype\":\"0\",\"connection_method\":\"RTSP\"},"
         "\"step_selector\":{\"id\":44,\"title\":\"portao\",\"job_name\":\"perimetro\",\"prompt\":\"watch entrances\"},"
         "\"step_camera_selector\":{\"target_id\":9,\"camera_id\":123,\"camera_name\":\"Portao\",\"slot_key\":\"entrada_principal\",\"slot_label\":\"Entrada principal\",\"scene_label\":\"front_door\",\"scene_description\":\"front gate\",\"description\":\"front gate\"},"
+        "\"source_agent_ref\":{\"agent_id\":77,\"display_name\":\"Pessoa no portao\",\"camera_name\":\"Portao\",\"step_title\":\"Entrada\",\"job_name\":\"Perimetro\",\"slot_key\":\"entrada_principal\",\"semantic_hint\":\"agent that detects people entering the gate\"},"
         "\"destination_types\":[\"camera\"],"
         "\"agent_patch\":{\"display_name\":\"Pessoa no portao\",\"prompt_template\":\"Observe o portao frontal.\",\"alert_condition\":\"Acione quando houver uma pessoa dentro da area do portao.\",\"negative_condition\":\"Ignore a rua ao fundo.\",\"input_type\":\"video\",\"run_every\":10},"
         "\"field_sources\":{\"display_name\":\"explicit_user\",\"run_every\":\"implied_user\"},"
@@ -1142,6 +1206,8 @@ nlohmann::json extractCreateAgentDraft_(
         "{\"goal_summary\":\"detectar carro parado\",\"step_selector\":{\"title\":\"portao\"},\"destination_types\":[\"step_default\"],\"agent_patch\":{},\"field_sources\":{},\"face_target_refs\":[],\"drakon_find_target_refs\":[],\"open_form\":false,\"needs_visual_context\":false}\n"
         "user_message='use no step entrada, mas so na camera garagem' => "
         "{\"goal_summary\":\"\",\"step_selector\":{\"title\":\"entrada\"},\"step_camera_selector\":{\"camera_name\":\"garagem\"},\"destination_types\":[\"step_camera\"],\"agent_patch\":{},\"field_sources\":{},\"face_target_refs\":[],\"drakon_find_target_refs\":[],\"open_form\":false,\"needs_visual_context\":false}\n"
+        "user_message='copie o agente pessoa no portao da tarefa perimetro para o step entrada na camera garagem' => "
+        "{\"goal_summary\":\"\",\"step_selector\":{\"title\":\"entrada\",\"job_name\":\"perimetro\"},\"step_camera_selector\":{\"camera_name\":\"garagem\"},\"source_agent_ref\":{\"display_name\":\"pessoa no portao\",\"job_name\":\"perimetro\"},\"destination_types\":[\"step_camera\"],\"agent_patch\":{},\"field_sources\":{},\"face_target_refs\":[],\"drakon_find_target_refs\":[],\"open_form\":false,\"needs_visual_context\":false}\n"
         "user_message='quero um agente para reconhecer o joao da recepcao e ignorar outras pessoas' => "
         "{\"goal_summary\":\"reconhecer joao da recepcao e ignorar outras pessoas\",\"destination_types\":[],\"agent_patch\":{},\"field_sources\":{},\"face_target_refs\":[{\"name\":\"joao da recepcao\"}],\"drakon_find_target_refs\":[],\"open_form\":false,\"needs_visual_context\":false}\n"
         "user_message='detecte invasao apenas dentro do patio, desenhando a area no chao' => "
@@ -1153,6 +1219,7 @@ nlohmann::json extractCreateAgentDraft_(
         { "compact_context", conversationContext.value("compact_context", nlohmann::json::object()) },
         { "conversation_task_state", conversationContext.value("task_state", defaultOperationTaskState()) },
         { "recent_turns", conversationContext.value("recent_turns", nlohmann::json::array()) },
+        { "authoring_context", authoringContextForPrompt.is_object() ? authoringContextForPrompt : nlohmann::json::object() },
         { "user_message", userMessage },
     };
 
@@ -1233,6 +1300,44 @@ nlohmann::json fetchCameraInventory_(
         { "ok", true },
         { "error", "" },
         { "cameras", cameras },
+    });
+}
+
+nlohmann::json fetchAgentInventory_(
+    AgentCore& agent,
+    const nlohmann::json& payload)
+{
+    const std::string clientId = clientIdFromPayload_(payload).empty()
+        ? agent.getClientId()
+        : clientIdFromPayload_(payload);
+    const std::string url =
+        agent.getBackendBaseUrl() + "/api/agent/agents?client_id=" + clientId;
+    const HttpResponse response = getUrl(
+        url,
+        agent.getExeToken(),
+        {},
+        7000);
+    if (!response.ok()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", parseErrorMessage_(response) },
+            { "agents", nlohmann::json::array() },
+        });
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object() || !parsed.contains("agents") || !parsed["agents"].is_array()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_agent_inventory" },
+            { "agents", nlohmann::json::array() },
+        });
+    }
+
+    return nlohmann::json::object({
+        { "ok", true },
+        { "error", "" },
+        { "agents", parsed["agents"] },
     });
 }
 
@@ -2115,6 +2220,369 @@ nlohmann::json resolveStepCamera_(
     return result;
 }
 
+bool stringMatchesLoose_(const std::string& candidate, const std::string& query)
+{
+    const std::string normalizedCandidate = compactToken_(candidate);
+    const std::string normalizedQuery = compactToken_(query);
+    if (normalizedQuery.empty()) {
+        return true;
+    }
+    if (normalizedCandidate.empty()) {
+        return false;
+    }
+    return normalizedCandidate == normalizedQuery ||
+        normalizedCandidate.find(normalizedQuery) != std::string::npos ||
+        normalizedQuery.find(normalizedCandidate) != std::string::npos;
+}
+
+std::string sourceAgentLocationType_(const nlohmann::json& value)
+{
+    return lowerAsciiCopy_(jsonStringField_(value, "location_type"));
+}
+
+bool entryMatchesSourceAgentRef_(
+    const nlohmann::json& item,
+    const nlohmann::json& sourceAgentRef)
+{
+    const std::string locationType = lowerAsciiCopy_(jsonStringField_(sourceAgentRef, "location_type"));
+    if (!locationType.empty() && locationType != sourceAgentLocationType_(item)) {
+        return false;
+    }
+
+    int agentId = 0;
+    if (tryJsonIntField_(sourceAgentRef, "agent_id", agentId) && agentId > 0) {
+        int candidateAgentId = 0;
+        return tryJsonIntField_(item, "agent_id", candidateAgentId) && candidateAgentId == agentId;
+    }
+
+    int cameraId = 0;
+    if (tryJsonIntField_(sourceAgentRef, "camera_id", cameraId) && cameraId > 0) {
+        int candidateCameraId = 0;
+        if (!tryJsonIntField_(item, "camera_id", candidateCameraId) || candidateCameraId != cameraId) {
+            return false;
+        }
+    }
+    int stepId = 0;
+    if (tryJsonIntField_(sourceAgentRef, "step_id", stepId) && stepId > 0) {
+        int candidateStepId = 0;
+        if (!tryJsonIntField_(item, "step_id", candidateStepId) || candidateStepId != stepId) {
+            return false;
+        }
+    }
+    int jobId = 0;
+    if (tryJsonIntField_(sourceAgentRef, "job_id", jobId) && jobId > 0) {
+        int candidateJobId = 0;
+        if (!tryJsonIntField_(item, "job_id", candidateJobId) || candidateJobId != jobId) {
+            return false;
+        }
+    }
+    int targetId = 0;
+    if (tryJsonIntField_(sourceAgentRef, "target_id", targetId) && targetId > 0) {
+        int candidateTargetId = 0;
+        if (!tryJsonIntField_(item, "target_id", candidateTargetId) || candidateTargetId != targetId) {
+            return false;
+        }
+    }
+
+    const std::vector<std::pair<const char*, const char*>> stringFields = {
+        { "display_name", "display_name" },
+        { "summary", "summary" },
+        { "camera_name", "camera_name" },
+        { "step_title", "step_title" },
+        { "job_name", "job_name" },
+        { "slot_key", "slot_key" },
+        { "slot_label", "slot_label" },
+    };
+    for (const auto& field : stringFields) {
+        if (!stringMatchesLoose_(jsonStringField_(item, field.second), jsonStringField_(sourceAgentRef, field.first))) {
+            return false;
+        }
+    }
+
+    const std::string semanticHint = jsonStringField_(sourceAgentRef, "semantic_hint");
+    if (!semanticHint.empty()) {
+        std::string searchText = jsonStringField_(item, "display_name");
+        searchText += " " + jsonStringField_(item, "summary");
+        searchText += " " + jsonStringField_(item, "camera_name");
+        searchText += " " + jsonStringField_(item, "step_title");
+        searchText += " " + jsonStringField_(item, "job_name");
+        searchText += " " + jsonStringField_(item, "slot_label");
+        searchText += " " + jsonStringField_(item, "prompt_template");
+        searchText += " " + jsonStringField_(item, "alert_condition");
+        if (!containsAllSemanticTokens_(semanticTokens_(searchText), semanticTokens_(semanticHint))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int scoreSourceAgentRef_(const nlohmann::json& item, const nlohmann::json& sourceAgentRef)
+{
+    int score = 0;
+    const std::vector<std::pair<const char*, const char*>> exactFields = {
+        { "display_name", "display_name" },
+        { "camera_name", "camera_name" },
+        { "step_title", "step_title" },
+        { "job_name", "job_name" },
+        { "slot_key", "slot_key" },
+        { "slot_label", "slot_label" },
+    };
+    for (const auto& field : exactFields) {
+        const std::string query = compactToken_(jsonStringField_(sourceAgentRef, field.first));
+        if (query.empty()) {
+            continue;
+        }
+        const std::string candidate = compactToken_(jsonStringField_(item, field.second));
+        if (candidate == query) {
+            score += 100;
+        }
+        else if (!candidate.empty()) {
+            score += 40;
+        }
+    }
+    const std::string summary = jsonStringField_(sourceAgentRef, "summary");
+    if (!summary.empty()) {
+        score += 30;
+    }
+    const std::string semanticHint = jsonStringField_(sourceAgentRef, "semantic_hint");
+    if (!semanticHint.empty()) {
+        score += 60;
+    }
+    return score;
+}
+
+nlohmann::json buildResolvedSourceAgent_(const nlohmann::json& item)
+{
+    nlohmann::json resolved = nlohmann::json::object();
+    if (!item.is_object()) {
+        return resolved;
+    }
+
+    for (const auto* field : {
+            "location_type",
+            "agent_key",
+            "display_name",
+            "summary",
+            "camera_name",
+            "step_title",
+            "job_name",
+            "slot_key",
+            "slot_label",
+            "prompt_template",
+            "alert_condition",
+        }) {
+        const std::string text = jsonStringField_(item, field);
+        if (!text.empty()) {
+            resolved[field] = text;
+        }
+    }
+    for (const auto* field : { "agent_id", "camera_id", "step_id", "job_id", "target_id" }) {
+        int intValue = 0;
+        if (tryJsonIntField_(item, field, intValue) && intValue > 0) {
+            resolved[field] = intValue;
+        }
+    }
+    if (item.contains("snapshot") && item["snapshot"].is_object()) {
+        resolved["snapshot"] = item["snapshot"];
+    }
+    return resolved;
+}
+
+nlohmann::json resolveSourceAgent_(
+    const nlohmann::json& inventory,
+    const nlohmann::json& sourceAgentRef,
+    const nlohmann::json& activeResolved)
+{
+    nlohmann::json result = {
+        { "status", "missing_target" },
+        { "item", nlohmann::json::object() },
+        { "candidates", nlohmann::json::array() },
+    };
+
+    const nlohmann::json agents =
+        inventory.is_object() && inventory.contains("agents") && inventory["agents"].is_array()
+            ? inventory["agents"]
+            : nlohmann::json::array();
+
+    if ((!sourceAgentRef.is_object() || sourceAgentRef.empty()) &&
+        activeResolved.is_object() &&
+        !activeResolved.empty()) {
+        result["status"] = "resolved";
+        result["item"] = activeResolved;
+        return result;
+    }
+    if (!sourceAgentRef.is_object() || sourceAgentRef.empty()) {
+        return result;
+    }
+    if (agents.empty()) {
+        result["status"] = "not_found";
+        return result;
+    }
+
+    int bestScore = -1;
+    int secondBestScore = -1;
+    nlohmann::json bestItem = nlohmann::json::object();
+    nlohmann::json filtered = nlohmann::json::array();
+    for (const auto& item : agents) {
+        if (!item.is_object() || !entryMatchesSourceAgentRef_(item, sourceAgentRef)) {
+            continue;
+        }
+        filtered.push_back(item);
+        const int score = scoreSourceAgentRef_(item, sourceAgentRef);
+        if (score > bestScore) {
+            secondBestScore = bestScore;
+            bestScore = score;
+            bestItem = item;
+        }
+        else if (score > secondBestScore) {
+            secondBestScore = score;
+        }
+    }
+
+    if (filtered.empty()) {
+        result["status"] = "not_found";
+        return result;
+    }
+    if (filtered.size() == 1 || (bestScore > 0 && bestScore > secondBestScore)) {
+        result["status"] = "resolved";
+        result["item"] = buildResolvedSourceAgent_(bestItem.empty() ? filtered[0] : bestItem);
+        return result;
+    }
+
+    result["status"] = "ambiguous";
+    result["candidates"] = filtered;
+    return result;
+}
+
+std::string sourceAgentLabel_(const nlohmann::json& agent)
+{
+    const std::string displayName = jsonStringField_(agent, "display_name");
+    std::string location = jsonStringField_(agent, "camera_name");
+    if (location.empty()) {
+        location = jsonStringField_(agent, "step_title");
+    }
+    else if (!jsonStringField_(agent, "step_title").empty()) {
+        location += " / " + jsonStringField_(agent, "step_title");
+    }
+    return displayName.empty() ? location : (location.empty() ? displayName : displayName + " [" + location + "]");
+}
+
+bool hasSourceAgentRef_(const nlohmann::json& draft)
+{
+    return draft.contains("source_agent_ref") &&
+        draft["source_agent_ref"].is_object() &&
+        !draft["source_agent_ref"].empty();
+}
+
+void applySourceAgentDefaults_(
+    nlohmann::json& mergedDraft,
+    const nlohmann::json& resolvedSourceAgent)
+{
+    const nlohmann::json snapshot = resolvedSourceAgent.value("snapshot", nlohmann::json::object());
+    if (!snapshot.is_object() || snapshot.empty()) {
+        return;
+    }
+
+    nlohmann::json agentPatch = mergedDraft.value("agent_patch", nlohmann::json::object());
+    nlohmann::json fieldSources = mergedDraft.value("field_sources", nlohmann::json::object());
+
+    for (const auto* field : {
+            "display_name",
+            "summary",
+            "prompt_template",
+            "alert_condition",
+            "negative_condition",
+            "input_type",
+            "video_packaging_mode",
+            "inference_model",
+        }) {
+        if (!agentPatch.contains(field) && snapshot.contains(field) && snapshot[field].is_string()) {
+            agentPatch[field] = snapshot[field];
+            if (!fieldSources.contains(field)) {
+                fieldSources[field] = "system_default";
+            }
+        }
+    }
+    for (const auto* field : { "model_fps", "run_every", "running_resolution" }) {
+        if (!agentPatch.contains(field) &&
+            snapshot.contains(field) &&
+            snapshot[field].is_number_integer()) {
+            agentPatch[field] = snapshot[field];
+            if (!fieldSources.contains(field)) {
+                fieldSources[field] = "system_default";
+            }
+        }
+    }
+    for (const auto* field : { "only_capture_on_motion", "use_temporal_context", "is_enabled" }) {
+        if (!agentPatch.contains(field) &&
+            snapshot.contains(field) &&
+            snapshot[field].is_boolean()) {
+            agentPatch[field] = snapshot[field];
+            if (!fieldSources.contains(field)) {
+                fieldSources[field] = "system_default";
+            }
+        }
+    }
+
+    int destinationCameraId = 0;
+    if (mergedDraft.contains("resolved_camera") && mergedDraft["resolved_camera"].is_object()) {
+        destinationCameraId = mergedDraft["resolved_camera"].value("id", 0);
+    }
+    else if (mergedDraft.contains("resolved_step_camera") && mergedDraft["resolved_step_camera"].is_object()) {
+        destinationCameraId = mergedDraft["resolved_step_camera"].value("camera_id", 0);
+    }
+    const int sourceCameraId = resolvedSourceAgent.value("camera_id", 0);
+    if (!agentPatch.contains("analysis_regions") &&
+        snapshot.contains("analysis_regions") &&
+        snapshot["analysis_regions"].is_array() &&
+        !snapshot["analysis_regions"].empty() &&
+        destinationCameraId > 0 &&
+        destinationCameraId == sourceCameraId) {
+        agentPatch["analysis_regions"] = snapshot["analysis_regions"];
+        if (!fieldSources.contains("analysis_regions")) {
+            fieldSources["analysis_regions"] = "system_default";
+        }
+    }
+
+    if (!mergedDraft.contains("goal_summary") ||
+        !mergedDraft["goal_summary"].is_string() ||
+        trimCopy_(mergedDraft["goal_summary"].get<std::string>()).empty()) {
+        const std::string sourceGoal = normalizeInlineWhitespace_(firstNonEmptyText_({
+            jsonStringField_(snapshot, "summary"),
+            jsonStringField_(snapshot, "display_name"),
+        }));
+        if (!sourceGoal.empty()) {
+            mergedDraft["goal_summary"] = sourceGoal;
+        }
+    }
+
+    if ((!mergedDraft.contains("resolved_face_targets") || !mergedDraft["resolved_face_targets"].is_array() || mergedDraft["resolved_face_targets"].empty()) &&
+        snapshot.contains("face_target_ids") &&
+        snapshot["face_target_ids"].is_array()) {
+        nlohmann::json copiedFaceTargets = nlohmann::json::array();
+        for (const auto& entry : snapshot["face_target_ids"]) {
+            if (!entry.is_number_integer()) {
+                continue;
+            }
+            const int faceTargetId = entry.get<int>();
+            if (faceTargetId > 0) {
+                copiedFaceTargets.push_back(nlohmann::json::object({ { "id", faceTargetId } }));
+            }
+        }
+        if (!copiedFaceTargets.empty()) {
+            mergedDraft["resolved_face_targets"] = copiedFaceTargets;
+        }
+    }
+
+    if (!agentPatch.empty()) {
+        mergedDraft["agent_patch"] = agentPatch;
+    }
+    if (!fieldSources.empty()) {
+        mergedDraft["field_sources"] = fieldSources;
+    }
+}
+
 std::string referenceDisplayName_(const nlohmann::json& ref)
 {
     std::string name = jsonStringField_(ref, "name");
@@ -2738,6 +3206,7 @@ nlohmann::json buildTaskDraft_(const nlohmann::json& mergedDraft)
         "camera_selector",
         "step_selector",
         "step_camera_selector",
+        "source_agent_ref",
         "destination_types",
         "agent_patch",
         "field_sources",
@@ -2748,6 +3217,7 @@ nlohmann::json buildTaskDraft_(const nlohmann::json& mergedDraft)
         "resolved_camera",
         "resolved_step",
         "resolved_step_camera",
+        "resolved_source_agent",
         "resolved_face_targets",
         "resolved_drakon_find_targets",
     };
@@ -2776,6 +3246,9 @@ std::vector<std::string> collectedFieldsForAgent_(const nlohmann::json& mergedDr
     }
     if (mergedDraft.contains("resolved_step_camera") && mergedDraft["resolved_step_camera"].is_object() && !mergedDraft["resolved_step_camera"].empty()) {
         fields.push_back("step_camera");
+    }
+    if (mergedDraft.contains("resolved_source_agent") && mergedDraft["resolved_source_agent"].is_object() && !mergedDraft["resolved_source_agent"].empty()) {
+        fields.push_back("source_agent");
     }
     if (mergedDraft.contains("resolved_face_targets") && mergedDraft["resolved_face_targets"].is_array() && !mergedDraft["resolved_face_targets"].empty()) {
         fields.push_back("face_targets");
@@ -2936,6 +3409,17 @@ SkillRunResult CreateCameraAgentSkill::execute(
 
     const nlohmann::json conversationContext = loadConversationContext_(agent, payload);
     const std::string language = effectiveReplyLanguage_(selection, payload, conversationContext);
+    nlohmann::json authoringContext = nlohmann::json::object();
+    if (payload.is_object() && payload.value("authoring_context_enabled", false)) {
+        const nlohmann::json fetchedAuthoringContext = shared::fetchAuthoringContext(agent, payload);
+        if (fetchedAuthoringContext.value("ok", false)) {
+            authoringContext = fetchedAuthoringContext;
+        }
+    }
+    const nlohmann::json authoringContextForPrompt =
+        authoringContext.is_object() && authoringContext.value("ok", false)
+            ? shared::compactAuthoringContextForPrompt(authoringContext)
+            : nlohmann::json::object();
 
     nlohmann::json mergedDraft = mergeCreateAgentDrafts_(
         activeCreateAgentDraft_(conversationContext),
@@ -2945,7 +3429,7 @@ SkillRunResult CreateCameraAgentSkill::execute(
     configureActionModelClient_(llm, payload);
     mergedDraft = mergeCreateAgentDrafts_(
         mergedDraft,
-        extractCreateAgentDraft_(llm, payload, conversationContext, selection));
+        extractCreateAgentDraft_(llm, payload, conversationContext, selection, authoringContextForPrompt));
 
     auto hasDestination = [&](const std::string& destinationType) -> bool {
         if (!mergedDraft.contains("destination_types") || !mergedDraft["destination_types"].is_array()) {
@@ -3230,6 +3714,102 @@ SkillRunResult CreateCameraAgentSkill::execute(
         }
         if (stepCameraStatus == "resolved" && stepCameraResolution.contains("item") && stepCameraResolution["item"].is_object()) {
             mergedDraft["resolved_step_camera"] = buildResolvedStepCameraDraft_(stepCameraResolution["item"]);
+        }
+    }
+
+    if (hasSourceAgentRef_(mergedDraft)) {
+        nlohmann::json agentInventory = nlohmann::json::object({
+            { "ok", true },
+            { "error", "" },
+            { "agents", authoringContext.value("agents", nlohmann::json::array()) },
+        });
+        if (!authoringContext.value("ok", false) ||
+            !agentInventory.contains("agents") ||
+            !agentInventory["agents"].is_array()) {
+            agentInventory = fetchAgentInventory_(agent, payload);
+        }
+        if (!agentInventory.value("ok", false)) {
+            result.answer = buildFailureAnswer_(language, jsonStringField_(agentInventory, "error"));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_source_agent_context",
+                language == "pt" ? "Falha ao consultar agentes existentes" : "Failed to load existing agents",
+                result.answer,
+                language,
+                {},
+                nlohmann::json::object());
+            return result;
+        }
+
+        const nlohmann::json sourceResolution = resolveSourceAgent_(
+            agentInventory,
+            mergedDraft.value("source_agent_ref", nlohmann::json::object()),
+            mergedDraft.value("resolved_source_agent", nlohmann::json::object()));
+        const std::string sourceStatus = jsonStringField_(sourceResolution, "status");
+        if (sourceStatus == "missing_target") {
+            result.answer = language == "pt"
+                ? "Me diga qual agente existente devo copiar."
+                : "Tell me which existing agent I should copy.";
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_source_agent",
+                language == "pt" ? "Aguardando agente de origem" : "Waiting for the source agent",
+                result.answer,
+                language,
+                { "source_agent" },
+                nlohmann::json::object());
+            return result;
+        }
+        if (sourceStatus == "not_found") {
+            result.answer = language == "pt"
+                ? "Nao encontrei o agente existente que voce quer copiar."
+                : "I could not find the existing agent you want to copy.";
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_source_agent",
+                language == "pt" ? "Aguardando um agente de origem valido" : "Waiting for a valid source agent",
+                result.answer,
+                language,
+                { "source_agent" },
+                nlohmann::json::object());
+            return result;
+        }
+        if (sourceStatus == "ambiguous") {
+            std::ostringstream out;
+            out << (language == "pt"
+                ? "Encontrei mais de um agente possivel para copiar. Me confirme qual deles voce quer usar:"
+                : "I found more than one possible agent to copy. Confirm which one you want to use:");
+            int count = 0;
+            for (const auto& candidate : sourceResolution.value("candidates", nlohmann::json::array())) {
+                out << "\n- " << sourceAgentLabel_(candidate);
+                if (++count >= 5) {
+                    break;
+                }
+            }
+            result.answer = out.str();
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                mergedDraft,
+                "collecting_input",
+                "awaiting_source_agent_confirmation",
+                language == "pt" ? "Aguardando confirmacao do agente de origem" : "Waiting for source agent confirmation",
+                result.answer,
+                language,
+                { "source_agent" },
+                nlohmann::json::object());
+            return result;
+        }
+        if (sourceStatus == "resolved" &&
+            sourceResolution.contains("item") &&
+            sourceResolution["item"].is_object()) {
+            mergedDraft["resolved_source_agent"] = sourceResolution["item"];
+            applySourceAgentDefaults_(mergedDraft, sourceResolution["item"]);
         }
     }
 

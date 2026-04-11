@@ -34,7 +34,7 @@ function toFiniteNumber(value: unknown): number {
 function trimLabel(label: string, maxLength = 28): string {
   const normalized = normalizeText(label);
   if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function svgBytes(svg: string): Uint8Array {
@@ -138,6 +138,56 @@ function verticalBarChartSvg(params: {
   ].join("");
 }
 
+function aggregateChartItems(
+  rows: Array<Record<string, unknown>>,
+  labelResolver: (row: Record<string, unknown>) => string,
+  valueResolver: (row: Record<string, unknown>) => number,
+  tone: ReportTone = "primary",
+  limit = 5
+): ChartDatum[] {
+  const grouped = new Map<string, number>();
+  for (const row of rows) {
+    const label = normalizeText(labelResolver(row));
+    if (!label) continue;
+    grouped.set(label, (grouped.get(label) || 0) + Math.max(0, valueResolver(row)));
+  }
+  return Array.from(grouped.entries())
+    .map(([label, value]) => ({ label, value, tone }))
+    .filter((item) => item.value > 0)
+    .sort((left, right) => right.value - left.value)
+    .slice(0, limit);
+}
+
+function buildHorizontalChartBlock(params: {
+  isPt: boolean;
+  titlePt: string;
+  titleEn: string;
+  subtitlePt: string;
+  subtitleEn: string;
+  captionPt: string;
+  captionEn: string;
+  filename: string;
+  items: ChartDatum[];
+  maxValue?: number;
+}): ReportChartBlock | null {
+  if (params.items.length === 0) return null;
+  const title = params.isPt ? params.titlePt : params.titleEn;
+  return {
+    title,
+    caption: params.isPt ? params.captionPt : params.captionEn,
+    filename: params.filename,
+    contentType: "image/svg+xml",
+    bytes: svgBytes(
+      horizontalBarChartSvg({
+        title,
+        subtitle: params.isPt ? params.subtitlePt : params.subtitleEn,
+        items: params.items,
+        maxValue: params.maxValue,
+      })
+    ),
+  };
+}
+
 function buildSignalChart(input: ReportDocxInput, isPt: boolean): ReportChartBlock | null {
   const stats = new Map<string, string>();
   for (const stat of input.stats || []) {
@@ -149,11 +199,9 @@ function buildSignalChart(input: ReportDocxInput, isPt: boolean): ReportChartBlo
 
   const items = [
     {
-      label: isPt ? "Detecções" : "Detections",
+      label: isPt ? "Deteccoes" : "Detections",
       value: toFiniteNumber(
-        stats.get("detecções na janela") ||
-          stats.get("deteccoes na janela") ||
-          stats.get("detections in window")
+        stats.get("deteccoes na janela") || stats.get("detections in window")
       ),
       tone: "success",
     },
@@ -177,7 +225,6 @@ function buildSignalChart(input: ReportDocxInput, isPt: boolean): ReportChartBlo
   ] satisfies ChartDatum[];
 
   const visibleItems = items.filter((item) => item.value > 0);
-
   if (visibleItems.length === 0) {
     return null;
   }
@@ -185,14 +232,16 @@ function buildSignalChart(input: ReportDocxInput, isPt: boolean): ReportChartBlo
   return {
     title: isPt ? "Volume operacional" : "Operational volume",
     caption: isPt
-      ? "Leitura rápida da movimentação do período selecionado."
+      ? "Leitura rapida da movimentacao do periodo selecionado."
       : "Quick read of the selected window's operational flow.",
     filename: "chart-operational-volume.svg",
     contentType: "image/svg+xml",
     bytes: svgBytes(
       verticalBarChartSvg({
         title: isPt ? "Volume operacional" : "Operational volume",
-        subtitle: isPt ? "Detecções, alertas, comandos e erros" : "Detections, alerts, commands, and errors",
+        subtitle: isPt
+          ? "Deteccoes, alertas, comandos e erros"
+          : "Detections, alerts, commands, and errors",
         items: visibleItems,
       })
     ),
@@ -202,8 +251,126 @@ function buildSignalChart(input: ReportDocxInput, isPt: boolean): ReportChartBlo
 export function buildReportCharts(input: ReportDocxInput): ReportChartBlock[] {
   const context = input.context || {};
   const comparisons = context.comparisons || {};
+  const details = context.details || {};
   const isPt = isPtLanguage(context.replyLanguage);
-  const charts: ReportChartBlock[] = [];
+  const reportKind = normalizeText(input.reportKind).toLowerCase();
+  const focusSet = new Set(
+    Array.isArray(context.focus)
+      ? context.focus.map((entry) => normalizeText(entry).toLowerCase()).filter(Boolean)
+      : []
+  );
+
+  const stepChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Steps com mais sinal",
+    titleEn: "Top signal steps",
+    subtitlePt: "Execucao, resultados e alertas por step",
+    subtitleEn: "Execution, results, and alerts by step",
+    captionPt: "Highlights de atividade operacional por step.",
+    captionEn: "Operational highlights by step.",
+    filename: "chart-step-activity.svg",
+    items: coerceRows(comparisons.steps)
+      .map((row) => ({
+        label: normalizeText(row.step_name, `Step ${normalizeText(row.step_id, "")}`),
+        value: toFiniteNumber(row.activity_score || row.alert_count || row.result_count),
+        tone: "warning" as const,
+      }))
+      .filter((row) => row.label && row.value > 0)
+      .slice(0, 5),
+  });
+
+  const sessionChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Sessoes por camera",
+    titleEn: "Sessions by camera",
+    subtitlePt: "Quantidade de sessoes no periodo",
+    subtitleEn: "Number of sessions in the window",
+    captionPt: "Mostra quais cameras concentraram mais sessoes operacionais.",
+    captionEn: "Shows which cameras concentrated the most operational sessions.",
+    filename: "chart-camera-sessions.svg",
+    items: coerceRows(comparisons.sessions_by_camera)
+      .map((row) => ({
+        label: normalizeText(row.camera_name, `Camera ${normalizeText(row.camera_id, "")}`),
+        value: toFiniteNumber(row.session_count),
+        tone: "primary" as const,
+      }))
+      .filter((row) => row.label && row.value > 0)
+      .slice(0, 5),
+  });
+
+  const alertChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Alertas por camera",
+    titleEn: "Alerts by camera",
+    subtitlePt: "Alertas estruturados emitidos por camera",
+    subtitleEn: "Structured alerts emitted by camera",
+    captionPt: "Ajuda a localizar as cameras com maior volume de alerta.",
+    captionEn: "Helps locate the cameras with the highest alert volume.",
+    filename: "chart-alerts-by-camera.svg",
+    items: coerceRows(comparisons.alerts_by_camera)
+      .map((row) => ({
+        label: normalizeText(row.camera_name, `Camera ${normalizeText(row.camera_id, "")}`),
+        value: toFiniteNumber(row.alert_count),
+        tone: "warning" as const,
+      }))
+      .filter((row) => row.label && row.value > 0)
+      .slice(0, 5),
+  });
+
+  const agentRunChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Execucoes por agente",
+    titleEn: "Executions by agent",
+    subtitlePt: "Agentes com mais execucoes no recorte",
+    subtitleEn: "Agents with the most executions in the window",
+    captionPt: "Mostra os agentes que mais rodaram no periodo solicitado.",
+    captionEn: "Shows the agents that ran the most in the requested period.",
+    filename: "chart-agent-runs.svg",
+    items: aggregateChartItems(
+      coerceRows(details.agent_runs),
+      (row) => normalizeText(row.agent_key, `Agent ${normalizeText(row.agent_run_id, "")}`),
+      () => 1,
+      "success",
+      5
+    ),
+  });
+
+  const identityChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Identity cards por camera",
+    titleEn: "Identity cards by camera",
+    subtitlePt: "Ocorrencias com crop e vinculo operacional",
+    subtitleEn: "Occurrences with crop and operational linkage",
+    captionPt: "Resume quais cameras geraram mais identity cards no periodo.",
+    captionEn: "Summarizes which cameras generated the most identity cards.",
+    filename: "chart-identity-cards.svg",
+    items: coerceRows(comparisons.identity_cards_by_camera)
+      .map((row) => ({
+        label: normalizeText(row.camera_name, `Camera ${normalizeText(row.camera_id, "")}`),
+        value: toFiniteNumber(row.identity_card_count),
+        tone: "critical" as const,
+      }))
+      .filter((row) => row.label && row.value > 0)
+      .slice(0, 5),
+  });
+
+  const connectivityChart = buildHorizontalChartBlock({
+    isPt,
+    titlePt: "Incidentes por camera",
+    titleEn: "Incidents by camera",
+    subtitlePt: "Falhas e recuperacoes registradas no periodo",
+    subtitleEn: "Failures and recoveries recorded in the window",
+    captionPt: "Destaca as cameras com mais incidentes de conectividade.",
+    captionEn: "Highlights cameras with the most connectivity incidents.",
+    filename: "chart-connectivity-by-camera.svg",
+    items: aggregateChartItems(
+      coerceRows(details.connectivity_incidents),
+      (row) => normalizeText(row.camera_name, `Camera ${normalizeText(row.camera_id, "")}`),
+      () => 1,
+      "critical",
+      5
+    ),
+  });
 
   const cameraRows = coerceRows(comparisons.cameras)
     .map((row) => ({
@@ -213,25 +380,25 @@ export function buildReportCharts(input: ReportDocxInput): ReportChartBlock[] {
     }))
     .filter((row) => row.label && row.value >= 0)
     .slice(0, 5);
-
-  if (cameraRows.length > 0) {
-    charts.push({
-      title: isPt ? "Estabilidade por câmera" : "Stability by camera",
-      caption: isPt
-        ? "Score agregado por câmera no recorte analisado."
-        : "Aggregated camera score for the selected window.",
-      filename: "chart-camera-stability.svg",
-      contentType: "image/svg+xml",
-      bytes: svgBytes(
-        horizontalBarChartSvg({
-          title: isPt ? "Estabilidade por câmera" : "Stability by camera",
-          subtitle: isPt ? "Quanto maior, mais estável" : "Higher means more stable",
-          items: cameraRows,
-          maxValue: 100,
-        })
-      ),
-    });
-  }
+  const cameraStabilityChart =
+    cameraRows.length > 0
+      ? {
+          title: isPt ? "Estabilidade por camera" : "Stability by camera",
+          caption: isPt
+            ? "Score agregado por camera no recorte analisado."
+            : "Aggregated camera score for the selected window.",
+          filename: "chart-camera-stability.svg",
+          contentType: "image/svg+xml",
+          bytes: svgBytes(
+            horizontalBarChartSvg({
+              title: isPt ? "Estabilidade por camera" : "Stability by camera",
+              subtitle: isPt ? "Quanto maior, mais estavel" : "Higher means more stable",
+              items: cameraRows,
+              maxValue: 100,
+            })
+          ),
+        }
+      : null;
 
   const jobRows = coerceRows(comparisons.jobs)
     .map((row) => ({
@@ -241,29 +408,156 @@ export function buildReportCharts(input: ReportDocxInput): ReportChartBlock[] {
     }))
     .filter((row) => row.label && row.value > 0)
     .slice(0, 5);
-
-  if (jobRows.length > 0) {
-    charts.push({
-      title: isPt ? "Atividade de jobs" : "Job activity",
-      caption: isPt
-        ? "Jobs com maior score de atividade recente."
-        : "Jobs with the highest recent activity score.",
-      filename: "chart-job-activity.svg",
-      contentType: "image/svg+xml",
-      bytes: svgBytes(
-        horizontalBarChartSvg({
+  const jobActivityChart =
+    jobRows.length > 0
+      ? {
           title: isPt ? "Atividade de jobs" : "Job activity",
-          subtitle: isPt ? "Baseado em runs, etapas e alertas" : "Based on runs, steps, and alerts",
-          items: jobRows,
-        })
-      ),
-    });
-  }
+          caption: isPt
+            ? "Jobs com maior score de atividade recente."
+            : "Jobs with the highest recent activity score.",
+          filename: "chart-job-activity.svg",
+          contentType: "image/svg+xml",
+          bytes: svgBytes(
+            horizontalBarChartSvg({
+              title: isPt ? "Atividade de jobs" : "Job activity",
+              subtitle: isPt ? "Baseado em runs, etapas e alertas" : "Based on runs, steps, and alerts",
+              items: jobRows,
+            })
+          ),
+        }
+      : null;
 
   const signalChart = buildSignalChart(input, isPt);
-  if (signalChart) {
-    charts.push(signalChart);
+  const availableCharts = new Map<string, ReportChartBlock>();
+  const registerChart = (key: string, chart: ReportChartBlock | null) => {
+    if (chart) {
+      availableCharts.set(key, chart);
+    }
+  };
+
+  registerChart("step_activity", stepChart);
+  registerChart("camera_sessions", sessionChart);
+  registerChart("alerts_by_camera", alertChart);
+  registerChart("agent_runs", agentRunChart);
+  registerChart("identity_cards_by_camera", identityChart);
+  registerChart("connectivity_by_camera", connectivityChart);
+  registerChart("camera_stability", cameraStabilityChart);
+  registerChart("job_activity", jobActivityChart);
+  registerChart("operational_volume", signalChart);
+
+  const isCameraReport = reportKind === "camera_health" || focusSet.has("cameras");
+  const isJobReport = reportKind === "job_activity" || focusSet.has("jobs");
+  const isAgentReport = reportKind === "agent_activity" || focusSet.has("agents");
+  const isAlertReport = reportKind === "detections_alerts" || focusSet.has("detections");
+  const isHistoryReport = reportKind === "history";
+  const isComparisonReport = reportKind === "comparison";
+
+  let preferredOrder: string[];
+  if (isCameraReport) {
+    preferredOrder = [
+      "camera_sessions",
+      "alerts_by_camera",
+      "identity_cards_by_camera",
+      "connectivity_by_camera",
+      "camera_stability",
+      "agent_runs",
+      "step_activity",
+      "job_activity",
+      "operational_volume",
+    ];
+  } else if (isJobReport) {
+    preferredOrder = [
+      "step_activity",
+      "agent_runs",
+      "alerts_by_camera",
+      "identity_cards_by_camera",
+      "camera_sessions",
+      "job_activity",
+      "connectivity_by_camera",
+      "operational_volume",
+      "camera_stability",
+    ];
+  } else if (isAgentReport) {
+    preferredOrder = [
+      "agent_runs",
+      "step_activity",
+      "alerts_by_camera",
+      "camera_sessions",
+      "identity_cards_by_camera",
+      "job_activity",
+      "operational_volume",
+      "camera_stability",
+      "connectivity_by_camera",
+    ];
+  } else if (isAlertReport) {
+    preferredOrder = [
+      "alerts_by_camera",
+      "identity_cards_by_camera",
+      "step_activity",
+      "agent_runs",
+      "camera_sessions",
+      "operational_volume",
+      "camera_stability",
+      "job_activity",
+      "connectivity_by_camera",
+    ];
+  } else if (isHistoryReport) {
+    preferredOrder = [
+      "camera_sessions",
+      "step_activity",
+      "agent_runs",
+      "alerts_by_camera",
+      "identity_cards_by_camera",
+      "connectivity_by_camera",
+      "operational_volume",
+      "camera_stability",
+      "job_activity",
+    ];
+  } else if (isComparisonReport) {
+    preferredOrder = [
+      "camera_stability",
+      "job_activity",
+      "step_activity",
+      "alerts_by_camera",
+      "agent_runs",
+      "camera_sessions",
+      "identity_cards_by_camera",
+      "connectivity_by_camera",
+      "operational_volume",
+    ];
+  } else {
+    preferredOrder = [
+      "camera_stability",
+      "job_activity",
+      "alerts_by_camera",
+      "operational_volume",
+      "step_activity",
+      "agent_runs",
+      "camera_sessions",
+      "identity_cards_by_camera",
+      "connectivity_by_camera",
+    ];
   }
 
-  return charts.slice(0, 3);
+  const charts: ReportChartBlock[] = [];
+  for (const key of preferredOrder) {
+    const chart = availableCharts.get(key);
+    if (chart && !charts.includes(chart)) {
+      charts.push(chart);
+    }
+    if (charts.length >= 5) {
+      return charts;
+    }
+  }
+
+  for (const chart of availableCharts.values()) {
+    if (!charts.includes(chart)) {
+      charts.push(chart);
+    }
+    if (charts.length >= 5) {
+      break;
+    }
+  }
+
+  return charts;
 }

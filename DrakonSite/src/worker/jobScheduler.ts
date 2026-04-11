@@ -9,6 +9,11 @@
  * 5. Enqueue job_start command with full payload
  */
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
+import {
+  deriveFallbackEventId,
+  extractOperationalCorrelationIds,
+  persistStructuredAgentEvent,
+} from "./operationalPersistence";
 
 function normalizeOpenAIApiKeyInput(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -42,6 +47,270 @@ function describeJobSchedulerError(error: unknown, fallback: string): string {
     }
   }
   return fallback;
+}
+
+function safeJsonStringify(value: unknown): string | null {
+  try {
+    if (value === undefined) return null;
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized : null;
+  } catch {
+    return null;
+  }
+}
+
+function redactSchedulerPayloadForStorage(value: unknown): string | null {
+  try {
+    return JSON.stringify(value, (key, rawValue) => {
+      const normalizedKey = String(key || "").trim().toLowerCase();
+      if (
+        normalizedKey === "password" ||
+        normalizedKey === "telegram_bot_token" ||
+        normalizedKey === "bot_token" ||
+        normalizedKey === "description_model_api_key" ||
+        normalizedKey === "api_key" ||
+        normalizedKey.endsWith("_api_key")
+      ) {
+        if (typeof rawValue === "string" && rawValue.trim()) {
+          return "[REDACTED]";
+        }
+      }
+      return rawValue;
+    });
+  } catch {
+    return safeJsonStringify({ redaction_failed: true });
+  }
+}
+
+async function upsertJobRunFromScheduler(
+  db: D1Database,
+  input: {
+    jobRunId: string;
+    jobId: number;
+    userId: string;
+    jobName: string;
+    triggerType: string;
+    trigger: unknown;
+    nowIso: string;
+  }
+) {
+  await db.prepare(
+    `INSERT INTO job_runs (
+       job_run_id,
+       job_id,
+       user_id,
+       job_name,
+       status,
+       trigger_type,
+       trigger_json,
+       started_at_utc,
+       last_event_at_utc,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(job_run_id) DO UPDATE SET
+       job_name = COALESCE(excluded.job_name, job_runs.job_name),
+       status = 'running',
+       trigger_type = COALESCE(excluded.trigger_type, job_runs.trigger_type),
+       trigger_json = COALESCE(excluded.trigger_json, job_runs.trigger_json),
+       started_at_utc = COALESCE(job_runs.started_at_utc, excluded.started_at_utc),
+       last_event_at_utc = excluded.last_event_at_utc,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      input.jobRunId,
+      input.jobId,
+      input.userId,
+      input.jobName,
+      input.triggerType,
+      safeJsonStringify(input.trigger),
+      input.nowIso,
+      input.nowIso,
+      input.nowIso,
+      input.nowIso
+    )
+    .run();
+}
+
+async function updateJobRunSourceCommand(
+  db: D1Database,
+  jobRunId: string,
+  commandId: number,
+  nowIso: string
+) {
+  if (!Number.isInteger(commandId) || commandId <= 0) return;
+  await db.prepare(
+    `UPDATE job_runs
+     SET source_command_id = COALESCE(source_command_id, ?),
+         updated_at = ?
+     WHERE job_run_id = ?`
+  )
+    .bind(commandId, nowIso, jobRunId)
+    .run();
+}
+
+async function upsertCameraRuntimeSessionStartRequest(
+  db: D1Database,
+  input: {
+    cameraSessionId: string;
+    userId: string;
+    cameraId: number;
+    cameraName: string | null;
+    payload: unknown;
+    enabledAlgorithms: unknown;
+    nowIso: string;
+  }
+) {
+  await db.prepare(
+    `INSERT INTO camera_runtime_sessions (
+       camera_session_id,
+       user_id,
+       camera_id,
+       camera_name,
+       start_origin,
+       status,
+       start_requested_at,
+       last_event_at,
+       agents_snapshot_json,
+       start_payload_json,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, 'job', 'starting', ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(camera_session_id) DO UPDATE SET
+       camera_name = COALESCE(excluded.camera_name, camera_runtime_sessions.camera_name),
+       start_origin = COALESCE(excluded.start_origin, camera_runtime_sessions.start_origin),
+       status = 'starting',
+       start_requested_at = COALESCE(camera_runtime_sessions.start_requested_at, excluded.start_requested_at),
+       last_event_at = excluded.last_event_at,
+       agents_snapshot_json = COALESCE(excluded.agents_snapshot_json, camera_runtime_sessions.agents_snapshot_json),
+       start_payload_json = COALESCE(excluded.start_payload_json, camera_runtime_sessions.start_payload_json),
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      input.cameraSessionId,
+      input.userId,
+      input.cameraId,
+      input.cameraName,
+      input.nowIso,
+      input.nowIso,
+      safeJsonStringify(input.enabledAlgorithms),
+      redactSchedulerPayloadForStorage(input.payload),
+      input.nowIso,
+      input.nowIso
+    )
+    .run();
+}
+
+async function markSchedulerCameraStartRequested(
+  db: D1Database,
+  userId: string,
+  cameraId: number
+) {
+  await db.prepare(
+    `UPDATE cameras
+     SET is_service_running = 1,
+         is_online = CASE
+           WHEN is_service_running = 1 THEN is_online
+           ELSE 0
+         END,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND user_id = ?`
+  )
+    .bind(cameraId, userId)
+    .run();
+}
+
+async function persistSchedulerStructuredEvent(
+  db: D1Database,
+  input: {
+    userId: string;
+    eventType: string;
+    cameraId: number | null;
+    message: string;
+    details: Record<string, unknown>;
+    correlationIds?: ReturnType<typeof extractOperationalCorrelationIds>;
+    nowIso: string;
+  }
+) {
+  const correlationIds =
+    input.correlationIds ||
+    extractOperationalCorrelationIds({
+      jobRunId: input.details.job_run_id,
+      stepRunId: input.details.step_run_id,
+      agentRunId: input.details.agent_run_id,
+      cameraSessionId: input.details.camera_session_id,
+      identityCardId: input.details.identity_card_id,
+      details: input.details,
+      fallbackExternalEventId: deriveFallbackEventId({
+        eventType: input.eventType,
+        cameraId: input.cameraId,
+        message: input.message,
+        details: input.details,
+      }),
+    });
+  const detailsJson = safeJsonStringify(input.details) || "{}";
+  const eventResult = await db.prepare(
+    `INSERT OR IGNORE INTO events (
+       user_id,
+       camera_id,
+       event_type,
+       message,
+       details_json,
+       is_unread,
+       created_at,
+       updated_at,
+       external_event_id,
+       job_run_id,
+       step_run_id,
+       agent_run_id,
+       camera_session_id,
+       identity_card_id
+     ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      input.userId,
+      input.cameraId,
+      input.eventType,
+      input.message,
+      detailsJson,
+      input.nowIso,
+      input.nowIso,
+      correlationIds.externalEventId,
+      correlationIds.jobRunId,
+      correlationIds.stepRunId,
+      correlationIds.agentRunId,
+      correlationIds.cameraSessionId,
+      correlationIds.identityCardId
+    )
+    .run();
+
+  let eventDbId = Number((eventResult as any)?.meta?.last_row_id || 0);
+  if (!eventDbId && correlationIds.externalEventId) {
+    const existingEvent = await db.prepare(
+      `SELECT id
+       FROM events
+       WHERE external_event_id = ?
+       LIMIT 1`
+    )
+      .bind(correlationIds.externalEventId)
+      .first();
+    eventDbId = Number((existingEvent as any)?.id || 0);
+  }
+  if (!Number.isInteger(eventDbId) || eventDbId <= 0) {
+    return;
+  }
+
+  await persistStructuredAgentEvent({
+    db,
+    userId: input.userId,
+    eventDbId,
+    eventType: input.eventType,
+    cameraId: input.cameraId,
+    message: input.message,
+    details: input.details,
+    correlationIds,
+    nowIso: input.nowIso,
+  });
 }
 
 // Helper function to get Telegram settings for a user
@@ -1573,7 +1842,8 @@ async function buildJobStartPayload(
   scheduleDay: any,
   window: any,
   localTime: { localDate: string; localTimeHHMM: string },
-  effectiveTimezone: string
+  effectiveTimezone: string,
+  jobRunId: string
 ): Promise<any> {
   const triggeredAtUtc = new Date().toISOString();
   const windowStartUtc =
@@ -1629,6 +1899,7 @@ async function buildJobStartPayload(
   // Build steps array with targets, agent, and alerts
   const stepsWithDetails = await Promise.all(
     (steps || []).map(async (step: any) => {
+      const stepRunId = crypto.randomUUID();
       // Fetch targets with camera names
       const { results: targets } = await env.DB.prepare(
         `SELECT jst.*, c.name as camera_name
@@ -1656,6 +1927,7 @@ async function buildJobStartPayload(
       );
 
       const agents = activeAgentRows.map((a: any) => {
+        const agentRunId = crypto.randomUUID();
         const inferenceModel = normalizeInferenceModel(a.inference_model);
         const modelConfig = modelRuntimeConfig[inferenceModel] || DEFAULT_MODEL_RUNTIME_CONFIG[inferenceModel];
         const agentId = Number(a?.id);
@@ -1713,6 +1985,7 @@ async function buildJobStartPayload(
           : sanitizeAnalysisRegionsForLegacyFlow(analysisRegionsRaw);
         return {
           id: a.id,
+          agent_run_id: agentRunId,
           agent_key: a.agent_key,
           prompt_template: promptParts.prompt_template,
           params: a.params,
@@ -2232,6 +2505,7 @@ async function buildJobStartPayload(
       // Build step object - exclude input_from_step_id and input_inject_key when pipeline is defined
       const stepObj: any = {
         id: step.id,
+        step_run_id: stepRunId,
         step_order: step.step_order,
         name: step.name,
         timeout_seconds: Math.max(
@@ -2272,6 +2546,7 @@ async function buildJobStartPayload(
       }
 
       return {
+        step_run_id: stepRunId,
         step: stepObj,
         targets: (targets || []).map((t: any) => ({
           id: t.id,
@@ -2329,6 +2604,7 @@ async function buildJobStartPayload(
 
   return {
     version: 1,
+    job_run_id: jobRunId,
     job: {
       id: job.id,
       user_id: job.user_id,
@@ -2403,6 +2679,7 @@ export async function enqueueManualJobStart(
       start_time: localTime.localTimeHHMM,
       end_time: localTime.localTimeHHMM,
     };
+    const jobRunId = crypto.randomUUID();
 
     let jobStartPayload = await buildJobStartPayload(
       env,
@@ -2410,15 +2687,38 @@ export async function enqueueManualJobStart(
       manualScheduleDay,
       manualWindow,
       localTime,
-      timezone
+      timezone,
+      jobRunId
     );
 
     const startCameraPayloads: Record<string, any> = {};
     for (const cameraId of jobStartPayload.all_camera_ids) {
       const res = await buildStartCameraPayloadForScheduler(env, job.user_id, cameraId);
       if (res.ok && res.payload) {
-        startCameraPayloads[String(cameraId)] = {
+        const cameraSessionId = crypto.randomUUID();
+        const payloadWithSession = {
           ...res.payload,
+          camera_session_id: cameraSessionId,
+        };
+        await upsertCameraRuntimeSessionStartRequest(env.DB, {
+          cameraSessionId,
+          userId: String(job.user_id || ""),
+          cameraId,
+          cameraName:
+            typeof payloadWithSession.name === "string"
+              ? payloadWithSession.name
+              : `Camera #${cameraId}`,
+          payload: payloadWithSession,
+          enabledAlgorithms: payloadWithSession.enabled_algorithms,
+          nowIso: nowUtc,
+        });
+        await markSchedulerCameraStartRequested(
+          env.DB,
+          String(job.user_id || ""),
+          cameraId
+        );
+        startCameraPayloads[String(cameraId)] = {
+          ...payloadWithSession,
           enabled_algorithms: [],
         };
       } else {
@@ -2438,17 +2738,43 @@ export async function enqueueManualJobStart(
       start_camera_payloads: startCameraPayloads,
     };
 
-    await env.DB.prepare(
-      `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?)`
+    await upsertJobRunFromScheduler(env.DB, {
+      jobRunId,
+      jobId: Number(job.id),
+      userId: String(job.user_id || ""),
+      jobName: typeof job.name === "string" ? job.name : `Job #${job.id}`,
+      triggerType: "manual",
+      trigger: jobStartPayload.trigger,
+      nowIso: nowUtc,
+    });
+
+    const commandResult = await env.DB.prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         job_run_id
+       )
+       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?)`
     )
       .bind(
         job.user_id,
         JSON.stringify(jobStartPayload),
         nowUtc,
-        nowUtc
+        nowUtc,
+        jobRunId
       )
       .run();
+    await updateJobRunSourceCommand(
+      env.DB,
+      jobRunId,
+      Number((commandResult as any)?.meta?.last_row_id || 0),
+      nowUtc
+    );
     commandQueued = true;
 
     try {
@@ -2482,51 +2808,35 @@ export async function enqueueManualJobStart(
     }
 
     const startedMessage = `Job "${job.name}" started successfully.`;
-    const startedDetails = JSON.stringify({
+    const startedDetails = {
       reason: "manual_start",
       job_id: job.id,
+      job_run_id: jobRunId,
       job_name: job.name,
       local_date: localTime.localDate,
       local_time: localTime.localTimeHHMM,
       timezone,
-    });
+    };
 
     try {
-      await env.DB.prepare(
-        `INSERT INTO events (user_id, camera_id, event_type, message, details_json, is_unread, created_at, updated_at)
-         VALUES (?, NULL, 'job_started', ?, ?, 1, ?, ?)`
-      )
-        .bind(
-          job.user_id,
-          startedMessage,
-          startedDetails,
-          nowUtc,
-          nowUtc
-        )
-        .run();
+      await persistSchedulerStructuredEvent(env.DB, {
+        userId: String(job.user_id || ""),
+        eventType: "job_started",
+        cameraId: null,
+        message: startedMessage,
+        details: startedDetails,
+        correlationIds: extractOperationalCorrelationIds({
+          jobRunId,
+          details: startedDetails,
+          fallbackExternalEventId: `jobrun_${jobRunId}_started`,
+        }),
+        nowIso: nowUtc,
+      });
     } catch (richInsertError) {
-      try {
-        await env.DB.prepare(
-          `INSERT INTO events (user_id, camera_id, event_type, message, created_at, updated_at)
-           VALUES (?, NULL, 'job_started', ?, ?, ?)`
-        )
-          .bind(
-            job.user_id,
-            startedMessage,
-            nowUtc,
-            nowUtc
-          )
-          .run();
-        console.warn(
-          `[JOB SCHEDULER] job_started fallback insert used for manual start job ${job.id}:`,
-          richInsertError
-        );
-      } catch (fallbackEventInsertError) {
-        console.error(
-          `[JOB SCHEDULER] Failed to insert job_started event for manual start job ${job.id}:`,
-          fallbackEventInsertError
-        );
-      }
+      console.error(
+        `[JOB SCHEDULER] Failed to insert job_started event for manual start job ${job.id}:`,
+        richInsertError
+      );
     }
 
     console.log(`[JOB SCHEDULER] Enqueued manual job_start for job ${job.id} (${job.name})`);
@@ -2793,16 +3103,47 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
 
                 console.log(`[JOB SCHEDULER] Fire key ${fireKey} inserted, proceeding with job start`);
 
-                let jobStartPayload = await buildJobStartPayload(env, j, d, w, localTime, timezone);
+                const jobRunId = crypto.randomUUID();
+                let jobStartPayload = await buildJobStartPayload(
+                  env,
+                  j,
+                  d,
+                  w,
+                  localTime,
+                  timezone,
+                  jobRunId
+                );
 
-                // Build start_camera_payloads map WITHOUT enqueueing cameras or updating status
+                // Build start_camera_payloads without enqueueing individual camera start commands.
                 const startCameraPayloads: Record<string, any> = {};
                 for (const cameraId of jobStartPayload.all_camera_ids) {
                   const res = await buildStartCameraPayloadForScheduler(env, j.user_id, cameraId);
                   if (res.ok && res.payload) {
+                    const cameraSessionId = crypto.randomUUID();
+                    const payloadWithSession = {
+                      ...res.payload,
+                      camera_session_id: cameraSessionId,
+                    };
+                    await upsertCameraRuntimeSessionStartRequest(env.DB, {
+                      cameraSessionId,
+                      userId: String(j.user_id || ""),
+                      cameraId,
+                      cameraName:
+                        typeof payloadWithSession.name === "string"
+                          ? payloadWithSession.name
+                          : `Camera #${cameraId}`,
+                      payload: payloadWithSession,
+                      enabledAlgorithms: payloadWithSession.enabled_algorithms,
+                      nowIso: nowUtc,
+                    });
+                    await markSchedulerCameraStartRequested(
+                      env.DB,
+                      String(j.user_id || ""),
+                      cameraId
+                    );
                     // Always clear enabled_algorithms in job_start payloads
                     startCameraPayloads[String(cameraId)] = {
-                      ...res.payload,
+                      ...payloadWithSession,
                       enabled_algorithms: [],
                     };
                   } else {
@@ -2813,15 +3154,41 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                 // Enrich job_start payload with start_camera_payloads
                 jobStartPayload = { ...jobStartPayload, start_camera_payloads: startCameraPayloads };
 
-                await env.DB.prepare(
-                  `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-                   VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?)`
+                await upsertJobRunFromScheduler(env.DB, {
+                  jobRunId,
+                  jobId: Number(j.id),
+                  userId: String(j.user_id || ""),
+                  jobName: typeof j.name === "string" ? j.name : `Job #${j.id}`,
+                  triggerType: "schedule",
+                  trigger: jobStartPayload.trigger,
+                  nowIso: nowUtc,
+                });
+
+                const commandResult = await env.DB.prepare(
+                  `INSERT INTO commands (
+                     user_id,
+                     camera_id,
+                     command_type,
+                     payload,
+                     status,
+                     created_at,
+                     updated_at,
+                     job_run_id
+                   )
+                   VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?)`
                 ).bind(
                   j.user_id,
                   JSON.stringify(jobStartPayload),
                   nowUtc,
-                  nowUtc
+                  nowUtc,
+                  jobRunId
                 ).run();
+                await updateJobRunSourceCommand(
+                  env.DB,
+                  jobRunId,
+                  Number((commandResult as any)?.meta?.last_row_id || 0),
+                  nowUtc
+                );
 
                 await env.DB.prepare(
                   `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, started_at_utc, last_event_at_utc, created_at, updated_at)
@@ -2846,45 +3213,35 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
 
                 try {
                   const startedMessage = `Job "${j.name}" started successfully.`;
-                  const startedDetails = JSON.stringify({
+                  const startedDetails = {
                     reason: "schedule_window_start",
                     job_id: j.id,
+                    job_run_id: jobRunId,
                     job_name: j.name,
                     schedule_day_id: d.id,
                     schedule_window_id: w.id,
                     local_date: localTime.localDate,
                     local_time: localTime.localTimeHHMM,
                     timezone,
-                  });
+                  };
 
                   try {
-                    await env.DB.prepare(
-                      `INSERT INTO events (user_id, camera_id, event_type, message, details_json, is_unread, created_at, updated_at)
-                       VALUES (?, NULL, 'job_started', ?, ?, 1, ?, ?)`
-                    )
-                      .bind(
-                        j.user_id,
-                        startedMessage,
-                        startedDetails,
-                        nowUtc,
-                        nowUtc
-                      )
-                      .run();
+                    await persistSchedulerStructuredEvent(env.DB, {
+                      userId: String(j.user_id || ""),
+                      eventType: "job_started",
+                      cameraId: null,
+                      message: startedMessage,
+                      details: startedDetails,
+                      correlationIds: extractOperationalCorrelationIds({
+                        jobRunId,
+                        details: startedDetails,
+                        fallbackExternalEventId: `jobrun_${jobRunId}_started`,
+                      }),
+                      nowIso: nowUtc,
+                    });
                   } catch (richInsertError) {
-                    // Fallback for legacy schemas where details_json/is_unread might be absent.
-                    await env.DB.prepare(
-                      `INSERT INTO events (user_id, camera_id, event_type, message, created_at, updated_at)
-                       VALUES (?, NULL, 'job_started', ?, ?, ?)`
-                    )
-                      .bind(
-                        j.user_id,
-                        startedMessage,
-                        nowUtc,
-                        nowUtc
-                      )
-                      .run();
-                    console.warn(
-                      `[JOB SCHEDULER] job_started fallback insert used for job ${j.id}:`,
+                    console.error(
+                      `[JOB SCHEDULER] Failed to insert job_started event for job ${j.id}:`,
                       richInsertError
                     );
                   }

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -202,6 +203,497 @@ std::string uniqueSlotKeyForTarget_(
     }
     usedSlotKeys.push_back(candidate);
     return candidate;
+}
+
+bool hasSourceJobRef_(const json& blueprint)
+{
+    const json sourceJobRef = blueprint.value("source_job_ref", json::object());
+    if (!sourceJobRef.is_object()) {
+        return false;
+    }
+    int sourceJobId = 0;
+    if (shared::tryJsonIntField(sourceJobRef, "id", sourceJobId) && sourceJobId > 0) {
+        return true;
+    }
+    return !safeText_(sourceJobRef, "name").empty() ||
+        !safeText_(sourceJobRef, "description").empty();
+}
+
+bool copyFromSourceFlag_(const json& blueprint, const char* key)
+{
+    const json copyFromSource = blueprint.value("copy_from_source", json::object());
+    return copyFromSource.is_object() &&
+        copyFromSource.contains(key) &&
+        copyFromSource[key].is_boolean() &&
+        copyFromSource[key].get<bool>();
+}
+
+std::string sourceJobRefLabel_(const json& blueprint)
+{
+    const json sourceJobRef = blueprint.value("source_job_ref", json::object());
+    const std::string name = safeText_(sourceJobRef, "name");
+    if (!name.empty()) {
+        return name;
+    }
+    int sourceJobId = 0;
+    if (shared::tryJsonIntField(sourceJobRef, "id", sourceJobId) && sourceJobId > 0) {
+        return "job " + std::to_string(sourceJobId);
+    }
+    return safeText_(sourceJobRef, "description");
+}
+
+std::string buildSourceJobNotFoundAnswer_(
+    const std::string& language,
+    const json& blueprint)
+{
+    const std::string label = sourceJobRefLabel_(blueprint);
+    if (normalizeAssistantLanguageTag(language) == "pt") {
+        return label.empty()
+            ? "Nao encontrei o job de origem que voce quer reutilizar."
+            : "Nao encontrei o job de origem \"" + label + "\" para reutilizar as cameras ou etapas.";
+    }
+    return label.empty()
+        ? "I could not find the source job you want to reuse."
+        : "I could not find the source job \"" + label + "\" to reuse its cameras or steps.";
+}
+
+std::string buildAmbiguousSourceJobAnswer_(
+    const std::string& language,
+    const json& candidates)
+{
+    std::ostringstream out;
+    if (normalizeAssistantLanguageTag(language) == "pt") {
+        out << "Encontrei mais de um job possivel para usar como origem. Me confirme qual deles voce quer copiar:";
+    }
+    else {
+        out << "I found more than one possible source job. Confirm which one you want me to copy:";
+    }
+    int count = 0;
+    for (const auto& candidate : candidates) {
+        const std::string name = safeText_(candidate, "name");
+        const std::string description = safeText_(candidate, "description");
+        out << "\n- " << (name.empty() ? "job" : name);
+        if (!description.empty()) {
+            out << " (" << description << ")";
+        }
+        if (++count >= 5) {
+            break;
+        }
+    }
+    return out.str();
+}
+
+std::map<std::string, json> sourceCameraSlotsByKey_(const json& snapshot)
+{
+    std::map<std::string, json> byKey;
+    for (const auto& slot : snapshot.value("camera_slots", json::array())) {
+        if (!slot.is_object()) {
+            continue;
+        }
+        const std::string slotKey = safeText_(slot, "slot_key");
+        if (!slotKey.empty()) {
+            byKey[slotKey] = slot;
+        }
+    }
+    return byKey;
+}
+
+json buildResolvedCameraFromSourceSlot_(const json& slot)
+{
+    json resolved = json::object();
+    if (!slot.is_object()) {
+        return resolved;
+    }
+    int cameraId = 0;
+    if (shared::tryJsonIntField(slot, "camera_id", cameraId) && cameraId > 0) {
+        resolved["id"] = cameraId;
+    }
+    const std::string cameraName = firstNonEmptyText_({
+        safeText_(slot, "camera_name"),
+        safeText_(slot, "label"),
+        safeText_(slot, "slot_key"),
+    });
+    if (!cameraName.empty()) {
+        resolved["name"] = cameraName;
+    }
+    return resolved;
+}
+
+json buildTargetFromSourceTarget_(
+    const json& sourceTarget,
+    const std::map<std::string, json>& slotCatalog,
+    std::vector<std::string>& usedSlotKeys)
+{
+    const std::string sourceSlotKey = safeText_(sourceTarget, "target_slot_key");
+    auto slotIt = slotCatalog.find(sourceSlotKey);
+    const json slot = slotIt != slotCatalog.end() ? slotIt->second : json::object();
+    const std::string slotLabel = firstNonEmptyText_({
+        safeText_(slot, "camera_name"),
+        safeText_(slot, "label"),
+        sourceSlotKey,
+    });
+    const std::string localSlotKey = uniqueSlotKeyForTarget_(
+        sourceSlotKey.empty() ? slotLabel : sourceSlotKey,
+        "camera_" + std::to_string(usedSlotKeys.size() + 1),
+        usedSlotKeys);
+
+    json target = json::object({
+        { "slot_key", localSlotKey },
+        { "input_type", firstNonEmptyText_({ safeText_(sourceTarget, "input_type"), "video" }) },
+    });
+    if (!slotLabel.empty()) {
+        target["slot_label"] = slotLabel;
+    }
+
+    const json resolvedCamera = buildResolvedCameraFromSourceSlot_(slot);
+    if (!resolvedCamera.empty()) {
+        target["resolved_camera"] = resolvedCamera;
+    }
+    else if (!slotLabel.empty()) {
+        target["camera_selector"] = json::object({ { "name", slotLabel } });
+    }
+    return target;
+}
+
+json flattenTargetsFromSourceSnapshot_(const json& snapshot)
+{
+    const std::map<std::string, json> slotCatalog = sourceCameraSlotsByKey_(snapshot);
+    std::vector<std::string> seenSourceSlots;
+    std::vector<std::string> usedLocalSlots;
+    json flattened = json::array();
+
+    const json steps = snapshot.value("steps", json::array());
+    for (const auto& step : steps) {
+        for (const auto& sourceTarget : step.value("targets", json::array())) {
+            const std::string sourceSlotKey = safeText_(sourceTarget, "target_slot_key");
+            if (!sourceSlotKey.empty() &&
+                std::find(seenSourceSlots.begin(), seenSourceSlots.end(), sourceSlotKey) != seenSourceSlots.end()) {
+                continue;
+            }
+            if (!sourceSlotKey.empty()) {
+                seenSourceSlots.push_back(sourceSlotKey);
+            }
+            const json target = buildTargetFromSourceTarget_(sourceTarget, slotCatalog, usedLocalSlots);
+            if (!target.empty()) {
+                flattened.push_back(target);
+            }
+        }
+    }
+
+    if (!flattened.empty()) {
+        return flattened;
+    }
+
+    for (const auto& slot : snapshot.value("camera_slots", json::array())) {
+        if (!slot.is_object()) {
+            continue;
+        }
+        json target = json::object();
+        const std::string slotKey = safeText_(slot, "slot_key");
+        const std::string slotLabel = firstNonEmptyText_({
+            safeText_(slot, "camera_name"),
+            safeText_(slot, "label"),
+            slotKey,
+        });
+        target["slot_key"] = uniqueSlotKeyForTarget_(
+            slotKey.empty() ? slotLabel : slotKey,
+            "camera_" + std::to_string(usedLocalSlots.size() + 1),
+            usedLocalSlots);
+        target["input_type"] = "video";
+        if (!slotLabel.empty()) {
+            target["slot_label"] = slotLabel;
+        }
+        const json resolvedCamera = buildResolvedCameraFromSourceSlot_(slot);
+        if (!resolvedCamera.empty()) {
+            target["resolved_camera"] = resolvedCamera;
+        }
+        if (!target.empty()) {
+            flattened.push_back(target);
+        }
+    }
+
+    return flattened;
+}
+
+json buildAgentSpecFromSourceAgent_(
+    const json& sourceAgent,
+    const std::map<std::string, std::string>& localSlotBySourceSlot,
+    const std::string& stepRole)
+{
+    const json compiledSnapshot = sourceAgent.value("agent_snapshot", json::object());
+    if (!compiledSnapshot.is_object() || compiledSnapshot.empty()) {
+        return json::object();
+    }
+
+    json spec = json::object({
+        { "destination_type", "step_default" },
+        { "alert_policy", stepRole == "decision" ? "local" : "never" },
+        { "compiled_snapshot", compiledSnapshot },
+    });
+
+    const std::string sourceSlotKey = safeText_(sourceAgent, "camera_slot_key");
+    const auto mappedSlotIt = localSlotBySourceSlot.find(sourceSlotKey);
+    if (mappedSlotIt != localSlotBySourceSlot.end() && !mappedSlotIt->second.empty()) {
+        spec["destination_type"] = "step_camera";
+        spec["camera_slot_key"] = mappedSlotIt->second;
+    }
+
+    const std::string summary = firstNonEmptyText_({
+        safeText_(compiledSnapshot, "summary"),
+        safeText_(compiledSnapshot, "display_name"),
+    });
+    if (!summary.empty()) {
+        spec["goal_summary"] = summary;
+    }
+    return spec;
+}
+
+json buildInferenceGroupFromSource_(
+    const json& sourceGroup,
+    const std::map<std::string, std::string>& localSlotBySourceSlot,
+    const std::string& stepName)
+{
+    if (!sourceGroup.is_object()) {
+        return json::object();
+    }
+
+    json compiledSnapshot = json::object({
+        { "type", "agent" },
+        { "agent_key", firstNonEmptyText_({ safeText_(sourceGroup, "agent_key"), "shared_group_agent" }) },
+        { "display_name", firstNonEmptyText_({ stepName, safeText_(sourceGroup, "name"), "Shared group agent" }) },
+        { "summary", firstNonEmptyText_({ stepName, safeText_(sourceGroup, "name"), "Shared group agent" }) },
+        { "is_enabled", true },
+        { "input_type", firstNonEmptyText_({ safeText_(sourceGroup, "input_type"), "image" }) },
+        { "video_packaging_mode", safeText_(sourceGroup, "video_packaging_mode") },
+        { "inference_model", safeText_(sourceGroup, "inference_model") },
+        { "prompt_template", safeText_(sourceGroup, "prompt_template") },
+        { "alert_condition", safeText_(sourceGroup, "alert_condition") },
+        { "negative_condition", safeText_(sourceGroup, "negative_condition") },
+        { "face_target_ids", json::array() },
+        { "analysis_regions", json::array() },
+        { "use_temporal_context", true },
+    });
+    if (sourceGroup.contains("model_fps")) {
+        compiledSnapshot["model_fps"] = sourceGroup["model_fps"];
+    }
+    if (sourceGroup.contains("run_every")) {
+        compiledSnapshot["run_every"] = sourceGroup["run_every"];
+    }
+    if (sourceGroup.contains("running_resolution")) {
+        compiledSnapshot["running_resolution"] = sourceGroup["running_resolution"];
+    }
+    if (sourceGroup.contains("only_capture_on_motion")) {
+        compiledSnapshot["only_capture_on_motion"] = sourceGroup["only_capture_on_motion"];
+    }
+
+    if (safeText_(compiledSnapshot, "prompt_template").empty() ||
+        safeText_(compiledSnapshot, "alert_condition").empty()) {
+        return json::object();
+    }
+
+    json group = json::object({
+        { "enabled", true },
+        { "compiled_snapshot", compiledSnapshot },
+        { "input_type", firstNonEmptyText_({ safeText_(sourceGroup, "input_type"), "image" }) },
+    });
+
+    json targetSlotKeys = json::array();
+    for (const auto& sourceSlotValue : sourceGroup.value("target_slot_keys", json::array())) {
+        if (!sourceSlotValue.is_string()) {
+            continue;
+        }
+        const auto mappedSlotIt = localSlotBySourceSlot.find(shared::slugifyKey(sourceSlotValue.get<std::string>(), ""));
+        if (mappedSlotIt != localSlotBySourceSlot.end() && !mappedSlotIt->second.empty()) {
+            targetSlotKeys.push_back(mappedSlotIt->second);
+        }
+    }
+    if (!targetSlotKeys.empty()) {
+        group["target_slot_keys"] = targetSlotKeys;
+    }
+
+    const std::string sourceTargetSlotKey = shared::slugifyKey(safeText_(sourceGroup, "source_target_slot_key"), "");
+    const auto sourceSlotIt = localSlotBySourceSlot.find(sourceTargetSlotKey);
+    if (sourceSlotIt != localSlotBySourceSlot.end() && !sourceSlotIt->second.empty()) {
+        group["source_target_slot_key"] = sourceSlotIt->second;
+    }
+
+    return group;
+}
+
+json buildStepFromSourceSnapshot_(
+    const json& sourceStep,
+    const json& snapshot,
+    bool copyAgentTemplates,
+    bool isLastStep)
+{
+    json step = json::object({
+        { "step_key", shared::slugifyKey(safeText_(sourceStep, "step_key"), "source_step") },
+        { "name", firstNonEmptyText_({ safeText_(sourceStep, "name"), safeText_(sourceStep, "step_key"), "Copied step" }) },
+        { "role", isLastStep ? "decision" : "collector" },
+        { "timeout_seconds", (std::max)(120, sourceStep.value("timeout_seconds", 120)) },
+        { "targets", json::array() },
+        { "agents", json::array() },
+    });
+
+    const std::string stepName = safeText_(step, "name");
+    const std::map<std::string, json> slotCatalog = sourceCameraSlotsByKey_(snapshot);
+    std::vector<std::string> usedLocalSlots;
+    std::map<std::string, std::string> localSlotBySourceSlot;
+    for (const auto& sourceTarget : sourceStep.value("targets", json::array())) {
+        const std::string sourceSlotKey = safeText_(sourceTarget, "target_slot_key");
+        const json target = buildTargetFromSourceTarget_(sourceTarget, slotCatalog, usedLocalSlots);
+        if (!target.empty()) {
+            step["targets"].push_back(target);
+            if (!sourceSlotKey.empty()) {
+                localSlotBySourceSlot[sourceSlotKey] = safeText_(target, "slot_key");
+            }
+        }
+    }
+
+    if (copyAgentTemplates) {
+        for (const auto& sourceAgent : sourceStep.value("agents", json::array())) {
+            const json agentSpec = buildAgentSpecFromSourceAgent_(sourceAgent, localSlotBySourceSlot, safeText_(step, "role"));
+            if (!agentSpec.empty()) {
+                step["agents"].push_back(agentSpec);
+            }
+        }
+        const json sourceGroups = sourceStep.value("inference_groups", json::array());
+        if (sourceGroups.is_array() && !sourceGroups.empty()) {
+            const json group = buildInferenceGroupFromSource_(sourceGroups[0], localSlotBySourceSlot, stepName);
+            if (!group.empty()) {
+                step["execution"] = json::object({
+                    { "mode", "inference_group_image" },
+                    { "reason", "copied_from_source_job" },
+                });
+                step["inference_group"] = group;
+            }
+        }
+    }
+
+    return step;
+}
+
+void mergeTargetsIntoStepIfMissing_(json& step, const json& sourceTargets)
+{
+    if (!step.is_object() || !sourceTargets.is_array() || sourceTargets.empty()) {
+        return;
+    }
+    if (step.contains("targets") && step["targets"].is_array() && !step["targets"].empty()) {
+        return;
+    }
+    step["targets"] = sourceTargets;
+}
+
+void mergeAgentsIntoStepIfMissing_(
+    json& step,
+    const json& sourceStep,
+    const json& snapshot)
+{
+    if (!step.is_object()) {
+        return;
+    }
+    if (step.contains("agents") && step["agents"].is_array() && !step["agents"].empty()) {
+        return;
+    }
+    const json copiedStep = buildStepFromSourceSnapshot_(sourceStep, snapshot, true, false);
+    if (copiedStep.contains("agents") && copiedStep["agents"].is_array() && !copiedStep["agents"].empty()) {
+        step["agents"] = copiedStep["agents"];
+    }
+    if (!step.contains("execution") &&
+        copiedStep.contains("execution") &&
+        copiedStep["execution"].is_object()) {
+        step["execution"] = copiedStep["execution"];
+    }
+    if (!step.contains("inference_group") &&
+        copiedStep.contains("inference_group") &&
+        copiedStep["inference_group"].is_object()) {
+        step["inference_group"] = copiedStep["inference_group"];
+    }
+}
+
+json hydrateBlueprintFromSourceJob_(
+    const json& blueprint,
+    const json& sourceSnapshot)
+{
+    if (!sourceSnapshot.is_object()) {
+        return blueprint;
+    }
+
+    const bool copyCameraTargets = copyFromSourceFlag_(blueprint, "camera_targets");
+    const bool copyStepTopology = copyFromSourceFlag_(blueprint, "step_topology");
+    const bool copyAgentTemplates = copyFromSourceFlag_(blueprint, "agent_templates");
+    if (!copyCameraTargets && !copyStepTopology && !copyAgentTemplates) {
+        return blueprint;
+    }
+
+    json hydrated = blueprint;
+    const json sourceSteps = sourceSnapshot.value("steps", json::array());
+
+    if (copyStepTopology && sourceSteps.is_array() && !sourceSteps.empty()) {
+        json sourceBlueprint = shared::defaultJobBlueprint();
+        sourceBlueprint["steps"] = json::array();
+        for (std::size_t index = 0; index < sourceSteps.size(); ++index) {
+            const json copiedStep = buildStepFromSourceSnapshot_(
+                sourceSteps[index],
+                sourceSnapshot,
+                copyAgentTemplates,
+                index + 1 == sourceSteps.size());
+            if (!copiedStep.empty()) {
+                sourceBlueprint["steps"].push_back(copiedStep);
+            }
+        }
+        hydrated = shared::mergeJobBlueprint(sourceBlueprint, hydrated);
+        return hydrated;
+    }
+
+    if (!copyCameraTargets && !copyAgentTemplates) {
+        return hydrated;
+    }
+
+    json& hydratedSteps = hydrated["steps"];
+    if (!hydratedSteps.is_array()) {
+        hydratedSteps = json::array();
+    }
+
+    if (hydratedSteps.empty()) {
+        json fallbackStep = json::object({
+            { "step_key", "copied_step" },
+            { "name", "Copied step" },
+            { "role", "decision" },
+            { "timeout_seconds", 120 },
+            { "targets", flattenTargetsFromSourceSnapshot_(sourceSnapshot) },
+            { "agents", json::array() },
+        });
+        if (copyAgentTemplates && sourceSteps.is_array() && !sourceSteps.empty()) {
+            mergeAgentsIntoStepIfMissing_(fallbackStep, sourceSteps[0], sourceSnapshot);
+        }
+        hydratedSteps.push_back(fallbackStep);
+        return hydrated;
+    }
+
+    if (sourceSteps.is_array() && sourceSteps.size() == hydratedSteps.size()) {
+        for (std::size_t index = 0; index < hydratedSteps.size(); ++index) {
+            json sourceStep = sourceSteps[index];
+            json sourceStepTargets = buildStepFromSourceSnapshot_(sourceStep, sourceSnapshot, false, index + 1 == sourceSteps.size()).value("targets", json::array());
+            if (copyCameraTargets) {
+                mergeTargetsIntoStepIfMissing_(hydratedSteps[index], sourceStepTargets);
+            }
+            if (copyAgentTemplates) {
+                mergeAgentsIntoStepIfMissing_(hydratedSteps[index], sourceStep, sourceSnapshot);
+            }
+        }
+        return hydrated;
+    }
+
+    if (copyCameraTargets) {
+        const json flattenedTargets = flattenTargetsFromSourceSnapshot_(sourceSnapshot);
+        mergeTargetsIntoStepIfMissing_(hydratedSteps[0], flattenedTargets);
+    }
+    if (copyAgentTemplates && sourceSteps.is_array() && !sourceSteps.empty()) {
+        mergeAgentsIntoStepIfMissing_(hydratedSteps[0], sourceSteps[0], sourceSnapshot);
+    }
+
+    return hydrated;
 }
 
 bool looksLikeCameraSectionHeader_(const std::string& line)
@@ -1990,6 +2482,17 @@ SkillRunResult CreateJobSkill::execute(
 
     const json conversationContext = shared::loadConversationContext(agent, payload);
     const std::string language = shared::effectiveReplyLanguage(selection, payload, conversationContext);
+    json authoringContext = json::object();
+    if (payload.is_object() && payload.value("authoring_context_enabled", false)) {
+        const json fetchedAuthoringContext = shared::fetchAuthoringContext(agent, payload);
+        if (fetchedAuthoringContext.value("ok", false)) {
+            authoringContext = fetchedAuthoringContext;
+        }
+    }
+    const json authoringContextForPrompt =
+        authoringContext.is_object() && authoringContext.value("ok", false)
+            ? shared::compactAuthoringContextForPrompt(authoringContext)
+            : json::object();
 
     postChatProgress(
         agent,
@@ -2005,7 +2508,7 @@ SkillRunResult CreateJobSkill::execute(
     shared::configureActionModelClient(llm, payload);
     blueprint = shared::mergeJobBlueprint(
         blueprint,
-        shared::extractJobBlueprintDraft(llm, payload, conversationContext, selection));
+        shared::extractJobBlueprintDraft(llm, payload, conversationContext, selection, authoringContextForPrompt));
     applyExplicitCameraTargetsToBlueprint_(blueprint, payload);
     applyExplicitExecutionPreferencesToBlueprint_(blueprint, payload);
     applyGoalSummaryFallbacksToBlueprint_(blueprint, payload);
@@ -2013,6 +2516,101 @@ SkillRunResult CreateJobSkill::execute(
     if (isExplicitJobArtifactRequest_(payload, selection, blueprint)) {
         ensureDecisionConstraint_(blueprint, "force_job_artifact");
     }
+
+    if (hasSourceJobRef_(blueprint)) {
+        json sourceJobInventory = json::object({
+            { "ok", true },
+            { "error", "" },
+            { "jobs", authoringContext.value("jobs", json::array()) },
+        });
+        if (!authoringContext.value("ok", false) ||
+            !sourceJobInventory.contains("jobs") ||
+            !sourceJobInventory["jobs"].is_array()) {
+            sourceJobInventory = shared::fetchJobInventory(agent, payload);
+        }
+        if (!sourceJobInventory.value("ok", false)) {
+            result.answer = buildFailureAnswer_(language, safeText_(sourceJobInventory, "error"));
+            result.metadata["task_state"] = buildCreateJobTaskState_(
+                conversationContext,
+                blueprint,
+                "collecting_input",
+                "awaiting_source_job_context",
+                language == "pt" ? "Falha ao consultar jobs existentes" : "Failed to load existing jobs",
+                result.answer,
+                language,
+                {});
+            return result;
+        }
+
+        const json sourceJobResolution =
+            shared::resolveJob(sourceJobInventory, blueprint.value("source_job_ref", json::object()));
+        const std::string sourceJobStatus = safeText_(sourceJobResolution, "status");
+        if (sourceJobStatus == "ambiguous") {
+            result.answer = buildAmbiguousSourceJobAnswer_(
+                language,
+                sourceJobResolution.value("candidates", json::array()));
+            result.metadata["task_state"] = buildCreateJobTaskState_(
+                conversationContext,
+                blueprint,
+                "collecting_input",
+                "awaiting_source_job_confirmation",
+                language == "pt" ? "Aguardando confirmacao do job de origem" : "Waiting for source job confirmation",
+                result.answer,
+                language,
+                { "source_job" });
+            return result;
+        }
+        if (sourceJobStatus == "not_found" || sourceJobStatus == "missing_target") {
+            result.answer = buildSourceJobNotFoundAnswer_(language, blueprint);
+            result.metadata["task_state"] = buildCreateJobTaskState_(
+                conversationContext,
+                blueprint,
+                "collecting_input",
+                "awaiting_source_job",
+                language == "pt" ? "Aguardando um job de origem valido" : "Waiting for a valid source job",
+                result.answer,
+                language,
+                { "source_job" });
+            return result;
+        }
+        if (sourceJobStatus == "resolved" &&
+            sourceJobResolution.contains("item") &&
+            sourceJobResolution["item"].is_object()) {
+            json resolvedSourceRef = json::object();
+            int resolvedJobId = 0;
+            if (shared::tryJsonIntField(sourceJobResolution["item"], "id", resolvedJobId) && resolvedJobId > 0) {
+                resolvedSourceRef["id"] = resolvedJobId;
+            }
+            const std::string resolvedJobName = safeText_(sourceJobResolution["item"], "name");
+            if (!resolvedJobName.empty()) {
+                resolvedSourceRef["name"] = resolvedJobName;
+            }
+            const std::string resolvedJobDescription = safeText_(sourceJobResolution["item"], "description");
+            if (!resolvedJobDescription.empty()) {
+                resolvedSourceRef["description"] = resolvedJobDescription;
+            }
+            if (!resolvedSourceRef.empty()) {
+                blueprint["source_job_ref"] = resolvedSourceRef;
+            }
+
+            const json sourceJobSnapshot = shared::fetchJobSnapshot(agent, payload, resolvedJobId);
+            if (!sourceJobSnapshot.value("ok", false)) {
+                result.answer = buildFailureAnswer_(language, safeText_(sourceJobSnapshot, "error"));
+                result.metadata["task_state"] = buildCreateJobTaskState_(
+                    conversationContext,
+                    blueprint,
+                    "collecting_input",
+                    "awaiting_source_job_snapshot",
+                    language == "pt" ? "Falha ao carregar o job de origem" : "Failed to load the source job",
+                    result.answer,
+                    language,
+                    {});
+                return result;
+            }
+            blueprint = hydrateBlueprintFromSourceJob_(blueprint, sourceJobSnapshot.value("snapshot", json::object()));
+        }
+    }
+
     blueprint = shared::finalizeJobBlueprintValidation(blueprint);
 
     const std::string executionMode = safeText_(blueprint.value("decision", json::object()), "execution_mode");

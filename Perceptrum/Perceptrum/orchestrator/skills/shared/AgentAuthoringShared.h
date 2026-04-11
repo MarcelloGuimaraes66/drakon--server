@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -34,6 +35,14 @@ std::string parseErrorMessage(const HttpResponse& response);
 
 nlohmann::json fetchCameraInventory(AgentCore& agent, const nlohmann::json& payload);
 nlohmann::json fetchJobInventory(AgentCore& agent, const nlohmann::json& payload);
+nlohmann::json fetchAuthoringContext(AgentCore& agent, const nlohmann::json& payload);
+nlohmann::json fetchJobSnapshot(AgentCore& agent, const nlohmann::json& payload, int jobId);
+nlohmann::json compactAuthoringContextForPrompt(
+    const nlohmann::json& authoringContext,
+    std::size_t cameraLimit = 40,
+    std::size_t jobLimit = 30,
+    std::size_t stepLimit = 40,
+    std::size_t agentLimit = 60);
 nlohmann::json fetchReferenceTargets(AgentCore& agent, const nlohmann::json& payload);
 nlohmann::json resolveCamera(
     const nlohmann::json& inventory,

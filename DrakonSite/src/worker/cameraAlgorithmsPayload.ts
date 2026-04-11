@@ -9,6 +9,13 @@ type AnalysisRegionPoint = {
   y: number;
 };
 
+export type FrameWindowNormPayload = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 export type AnalysisRegionPayload = {
   region_id: string;
   label: string;
@@ -24,6 +31,7 @@ export type AnalysisRegionPayload = {
   negative_condition: string | null;
   face_target_ids: number[];
   negative_image_ids: number[];
+  frame_window_norm: FrameWindowNormPayload | null;
 };
 
 type FaceTargetImagePayload = {
@@ -79,6 +87,31 @@ const clamp01 = (value: number): number => {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+};
+
+const normalizeFrameWindowNorm = (value: unknown): FrameWindowNormPayload | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const width = clamp01(Number(row.width));
+  const height = clamp01(Number(row.height));
+  if (width <= 0 || height <= 0) return null;
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  const normalized = {
+    x: Math.min(maxX, Math.max(0, Number(row.x) || 0)),
+    y: Math.min(maxY, Math.max(0, Number(row.y) || 0)),
+    width,
+    height,
+  } satisfies FrameWindowNormPayload;
+  if (
+    normalized.x <= 0.001 &&
+    normalized.y <= 0.001 &&
+    normalized.width >= 0.999 &&
+    normalized.height >= 0.999
+  ) {
+    return null;
+  }
+  return normalized;
 };
 
 const toPositiveIntOr = (value: unknown, fallback: number): number => {
@@ -317,6 +350,7 @@ const parseStoredAnalysisRegionsForCameraAgent = (
       negative_condition: defaults.promptParts.negative_condition,
       face_target_ids: defaults.faceTargetIds,
       negative_image_ids: defaults.negativeImageIds,
+      frame_window_norm: null,
     },
   ];
 
@@ -406,6 +440,9 @@ const parseStoredAnalysisRegionsForCameraAgent = (
             .map((v: unknown) => Number(v))
             .filter((v: number) => Number.isInteger(v) && v > 0)
         )
+      ),
+      frame_window_norm: normalizeFrameWindowNorm(
+        row?.frame_window_norm ?? row?.frameWindowNorm
       ),
     });
   }

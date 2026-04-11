@@ -24,7 +24,8 @@ nlohmann::json extractJobBlueprintDraft(
     const LocalLlmClient& llm,
     const nlohmann::json& payload,
     const nlohmann::json& conversationContext,
-    const SkillSelection& selection);
+    const SkillSelection& selection,
+    const nlohmann::json& authoringContextForPrompt = nlohmann::json::object());
 nlohmann::json chooseJobTopology(const nlohmann::json& blueprint);
 nlohmann::json resolveJobBlueprintSelectors(
     const nlohmann::json& blueprint,

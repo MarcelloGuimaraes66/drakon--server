@@ -42,6 +42,10 @@ tmp_drakon_db_snapshot/
 tmp_runtime_backups/
 tmp_perceptrum_trace/
 tmp_runtime_stage/
+tmp_billing_frames/
+tmp_video_analysis/
+tmp_zoom_review/
+tmp_zoom_review_132025/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

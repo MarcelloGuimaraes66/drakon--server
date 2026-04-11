@@ -51,6 +51,16 @@ bool containsAny_(const std::string& haystack, const std::vector<std::string>& n
     return false;
 }
 
+bool isAuthoringSkill_(const std::string& skillName)
+{
+    return skillName == "create_camera" ||
+        skillName == "edit_camera" ||
+        skillName == "create_camera_agent" ||
+        skillName == "edit_camera_agent" ||
+        skillName == "create_job" ||
+        skillName == "edit_job";
+}
+
 std::string appLanguageFromPayload_(const nlohmann::json& payload);
 std::string truncateForContext_(std::string value, std::size_t maxChars);
 
@@ -2303,6 +2313,9 @@ void ChatV2Orchestrator::handleQuery(AgentCore& agent, const nlohmann::json& pay
             effectivePayload["video_routing_context"] = videoRoutingContext;
         }
     }
+    if (isAuthoringSkill_(selection.selectedSkill)) {
+        effectivePayload["authoring_context_enabled"] = true;
+    }
 
     SkillRunResult result = registry_.execute(selection.selectedSkill, agent, effectivePayload, selection);
     if (result.status == SkillExecutionStatus::Delegated) {
@@ -3173,7 +3186,7 @@ bool ChatV2Orchestrator::finalizeAsChatMessage_(
         { "command_id", commandId },
         { "original_query", originalQuery },
         { "answer", result.answer },
-        { "response_type", "final" },
+        { "response_type", "final_answer" },
         { "model_prompt_tokens", 0 },
         { "model_output_tokens", 0 },
         { "model_total_tokens", 0 },

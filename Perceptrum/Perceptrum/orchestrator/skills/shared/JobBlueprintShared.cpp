@@ -920,6 +920,47 @@ json mergeArrayByIdentity_(
     return merged;
 }
 
+json normalizeSourceJobRef_(const json& value)
+{
+    json normalized = json::object();
+    if (!value.is_object()) {
+        return normalized;
+    }
+
+    int id = 0;
+    if (tryJsonIntField(value, "id", id) && id > 0) {
+        normalized["id"] = id;
+    }
+    const std::string name = text_(value, "name");
+    if (!name.empty()) {
+        normalized["name"] = name;
+    }
+    const std::string description = text_(value, "description");
+    if (!description.empty()) {
+        normalized["description"] = description;
+    }
+    return normalized;
+}
+
+json normalizeCopyFromSource_(const json& value)
+{
+    json normalized = json::object({
+        { "camera_targets", false },
+        { "step_topology", false },
+        { "agent_templates", false },
+    });
+    if (!value.is_object()) {
+        return normalized;
+    }
+
+    for (const auto* field : { "camera_targets", "step_topology", "agent_templates" }) {
+        if (value.contains(field)) {
+            normalized[field] = boolField_(value, field, false);
+        }
+    }
+    return normalized;
+}
+
 } // namespace
 
 json defaultJobBlueprint()
@@ -941,6 +982,12 @@ json defaultJobBlueprint()
                 { "active_until", nullptr },
                 { "schedule_days", json::array() },
             }) },
+        }) },
+        { "source_job_ref", json::object() },
+        { "copy_from_source", json::object({
+            { "camera_targets", false },
+            { "step_topology", false },
+            { "agent_templates", false },
         }) },
         { "steps", json::array() },
         { "validation", json::object({
@@ -1005,6 +1052,10 @@ json normalizeJobBlueprint(const json& value)
     schedule["schedule_days"] = scheduleDays;
     normalized["job"]["schedule"] = schedule;
 
+    normalized["source_job_ref"] = normalizeSourceJobRef_(value.value("source_job_ref", json::object()));
+    normalized["copy_from_source"] =
+        normalizeCopyFromSource_(value.value("copy_from_source", json::object()));
+
     json steps = json::array();
     if (value.contains("steps") && value["steps"].is_array()) {
         int index = 0;
@@ -1030,6 +1081,8 @@ json mergeJobBlueprint(
     const json rawDecision = rawPatch.value("decision", json::object());
     const json rawJob = rawPatch.value("job", json::object());
     const json rawSchedule = rawJob.value("schedule", json::object());
+    const json rawSourceJobRef = rawPatch.value("source_job_ref", json::object());
+    const json rawCopyFromSource = rawPatch.value("copy_from_source", json::object());
 
     if (rawDecision.contains("execution_mode") && !text_(patch["decision"], "execution_mode").empty()) {
         merged["decision"]["execution_mode"] = patch["decision"]["execution_mode"];
@@ -1070,6 +1123,27 @@ json mergeJobBlueprint(
             mergedSchedule["schedule_days"] = patchSchedule["schedule_days"];
         }
         merged["job"]["schedule"] = mergedSchedule;
+    }
+
+    if (rawSourceJobRef.is_object()) {
+        if (rawSourceJobRef.empty()) {
+            merged["source_job_ref"] = json::object();
+        }
+        else {
+            merged["source_job_ref"] = mergeObjectShallow_(
+                merged.value("source_job_ref", json::object()),
+                patch.value("source_job_ref", json::object()));
+        }
+    }
+    if (rawCopyFromSource.is_object() && !rawCopyFromSource.empty()) {
+        json mergedCopy = normalizeCopyFromSource_(merged.value("copy_from_source", json::object()));
+        const json patchCopy = patch.value("copy_from_source", json::object());
+        for (const auto* field : { "camera_targets", "step_topology", "agent_templates" }) {
+            if (rawCopyFromSource.contains(field) && patchCopy.contains(field)) {
+                mergedCopy[field] = patchCopy[field];
+            }
+        }
+        merged["copy_from_source"] = mergedCopy;
     }
 
     if (patch.contains("steps") && patch["steps"].is_array() && !patch["steps"].empty()) {
@@ -1143,7 +1217,8 @@ json extractJobBlueprintDraft(
     const LocalLlmClient& llm,
     const json& payload,
     const json& conversationContext,
-    const SkillSelection& selection)
+    const SkillSelection& selection,
+    const json& authoringContextForPrompt)
 {
     if (!llm.isConfigured()) {
         return defaultJobBlueprint();
@@ -1174,6 +1249,11 @@ json extractJobBlueprintDraft(
         "Use knowledge_inputs to describe structured information flowing from one step into another.\n"
         "Use output_contract.schema when the downstream step needs a structured JSON contract.\n"
         "Use camera selectors when the user names cameras directly or by scene.\n"
+        "authoring_context may list existing cameras, jobs, steps, and agents already available in the workspace. Use it only to disambiguate references the user already made.\n"
+        "If the user asks to reuse cameras, steps, workflow topology, or agents from an existing job, fill source_job_ref and copy_from_source instead of asking for cameras again.\n"
+        "Set copy_from_source.camera_targets=true when the user asks for the same cameras, same targets, same placeholders, or same camera setup as an existing job.\n"
+        "Set copy_from_source.step_topology=true when the user asks for the same workflow, same steps, same etapas, or to clone the source workflow structure.\n"
+        "Set copy_from_source.agent_templates=true when the user asks to copy the agents, prompts, logic, or analysis behavior from the source job.\n"
         "Use step.start_condition to describe positive, negative, sequential, time, elapsed, or custom starts.\n"
         "Preserve explicit technical execution settings from the user. When the user gives input_type, run_every, inference_model, model_fps, video_packaging_mode, running_resolution, only_capture_on_motion, or use_temporal_context, copy them into agent_patch or inference_group.shared_agent_patch instead of dropping them.\n"
         "job.schedule.mode must be weekly, monthly, yearly, or none.\n"
@@ -1183,6 +1263,8 @@ json extractJobBlueprintDraft(
         "\"blueprint_version\":1,"
         "\"decision\":{\"execution_mode\":\"multi_step_job\",\"reason\":\"\",\"constraints\":[]},"
         "\"job\":{\"name\":\"\",\"description\":\"\",\"schedule\":{\"mode\":\"none\",\"timezone\":\"\",\"active_from\":\"\",\"active_until\":null,\"schedule_days\":[]}},"
+        "\"source_job_ref\":{\"id\":0,\"name\":\"\",\"description\":\"\"},"
+        "\"copy_from_source\":{\"camera_targets\":false,\"step_topology\":false,\"agent_templates\":false},"
         "\"steps\":["
         "{"
         "\"step_key\":\"collector_varanda\","
@@ -1211,6 +1293,7 @@ json extractJobBlueprintDraft(
         { "compact_context", conversationContext.value("compact_context", json::object()) },
         { "conversation_task_state", conversationContext.value("task_state", defaultOperationTaskState()) },
         { "recent_turns", conversationContext.value("recent_turns", json::array()) },
+        { "authoring_context", authoringContextForPrompt.is_object() ? authoringContextForPrompt : json::object() },
         { "user_message", userMessage },
     };
 

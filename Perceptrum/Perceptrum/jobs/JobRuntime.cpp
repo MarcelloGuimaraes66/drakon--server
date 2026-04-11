@@ -1679,6 +1679,157 @@ static std::vector<JobAnalysisRegion> collectEnabledAnalysisRegionsForAgent_(con
     return out;
 }
 
+static bool isFrameWindowActive_(const JobFrameWindowNorm& frameWindow)
+{
+    return frameWindow.enabled &&
+        frameWindow.width > 1e-6 &&
+        frameWindow.height > 1e-6 &&
+        (frameWindow.x > 1e-6 ||
+         frameWindow.y > 1e-6 ||
+         frameWindow.width < (1.0 - 1e-6) ||
+         frameWindow.height < (1.0 - 1e-6));
+}
+
+static JobFrameWindowNorm resolveFrameWindowFromRegions_(
+    const std::vector<JobAnalysisRegion>& regions)
+{
+    for (const auto& region : regions) {
+        if (isFrameWindowActive_(region.frame_window_norm)) {
+            return region.frame_window_norm;
+        }
+    }
+    return JobFrameWindowNorm{};
+}
+
+static JobAnalysisRegion buildFrameWindowCropRegion_(
+    const JobFrameWindowNorm& frameWindow)
+{
+    JobAnalysisRegion region;
+    region.region_id = "frame-window";
+    region.label = "Frame window";
+    region.enabled = true;
+    region.full_frame = false;
+    const double x1 = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double y1 = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double x2 = (std::max)(x1, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double y2 = (std::max)(y1, (std::min)(1.0, frameWindow.y + frameWindow.height));
+    region.polygon_norm = {
+        JobPolygonPoint{ x1, y1 },
+        JobPolygonPoint{ x2, y1 },
+        JobPolygonPoint{ x2, y2 },
+        JobPolygonPoint{ x1, y2 }
+    };
+    return region;
+}
+
+static std::vector<JobPolygonPoint> clipPolygonToFrameWindow_(
+    const std::vector<JobPolygonPoint>& polygon,
+    const JobFrameWindowNorm& frameWindow)
+{
+    using Point = JobPolygonPoint;
+    if (!isFrameWindowActive_(frameWindow) || polygon.size() < 3) {
+        return polygon;
+    }
+
+    const double minX = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double minY = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double maxX = (std::max)(minX, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double maxY = (std::max)(minY, (std::min)(1.0, frameWindow.y + frameWindow.height));
+
+    auto intersectAtX = [](const Point& a, const Point& b, double x) -> Point {
+        const double dx = b.x - a.x;
+        if (std::abs(dx) <= 1e-9) {
+            return Point{ x, a.y };
+        }
+        const double t = (x - a.x) / dx;
+        return Point{ x, a.y + ((b.y - a.y) * t) };
+    };
+    auto intersectAtY = [](const Point& a, const Point& b, double y) -> Point {
+        const double dy = b.y - a.y;
+        if (std::abs(dy) <= 1e-9) {
+            return Point{ a.x, y };
+        }
+        const double t = (y - a.y) / dy;
+        return Point{ a.x + ((b.x - a.x) * t), y };
+    };
+    auto clipEdge = [](const std::vector<Point>& input, const auto& inside, const auto& intersect) {
+        std::vector<Point> output;
+        if (input.empty()) return output;
+        output.reserve(input.size() + 4);
+
+        Point prev = input.back();
+        bool prevInside = inside(prev);
+        for (const auto& curr : input) {
+            const bool currInside = inside(curr);
+            if (currInside) {
+                if (!prevInside) {
+                    output.push_back(intersect(prev, curr));
+                }
+                output.push_back(curr);
+            }
+            else if (prevInside) {
+                output.push_back(intersect(prev, curr));
+            }
+            prev = curr;
+            prevInside = currInside;
+        }
+        return output;
+    };
+
+    std::vector<Point> clipped = polygon;
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.x >= minX; },
+        [&](const Point& a, const Point& b) { return intersectAtX(a, b, minX); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.x <= maxX; },
+        [&](const Point& a, const Point& b) { return intersectAtX(a, b, maxX); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.y >= minY; },
+        [&](const Point& a, const Point& b) { return intersectAtY(a, b, minY); }
+    );
+    clipped = clipEdge(
+        clipped,
+        [&](const Point& p) { return p.y <= maxY; },
+        [&](const Point& a, const Point& b) { return intersectAtY(a, b, maxY); }
+    );
+    return clipped;
+}
+
+static std::vector<JobAnalysisRegion> remapRegionsToFrameWindow_(
+    const std::vector<JobAnalysisRegion>& regions,
+    const JobFrameWindowNorm& frameWindow)
+{
+    if (!isFrameWindowActive_(frameWindow)) return regions;
+
+    std::vector<JobAnalysisRegion> out;
+    out.reserve(regions.size());
+    const double invWidth = frameWindow.width > 1e-6 ? (1.0 / frameWindow.width) : 1.0;
+    const double invHeight = frameWindow.height > 1e-6 ? (1.0 / frameWindow.height) : 1.0;
+
+    for (const auto& region : regions) {
+        JobAnalysisRegion next = region;
+        next.frame_window_norm = JobFrameWindowNorm{};
+        if (!next.full_frame && !next.polygon_norm.empty()) {
+            auto clippedPolygon = clipPolygonToFrameWindow_(next.polygon_norm, frameWindow);
+            if (clippedPolygon.size() < 3) {
+                continue;
+            }
+            for (auto& point : clippedPolygon) {
+                point.x = (std::max)(0.0, (std::min)(1.0, (point.x - frameWindow.x) * invWidth));
+                point.y = (std::max)(0.0, (std::min)(1.0, (point.y - frameWindow.y) * invHeight));
+            }
+            next.polygon_norm = std::move(clippedPolygon);
+        }
+        out.push_back(std::move(next));
+    }
+    return out;
+}
+
 static std::vector<cv::Point> regionPolygonToPixels_(
     const JobAnalysisRegion& region,
     const cv::Size& size)
@@ -1785,6 +1936,93 @@ static bool cropJpegDataUrlByRegion_(
 
     outJpegDataUrl = ensureDataUrlBase64_(outB64, "image/jpeg");
     return !outJpegDataUrl.empty();
+}
+
+static bool cropJpegDataUrlByFrameWindow_(
+    const std::string& jpegDataUrl,
+    const JobFrameWindowNorm& frameWindow,
+    std::string& outJpegDataUrl,
+    std::string* outErr = nullptr)
+{
+    outJpegDataUrl = jpegDataUrl;
+    if (!isFrameWindowActive_(frameWindow)) {
+        return !outJpegDataUrl.empty();
+    }
+    return cropJpegDataUrlByRegion_(
+        jpegDataUrl,
+        buildFrameWindowCropRegion_(frameWindow),
+        outJpegDataUrl,
+        outErr
+    );
+}
+
+static bool cropVideoClipByFrameWindow_(
+    const fs::path& srcClipPath,
+    const JobFrameWindowNorm& frameWindow,
+    fs::path& outClipPath,
+    std::string* outErr = nullptr)
+{
+    outClipPath.clear();
+    if (!isFrameWindowActive_(frameWindow)) {
+        outClipPath = srcClipPath;
+        return true;
+    }
+
+    cv::VideoCapture cap(srcClipPath.string());
+    if (!cap.isOpened()) {
+        if (outErr) *outErr = "cv::VideoCapture failed to open source clip";
+        return false;
+    }
+
+    cv::Mat frame;
+    if (!cap.read(frame) || frame.empty()) {
+        if (outErr) *outErr = "failed reading first frame";
+        return false;
+    }
+
+    const cv::Rect cropRect =
+        computeRegionCropRect_(buildFrameWindowCropRegion_(frameWindow), frame.size());
+    if (cropRect.width <= 0 || cropRect.height <= 0) {
+        if (outErr) *outErr = "frame window crop rect invalid";
+        return false;
+    }
+
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (!std::isfinite(fps) || fps <= 0.0) {
+        fps = 10.0;
+    }
+
+    fs::path dstClipPath = srcClipPath;
+    dstClipPath += ".frame_window.mp4";
+
+    cv::VideoWriter writer;
+    const std::vector<int> fourccCandidates = {
+        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
+        cv::VideoWriter::fourcc('m', 'p', '4', 'v')
+    };
+    for (const int fourcc : fourccCandidates) {
+        if (writer.open(dstClipPath.string(), fourcc, fps, cropRect.size(), true)) {
+            break;
+        }
+    }
+    if (!writer.isOpened()) {
+        if (outErr) *outErr = "cv::VideoWriter failed to open output clip";
+        return false;
+    }
+
+    writer.write(frame(cropRect).clone());
+    while (cap.read(frame)) {
+        if (frame.empty()) continue;
+        const cv::Rect currentCropRect =
+            computeRegionCropRect_(buildFrameWindowCropRegion_(frameWindow), frame.size());
+        if (currentCropRect.width <= 0 || currentCropRect.height <= 0) continue;
+        writer.write(frame(currentCropRect).clone());
+    }
+
+    writer.release();
+    cap.release();
+    outClipPath = std::move(dstClipPath);
+    return true;
 }
 
 static std::vector<JobAnalysisRegion> collectPolygonOnlyRegions_(
@@ -3080,6 +3318,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
     postJobEvent_("job_started", J, json{
         {"job_id", J.id},
         {"job_name", J.name},
+        {"job_run_id", job->payload.job_run_id},
         {"trigger", job->payload.trigger.raw}
         });
 
@@ -3159,6 +3398,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     if (step.on_missing_input == "skip") {
                         run.state = JobInstance::StepState::Skipped;
                         postStepEvent_("job_step_skipped", J, step, json{
+                            {"job_run_id", job->payload.job_run_id},
                             {"reason", "invalid_dependency_or_cycle"},
                             {"from_step_id", dep}
                         });
@@ -3217,6 +3457,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             }
 
             postStepEvent_("job_step_started", J, step, json{
+                {"job_run_id", job->payload.job_run_id},
                 {"timeout_seconds", effectiveTimeoutSeconds},
                 {"targets", (int)step.targets.size()}
             });
@@ -4377,9 +4618,10 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
             for (const auto& tgt : legacyTargets) {
                 run.workers.emplace_back([this, job, &run, &step, &stepsById, tgt]() {
+                    const int cameraId = tgt.camera_id;
+                    const JobAgentDef* agent = nullptr;
                     try {
-                        const int cameraId = tgt.camera_id;
-                        const JobAgentDef* agent = selectAgentForCamera_(step, cameraId);
+                        agent = selectAgentForCamera_(step, cameraId);
                         if (!agent) return;
                         // Model tier for this camera (default: pro)
                         std::string modelTier = "pro";
@@ -4389,6 +4631,81 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 try { modelTier = itP->second.value("model_tier", modelTier); } catch (...) {}
                             }
                         }
+
+                        const std::string normalizedInferenceModel =
+                            normalizeInferenceModel_(agent->inference_model);
+                        const std::string providerName =
+                            isCoreInferenceModel_(normalizedInferenceModel) ? "zai" : "openai";
+                        const std::string modelName =
+                            openAIModelNameForInferenceModel_(normalizedInferenceModel);
+                        const std::string cameraSessionId = [&]() -> std::string {
+                            auto itP = job->payload.camera_start_payload_by_id.find(cameraId);
+                            if (itP == job->payload.camera_start_payload_by_id.end() ||
+                                !itP->second.is_object()) {
+                                return std::string();
+                            }
+                            try {
+                                return itP->second.value("camera_session_id", std::string());
+                            }
+                            catch (...) {
+                                return std::string();
+                            }
+                        }();
+                        const std::string agentRunKey =
+                            !agent->agent_run_id.empty()
+                                ? agent->agent_run_id
+                                : ("job:" + std::to_string(job->payload.job.id) +
+                                   ":step:" + std::to_string(step.id) +
+                                   ":cam:" + std::to_string(cameraId) +
+                                   ":agent:" +
+                                   std::string(agent->agent_key.empty()
+                                                   ? std::to_string(agent->id > 0 ? agent->id : 0)
+                                                   : agent->agent_key));
+                        auto postAgentRunEvent = [&](const std::string& eventType,
+                                                     const std::string& eventMessage,
+                                                     json extra)
+                        {
+                            if (!owner_) return;
+                            json details = extra.is_object() ? std::move(extra) : json::object();
+                            details["job_id"] = job->payload.job.id;
+                            details["job_name"] = job->payload.job.name;
+                            details["step_id"] = step.id;
+                            details["step_order"] = step.step_order;
+                            details["step_name"] = step.name;
+                            details["camera_id"] = cameraId;
+                            if (!tgt.camera_name.empty()) {
+                                details["camera_name"] = tgt.camera_name;
+                            }
+                            details["agent_id"] = agent->id;
+                            details["step_agent_id"] = agent->id;
+                            details["agent_key"] = agent->agent_key;
+                            details["inference_model"] = normalizedInferenceModel;
+                            details["provider"] = providerName;
+                            details["model"] = modelName;
+                            details["input_type"] = agent->input_type;
+                            details["priority_level"] = agent->priority_level;
+                            details["timeout_seconds"] = 15;
+                            if (!job->payload.job_run_id.empty()) {
+                                details["job_run_id"] = job->payload.job_run_id;
+                            }
+                            if (!step.step_run_id.empty()) {
+                                details["step_run_id"] = step.step_run_id;
+                            }
+                            if (!agent->agent_run_id.empty()) {
+                                details["agent_run_id"] = agent->agent_run_id;
+                            }
+                            if (!cameraSessionId.empty()) {
+                                details["camera_session_id"] = cameraSessionId;
+                            }
+                            details["event_id"] = agentRunKey + ":" + eventType;
+                            owner_->postAgentEvent(
+                                eventType,
+                                std::optional<int>(cameraId),
+                                job->payload.job.user_id,
+                                eventMessage,
+                                details
+                            );
+                        };
 
                         // Build startConditionText for this (step, camera_name) from downstream custom start_conditions
                         auto buildStartConditionText = [&]() -> std::string {
@@ -4415,6 +4732,16 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         );
                         const bool isImageAgentInput = (normalizedAgentInputType == "image");
                         const bool useRunEverySchedulerGate = true;
+                        int successfulInferenceCount = 0;
+                        std::string lastCompletedOutput;
+                        postAgentRunEvent(
+                            "job_agent_started",
+                            "Job agent started.",
+                            json{
+                                {"run_every_seconds", runEverySeconds},
+                                {"status_reason", "started"}
+                            }
+                        );
                         bool runDuePending = !isImageAgentInput;
                         while (!job->cancel && !run.cancel && std::chrono::steady_clock::now() < run.deadline) {
                             const auto nowTick = std::chrono::steady_clock::now();
@@ -4476,6 +4803,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         // Record successful cycles after a real inference window was handled.
                         lastRunAt = nowTick;
                         runDuePending = false;
+                        successfulInferenceCount += 1;
+                        lastCompletedOutput = out;
 
                         {
                             std::lock_guard<std::mutex> lk(job->outputsMu);
@@ -4534,8 +4863,110 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
+
+                        json completionDetails = {
+                            {"status_reason",
+                             job->cancel ? "job_cancelled"
+                                         : (run.cancel ? "step_cancelled" : "deadline_reached")},
+                            {"successful_iterations", successfulInferenceCount}
+                        };
+                        if (!lastCompletedOutput.empty()) {
+                            if (isLikelyJson_(lastCompletedOutput)) {
+                                try {
+                                    json parsedOutput = json::parse(lastCompletedOutput);
+                                    if (parsedOutput.is_object()) {
+                                        parsedOutput.erase("image_jpeg_b64");
+                                        parsedOutput.erase("frame_jpeg_base64");
+                                        parsedOutput.erase("group_images");
+                                        auto stripInlineImageFields = [](json& node) {
+                                            if (!node.is_array()) return;
+                                            for (auto& item : node) {
+                                                if (!item.is_object()) continue;
+                                                item.erase("image_jpeg_b64");
+                                                item.erase("frame_jpeg_base64");
+                                            }
+                                        };
+                                        if (parsedOutput.contains("region_results")) {
+                                            stripInlineImageFields(parsedOutput["region_results"]);
+                                        }
+                                        if (parsedOutput.contains("group_region_results")) {
+                                            stripInlineImageFields(parsedOutput["group_region_results"]);
+                                        }
+                                        for (auto it = parsedOutput.begin(); it != parsedOutput.end(); ++it) {
+                                            if (!completionDetails.contains(it.key())) {
+                                                completionDetails[it.key()] = it.value();
+                                            }
+                                        }
+                                    }
+                                    else {
+                                        completionDetails["output_data"] = lastCompletedOutput;
+                                    }
+                                }
+                                catch (...) {
+                                    completionDetails["output_data"] = lastCompletedOutput;
+                                }
+                            }
+                            else {
+                                completionDetails["output_data"] = lastCompletedOutput;
+                            }
+                        }
+                        postAgentRunEvent(
+                            "job_agent_completed",
+                            "Job agent completed.",
+                            std::move(completionDetails)
+                        );
                     }
                     catch (const std::exception& ex) {
+                        try {
+                            const std::string failureAgentRunId =
+                                (agent && !agent->agent_run_id.empty()) ? agent->agent_run_id : std::string();
+                            const std::string failureAgentKey =
+                                agent ? agent->agent_key : std::string();
+                            const int failureAgentId =
+                                (agent && agent->id > 0) ? agent->id : 0;
+                            json failureDetails = {
+                                {"status_reason", "exception"},
+                                {"error_message", ex.what()}
+                            };
+                            if (!job->payload.job_run_id.empty()) {
+                                failureDetails["job_run_id"] = job->payload.job_run_id;
+                            }
+                            if (!step.step_run_id.empty()) {
+                                failureDetails["step_run_id"] = step.step_run_id;
+                            }
+                            if (!failureAgentRunId.empty()) {
+                                failureDetails["agent_run_id"] = failureAgentRunId;
+                            }
+                            auto itP = job->payload.camera_start_payload_by_id.find(cameraId);
+                            if (itP != job->payload.camera_start_payload_by_id.end() &&
+                                itP->second.is_object()) {
+                                const std::string failureCameraSessionId =
+                                    itP->second.value("camera_session_id", std::string());
+                                if (!failureCameraSessionId.empty()) {
+                                    failureDetails["camera_session_id"] = failureCameraSessionId;
+                                }
+                            }
+                            failureDetails["event_id"] =
+                                (!failureAgentRunId.empty()
+                                     ? failureAgentRunId
+                                     : ("job:" + std::to_string(job->payload.job.id) +
+                                        ":step:" + std::to_string(step.id) +
+                                        ":cam:" + std::to_string(cameraId) +
+                                        ":agent:" +
+                                        std::string(failureAgentKey.empty()
+                                                        ? std::to_string(failureAgentId)
+                                                        : failureAgentKey))) +
+                                ":job_agent_failed";
+                            owner_->postAgentEvent(
+                                "job_agent_failed",
+                                std::optional<int>(cameraId),
+                                job->payload.job.user_id,
+                                "Job agent failed.",
+                                failureDetails
+                            );
+                        }
+                        catch (...) {
+                        }
                         logJobException_(
                             tgt.camera_id > 0 ? std::to_string(tgt.camera_id) : "job",
                             "job_step",
@@ -4551,6 +4982,56 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         );
                     }
                     catch (...) {
+                        try {
+                            const std::string failureAgentRunId =
+                                (agent && !agent->agent_run_id.empty()) ? agent->agent_run_id : std::string();
+                            const std::string failureAgentKey =
+                                agent ? agent->agent_key : std::string();
+                            const int failureAgentId =
+                                (agent && agent->id > 0) ? agent->id : 0;
+                            json failureDetails = {
+                                {"status_reason", "unknown_exception"},
+                                {"error_message", "unknown"}
+                            };
+                            if (!job->payload.job_run_id.empty()) {
+                                failureDetails["job_run_id"] = job->payload.job_run_id;
+                            }
+                            if (!step.step_run_id.empty()) {
+                                failureDetails["step_run_id"] = step.step_run_id;
+                            }
+                            if (!failureAgentRunId.empty()) {
+                                failureDetails["agent_run_id"] = failureAgentRunId;
+                            }
+                            auto itP = job->payload.camera_start_payload_by_id.find(cameraId);
+                            if (itP != job->payload.camera_start_payload_by_id.end() &&
+                                itP->second.is_object()) {
+                                const std::string failureCameraSessionId =
+                                    itP->second.value("camera_session_id", std::string());
+                                if (!failureCameraSessionId.empty()) {
+                                    failureDetails["camera_session_id"] = failureCameraSessionId;
+                                }
+                            }
+                            failureDetails["event_id"] =
+                                (!failureAgentRunId.empty()
+                                     ? failureAgentRunId
+                                     : ("job:" + std::to_string(job->payload.job.id) +
+                                        ":step:" + std::to_string(step.id) +
+                                        ":cam:" + std::to_string(cameraId) +
+                                        ":agent:" +
+                                        std::string(failureAgentKey.empty()
+                                                        ? std::to_string(failureAgentId)
+                                                        : failureAgentKey))) +
+                                ":job_agent_failed";
+                            owner_->postAgentEvent(
+                                "job_agent_failed",
+                                std::optional<int>(cameraId),
+                                job->payload.job.user_id,
+                                "Job agent failed.",
+                                failureDetails
+                            );
+                        }
+                        catch (...) {
+                        }
                         logJobUnknownException_(
                             tgt.camera_id > 0 ? std::to_string(tgt.camera_id) : "job",
                             "job_step",
@@ -4623,6 +5104,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             if (run.state == JobInstance::StepState::Running) {
                 run.state = JobInstance::StepState::Completed;
                 postStepEvent_("job_step_completed", J, step, json{
+                    {"job_run_id", job->payload.job_run_id},
                     {"step_id", step.id},
                     {"step_order", step.step_order},
                     {"reason", reason}
@@ -4774,6 +5256,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         postJobEvent_("job_staled", J, json{
                             {"job_id", J.id},
                             {"job_name", J.name},
+                            {"job_run_id", job->payload.job_run_id},
                             {"reason", "no_runnable_or_future_steps"},
                             {"pending_steps", blocked}
                         });
@@ -4794,12 +5277,20 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     finalizeStep(run, "job_cancel");
                 }
             }
-            postJobEvent_("job_stopped", J, json{ {"job_id", J.id}, {"reason", "cancelled"} });
+            postJobEvent_("job_stopped", J, json{
+                {"job_id", J.id},
+                {"job_run_id", job->payload.job_run_id},
+                {"reason", "cancelled"}
+            });
             finalizeJobRuntimeState();
             return;
         }
 
-        postJobEvent_("job_completed", J, json{ {"job_id", J.id}, {"job_name", J.name} });
+        postJobEvent_("job_completed", J, json{
+            {"job_id", J.id},
+            {"job_name", J.name},
+            {"job_run_id", job->payload.job_run_id}
+        });
         finalizeJobRuntimeState();
     }
     catch (const std::exception& e) {
@@ -4817,6 +5308,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
         postJobEvent_("job_failed", J, json{
             {"job_id", J.id},
             {"job_name", J.name},
+            {"job_run_id", job->payload.job_run_id},
             {"error", e.what()}
             });
         finalizeJobRuntimeState();
@@ -4835,6 +5327,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
         postJobEvent_("job_failed", J, json{
             {"job_id", J.id},
             {"job_name", J.name},
+            {"job_run_id", job->payload.job_run_id},
             {"error", "unknown"}
             });
         finalizeJobRuntimeState();
@@ -5424,6 +5917,9 @@ void JobRuntime::postStepEvent_(const std::string& eventType, const JobDefSnapsh
     d["step_id"] = step.id;
     d["step_order"] = step.step_order;
     d["step_name"] = step.name;
+    if (!step.step_run_id.empty()) {
+        d["step_run_id"] = step.step_run_id;
+    }
     postJobEvent_(eventType, job, d);
 }
 
@@ -6926,9 +7422,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
 
         const std::vector<JobAnalysisRegion> activeRegions =
             collectEnabledAnalysisRegionsForAgent_(agent);
+        const JobFrameWindowNorm frameWindow =
+            resolveFrameWindowFromRegions_(activeRegions);
 
         std::string clipPath;
         bool clipBackedSource = false;
+        std::string croppedClipPathForMotion;
 
         struct ProcessingClipGuard {
             std::string path;
@@ -6941,6 +7440,14 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 fs::remove(fs::path(path), ec);
             }
         } clipGuard;
+        struct TempClipGuard {
+            std::string* pathPtr = nullptr;
+            ~TempClipGuard() {
+                if (!pathPtr || pathPtr->empty()) return;
+                std::error_code ec;
+                fs::remove(fs::path(*pathPtr), ec);
+            }
+        } croppedClipGuard{ &croppedClipPathForMotion };
 
         std::string jpegB64;
         std::string tsUtcIso;
@@ -6998,6 +7505,41 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             parseClipEndTsUtcIsoFromPath_(fs::path(clipPath), tsUtcIso);
         }
 
+        if (isFrameWindowActive_(frameWindow)) {
+            std::string cropErr;
+            std::string croppedJpegB64;
+            if (!cropJpegDataUrlByFrameWindow_(jpegB64, frameWindow, croppedJpegB64, &cropErr) ||
+                croppedJpegB64.empty())
+            {
+                Logger::instance().logDebug(
+                    "job",
+                    "runAgentInferenceOnCamera_: frame-window crop failed for image inference cameraId=" +
+                    std::to_string(cameraId) + " err=" + cropErr
+                );
+                return "";
+            }
+            jpegB64 = croppedJpegB64;
+
+            if (clipBackedSource) {
+                fs::path croppedClipPath;
+                if (!cropVideoClipByFrameWindow_(
+                        fs::path(clipPath),
+                        frameWindow,
+                        croppedClipPath,
+                        &cropErr) ||
+                    croppedClipPath.empty())
+                {
+                    Logger::instance().logDebug(
+                        "job",
+                        "runAgentInferenceOnCamera_: frame-window clip crop failed for image motion gate cameraId=" +
+                        std::to_string(cameraId) + " err=" + cropErr
+                    );
+                    return "";
+                }
+                croppedClipPathForMotion = croppedClipPath.string();
+            }
+        }
+
         json regionResults = json::array();
         int sumPromptTokens = 0;
         int sumOutputTokens = 0;
@@ -7016,10 +7558,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         std::string representativeImageB64;
         std::string representativeRegionId;
 
+        const std::vector<JobAnalysisRegion> runtimeActiveRegions =
+            remapRegionsToFrameWindow_(activeRegions, frameWindow);
         const std::vector<JobAnalysisRegion> polygonRegions =
-            collectPolygonOnlyRegions_(activeRegions);
+            collectPolygonOnlyRegions_(runtimeActiveRegions);
         const std::vector<JobAnalysisRegion>& allowedAlertRegions =
-            polygonRegions.empty() ? activeRegions : polygonRegions;
+            polygonRegions.empty() ? runtimeActiveRegions : polygonRegions;
         const std::unordered_map<std::string, std::string> allowedAlertRegionLabelById =
             buildRegionLabelByIdMap_(allowedAlertRegions);
         std::vector<std::string> motionTriggeredRegionIds;
@@ -7038,7 +7582,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             bool motionDetected = false;
             if (clipBackedSource) {
                 if (!detectMotionInAnyRegionFromClip_(
-                        fs::path(clipPath),
+                        fs::path(croppedClipPathForMotion.empty() ? clipPath : croppedClipPathForMotion),
                         motionRegions,
                         motionDetected,
                         &motionTriggeredRegionIds,
@@ -7692,43 +8236,29 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
 
     const std::vector<JobAnalysisRegion> activeRegions =
         collectEnabledAnalysisRegionsForAgent_(agent);
+    const JobFrameWindowNorm frameWindow =
+        resolveFrameWindowFromRegions_(activeRegions);
+    const std::vector<JobAnalysisRegion> runtimeActiveRegions =
+        remapRegionsToFrameWindow_(activeRegions, frameWindow);
     const std::vector<JobAnalysisRegion> polygonRegions =
-        collectPolygonOnlyRegions_(activeRegions);
+        collectPolygonOnlyRegions_(runtimeActiveRegions);
     const std::vector<JobAnalysisRegion>& allowedAlertRegions =
-        polygonRegions.empty() ? activeRegions : polygonRegions;
+        polygonRegions.empty() ? runtimeActiveRegions : polygonRegions;
     const std::unordered_map<std::string, std::string> allowedAlertRegionLabelById =
         buildRegionLabelByIdMap_(allowedAlertRegions);
     std::vector<std::string> motionTriggeredRegionIds;
-
-    if (agent.only_capture_on_motion && !polygonRegions.empty()) {
-        std::string motionErr;
-        bool motionDetected = false;
-        if (!detectMotionInAnyRegionFromClip_(
-                fs::path(clipPath),
-                polygonRegions,
-                motionDetected,
-                &motionTriggeredRegionIds,
-                &motionErr))
-        {
-            Logger::instance().logDebug(
-                "job",
-                "runAgentInferenceOnCamera_: ROI motion check failed (video), skipping inference cameraId=" +
-                std::to_string(cameraId) + " err=" + motionErr +
-                " roi_count=" + std::to_string(polygonRegions.size())
-            );
-            return "";
-        }
-        if (!motionDetected) {
-            Logger::instance().logDebug(
-                "job",
-                "runAgentInferenceOnCamera_: skipped video inference due no ROI motion cameraId=" +
-                std::to_string(cameraId) + " roi_count=" + std::to_string(polygonRegions.size())
-            );
-            return "";
+    const bool enforceMotionGate = agent.only_capture_on_motion;
+    const bool enforceMotionWithoutPolygon = enforceMotionGate && polygonRegions.empty();
+    std::vector<JobAnalysisRegion> motionRegions;
+    if (enforceMotionGate) {
+        motionRegions = polygonRegions;
+        if (enforceMotionWithoutPolygon) {
+            motionRegions.push_back(buildSyntheticFullFrameMotionRegion_());
         }
     }
 
     std::string clipPathForInference = clipPath;
+    std::string croppedClipPath;
     std::string sampledClipPath;
     std::string overlayClipPath;
     struct TempPathGuard {
@@ -7739,13 +8269,67 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 fs::remove(fs::path(*pathPtr), ec);
             }
         }
-    } sampledClipGuard{ &sampledClipPath };
+    } croppedClipGuard{ &croppedClipPath };
+    TempPathGuard sampledClipGuard{ &sampledClipPath };
     TempPathGuard overlayClipGuard{ &overlayClipPath };
     std::vector<std::string> drawnOverlayRegionIds;
 
+    if (isFrameWindowActive_(frameWindow)) {
+        fs::path croppedPath;
+        std::string cropErr;
+        if (!cropVideoClipByFrameWindow_(
+                fs::path(clipPath),
+                frameWindow,
+                croppedPath,
+                &cropErr) ||
+            croppedPath.empty())
+        {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: frame-window crop failed (video), skipping inference cameraId=" +
+                std::to_string(cameraId) + " err=" + cropErr
+            );
+            return "";
+        }
+        croppedClipPath = croppedPath.string();
+        clipPathForInference = croppedClipPath;
+    }
+
+    if (!motionRegions.empty()) {
+        std::string motionErr;
+        bool motionDetected = false;
+        if (!detectMotionInAnyRegionFromClip_(
+                fs::path(clipPathForInference),
+                motionRegions,
+                motionDetected,
+                &motionTriggeredRegionIds,
+                &motionErr))
+        {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: ROI/full-frame motion check failed (video), skipping inference cameraId=" +
+                std::to_string(cameraId) + " err=" + motionErr +
+                " roi_count=" + std::to_string(motionRegions.size())
+            );
+            return "";
+        }
+        if (!motionDetected) {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: skipped video inference due no ROI/full-frame motion cameraId=" +
+                std::to_string(cameraId) + " roi_count=" + std::to_string(motionRegions.size())
+            );
+            return "";
+        }
+
+        if (enforceMotionWithoutPolygon) {
+            motionTriggeredRegionIds.clear();
+        }
+    }
+
     if (!useOpenAICompatible) {
         try {
-            fs::path srcPath = fs::path(clipPath);
+            fs::path srcPath = fs::path(clipPathForInference);
             fs::path dstPath = srcPath;
             dstPath += ".model_" + std::to_string(modelInputFps) + "fps.mp4";
 
@@ -9902,15 +10486,38 @@ void JobRuntime::maybeFireAlerts_(
         }
     }
 
+    const std::string cameraSessionId = [&]() -> std::string {
+        auto it = payload.camera_start_payload_by_id.find(cameraId);
+        if (it == payload.camera_start_payload_by_id.end() || !it->second.is_object()) {
+            return std::string();
+        }
+        try {
+            return it->second.value("camera_session_id", std::string());
+        }
+        catch (...) {
+            return std::string();
+        }
+    }();
+    const std::string normalizedAlertInferenceModel =
+        normalizeInferenceModel_(agent.inference_model);
+    const std::string alertProvider =
+        isCoreInferenceModel_(normalizedAlertInferenceModel) ? "zai" : "openai";
+    const std::string alertModel =
+        openAIModelNameForInferenceModel_(normalizedAlertInferenceModel);
+
     auto buildAlertDetails = [&](bool includeInlineImages) {
         json details = {
             {"camera_id", cameraId},
             {"agent_id", agent.id},
             {"agent_key", agent.agent_key},
+            {"inference_model", normalizedAlertInferenceModel},
+            {"provider", alertProvider},
+            {"model", alertModel},
             {"priority_level", agent.priority_level},
             {"prompt_template", agent.prompt_template},
             {"alert_condition_text", agent.alert_condition_text},
             {"negative_condition_text", agent.negative_condition_text},
+            {"alert_condition_true", true},
 
             // no specific rule context here
             {"channel", "none"},
@@ -9999,9 +10606,21 @@ void JobRuntime::maybeFireAlerts_(
     auto postAlertEvent = [&](json details) {
         details["job_id"] = payload.job.id;
         details["job_name"] = payload.job.name;
+        if (!payload.job_run_id.empty()) {
+            details["job_run_id"] = payload.job_run_id;
+        }
         details["step_id"] = step.id;
         details["step_order"] = step.step_order;
         details["step_name"] = step.name;
+        if (!step.step_run_id.empty()) {
+            details["step_run_id"] = step.step_run_id;
+        }
+        if (!agent.agent_run_id.empty()) {
+            details["agent_run_id"] = agent.agent_run_id;
+        }
+        if (!cameraSessionId.empty()) {
+            details["camera_session_id"] = cameraSessionId;
+        }
         if (!owner_) {
             return AgentCore::AgentEventPostResult{};
         }

@@ -4969,6 +4969,36 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         }
         return fallback;
     };
+    auto parseFrameWindowNorm = [](const json& holder) {
+        AlgorithmConfig::FrameWindowNorm out;
+        const json* node = nullptr;
+        if (holder.contains("frame_window_norm") && holder["frame_window_norm"].is_object()) {
+            node = &holder["frame_window_norm"];
+        }
+        else if (holder.contains("frameWindowNorm") && holder["frameWindowNorm"].is_object()) {
+            node = &holder["frameWindowNorm"];
+        }
+        if (!node) return out;
+        const auto parseCoord = [&](const char* key, double fallback) {
+            if (!node->contains(key) || !(*node)[key].is_number()) return fallback;
+            return std::max(0.0, std::min(1.0, (*node)[key].get<double>()));
+        };
+        double width = parseCoord("width", 1.0);
+        double height = parseCoord("height", 1.0);
+        if (width <= 0.0 || height <= 0.0) return out;
+        const double maxX = std::max(0.0, 1.0 - width);
+        const double maxY = std::max(0.0, 1.0 - height);
+        out.x = std::min(maxX, std::max(0.0, parseCoord("x", 0.0)));
+        out.y = std::min(maxY, std::max(0.0, parseCoord("y", 0.0)));
+        out.width = width;
+        out.height = height;
+        out.enabled =
+            out.x > 1e-6 ||
+            out.y > 1e-6 ||
+            out.width < (1.0 - 1e-6) ||
+            out.height < (1.0 - 1e-6);
+        return out;
+    };
 
     for (const auto& a : payload["enabled_algorithms"]) {
         AlgorithmConfig ac;
@@ -5115,6 +5145,7 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
                 if (region.label.empty()) region.label = region.regionId;
                 region.enabled = jsonBoolOr(r, "enabled", true);
                 region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                region.frameWindowNorm = parseFrameWindowNorm(r);
                 if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
                     for (const auto& pnt : r["polygon_norm"]) {
                         if (!pnt.is_object()) continue;
@@ -5862,6 +5893,25 @@ void AgentCore::processCommand_(const json& cmd) {
             startCameraFromPayload_(cameraId, payload);
         }
         else if (type == "stop_camera") {
+            try {
+                nlohmann::json stopDetails =
+                    payload.is_object() ? payload : nlohmann::json::object();
+                if (!stopDetails.contains("event_id") &&
+                    stopDetails.contains("command_event_id") &&
+                    stopDetails["command_event_id"].is_string())
+                {
+                    stopDetails["event_id"] = stopDetails["command_event_id"];
+                }
+                postAgentEvent(
+                    "camera_stop_requested",
+                    cameraId,
+                    /*userId*/ "",
+                    "Camera stop requested.",
+                    stopDetails
+                );
+            }
+            catch (...) {
+            }
             stopDirectCamera_(cameraId);
         }
         else if (type == "probe_webcams") {
@@ -6374,6 +6424,11 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
     cfg.labelsPath = "";
     cfg.useGpu = true;
 
+    cfg.cameraSessionId.clear();
+    if (p.contains("camera_session_id") && p["camera_session_id"].is_string()) {
+        cfg.cameraSessionId = trimAscii(p["camera_session_id"].get<std::string>());
+    }
+
     bool startedByJob = false;
     cfg.startOrigin.clear();
     if (p.contains("start_origin") && p["start_origin"].is_string()) {
@@ -6453,6 +6508,36 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 if (s == "0" || s == "false" || s == "no" || s == "off") return false;
             }
             return fallback;
+        };
+        auto parseFrameWindowNorm = [](const json& holder) {
+            AlgorithmConfig::FrameWindowNorm out;
+            const json* node = nullptr;
+            if (holder.contains("frame_window_norm") && holder["frame_window_norm"].is_object()) {
+                node = &holder["frame_window_norm"];
+            }
+            else if (holder.contains("frameWindowNorm") && holder["frameWindowNorm"].is_object()) {
+                node = &holder["frameWindowNorm"];
+            }
+            if (!node) return out;
+            const auto parseCoord = [&](const char* key, double fallback) {
+                if (!node->contains(key) || !(*node)[key].is_number()) return fallback;
+                return std::max(0.0, std::min(1.0, (*node)[key].get<double>()));
+            };
+            double width = parseCoord("width", 1.0);
+            double height = parseCoord("height", 1.0);
+            if (width <= 0.0 || height <= 0.0) return out;
+            const double maxX = std::max(0.0, 1.0 - width);
+            const double maxY = std::max(0.0, 1.0 - height);
+            out.x = std::min(maxX, std::max(0.0, parseCoord("x", 0.0)));
+            out.y = std::min(maxY, std::max(0.0, parseCoord("y", 0.0)));
+            out.width = width;
+            out.height = height;
+            out.enabled =
+                out.x > 1e-6 ||
+                out.y > 1e-6 ||
+                out.width < (1.0 - 1e-6) ||
+                out.height < (1.0 - 1e-6);
+            return out;
         };
 
         for (const auto& algo : p["enabled_algorithms"]) {
@@ -6609,6 +6694,7 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                     if (region.label.empty()) region.label = region.regionId;
                     region.enabled = jsonBoolOr(r, "enabled", true);
                     region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                    region.frameWindowNorm = parseFrameWindowNorm(r);
                     if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
                         for (const auto& pnt : r["polygon_norm"]) {
                             if (!pnt.is_object()) continue;
@@ -7477,15 +7563,42 @@ AgentCore::AgentEventPostResult AgentCore::postAgentEventWithResult(
         payload["event_type"] = eventType;
         payload["message"] = message;
 
+        const nlohmann::json effectiveDetails =
+            details.is_null() ? nlohmann::json::object() : details;
+
         if (cameraId.has_value()) {
             payload["camera_id"] = cameraId.value();
+        }
+        else if (effectiveDetails.is_object() &&
+                 effectiveDetails.contains("camera_id") &&
+                 effectiveDetails["camera_id"].is_number_integer())
+        {
+            payload["camera_id"] = effectiveDetails["camera_id"];
         }
 
         if (!userId.empty()) {
             payload["user_id"] = userId;
         }
 
-        payload["details"] = details.is_null() ? nlohmann::json::object() : details;
+        if (effectiveDetails.is_object()) {
+            const char* correlationKeys[] = {
+                "event_id",
+                "external_event_id",
+                "camera_session_id",
+                "job_run_id",
+                "step_run_id",
+                "agent_run_id",
+                "identity_card_id"
+            };
+            for (const char* key : correlationKeys) {
+                auto it = effectiveDetails.find(key);
+                if (it != effectiveDetails.end() && !it->is_null()) {
+                    payload[key] = *it;
+                }
+            }
+        }
+
+        payload["details"] = effectiveDetails;
 
         std::string body = payload.dump();
 

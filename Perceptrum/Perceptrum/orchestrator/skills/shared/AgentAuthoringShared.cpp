@@ -121,6 +121,67 @@ void appendUniqueCandidateById_(
     array.push_back(candidate);
 }
 
+nlohmann::json copyAuthoringFields_(
+    const nlohmann::json& item,
+    const std::vector<const char*>& stringFields,
+    const std::vector<const char*>& intFields,
+    const std::vector<const char*>& boolFields = {})
+{
+    nlohmann::json compact = nlohmann::json::object();
+    if (!item.is_object()) {
+        return compact;
+    }
+
+    for (const auto* field : intFields) {
+        int value = 0;
+        if (tryJsonIntField(item, field, value) && value > 0) {
+            compact[field] = value;
+        }
+    }
+    for (const auto* field : stringFields) {
+        const std::string value = jsonStringField(item, field);
+        if (!value.empty()) {
+            compact[field] = value;
+        }
+    }
+    for (const auto* field : boolFields) {
+        if (item.contains(field) && item[field].is_boolean()) {
+            compact[field] = item[field];
+        }
+    }
+
+    return compact;
+}
+
+nlohmann::json truncateAuthoringArray_(
+    const nlohmann::json& source,
+    std::size_t limit,
+    const std::vector<const char*>& stringFields,
+    const std::vector<const char*>& intFields,
+    const std::vector<const char*>& boolFields = {})
+{
+    nlohmann::json compact = nlohmann::json::array();
+    if (!source.is_array()) {
+        return compact;
+    }
+
+    std::size_t count = 0;
+    for (const auto& item : source) {
+        if (!item.is_object()) {
+            continue;
+        }
+        if (limit > 0 && count >= limit) {
+            break;
+        }
+        nlohmann::json current = copyAuthoringFields_(item, stringFields, intFields, boolFields);
+        if (!current.empty()) {
+            compact.push_back(std::move(current));
+            ++count;
+        }
+    }
+    return compact;
+}
+
 std::vector<std::string> selectorSceneQueries_(const nlohmann::json& selector)
 {
     std::vector<std::string> queries;
@@ -558,6 +619,145 @@ nlohmann::json fetchJobInventory(AgentCore& agent, const nlohmann::json& payload
         { "ok", true },
         { "error", "" },
         { "jobs", jobs },
+    });
+}
+
+nlohmann::json fetchAuthoringContext(AgentCore& agent, const nlohmann::json& payload)
+{
+    const std::string clientId = clientIdFromPayload(payload).empty()
+        ? agent.getClientId()
+        : clientIdFromPayload(payload);
+    const std::string url =
+        agent.getBackendBaseUrl() + "/api/agent/authoring-context?client_id=" + clientId;
+    const HttpResponse response = getUrl(
+        url,
+        agent.getExeToken(),
+        {},
+        9000);
+    if (!response.ok()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", parseErrorMessage(response) },
+            { "cameras", nlohmann::json::array() },
+            { "jobs", nlohmann::json::array() },
+            { "steps", nlohmann::json::array() },
+            { "agents", nlohmann::json::array() },
+        });
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_authoring_context" },
+            { "cameras", nlohmann::json::array() },
+            { "jobs", nlohmann::json::array() },
+            { "steps", nlohmann::json::array() },
+            { "agents", nlohmann::json::array() },
+        });
+    }
+
+    return nlohmann::json::object({
+        { "ok", parsed.value("ok", true) },
+        { "error", jsonStringField(parsed, "error") },
+        { "cameras", parsed.value("cameras", nlohmann::json::array()) },
+        { "jobs", parsed.value("jobs", nlohmann::json::array()) },
+        { "steps", parsed.value("steps", nlohmann::json::array()) },
+        { "agents", parsed.value("agents", nlohmann::json::array()) },
+    });
+}
+
+nlohmann::json fetchJobSnapshot(AgentCore& agent, const nlohmann::json& payload, int jobId)
+{
+    if (jobId <= 0) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_job_id" },
+            { "job", nlohmann::json::object() },
+            { "snapshot", nlohmann::json::object() },
+        });
+    }
+
+    const std::string clientId = clientIdFromPayload(payload).empty()
+        ? agent.getClientId()
+        : clientIdFromPayload(payload);
+    std::ostringstream url;
+    url << agent.getBackendBaseUrl()
+        << "/api/agent/jobs/" << jobId
+        << "/snapshot?client_id=" << clientId;
+    const HttpResponse response = getUrl(
+        url.str(),
+        agent.getExeToken(),
+        {},
+        9000);
+    if (!response.ok()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", parseErrorMessage(response) },
+            { "job", nlohmann::json::object() },
+            { "snapshot", nlohmann::json::object() },
+        });
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_job_snapshot_payload" },
+            { "job", nlohmann::json::object() },
+            { "snapshot", nlohmann::json::object() },
+        });
+    }
+
+    return nlohmann::json::object({
+        { "ok", parsed.value("ok", true) },
+        { "error", jsonStringField(parsed, "error") },
+        { "job", parsed.value("job", nlohmann::json::object()) },
+        { "snapshot", parsed.value("snapshot", nlohmann::json::object()) },
+    });
+}
+
+nlohmann::json compactAuthoringContextForPrompt(
+    const nlohmann::json& authoringContext,
+    std::size_t cameraLimit,
+    std::size_t jobLimit,
+    std::size_t stepLimit,
+    std::size_t agentLimit)
+{
+    const nlohmann::json cameras = authoringContext.value("cameras", nlohmann::json::array());
+    const nlohmann::json jobs = authoringContext.value("jobs", nlohmann::json::array());
+    const nlohmann::json steps = authoringContext.value("steps", nlohmann::json::array());
+    const nlohmann::json agents = authoringContext.value("agents", nlohmann::json::array());
+
+    return nlohmann::json::object({
+        { "counts", nlohmann::json::object({
+            { "camera_count", cameras.is_array() ? cameras.size() : 0 },
+            { "job_count", jobs.is_array() ? jobs.size() : 0 },
+            { "step_count", steps.is_array() ? steps.size() : 0 },
+            { "agent_count", agents.is_array() ? agents.size() : 0 },
+        }) },
+        { "cameras", truncateAuthoringArray_(
+            cameras,
+            cameraLimit,
+            { "name", "scene_label", "scene_description", "ip_address", "manufacturer", "connection_method" },
+            { "id" }) },
+        { "jobs", truncateAuthoringArray_(
+            jobs,
+            jobLimit,
+            { "name", "description", "status", "schedule_mode", "runtime_status" },
+            { "id" },
+            { "is_active" }) },
+        { "steps", truncateAuthoringArray_(
+            steps,
+            stepLimit,
+            { "job_name", "title", "prompt" },
+            { "id", "job_id", "step_order", "target_count" }) },
+        { "agents", truncateAuthoringArray_(
+            agents,
+            agentLimit,
+            { "location_type", "display_name", "summary", "camera_name", "step_title", "job_name", "slot_key", "slot_label" },
+            { "agent_id", "camera_id", "step_id", "job_id", "target_id" },
+            { "is_enabled" }) },
     });
 }
 

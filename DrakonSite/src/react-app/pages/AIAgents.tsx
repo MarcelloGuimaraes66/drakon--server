@@ -17,6 +17,7 @@ import {
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
+import { useThumbnailRecovery } from "@/react-app/hooks/useThumbnailRecovery";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import {
@@ -94,6 +95,7 @@ function AIAgentsContent() {
       });
     }
   });
+  useThumbnailRecovery(cameras);
   const existingCameraNames = useMemo(
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]

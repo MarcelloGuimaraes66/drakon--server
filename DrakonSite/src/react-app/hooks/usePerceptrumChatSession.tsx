@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ChatMessage } from "@/shared/types";
-import { brand } from "@/shared/brand";
 import { sanitizeAiApiErrorText } from "@/shared/aiApiErrorDisplay";
 import {
   emitOpenAiKeyRequiredPrompt,
@@ -33,6 +32,7 @@ export type PendingExecutionState =
     };
 
 type ChatModelTier = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
+export const PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR = "PERCEPTRUM_CHAT_TRIAL_EXPIRED";
 const FIXED_CHAT_MODEL_TIER: ChatModelTier = "ultra";
 const CHAT_MODE = "v2";
 type ChatRunningResolution = 640 | 1024;
@@ -196,6 +196,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
   const disableWebSocket = import.meta.env.VITE_DISABLE_WS === "true";
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [pendingExecutionState, setPendingExecutionState] = useState<PendingExecutionState>({
     kind: "none",
@@ -211,6 +212,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
     setWarning(null);
     setPendingExecutionState({ kind: "none" });
     autoCancelKeyRef.current = null;
+    setErrorCode(null);
   }, [sessionId]);
 
   // Helper function to upsert messages by ID
@@ -270,6 +272,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
       setIsLoading(false);
       setPendingExecutionState({ kind: "none" });
       setError(null);
+      setErrorCode(null);
       setWarning(null);
       autoCancelKeyRef.current = null;
     },
@@ -541,6 +544,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
 
       setIsLoading(true);
       setError(null);
+      setErrorCode(null);
       setWarning(null);
 
       try {
@@ -570,19 +574,9 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         });
         const data = await response.json().catch(() => ({}));
 
-        if (response.status === 402) {
-          setError(
-            sanitizeAiApiErrorText((data as any).error) ||
-              (brand.features.billingEnabled
-                ? "You're out of AI tokens. Go to Billing to add more."
-                : "You're out of AI tokens.")
-          );
-          setIsLoading(false);
-          return;
-        }
-
         if (isOpenAiKeyRequiredError(data)) {
           emitOpenAiKeyRequiredPrompt();
+          setErrorCode(typeof (data as any)?.error === "string" ? (data as any).error : null);
           setError(
             sanitizeAiApiErrorText((data as any).message) || "OpenAI API key is required in Settings."
           );
@@ -591,6 +585,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         }
         if (isZAiKeyRequiredError(data)) {
           emitZAiKeyRequiredPrompt();
+          setErrorCode(typeof (data as any)?.error === "string" ? (data as any).error : null);
           setError(
             sanitizeAiApiErrorText((data as any).message) || "Z.ai API key is required in Settings."
           );
@@ -599,9 +594,18 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         }
 
         if (!response.ok) {
-          throw new Error(sanitizeAiApiErrorText((data as any)?.error) || "Failed to send message");
+          const serverErrorCode =
+            typeof (data as any)?.error === "string" ? (data as any).error.trim() : "";
+          const serverErrorMessage =
+            typeof (data as any)?.message === "string" ? (data as any).message.trim() : "";
+          setErrorCode(serverErrorCode || null);
+          throw new Error(
+            sanitizeAiApiErrorText(serverErrorMessage || serverErrorCode) ||
+              "Failed to send message"
+          );
         }
 
+        setErrorCode(null);
         const warningMessage =
           typeof (data as any)?.warning === "string" ? (data as any).warning.trim() : "";
         setWarning(warningMessage || null);
@@ -612,7 +616,11 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         // Keep loading state active (will be cleared when final answer arrives via WebSocket)
       } catch (err) {
         console.error("Failed to send message:", err);
-        setError("Failed to send message. Please try again.");
+        setError(
+          err instanceof Error && err.message
+            ? sanitizeAiApiErrorText(err.message)
+            : "Failed to send message. Please try again."
+        );
         setWarning(null);
         setIsLoading(false);
       }
@@ -870,6 +878,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
 
   const clearError = useCallback(() => {
     setError(null);
+    setErrorCode(null);
   }, []);
 
   const clearWarning = useCallback(() => {
@@ -879,6 +888,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
   return {
     isLoading,
     error,
+    errorCode,
     warning,
     pendingExecutionState,
     sendMessage,

@@ -291,6 +291,8 @@ std::string buildDraftSystemPrompt_()
         << "- stats: array of up to 8 objects with label and value.\n"
         << "Use only facts present in report_context.\n"
         << "Do not invent live data, detections, timelines, or evidence.\n"
+        << "When the request is about a task/job, prioritize runs, steps, cameras, agents, alerts, identity cards, models, and errors tied to that task.\n"
+        << "When the request is about a camera, prioritize sessions, start/online/stop flow, agents observed, alerts, identity cards, and connectivity incidents tied to that camera.\n"
         << "If rollups are empty or evidence is limited, acknowledge that briefly.\n"
         << "Write in reply_language.\n"
         << "Never mention internal skills, endpoints, payloads, JSON, or implementation details.\n";
@@ -442,8 +444,8 @@ SkillRunResult GenerateReportSkill::execute(
         }
     }
 
-    if (!sections.is_array() || sections.empty()) {
-        sections = buildFallbackSections_(reportContext, language);
+    if (!sections.is_array()) {
+        sections = nlohmann::json::array();
     }
 
     postChatProgress(
