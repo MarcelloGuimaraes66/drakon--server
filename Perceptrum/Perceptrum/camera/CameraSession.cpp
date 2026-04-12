@@ -545,9 +545,10 @@ bool CameraSession::shouldPublishDashboardThumbnail_() const
         return false;
     }
 
-    // Keep persisted dashboard thumbnails tied to the direct service request so
-    // job-only runtime sessions do not overwrite the preview shown in AI Agents.
-    return directServiceRequested_.load(std::memory_order_relaxed);
+    // Publish dashboard thumbnails for any non-temporary live session. Job-started
+    // RTSP sessions also need thumbnail heartbeats so the UI can leave
+    // "Reconnecting" and render the current preview.
+    return true;
 }
 
 void CameraSession::maybePublishDashboardThumbnail_(

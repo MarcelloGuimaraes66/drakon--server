@@ -4756,6 +4756,87 @@ inline long long countDistinctLoggedEventEntitiesBetween(
     return static_cast<long long>(seen.size());
 }
 
+inline std::string promptEventDocIdentityKey(const json& doc) {
+    if (!doc.is_object()) return std::string();
+    const std::string evidenceKey = trim(strField(doc, "temporal_evidence_key"));
+    if (!evidenceKey.empty()) return "key:" + evidenceKey;
+    return lower(trim(strField(doc, "event"))) + "|" +
+           lower(trim(strField(doc, "entity_id"))) + "|" +
+           trim(strField(doc, "ts_utc")) + "|" +
+           trim(strField(doc, "timestamp_name")) + "|" +
+           trim(strField(doc, "frame_timestamp_in_segment"));
+}
+
+inline json makePromptEventDoc(const json& source) {
+    if (!source.is_object()) return json();
+    json out = json::object();
+    const std::string eventName = trim(strField(source, "event", strField(source, "type", strField(source, "event_type"))));
+    const std::string entityId = trim(strField(source, "entity_id"));
+    const std::string tsUtc = trim(strField(source, "ts_utc", strField(source, "last_evidence_ts_utc", strField(source, "last_seen_ts"))));
+    const std::string zone = trim(strField(source, "zone", strField(source, "current_zone")));
+    const std::string evidenceKey =
+        trim(strField(source, "temporal_evidence_key", strField(source, "last_evidence_key")));
+    const std::string frameOffset =
+        trim(strField(source, "frame_timestamp_in_segment", strField(source, "last_frame_timestamp_in_segment")));
+    const std::string timestampName =
+        trim(strField(source, "timestamp_name", strField(source, "last_timestamp_name")));
+
+    if (!eventName.empty()) out["event"] = eventName;
+    if (!entityId.empty()) out["entity_id"] = entityId;
+    if (!tsUtc.empty()) out["ts_utc"] = tsUtc;
+    if (!zone.empty()) out["zone"] = zone;
+    if (!evidenceKey.empty()) out["temporal_evidence_key"] = evidenceKey;
+    if (!frameOffset.empty()) out["frame_timestamp_in_segment"] = frameOffset;
+    if (!timestampName.empty()) out["timestamp_name"] = timestampName;
+
+    if (source.contains("frame_index") && source["frame_index"].is_number_integer()) {
+        out["frame_index"] = source["frame_index"].get<int>();
+    } else if (source.contains("last_frame_index") && source["last_frame_index"].is_number_integer()) {
+        out["frame_index"] = source["last_frame_index"].get<int>();
+    }
+
+    return out.empty() ? json() : out;
+}
+
+inline json collectLoggedEventDocsBetween(
+    const json& st,
+    const std::string& rawEventName,
+    const std::string& startIsoUtc,
+    const std::string& endIsoUtc,
+    const std::string& entityFilter = std::string(),
+    const std::string& zoneFilter = std::string(),
+    int maxItems = 20)
+{
+    json docs = json::array();
+    if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return docs;
+
+    const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
+    std::unordered_set<std::string> seenIdentityKeys;
+    for (auto it = st["events"].rbegin(); it != st["events"].rend(); ++it) {
+        if (!it->is_object()) continue;
+        if (eventRepresentsSyntheticAbsence(st, *it)) continue;
+        if (!eventName.empty() && lower(trim(strField(*it, "event"))) != eventName) continue;
+        if (!eventMatchesFilter(st, *it, entityFilter)) continue;
+        if (!zoneMatchesFilter(extractZoneField(*it), zoneFilter)) continue;
+
+        std::string normalizedTs;
+        if (!normalizeTsBetweenInclusive(strField(*it, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
+
+        json doc = makePromptEventDoc(*it);
+        if (!doc.is_object() || doc.empty()) continue;
+        doc["ts_utc"] = normalizedTs;
+
+        const std::string identityKey = promptEventDocIdentityKey(doc);
+        if (identityKey.empty() || !seenIdentityKeys.insert(identityKey).second) continue;
+
+        docs.push_back(std::move(doc));
+        if (maxItems > 0 && static_cast<int>(docs.size()) >= maxItems) break;
+    }
+
+    std::reverse(docs.begin(), docs.end());
+    return docs;
+}
+
 inline std::string earliestLoggedEventTsBetween(
     const json& st,
     const std::string& rawEventName,
@@ -6669,6 +6750,484 @@ inline json buildStateSlice(const json& st, const json& envelope) {
     return out;
 }
 
+inline json buildGlobalVarSlice(const json& st, const json& envelope) {
+    const json plan = effectivePlan(envelope);
+    json out = json::object();
+    if (!st.is_object()) return out;
+
+    const json globalVars =
+        st.contains("global_vars") && st["global_vars"].is_object()
+            ? st["global_vars"]
+            : json::object();
+    if (!plan.contains("runtime_variables") || !plan["runtime_variables"].is_array()) {
+        return out;
+    }
+
+    std::unordered_set<std::string> seenNames;
+    for (const auto& rv : plan["runtime_variables"]) {
+        if (!rv.is_object()) continue;
+        if (lower(trim(strField(rv, "scope"))) != "global") continue;
+
+        const std::string name = trim(strField(rv, "name"));
+        if (name.empty()) continue;
+
+        const std::string normalizedName = lower(name);
+        if (!seenNames.insert(normalizedName).second) continue;
+
+        if (globalVars.contains(name)) out[name] = globalVars[name];
+        else if (rv.contains("init")) out[name] = rv["init"];
+    }
+
+    return out;
+}
+
+inline json buildConfirmedRefs(const json& envelope,
+                               const json& st,
+                               const std::string& nowIsoUtc,
+                               const std::string& segmentStartTsRaw = std::string(),
+                               const std::string& segmentEndTsRaw = std::string())
+{
+    const json plan = effectivePlan(envelope);
+    json refs = json::array();
+    if (!st.is_object() || !plan.is_object() || !plan.contains("operators") || !plan["operators"].is_array()) {
+        return refs;
+    }
+
+    const std::string segmentStartTs = normalizeFlexibleTs(segmentStartTsRaw);
+    const std::string segmentEndTs = normalizeFlexibleTs(segmentEndTsRaw);
+    std::string cutoffTs = !segmentStartTs.empty() ? segmentStartTs : decisionAnchorUtc(nowIsoUtc, segmentEndTs);
+    if (cutoffTs.empty()) cutoffTs = normalizeFlexibleTs(nowIsoUtc);
+    if (cutoffTs.empty()) return refs;
+
+    const json meta =
+        st.contains("meta") && st["meta"].is_object()
+            ? st["meta"]
+            : json::object();
+    const json operatorState =
+        meta.contains("operator_state") && meta["operator_state"].is_object()
+            ? meta["operator_state"]
+            : json::object();
+    const std::string monitoringStartTs = trim(strField(
+        meta,
+        "first_round_start_ts_utc",
+        strField(meta, "last_round_start_ts_utc", cutoffTs)));
+
+    auto valueTypeLabel = [](const json& value) -> std::string {
+        if (value.is_boolean()) return "bool";
+        if (value.is_number_integer() || value.is_number_unsigned()) return "int";
+        if (value.is_number_float()) return "float";
+        if (value.is_array()) return "array";
+        if (value.is_string()) return "string";
+        if (value.is_object()) return "object";
+        return "null";
+    };
+
+    auto appendRef = [&](const std::string& rawName,
+                         const std::string& operatorId,
+                         const std::string& operatorType,
+                         const std::string& metric,
+                         const json& value,
+                         const std::string& meaning,
+                         const json& source,
+                         const json& window,
+                         const json& extra = json::object()) {
+        json ref = {
+            { "name", sanitizeToken(rawName, "confirmed_ref") },
+            { "operator_id", operatorId },
+            { "operator_type", operatorType },
+            { "metric", metric },
+            { "value_type", valueTypeLabel(value) },
+            { "value", value },
+            { "authority", "authoritative_derived_from_accepted_st_events_prior_rounds" },
+            { "precedence", "fallback_if_no_explicit_runtime_variable_matches" },
+            { "meaning", meaning },
+            { "source", source },
+            { "window", window }
+        };
+        if (extra.is_object()) {
+            for (auto it = extra.begin(); it != extra.end(); ++it) {
+                ref[it.key()] = it.value();
+            }
+        }
+        refs.push_back(std::move(ref));
+    };
+
+    auto buildSource = [](const std::string& eventName,
+                          const std::string& entityFilter,
+                          const std::string& zoneFilter) {
+        json source = json::object();
+        if (!trim(eventName).empty()) source["event"] = eventName;
+        if (!trim(entityFilter).empty()) source["entity_filter"] = entityFilter;
+        if (!trim(zoneFilter).empty()) source["zone"] = zoneFilter;
+        return source;
+    };
+
+    auto buildWindow = [&](const std::string& mode,
+                           const std::string& startTs,
+                           const std::string& endTs,
+                           const json& extra = json::object()) {
+        json window = {
+            { "mode", mode },
+            { "cutoff_utc", cutoffTs }
+        };
+        if (!startTs.empty()) window["start_utc"] = startTs;
+        if (!endTs.empty()) window["end_utc"] = endTs;
+        if (extra.is_object()) {
+            for (auto it = extra.begin(); it != extra.end(); ++it) {
+                window[it.key()] = it.value();
+            }
+        }
+        return window;
+    };
+
+    auto collectKnownMatchingEntityIds = [&](const std::string& filter) -> std::vector<std::string> {
+        std::vector<std::string> ids;
+        std::unordered_set<std::string> seen;
+        auto acceptId = [&](const std::string& rawId) {
+            const std::string id = trim(rawId);
+            if (id.empty()) return;
+            const std::string normalizedId = lower(id);
+            if (!seen.insert(normalizedId).second) return;
+            ids.push_back(id);
+        };
+
+        if (st.contains("entities") && st["entities"].is_object()) {
+            for (auto it = st["entities"].begin(); it != st["entities"].end(); ++it) {
+                if (!it.value().is_object()) continue;
+                const json* identityMemoryRow = findIdentityMemoryByEntityId(st, it.key());
+                if (!entityMatchesFilter(it.key(), filter, &it.value(), identityMemoryRow)) continue;
+                acceptId(it.key());
+            }
+        }
+        if (st.contains("events") && st["events"].is_array()) {
+            for (const auto& ev : st["events"]) {
+                if (!ev.is_object()) continue;
+                if (!eventMatchesFilter(st, ev, filter)) continue;
+                acceptId(eventEntityToken(ev));
+            }
+        }
+        return ids;
+    };
+
+    auto countEventsBetweenExactEntityId = [&](const std::string& eventName,
+                                               const std::string& startTs,
+                                               const std::string& endTs,
+                                               const std::string& entityId,
+                                               const std::string& zoneFilter) -> long long {
+        if (!st.contains("events") || !st["events"].is_array()) return 0;
+        const std::string normalizedEvent = lower(trim(normalizeEventName(eventName)));
+        const std::string targetEntity = trim(entityId);
+        long long count = 0;
+        for (const auto& item : st["events"]) {
+            if (!item.is_object()) continue;
+            if (eventRepresentsSyntheticAbsence(st, item)) continue;
+            if (!normalizedEvent.empty() && lower(trim(strField(item, "event"))) != normalizedEvent) continue;
+            if (!targetEntity.empty() && trim(strField(item, "entity_id")) != targetEntity) continue;
+            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startTs, endTs)) continue;
+            ++count;
+        }
+        return count;
+    };
+
+    auto countEventsForPrompt = [&](const std::string& eventName,
+                                    int windowSeconds,
+                                    const std::string& entityFilter,
+                                    const std::string& zoneFilter) -> long long {
+        if (isPresentEventName(eventName)) {
+            if (windowSeconds > 0) {
+                return countPresentEntitiesInState(st, cutoffTs, windowSeconds, entityFilter, zoneFilter);
+            }
+            return countDistinctEventEntities(st, eventName, cutoffTs, 0, entityFilter, zoneFilter);
+        }
+        if (!st.contains("events") || !st["events"].is_array()) return 0;
+        const std::string normalizedEvent = lower(trim(normalizeEventName(eventName)));
+        long long count = 0;
+        for (const auto& item : st["events"]) {
+            if (!item.is_object()) continue;
+            if (eventRepresentsSyntheticAbsence(st, item)) continue;
+            if (!normalizedEvent.empty() && lower(trim(strField(item, "event"))) != normalizedEvent) continue;
+            if (!trim(entityFilter).empty() && !eventMatchesFilter(st, item, entityFilter)) continue;
+            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), cutoffTs) > windowSeconds) continue;
+            ++count;
+        }
+        return count;
+    };
+
+    for (const auto& op : plan["operators"]) {
+        if (!op.is_object()) continue;
+
+        const std::string operatorType = lower(trim(strField(op, "type")));
+        const std::string operatorId = trim(strField(op, "operator_id", operatorType));
+        const std::string refPrefix = sanitizeToken(operatorId.empty() ? operatorType : operatorId, "operator");
+        const json params = op.value("params", json::object());
+
+        if (operatorType == "count_events_in_window") {
+            const int windowSeconds = intField(params, "window_seconds", 0);
+            const std::string eventName = strField(params, "event");
+            const std::string entityFilter = strField(params, "entity");
+            const std::string zoneFilter = extractZoneField(params);
+            if (windowSeconds <= 0 || trim(eventName).empty()) continue;
+
+            const std::string windowStartTs = addSecondsIso(cutoffTs, -windowSeconds);
+            if (windowStartTs.empty()) continue;
+
+            const long long currentCount = countEventsForPrompt(
+                eventName,
+                windowSeconds,
+                entityFilter,
+                zoneFilter);
+
+            appendRef(
+                refPrefix + "__prior_current_count",
+                operatorId,
+                operatorType,
+                "prior_current_count",
+                json(currentCount),
+                "Confirmed count of accepted event '" + eventName +
+                    "' before the current batch within the operator window.",
+                buildSource(eventName, entityFilter, zoneFilter),
+                buildWindow(
+                    "sliding_window",
+                    windowStartTs,
+                    cutoffTs,
+                    json{ { "window_seconds", windowSeconds } }),
+                json{ { "threshold", intField(params, "threshold", 1) } });
+            continue;
+        }
+
+        if (operatorType == "seen_n_times_in_window_by_entity") {
+            const int threshold = intField(params, "n", 0);
+            const int windowSeconds = intField(params, "window_seconds", 0);
+            const std::string eventName = strField(params, "event");
+            const std::string entityFilter = strField(params, "entity");
+            const std::string zoneFilter = extractZoneField(params);
+            if (threshold <= 0 || windowSeconds <= 0 || trim(eventName).empty()) continue;
+
+            const std::string windowStartTs = addSecondsIso(cutoffTs, -windowSeconds);
+            if (windowStartTs.empty()) continue;
+
+            json entityCounts = json::array();
+            struct EntityCountRow {
+                std::string entityId;
+                long long count = 0;
+            };
+            std::vector<EntityCountRow> rows;
+            for (const auto& entityId : collectKnownMatchingEntityIds(entityFilter)) {
+                const long long currentCount = countEventsBetweenExactEntityId(
+                    eventName,
+                    windowStartTs,
+                    cutoffTs,
+                    entityId,
+                    zoneFilter);
+                if (currentCount <= 0) continue;
+                rows.push_back(EntityCountRow{ entityId, currentCount });
+            }
+            std::sort(
+                rows.begin(),
+                rows.end(),
+                [](const EntityCountRow& lhs, const EntityCountRow& rhs) {
+                    if (lhs.count != rhs.count) return lhs.count > rhs.count;
+                    return lhs.entityId < rhs.entityId;
+                });
+            for (std::size_t i = 0; i < rows.size() && i < 24; ++i) {
+                entityCounts.push_back({
+                    { "entity_id", rows[i].entityId },
+                    { "current_count", rows[i].count }
+                });
+            }
+
+            appendRef(
+                refPrefix + "__prior_entity_counts",
+                operatorId,
+                operatorType,
+                "prior_entity_counts",
+                entityCounts,
+                "Confirmed per-entity counts of accepted event '" + eventName +
+                    "' before the current batch within the operator window.",
+                buildSource(eventName, entityFilter, zoneFilter),
+                buildWindow(
+                    "sliding_window",
+                    windowStartTs,
+                    cutoffTs,
+                    json{ { "window_seconds", windowSeconds } }),
+                json{ { "threshold", threshold } });
+            continue;
+        }
+
+        if (operatorType == "no_event_for_duration") {
+            const int durationSeconds = intField(params, "duration_seconds", 0);
+            const std::string eventName = strField(params, "event");
+            const std::string entityFilter = strField(params, "entity");
+            const std::string zoneFilter = extractZoneField(params);
+            if (durationSeconds <= 0 || trim(eventName).empty()) continue;
+
+            const std::string windowStartTs = addSecondsIso(cutoffTs, -durationSeconds);
+            if (windowStartTs.empty()) continue;
+
+            const long long currentCount = countEventsForPrompt(
+                eventName,
+                durationSeconds,
+                entityFilter,
+                zoneFilter);
+
+            appendRef(
+                refPrefix + "__prior_current_count",
+                operatorId,
+                operatorType,
+                "prior_current_count",
+                json(currentCount),
+                "Confirmed count of accepted event '" + eventName +
+                    "' before the current batch within the duration checked by this operator.",
+                buildSource(eventName, entityFilter, zoneFilter),
+                buildWindow(
+                    "sliding_window",
+                    windowStartTs,
+                    cutoffTs,
+                    json{ { "window_seconds", durationSeconds } }),
+                json{ { "absence_condition_true", currentCount == 0 } });
+            continue;
+        }
+
+        if (operatorType == "analyze_events_at_interval") {
+            const json schedule = params.value("schedule", json::object());
+            const json source = params.value("source", json::object());
+            const json analysis = params.value("analysis", json::object());
+
+            const std::string eventName = strField(source, "event");
+            const std::string entityFilter = strField(source, "entity");
+            const std::string zoneFilter = extractZoneField(source);
+            const std::string analysisKind = lower(trim(strField(analysis, "kind")));
+            const std::string windowMode = lower(trim(strField(analysis, "window_mode", "cumulative_from_anchor")));
+            const std::string anchorMode = lower(trim(strField(schedule, "anchor_mode", "monitoring_start")));
+            const int intervalSeconds = intField(schedule, "interval_seconds", 0);
+            const int windowSeconds = intField(analysis, "window_seconds", 0);
+            const std::string timeLocal = strField(schedule, "time_local");
+            const std::string timezone = strField(schedule, "timezone");
+            if (trim(eventName).empty() || trim(analysisKind).empty()) continue;
+
+            const json opState =
+                operatorState.contains(operatorId) && operatorState[operatorId].is_object()
+                    ? operatorState[operatorId]
+                    : json::object();
+
+            std::string analysisAnchorTs = trim(strField(opState, "analysis_anchor_ts_utc"));
+            std::string firstDueTs = trim(strField(opState, "first_due_ts_utc"));
+            std::string horizonEndTs = trim(strField(opState, "horizon_end_ts_utc"));
+
+            if (analysisAnchorTs.empty() || firstDueTs.empty()) {
+                if (anchorMode == "monitoring_start") {
+                    analysisAnchorTs = monitoringStartTs;
+                    if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
+                        firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
+                    }
+                } else if (anchorMode == "first_matching_event") {
+                    analysisAnchorTs =
+                        earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), entityFilter, zoneFilter);
+                    if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
+                        firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
+                    }
+                } else if (anchorMode == "fixed_time_local") {
+                    analysisAnchorTs = monitoringStartTs;
+                    if (!analysisAnchorTs.empty()) {
+                        if (!computeNextFixedLocalCheckpointUtc(analysisAnchorTs, timeLocal, timezone, firstDueTs)) {
+                            firstDueTs.clear();
+                        }
+                    }
+                }
+            }
+
+            if (windowMode == "cumulative_from_anchor" &&
+                windowSeconds > 0 &&
+                !analysisAnchorTs.empty() &&
+                horizonEndTs.empty())
+            {
+                horizonEndTs = addSecondsIso(analysisAnchorTs, windowSeconds);
+            }
+
+            if (analysisAnchorTs.empty()) continue;
+
+            std::string windowStartTs;
+            std::string windowEndTs = cutoffTs;
+            if (windowMode == "cumulative_from_anchor") {
+                windowStartTs = analysisAnchorTs;
+                if (!horizonEndTs.empty() && windowEndTs > horizonEndTs) {
+                    windowEndTs = horizonEndTs;
+                }
+            } else {
+                const int effectiveWindowSeconds = windowSeconds > 0 ? windowSeconds : intervalSeconds;
+                windowStartTs =
+                    effectiveWindowSeconds > 0
+                        ? addSecondsIso(windowEndTs, -effectiveWindowSeconds)
+                        : analysisAnchorTs;
+            }
+
+            if (windowStartTs.empty() || windowEndTs.empty() || windowEndTs < windowStartTs) continue;
+
+            json value = nullptr;
+            if (analysisKind == "count_occurrences") {
+                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+            } else if (analysisKind == "count_distinct_entities") {
+                value = countDistinctLoggedEventEntitiesBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+            } else if (analysisKind == "has_any_event") {
+                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter) > 0;
+            } else if (analysisKind == "last_event_age_seconds") {
+                const std::string latestTs =
+                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                value = latestTs.empty() ? json(nullptr) : json(std::max(0LL, ageSeconds(latestTs, windowEndTs)));
+            } else if (analysisKind == "first_event_ts") {
+                const std::string firstTs =
+                    earliestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                value = firstTs.empty() ? json(nullptr) : json(firstTs);
+            } else if (analysisKind == "last_event_ts") {
+                const std::string lastTs =
+                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                value = lastTs.empty() ? json(nullptr) : json(lastTs);
+            } else if (analysisKind == "event_rate") {
+                const long long count =
+                    countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                const long long seconds = (std::max)(1LL, ageSeconds(windowStartTs, windowEndTs));
+                value = static_cast<double>(count) / static_cast<double>(seconds);
+            } else if (analysisKind == "window_buffer") {
+                value = collectLoggedEventDocsBetween(
+                    st,
+                    eventName,
+                    windowStartTs,
+                    windowEndTs,
+                    entityFilter,
+                    zoneFilter,
+                    20);
+            } else {
+                continue;
+            }
+
+            json windowExtra = {
+                { "window_mode", windowMode }
+            };
+            if (!analysisAnchorTs.empty()) windowExtra["anchor_utc"] = analysisAnchorTs;
+            if (!firstDueTs.empty()) windowExtra["first_due_ts_utc"] = firstDueTs;
+            if (!horizonEndTs.empty()) windowExtra["horizon_end_ts_utc"] = horizonEndTs;
+            if (intervalSeconds > 0) windowExtra["interval_seconds"] = intervalSeconds;
+            if (windowSeconds > 0) windowExtra["configured_window_seconds"] = windowSeconds;
+
+            appendRef(
+                refPrefix + "__prior_confirmed_value",
+                operatorId,
+                operatorType,
+                "prior_confirmed_value",
+                value,
+                "Confirmed pre-batch value for analyze_events_at_interval derived from accepted events already committed to temporal state.",
+                buildSource(eventName, entityFilter, zoneFilter),
+                buildWindow(windowMode, windowStartTs, windowEndTs, windowExtra),
+                json{ { "analysis_kind", analysisKind } });
+            continue;
+        }
+    }
+
+    return refs;
+}
+
 inline std::string runtimeVariableMeaning(const json& rv) {
     const std::string name = trim(strField(rv, "name"));
     const std::string scope = lower(trim(strField(rv, "scope")));
@@ -6740,6 +7299,8 @@ inline json buildInferenceStaticContext(const json& envelope) {
         { "state_semantics", {
             { "state_slice_authority", "authoritative_confirmed_state_from_prior_rounds" },
             { "identity_memory_authority", "authoritative_identity_memory_from_prior_rounds" },
+            { "global_vars_authority", "authoritative_explicit_runtime_variables_from_prior_rounds" },
+            { "confirmed_refs_authority", "authoritative_event_derived_refs_from_accepted_st_events_prior_rounds" },
             { "observations_scope", "current_batch_only" },
             { "final_alert_authority", "temporal_engine" }
         }},
@@ -6825,6 +7386,8 @@ inline json buildInferenceRuntimeState(const json& envelope,
     if (!segmentEndTs.empty()) timeContext["segment_end_utc"] = segmentEndTs;
     return json{
         { "camera_id", cameraId },
+        { "global_vars", buildGlobalVarSlice(st, envelope) },
+        { "confirmed_refs", buildConfirmedRefs(envelope, st, nowIsoUtc, segmentStartTsRaw, segmentEndTsRaw) },
         { "state_slice", buildStateSlice(st, envelope) },
         { "identity_memory", idMem },
         { "time_context", timeContext }
@@ -6899,11 +7462,17 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "\n\nTEMPORAL OUTPUT RULES:\n"
         << "- Keep original output fields requested by this prompt.\n"
         << "- Also return identity_patch (array), observations (array), unknown_reasons (array).\n"
-        << "- state_slice and identity_memory are authoritative confirmed state from prior rounds. Use them when interpreting cumulative behavior.\n"
+        << "- global_vars contains authoritative explicit global runtime-variable values from prior rounds.\n"
+        << "- state_slice contains authoritative entity-scoped runtime-variable values for the listed entities from prior rounds.\n"
+        << "- confirmed_refs contains authoritative refs derived from accepted st.events from prior rounds only. Each ref includes a value, meaning, source filter and window.\n"
+        << "- When an explicit runtime-variable value already covers a quantity, prefer that explicit runtime-variable value over confirmed_refs.\n"
+        << "- Use confirmed_refs as the prior numeric/event baseline when no explicit runtime-variable already provides that quantity.\n"
+        << "- state_slice and identity_memory are authoritative confirmed prior-round context for identity continuity, but they are not complete numeric ledgers.\n"
         << "- If identity_memory contains resolved_identity metadata for an entity, preserve that metadata for the same entity_id; do not replace entity_id with a human name.\n"
         << "- observations and identity_patch MUST describe only what is visible in the current batch or snapshot.\n"
-        << "- answer may combine the current batch with state_slice when explaining cumulative counts or prior confirmed context.\n"
-        << "- alert_condition must reflect only whether the current batch itself satisfies the local alert condition; use state_slice only for explanation and identity continuity. The TemporalEngine is the final alert authority.\n"
+        << "- Do not estimate totals or cumulative baselines by counting state_slice entries or identity_memory rows.\n"
+        << "- answer may combine the current batch with confirmed_refs and explicit runtime-variable values when explaining cumulative counts or prior confirmed context.\n"
+        << "- alert_condition must reflect only whether the current batch itself satisfies the local alert condition; use prior runtime state only for explanation and identity continuity. The TemporalEngine is the final alert authority.\n"
         << "- Use time_context.now_utc as authoritative current time for temporal decisions.\n"
         << "- If an on-frame clock conflicts with provided temporal fields, prefer provided temporal fields.\n"
         << "- If time_context.segment_start_utc and time_context.segment_end_utc are present, any ts_utc you emit must stay inside that interval.\n"

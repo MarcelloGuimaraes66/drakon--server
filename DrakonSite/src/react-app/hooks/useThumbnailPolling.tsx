@@ -5,6 +5,8 @@ interface ThumbnailMetadata {
   camera_id: number;
   thumbnail_url: string | null | undefined;
   last_thumbnail_update: string | null | undefined;
+  is_service_running: number | undefined;
+  is_online: number | undefined;
 }
 
 interface Camera {
@@ -12,6 +14,7 @@ interface Camera {
   thumbnail_url?: string | null;
   last_thumbnail_update?: string | null;
   is_service_running?: number;
+  is_online?: number;
 }
 
 export function useThumbnailPolling(cameras: Camera[], onUpdate: (updates: ThumbnailMetadata[]) => void) {
@@ -62,15 +65,19 @@ export function useThumbnailPolling(cameras: Camera[], onUpdate: (updates: Thumb
           
           if (!oldCamera) continue;
           
-          // Check if thumbnail_url or last_thumbnail_update changed
+          // Check if thumbnail or connection state changed
           if (
             newCamera.thumbnail_url !== oldCamera.thumbnail_url ||
-            newCamera.last_thumbnail_update !== oldCamera.last_thumbnail_update
+            newCamera.last_thumbnail_update !== oldCamera.last_thumbnail_update ||
+            newCamera.is_service_running !== oldCamera.is_service_running ||
+            newCamera.is_online !== oldCamera.is_online
           ) {
             updates.push({
               camera_id: newCamera.id,
               thumbnail_url: newCamera.thumbnail_url,
               last_thumbnail_update: newCamera.last_thumbnail_update,
+              is_service_running: newCamera.is_service_running,
+              is_online: newCamera.is_online,
             });
           }
         }

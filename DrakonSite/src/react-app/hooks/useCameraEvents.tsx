@@ -544,6 +544,9 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
         }
 
         if (didRecoverCamera) {
+          if (onCameraStateChangeRef.current) {
+            onCameraStateChangeRef.current();
+          }
           dashboardSummaryStore.refresh();
         }
       },

@@ -21963,7 +21963,7 @@ app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
     const { results: startedStats } = await c.env.DB.prepare(
       `SELECT camera_id, MAX(created_at) AS last_started_at
        FROM events
-       WHERE user_id = ? AND event_type IN ('camera_started', 'camera_online')
+       WHERE user_id = ? AND event_type IN ('camera_started', 'camera_online', 'camera_recovered')
        GROUP BY camera_id`
     )
       .bind(user.id)
@@ -24243,7 +24243,7 @@ async function enqueueStartCameraCommand(
       normalizeCameraStartSummaryText(cam.name) || `Camera #${cameraId}`;
 
     // Mark the service as running immediately, but keep camera offline until the agent
-    // confirms the stream is actually online via camera_started/camera_online.
+    // confirms the stream is actually online via camera_started/camera_online/camera_recovered.
     await env.DB.prepare(
       "UPDATE cameras SET is_service_running = 1, is_online = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
     )
@@ -29032,10 +29032,11 @@ async function populateReportDailyRollups(params: {
          WHERE user_id = ?
            AND created_at >= ?
            AND created_at < ?
-           AND event_type IN (
+          AND event_type IN (
              'camera_connection_failed',
              'camera_started',
              'camera_online',
+             'camera_recovered',
              'job_started',
              'job_stopped',
              'job_failed',
@@ -29224,7 +29225,8 @@ async function populateReportDailyRollups(params: {
         Number.isFinite(createdAtMs) &&
         (eventType === "camera_connection_failed" ||
           eventType === "camera_started" ||
-          eventType === "camera_online")
+          eventType === "camera_online" ||
+          eventType === "camera_recovered")
       ) {
         pushReportMapArray(cameraOutageEvents, reportCompositeKey(dateKey, cameraId), {
           event_type: eventType,
@@ -29375,7 +29377,11 @@ async function populateReportDailyRollups(params: {
       }
 
       if (
-        (entry.event_type === "camera_started" || entry.event_type === "camera_online") &&
+        (
+          entry.event_type === "camera_started" ||
+          entry.event_type === "camera_online" ||
+          entry.event_type === "camera_recovered"
+        ) &&
         outageStartedAtMs !== null
       ) {
         if (atMs > outageStartedAtMs) {
@@ -31332,7 +31338,11 @@ async function buildReportContext(params: {
         stats.last_failure_at =
           typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_failure_at;
       }
-      if (eventType === "camera_started" || eventType === "camera_online") {
+      if (
+        eventType === "camera_started" ||
+        eventType === "camera_online" ||
+        eventType === "camera_recovered"
+      ) {
         stats.last_online_at =
           typeof (row as any).created_at === "string" ? (row as any).created_at : stats.last_online_at;
       }
@@ -45680,7 +45690,12 @@ app.post("/api/agent/events", async (c) => {
   }
 
   // Set camera online when it starts successfully
-  if (cameraId && (eventType === "camera_started" || eventType === "camera_online")) {
+  if (
+    cameraId &&
+    (eventType === "camera_started" ||
+      eventType === "camera_online" ||
+      eventType === "camera_recovered")
+  ) {
     if (isDrakonFindTemporarySessionEvent) {
       console.log(
         `[CAMERA STATE] Skipped online state mutation for temporary Drakon Find session on camera ${cameraId}`

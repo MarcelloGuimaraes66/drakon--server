@@ -3011,11 +3011,17 @@ static void attachTemporalZoneCatalog_(
 
 static std::string resolveAlertAnswerText_(
     const std::string& rawAnswer,
-    const std::string& temporalDecisionSummary)
+    const std::string& temporalDecisionSummary,
+    const std::string& decisionSource)
 {
     const std::string answer = trimCopyRuntime_(rawAnswer);
+    const std::string summary = trimCopyRuntime_(temporalDecisionSummary);
+    const std::string source = trimCopyRuntime_(decisionSource);
+    if ((source == "temporal_engine" || source == "temporal_engine_cross_camera") && !summary.empty()) {
+        return summary;
+    }
     if (!answer.empty()) return answer;
-    return trimCopyRuntime_(temporalDecisionSummary);
+    return summary;
 }
 
 static std::vector<std::string> sanitizeAlertRegionIds_(
@@ -8368,7 +8374,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         );
 
         const std::string effectiveAnswer =
-            resolveAlertAnswerText_(hit.answer, temporalDecisionSummary);
+            resolveAlertAnswerText_(hit.answer, temporalDecisionSummary, decisionSource);
         json regionOut;
         regionOut["region_id"] = "full-frame";
         regionOut["region_label"] = polygonRegions.empty()
@@ -9149,7 +9155,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     );
 
     const std::string effectiveAnswer =
-        resolveAlertAnswerText_(hit.answer, temporalDecisionSummary);
+        resolveAlertAnswerText_(hit.answer, temporalDecisionSummary, decisionSource);
     json regionOut;
     regionOut["region_id"] = "full-frame";
     regionOut["region_label"] = polygonRegions.empty()
@@ -10763,7 +10769,7 @@ void JobRuntime::maybeFireAlerts_(
         if (j.contains("overlay_region_ids") && j["overlay_region_ids"].is_array()) {
             overlayRegionIds = j["overlay_region_ids"];
         }
-        answer = resolveAlertAnswerText_(answer, temporalDecisionSummary);
+        answer = resolveAlertAnswerText_(answer, temporalDecisionSummary, decisionSource);
     }
     catch (...) {
         Logger::instance().logError(

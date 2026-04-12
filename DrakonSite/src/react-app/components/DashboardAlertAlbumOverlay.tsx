@@ -164,13 +164,13 @@ export default function DashboardAlertAlbumOverlay({
         aria-label={t("dashboard.closeAlbum")}
       />
 
-      <div className="absolute inset-0 flex items-center justify-center p-4 md:p-6">
-        <div className="relative flex w-full max-w-7xl items-center justify-center px-1 sm:px-10">
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-4 md:p-6">
+        <div className="relative flex w-full max-w-7xl items-center justify-center">
           {hasAlertPagination ? (
             <button
               type="button"
               onClick={onShowPrevious}
-              className="absolute left-0 top-1/2 z-20 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full border border-white/12 bg-black/45 text-white shadow-[0_24px_60px_-28px_rgba(0,0,0,0.95)] backdrop-blur-md transition hover:border-white/30 hover:bg-black/70"
+              className="pointer-events-auto absolute left-2 top-1/2 z-20 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full border border-white/12 bg-black/45 text-white shadow-[0_24px_60px_-28px_rgba(0,0,0,0.95)] backdrop-blur-md transition hover:border-white/30 hover:bg-black/70 sm:left-3 md:left-4 lg:left-0 lg:-translate-x-[calc(100%+1.25rem)] xl:-translate-x-[calc(100%+2rem)]"
               aria-label={previousAlertLabel}
               title={previousAlertLabel}
             >
@@ -178,7 +178,7 @@ export default function DashboardAlertAlbumOverlay({
             </button>
           ) : null}
 
-          <div className="relative z-10 flex max-h-[92vh] w-full flex-col overflow-hidden rounded-[32px] border border-white/[0.08] bg-[linear-gradient(180deg,rgba(18,23,34,0.97),rgba(8,11,18,0.99))] shadow-[0_40px_140px_-46px_rgba(0,0,0,0.98)]">
+          <div className="pointer-events-auto relative z-10 flex max-h-[92vh] w-full flex-col overflow-hidden rounded-[32px] border border-white/[0.08] bg-[linear-gradient(180deg,rgba(18,23,34,0.97),rgba(8,11,18,0.99))] shadow-[0_40px_140px_-46px_rgba(0,0,0,0.98)]">
             <div className="border-b border-white/[0.06] bg-white/[0.03] px-5 py-4 md:px-6">
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
@@ -428,7 +428,7 @@ export default function DashboardAlertAlbumOverlay({
             <button
               type="button"
               onClick={onShowNext}
-              className="absolute right-0 top-1/2 z-20 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full border border-white/12 bg-black/45 text-white shadow-[0_24px_60px_-28px_rgba(0,0,0,0.95)] backdrop-blur-md transition hover:border-white/30 hover:bg-black/70"
+              className="pointer-events-auto absolute right-2 top-1/2 z-20 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full border border-white/12 bg-black/45 text-white shadow-[0_24px_60px_-28px_rgba(0,0,0,0.95)] backdrop-blur-md transition hover:border-white/30 hover:bg-black/70 sm:right-3 md:right-4 lg:right-0 lg:translate-x-[calc(100%+1.25rem)] xl:translate-x-[calc(100%+2rem)]"
               aria-label={nextAlertLabel}
               title={nextAlertLabel}
             >

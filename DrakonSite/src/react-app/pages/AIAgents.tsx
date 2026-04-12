@@ -204,6 +204,8 @@ function AIAgentsContent() {
   useThumbnailPolling(cameras, (updates) => {
     for (const update of updates) {
       dashboardSummaryStore.patchCameraLocal(update.camera_id, {
+        is_service_running: update.is_service_running ?? undefined,
+        is_online: update.is_online ?? undefined,
         thumbnail_url: update.thumbnail_url ?? null,
         last_thumbnail_update: update.last_thumbnail_update ?? null,
       });

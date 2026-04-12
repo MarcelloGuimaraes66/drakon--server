@@ -346,12 +346,6 @@ function DashboardContent() {
   const [isAlertGroupOverlayOpen, setIsAlertGroupOverlayOpen] = useState(false);
   const [alertGroupOverlayAlerts, setAlertGroupOverlayAlerts] = useState<any[]>([]);
   const [alertGroupOverlayIndex, setAlertGroupOverlayIndex] = useState(0);
-  const [isAlertMediaPreviewOpen, setIsAlertMediaPreviewOpen] = useState(false);
-  const [alertMediaPreview, setAlertMediaPreview] = useState<{
-    url: string;
-    isVideo: boolean;
-    label: string;
-  } | null>(null);
   const [alertsCompactMode, setAlertsCompactMode] = useState(false);
   const [alertPanelFocusTarget, setAlertPanelFocusTarget] = useState<"emitted-alerts" | null>(null);
   const [highlightEmittedAlerts, setHighlightEmittedAlerts] = useState(false);
@@ -875,37 +869,9 @@ function DashboardContent() {
     setIsGroupAlbumOpen(false);
   };
 
-  const openAlertMediaPreview = (alert: any) => {
-    const { mediaUrl, isVideo } = getAlertMedia(alert);
-    if (!mediaUrl) return;
-
-    const displayMeta = getAlertDisplayMeta(alert, cameras, alertDisplayOptions);
-    const details = alert?.details || {};
-    const label =
-      displayMeta.mediaLabel ||
-      details.camera_name ||
-      alert?.camera_name ||
-      details.agent_key ||
-      alert?.algo_type ||
-      t("dashboard.alertDetails");
-
-    setAlertMediaPreview({
-      url: mediaUrl,
-      isVideo,
-      label: String(label || t("dashboard.alertDetails")),
-    });
-    setIsAlertMediaPreviewOpen(true);
-  };
-
   const openAlertMediaGallery = (alert: any) => {
-    const { mediaUrl, albumImages } = getAlertMedia(alert);
-    if (albumImages.length > 1) {
-      openGroupAlbum(alert, 0);
-      return;
-    }
-    if (mediaUrl) {
-      openAlertMediaPreview(alert);
-    }
+    if (!alert) return;
+    openAlertGroupOverlay([alert], 0);
   };
 
   const openAlertGroupOverlay = (alertsList: any[], startIndex = 0) => {
@@ -936,11 +902,6 @@ function DashboardContent() {
     setAlertGroupOverlayIndex((current) =>
       current >= alertGroupOverlayAlerts.length - 1 ? 0 : current + 1
     );
-  };
-
-  const closeAlertMediaPreview = () => {
-    setIsAlertMediaPreviewOpen(false);
-    setAlertMediaPreview(null);
   };
 
   const showPreviousGroupAlbumImage = () => {
@@ -2283,11 +2244,7 @@ function DashboardContent() {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          if (hasImageAlbum) {
-                            openGroupAlbum(mediaSourceAlert, 0);
-                            return;
-                          }
-                          openAlertMediaPreview(mediaSourceAlert);
+                          openAlertMediaGallery(mediaSourceAlert);
                         }}
                         className="pointer-events-auto p-2 rounded-full border border-gray-500/70 bg-black/55 text-gray-100 hover:border-white hover:bg-black/75 transition-colors"
                         aria-label="Expand alert media"
@@ -2547,49 +2504,6 @@ function DashboardContent() {
                     </div>
                     <div className="absolute right-4 bottom-4 rounded bg-black/70 px-3 py-1.5 text-sm text-gray-100">
                       {groupAlbumIndex + 1} / {groupAlbumImages.length}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {isAlertMediaPreviewOpen && alertMediaPreview && (
-            <div className="fixed inset-0 z-[92]">
-              <div
-                className="absolute inset-0 bg-black/65 backdrop-blur-sm"
-                onClick={closeAlertMediaPreview}
-              />
-              <div className="absolute inset-0 flex items-center justify-center p-4">
-                <div className="relative w-full max-w-6xl">
-                  <button
-                    type="button"
-                    onClick={closeAlertMediaPreview}
-                    className="absolute top-3 right-3 z-20 p-2 rounded-full border border-gray-600 bg-black/70 text-gray-100 hover:border-white hover:text-white transition-colors"
-                    aria-label={t("dashboard.closeAlbum")}
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-
-                  <div className="relative overflow-hidden rounded-xl border border-gray-700/90 bg-black/80 shadow-2xl">
-                    {alertMediaPreview.isVideo ? (
-                      <video
-                        src={alertMediaPreview.url}
-                        className="w-full h-[72vh] md:h-[80vh] object-contain bg-black"
-                        controls
-                        autoPlay
-                        playsInline
-                        preload="metadata"
-                      />
-                    ) : (
-                      <img
-                        src={alertMediaPreview.url}
-                        alt={alertMediaPreview.label}
-                        className="w-full h-[72vh] md:h-[80vh] object-contain"
-                      />
-                    )}
-                    <div className="absolute left-4 bottom-4 max-w-[75%] truncate rounded bg-black/70 px-3 py-1.5 text-sm text-gray-100">
-                      {alertMediaPreview.label}
                     </div>
                   </div>
                 </div>

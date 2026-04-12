@@ -1690,7 +1690,10 @@ export default function JobsPage() {
   const [showHubPublishModal, setShowHubPublishModal] = useState(false);
   const [publishingJobToHub, setPublishingJobToHub] = useState(false);
   const [hubPublishError, setHubPublishError] = useState<string | null>(null);
-  const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(cameras);
+  const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(
+    cameras,
+    fetchCameras,
+  );
   const [confirmDelete, setConfirmDelete] = useState<{ isOpen: boolean; jobId: number | null }>({
     isOpen: false,
     jobId: null,
@@ -1869,7 +1872,7 @@ export default function JobsPage() {
     }
   };
 
-  const fetchCameras = async () => {
+  async function fetchCameras() {
     try {
       const response = await fetch("/api/cameras");
       if (response.ok) {
@@ -1879,7 +1882,7 @@ export default function JobsPage() {
     } catch (error) {
       console.error("Failed to fetch cameras:", error);
     }
-  };
+  }
 
   const fetchGlobalTimezone = async () => {
     try {
