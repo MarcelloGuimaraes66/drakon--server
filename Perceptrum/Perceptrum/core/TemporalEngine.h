@@ -25,6 +25,7 @@ using json = nlohmann::json;
 
 inline std::string extractZoneField(const json& node, const std::string& fallback = std::string());
 inline std::string extractObservedZoneField(const json& node, const std::string& fallback = std::string());
+inline std::string canonicalZoneKey(const std::string& rawZone);
 inline json effectivePlan(const json& envelope);
 inline bool validateCompilerDecisionConsistency(const json& envelope, std::string* outReason = nullptr);
 inline json parseTraitsValue(const json& value);
@@ -48,6 +49,140 @@ inline std::string lower(std::string s) {
 inline std::string upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return s;
+}
+
+inline std::string canonicalZoneKey(const std::string& rawZone) {
+    const std::string input = trim(rawZone);
+    if (input.empty()) return std::string();
+
+    std::string out;
+    out.reserve(input.size());
+    bool previousSeparator = false;
+    for (unsigned char ch : input) {
+        if (std::isalnum(ch)) {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+            previousSeparator = false;
+        }
+        else if (!out.empty() && !previousSeparator) {
+            out.push_back('_');
+            previousSeparator = true;
+        }
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    return out;
+}
+
+inline void appendZoneAliasCandidate(
+    json& aliases,
+    std::unordered_set<std::string>& seen,
+    const std::string& rawValue)
+{
+    const std::string trimmedValue = trim(rawValue);
+    if (trimmedValue.empty()) return;
+
+    if (seen.insert(trimmedValue).second) {
+        aliases.push_back(trimmedValue);
+    }
+
+    const std::string loweredValue = lower(trimmedValue);
+    if (!loweredValue.empty() && seen.insert(loweredValue).second) {
+        aliases.push_back(loweredValue);
+    }
+
+    const std::string canonicalValue = canonicalZoneKey(trimmedValue);
+    if (!canonicalValue.empty() && seen.insert(canonicalValue).second) {
+        aliases.push_back(canonicalValue);
+    }
+}
+
+inline json normalizeZoneCatalog(const json& envelope) {
+    json rawCatalog = json::array();
+    if (envelope.is_object() &&
+        envelope.contains("zone_catalog") &&
+        envelope["zone_catalog"].is_array())
+    {
+        rawCatalog = envelope["zone_catalog"];
+    }
+    else {
+        const json plan = effectivePlan(envelope);
+        if (plan.is_object() &&
+            plan.contains("zone_catalog") &&
+            plan["zone_catalog"].is_array())
+        {
+            rawCatalog = plan["zone_catalog"];
+        }
+    }
+
+    json out = json::array();
+    if (!rawCatalog.is_array()) return out;
+
+    std::unordered_set<std::string> seenCanonicalKeys;
+    for (const auto& item : rawCatalog) {
+        if (!item.is_object()) continue;
+
+        const std::string regionId =
+            trim(strField(item, "region_id", strField(item, "regionId", std::string())));
+        const std::string label =
+            trim(strField(
+                item,
+                "label",
+                strField(item, "region_label", strField(item, "regionLabel", std::string()))));
+        std::string canonical =
+            canonicalZoneKey(strField(
+                item,
+                "canonical_zone_key",
+                strField(item, "canonicalZoneKey", label.empty() ? regionId : label)));
+        if (canonical.empty()) canonical = canonicalZoneKey(regionId);
+        if (canonical.empty()) continue;
+        if (!seenCanonicalKeys.insert(canonical).second) continue;
+
+        json aliases = json::array();
+        std::unordered_set<std::string> seenAliases;
+        appendZoneAliasCandidate(aliases, seenAliases, canonical);
+        appendZoneAliasCandidate(aliases, seenAliases, regionId);
+        appendZoneAliasCandidate(aliases, seenAliases, label);
+        if (item.contains("aliases") && item["aliases"].is_array()) {
+            for (const auto& alias : item["aliases"]) {
+                if (!alias.is_string()) continue;
+                appendZoneAliasCandidate(aliases, seenAliases, alias.get<std::string>());
+            }
+        }
+
+        json row = {
+            { "canonical_zone_key", canonical }
+        };
+        if (!regionId.empty()) row["region_id"] = regionId;
+        if (!label.empty()) row["label"] = label;
+        if (!aliases.empty()) row["aliases"] = aliases;
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+inline bool replaceWholeToken(std::string& text,
+                              const std::string& token,
+                              const std::string& replacement) {
+    if (text.empty() || token.empty()) return false;
+
+    bool replaced = false;
+    std::size_t pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        const bool leftBoundary =
+            pos == 0 ||
+            !std::isalnum(static_cast<unsigned char>(text[pos - 1]));
+        const std::size_t rightIndex = pos + token.size();
+        const bool rightBoundary =
+            rightIndex >= text.size() ||
+            !std::isalnum(static_cast<unsigned char>(text[rightIndex]));
+        if (!leftBoundary || !rightBoundary) {
+            pos += token.size();
+            continue;
+        }
+        text.replace(pos, token.size(), replacement);
+        pos += replacement.size();
+        replaced = true;
+    }
+    return replaced;
 }
 
 inline bool containsAnySubstring(
@@ -3552,7 +3687,8 @@ inline void appendEvent(json& st,
         { "entity_id", trim(entityId) },
         { "ts_utc", trim(tsUtc).empty() ? nowIso() : trim(tsUtc) }
     };
-    if (!trim(zone).empty()) ev["zone"] = trim(zone);
+    const std::string normalizedZone = canonicalZoneKey(zone);
+    if (!normalizedZone.empty()) ev["zone"] = normalizedZone;
 
     if (evidenceRef.is_object()) {
         if (evidenceRef.contains("temporal_evidence_key") &&
@@ -3619,7 +3755,8 @@ inline void touchEntity(
     }
     if (previousLastSeen.empty() || normalizedTs > previousLastSeen) {
         e["last_seen_ts"] = normalizedTs;
-        if (!trim(zone).empty()) e["current_zone"] = trim(zone);
+        const std::string normalizedZone = canonicalZoneKey(zone);
+        if (!normalizedZone.empty()) e["current_zone"] = normalizedZone;
         if (traits.is_array() && !traits.empty()) {
             json mergedTraits = json::array();
             if (e.contains("key_traits")) appendUniqueTraitsToArray(mergedTraits, e["key_traits"]);
@@ -3669,7 +3806,8 @@ inline void markEntityAbsent(
     } else {
         e["last_absent_ts"] = previousLastAbsent;
     }
-    if (!trim(zone).empty()) e["last_absent_zone"] = trim(zone);
+    const std::string normalizedZone = canonicalZoneKey(zone);
+    if (!normalizedZone.empty()) e["last_absent_zone"] = normalizedZone;
 }
 
 inline std::string sanitizeToken(const std::string& value, const std::string& fallback = "entity") {
@@ -4489,8 +4627,8 @@ inline bool stateAlreadyHasEvidenceKey(const json& st, const std::string& rawKey
 }
 
 inline std::string extractZoneField(const json& node, const std::string& fallback) {
-    if (!node.is_object()) return trim(fallback);
-    return trim(strField(
+    if (!node.is_object()) return canonicalZoneKey(fallback);
+    return canonicalZoneKey(strField(
         node,
         "zone",
         strField(
@@ -4509,14 +4647,14 @@ inline std::string extractZoneField(const json& node, const std::string& fallbac
 }
 
 inline std::string extractObservedZoneField(const json& node, const std::string& fallback) {
-    if (!node.is_object()) return trim(fallback);
-    return trim(strField(node, "last_seen_zone", extractZoneField(node, fallback)));
+    if (!node.is_object()) return canonicalZoneKey(fallback);
+    return canonicalZoneKey(strField(node, "last_seen_zone", extractZoneField(node, fallback)));
 }
 
 inline bool zoneMatchesFilter(const std::string& rawZone, const std::string& rawExpectedZone) {
-    const std::string expectedZone = lower(trim(rawExpectedZone));
+    const std::string expectedZone = canonicalZoneKey(rawExpectedZone);
     if (expectedZone.empty()) return true;
-    return lower(trim(rawZone)) == expectedZone;
+    return canonicalZoneKey(rawZone) == expectedZone;
 }
 
 inline long long countPresentEntitiesInState(
@@ -4852,7 +4990,8 @@ inline void upsertIdentityMemory(
         if (entityState->contains("appearance_summary")) entityState->erase("appearance_summary");
     }
     mem["last_seen_ts_utc"] = seenTsUtc;
-    if (!trim(zone).empty()) mem["last_seen_zone"] = trim(zone);
+    const std::string normalizedZone = canonicalZoneKey(zone);
+    if (!normalizedZone.empty()) mem["last_seen_zone"] = normalizedZone;
 
     const json rawIdentityFeatureCandidates =
         extractIdentityFeatureCandidatesFromNode(patch);
@@ -6588,7 +6727,7 @@ inline constexpr const char* kTemporalRuntimePromptMarker = "TEMPORAL_RUNTIME_ST
 
 inline json buildInferenceStaticContext(const json& envelope) {
     const json plan = effectivePlan(envelope);
-    return json{
+    json out = json{
         { "plan_ref", {
             { "plan_id", strField(plan, "plan_id") },
             { "plan_hash", strField(plan, "plan_hash") },
@@ -6610,6 +6749,11 @@ inline json buildInferenceStaticContext(const json& envelope) {
             { "unknown_reasons", json::array() }
         }}
     };
+    const json zoneCatalog = normalizeZoneCatalog(envelope);
+    if (zoneCatalog.is_array() && !zoneCatalog.empty()) {
+        out["zone_catalog"] = zoneCatalog;
+    }
+    return out;
 }
 
 inline json sanitizePromptIdentityPayload(const json& value) {
@@ -6718,6 +6862,7 @@ inline void splitInferenceInputForPrompt(const json& runtimeInput, json& staticC
         "entities_contract",
         "event_catalog",
         "identity_policy",
+        "zone_catalog",
         "runtime_variable_contract",
         "state_semantics",
         "expected_output_schema"
@@ -6779,6 +6924,7 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- When exact frame references are present, the backend will derive ts_utc, so do not invent ts_utc from timestamp_name.\n"
         << "- For stills or when no exact frame reference is available, use event, ts_utc, and zone.\n"
         << "- When providing zone information in identity_patch or observations, use zone as the canonical field name instead of zone_id, zone_key, region, region_id, or region_key.\n"
+        << "- If TEMPORAL_STATIC_CONTEXT_JSON contains zone_catalog, any emitted zone must use one of zone_catalog[*].canonical_zone_key exactly; do not emit the human label instead.\n"
         << "- When the scenario is about entering/leaving places, use entered_zone and left_zone from event_catalog instead of only generic present.\n"
         << "- Do not infer entered_zone just because the entity is already visible in the first frame of the batch; only use entered_zone when the entry is actually visible.\n"
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
@@ -7691,6 +7837,55 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                     if (node.is_object()) return node.dump();
                     return "null";
                 };
+                auto renderAnalyzeIntervalSummary = [&](const json& checkpoint,
+                                                        const std::string& latestDueTs,
+                                                        std::size_t dueCount) -> std::string {
+                    const std::string analysisValueText =
+                        describeScalarValue(checkpoint.value("analysis_value", json(nullptr)));
+                    const std::string expectedValueText =
+                        checkpoint.contains("expected_value")
+                            ? describeScalarValue(checkpoint["expected_value"])
+                            : std::string();
+                    const bool hasDeficit = checkpoint.contains("deficit");
+                    const bool hasDelta = checkpoint.contains("delta");
+                    const std::string deltaValueText =
+                        hasDeficit
+                            ? describeScalarValue(checkpoint["deficit"])
+                            : (hasDelta ? describeScalarValue(checkpoint["delta"]) : std::string());
+                    std::string renderedLabel = trim(summaryLabel.empty() ? eventName : summaryLabel);
+                    bool usedTemplate = false;
+                    if (!renderedLabel.empty()) {
+                        usedTemplate =
+                            replaceWholeToken(renderedLabel, "X", analysisValueText) || usedTemplate;
+                        if (!expectedValueText.empty()) {
+                            usedTemplate =
+                                replaceWholeToken(renderedLabel, "EXPECTED", expectedValueText) || usedTemplate;
+                        }
+                        if (!deltaValueText.empty()) {
+                            usedTemplate =
+                                replaceWholeToken(renderedLabel, "Y", deltaValueText) || usedTemplate;
+                        }
+                    }
+                    if (usedTemplate) {
+                        return renderedLabel;
+                    }
+
+                    std::ostringstream summary;
+                    summary << renderedLabel << " = " << analysisValueText;
+                    if (includeExpectedValue && !expectedValueText.empty()) {
+                        summary << "; expected=" << expectedValueText;
+                    }
+                    if (includeDelta && !deltaValueText.empty()) {
+                        summary << (hasDeficit ? "; deficit=" : "; delta=") << deltaValueText;
+                    }
+                    if (!latestDueTs.empty()) {
+                        summary << " at " << latestDueTs;
+                    }
+                    if (dueCount > 1) {
+                        summary << " (" << dueCount << " checkpoints due)";
+                    }
+                    return summary.str();
+                };
 
                 auto nodeTruthy = [&](const json& node) -> bool {
                     if (node.is_null()) return false;
@@ -8048,33 +8243,11 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                                 v = anyConditionTrue;
 
                                 if (shouldReport || v) {
-                                    const std::string label =
-                                        summaryLabel.empty() ? eventName : summaryLabel;
-                                    std::ostringstream summary;
-                                    summary << label << " = " << describeScalarValue(
-                                        latestCheckpoint.value("analysis_value", json(nullptr)));
-                                    if (includeExpectedValue &&
-                                        latestCheckpoint.contains("expected_value"))
-                                    {
-                                        summary << "; expected=" << describeScalarValue(
-                                            latestCheckpoint["expected_value"]);
-                                    }
-                                    if (includeDelta) {
-                                        if (latestCheckpoint.contains("deficit")) {
-                                            summary << "; deficit=" << describeScalarValue(
-                                                latestCheckpoint["deficit"]);
-                                        } else if (latestCheckpoint.contains("delta")) {
-                                            summary << "; delta=" << describeScalarValue(
-                                                latestCheckpoint["delta"]);
-                                        }
-                                    }
-                                    if (!latestDueTs.empty()) {
-                                        summary << " at " << latestDueTs;
-                                    }
-                                    if (dueTimes.size() > 1) {
-                                        summary << " (" << dueTimes.size() << " checkpoints due)";
-                                    }
-                                    summaryParts.push_back(summary.str());
+                                    summaryParts.push_back(
+                                        renderAnalyzeIntervalSummary(
+                                            latestCheckpoint,
+                                            latestDueTs,
+                                            dueTimes.size()));
                                 }
                             }
                         }

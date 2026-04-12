@@ -78,6 +78,8 @@ static bool openVideoCaptureForClipPathCamera_(
     cv::VideoCapture& outCap,
     std::string& outTempOpenPath,
     std::string* outErr = nullptr);
+
+static constexpr auto kDashboardThumbnailIntervalCamera_ = std::chrono::seconds(3);
 static bool buildFrameWindowCroppedClipWithFfmpegCamera_(
     const std::string& srcClipPath,
     const AlgorithmConfig::FrameWindowNorm& frameWindow,
@@ -552,17 +554,15 @@ void CameraSession::maybePublishDashboardThumbnail_(
     const cv::Mat& frame,
     std::chrono::steady_clock::time_point now)
 {
-    static const auto kThumbnailInterval = std::chrono::seconds(10);
-
     if (frame.empty() || !shouldPublishDashboardThumbnail_()) {
         return;
     }
 
     if (lastThumbnailSent_.time_since_epoch().count() == 0) {
-        lastThumbnailSent_ = now - kThumbnailInterval;
+        lastThumbnailSent_ = now - kDashboardThumbnailIntervalCamera_;
     }
 
-    if ((now - lastThumbnailSent_) < kThumbnailInterval) {
+    if ((now - lastThumbnailSent_) < kDashboardThumbnailIntervalCamera_) {
         return;
     }
 
@@ -2595,8 +2595,6 @@ void CameraSession::captureLoop_() {
                 ", retentionDays=" + std::to_string(config_.storage.retentionDays)
             );
 
-            static constexpr auto kThumbnailInterval = std::chrono::seconds(10);
-
             while (running_) {
                 refreshRecordingProfiles();
 
@@ -2689,13 +2687,13 @@ void CameraSession::captureLoop_() {
                 // Launch one-time description check in background
                 checkCameraDescriptionOnce_();
 
-                // --- Thumbnail update every 10 seconds ---
+                // --- Thumbnail update every 3 seconds ---
                 if (lastThumbnailSent_.time_since_epoch().count() == 0) {
                     // segurança, caso não tenha sido inicializado
-                    lastThumbnailSent_ = now - kThumbnailInterval;
+                    lastThumbnailSent_ = now - kDashboardThumbnailIntervalCamera_;
                 }
 
-                if ((now - lastThumbnailSent_) >= kThumbnailInterval) {
+                if ((now - lastThumbnailSent_) >= kDashboardThumbnailIntervalCamera_) {
                     sendThumbnail_(frameMat);
                     lastThumbnailSent_ = now;
                 }

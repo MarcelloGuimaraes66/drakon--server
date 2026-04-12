@@ -2937,6 +2937,87 @@ static std::unordered_map<std::string, std::string> buildRegionLabelByIdMap_(
     return out;
 }
 
+static void appendTemporalZoneAlias_(
+    json& aliases,
+    std::unordered_set<std::string>& seenAliases,
+    const std::string& rawValue)
+{
+    const std::string trimmedValue = trimCopyRuntime_(rawValue);
+    if (trimmedValue.empty()) return;
+
+    if (seenAliases.insert(trimmedValue).second) {
+        aliases.push_back(trimmedValue);
+    }
+
+    const std::string loweredValue = temporal::lower(trimmedValue);
+    if (!loweredValue.empty() && seenAliases.insert(loweredValue).second) {
+        aliases.push_back(loweredValue);
+    }
+
+    const std::string canonicalValue = temporal::canonicalZoneKey(trimmedValue);
+    if (!canonicalValue.empty() && seenAliases.insert(canonicalValue).second) {
+        aliases.push_back(canonicalValue);
+    }
+}
+
+static json buildTemporalZoneCatalogFromRegions_(
+    const std::vector<JobAnalysisRegion>& regions)
+{
+    json out = json::array();
+    std::unordered_set<std::string> seenCanonicalKeys;
+    for (const auto& region : regions) {
+        if (region.full_frame && region.polygon_norm.empty()) continue;
+
+        const std::string regionId = trimCopyRuntime_(region.region_id);
+        const std::string label = trimCopyRuntime_(region.label);
+        std::string canonicalZoneKey =
+            temporal::canonicalZoneKey(label.empty() ? regionId : label);
+        if (canonicalZoneKey.empty()) {
+            canonicalZoneKey = temporal::canonicalZoneKey(regionId);
+        }
+        if (canonicalZoneKey.empty()) continue;
+        if (!seenCanonicalKeys.insert(canonicalZoneKey).second) continue;
+
+        json aliases = json::array();
+        std::unordered_set<std::string> seenAliases;
+        appendTemporalZoneAlias_(aliases, seenAliases, canonicalZoneKey);
+        appendTemporalZoneAlias_(aliases, seenAliases, regionId);
+        appendTemporalZoneAlias_(aliases, seenAliases, label);
+
+        json row = {
+            {"canonical_zone_key", canonicalZoneKey},
+            {"aliases", aliases}
+        };
+        if (!regionId.empty()) row["region_id"] = regionId;
+        if (!label.empty()) row["label"] = label;
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+static void attachTemporalZoneCatalog_(
+    json& planEnvelope,
+    const std::vector<JobAnalysisRegion>& regions)
+{
+    if (!planEnvelope.is_object()) return;
+    const json zoneCatalog = buildTemporalZoneCatalogFromRegions_(regions);
+    if (zoneCatalog.is_array() && !zoneCatalog.empty()) {
+        planEnvelope["zone_catalog"] = zoneCatalog;
+    }
+    else if (planEnvelope.contains("zone_catalog")) {
+        planEnvelope.erase("zone_catalog");
+    }
+}
+
+static std::string resolveAlertAnswerText_(
+    const std::string& rawAnswer,
+    const std::string& temporalDecisionSummary)
+{
+    const std::string answer = trimCopyRuntime_(rawAnswer);
+    if (!answer.empty()) return answer;
+    return trimCopyRuntime_(temporalDecisionSummary);
+}
+
 static std::vector<std::string> sanitizeAlertRegionIds_(
     const std::vector<std::string>& rawIds,
     const std::unordered_map<std::string, std::string>& allowedRegionLabelById,
@@ -7976,6 +8057,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         const json promptCrossCameraWatchlist =
             temporal::sanitizePromptIdentityPayload(activeCrossCameraWatchlist);
         if (temporalPlanPrepared && temporal::planUsable(temporalSlot.planEnvelope)) {
+            attachTemporalZoneCatalog_(temporalSlot.planEnvelope, activeRegions);
             nlohmann::json temporalInput = temporal::buildInferenceInput(
                 temporalSlot.planEnvelope,
                 temporalSlot.state,
@@ -8285,6 +8367,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             agent.agent_key
         );
 
+        const std::string effectiveAnswer =
+            resolveAlertAnswerText_(hit.answer, temporalDecisionSummary);
         json regionOut;
         regionOut["region_id"] = "full-frame";
         regionOut["region_label"] = polygonRegions.empty()
@@ -8294,7 +8378,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (!overlayRegionIds.empty()) {
             regionOut["overlay_region_ids"] = overlayRegionIds;
         }
-        regionOut["answer"] = hit.answer;
+        regionOut["answer"] = effectiveAnswer;
         regionOut["alert_condition"] = hit.alertCondition;
         regionOut["alert_region_ids"] = alertRegionIds;
         regionOut["alert_region_names"] = alertRegionNames;
@@ -8341,7 +8425,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         finalAlertAny = hit.alertCondition;
         faceIdMatchAny = hit.faceIdMatch;
         startConditionStepId = hit.startConditionStepId;
-        representativeAnswer = hit.answer;
+        representativeAnswer = effectiveAnswer;
         representativeImageB64 =
             (hit.alertCondition || hit.faceIdMatch) ? annotatedJpegB64 : std::string();
         representativeRegionId = "full-frame";
@@ -8750,6 +8834,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     const json promptCrossCameraWatchlist =
         temporal::sanitizePromptIdentityPayload(activeCrossCameraWatchlist);
     if (temporalPlanPrepared && temporal::planUsable(temporalSlot.planEnvelope)) {
+        attachTemporalZoneCatalog_(temporalSlot.planEnvelope, activeRegions);
         nlohmann::json temporalInput = temporal::buildInferenceInput(
             temporalSlot.planEnvelope,
             temporalSlot.state,
@@ -9063,13 +9148,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         agent.agent_key
     );
 
+    const std::string effectiveAnswer =
+        resolveAlertAnswerText_(hit.answer, temporalDecisionSummary);
     json regionOut;
     regionOut["region_id"] = "full-frame";
     regionOut["region_label"] = polygonRegions.empty()
         ? "Full frame"
         : ("ROI overlays: " + std::to_string(polygonRegions.size()));
     regionOut["full_frame"] = true;
-    regionOut["answer"] = hit.answer;
+    regionOut["answer"] = effectiveAnswer;
     regionOut["alert_condition"] = hit.alertCondition;
     regionOut["alert_region_ids"] = alertRegionIds;
     regionOut["alert_region_names"] = alertRegionNames;
@@ -9116,7 +9203,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     finalAlertAny = hit.alertCondition;
     faceIdMatchAny = hit.faceIdMatch;
     startConditionStepId = hit.startConditionStepId;
-    representativeAnswer = hit.answer;
+    representativeAnswer = effectiveAnswer;
     representativeRegionId = "full-frame";
     for (const auto& name : hit.faceIdTargetNames) {
         if (std::find(mergedFaceNames.begin(), mergedFaceNames.end(), name) == mergedFaceNames.end()) {
@@ -10604,6 +10691,13 @@ void JobRuntime::maybeFireAlerts_(
     json motionTriggerRegionIds = json::array();
     json motionTriggerRegionNames = json::array();
     json overlayRegionIds = json::array();
+    std::string decisionSource;
+    bool llmAlertCondition = false;
+    bool finalAlertCondition = false;
+    bool hasLlmAlertCondition = false;
+    bool hasFinalAlertCondition = false;
+    std::string temporalDecisionSummary;
+    json temporalOperatorResults = json::array();
 
     try {
         json j = json::parse(inferenceOutput);
@@ -10615,6 +10709,23 @@ void JobRuntime::maybeFireAlerts_(
         groupId = j.value("group_id", "");
         groupName = j.value("group_name", "");
         resultSource = j.value("result_source", "");
+        if (j.contains("decision_source") && j["decision_source"].is_string()) {
+            decisionSource = j["decision_source"].get<std::string>();
+        }
+        if (j.contains("llm_alert_condition") && j["llm_alert_condition"].is_boolean()) {
+            llmAlertCondition = j["llm_alert_condition"].get<bool>();
+            hasLlmAlertCondition = true;
+        }
+        if (j.contains("final_alert_condition") && j["final_alert_condition"].is_boolean()) {
+            finalAlertCondition = j["final_alert_condition"].get<bool>();
+            hasFinalAlertCondition = true;
+        }
+        if (j.contains("temporal_decision_summary") && j["temporal_decision_summary"].is_string()) {
+            temporalDecisionSummary = j["temporal_decision_summary"].get<std::string>();
+        }
+        if (j.contains("temporal_operator_results") && j["temporal_operator_results"].is_array()) {
+            temporalOperatorResults = j["temporal_operator_results"];
+        }
         if (j.contains("group_images") && j["group_images"].is_array()) {
             groupImages = j["group_images"];
         }
@@ -10652,6 +10763,7 @@ void JobRuntime::maybeFireAlerts_(
         if (j.contains("overlay_region_ids") && j["overlay_region_ids"].is_array()) {
             overlayRegionIds = j["overlay_region_ids"];
         }
+        answer = resolveAlertAnswerText_(answer, temporalDecisionSummary);
     }
     catch (...) {
         Logger::instance().logError(
@@ -10896,8 +11008,22 @@ void JobRuntime::maybeFireAlerts_(
             {"group_name", groupName.empty() ? json(nullptr) : json(groupName)},
             {"result_source", resultSource.empty() ? json(nullptr) : json(resultSource)},
 
-
         };
+        if (!decisionSource.empty()) {
+            details["decision_source"] = decisionSource;
+        }
+        if (hasLlmAlertCondition) {
+            details["llm_alert_condition"] = llmAlertCondition;
+        }
+        if (hasFinalAlertCondition) {
+            details["final_alert_condition"] = finalAlertCondition;
+        }
+        if (!temporalDecisionSummary.empty()) {
+            details["temporal_decision_summary"] = temporalDecisionSummary;
+        }
+        if (temporalOperatorResults.is_array() && !temporalOperatorResults.empty()) {
+            details["temporal_operator_results"] = temporalOperatorResults;
+        }
 
         if (uploadedVideo.ok) {
             details["video_key"] = uploadedVideo.videoKey;
@@ -10989,7 +11115,12 @@ void JobRuntime::maybeFireAlerts_(
         if (!owner_) {
             return AgentCore::AgentEventPostResult{};
         }
-        return owner_->postAgentEventWithResult("job_alert_triggered", std::nullopt, payload.job.user_id, "", details);
+        return owner_->postAgentEventWithResult(
+            "job_alert_triggered",
+            std::nullopt,
+            payload.job.user_id,
+            answer,
+            details);
     };
 
     {

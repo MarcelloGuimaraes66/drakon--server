@@ -2,6 +2,7 @@ import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { deepReplaceKnownBrandTokens } from "@/shared/brand";
 import { drakonFindOverrides } from "@/react-app/drakonFindI18n";
+import { billingPageTranslations } from "@/react-app/billingTranslations";
 import { tutorialFeatureTranslations } from "@/react-app/tutorialTranslations";
 import { tutorialCameraStepTranslations } from "@/react-app/tutorialCameraStepTranslations";
 import { tutorialAgentStepTranslations } from "@/react-app/tutorialAgentStepTranslations";
@@ -4105,6 +4106,10 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
 };
 
 for (const [lang, entries] of Object.entries(drakonFindOverrides)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(billingPageTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 

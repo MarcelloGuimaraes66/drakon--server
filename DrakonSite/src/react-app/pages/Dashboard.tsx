@@ -108,6 +108,11 @@ function getAlertDisplayMeta(
   const rawSummary =
     readAlertLabelString(
       details?.answer,
+      representativeRegion?.answer,
+      details?.temporal_decision_summary,
+      details?.temporalDecisionSummary,
+      representativeRegion?.temporal_decision_summary,
+      representativeRegion?.temporalDecisionSummary,
       alert?.message,
       details?.summary,
       details?.reason,
@@ -3093,9 +3098,21 @@ function DashboardContent() {
                     groupAlertId > 0 &&
                     groupAlertId === Number(activeAlert?.id);
                   const groupAlertDetails = groupAlert?.details || {};
+                  const groupRegionResults = Array.isArray(groupAlertDetails?.region_results)
+                    ? groupAlertDetails.region_results
+                    : [];
+                  const groupRepresentativeRegion =
+                    groupRegionResults.find((region: any) => region?.final_alert_condition) ||
+                    groupRegionResults[0] ||
+                    null;
                   const groupAlertSummary =
                     readAlertLabelString(
                       groupAlertDetails?.answer,
+                      groupRepresentativeRegion?.answer,
+                      groupAlertDetails?.temporal_decision_summary,
+                      groupAlertDetails?.temporalDecisionSummary,
+                      groupRepresentativeRegion?.temporal_decision_summary,
+                      groupRepresentativeRegion?.temporalDecisionSummary,
                       groupAlert?.message,
                       groupAlertDetails?.summary,
                       groupAlertDetails?.reason,

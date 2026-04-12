@@ -6,13 +6,22 @@ import {
   AGENT_BILLING_PAID_PLANS,
   AGENT_BILLING_PLANS,
   FREE_AGENT_INSTANCES,
-  formatAgentInstanceLabel,
   getAgentBillingPlanFromSubscription,
   getCurrentAgentInstanceLimit,
   isLegacyCameraBillingSubscription,
   type AgentBillingPlan,
   type AgentBillingPlanId,
 } from "@/react-app/utils/agentBilling";
+import {
+  formatBillingDate,
+  formatBillingMoney,
+  formatBillingPaymentAmount,
+  getBillingAgentInstanceLabel,
+  getBillingIncludedLabel,
+  getBillingPaidSlotsLabel,
+  getBillingPaymentStatusLabel,
+  getBillingPlanName,
+} from "@/react-app/utils/billingI18n";
 import { brand } from "@/shared/brand";
 import { Payment } from "@/shared/types";
 import {
@@ -28,6 +37,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import type { TFunction } from "i18next";
 
 type BillingTab = "plans" | "history";
 type ActiveSubscription = Record<string, unknown> | null;
@@ -39,126 +49,141 @@ const IS_PERCEPTRUM_BILLING = brand.id === "perceptrum";
 const PLAN_MARKETING: Record<
   AgentBillingPlanId,
   {
-    eyebrow: string;
-    summary: string;
-    bestFor: string;
-    knowledgeValue: string;
+    eyebrowKey?: string;
+    summaryKey: string;
+    summaryPerceptrumKey?: string;
+    bestForKey: string;
+    knowledgeValueKey: string;
   }
 > = {
   free: {
-    eyebrow: "Included baseline",
-    summary: IS_PERCEPTRUM_BILLING
-      ? "Save unlimited cameras, agents, jobs and steps. Free is best for proving one live viewpoint before Knowledge Sharing spans multiple cameras, and new accounts get 30 days of chat."
-      : "Save unlimited cameras, agents, jobs and steps. Free is best for proving one live viewpoint before Knowledge Sharing spans multiple cameras.",
-    bestFor: "Single-camera setup, validation and low-volume operations.",
-    knowledgeValue:
-      "One live viewpoint at a time before cameras start building richer shared context.",
+    summaryKey: "billing.page.plan.free.summary",
+    summaryPerceptrumKey: "billing.page.plan.free.summaryPerceptrum",
+    bestForKey: "billing.page.plan.free.bestFor",
+    knowledgeValueKey: "billing.page.plan.free.knowledgeValue",
   },
   starter: {
-    eyebrow: "Knowledge Sharing entry",
-    summary:
-      "The first paid plan that turns multiple cameras into one shared live analysis brain.",
-    bestFor: "Homes, stores and small teams that want cross-camera awareness fast.",
-    knowledgeValue:
-      "Multiple cameras start sharing live analysis like one operational brain.",
+    eyebrowKey: "billing.page.plan.starter.eyebrow",
+    summaryKey: "billing.page.plan.starter.summary",
+    bestForKey: "billing.page.plan.starter.bestFor",
+    knowledgeValueKey: "billing.page.plan.starter.knowledgeValue",
   },
   growth: {
-    eyebrow: "Recommended",
-    summary:
-      "Balanced capacity for a stronger Knowledge Sharing layer across recurring multi-camera workflows and daily operations.",
-    bestFor: "Businesses that need shared live context across several areas or shifts.",
-    knowledgeValue:
-      "Recurring areas and shifts can feed the same shared live context in real time.",
+    eyebrowKey: "billing.page.plan.growth.eyebrow",
+    summaryKey: "billing.page.plan.growth.summary",
+    bestForKey: "billing.page.plan.growth.bestFor",
+    knowledgeValueKey: "billing.page.plan.growth.knowledgeValue",
   },
   scale: {
-    eyebrow: "Multi-site",
-    summary:
-      "Extend the shared real-time brain across larger sites, denser schedules and distributed deployments.",
-    bestFor: "Factories, campuses and operators spanning many cameras or locations.",
-    knowledgeValue:
-      "Larger sites and distributed cameras can stay aligned through one live knowledge layer.",
+    eyebrowKey: "billing.page.plan.scale.eyebrow",
+    summaryKey: "billing.page.plan.scale.summary",
+    bestForKey: "billing.page.plan.scale.bestFor",
+    knowledgeValueKey: "billing.page.plan.scale.knowledgeValue",
   },
   max: {
-    eyebrow: "High density",
-    summary:
-      "Keep a large Knowledge Sharing network online when many cameras and agents must collaborate continuously.",
-    bestFor: "Heavy production fleets with constant parallel execution.",
-    knowledgeValue:
-      "Dense fleets can maintain a large always-on shared intelligence layer.",
+    eyebrowKey: "billing.page.plan.max.eyebrow",
+    summaryKey: "billing.page.plan.max.summary",
+    bestForKey: "billing.page.plan.max.bestFor",
+    knowledgeValueKey: "billing.page.plan.max.knowledgeValue",
   },
 };
 
 const INCLUDED_FEATURES: Array<{
-  title: string;
-  description: string;
+  titleKey: string;
+  titlePerceptrumKey?: string;
+  descriptionKey: string;
+  descriptionPerceptrumKey?: string;
   icon: LucideIcon;
   iconClassName: string;
 }> = [
   {
-    title: "Knowledge Sharing turns cameras into one live brain",
-    description:
-      "Paid runtime lets multiple agents run at once, so cameras can reuse each other's analysis in real time instead of acting like isolated feeds.",
+    titleKey: "billing.page.included.feature.knowledgeSharing.title",
+    descriptionKey: "billing.page.included.feature.knowledgeSharing.description",
     icon: Sparkles,
     iconClassName: "bg-cyan-500/12 text-cyan-100",
   },
   {
-    title: "Unlimited setup stays unlocked",
-    description:
-      "Every plan keeps unlimited saved cameras, agents, jobs and steps. Licensing only changes what can run at the same time.",
+    titleKey: "billing.page.included.feature.unlimitedSetup.title",
+    descriptionKey: "billing.page.included.feature.unlimitedSetup.description",
     icon: Camera,
     iconClassName: "bg-blue-500/12 text-blue-100",
   },
   {
-    title: IS_PERCEPTRUM_BILLING ? "Chat trial and unlock path" : "Chat stays available",
-    description:
-      IS_PERCEPTRUM_BILLING
-        ? "Perceptrum includes 30 days of chat on new accounts. Buying any paid plan permanently unlocks chat, and users still need a valid API key for the selected model."
-        : "Chat is not tied to token packs or licenses. Users only need a valid API key for the selected model.",
+    titleKey: "billing.page.included.feature.chat.title",
+    titlePerceptrumKey: "billing.page.included.feature.chat.titlePerceptrum",
+    descriptionKey: "billing.page.included.feature.chat.description",
+    descriptionPerceptrumKey: "billing.page.included.feature.chat.descriptionPerceptrum",
     icon: MessageSquare,
     iconClassName: "bg-emerald-500/12 text-emerald-100",
   },
   {
-    title: "Upgrade only when concurrency grows",
-    description:
-      "Choose plans by how much shared live coverage you need, not by how many cameras you created or which model you selected.",
+    titleKey: "billing.page.included.feature.upgrade.title",
+    descriptionKey: "billing.page.included.feature.upgrade.description",
     icon: Gauge,
     iconClassName: "bg-amber-500/12 text-amber-100",
   },
 ];
 
-function formatMoney(amount: number, currency = "usd", locale?: string): string {
-  const normalizedCurrency = currency.toUpperCase();
-  const resolvedLocale =
-    locale || (normalizedCurrency === "BRL" ? "pt-BR" : "en-US");
-
-  return new Intl.NumberFormat(resolvedLocale, {
-    style: "currency",
-    currency: normalizedCurrency,
-  }).format(amount);
+function getPlanEyebrow(t: TFunction, planId: AgentBillingPlanId): string {
+  const key = PLAN_MARKETING[planId].eyebrowKey;
+  return key ? t(key) : "";
 }
 
-function formatUsd(amount: number): string {
-  return formatMoney(amount, "usd", "en-US");
+function getPlanSummary(
+  t: TFunction,
+  planId: AgentBillingPlanId,
+  isPerceptrumBilling: boolean
+): string {
+  const plan = PLAN_MARKETING[planId];
+  return t(
+    isPerceptrumBilling && plan.summaryPerceptrumKey
+      ? plan.summaryPerceptrumKey
+      : plan.summaryKey
+  );
 }
 
-function formatPaymentAmount(amount: number, currency: string): string {
-  return formatMoney(amount / 100, currency);
+function getPlanBestFor(t: TFunction, planId: AgentBillingPlanId): string {
+  return t(PLAN_MARKETING[planId].bestForKey);
 }
 
-function formatDate(dateString: string): string {
-  return new Date(dateString).toLocaleDateString("en-US", {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+function getPlanKnowledgeValue(t: TFunction, planId: AgentBillingPlanId): string {
+  return t(PLAN_MARKETING[planId].knowledgeValueKey);
 }
 
-function getDisplayedPlanPrice(plan: AgentBillingPlan): string {
+function getIncludedFeatureTitle(
+  t: TFunction,
+  feature: (typeof INCLUDED_FEATURES)[number],
+  isPerceptrumBilling: boolean
+): string {
+  return t(
+    isPerceptrumBilling && feature.titlePerceptrumKey
+      ? feature.titlePerceptrumKey
+      : feature.titleKey
+  );
+}
+
+function getIncludedFeatureDescription(
+  t: TFunction,
+  feature: (typeof INCLUDED_FEATURES)[number],
+  isPerceptrumBilling: boolean
+): string {
+  return t(
+    isPerceptrumBilling && feature.descriptionPerceptrumKey
+      ? feature.descriptionPerceptrumKey
+      : feature.descriptionKey
+  );
+}
+
+function getDisplayedPlanPrice(
+  plan: AgentBillingPlan,
+  t: TFunction,
+  language?: string
+): string {
   if (plan.monthlyPriceUsd <= 0) {
-    return "Included";
+    return getBillingIncludedLabel(t);
   }
 
-  return formatUsd(plan.monthlyPriceUsd);
+  return formatBillingMoney(plan.monthlyPriceUsd, "usd", language);
 }
 
 function getPlanSurfaceClass(planId: AgentBillingPlanId, isCurrent: boolean): string {
@@ -238,7 +263,8 @@ function getPlanCtaClass(planId: AgentBillingPlanId, isCurrent: boolean): string
 }
 
 export default function Billing() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const currentLanguage = i18n.resolvedLanguage || i18n.language;
   const [payments, setPayments] = useState<Payment[]>([]);
   const [configuredCameras, setConfiguredCameras] = useState(0);
   const [runningCameras, setRunningCameras] = useState(0);
@@ -345,54 +371,72 @@ export default function Billing() {
     () => getCurrentAgentInstanceLimit(activeSubscription),
     [activeSubscription]
   );
-  const currentPlanName = currentPlan?.name || (isLegacyPlan ? "Legacy" : "Free");
+  const currentPlanName = currentPlan
+    ? getBillingPlanName(t, currentPlan.id, currentPlan.name)
+    : isLegacyPlan
+    ? t("billing.page.current.legacyName")
+    : getBillingPlanName(t, "free", "Free");
   const currentPlanPrice = isLegacyPlan
-    ? { primary: "Legacy plan", secondary: "Camera-based billing structure" }
+    ? {
+        primary: t("billing.page.current.legacyPrimary"),
+        secondary: t("billing.page.current.legacySecondary"),
+      }
     : currentPlan
-    ? { primary: getDisplayedPlanPrice(currentPlan), secondary: "Billed monthly in USD" }
-    : { primary: "Included", secondary: "No monthly charge" };
+    ? {
+        primary: getDisplayedPlanPrice(currentPlan, t, currentLanguage),
+        secondary: t("billing.page.current.secondaryBilledMonthly"),
+      }
+    : {
+        primary: getBillingIncludedLabel(t),
+        secondary: t("billing.page.current.secondaryNoCharge"),
+      };
   const currentPlanSummary = isLegacyPlan
-    ? "This account still uses the previous camera-based subscription and should be migrated to the new agent-instance catalog."
+    ? t("billing.page.current.summaryLegacy")
     : currentPlan
-    ? `${formatAgentInstanceLabel(currentPlan.totalAgentInstances)} can run in parallel on this account. ${currentPlan.description}`
+    ? t("billing.page.current.summaryPaid", {
+        countLabel: getBillingAgentInstanceLabel(t, currentPlan.totalAgentInstances),
+        summary: getPlanSummary(t, currentPlan.id, IS_PERCEPTRUM_BILLING),
+      })
     : IS_PERCEPTRUM_BILLING
-    ? "The free plan includes 1 running agent instance with unlimited saved cameras, agents, jobs and steps, plus 30 days of chat. Upgrade when you want Knowledge Sharing across multiple live cameras and a permanent chat unlock."
-    : "The free plan includes 1 running agent instance with unlimited saved cameras, agents, jobs and steps. Upgrade when you want Knowledge Sharing across multiple live cameras.";
+    ? t("billing.page.current.summaryFreePerceptrum")
+    : t("billing.page.current.summaryFree");
   const nextStepCopy = isLegacyPlan
-    ? "Keep this account on the legacy billing path until the Stripe migration is complete."
+    ? t("billing.page.current.nextStepLegacy")
     : currentPlan
-    ? `This account already includes +${currentPlan.paidAgentInstances} paid runtime slots on top of the free base instance, so more cameras can contribute to the same shared live context.`
+    ? t("billing.page.current.nextStepPaid", {
+        paidSlotsLabel: getBillingPaidSlotsLabel(t, currentPlan.paidAgentInstances),
+      })
     : IS_PERCEPTRUM_BILLING
-    ? "Stay on Free if one live camera is enough today. Upgrade when you want Knowledge Sharing across multiple cameras, or when chat matters beyond the first 30 days."
-    : "Stay on Free if one live camera is enough today, or upgrade when you want multiple cameras contributing to the same real-time operating brain.";
+    ? t("billing.page.current.nextStepFreePerceptrum")
+    : t("billing.page.current.nextStepFree");
   const currentBillingStats = useMemo(
     () => [
       {
-        label: "Configured cameras",
+        label: t("billing.page.current.stat.configuredCameras"),
         value: configuredCameras,
         icon: Camera,
         iconClassName: "bg-blue-500/15 text-blue-100",
       },
       {
-        label: "Runtime limit",
+        label: t("billing.page.current.stat.runtimeLimit"),
         value: currentAgentLimit,
         icon: Bot,
         iconClassName: "bg-emerald-500/15 text-emerald-100",
       },
       {
-        label: "Running cameras",
+        label: t("billing.page.current.stat.runningCameras"),
         value: runningCameras,
         icon: Gauge,
         iconClassName: "bg-amber-500/15 text-amber-100",
       },
     ],
-    [configuredCameras, currentAgentLimit, runningCameras]
+    [configuredCameras, currentAgentLimit, runningCameras, t]
   );
 
   const tabs: Array<{ id: BillingTab; label: string }> = [
     {
       id: "plans",
-      label: "Plans",
+      label: t("billing.page.tabs.plans"),
     },
     {
       id: "history",
@@ -403,47 +447,51 @@ export default function Billing() {
   const comparisonRows = useMemo(
     () => [
       {
-        label: "Monthly price",
+        label: t("billing.page.compare.row.monthlyPrice"),
         getValue: (plan: AgentBillingPlan) =>
-          plan.id === "free" ? "Included" : `${getDisplayedPlanPrice(plan)} / month`,
+          plan.id === "free"
+            ? getBillingIncludedLabel(t)
+            : `${getDisplayedPlanPrice(plan, t, currentLanguage)} ${t("billing.perMonth")}`,
       },
       {
-        label: "Parallel runtime",
+        label: t("billing.page.compare.row.parallelRuntime"),
         getValue: (plan: AgentBillingPlan) =>
-          formatAgentInstanceLabel(plan.totalAgentInstances),
+          getBillingAgentInstanceLabel(t, plan.totalAgentInstances),
       },
       {
-        label: "Paid add-on",
+        label: t("billing.page.compare.row.paidAddon"),
         getValue: (plan: AgentBillingPlan) =>
-          plan.id === "free" ? "0 paid slots" : `+${plan.paidAgentInstances} paid slots`,
+          plan.id === "free"
+            ? t("billing.page.compare.paidAddonNone")
+            : getBillingPaidSlotsLabel(t, plan.paidAgentInstances),
       },
       {
-        label: "Unlimited saved cameras",
-        getValue: () => "Included",
+        label: t("billing.page.compare.row.unlimitedSavedCameras"),
+        getValue: () => getBillingIncludedLabel(t),
       },
       {
-        label: "Unlimited saved agents and jobs",
-        getValue: () => "Included",
+        label: t("billing.page.compare.row.unlimitedSavedAgentsJobs"),
+        getValue: () => getBillingIncludedLabel(t),
       },
       {
-        label: "Knowledge Sharing value",
-        getValue: (plan: AgentBillingPlan) => PLAN_MARKETING[plan.id].knowledgeValue,
+        label: t("billing.page.compare.row.knowledgeSharingValue"),
+        getValue: (plan: AgentBillingPlan) => getPlanKnowledgeValue(t, plan.id),
       },
       {
-        label: "Chat access",
+        label: t("billing.page.compare.row.chatAccess"),
         getValue: (plan: AgentBillingPlan) =>
           IS_PERCEPTRUM_BILLING
             ? plan.id === "free"
-              ? "30 days free, then unlock with any paid plan"
-              : "Unlocked with a configured model key"
-            : "Included with a configured model key",
+              ? t("billing.page.compare.chatAccessFreePerceptrum")
+              : t("billing.page.compare.chatAccessPaidPerceptrum")
+            : t("billing.page.compare.chatAccessConfiguredModel"),
       },
       {
-        label: "Best fit",
-        getValue: (plan: AgentBillingPlan) => PLAN_MARKETING[plan.id].bestFor,
+        label: t("billing.page.compare.row.bestFit"),
+        getValue: (plan: AgentBillingPlan) => getPlanBestFor(t, plan.id),
       },
     ],
-    []
+    [currentLanguage, t]
   );
 
   const startCheckout = async (planId: string) => {
@@ -463,7 +511,7 @@ export default function Billing() {
       if (!response.ok || typeof data?.url !== "string" || !data.url) {
         throw new Error(
           (typeof data?.error === "string" && data.error) ||
-            "Failed to create Stripe checkout session"
+            t("billing.page.checkoutFailed")
         );
       }
 
@@ -473,7 +521,7 @@ export default function Billing() {
       alert(
         error instanceof Error && error.message
           ? error.message
-          : "Failed to start Stripe checkout"
+          : t("billing.page.checkoutFailed")
       );
     } finally {
       setCheckoutPlanId(null);
@@ -484,7 +532,7 @@ export default function Billing() {
     <Layout>
       {showSuccessToast ? (
         <div className="fixed top-4 right-4 z-50 rounded-lg bg-green-500 px-6 py-3 text-white shadow-lg animate-fade-in">
-          Payment successful! Your account has been updated.
+          {t("billing.page.toast.paymentSuccess")}
         </div>
       ) : null}
 
@@ -500,23 +548,23 @@ export default function Billing() {
       <div className="max-w-[1280px] space-y-6 md:space-y-8">
         <header className="max-w-3xl">
           <div className="inline-flex items-center rounded-full border border-blue-400/20 bg-blue-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-blue-100">
-            Monthly subscriptions by agent runtime
+            {t("billing.page.hero.badge")}
           </div>
           <h1 className="mt-4 text-3xl font-semibold tracking-tight text-white md:text-4xl">
-            Billing
+            {t("billing.page.hero.title")}
           </h1>
           <p className="mt-3 text-sm leading-6 text-gray-400 md:text-[15px]">
-            Parallel runtime is what makes Knowledge Sharing valuable: more live
-            agents can connect more cameras into one real-time analysis brain.
+            {IS_PERCEPTRUM_BILLING
+              ? t("billing.page.hero.descriptionPerceptrum")
+              : t("billing.page.hero.description")}
           </p>
         </header>
 
         {isLegacyPlan ? (
           <section className="rounded-3xl border border-amber-400/20 bg-amber-500/10 px-5 py-4 text-sm text-amber-100">
-            <p className="font-medium">Legacy billing detected.</p>
+            <p className="font-medium">{t("billing.page.legacy.title")}</p>
             <p className="mt-1 text-amber-100/80">
-              This subscription still uses the previous camera and model structure.
-              Keep it on the migration path before enabling self-serve plan changes.
+              {t("billing.page.legacy.description")}
             </p>
           </section>
         ) : null}
@@ -548,70 +596,66 @@ export default function Billing() {
               <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_380px]">
                 <div>
                   <div className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-gray-200">
-                    No token packs. No camera fees.
+                    {t("billing.page.hero.panelBadge")}
                   </div>
 
                   <h2 className="mt-4 text-3xl font-semibold tracking-tight text-white md:text-[2.6rem] md:leading-[1.05]">
-                    Turn many cameras into one shared real-time analysis brain.
+                    {t("billing.page.hero.mainTitle")}
                   </h2>
 
                   <p className="mt-4 max-w-2xl text-sm leading-7 text-gray-300 md:text-[15px]">
                     {IS_PERCEPTRUM_BILLING
-                      ? "Create as many cameras, agents, jobs and steps as you want. Paid runtime makes Knowledge Sharing live, so agents running on different cameras can share analysis in real time across a home, company, factory or shopping environment. Any paid plan also keeps chat unlocked after the first 30 days."
-                      : "Create as many cameras, agents, jobs and steps as you want. Paid runtime makes Knowledge Sharing live, so agents running on different cameras can share analysis in real time across a home, company, factory or shopping environment."}
+                      ? t("billing.page.hero.mainDescriptionPerceptrum")
+                      : t("billing.page.hero.mainDescription")}
                   </p>
 
                   <div className="mt-6 flex flex-wrap gap-2">
                     <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-200">
-                      1 free runtime slot is always included
+                      {t("billing.page.hero.chip.freeRuntime")}
                     </span>
                     <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-200">
-                      Knowledge Sharing across multiple live cameras
+                      {t("billing.page.hero.chip.knowledgeSharing")}
                     </span>
                     <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-200">
-                      Unlimited saved cameras and agents
+                      {t("billing.page.hero.chip.unlimitedSaved")}
                     </span>
                     <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-gray-200">
-                      Secure Stripe checkout
+                      {t("billing.page.hero.chip.secureCheckout")}
                     </span>
                   </div>
 
                   <div className="mt-6 rounded-[28px] border border-white/10 bg-black/20 p-5 backdrop-blur-sm">
                     <p className="text-xs uppercase tracking-[0.24em] text-gray-500">
-                      How to choose the right plan
+                      {t("billing.page.choosePlan.label")}
                     </p>
 
                     <div className="mt-4 grid gap-3 md:grid-cols-3">
                       <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
                         <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
-                          1. Map the environment
+                          {t("billing.page.choosePlan.step1.title")}
                         </div>
                         <p className="mt-2 text-sm leading-6 text-gray-300">
-                          Connect as many cameras, agents, jobs and steps as the
-                          environment needs, from a home or store to a factory
-                          or mall.
+                          {t("billing.page.choosePlan.step1.description")}
                         </p>
                       </div>
 
                       <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
                         <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
-                          2. Build the shared brain
+                          {t("billing.page.choosePlan.step2.title")}
                         </div>
                         <p className="mt-2 text-sm leading-6 text-gray-300">
-                          The moment more than one agent can run, Knowledge
-                          Sharing stops being isolated analysis and becomes one
-                          live operational context across cameras.
+                          {t("billing.page.choosePlan.step2.description")}
                         </p>
                       </div>
 
                       <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
                         <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
-                          3. Buy the parallelism that keeps it live
+                          {t("billing.page.choosePlan.step3.title")}
                         </div>
                         <p className="mt-2 text-sm leading-6 text-gray-300">
                           {IS_PERCEPTRUM_BILLING
-                            ? "Free covers one live agent. Starter is the first paid step into cross-camera intelligence, and any paid plan keeps chat unlocked after 30 days."
-                            : "Free covers one live agent. Starter is the first paid step into cross-camera intelligence, and higher tiers expand that same shared brain."}
+                            ? t("billing.page.choosePlan.step3.descriptionPerceptrum")
+                            : t("billing.page.choosePlan.step3.description")}
                         </p>
                       </div>
                     </div>
@@ -621,7 +665,7 @@ export default function Billing() {
                 <aside className="rounded-[30px] border border-white/10 bg-black/25 p-6 backdrop-blur-sm">
                   <div className="flex items-center justify-between gap-3">
                     <span className="rounded-full border border-white/10 bg-white/[0.06] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-gray-200">
-                      Current billing
+                      {t("billing.page.current.label")}
                     </span>
                     <span className="rounded-full border border-blue-300/20 bg-blue-400/15 px-3 py-1 text-[11px] font-medium text-blue-50">
                       {currentPlanName}
@@ -633,7 +677,7 @@ export default function Billing() {
                       {currentPlanPrice.primary}
                       {currentPlan?.id ? (
                         <span className="ml-2 text-sm font-normal text-gray-400">
-                          / month
+                          {t("billing.page.current.priceSuffix")}
                         </span>
                       ) : null}
                     </div>
@@ -679,7 +723,7 @@ export default function Billing() {
                       </div>
                       <div>
                         <div className="text-sm font-medium text-white">
-                          What this means today
+                          {t("billing.page.current.nextStepTitle")}
                         </div>
                         <p className="mt-1 text-sm leading-6 text-gray-400">
                           {nextStepCopy}
@@ -692,11 +736,10 @@ export default function Billing() {
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0">
                         <p className="text-sm text-gray-400">
-                          Need to update cards or manage this subscription?
+                          {t("billing.page.manage.title")}
                         </p>
                         <p className="mt-1 text-xs text-gray-500">
-                          Open billing management for saved cards, cancellation
-                          and current plan details.
+                          {t("billing.page.manage.description")}
                         </p>
                       </div>
                       <button
@@ -716,21 +759,19 @@ export default function Billing() {
               <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.24em] text-gray-500">
-                    Pricing plans
+                    {t("billing.page.pricing.eyebrow")}
                   </p>
                   <h2 className="mt-2 text-2xl font-semibold text-white">
-                    Choose how much shared live intelligence you want available
+                    {t("billing.page.pricing.title")}
                   </h2>
                   <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-400">
-                    Free is your baseline. Paid plans add the parallel slots
-                    that let Knowledge Sharing connect more cameras into one
-                    real-time brain.
+                    {t("billing.page.pricing.description")}
                   </p>
                 </div>
 
                 <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-4 py-2 text-xs text-gray-300">
                   <Sparkles className="h-3.5 w-3.5 text-blue-200" />
-                  Starter is the entry to Knowledge Sharing. Growth is best for active teams.
+                  {t("billing.page.pricing.hint")}
                 </div>
               </div>
 
@@ -738,27 +779,31 @@ export default function Billing() {
                 <div className="grid gap-5 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]">
                   <div>
                     <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-gray-200">
-                      {!isLegacyPlan && !currentPlan?.id ? "Current plan" : "Still included"}
+                      {!isLegacyPlan && !currentPlan?.id
+                        ? t("billing.page.free.badgeCurrent")
+                        : t("billing.page.free.badgeIncluded")}
                     </span>
-                    <h3 className="mt-4 text-2xl font-semibold text-white">Free</h3>
+                    <h3 className="mt-4 text-2xl font-semibold text-white">
+                      {getBillingPlanName(t, "free", "Free")}
+                    </h3>
                     <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-300">
-                      {PLAN_MARKETING.free.summary}
+                      {getPlanSummary(t, "free", IS_PERCEPTRUM_BILLING)}
                     </p>
 
                     <div className="mt-5 flex flex-wrap gap-2">
                       <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs text-gray-200">
-                        1 running agent instance
+                        {t("billing.page.free.chip.runtime")}
                       </span>
                       <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs text-gray-200">
-                        Unlimited saved cameras and agents
+                        {t("billing.page.free.chip.unlimitedSaved")}
                       </span>
                       <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs text-gray-200">
-                        Knowledge Sharing grows with more runtime
+                        {t("billing.page.free.chip.knowledgeSharing")}
                       </span>
                       <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-xs text-gray-200">
                         {IS_PERCEPTRUM_BILLING
-                          ? "30-day chat access with model API key"
-                          : "Chat available with model API key"}
+                          ? t("billing.page.free.chip.chatPerceptrum")
+                          : t("billing.page.free.chip.chat")}
                       </span>
                     </div>
                   </div>
@@ -766,32 +811,34 @@ export default function Billing() {
                   <div className="grid gap-3 sm:grid-cols-3">
                     <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                       <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                        Monthly price
+                        {t("billing.page.paid.metric.monthlyPrice")}
                       </div>
-                      <div className="mt-2 text-xl font-semibold text-white">Included</div>
+                      <div className="mt-2 text-xl font-semibold text-white">
+                        {getBillingIncludedLabel(t)}
+                      </div>
                       <p className="mt-1 text-xs leading-5 text-gray-400">
-                        No monthly charge.
+                        {t("billing.page.free.metric.noMonthlyCharge")}
                       </p>
                     </div>
 
                     <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                       <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                        Runtime
+                        {t("billing.page.paid.metric.parallelRuntime")}
                       </div>
                       <div className="mt-2 text-xl font-semibold text-white">
                         {FREE_AGENT_INSTANCES}
                       </div>
                       <p className="mt-1 text-xs leading-5 text-gray-400">
-                        {formatAgentInstanceLabel(FREE_AGENT_INSTANCES)}
+                        {getBillingAgentInstanceLabel(t, FREE_AGENT_INSTANCES)}
                       </p>
                     </div>
 
                     <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                       <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                        Best fit
+                        {t("billing.page.compare.row.bestFit")}
                       </div>
                       <div className="mt-2 text-sm font-medium text-white">
-                        {PLAN_MARKETING.free.bestFor}
+                        {getPlanBestFor(t, "free")}
                       </div>
                     </div>
                   </div>
@@ -802,7 +849,8 @@ export default function Billing() {
                 {AGENT_BILLING_PAID_PLANS.map((plan) => {
                   const isCurrent = currentPlan?.id === plan.id;
                   const isLoadingCheckout = checkoutPlanId === plan.id;
-                  const planPrice = getDisplayedPlanPrice(plan);
+                  const planPrice = getDisplayedPlanPrice(plan, t, currentLanguage);
+                  const planName = getBillingPlanName(t, plan.id, plan.name);
 
                   return (
                     <article
@@ -815,10 +863,10 @@ export default function Billing() {
                       <div className="flex items-start justify-between gap-3">
                         <div>
                           <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                            {PLAN_MARKETING[plan.id].eyebrow}
+                            {getPlanEyebrow(t, plan.id)}
                           </div>
                           <h3 className="mt-2 text-2xl font-semibold text-white">
-                            {plan.name}
+                            {planName}
                           </h3>
                         </div>
 
@@ -829,26 +877,28 @@ export default function Billing() {
                           )}`}
                         >
                           {isCurrent
-                            ? "Current"
+                            ? t("billing.page.paid.badgeCurrent")
                             : plan.id === "growth"
-                            ? "Recommended"
+                            ? t("billing.page.paid.badgeRecommended")
                             : `+${plan.paidAgentInstances}`}
                         </span>
                       </div>
 
                       <p className="mt-3 text-sm leading-6 text-gray-300">
-                        {PLAN_MARKETING[plan.id].summary}
+                        {getPlanSummary(t, plan.id, IS_PERCEPTRUM_BILLING)}
                       </p>
 
                       <div className="mt-5">
                         <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                          Monthly price
+                          {t("billing.page.paid.metric.monthlyPrice")}
                         </div>
                         <div className="mt-2 flex items-end gap-2">
                           <span className="text-4xl font-semibold tracking-tight text-white">
                             {planPrice}
                           </span>
-                          <span className="pb-1 text-sm text-gray-400">/ month</span>
+                          <span className="pb-1 text-sm text-gray-400">
+                            {t("billing.page.current.priceSuffix")}
+                          </span>
                         </div>
                       </div>
 
@@ -859,40 +909,44 @@ export default function Billing() {
                         )}`}
                       >
                         <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                          Parallel runtime
+                          {t("billing.page.paid.metric.parallelRuntime")}
                         </div>
                         <div className="mt-2 text-2xl font-semibold text-white">
                           {plan.totalAgentInstances}
                         </div>
                         <p className="mt-1 text-sm text-gray-300">
-                          {formatAgentInstanceLabel(plan.totalAgentInstances)}
+                          {getBillingAgentInstanceLabel(t, plan.totalAgentInstances)}
                         </p>
                         <p className="mt-1 text-xs leading-5 text-gray-400">
-                          Includes +{plan.paidAgentInstances} paid runtime slots
-                          plus the free base instance.
+                          {t("billing.page.paid.metric.paidSlotsSummary", {
+                            paidSlotsLabel: getBillingPaidSlotsLabel(
+                              t,
+                              plan.paidAgentInstances
+                            ),
+                          })}
                         </p>
                       </div>
 
                       <div className="mt-5 space-y-2 text-sm text-gray-200">
                         <div className="flex items-start gap-2">
                           <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
-                          <span>Unlimited cameras and saved agents</span>
+                          <span>{t("billing.page.paid.feature.unlimitedSaved")}</span>
                         </div>
                         <div className="flex items-start gap-2">
                           <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
-                          <span>{PLAN_MARKETING[plan.id].knowledgeValue}</span>
+                          <span>{getPlanKnowledgeValue(t, plan.id)}</span>
                         </div>
                         <div className="flex items-start gap-2">
                           <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
                           <span>
                             {IS_PERCEPTRUM_BILLING
-                              ? "Jobs and steps stay available, and chat stays unlocked"
-                              : "Jobs, steps and chat stay available"}
+                              ? t("billing.page.paid.feature.availabilityPerceptrum")
+                              : t("billing.page.paid.feature.availability")}
                           </span>
                         </div>
                         <div className="flex items-start gap-2">
                           <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
-                          <span>{PLAN_MARKETING[plan.id].bestFor}</span>
+                          <span>{getPlanBestFor(t, plan.id)}</span>
                         </div>
                       </div>
 
@@ -906,12 +960,12 @@ export default function Billing() {
                         )} ${isLoadingCheckout ? "opacity-70" : ""}`}
                       >
                         {isCurrent ? (
-                          "Current plan"
+                          t("billing.page.free.badgeCurrent")
                         ) : isLoadingCheckout ? (
-                          "Opening checkout..."
+                          t("billing.page.paid.openingCheckout")
                         ) : (
                           <>
-                            Choose {plan.name}
+                            {t("billing.page.paid.choose", { plan: planName })}
                             <ArrowRight className="h-4 w-4" />
                           </>
                         )}
@@ -925,12 +979,12 @@ export default function Billing() {
             <section className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
               <article className="rounded-[30px] border border-white/10 bg-white/[0.035] p-6">
                 <p className="text-xs uppercase tracking-[0.24em] text-gray-500">
-                  Included on every plan
+                  {t("billing.page.included.eyebrow")}
                 </p>
                 <h3 className="mt-2 text-2xl font-semibold text-white">
                   {IS_PERCEPTRUM_BILLING
-                    ? "Most of the product stays unlocked across plans"
-                    : "The upgrade changes concurrency, not product access"}
+                    ? t("billing.page.included.titlePerceptrum")
+                    : t("billing.page.included.title")}
                 </h3>
 
                 <div className="mt-6 space-y-4">
@@ -939,7 +993,7 @@ export default function Billing() {
 
                     return (
                       <div
-                        key={feature.title}
+                        key={feature.titleKey}
                         className="rounded-2xl border border-white/10 bg-black/20 p-4"
                       >
                         <div className="flex items-start gap-4">
@@ -950,10 +1004,14 @@ export default function Billing() {
                           </div>
                           <div>
                             <h4 className="text-base font-semibold text-white">
-                              {feature.title}
+                              {getIncludedFeatureTitle(t, feature, IS_PERCEPTRUM_BILLING)}
                             </h4>
                             <p className="mt-2 text-sm leading-6 text-gray-400">
-                              {feature.description}
+                              {getIncludedFeatureDescription(
+                                t,
+                                feature,
+                                IS_PERCEPTRUM_BILLING
+                              )}
                             </p>
                           </div>
                         </div>
@@ -965,45 +1023,37 @@ export default function Billing() {
 
               <article className="rounded-[30px] border border-white/10 bg-white/[0.035] p-6">
                 <p className="text-xs uppercase tracking-[0.24em] text-gray-500">
-                  Capacity examples
+                  {t("billing.page.capacity.eyebrow")}
                 </p>
                 <h3 className="mt-2 text-2xl font-semibold text-white">
-                  Think in shared live context, not isolated feeds
+                  {t("billing.page.capacity.title")}
                 </h3>
 
                 <div className="mt-6 space-y-4">
                   <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                     <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                      Free
+                      {t("billing.page.capacity.free.title")}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-gray-300">
-                      One agent can run at a time on one camera. It is enough
-                      for testing, setup and low-volume usage, but it does not
-                      create the richer Knowledge Sharing loop that comes from
-                      multiple live viewpoints.
+                      {t("billing.page.capacity.free.description")}
                     </p>
                   </div>
 
                   <div className="rounded-2xl border border-emerald-300/15 bg-emerald-500/[0.06] p-4">
                     <div className="text-[11px] uppercase tracking-[0.18em] text-emerald-100/80">
-                      Starter to Growth
+                      {t("billing.page.capacity.starterGrowth.title")}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-gray-200">
-                      This is where a home, company, factory or shopping
-                      environment starts acting like one central brain.
-                      Multiple cameras can run agents in parallel and share
-                      analysis in real time through Knowledge Sharing.
+                      {t("billing.page.capacity.starterGrowth.description")}
                     </p>
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
                     <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500">
-                      Scale to Max
+                      {t("billing.page.capacity.scaleMax.title")}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-gray-300">
-                      These tiers are better when that shared brain has to stay
-                      alive across bigger footprints, many zones, heavier
-                      schedules and multi-site operations.
+                      {t("billing.page.capacity.scaleMax.description")}
                     </p>
                   </div>
                 </div>
@@ -1014,16 +1064,13 @@ export default function Billing() {
               <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.24em] text-gray-500">
-                    Compare plans
+                    {t("billing.page.compare.eyebrow")}
                   </p>
                   <h3 className="mt-2 text-2xl font-semibold text-white">
-                    Only one thing scales: how much shared live intelligence you can run
+                    {t("billing.page.compare.title")}
                   </h3>
                   <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-400">
-                    This comparison is designed to make the buying decision fast:
-                    the product surface stays the same, and the real difference
-                    is how much Knowledge Sharing headroom you have as you move
-                    up.
+                    {t("billing.page.compare.description")}
                   </p>
                 </div>
               </div>
@@ -1033,11 +1080,12 @@ export default function Billing() {
                   <thead>
                     <tr>
                       <th className="sticky left-0 z-10 border-b border-white/10 bg-[#0b1220] px-4 py-4 text-left text-xs font-semibold uppercase tracking-[0.18em] text-gray-500">
-                        Metric
+                        {t("billing.page.compare.metricHeader")}
                       </th>
                       {AGENT_BILLING_PLANS.map((plan) => {
                         const isCurrent = currentPlan?.id === plan.id;
-                        const price = getDisplayedPlanPrice(plan);
+                        const price = getDisplayedPlanPrice(plan, t, currentLanguage);
+                        const planName = getBillingPlanName(t, plan.id, plan.name);
 
                         return (
                           <th
@@ -1050,20 +1098,20 @@ export default function Billing() {
                           >
                             <div className="flex items-center gap-2">
                               <span className="text-base font-semibold text-white">
-                                {plan.name}
+                                {planName}
                               </span>
                               {isCurrent ? (
                                 <span className="rounded-full border border-blue-300/20 bg-blue-400/15 px-2.5 py-1 text-[11px] font-medium text-blue-50">
-                                  Current
+                                  {t("billing.page.paid.badgeCurrent")}
                                 </span>
                               ) : plan.id === "growth" ? (
                                 <span className="rounded-full border border-emerald-300/20 bg-emerald-400/15 px-2.5 py-1 text-[11px] font-medium text-emerald-50">
-                                  Recommended
+                                  {t("billing.page.paid.badgeRecommended")}
                                 </span>
                               ) : null}
                             </div>
                             <p className="mt-1 text-sm text-gray-400">
-                              {plan.id === "free" ? "Included" : price}
+                              {plan.id === "free" ? getBillingIncludedLabel(t) : price}
                             </p>
                           </th>
                         );
@@ -1114,7 +1162,7 @@ export default function Billing() {
                   {t("billing.paymentHistory", { defaultValue: "Payment History" })}
                 </h2>
                 <p className="text-sm text-gray-400">
-                  Past charges remain visible here, including legacy purchases.
+                  {t("billing.page.history.description")}
                 </p>
               </div>
             </div>
@@ -1142,20 +1190,24 @@ export default function Billing() {
                         </div>
                         <div>
                           <p className="font-medium text-gray-100">
-                            {payment.description || "Payment"}
+                            {payment.description || t("billing.page.paymentFallback")}
                           </p>
                           <p className="text-sm text-gray-500">
-                            {formatDate(payment.created_at)}
+                            {formatBillingDate(payment.created_at, currentLanguage)}
                           </p>
                         </div>
                       </div>
 
                       <div className="text-right">
                         <p className="font-semibold text-gray-100">
-                          {formatPaymentAmount(payment.amount, payment.currency)}
+                          {formatBillingPaymentAmount(
+                            payment.amount,
+                            payment.currency,
+                            currentLanguage
+                          )}
                         </p>
                         <p className="text-xs capitalize text-emerald-400">
-                          {payment.status}
+                          {getBillingPaymentStatusLabel(t, payment.status)}
                         </p>
                       </div>
                     </div>

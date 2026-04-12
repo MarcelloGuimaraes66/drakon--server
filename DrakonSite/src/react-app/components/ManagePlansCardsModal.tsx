@@ -3,12 +3,16 @@ import { useTranslation } from "react-i18next";
 import { AlertCircle, CreditCard, Loader2, Trash2, X } from "lucide-react";
 import {
   FREE_AGENT_INSTANCES,
-  formatAgentInstanceLabel,
   getAgentBillingPlanFromSubscription,
   getCurrentAgentInstanceLimit,
   getPaidAgentInstancesFromSubscription,
   isLegacyCameraBillingSubscription,
 } from "@/react-app/utils/agentBilling";
+import {
+  formatBillingMoney,
+  getBillingAgentInstanceLabel,
+  getBillingPlanName,
+} from "@/react-app/utils/billingI18n";
 
 interface ActiveCard {
   id: number;
@@ -34,21 +38,13 @@ interface ManagePlansCardsModalProps {
   onUpdate: () => void;
 }
 
-function formatMoney(amount: number, currency = "usd"): string {
-  const normalizedCurrency = currency.toUpperCase();
-  const locale = normalizedCurrency === "BRL" ? "pt-BR" : "en-US";
-  return new Intl.NumberFormat(locale, {
-    style: "currency",
-    currency: normalizedCurrency,
-  }).format(amount);
-}
-
 export default function ManagePlansCardsModal({
   isOpen,
   onClose,
   onUpdate,
 }: ManagePlansCardsModalProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const currentLanguage = i18n.resolvedLanguage || i18n.language;
   const [cards, setCards] = useState<ActiveCard[]>([]);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -104,7 +100,7 @@ export default function ManagePlansCardsModal({
       }
     } catch (fetchError) {
       console.error("Failed to fetch data:", fetchError);
-      setError("Failed to load billing information");
+      setError(t("billing.modal.loadFailed"));
     } finally {
       setIsLoading(false);
     }
@@ -124,7 +120,7 @@ export default function ManagePlansCardsModal({
 
       if (!response.ok) {
         const data = await response.json();
-        setError(data.error || "Failed to cancel subscription");
+        setError(data.error || t("billing.modal.cancelFailed"));
         return;
       }
 
@@ -133,7 +129,7 @@ export default function ManagePlansCardsModal({
       onUpdate();
     } catch (cancelError) {
       console.error("Failed to cancel subscription:", cancelError);
-      setError("Failed to cancel subscription");
+      setError(t("billing.modal.cancelFailed"));
     } finally {
       setIsLoading(false);
     }
@@ -152,7 +148,7 @@ export default function ManagePlansCardsModal({
 
       if (!response.ok) {
         const data = await response.json();
-        setError(data.error || "Failed to remove card");
+        setError(data.error || t("billing.modal.removeFailed"));
         return;
       }
 
@@ -161,7 +157,7 @@ export default function ManagePlansCardsModal({
       onUpdate();
     } catch (removeError) {
       console.error("Failed to remove card:", removeError);
-      setError("Failed to remove card");
+      setError(t("billing.modal.removeFailed"));
     } finally {
       setIsLoading(false);
     }
@@ -207,18 +203,34 @@ export default function ManagePlansCardsModal({
                   <div className="min-w-0">
                     <p className="text-base font-medium text-gray-100">
                       {currentPlan
-                        ? `${currentPlan.name} - ${formatMoney(currentPlan.monthlyPriceUsd, "usd")} ${t("billing.perMonth")}`
+                        ? `${getBillingPlanName(t, currentPlan.id, currentPlan.name)} - ${formatBillingMoney(
+                            currentPlan.monthlyPriceUsd,
+                            "usd",
+                            currentLanguage
+                          )} ${t("billing.perMonth")}`
                         : isLegacyPlan
-                        ? "Legacy camera-based subscription"
-                        : "Monthly agent license"}
+                        ? t("billing.modal.currentPlanLegacy")
+                        : t("billing.modal.currentPlanFree")}
                     </p>
 
                     <p className="mt-1 text-sm text-gray-400">
                       {currentPlan
-                        ? `Includes ${formatAgentInstanceLabel(totalAgentInstances)} in parallel (${FREE_AGENT_INSTANCES} free + ${paidAgentInstances} paid).`
+                        ? t("billing.modal.currentSummaryPaid", {
+                            countLabel: getBillingAgentInstanceLabel(
+                              t,
+                              totalAgentInstances
+                            ),
+                            freeCount: FREE_AGENT_INSTANCES,
+                            paidCount: paidAgentInstances,
+                          })
                         : isLegacyPlan
-                        ? "This account is still on the previous camera and model billing structure."
-                        : `The free base still includes ${formatAgentInstanceLabel(FREE_AGENT_INSTANCES)}.`}
+                        ? t("billing.modal.currentSummaryLegacy")
+                        : t("billing.modal.currentSummaryFree", {
+                            countLabel: getBillingAgentInstanceLabel(
+                              t,
+                              FREE_AGENT_INSTANCES
+                            ),
+                          })}
                     </p>
 
                     <p className="mt-1 text-sm text-gray-400">
@@ -240,8 +252,7 @@ export default function ManagePlansCardsModal({
               </div>
             ) : (
               <div className="rounded-2xl border border-gray-800 bg-gray-800/30 px-4 py-6 text-center text-sm text-gray-400">
-                No monthly agent license is active. The free plan still includes 1
-                running agent instance.
+                {t("billing.modal.noActiveLicense")}
               </div>
             )}
           </div>
@@ -276,7 +287,11 @@ export default function ManagePlansCardsModal({
                           ) : null}
                         </p>
                         <p className="text-xs text-gray-400">
-                          **** {card.last4} - Exp {card.exp_month}/{card.exp_year}
+                          {t("billing.modal.cardExpiry", {
+                            last4: card.last4,
+                            month: card.exp_month,
+                            year: card.exp_year,
+                          })}
                         </p>
                       </div>
                     </div>

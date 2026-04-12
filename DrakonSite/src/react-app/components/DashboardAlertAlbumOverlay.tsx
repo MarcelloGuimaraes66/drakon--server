@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
 export type DashboardAlertAlbumOverlayMediaEntry = {
@@ -154,7 +155,7 @@ export default function DashboardAlertAlbumOverlay({
       : currentItem.originLine;
   const selectedMediaText = selectedMedia?.label || noMediaLabel;
 
-  return (
+  const overlayContent = (
     <div className="fixed inset-0 z-[94]">
       <button
         type="button"
@@ -438,4 +439,10 @@ export default function DashboardAlertAlbumOverlay({
       </div>
     </div>
   );
+
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  return createPortal(overlayContent, document.body);
 }

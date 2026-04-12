@@ -3031,9 +3031,10 @@ namespace {
         const std::string encodedPassword = percentEncodeUrlComponent(password);
 
         auto make = [&](std::string tmpl) -> std::string {
-            tmpl = replaceAll(tmpl, "USUARIO", encodedUsername);
-            tmpl = replaceAll(tmpl, "SENHA", encodedPassword);
-            tmpl = replaceAll(tmpl, "IP", ip);
+            tmpl = replaceAll(tmpl, "__RTSP_USERNAME__", encodedUsername);
+            tmpl = replaceAll(tmpl, "__RTSP_PASSWORD__", encodedPassword);
+            tmpl = replaceAll(tmpl, "__RTSP_HOST__", ip);
+            tmpl = replaceAll(tmpl, "__RTSP_PORT__", portStr);
             return tmpl;
             };
 
@@ -3045,20 +3046,20 @@ namespace {
         const bool isAxis = (manufacturerNorm == "axis");
 
         if (isHikvision) {
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/Streaming/Channels/101"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/Streaming/Channels/101"));
         }
         else if (isDahua) {
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:5544/cam/realmonitor?channel=1&subtype=0"));
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=1"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/cam/realmonitor?channel=1&subtype=0"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/cam/realmonitor?channel=1&subtype=1"));
         }
         else if (isIntelbras) {
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=0"));
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"));
-            urls.push_back(make("rtsp://IP/user=USUARIO&password=SENHA&channel=1&stream=0.sdp?"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/cam/realmonitor?channel=1&subtype=0"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif"));
+            urls.push_back(make("rtsp://__RTSP_HOST__:__RTSP_PORT__/user=__RTSP_USERNAME__&password=__RTSP_PASSWORD__&channel=1&stream=0.sdp?"));
         }
         else if (isAxis) {
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/axis-media/media.amp"));
-            urls.push_back(make("rtsp://USUARIO:SENHA@IP:554/axis-media/media.amp?camera=1"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/axis-media/media.amp"));
+            urls.push_back(make("rtsp://__RTSP_USERNAME__:__RTSP_PASSWORD__@__RTSP_HOST__:__RTSP_PORT__/axis-media/media.amp?camera=1"));
         }
 
         if (urls.empty() && !ip.empty()) {
