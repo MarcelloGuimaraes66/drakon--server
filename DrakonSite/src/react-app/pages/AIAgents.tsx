@@ -1,5 +1,5 @@
 import { useState, useRef, useMemo, useEffect } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
 import CameraDirectoryControls from "@/react-app/components/CameraDirectoryControls";
@@ -11,8 +11,12 @@ import CameraEditorModal, {
 } from "@/react-app/components/CameraEditorModal";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import {
+  CAMERA_DIRECTORY_INDEX_KEYS,
   getCameraDirectoryTab,
   useCameraDirectory,
+  type CameraDirectoryIndexKey,
+  type CameraDirectoryState,
+  type CameraDirectoryTab,
 } from "@/react-app/hooks/useCameraDirectory";
 import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
@@ -48,9 +52,95 @@ import {
   X,
 } from "lucide-react";
 
+const AI_AGENTS_RETURN_SOURCE = "ai-agents";
+const AI_AGENTS_DIRECTORY_PARAM_KEYS = {
+  tab: "tab",
+  onlineSearch: "onlineSearch",
+  offlineSearch: "offlineSearch",
+  onlineIndex: "onlineIndex",
+  offlineIndex: "offlineIndex",
+} as const;
+
+const CAMERA_DIRECTORY_TABS: CameraDirectoryTab[] = ["online", "offline"];
+const CAMERA_DIRECTORY_INDEX_KEY_SET = new Set<CameraDirectoryIndexKey>(
+  CAMERA_DIRECTORY_INDEX_KEYS
+);
+
+function isCameraDirectoryTabValue(value: string | null): value is CameraDirectoryTab {
+  return value === "online" || value === "offline";
+}
+
+function parseAIAgentsDirectoryState(searchParams: URLSearchParams): Partial<CameraDirectoryState> {
+  const rawActiveTab = searchParams.get(AI_AGENTS_DIRECTORY_PARAM_KEYS.tab);
+  const onlineIndex = searchParams.get(AI_AGENTS_DIRECTORY_PARAM_KEYS.onlineIndex);
+  const offlineIndex = searchParams.get(AI_AGENTS_DIRECTORY_PARAM_KEYS.offlineIndex);
+
+  return {
+    activeTab: isCameraDirectoryTabValue(rawActiveTab) ? rawActiveTab : undefined,
+    searchByTab: {
+      online: searchParams.get(AI_AGENTS_DIRECTORY_PARAM_KEYS.onlineSearch) ?? "",
+      offline: searchParams.get(AI_AGENTS_DIRECTORY_PARAM_KEYS.offlineSearch) ?? "",
+    },
+    indexByTab: {
+      online: CAMERA_DIRECTORY_INDEX_KEY_SET.has(onlineIndex as CameraDirectoryIndexKey)
+        ? (onlineIndex as CameraDirectoryIndexKey)
+        : "all",
+      offline: CAMERA_DIRECTORY_INDEX_KEY_SET.has(offlineIndex as CameraDirectoryIndexKey)
+        ? (offlineIndex as CameraDirectoryIndexKey)
+        : "all",
+    },
+  };
+}
+
+function applyAIAgentsDirectoryState(
+  searchParams: URLSearchParams,
+  state: CameraDirectoryState
+): URLSearchParams {
+  const nextParams = new URLSearchParams(searchParams);
+
+  if (state.activeTab === "online") {
+    nextParams.delete(AI_AGENTS_DIRECTORY_PARAM_KEYS.tab);
+  } else {
+    nextParams.set(AI_AGENTS_DIRECTORY_PARAM_KEYS.tab, state.activeTab);
+  }
+
+  for (const tab of CAMERA_DIRECTORY_TABS) {
+    const searchParamKey =
+      tab === "online"
+        ? AI_AGENTS_DIRECTORY_PARAM_KEYS.onlineSearch
+        : AI_AGENTS_DIRECTORY_PARAM_KEYS.offlineSearch;
+    const indexParamKey =
+      tab === "online"
+        ? AI_AGENTS_DIRECTORY_PARAM_KEYS.onlineIndex
+        : AI_AGENTS_DIRECTORY_PARAM_KEYS.offlineIndex;
+    const searchValue = state.searchByTab[tab].trim();
+    const indexValue = state.indexByTab[tab];
+
+    if (searchValue.length > 0) {
+      nextParams.set(searchParamKey, state.searchByTab[tab]);
+    } else {
+      nextParams.delete(searchParamKey);
+    }
+
+    if (indexValue === "all") {
+      nextParams.delete(indexParamKey);
+    } else {
+      nextParams.set(indexParamKey, indexValue);
+    }
+  }
+
+  return nextParams;
+}
+
 function AIAgentsContent() {
   const { t } = useTranslation();
+  const location = useLocation();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialDirectoryStateRef = useRef<Partial<CameraDirectoryState> | null>(null);
+  if (initialDirectoryStateRef.current === null) {
+    initialDirectoryStateRef.current = parseAIAgentsDirectoryState(searchParams);
+  }
   const {
     isOpen: isOnboardingOpen,
     currentStepId: onboardingStepId,
@@ -79,13 +169,37 @@ function AIAgentsContent() {
     setActiveSearchTerm,
     activeIndexKey,
     setActiveIndexKey,
+    directoryState,
     activeIndexCounts,
     filteredCameras,
     totalCameraCount,
     hasFiltersApplied,
     tabCounts,
-  } = useCameraDirectory(cameras);
+  } = useCameraDirectory(cameras, {
+    initialState: initialDirectoryStateRef.current ?? undefined,
+  });
   const hasLoaded = lastUpdatedAt !== null;
+  const aiAgentsReturnTo = useMemo(() => {
+    const nextParams = applyAIAgentsDirectoryState(
+      new URLSearchParams(searchParams),
+      directoryState
+    );
+    const query = nextParams.toString();
+    return query ? `${location.pathname}?${query}` : location.pathname;
+  }, [directoryState, location.pathname, searchParams]);
+
+  useEffect(() => {
+    const nextParams = applyAIAgentsDirectoryState(
+      new URLSearchParams(searchParams),
+      directoryState
+    );
+
+    if (nextParams.toString() === searchParams.toString()) {
+      return;
+    }
+
+    setSearchParams(nextParams, { replace: true });
+  }, [directoryState, searchParams, setSearchParams]);
 
   useThumbnailPolling(cameras, (updates) => {
     for (const update of updates) {
@@ -383,7 +497,11 @@ function AIAgentsContent() {
         </button>
 
         <Link
-          to={`/algorithms/${camera.id}`}
+          to={{
+            pathname: `/algorithms/${camera.id}`,
+            search: `?${new URLSearchParams({ returnTo: aiAgentsReturnTo }).toString()}`,
+          }}
+          state={{ returnSource: AI_AGENTS_RETURN_SOURCE }}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
             isOverlay
               ? "col-span-2 min-h-[40px] rounded-xl border border-blue-400/20 bg-blue-500/20 px-3 py-2 text-blue-100 backdrop-blur-sm hover:bg-blue-500/30"

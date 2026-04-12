@@ -1689,6 +1689,7 @@ export default function JobsPage() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "warning" | "info" } | null>(null);
   const [showHubPublishModal, setShowHubPublishModal] = useState(false);
   const [publishingJobToHub, setPublishingJobToHub] = useState(false);
+  const [hubPublishError, setHubPublishError] = useState<string | null>(null);
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(cameras);
   const [confirmDelete, setConfirmDelete] = useState<{ isOpen: boolean; jobId: number | null }>({
     isOpen: false,
@@ -1822,6 +1823,7 @@ export default function JobsPage() {
       tags: string[];
     }) => {
       if (!selectedJob) return;
+      setHubPublishError(null);
       setPublishingJobToHub(true);
       try {
         const response = await fetch(`/api/hub/tasks/publish-from-job/${selectedJob.id}`, {
@@ -1833,13 +1835,13 @@ export default function JobsPage() {
         if (!response.ok) {
           throw new Error(data?.error || "Failed to publish task to Hub");
         }
+        setHubPublishError(null);
         setShowHubPublishModal(false);
         setToast({ message: "Task published to Hub.", type: "success" });
-      } catch (error: any) {
-        setToast({
-          message: String(error?.message || error || "Failed to publish task to Hub"),
-          type: "error",
-        });
+      } catch (error: unknown) {
+        setHubPublishError(
+          error instanceof Error ? error.message : "Failed to publish task to Hub"
+        );
       } finally {
         setPublishingJobToHub(false);
       }
@@ -3072,7 +3074,10 @@ export default function JobsPage() {
             headerActions={
               <>
                 <button
-                  onClick={() => setShowHubPublishModal(true)}
+                  onClick={() => {
+                    setHubPublishError(null);
+                    setShowHubPublishModal(true);
+                  }}
                   className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-orange-500/30 bg-orange-500/10 text-orange-100 transition-colors hover:bg-orange-500/15"
                   title="Publish to Hub"
                 >
@@ -3459,8 +3464,10 @@ export default function JobsPage() {
             defaultSummary={selectedJob.description || selectedJob.name || "Reusable task template"}
             defaultDescription={selectedJob.description || ""}
             submitting={publishingJobToHub}
+            submissionError={hubPublishError}
             onClose={() => {
               if (publishingJobToHub) return;
+              setHubPublishError(null);
               setShowHubPublishModal(false);
             }}
             onSubmit={publishSelectedJobToHub}
@@ -5952,6 +5959,7 @@ function StepCard({
 
       if (response.ok) {
         await response.json().catch(() => ({}));
+        closeTargetPicker();
         await fetchStepData();
         setExpandedTargetId(null);
         setClonePickerTargetId(null);
@@ -8973,18 +8981,47 @@ function StepCard({
             <div className="mb-3 overflow-hidden rounded-[22px] border border-blue-500/20 bg-[linear-gradient(180deg,rgba(30,41,59,0.92),rgba(15,23,42,0.78))]">
               <div className="border-b border-blue-500/10 px-3.5 py-3">
                 <div className="flex flex-col gap-3">
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                    <div className="min-w-0">
-                      <p className="text-[11px] uppercase tracking-[0.18em] text-blue-100/70">
-                        {t("jobs.selectCamera")}:
-                      </p>
-                      <p className="mt-1 text-xs leading-5 text-gray-400">
-                        {t("jobs.targetPickerHint", {
-                          defaultValue: "Search by camera name and add new targets without leaving this step.",
+                  <div className="min-w-0">
+                    <p className="text-[11px] uppercase tracking-[0.18em] text-blue-100/70">
+                      {t("jobs.selectCamera")}:
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-gray-400">
+                      {t("jobs.targetPickerHint", {
+                        defaultValue: "Search by camera name and add new targets without leaving this step.",
+                      })}
+                    </p>
+                  </div>
+
+                  <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr),auto] sm:items-center">
+                    <label className="relative block min-w-0">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+                      <input
+                        ref={targetPickerInputRef}
+                        type="text"
+                        value={targetPickerQuery}
+                        onChange={(event) => setTargetPickerQuery(event.target.value)}
+                        placeholder={t("jobs.searchTargetsPlaceholder", {
+                          defaultValue: "Search camera by name or ID",
                         })}
-                      </p>
-                    </div>
-                    <span className="inline-flex shrink-0 items-center rounded-full border border-blue-400/20 bg-blue-500/10 px-2.5 py-1 text-[11px] font-medium text-blue-100">
+                        aria-label={t("jobs.searchTargetsPlaceholder", {
+                          defaultValue: "Search camera by name or ID",
+                        })}
+                        className="w-full rounded-2xl border border-gray-700 bg-gray-950/85 py-3 pl-10 pr-10 text-sm text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
+                      />
+                      {targetPickerQuery ? (
+                        <button
+                          type="button"
+                          onClick={() => setTargetPickerQuery("")}
+                          className="absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-gray-700 bg-gray-900/80 text-gray-400 transition-colors hover:border-gray-600 hover:text-gray-200"
+                          title={t("jobs.clearSearch", { defaultValue: "Clear search" })}
+                          aria-label={t("jobs.clearSearch", { defaultValue: "Clear search" })}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                    </label>
+
+                    <span className="inline-flex shrink-0 items-center justify-center rounded-full border border-blue-400/20 bg-blue-500/10 px-2.5 py-1 text-[11px] font-medium text-blue-100 sm:justify-self-end">
                       {targetPickerHasQuery
                         ? t("jobs.targetPickerMatches", {
                             defaultValue: "{{count}} matches",
@@ -8997,31 +9034,7 @@ function StepCard({
                     </span>
                   </div>
 
-                  <label className="relative block">
-                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
-                    <input
-                      ref={targetPickerInputRef}
-                      type="text"
-                      value={targetPickerQuery}
-                      onChange={(event) => setTargetPickerQuery(event.target.value)}
-                      placeholder={t("jobs.searchTargetsPlaceholder", {
-                        defaultValue: "Search camera by name or ID",
-                      })}
-                      className="w-full rounded-2xl border border-gray-700 bg-gray-950/85 py-3 pl-10 pr-10 text-sm text-gray-100 placeholder:text-gray-500 focus:border-blue-500 focus:outline-none"
-                    />
-                    {targetPickerQuery ? (
-                      <button
-                        type="button"
-                        onClick={() => setTargetPickerQuery("")}
-                        className="absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-gray-700 bg-gray-900/80 text-gray-400 transition-colors hover:border-gray-600 hover:text-gray-200"
-                        title={t("jobs.clearSearch", { defaultValue: "Clear search" })}
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    ) : null}
-                  </label>
-
-                  <div className="flex flex-wrap gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
                     <span className="inline-flex items-center rounded-full border border-gray-700 bg-gray-900/70 px-2.5 py-1 text-gray-300">
                       {t("jobs.targetPickerAddedCount", {
                         defaultValue: "{{count}} already in this step",

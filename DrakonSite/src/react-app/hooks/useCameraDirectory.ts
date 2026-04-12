@@ -43,8 +43,17 @@ type CameraDirectoryCamera = {
 
 type CameraDirectoryTabCounts = Record<CameraDirectoryTab, number>;
 type CameraDirectoryIndexCounts = Record<CameraDirectoryIndexKey, number>;
-type CameraDirectorySearchState = Record<CameraDirectoryTab, string>;
-type CameraDirectoryIndexState = Record<CameraDirectoryTab, CameraDirectoryIndexKey>;
+export type CameraDirectorySearchState = Record<CameraDirectoryTab, string>;
+export type CameraDirectoryIndexState = Record<CameraDirectoryTab, CameraDirectoryIndexKey>;
+export type CameraDirectoryState = {
+  activeTab: CameraDirectoryTab;
+  searchByTab: CameraDirectorySearchState;
+  indexByTab: CameraDirectoryIndexState;
+};
+
+type UseCameraDirectoryOptions = {
+  initialState?: Partial<CameraDirectoryState>;
+};
 
 const LETTER_INDEX_KEYS: CameraDirectoryLetterKey[] = Array.from(
   { length: 26 },
@@ -56,6 +65,8 @@ export const CAMERA_DIRECTORY_INDEX_KEYS: CameraDirectoryIndexKey[] = [
   "0-9",
   ...LETTER_INDEX_KEYS,
 ];
+
+const CAMERA_DIRECTORY_TABS: CameraDirectoryTab[] = ["online", "offline"];
 
 const cameraNameCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -78,6 +89,64 @@ function createEmptyIndexCounts(): CameraDirectoryIndexCounts {
     },
     {} as CameraDirectoryIndexCounts
   );
+}
+
+export function createDefaultCameraDirectorySearchState(): CameraDirectorySearchState {
+  return {
+    online: "",
+    offline: "",
+  };
+}
+
+export function createDefaultCameraDirectoryIndexState(): CameraDirectoryIndexState {
+  return {
+    online: "all",
+    offline: "all",
+  };
+}
+
+function isCameraDirectoryTab(value: unknown): value is CameraDirectoryTab {
+  return value === "online" || value === "offline";
+}
+
+function isCameraDirectoryIndexKey(value: unknown): value is CameraDirectoryIndexKey {
+  return (
+    typeof value === "string" &&
+    CAMERA_DIRECTORY_INDEX_KEYS.includes(value as CameraDirectoryIndexKey)
+  );
+}
+
+function normalizeCameraDirectoryState(
+  initialState?: Partial<CameraDirectoryState>
+): CameraDirectoryState {
+  const normalizedSearchState = createDefaultCameraDirectorySearchState();
+  const normalizedIndexState = createDefaultCameraDirectoryIndexState();
+
+  if (initialState?.searchByTab) {
+    for (const tab of CAMERA_DIRECTORY_TABS) {
+      const nextValue = initialState.searchByTab[tab];
+      if (typeof nextValue === "string") {
+        normalizedSearchState[tab] = nextValue;
+      }
+    }
+  }
+
+  if (initialState?.indexByTab) {
+    for (const tab of CAMERA_DIRECTORY_TABS) {
+      const nextValue = initialState.indexByTab[tab];
+      if (isCameraDirectoryIndexKey(nextValue)) {
+        normalizedIndexState[tab] = nextValue;
+      }
+    }
+  }
+
+  return {
+    activeTab: isCameraDirectoryTab(initialState?.activeTab)
+      ? initialState.activeTab
+      : "online",
+    searchByTab: normalizedSearchState,
+    indexByTab: normalizedIndexState,
+  };
 }
 
 function compareCamerasByName(
@@ -140,16 +209,24 @@ export function getCameraDirectoryIndexKey(
   return null;
 }
 
-export function useCameraDirectory<T extends CameraDirectoryCamera>(cameras: T[]) {
-  const [activeTab, setActiveTab] = useState<CameraDirectoryTab>("online");
-  const [searchByTab, setSearchByTab] = useState<CameraDirectorySearchState>(() => ({
-    online: "",
-    offline: "",
-  }));
-  const [indexByTab, setIndexByTab] = useState<CameraDirectoryIndexState>(() => ({
-    online: "all",
-    offline: "all",
-  }));
+export function useCameraDirectory<T extends CameraDirectoryCamera>(
+  cameras: T[],
+  options: UseCameraDirectoryOptions = {}
+) {
+  const initialStateRef = useRef<CameraDirectoryState | null>(null);
+  if (initialStateRef.current === null) {
+    initialStateRef.current = normalizeCameraDirectoryState(options.initialState);
+  }
+
+  const [activeTab, setActiveTab] = useState<CameraDirectoryTab>(
+    () => initialStateRef.current?.activeTab ?? "online"
+  );
+  const [searchByTab, setSearchByTab] = useState<CameraDirectorySearchState>(
+    () => initialStateRef.current?.searchByTab ?? createDefaultCameraDirectorySearchState()
+  );
+  const [indexByTab, setIndexByTab] = useState<CameraDirectoryIndexState>(
+    () => initialStateRef.current?.indexByTab ?? createDefaultCameraDirectoryIndexState()
+  );
   const hasAutoSelectedInitialTabRef = useRef(false);
 
   const camerasByTab = useMemo(() => {
@@ -258,6 +335,13 @@ export function useCameraDirectory<T extends CameraDirectoryCamera>(cameras: T[]
     setActiveSearchTerm,
     activeIndexKey,
     setActiveIndexKey,
+    searchByTab,
+    indexByTab,
+    directoryState: {
+      activeTab,
+      searchByTab,
+      indexByTab,
+    },
     activeIndexCounts,
     filteredCameras,
     totalCameraCount: cameras.length,

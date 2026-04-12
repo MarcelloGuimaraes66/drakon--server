@@ -785,7 +785,8 @@ private:
         const std::string& sourceType,
         int sourceId,
         const nlohmann::json& envelope,
-        const std::string& compileModel);
+        const std::string& compileModel,
+        bool persistPlanCache = true);
     void pruneChatTemporalSessions_();
 
     std::atomic<bool> schedulerPingerRunning_{ false };

@@ -428,6 +428,13 @@ type AnalysisRegionPoint = {
   y: number;
 };
 
+type FrameWindowNormPayload = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type AnalysisRegionPayload = {
   region_id: string;
   label: string;
@@ -443,6 +450,7 @@ type AnalysisRegionPayload = {
   negative_condition: string | null;
   face_target_ids: number[];
   negative_image_ids: number[];
+  frame_window_norm: FrameWindowNormPayload | null;
 };
 
 type ModelRuntimeConfig = {
@@ -827,6 +835,32 @@ function normalizePositiveInt(value: unknown, fallback: number): number {
   return parsed;
 }
 
+function normalizeFrameWindowNorm(value: unknown): FrameWindowNormPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const width = clamp01(Number(row.width));
+  const height = clamp01(Number(row.height));
+  if (width <= 0 || height <= 0) return null;
+
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  const normalized: FrameWindowNormPayload = {
+    x: Math.min(maxX, Math.max(0, Number(row.x) || 0)),
+    y: Math.min(maxY, Math.max(0, Number(row.y) || 0)),
+    width,
+    height,
+  };
+  if (
+    normalized.x <= 0.001 &&
+    normalized.y <= 0.001 &&
+    normalized.width >= 0.999 &&
+    normalized.height >= 0.999
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
 function normalizeRegionId(value: unknown, index: number): string {
   const raw = typeof value === "string" ? value.trim() : "";
   const normalized = raw
@@ -861,6 +895,7 @@ function parseAnalysisRegionsFromUnknown(
       negative_condition: defaults.promptParts.negative_condition,
       face_target_ids: defaults.faceTargetIds,
       negative_image_ids: defaults.negativeImageIds,
+      frame_window_norm: null,
     },
   ];
 
@@ -975,6 +1010,9 @@ function parseAnalysisRegionsFromUnknown(
         ) ?? defaults.promptParts.negative_condition,
       face_target_ids: faceTargetIds,
       negative_image_ids: negativeImageIds,
+      frame_window_norm: normalizeFrameWindowNorm(
+        row?.frame_window_norm ?? row?.frameWindowNorm
+      ),
     });
   }
 

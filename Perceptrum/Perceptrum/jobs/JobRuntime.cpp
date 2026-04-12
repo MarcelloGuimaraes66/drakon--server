@@ -49,6 +49,7 @@
 #endif
 
 #include <windows.h>
+#include <objbase.h>
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
 #endif
@@ -61,6 +62,23 @@ namespace fs = std::filesystem;
 static bool extractLastFrameJpegDataUrlFromMp4_(
     const fs::path& srcMp4Path,
     std::string& outJpegDataUrl,
+    std::string* outErr);
+static int runProcessAndWaitWin_(const std::wstring& cmdLine);
+static std::string getExecutableDir_();
+static std::wstring utf8ToWide(const std::string& str);
+static bool transcodeToWebMp4_(
+    const fs::path& srcMp4Path,
+    const fs::path& dstMp4Path,
+    std::string* outErr);
+static bool cropVideoClipByFrameWindowWithFfmpeg_(
+    const fs::path& srcClipPath,
+    const JobFrameWindowNorm& frameWindow,
+    fs::path& outClipPath,
+    std::string* outErr);
+static bool extractBoundaryFrameToMatFromMp4_(
+    const fs::path& srcMp4Path,
+    bool useLastMoment,
+    cv::Mat& outFrame,
     std::string* outErr);
 
 namespace {
@@ -1328,6 +1346,247 @@ static bool parseClipEndTsUtcIsoFromPath_(
     return compactLocalClipTokenToUtcIso_(endDate, endTime, outTsUtcIso);
 }
 
+static bool hasProcessingSuffix_(const fs::path& clipPath)
+{
+    const std::string name = clipPath.filename().string();
+    const std::string processingSuffix = ".processing";
+    return name.size() > processingSuffix.size() &&
+        name.rfind(processingSuffix) == (name.size() - processingSuffix.size());
+}
+
+static std::string describeClipPathForLogs_(const fs::path& clipPath)
+{
+    std::error_code ec;
+    const bool exists = fs::exists(clipPath, ec) && !ec;
+    const std::uintmax_t size = exists ? fs::file_size(clipPath, ec) : 0;
+    const bool hasSize = exists && !ec;
+    return clipPath.string() +
+        " exists=" + std::string(exists ? "1" : "0") +
+        " size=" + (hasSize ? std::to_string(size) : std::string("n/a"));
+}
+
+#ifdef _WIN32
+static void ensureOpenCvVideoIoThreadReady_()
+{
+    thread_local bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        try {
+            Logger::instance().logDebug(
+                "job",
+                "OpenCV video I/O CoInitializeEx failed hr=" + std::to_string(hr)
+            );
+        }
+        catch (...) {
+        }
+    }
+}
+#else
+static void ensureOpenCvVideoIoThreadReady_() {}
+#endif
+
+static bool waitForReadableClipPath_(
+    const fs::path& clipPath,
+    std::string* outErr = nullptr)
+{
+    constexpr int kMaxAttempts = 8;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(50);
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        std::error_code ec;
+        const bool exists = fs::exists(clipPath, ec) && !ec;
+        const std::uintmax_t size = exists ? fs::file_size(clipPath, ec) : 0;
+        if (exists && !ec && size > 0) {
+            std::ifstream ifs(clipPath, std::ios::binary);
+            if (ifs.good()) {
+                return true;
+            }
+        }
+        if (attempt + 1 < kMaxAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+
+    if (outErr) {
+        *outErr = "clip not readable yet: " + describeClipPathForLogs_(clipPath);
+    }
+    return false;
+}
+
+struct TempOpenCvClipPathGuard_
+{
+    fs::path path;
+
+    ~TempOpenCvClipPathGuard_()
+    {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+};
+
+static bool tryOpenVideoCaptureWithPreferredBackends_(
+    const fs::path& clipPath,
+    cv::VideoCapture& outCap)
+{
+    ensureOpenCvVideoIoThreadReady_();
+
+    const std::string clipPathUtf8 = clipPath.string();
+    if (clipPathUtf8.empty()) {
+        outCap.release();
+        return false;
+    }
+
+    // Prefer the ffmpeg backend for normalized MP4s so jobs and direct camera
+    // inference resolve clips consistently before crop / motion-gate.
+#ifdef _WIN32
+    const std::vector<int> apiPreferences = {
+        cv::CAP_FFMPEG,
+        cv::CAP_MSMF,
+        cv::CAP_ANY
+    };
+#else
+    const std::vector<int> apiPreferences = {
+        cv::CAP_FFMPEG,
+        cv::CAP_ANY
+    };
+#endif
+    for (const int apiPreference : apiPreferences) {
+        outCap.release();
+        if (outCap.open(clipPathUtf8, apiPreference)) {
+            return true;
+        }
+    }
+
+    outCap.release();
+    return false;
+}
+
+static bool tryOpenVideoCaptureWithRetry_(
+    const fs::path& clipPath,
+    cv::VideoCapture& outCap)
+{
+    constexpr int kMaxOpenAttempts = 4;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(75);
+    for (int attempt = 0; attempt < kMaxOpenAttempts; ++attempt) {
+        if (tryOpenVideoCaptureWithPreferredBackends_(clipPath, outCap)) {
+            return true;
+        }
+        if (attempt + 1 < kMaxOpenAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+    return false;
+}
+
+static bool openVideoCaptureForClipPath_(
+    const fs::path& clipPath,
+    cv::VideoCapture& outCap,
+    fs::path& outTempOpenPath,
+    std::string* outErr = nullptr)
+{
+    outTempOpenPath.clear();
+    outCap.release();
+    auto clearTempPath = [](const fs::path& path) {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::remove(path, ec);
+    };
+    auto tryOpen = [&](const fs::path& path) -> bool {
+        return tryOpenVideoCaptureWithRetry_(path, outCap);
+    };
+
+    std::string readableErr;
+    if (!waitForReadableClipPath_(clipPath, &readableErr)) {
+        if (outErr) *outErr = readableErr;
+        return false;
+    }
+
+    if (tryOpen(clipPath)) {
+        return true;
+    }
+
+    fs::path normalizedInputPath = clipPath;
+    fs::path processingTempPath;
+    if (hasProcessingSuffix_(clipPath)) {
+        // OpenCV commonly rejects ".processing" even when the bytes are a valid MP4.
+        processingTempPath = fs::path(clipPath.string() + ".opencv_source.mp4");
+        std::error_code copyEc;
+        clearTempPath(processingTempPath);
+        if (!fs::copy_file(
+                clipPath,
+                processingTempPath,
+                fs::copy_options::overwrite_existing,
+                copyEc))
+        {
+            if (outErr) {
+                *outErr =
+                    "failed to create OpenCV temp clip: " + copyEc.message() +
+                    " src=" + describeClipPathForLogs_(clipPath) +
+                    " dst=" + processingTempPath.string();
+            }
+            return false;
+        }
+
+        normalizedInputPath = processingTempPath;
+        if (tryOpen(normalizedInputPath)) {
+            outTempOpenPath = normalizedInputPath;
+            return true;
+        }
+    }
+
+    // Some Media Foundation clips are valid for ffmpeg but not directly readable by OpenCV.
+    // Normalize them into an H.264/yuv420p temp MP4 and reopen that instead of aborting the
+    // job agent before motion-gate / frame-window crop can run.
+    const fs::path normalizedOpenPath = fs::path(normalizedInputPath.string() + ".opencv_normalized.mp4");
+    clearTempPath(normalizedOpenPath);
+    std::string normalizeErr;
+    if (!transcodeToWebMp4_(normalizedInputPath, normalizedOpenPath, &normalizeErr)) {
+        clearTempPath(processingTempPath);
+        if (outErr) {
+            *outErr =
+                "cv::VideoCapture failed to open source clip; normalize_err=" + normalizeErr +
+                " src=" + describeClipPathForLogs_(clipPath) +
+                " normalized_input=" + describeClipPathForLogs_(normalizedInputPath) +
+                " normalized_output=" + normalizedOpenPath.string();
+        }
+        return false;
+    }
+
+    readableErr.clear();
+    if (!waitForReadableClipPath_(normalizedOpenPath, &readableErr)) {
+        const std::string normalizedDesc = describeClipPathForLogs_(normalizedOpenPath);
+        clearTempPath(normalizedOpenPath);
+        clearTempPath(processingTempPath);
+        if (outErr) {
+            *outErr =
+                "normalized clip not readable yet normalized=" + normalizedDesc +
+                " src=" + describeClipPathForLogs_(clipPath) +
+                " reason=" + readableErr;
+        }
+        return false;
+    }
+
+    if (!tryOpen(normalizedOpenPath)) {
+        const std::string normalizedDesc = describeClipPathForLogs_(normalizedOpenPath);
+        clearTempPath(normalizedOpenPath);
+        clearTempPath(processingTempPath);
+        if (outErr) {
+            *outErr =
+                "cv::VideoCapture failed to open normalized clip normalized=" +
+                normalizedDesc +
+                " src=" + describeClipPathForLogs_(clipPath);
+        }
+        return false;
+    }
+
+    clearTempPath(processingTempPath);
+    outTempOpenPath = normalizedOpenPath;
+    return true;
+}
+
 
 
 
@@ -1956,11 +2215,11 @@ static bool cropJpegDataUrlByFrameWindow_(
     );
 }
 
-static bool cropVideoClipByFrameWindow_(
+static bool cropVideoClipByFrameWindowWithFfmpeg_(
     const fs::path& srcClipPath,
     const JobFrameWindowNorm& frameWindow,
     fs::path& outClipPath,
-    std::string* outErr = nullptr)
+    std::string* outErr)
 {
     outClipPath.clear();
     if (!isFrameWindowActive_(frameWindow)) {
@@ -1968,61 +2227,93 @@ static bool cropVideoClipByFrameWindow_(
         return true;
     }
 
-    cv::VideoCapture cap(srcClipPath.string());
-    if (!cap.isOpened()) {
-        if (outErr) *outErr = "cv::VideoCapture failed to open source clip";
+    std::error_code ec;
+    if (!fs::exists(srcClipPath, ec) || ec) {
+        if (outErr) *outErr = "source clip missing: " + srcClipPath.string();
         return false;
     }
 
-    cv::Mat frame;
-    if (!cap.read(frame) || frame.empty()) {
-        if (outErr) *outErr = "failed reading first frame";
+    fs::path ffmpegPath = fs::path(getExecutableDir_()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath, ec) || ec) {
+        if (outErr) *outErr = "ffmpeg missing: " + ffmpegPath.string();
         return false;
     }
 
-    const cv::Rect cropRect =
-        computeRegionCropRect_(buildFrameWindowCropRegion_(frameWindow), frame.size());
-    if (cropRect.width <= 0 || cropRect.height <= 0) {
+    const double x1 = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double y1 = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double x2 = (std::max)(x1 + 1e-6, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double y2 = (std::max)(y1 + 1e-6, (std::min)(1.0, frameWindow.y + frameWindow.height));
+    const double widthNorm = x2 - x1;
+    const double heightNorm = y2 - y1;
+    if (widthNorm <= 1e-6 || heightNorm <= 1e-6) {
         if (outErr) *outErr = "frame window crop rect invalid";
         return false;
     }
 
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (!std::isfinite(fps) || fps <= 0.0) {
-        fps = 10.0;
-    }
+    auto fmt = [](double value) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(6) << value;
+        return oss.str();
+    };
+
+    const std::string widthExpr =
+        "max(2,trunc(iw*" + fmt(widthNorm) + "/2)*2)";
+    const std::string heightExpr =
+        "max(2,trunc(ih*" + fmt(heightNorm) + "/2)*2)";
+    const std::string xExpr =
+        "max(0,trunc(iw*" + fmt(x1) + "/2)*2)";
+    const std::string yExpr =
+        "max(0,trunc(ih*" + fmt(y1) + "/2)*2)";
+    const std::string cropFilter =
+        "crop=w='" + widthExpr +
+        "':h='" + heightExpr +
+        "':x='" + xExpr +
+        "':y='" + yExpr + "'";
 
     fs::path dstClipPath = srcClipPath;
     dstClipPath += ".frame_window.mp4";
+    fs::remove(dstClipPath, ec);
 
-    cv::VideoWriter writer;
-    const std::vector<int> fourccCandidates = {
-        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
-        cv::VideoWriter::fourcc('m', 'p', '4', 'v')
-    };
-    for (const int fourcc : fourccCandidates) {
-        if (writer.open(dstClipPath.string(), fourcc, fps, cropRect.size(), true)) {
-            break;
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(srcClipPath.string());
+    std::wstring outW = utf8ToWide(dstClipPath.string());
+    std::wstring filterW = utf8ToWide(cropFilter);
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -hide_banner -loglevel error"
+        L" -i \"" + inW + L"\""
+        L" -vf \"" + filterW + L"\""
+        L" -c:v libx264 -pix_fmt yuv420p -movflags +faststart"
+        L" -an "
+        L" \"" + outW + L"\"";
+
+    const int rc = runProcessAndWaitWin_(cmdLine);
+    if (rc != 0) {
+        if (outErr) {
+            *outErr =
+                "ffmpeg frame-window crop failed rc=" + std::to_string(rc) +
+                " src=" + describeClipPathForLogs_(srcClipPath) +
+                " filter=" + cropFilter;
         }
-    }
-    if (!writer.isOpened()) {
-        if (outErr) *outErr = "cv::VideoWriter failed to open output clip";
         return false;
     }
 
-    writer.write(frame(cropRect).clone());
-    while (cap.read(frame)) {
-        if (frame.empty()) continue;
-        const cv::Rect currentCropRect =
-            computeRegionCropRect_(buildFrameWindowCropRegion_(frameWindow), frame.size());
-        if (currentCropRect.width <= 0 || currentCropRect.height <= 0) continue;
-        writer.write(frame(currentCropRect).clone());
+    if (!waitForReadableClipPath_(dstClipPath, outErr)) {
+        return false;
     }
 
-    writer.release();
-    cap.release();
     outClipPath = std::move(dstClipPath);
     return true;
+}
+
+static bool cropVideoClipByFrameWindow_(
+    const fs::path& srcClipPath,
+    const JobFrameWindowNorm& frameWindow,
+    fs::path& outClipPath,
+    std::string* outErr = nullptr)
+{
+    return cropVideoClipByFrameWindowWithFfmpeg_(srcClipPath, frameWindow, outClipPath, outErr);
 }
 
 static std::vector<JobAnalysisRegion> collectPolygonOnlyRegions_(
@@ -2179,26 +2470,17 @@ static bool detectMotionInRegionFromClip_(
     }
 
     try {
-        cv::VideoCapture cap(clipPath.string());
-        if (!cap.isOpened()) {
-            if (outErr) *outErr = "cv::VideoCapture failed to open clip";
+        cv::Mat firstFrame;
+        if (!extractBoundaryFrameToMatFromMp4_(clipPath, false, firstFrame, outErr) ||
+            firstFrame.empty())
+        {
             return false;
         }
 
-        cv::Mat firstFrame;
-        if (!cap.read(firstFrame) || firstFrame.empty()) {
-            if (outErr) *outErr = "failed to read first frame";
-            return false;
-        }
-        cv::Mat lastFrame = firstFrame.clone();
-        cv::Mat frame;
-        while (cap.read(frame)) {
-            if (!frame.empty()) {
-                lastFrame = frame.clone();
-            }
-        }
-        if (lastFrame.empty()) {
-            if (outErr) *outErr = "failed to read last frame";
+        cv::Mat lastFrame;
+        if (!extractBoundaryFrameToMatFromMp4_(clipPath, true, lastFrame, outErr) ||
+            lastFrame.empty())
+        {
             return false;
         }
         if (lastFrame.size() != firstFrame.size()) {
@@ -2478,9 +2760,11 @@ static bool annotateVideoClipWithRegions_(
         return true;
     }
 
-    cv::VideoCapture cap(srcClipPath.string());
-    if (!cap.isOpened()) {
-        if (outErr) *outErr = "cv::VideoCapture failed to open source clip";
+    ensureOpenCvVideoIoThreadReady_();
+
+    cv::VideoCapture cap;
+    TempOpenCvClipPathGuard_ tempOpenPathGuard;
+    if (!openVideoCaptureForClipPath_(srcClipPath, cap, tempOpenPathGuard.path, outErr)) {
         return false;
     }
 
@@ -2550,6 +2834,10 @@ static bool annotateVideoClipWithRegions_(
                 outDrawnRegionIds->push_back(region.region_id);
             }
         }
+    }
+
+    if (!waitForReadableClipPath_(dstClipPath, outErr)) {
+        return false;
     }
 
     outClipPath = std::move(dstClipPath);
@@ -7424,6 +7712,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             collectEnabledAnalysisRegionsForAgent_(agent);
         const JobFrameWindowNorm frameWindow =
             resolveFrameWindowFromRegions_(activeRegions);
+        const bool hasFrameWindow = isFrameWindowActive_(frameWindow);
 
         std::string clipPath;
         bool clipBackedSource = false;
@@ -7505,7 +7794,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             parseClipEndTsUtcIsoFromPath_(fs::path(clipPath), tsUtcIso);
         }
 
-        if (isFrameWindowActive_(frameWindow)) {
+        if (hasFrameWindow) {
             std::string cropErr;
             std::string croppedJpegB64;
             if (!cropJpegDataUrlByFrameWindow_(jpegB64, frameWindow, croppedJpegB64, &cropErr) ||
@@ -7568,7 +7857,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             buildRegionLabelByIdMap_(allowedAlertRegions);
         std::vector<std::string> motionTriggeredRegionIds;
         const bool enforceMotionGate = agent.only_capture_on_motion;
-        const bool enforceMotionWithoutPolygon = enforceMotionGate && polygonRegions.empty();
+        const bool enforceMotionWithoutPolygon =
+            enforceMotionGate && polygonRegions.empty();
         std::vector<JobAnalysisRegion> motionRegions;
         if (enforceMotionGate) {
             motionRegions = polygonRegions;
@@ -8238,6 +8528,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         collectEnabledAnalysisRegionsForAgent_(agent);
     const JobFrameWindowNorm frameWindow =
         resolveFrameWindowFromRegions_(activeRegions);
+    const bool hasFrameWindow = isFrameWindowActive_(frameWindow);
     const std::vector<JobAnalysisRegion> runtimeActiveRegions =
         remapRegionsToFrameWindow_(activeRegions, frameWindow);
     const std::vector<JobAnalysisRegion> polygonRegions =
@@ -8248,7 +8539,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         buildRegionLabelByIdMap_(allowedAlertRegions);
     std::vector<std::string> motionTriggeredRegionIds;
     const bool enforceMotionGate = agent.only_capture_on_motion;
-    const bool enforceMotionWithoutPolygon = enforceMotionGate && polygonRegions.empty();
+    const bool enforceMotionWithoutPolygon =
+        enforceMotionGate && polygonRegions.empty();
     std::vector<JobAnalysisRegion> motionRegions;
     if (enforceMotionGate) {
         motionRegions = polygonRegions;
@@ -8274,7 +8566,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     TempPathGuard overlayClipGuard{ &overlayClipPath };
     std::vector<std::string> drawnOverlayRegionIds;
 
-    if (isFrameWindowActive_(frameWindow)) {
+    if (hasFrameWindow) {
         fs::path croppedPath;
         std::string cropErr;
         if (!cropVideoClipByFrameWindow_(
@@ -9044,6 +9336,79 @@ static int runProcessAndWaitWin_(const std::wstring& cmdLine)
     CloseHandle(pi.hProcess);
 
     return (int)exitCode;
+}
+
+static bool extractBoundaryFrameToMatFromMp4_(
+    const fs::path& srcMp4Path,
+    bool useLastMoment,
+    cv::Mat& outFrame,
+    std::string* outErr)
+{
+    outFrame.release();
+
+    std::error_code ec;
+    if (!fs::exists(srcMp4Path, ec) || ec) {
+        if (outErr) *outErr = "src does not exist: " + srcMp4Path.string();
+        return false;
+    }
+
+    fs::path ffmpegPath = fs::path(getExecutableDir_()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath, ec) || ec) {
+        if (outErr) *outErr = "ffmpeg missing: " + ffmpegPath.string();
+        return false;
+    }
+
+    fs::path jpgPath = srcMp4Path;
+    jpgPath +=
+        (useLastMoment ? ".lastframe_" : ".firstframe_") +
+        nowMs_() + "_" +
+        std::to_string(static_cast<unsigned long>(GetCurrentThreadId())) +
+        ".jpg";
+
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(srcMp4Path.string());
+    std::wstring outW = utf8ToWide(jpgPath.string());
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -hide_banner -loglevel error ";
+    if (useLastMoment) {
+        cmdLine += L" -sseof -0.20 ";
+    }
+    cmdLine +=
+        L" -i \"" + inW + L"\""
+        L" -frames:v 1 -q:v 3 "
+        L" \"" + outW + L"\"";
+
+    int rc = runProcessAndWaitWin_(cmdLine);
+    if (rc != 0 && useLastMoment) {
+        cmdLine =
+            L"\"" + ffmpegW + L"\""
+            L" -y -hide_banner -loglevel error"
+            L" -i \"" + inW + L"\""
+            L" -frames:v 1 -q:v 3 "
+            L" \"" + outW + L"\"";
+        rc = runProcessAndWaitWin_(cmdLine);
+    }
+
+    if (rc != 0 || !fs::exists(jpgPath, ec) || ec) {
+        if (outErr) {
+            *outErr =
+                "ffmpeg boundary frame extract failed rc=" + std::to_string(rc) +
+                " src=" + srcMp4Path.string();
+        }
+        return false;
+    }
+
+    outFrame = cv::imread(jpgPath.string(), cv::IMREAD_COLOR);
+    std::error_code rmEc;
+    fs::remove(jpgPath, rmEc);
+    if (outFrame.empty()) {
+        if (outErr) *outErr = "cv::imread failed for extracted frame";
+        return false;
+    }
+
+    return true;
 }
 
 static bool extractLastFrameJpegDataUrlFromMp4_(

@@ -11,6 +11,10 @@ import { useDashboardAlerts } from "@/react-app/hooks/useDashboardAlerts";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
 import Toast from "@/react-app/components/Toast";
 import ConfirmDialog from "@/react-app/components/ConfirmDialog";
+import DashboardAlertAlbumOverlay, {
+  type DashboardAlertAlbumOverlayItem,
+  type DashboardAlertAlbumOverlayMediaEntry,
+} from "@/react-app/components/DashboardAlertAlbumOverlay";
 import { Camera, Activity, AlertCircle, AlertTriangle, Layers, CheckCircle, Clock, Zap, Bell, Command, StopCircle, ChevronDown, ChevronLeft, ChevronRight, Loader2, Circle, ListChecks, Calendar, Search, Play, X, MapPin, Sparkles, PhoneCall, FileText, XCircle, Download, LayoutGrid, Maximize2 } from "lucide-react";
 import { Link } from "react-router";
 import { useEffect, useRef, useState } from "react";
@@ -334,6 +338,9 @@ function DashboardContent() {
   const [groupAlbumImages, setGroupAlbumImages] = useState<any[]>([]);
   const [groupAlbumIndex, setGroupAlbumIndex] = useState(0);
   const [groupAlbumLabel, setGroupAlbumLabel] = useState("");
+  const [isAlertGroupOverlayOpen, setIsAlertGroupOverlayOpen] = useState(false);
+  const [alertGroupOverlayAlerts, setAlertGroupOverlayAlerts] = useState<any[]>([]);
+  const [alertGroupOverlayIndex, setAlertGroupOverlayIndex] = useState(0);
   const [isAlertMediaPreviewOpen, setIsAlertMediaPreviewOpen] = useState(false);
   const [alertMediaPreview, setAlertMediaPreview] = useState<{
     url: string;
@@ -378,6 +385,12 @@ function DashboardContent() {
     HIGH: "text-orange-400",
     MEDIUM: "text-yellow-400",
     LOW: "text-green-400",
+  };
+  const alertPriorityChipClasses: Record<string, string> = {
+    CRITIC: "border-red-400/35 bg-red-500/15 text-red-100",
+    HIGH: "border-orange-400/30 bg-orange-500/15 text-orange-100",
+    MEDIUM: "border-yellow-400/30 bg-yellow-500/15 text-yellow-100",
+    LOW: "border-emerald-400/30 bg-emerald-500/15 text-emerald-100",
   };
   const panelPriorityWidths: Record<string, string> = {
     CRITIC: "100%",
@@ -673,6 +686,48 @@ function DashboardContent() {
     return getAlertMedia(alert).albumImages.length;
   };
 
+  const buildAlertAlbumMediaEntries = (
+    alert: any,
+    alertMedia: ReturnType<typeof getAlertMedia>,
+  ): DashboardAlertAlbumOverlayMediaEntry[] => {
+    const details = alert?.details || {};
+    const baseCameraName =
+      readAlertLabelString(details?.camera_name, details?.cameraName, alert?.camera_name) ||
+      t("dashboard.camera");
+    const entries: DashboardAlertAlbumOverlayMediaEntry[] = [];
+
+    alertMedia.albumImages.forEach((entry: any, index: number) => {
+      const fallbackMomentLabel = isPortuguese ? `Momento ${index + 1}` : `Moment ${index + 1}`;
+      entries.push({
+        key: String(entry?.key || `alert-media-${alert?.id || "item"}-${index}`),
+        kind: entry?.isOfflinePlaceholder ? "offline" : "image",
+        url: typeof entry?.url === "string" ? entry.url : null,
+        thumbnailUrl: typeof entry?.url === "string" ? entry.url : null,
+        label: String(entry?.cameraName || fallbackMomentLabel),
+      });
+    });
+
+    if (alertMedia.isVideo && alertMedia.mediaUrl) {
+      entries.push({
+        key: `alert-video-${Number(alert?.id) || 0}`,
+        kind: "video",
+        url: alertMedia.mediaUrl,
+        thumbnailUrl: null,
+        label: isPortuguese ? "Clip do alerta" : "Alert clip",
+      });
+    } else if (alertMedia.mediaUrl && alertMedia.albumImages.length === 0) {
+      entries.push({
+        key: `alert-image-${Number(alert?.id) || 0}`,
+        kind: "image",
+        url: alertMedia.mediaUrl,
+        thumbnailUrl: alertMedia.mediaUrl,
+        label: String(baseCameraName),
+      });
+    }
+
+    return entries;
+  };
+
   const selectGroupMediaAlert = (alertsList: any[]) => {
     let bestAlert: any | null = null;
     let bestGroupImageCount = -1;
@@ -846,6 +901,36 @@ function DashboardContent() {
     if (mediaUrl) {
       openAlertMediaPreview(alert);
     }
+  };
+
+  const openAlertGroupOverlay = (alertsList: any[], startIndex = 0) => {
+    const normalizedAlerts = Array.isArray(alertsList) ? alertsList.filter(Boolean) : [];
+    if (!normalizedAlerts.length) return;
+
+    const clampedStart = Math.max(0, Math.min(startIndex, normalizedAlerts.length - 1));
+    setAlertGroupOverlayAlerts(normalizedAlerts);
+    setAlertGroupOverlayIndex(clampedStart);
+    setIsAlertGroupOverlayOpen(true);
+  };
+
+  const closeAlertGroupOverlay = () => {
+    setIsAlertGroupOverlayOpen(false);
+    setAlertGroupOverlayAlerts([]);
+    setAlertGroupOverlayIndex(0);
+  };
+
+  const showPreviousAlertGroupOverlay = () => {
+    if (alertGroupOverlayAlerts.length <= 1) return;
+    setAlertGroupOverlayIndex((current) =>
+      current <= 0 ? alertGroupOverlayAlerts.length - 1 : current - 1
+    );
+  };
+
+  const showNextAlertGroupOverlay = () => {
+    if (alertGroupOverlayAlerts.length <= 1) return;
+    setAlertGroupOverlayIndex((current) =>
+      current >= alertGroupOverlayAlerts.length - 1 ? 0 : current + 1
+    );
   };
 
   const closeAlertMediaPreview = () => {
@@ -1072,6 +1157,109 @@ function DashboardContent() {
     activeAlertMedia.mediaUrl,
     activeAlertMedia.albumImages,
   );
+  const alertGroupOverlayItems: DashboardAlertAlbumOverlayItem[] = alertGroupOverlayAlerts.map((alert) => {
+    const details = alert?.details || {};
+    const displayMeta = getAlertDisplayMeta(alert, cameras, alertDisplayOptions);
+    const alertMedia = getAlertMedia(alert);
+    const rawPriority =
+      alert?.priority_level ??
+      details?.priority_level ??
+      details?.priorityLevel ??
+      details?.priority ??
+      "";
+    const priorityValue =
+      String(rawPriority || "").toUpperCase() === "MEDUIM"
+        ? "MEDIUM"
+        : String(rawPriority || "").toUpperCase();
+    const priorityLabel = alertPriorityChipClasses[priorityValue] ? priorityValue : null;
+    const rawInputType = String(
+      details?.input_type ||
+        details?.agent_input_type ||
+        alert?.input_type ||
+        ""
+    ).toLowerCase();
+    const normalizedInputType =
+      rawInputType === "video" || rawInputType === "image"
+        ? rawInputType
+        : alertMedia.albumImages.length > 0
+        ? "image"
+        : alertMedia.mediaUrl
+        ? alertMedia.isVideo
+          ? "video"
+          : "image"
+        : null;
+    const mediaTypeLabel =
+      normalizedInputType === "video"
+        ? t("dashboard.videoBased")
+        : normalizedInputType === "image"
+        ? t("dashboard.imageBased")
+        : null;
+    const mediaTypeClassName =
+      normalizedInputType === "video"
+        ? "border-blue-400/30 bg-blue-500/15 text-blue-100"
+        : normalizedInputType === "image"
+        ? "border-emerald-400/30 bg-emerald-500/15 text-emerald-100"
+        : null;
+    const groupNameValue =
+      details?.group_name ||
+      details?.groupName ||
+      alert?.group_name ||
+      alert?.groupName ||
+      "";
+    const normalizedGroupName = typeof groupNameValue === "string" ? groupNameValue.trim() : "";
+    const groupNameLabel = normalizedGroupName
+      ? `${t("dashboard.groupPrefix")}: ${normalizedGroupName.replace(/^group\s*:\s*/i, "")}`
+      : null;
+    const stepValue =
+      alert?.step_id ??
+      details?.step_id ??
+      details?.stepId ??
+      details?.step_order ??
+      details?.stepOrder;
+    const stepLabel =
+      stepValue !== undefined && stepValue !== null && String(stepValue).trim()
+        ? String(stepValue)
+        : null;
+    const momentsCount = Math.max(
+      getAlertContributingEventsCount(alert),
+      getAlertGroupImageCount(alert),
+      alertMedia.albumImages.length
+    );
+    const momentsLabel =
+      momentsCount > 0
+        ? isPortuguese
+          ? `${momentsCount} momentos`
+          : `${momentsCount} moments`
+        : null;
+
+    return {
+      id: Number(alert?.id) || 0,
+      eventIdLabel:
+        Number.isInteger(Number(alert?.id)) && Number(alert?.id) > 0
+          ? `#${Number(alert.id)}`
+          : null,
+      summary: displayMeta.summaryText || "-",
+      badgeLabel: displayMeta.badgeLabel,
+      originLine: displayMeta.originLine,
+      cameraName:
+        readAlertLabelString(details?.camera_name, details?.cameraName, alert?.camera_name) ||
+        t("dashboard.camera"),
+      timestampLabel: formatAlertTimestamp(alert?.detected_at || alert?.created_at || null),
+      groupNameLabel,
+      jobName:
+        readAlertLabelString(alert?.job_name, details?.job_name, details?.job?.name) || null,
+      stepLabel,
+      priorityLabel,
+      priorityClassName: priorityLabel ? alertPriorityChipClasses[priorityValue] : null,
+      mediaTypeLabel,
+      mediaTypeClassName,
+      momentsLabel,
+      mediaEntries: buildAlertAlbumMediaEntries(alert, alertMedia),
+      downloadUrl: getAlertDownloadTarget(alertMedia.mediaUrl, alertMedia.albumImages),
+    };
+  });
+  const currentAlertGroupOverlayAlert =
+    alertGroupOverlayAlerts[alertGroupOverlayIndex] || null;
   const alertsCardsPerView = alertsCompactMode ? 8 : 4;
   const alertsForDisplay =
     isInitialAlertsLoading && groupedRecentAlerts.length === 0
@@ -2109,18 +2297,24 @@ function DashboardContent() {
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          openAlertPanel(alert, alertGroup.key, { focusEmittedAlerts: true });
+                          const mediaAlertIndex = alertGroup.alerts.findIndex(
+                            (entry: any) => Number(entry?.id) === Number(mediaSourceAlert?.id)
+                          );
+                          openAlertGroupOverlay(
+                            alertGroup.alerts,
+                            mediaAlertIndex >= 0 ? mediaAlertIndex : 0
+                          );
                         }}
                         className="absolute top-2 right-2 z-10 flex h-8 min-w-[2rem] items-center justify-center rounded-full border border-red-400/60 bg-red-500/90 px-2 text-xs font-bold text-white shadow-lg shadow-red-950/40 transition-all duration-200 hover:-translate-y-0.5 hover:scale-105 hover:border-red-200 hover:bg-red-400 hover:shadow-xl hover:shadow-red-950/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-200/80 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900"
                         aria-label={
                           i18n.language?.startsWith("pt")
-                            ? `Abrir ${alertGroup.alertCount} alertas emitidos`
-                            : `Open ${alertGroup.alertCount} emitted alerts`
+                            ? `Abrir album com ${alertGroup.alertCount} alertas`
+                            : `Open album with ${alertGroup.alertCount} alerts`
                         }
                         title={
                           i18n.language?.startsWith("pt")
-                            ? `Abrir ${alertGroup.alertCount} alertas emitidos`
-                            : `Open ${alertGroup.alertCount} emitted alerts`
+                            ? `Abrir album com ${alertGroup.alertCount} alertas`
+                            : `Open album with ${alertGroup.alertCount} alerts`
                         }
                       >
                         {alertGroup.alertCount}
@@ -2255,6 +2449,29 @@ function DashboardContent() {
               </div>
             )}
           </div>
+
+          <DashboardAlertAlbumOverlay
+            isOpen={isAlertGroupOverlayOpen}
+            items={alertGroupOverlayItems}
+            currentIndex={alertGroupOverlayIndex}
+            onClose={closeAlertGroupOverlay}
+            onShowPrevious={showPreviousAlertGroupOverlay}
+            onShowNext={showNextAlertGroupOverlay}
+            onDownloadCurrent={() => {
+              const currentItem = alertGroupOverlayItems[alertGroupOverlayIndex];
+              if (!currentAlertGroupOverlayAlert || !currentItem?.downloadUrl) return;
+              handleDownloadAlertMedia(currentItem.downloadUrl, currentAlertGroupOverlayAlert);
+            }}
+            onOpenDetails={
+              currentAlertGroupOverlayAlert
+                ? () => {
+                    const nextAlert = currentAlertGroupOverlayAlert;
+                    closeAlertGroupOverlay();
+                    openAlertPanel(nextAlert, buildAlertGroupKey(nextAlert));
+                  }
+                : undefined
+            }
+          />
 
           {isGroupAlbumOpen && (
             <div className="fixed inset-0 z-[90]">

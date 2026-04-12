@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { Bot, Briefcase, Camera, Download, RefreshCw, Search, X } from "lucide-react";
+import { Bot, Briefcase, Camera, Download, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import Layout from "@/react-app/components/Layout";
 
 type HubTab = "agent" | "task";
+type HubCatalogSource = "hub" | "cache";
 
 type HubItem = {
   id: number;
@@ -17,6 +19,8 @@ type HubItem = {
   version_id: number;
   version_number: number;
   snapshot_json: any;
+  can_delete?: boolean;
+  catalog_source?: HubCatalogSource;
 };
 
 type CameraRow = {
@@ -47,6 +51,8 @@ export default function HubPage() {
   const [taskInstallItem, setTaskInstallItem] = useState<HubItem | null>(null);
   const [taskNameOverride, setTaskNameOverride] = useState("");
   const [taskCameraMapping, setTaskCameraMapping] = useState<Record<string, string>>({});
+  const [deleteCandidate, setDeleteCandidate] = useState<HubItem | null>(null);
+  const [deletingItemId, setDeletingItemId] = useState<number | null>(null);
 
   const contextCameraReady = Number.isInteger(contextCameraId) && contextCameraId > 0;
   const contextStepCameraReady = Number.isInteger(contextCameraId) && contextCameraId !== 0;
@@ -220,6 +226,42 @@ export default function HubPage() {
     }
   };
 
+  const deleteHubItem = async () => {
+    if (!deleteCandidate || deletingItemId !== null) return;
+    setDeletingItemId(deleteCandidate.id);
+    setError(null);
+    setMessage(null);
+    try {
+      const query = new URLSearchParams();
+      if (deleteCandidate.catalog_source) {
+        query.set("source", deleteCandidate.catalog_source);
+      }
+      const response = await fetch(
+        `/api/hub/items/${deleteCandidate.id}${query.toString() ? `?${query.toString()}` : ""}`,
+        { method: "DELETE" }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to delete Hub item.");
+      }
+      const deletedId = deleteCandidate.id;
+      setItems((current) => current.filter((item) => item.id !== deletedId));
+      setAgentPickerItem((current) => (current?.id === deletedId ? null : current));
+      setTaskInstallItem((current) => (current?.id === deletedId ? null : current));
+      setDeleteCandidate(null);
+      setMessage(
+        deleteCandidate.item_type === "agent"
+          ? "Agent removed from Hub."
+          : "Task removed from Hub."
+      );
+      void fetchItems();
+    } catch (err: any) {
+      setError(String(err?.message || err || "Failed to delete Hub item."));
+    } finally {
+      setDeletingItemId(null);
+    }
+  };
+
   return (
     <Layout>
       <div className="space-y-6">
@@ -342,7 +384,14 @@ export default function HubPage() {
                       {item.item_type === "agent" ? "Agent" : jobsLabel}
                     </span>
                   </div>
-                  <div className="text-xs text-gray-500">{item.download_count} downloads</div>
+                  <div className="flex flex-col items-end gap-2">
+                    <div className="text-xs text-gray-500">{item.download_count} downloads</div>
+                    {item.can_delete ? (
+                      <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-200">
+                        Your upload
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
 
                 <div className="mt-4 flex-1">
@@ -363,70 +412,95 @@ export default function HubPage() {
                 </div>
 
                 <div className="mt-5 border-t border-gray-800/80 pt-4">
-                  {item.item_type === "agent" ? (
-                    installTarget === "step" && contextStepCameraReady && contextStepReady ? (
+                  <div className="flex gap-2">
+                    {item.can_delete ? (
                       <button
                         type="button"
-                        disabled={installingItemId === item.id}
-                        onClick={() => void installAgentIntoStep(item)}
-                        className={`inline-flex w-full items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
-                          installingItemId === item.id
-                            ? "cursor-not-allowed bg-gray-800 text-gray-500"
-                            : "bg-orange-500 text-white hover:bg-orange-400"
+                        disabled={deletingItemId === item.id || installingItemId === item.id}
+                        onClick={() => setDeleteCandidate(item)}
+                        className={`inline-flex items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition-colors ${
+                          deletingItemId === item.id
+                            ? "cursor-not-allowed border-gray-800 bg-gray-900 text-gray-500"
+                            : "border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/15"
                         }`}
                       >
-                        <Download className="h-4 w-4" />
-                        {installingItemId === item.id ? "Installing..." : "Use in This Step"}
+                        <Trash2 className="h-4 w-4" />
+                        {deletingItemId === item.id ? "Deleting..." : "Delete"}
                       </button>
-                    ) : installTarget === "camera" && contextCameraReady ? (
-                      <button
-                        type="button"
-                        disabled={installingItemId === item.id}
-                        onClick={() => void installAgent(item, contextCameraId)}
-                        className={`inline-flex w-full items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
-                          installingItemId === item.id
-                            ? "cursor-not-allowed bg-gray-800 text-gray-500"
-                            : "bg-orange-500 text-white hover:bg-orange-400"
-                        }`}
-                      >
-                        <Camera className="h-4 w-4" />
-                        {installingItemId === item.id ? "Installing..." : "Add to This Camera"}
-                      </button>
+                    ) : null}
+                    {item.item_type === "agent" ? (
+                      installTarget === "step" && contextStepCameraReady && contextStepReady ? (
+                        <button
+                          type="button"
+                          disabled={installingItemId === item.id}
+                          onClick={() => void installAgentIntoStep(item)}
+                          className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
+                            item.can_delete ? "flex-1" : "w-full"
+                          } ${
+                            installingItemId === item.id
+                              ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                              : "bg-orange-500 text-white hover:bg-orange-400"
+                          }`}
+                        >
+                          <Download className="h-4 w-4" />
+                          {installingItemId === item.id ? "Installing..." : "Use in This Step"}
+                        </button>
+                      ) : installTarget === "camera" && contextCameraReady ? (
+                        <button
+                          type="button"
+                          disabled={installingItemId === item.id}
+                          onClick={() => void installAgent(item, contextCameraId)}
+                          className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
+                            item.can_delete ? "flex-1" : "w-full"
+                          } ${
+                            installingItemId === item.id
+                              ? "cursor-not-allowed bg-gray-800 text-gray-500"
+                              : "bg-orange-500 text-white hover:bg-orange-400"
+                          }`}
+                        >
+                          <Camera className="h-4 w-4" />
+                          {installingItemId === item.id ? "Installing..." : "Add to This Camera"}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAgentPickerItem(item);
+                            setAgentCameraId(cameras[0]?.id ? String(cameras[0].id) : "");
+                          }}
+                          className={`inline-flex items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400 ${
+                            item.can_delete ? "flex-1" : "w-full"
+                          }`}
+                        >
+                          <Camera className="h-4 w-4" />
+                          Install to Camera
+                        </button>
+                      )
                     ) : (
                       <button
                         type="button"
                         onClick={() => {
-                          setAgentPickerItem(item);
-                          setAgentCameraId(cameras[0]?.id ? String(cameras[0].id) : "");
+                          setTaskInstallItem(item);
+                          setTaskNameOverride(item.title);
+                          const initialMapping: Record<string, string> = {};
+                          const slots = Array.isArray(item.snapshot_json?.camera_slots)
+                            ? item.snapshot_json.camera_slots
+                            : [];
+                          for (const slot of slots) {
+                            const slotKey = String(slot?.slot_key || "");
+                            if (slotKey) initialMapping[slotKey] = "";
+                          }
+                          setTaskCameraMapping(initialMapping);
                         }}
-                        className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400"
+                        className={`inline-flex items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400 ${
+                          item.can_delete ? "flex-1" : "w-full"
+                        }`}
                       >
-                        <Camera className="h-4 w-4" />
-                        Install to Camera
+                        <Briefcase className="h-4 w-4" />
+                        {createJobLabel}
                       </button>
-                    )
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setTaskInstallItem(item);
-                        setTaskNameOverride(item.title);
-                        const initialMapping: Record<string, string> = {};
-                        const slots = Array.isArray(item.snapshot_json?.camera_slots)
-                          ? item.snapshot_json.camera_slots
-                          : [];
-                        for (const slot of slots) {
-                          const slotKey = String(slot?.slot_key || "");
-                          if (slotKey) initialMapping[slotKey] = "";
-                        }
-                        setTaskCameraMapping(initialMapping);
-                      }}
-                      className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400"
-                    >
-                      <Briefcase className="h-4 w-4" />
-                      {createJobLabel}
-                    </button>
-                  )}
+                    )}
+                  </div>
                 </div>
               </article>
             ))}
@@ -567,6 +641,27 @@ export default function HubPage() {
           </div>
         </div>
       ) : null}
+      <ConfirmDialog
+        isOpen={!!deleteCandidate}
+        title={
+          deleteCandidate?.item_type === "agent"
+            ? "Delete Agent From Hub"
+            : "Delete Task From Hub"
+        }
+        message={
+          deleteCandidate
+            ? `Remove "${deleteCandidate.title}" from the Hub? Existing installs stay untouched, but this upload will no longer appear in the catalog.`
+            : ""
+        }
+        confirmLabel={deletingItemId ? "Deleting..." : "Delete"}
+        cancelLabel="Cancel"
+        onConfirm={deleteHubItem}
+        onCancel={() => {
+          if (deletingItemId) return;
+          setDeleteCandidate(null);
+        }}
+        variant="danger"
+      />
     </Layout>
   );
 }

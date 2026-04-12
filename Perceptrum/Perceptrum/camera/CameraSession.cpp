@@ -59,6 +59,110 @@ using json = nlohmann::json;
 
 namespace fs = std::filesystem;
 
+static std::wstring utf8ToWide(const std::string& str);
+static std::string getExecutableDir();
+
+struct TempOpenCvClipPathGuardCamera_ {
+    std::string path;
+
+    ~TempOpenCvClipPathGuardCamera_()
+    {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::remove(fs::path(path), ec);
+    }
+};
+
+static bool openVideoCaptureForClipPathCamera_(
+    const std::string& clipPath,
+    cv::VideoCapture& outCap,
+    std::string& outTempOpenPath,
+    std::string* outErr = nullptr);
+static bool buildFrameWindowCroppedClipWithFfmpegCamera_(
+    const std::string& srcClipPath,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow,
+    std::string& outClipPath,
+    std::string* outErr = nullptr);
+static bool extractBoundaryFrameToMatFromClipCamera_(
+    const std::string& clipPath,
+    bool useLastMoment,
+    cv::Mat& outFrame,
+    std::string* outErr = nullptr);
+static bool detectMotionInAnyRegionFromStillPairCamera_(
+    const cv::Mat& previousFrame,
+    const cv::Mat& currentFrame,
+    const std::vector<AlgorithmConfig::AnalysisRegion>& polygonRegions,
+    bool& outMotion,
+    std::vector<std::string>* outTriggeredRegionIds,
+    std::string* outErr);
+
+static std::string describeClipPathForLogsCamera_(const std::string& clipPath)
+{
+    if (clipPath.empty()) {
+        return "<empty>";
+    }
+
+    std::error_code ec;
+    const fs::path path(clipPath);
+    const bool exists = fs::exists(path, ec) && !ec;
+    const std::uintmax_t size = exists ? fs::file_size(path, ec) : 0;
+    const bool hasSize = exists && !ec;
+    return clipPath +
+        " exists=" + std::string(exists ? "1" : "0") +
+        " size=" + (hasSize ? std::to_string(size) : std::string("n/a"));
+}
+
+#ifdef _WIN32
+static void ensureOpenCvVideoIoThreadReadyCamera_()
+{
+    thread_local bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        try {
+            Logger::instance().logDebug(
+                "CameraSession",
+                "OpenCV video I/O CoInitializeEx failed hr=" + std::to_string(hr)
+            );
+        }
+        catch (...) {
+        }
+    }
+}
+#else
+static void ensureOpenCvVideoIoThreadReadyCamera_() {}
+#endif
+
+static bool waitForReadableClipPathCamera_(
+    const std::string& clipPath,
+    std::string* outErr = nullptr)
+{
+    constexpr int kMaxAttempts = 8;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(50);
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        std::error_code ec;
+        const fs::path path(clipPath);
+        const bool exists = fs::exists(path, ec) && !ec;
+        const std::uintmax_t size = exists ? fs::file_size(path, ec) : 0;
+        if (exists && !ec && size > 0) {
+            std::ifstream ifs(path, std::ios::binary);
+            if (ifs.good()) {
+                return true;
+            }
+        }
+        if (attempt + 1 < kMaxAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+
+    if (outErr) {
+        *outErr = "clip not readable yet: " + describeClipPathForLogsCamera_(clipPath);
+    }
+    return false;
+}
+
 struct CaptureThreadMetricSample {
     std::string backendBaseUrl;
     std::string clientId;
@@ -756,44 +860,15 @@ static bool encodeFrameToJpegDataUrlCamera_(
 static bool buildCroppedClipForFrameWindowCamera_(
     const std::string& srcClipPath,
     const AlgorithmConfig::FrameWindowNorm& frameWindow,
-    std::string& outClipPath)
+    std::string& outClipPath,
+    std::string* outErr = nullptr)
 {
-    outClipPath.clear();
-    if (!isFrameWindowActiveCamera_(frameWindow)) return false;
-
-    cv::VideoCapture cap(srcClipPath);
-    if (!cap.isOpened()) return false;
-
-    cv::Mat firstFrame;
-    if (!cap.read(firstFrame) || firstFrame.empty()) {
-        return false;
-    }
-
-    const cv::Rect cropRect = frameWindowToRectCamera_(frameWindow, firstFrame.size());
-    if (cropRect.width <= 0 || cropRect.height <= 0) return false;
-
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (!std::isfinite(fps) || fps <= 0.0) fps = 10.0;
-
-    const std::string dstClipPath = srcClipPath + ".frame_window.mp4";
-    const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-    cv::VideoWriter writer(dstClipPath, fourcc, fps, cropRect.size(), true);
-    if (!writer.isOpened()) return false;
-
-    writer.write(firstFrame(cropRect).clone());
-
-    cv::Mat frame;
-    while (cap.read(frame)) {
-        if (frame.empty()) continue;
-        const cv::Rect frameCropRect = frameWindowToRectCamera_(frameWindow, frame.size());
-        if (frameCropRect.width <= 0 || frameCropRect.height <= 0) continue;
-        writer.write(frame(frameCropRect).clone());
-    }
-
-    writer.release();
-    cap.release();
-    outClipPath = dstClipPath;
-    return true;
+    return buildFrameWindowCroppedClipWithFfmpegCamera_(
+        srcClipPath,
+        frameWindow,
+        outClipPath,
+        outErr
+    );
 }
 
 static std::vector<cv::Point> regionPolygonToPixelsForCamera_(
@@ -923,76 +998,27 @@ static bool detectMotionInAnyRegionFromClipCamera_(
         return true;
     }
 
-    cv::VideoCapture cap(clipPath);
-    if (!cap.isOpened()) {
-        if (outErr) *outErr = "failed to open clip";
-        return false;
-    }
-
     cv::Mat firstFrame;
-    if (!cap.read(firstFrame) || firstFrame.empty()) {
-        if (outErr) *outErr = "clip has no readable frames";
+    if (!extractBoundaryFrameToMatFromClipCamera_(clipPath, false, firstFrame, outErr) ||
+        firstFrame.empty())
+    {
         return false;
     }
 
-    cv::Mat prevGray;
-    cv::cvtColor(firstFrame, prevGray, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(prevGray, prevGray, cv::Size(5, 5), 0);
-
-    std::vector<cv::Mat> regionMasks;
-    regionMasks.reserve(polygonRegions.size());
-    std::vector<std::string> regionIds;
-    regionIds.reserve(polygonRegions.size());
-    for (const auto& region : polygonRegions) {
-        cv::Mat mask(prevGray.size(), CV_8U, cv::Scalar(0));
-        const auto polygon = regionPolygonToPixelsForCamera_(region, prevGray.size());
-        if (polygon.size() < 3) {
-            regionMasks.push_back(cv::Mat());
-            regionIds.push_back(region.regionId);
-            continue;
-        }
-        std::vector<std::vector<cv::Point>> polygons{ polygon };
-        cv::fillPoly(mask, polygons, cv::Scalar(255));
-        regionMasks.push_back(mask);
-        regionIds.push_back(region.regionId);
+    cv::Mat lastFrame;
+    if (!extractBoundaryFrameToMatFromClipCamera_(clipPath, true, lastFrame, outErr) ||
+        lastFrame.empty())
+    {
+        return false;
     }
-
-    cv::Mat frame;
-    std::set<std::string> triggered;
-    while (cap.read(frame)) {
-        if (frame.empty()) continue;
-
-        cv::Mat gray;
-        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
-
-        cv::Mat diff, motionMask;
-        cv::absdiff(gray, prevGray, diff);
-        cv::threshold(diff, motionMask, 18, 255, cv::THRESH_BINARY);
-        cv::erode(motionMask, motionMask, cv::Mat(), cv::Point(-1, -1), 1);
-        cv::dilate(motionMask, motionMask, cv::Mat(), cv::Point(-1, -1), 1);
-
-        for (std::size_t i = 0; i < regionMasks.size(); ++i) {
-            if (regionMasks[i].empty()) continue;
-            cv::Mat roiMotion;
-            cv::bitwise_and(motionMask, regionMasks[i], roiMotion);
-            const int changed = cv::countNonZero(roiMotion);
-            if (changed > 120) {
-                outMotion = true;
-                if (!regionIds[i].empty()) triggered.insert(regionIds[i]);
-            }
-        }
-
-        gray.copyTo(prevGray);
-        if (outMotion && triggered.size() >= regionMasks.size()) {
-            break;
-        }
-    }
-
-    if (outTriggeredRegionIds) {
-        outTriggeredRegionIds->assign(triggered.begin(), triggered.end());
-    }
-    return true;
+    return detectMotionInAnyRegionFromStillPairCamera_(
+        firstFrame,
+        lastFrame,
+        polygonRegions,
+        outMotion,
+        outTriggeredRegionIds,
+        outErr
+    );
 }
 
 static bool detectMotionInAnyRegionFromStillPairCamera_(
@@ -1072,8 +1098,13 @@ static bool buildOverlayClipForRegionsCamera_(
     if (outDrawnRegionIds) outDrawnRegionIds->clear();
     if (polygonRegions.empty()) return false;
 
-    cv::VideoCapture cap(srcClipPath);
-    if (!cap.isOpened()) return false;
+    ensureOpenCvVideoIoThreadReadyCamera_();
+
+    cv::VideoCapture cap;
+    TempOpenCvClipPathGuardCamera_ tempOpenPathGuard;
+    if (!openVideoCaptureForClipPathCamera_(srcClipPath, cap, tempOpenPathGuard.path)) {
+        return false;
+    }
 
     cv::Mat firstFrame;
     if (!cap.read(firstFrame) || firstFrame.empty()) {
@@ -1088,8 +1119,16 @@ static bool buildOverlayClipForRegionsCamera_(
     if (!std::isfinite(fps) || fps <= 0.0) fps = 10.0;
 
     std::string dstClipPath = srcClipPath + ".roi_overlay.mp4";
-    const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-    cv::VideoWriter writer(dstClipPath, fourcc, fps, cv::Size(width, height), true);
+    cv::VideoWriter writer;
+    const std::vector<int> fourccCandidates = {
+        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
+        cv::VideoWriter::fourcc('m', 'p', '4', 'v')
+    };
+    for (const int fourcc : fourccCandidates) {
+        if (writer.open(dstClipPath, fourcc, fps, cv::Size(width, height), true)) {
+            break;
+        }
+    }
     if (!writer.isOpened()) return false;
 
     {
@@ -1108,6 +1147,9 @@ static bool buildOverlayClipForRegionsCamera_(
 
     writer.release();
     cap.release();
+    if (!waitForReadableClipPathCamera_(dstClipPath)) {
+        return false;
+    }
     outClipPath = dstClipPath;
     return true;
 }
@@ -3704,6 +3746,388 @@ static std::string getExecutableDir()
     // Convert full EXE path ? parent folder
     fs::path exePath(buffer);
     return exePath.parent_path().string();
+}
+
+static bool runHiddenProcessCamera_(
+    const std::wstring& cmdLine,
+    DWORD& outExitCode,
+    std::string* outErr = nullptr)
+{
+    outExitCode = 1;
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    const BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+    if (!ok) {
+        if (outErr) *outErr = "CreateProcessW failed";
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &outExitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static bool buildOpenCvCompatibleClipWithFfmpegCamera_(
+    const std::string& inputPath,
+    std::string& outNormalizedPath,
+    std::string* outErr = nullptr)
+{
+    outNormalizedPath = inputPath + ".opencv_normalized.mp4";
+
+    std::error_code ec;
+    fs::remove(fs::path(outNormalizedPath), ec);
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath, ec) || ec) {
+        if (outErr) *outErr = "ffmpeg missing: " + ffmpegPath.string();
+        return false;
+    }
+
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(inputPath);
+    std::wstring outW = utf8ToWide(outNormalizedPath);
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -hide_banner -loglevel error"
+        L" -i \"" + inW + L"\""
+        L" -c:v libx264 -pix_fmt yuv420p -movflags +faststart"
+        L" -an "
+        L" \"" + outW + L"\"";
+
+    DWORD exitCode = 1;
+    if (!runHiddenProcessCamera_(cmdLine, exitCode, outErr)) {
+        return false;
+    }
+
+    if (exitCode != 0) {
+        if (outErr) *outErr = "ffmpeg normalize failed rc=" + std::to_string(exitCode);
+        return false;
+    }
+
+    if (!fs::exists(fs::path(outNormalizedPath), ec) || ec) {
+        if (outErr) *outErr = "normalized output missing: " + outNormalizedPath;
+        return false;
+    }
+
+    return true;
+}
+
+static bool buildFrameWindowCroppedClipWithFfmpegCamera_(
+    const std::string& srcClipPath,
+    const AlgorithmConfig::FrameWindowNorm& frameWindow,
+    std::string& outClipPath,
+    std::string* outErr)
+{
+    outClipPath.clear();
+    if (!isFrameWindowActiveCamera_(frameWindow)) {
+        if (outErr) *outErr = "frame window inactive";
+        return false;
+    }
+
+    std::error_code ec;
+    const fs::path srcPath(srcClipPath);
+    if (!fs::exists(srcPath, ec) || ec) {
+        if (outErr) *outErr = "source clip missing: " + srcClipPath;
+        return false;
+    }
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath, ec) || ec) {
+        if (outErr) *outErr = "ffmpeg missing: " + ffmpegPath.string();
+        return false;
+    }
+
+    const double x1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
+    const double y1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
+    const double x2Norm =
+        (std::max)(x1Norm + 1e-6, (std::min)(1.0, frameWindow.x + frameWindow.width));
+    const double y2Norm =
+        (std::max)(y1Norm + 1e-6, (std::min)(1.0, frameWindow.y + frameWindow.height));
+    const double widthNorm = x2Norm - x1Norm;
+    const double heightNorm = y2Norm - y1Norm;
+    if (widthNorm <= 1e-6 || heightNorm <= 1e-6) {
+        if (outErr) *outErr = "frame window crop rect invalid";
+        return false;
+    }
+
+    auto fmt = [](double value) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(6) << value;
+        return oss.str();
+    };
+
+    const std::string widthExpr =
+        "max(2,trunc(iw*" + fmt(widthNorm) + "/2)*2)";
+    const std::string heightExpr =
+        "max(2,trunc(ih*" + fmt(heightNorm) + "/2)*2)";
+    const std::string xExpr =
+        "max(0,trunc(iw*" + fmt(x1Norm) + "/2)*2)";
+    const std::string yExpr =
+        "max(0,trunc(ih*" + fmt(y1Norm) + "/2)*2)";
+    const std::string cropFilter =
+        "crop=w='" + widthExpr +
+        "':h='" + heightExpr +
+        "':x='" + xExpr +
+        "':y='" + yExpr + "'";
+
+    outClipPath = srcClipPath + ".frame_window.mp4";
+    fs::remove(fs::path(outClipPath), ec);
+
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(srcClipPath);
+    std::wstring outW = utf8ToWide(outClipPath);
+    std::wstring filterW = utf8ToWide(cropFilter);
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -hide_banner -loglevel error"
+        L" -i \"" + inW + L"\""
+        L" -vf \"" + filterW + L"\""
+        L" -c:v libx264 -pix_fmt yuv420p -movflags +faststart"
+        L" -an "
+        L" \"" + outW + L"\"";
+
+    DWORD exitCode = 1;
+    if (!runHiddenProcessCamera_(cmdLine, exitCode, outErr)) {
+        return false;
+    }
+    if (exitCode != 0) {
+        if (outErr) {
+            *outErr =
+                "ffmpeg frame-window crop failed rc=" + std::to_string(exitCode) +
+                " src=" + describeClipPathForLogsCamera_(srcClipPath) +
+                " filter=" + cropFilter;
+        }
+        return false;
+    }
+
+    if (!waitForReadableClipPathCamera_(outClipPath, outErr)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool extractBoundaryFrameToMatFromClipCamera_(
+    const std::string& clipPath,
+    bool useLastMoment,
+    cv::Mat& outFrame,
+    std::string* outErr)
+{
+    outFrame.release();
+
+    std::error_code ec;
+    const fs::path srcPath(clipPath);
+    if (!fs::exists(srcPath, ec) || ec) {
+        if (outErr) *outErr = "source clip missing: " + clipPath;
+        return false;
+    }
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath, ec) || ec) {
+        if (outErr) *outErr = "ffmpeg missing: " + ffmpegPath.string();
+        return false;
+    }
+
+    fs::path jpgPath = srcPath;
+    jpgPath +=
+        (useLastMoment ? ".lastframe_" : ".firstframe_") +
+        std::to_string(steadyNowMs_()) + "_" +
+        std::to_string(static_cast<unsigned long>(GetCurrentThreadId())) +
+        ".jpg";
+    fs::remove(jpgPath, ec);
+
+    std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    std::wstring inW = utf8ToWide(clipPath);
+    std::wstring outW = utf8ToWide(jpgPath.string());
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y -hide_banner -loglevel error ";
+    if (useLastMoment) {
+        cmdLine += L" -sseof -0.20 ";
+    }
+    cmdLine +=
+        L" -i \"" + inW + L"\""
+        L" -frames:v 1 -q:v 3 "
+        L" \"" + outW + L"\"";
+
+    DWORD exitCode = 1;
+    if (!runHiddenProcessCamera_(cmdLine, exitCode, outErr)) {
+        return false;
+    }
+    if (exitCode != 0 && useLastMoment) {
+        cmdLine =
+            L"\"" + ffmpegW + L"\""
+            L" -y -hide_banner -loglevel error"
+            L" -i \"" + inW + L"\""
+            L" -frames:v 1 -q:v 3 "
+            L" \"" + outW + L"\"";
+        if (!runHiddenProcessCamera_(cmdLine, exitCode, outErr)) {
+            return false;
+        }
+    }
+
+    if (exitCode != 0 || !fs::exists(jpgPath, ec) || ec) {
+        if (outErr) {
+            *outErr =
+                "ffmpeg boundary frame extract failed rc=" + std::to_string(exitCode) +
+                " clip=" + clipPath;
+        }
+        return false;
+    }
+
+    outFrame = cv::imread(jpgPath.string(), cv::IMREAD_COLOR);
+    std::error_code rmEc;
+    fs::remove(jpgPath, rmEc);
+    if (outFrame.empty()) {
+        if (outErr) *outErr = "cv::imread failed for extracted frame";
+        return false;
+    }
+
+    return true;
+}
+
+static bool tryOpenVideoCaptureWithPreferredBackendsCamera_(
+    const std::string& clipPath,
+    cv::VideoCapture& outCap)
+{
+    ensureOpenCvVideoIoThreadReadyCamera_();
+
+    if (clipPath.empty()) {
+        outCap.release();
+        return false;
+    }
+
+#ifdef _WIN32
+    const std::vector<int> apiPreferences = {
+        cv::CAP_FFMPEG,
+        cv::CAP_MSMF,
+        cv::CAP_ANY
+    };
+#else
+    const std::vector<int> apiPreferences = {
+        cv::CAP_FFMPEG,
+        cv::CAP_ANY
+    };
+#endif
+    for (const int apiPreference : apiPreferences) {
+        outCap.release();
+        if (outCap.open(clipPath, apiPreference)) {
+            return true;
+        }
+    }
+
+    outCap.release();
+    return false;
+}
+
+static bool tryOpenVideoCaptureWithRetryCamera_(
+    const std::string& clipPath,
+    cv::VideoCapture& outCap)
+{
+    constexpr int kMaxOpenAttempts = 4;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(75);
+    for (int attempt = 0; attempt < kMaxOpenAttempts; ++attempt) {
+        if (tryOpenVideoCaptureWithPreferredBackendsCamera_(clipPath, outCap)) {
+            return true;
+        }
+        if (attempt + 1 < kMaxOpenAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+    }
+    return false;
+}
+
+static bool openVideoCaptureForClipPathCamera_(
+    const std::string& clipPath,
+    cv::VideoCapture& outCap,
+    std::string& outTempOpenPath,
+    std::string* outErr)
+{
+    outTempOpenPath.clear();
+    outCap.release();
+
+    auto clearTempPath = [](const std::string& path) {
+        if (path.empty()) return;
+        std::error_code ec;
+        fs::remove(fs::path(path), ec);
+    };
+    auto tryOpen = [&](const std::string& path) -> bool {
+        return tryOpenVideoCaptureWithRetryCamera_(path, outCap);
+    };
+
+    std::string readableErr;
+    if (!waitForReadableClipPathCamera_(clipPath, &readableErr)) {
+        if (outErr) *outErr = readableErr;
+        return false;
+    }
+
+    if (tryOpen(clipPath)) {
+        return true;
+    }
+
+    std::string normalizedPath;
+    std::string normalizeErr;
+    if (!buildOpenCvCompatibleClipWithFfmpegCamera_(clipPath, normalizedPath, &normalizeErr)) {
+        if (outErr) {
+            *outErr =
+                "failed to normalize clip for OpenCV: " + normalizeErr +
+                " src=" + describeClipPathForLogsCamera_(clipPath) +
+                " normalized_output=" + normalizedPath;
+        }
+        return false;
+    }
+
+    readableErr.clear();
+    if (!waitForReadableClipPathCamera_(normalizedPath, &readableErr)) {
+        const std::string normalizedDesc = describeClipPathForLogsCamera_(normalizedPath);
+        clearTempPath(normalizedPath);
+        if (outErr) {
+            *outErr =
+                "normalized clip not readable yet normalized=" + normalizedDesc +
+                " src=" + describeClipPathForLogsCamera_(clipPath) +
+                " reason=" + readableErr;
+        }
+        return false;
+    }
+
+    if (!tryOpen(normalizedPath)) {
+        const std::string normalizedDesc = describeClipPathForLogsCamera_(normalizedPath);
+        clearTempPath(normalizedPath);
+        if (outErr) {
+            *outErr =
+                "failed to open normalized clip normalized=" +
+                normalizedDesc +
+                " src=" + describeClipPathForLogsCamera_(clipPath);
+        }
+        return false;
+    }
+
+    outTempOpenPath = normalizedPath;
+    return true;
 }
 
 
@@ -7730,15 +8154,18 @@ void CameraSession::inferenceLoop_() {
                         std::vector<unsigned char> preparedSegmentBytes = segmentSourceBytes;
                         std::string preparedSegmentPath = segmentSourcePath;
                         if (hasFrameWindow) {
+                            std::string cropErr;
                             if (!buildCroppedClipForFrameWindowCamera_(
                                 segmentSourcePath,
                                 frameWindow,
-                                croppedSegmentSourcePath))
+                                croppedSegmentSourcePath,
+                                &cropErr))
                             {
                                 Logger::instance().logDebug(
                                     config_.id,
                                     "inferenceLoop_: custom video failed to build cropped clip algo=" +
-                                    customAlgo.type + " clip=" + segmentSourcePath
+                                    customAlgo.type + " clip=" + segmentSourcePath +
+                                    " err=" + cropErr
                                 );
                                 continue;
                             }
@@ -7804,7 +8231,7 @@ void CameraSession::inferenceLoop_() {
                         }
                         std::vector<std::string> motionTriggeredRegionIds;
                         bool shouldInfer = true;
-                        if (!motionRegions.empty()) {
+                        if (!motionRegions.empty() && customAlgo.onlyCaptureOnMotion) {
                             bool hasRegionMotion = false;
                             std::string motionErr;
                             if (!detectMotionInAnyRegionFromClipCamera_(
@@ -7829,6 +8256,9 @@ void CameraSession::inferenceLoop_() {
                                     customAlgo.type
                                 );
                             }
+                        }
+                        else if (customAlgo.onlyCaptureOnMotion) {
+                            shouldInfer = inferenceEnabled_.load(std::memory_order_relaxed);
                         }
                         if (!shouldInfer) {
                             cleanupPreparedSegment();

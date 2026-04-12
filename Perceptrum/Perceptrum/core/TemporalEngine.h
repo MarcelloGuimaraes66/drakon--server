@@ -30,6 +30,8 @@ inline bool validateCompilerDecisionConsistency(const json& envelope, std::strin
 inline json parseTraitsValue(const json& value);
 inline void appendUniqueStringsToArray(json& target, const json& value);
 inline std::string normalizeEventName(const std::string& rawEvent);
+inline std::string strField(const json& n, const char* key, const std::string& fallback);
+inline int intField(const json& n, const char* key, int fallback);
 
 inline std::string trim(const std::string& s) {
     const auto a = s.find_first_not_of(" \t\r\n");
@@ -40,6 +42,11 @@ inline std::string trim(const std::string& s) {
 
 inline std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+inline std::string upper(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return s;
 }
 
@@ -549,6 +556,7 @@ inline bool isAllowedOperatorType(const std::string& opType) {
         "count_events_in_window",
         "no_event_for_duration",
         "cross_camera_track_after_trigger",
+        "analyze_events_at_interval",
         "custom_expression"
     };
     return kAllowed.find(lower(trim(opType))) != kAllowed.end();
@@ -570,6 +578,201 @@ inline bool isAllowedRuntimeType(const std::string& runtimeType) {
         "int", "float", "bool", "string", "array", "timestamp"
     };
     return kAllowed.find(lower(trim(runtimeType))) != kAllowed.end();
+}
+
+inline std::string normalizeAnalyzeIntervalScheduleModeToken(const std::string& rawMode) {
+    const std::string mode = lower(trim(rawMode));
+    if (mode == "one_shot" || mode == "single" || mode == "single_shot" || mode == "once_only") {
+        return "once";
+    }
+    if (mode == "repeat" || mode == "repeating" || mode == "periodic" ||
+        mode == "every_interval" || mode == "recurring_interval")
+    {
+        return "recurring";
+    }
+    return mode;
+}
+
+inline std::string normalizeAnalyzeIntervalAnchorModeToken(const std::string& rawMode) {
+    const std::string mode = lower(trim(rawMode));
+    if (mode == "start" || mode == "start_of_monitoring" || mode == "monitoring_begin" ||
+        mode == "from_start" || mode == "window_start" || mode == "start_of_window" ||
+        mode == "window_begin" || mode == "monitoring_window_start")
+    {
+        return "monitoring_start";
+    }
+    if (mode == "first_event" || mode == "first_match" ||
+        mode == "first_matching_observation" || mode == "first_observed_event" ||
+        mode == "on_first_match" || mode == "first_seen_event")
+    {
+        return "first_matching_event";
+    }
+    if (mode == "fixed_time" || mode == "fixed_local_time" ||
+        mode == "fixed_clock_time" || mode == "scheduled_local_time" ||
+        mode == "daily_local_time")
+    {
+        return "fixed_time_local";
+    }
+    return mode;
+}
+
+inline std::string normalizeAnalyzeIntervalCatchUpModeToken(const std::string& rawMode) {
+    const std::string mode = lower(trim(rawMode));
+    if (mode == "latest" || mode == "latest_only" || mode == "latest_due" ||
+        mode == "latest_checkpoint_only" || mode == "most_recent_due_only")
+    {
+        return "latest_due_only";
+    }
+    if (mode == "all_due" || mode == "emit_every_due" ||
+        mode == "emit_all_checkpoints" || mode == "process_all_due")
+    {
+        return "emit_all_due";
+    }
+    return mode;
+}
+
+inline std::string normalizeAnalyzeIntervalKindToken(const std::string& rawKind) {
+    return lower(trim(rawKind));
+}
+
+inline std::string normalizeAnalyzeIntervalWindowModeToken(const std::string& rawMode) {
+    return lower(trim(rawMode));
+}
+
+inline std::string normalizeAnalyzeIntervalDecisionModeToken(const std::string& rawMode) {
+    return lower(trim(rawMode));
+}
+
+inline std::string normalizeAnalyzeIntervalDecisionOpToken(const std::string& rawOp) {
+    return lower(trim(rawOp));
+}
+
+inline bool isAllowedAnalyzeIntervalScheduleMode(const std::string& rawMode) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "once",
+        "recurring"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalScheduleModeToken(rawMode)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalAnchorMode(const std::string& rawMode) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "monitoring_start",
+        "first_matching_event",
+        "fixed_time_local"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalAnchorModeToken(rawMode)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalCatchUpMode(const std::string& rawMode) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "latest_due_only",
+        "emit_all_due"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalCatchUpModeToken(rawMode)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalKind(const std::string& rawKind) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "count_occurrences",
+        "count_distinct_entities",
+        "has_any_event",
+        "last_event_age_seconds",
+        "first_event_ts",
+        "last_event_ts",
+        "event_rate",
+        "window_buffer"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalKindToken(rawKind)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalWindowMode(const std::string& rawMode) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "cumulative_from_anchor",
+        "bucket"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalWindowModeToken(rawMode)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalDecisionMode(const std::string& rawMode) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "report_only",
+        "alert_if_true",
+        "report_and_alert_if_true"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalDecisionModeToken(rawMode)) != kAllowed.end();
+}
+
+inline bool isAllowedAnalyzeIntervalDecisionOp(const std::string& rawOp) {
+    static const std::unordered_set<std::string> kAllowed = {
+        "<", "<=", ">", ">=", "==", "!=", "between", "outside", "is_true", "is_false"
+    };
+    return kAllowed.find(normalizeAnalyzeIntervalDecisionOpToken(rawOp)) != kAllowed.end();
+}
+
+inline json normalizeAnalyzeEventsAtIntervalParams(const json& rawParams) {
+    json params = rawParams.is_object() ? rawParams : json::object();
+    json schedule = params.value("schedule", json::object());
+    if (!schedule.is_object()) schedule = json::object();
+    json source = params.value("source", json::object());
+    if (!source.is_object()) source = json::object();
+    json analysis = params.value("analysis", json::object());
+    if (!analysis.is_object()) analysis = json::object();
+    json decision = params.value("decision", json::object());
+    if (!decision.is_object()) decision = json::object();
+    json output = params.value("output", json::object());
+    if (!output.is_object()) output = json::object();
+
+    const std::string scheduleMode =
+        normalizeAnalyzeIntervalScheduleModeToken(strField(schedule, "mode", std::string()));
+    schedule["mode"] = scheduleMode.empty() ? "once" : scheduleMode;
+
+    const std::string anchorMode =
+        normalizeAnalyzeIntervalAnchorModeToken(strField(schedule, "anchor_mode", std::string()));
+    schedule["anchor_mode"] = anchorMode.empty() ? "monitoring_start" : anchorMode;
+
+    const std::string catchUpMode = normalizeAnalyzeIntervalCatchUpModeToken(
+        strField(schedule, "catch_up_mode", "latest_due_only"));
+    schedule["catch_up_mode"] = catchUpMode.empty() ? "latest_due_only" : catchUpMode;
+
+    const std::string sourceEvent = normalizeEventName(strField(source, "event", std::string()));
+    if (!sourceEvent.empty()) source["event"] = sourceEvent;
+    const std::string sourceEntity = trim(strField(source, "entity", std::string()));
+    if (!sourceEntity.empty()) source["entity"] = sourceEntity;
+    const std::string sourceZone = extractZoneField(source);
+    if (!sourceZone.empty()) source["zone"] = sourceZone;
+
+    const std::string analysisKind =
+        normalizeAnalyzeIntervalKindToken(strField(analysis, "kind", std::string()));
+    analysis["kind"] = analysisKind.empty() ? "count_occurrences" : analysisKind;
+
+    const std::string windowMode =
+        normalizeAnalyzeIntervalWindowModeToken(strField(analysis, "window_mode", std::string()));
+    analysis["window_mode"] = windowMode.empty() ? "bucket" : windowMode;
+
+    if (!analysis.contains("window_seconds") &&
+        intField(schedule, "interval_seconds", 0) > 0)
+    {
+        analysis["window_seconds"] = intField(schedule, "interval_seconds", 0);
+    }
+
+    const std::string decisionMode =
+        normalizeAnalyzeIntervalDecisionModeToken(strField(decision, "mode", std::string()));
+    decision["mode"] = decisionMode.empty() ? "alert_if_true" : decisionMode;
+
+    const std::string decisionOp =
+        normalizeAnalyzeIntervalDecisionOpToken(strField(decision, "op", std::string()));
+    if (!decisionOp.empty()) decision["op"] = decisionOp;
+
+    const std::string summaryLabel = trim(strField(output, "summary_label", std::string()));
+    if (!summaryLabel.empty()) output["summary_label"] = summaryLabel;
+
+    params["schedule"] = std::move(schedule);
+    params["source"] = std::move(source);
+    params["analysis"] = std::move(analysis);
+    params["decision"] = std::move(decision);
+    params["output"] = std::move(output);
+    return params;
 }
 
 inline uint64_t fnv1a64(const std::string& s) {
@@ -731,6 +934,135 @@ inline long long ageSeconds(const std::string& tsIso, const std::string& nowIsoU
     std::chrono::system_clock::time_point a, b;
     if (!parseIso(tsIso, a) || !parseIso(nowIsoUtc, b)) return 0;
     return std::chrono::duration_cast<std::chrono::seconds>(b - a).count();
+}
+
+inline std::string addSecondsIso(const std::string& tsIso, long long deltaSeconds) {
+    std::chrono::system_clock::time_point tp;
+    if (!parseFlexibleTs(tsIso, tp)) return "";
+    tp += std::chrono::seconds(deltaSeconds);
+    return formatIsoUtcNoSuffix(tp);
+}
+
+inline bool normalizeTsBetweenInclusive(const std::string& rawTs,
+                                        const std::string& startIsoUtc,
+                                        const std::string& endIsoUtc,
+                                        std::string* outNormalizedTs = nullptr) {
+    const std::string normalized = normalizeFlexibleTs(rawTs);
+    if (normalized.empty()) return false;
+    if (!trim(startIsoUtc).empty() && normalized < trim(startIsoUtc)) return false;
+    if (!trim(endIsoUtc).empty() && normalized > trim(endIsoUtc)) return false;
+    if (outNormalizedTs) *outNormalizedTs = normalized;
+    return true;
+}
+
+inline bool parseClockTimeSeconds(const std::string& raw, int& outSeconds) {
+    const std::string s = trim(raw);
+    if (s.size() < 4 || s.size() > 8) return false;
+    const auto firstColon = s.find(':');
+    if (firstColon == std::string::npos) return false;
+    const auto secondColon = s.find(':', firstColon + 1);
+    if (secondColon != std::string::npos && s.find(':', secondColon + 1) != std::string::npos) {
+        return false;
+    }
+
+    int hh = -1;
+    int mm = -1;
+    int ss = 0;
+    try {
+        hh = std::stoi(s.substr(0, firstColon));
+        if (secondColon == std::string::npos) {
+            mm = std::stoi(s.substr(firstColon + 1));
+        } else {
+            mm = std::stoi(s.substr(firstColon + 1, secondColon - firstColon - 1));
+            ss = std::stoi(s.substr(secondColon + 1));
+        }
+    } catch (...) {
+        return false;
+    }
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59) return false;
+    outSeconds = hh * 3600 + mm * 60 + ss;
+    return true;
+}
+
+inline bool parseUtcOffsetSeconds(const std::string& raw, int& outSeconds) {
+    std::string s = upper(trim(raw));
+    if (s.empty() || s == "UTC" || s == "GMT" || s == "Z") {
+        outSeconds = 0;
+        return true;
+    }
+    if (s.rfind("UTC", 0) == 0) {
+        s = trim(s.substr(3));
+    } else if (s.rfind("GMT", 0) == 0) {
+        s = trim(s.substr(3));
+    }
+    if (s.empty() || s == "Z") {
+        outSeconds = 0;
+        return true;
+    }
+    if (s.size() < 2 || (s[0] != '+' && s[0] != '-')) return false;
+
+    int sign = (s[0] == '-') ? -1 : 1;
+    std::string rest = s.substr(1);
+    int hh = -1;
+    int mm = 0;
+    try {
+        const auto colon = rest.find(':');
+        if (colon != std::string::npos) {
+            hh = std::stoi(rest.substr(0, colon));
+            mm = std::stoi(rest.substr(colon + 1));
+        } else if (rest.size() == 4) {
+            hh = std::stoi(rest.substr(0, 2));
+            mm = std::stoi(rest.substr(2, 2));
+        } else {
+            hh = std::stoi(rest);
+        }
+    } catch (...) {
+        return false;
+    }
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
+    outSeconds = sign * (hh * 3600 + mm * 60);
+    return true;
+}
+
+inline bool computeNextFixedLocalCheckpointUtc(const std::string& monitoringStartIsoUtc,
+                                               const std::string& timeLocal,
+                                               const std::string& timezone,
+                                               std::string& outDueIsoUtc) {
+    std::chrono::system_clock::time_point monitoringStartTp;
+    if (!parseFlexibleTs(monitoringStartIsoUtc, monitoringStartTp)) return false;
+
+    int localClockSeconds = 0;
+    if (!parseClockTimeSeconds(timeLocal, localClockSeconds)) return false;
+
+    int offsetSeconds = 0;
+    if (!parseUtcOffsetSeconds(timezone, offsetSeconds)) return false;
+
+    const auto localReferenceTp = monitoringStartTp + std::chrono::seconds(offsetSeconds);
+    const std::time_t localReferenceTt = std::chrono::system_clock::to_time_t(localReferenceTp);
+    std::tm localReferenceTm{};
+#if defined(_WIN32)
+    gmtime_s(&localReferenceTm, &localReferenceTt);
+#else
+    gmtime_r(&localReferenceTt, &localReferenceTm);
+#endif
+    localReferenceTm.tm_hour = localClockSeconds / 3600;
+    localReferenceTm.tm_min = (localClockSeconds % 3600) / 60;
+    localReferenceTm.tm_sec = localClockSeconds % 60;
+
+#if defined(_WIN32)
+    std::time_t candidateLocalTt = _mkgmtime(&localReferenceTm);
+#else
+    std::time_t candidateLocalTt = timegm(&localReferenceTm);
+#endif
+    if (candidateLocalTt == static_cast<std::time_t>(-1)) return false;
+
+    auto candidateUtcTp =
+        std::chrono::system_clock::from_time_t(candidateLocalTt - offsetSeconds);
+    if (candidateUtcTp < monitoringStartTp) {
+        candidateUtcTp += std::chrono::hours(24);
+    }
+    outDueIsoUtc = formatIsoUtcNoSuffix(candidateUtcTp);
+    return !outDueIsoUtc.empty();
 }
 
 inline std::string strField(const json& n, const char* key, const std::string& fallback = std::string()) {
@@ -1384,21 +1716,28 @@ inline bool operatorUsesThreatEvidence(const json& op) {
     const std::string eventName = strField(params, "event");
     const std::string withoutEvent = strField(params, "without_event");
     const std::string triggerEvent = strField(params, "trigger_event");
+    const json source = params.value("source", json::object());
+    const std::string sourceEntity = strField(source, "entity");
+    const std::string sourceEvent = strField(source, "event");
 
     if (tokenLooksLikeThreatEvidence(eventName) ||
         tokenLooksLikeThreatEvidence(withoutEvent) ||
         tokenLooksLikeThreatEvidence(triggerEvent) ||
+        tokenLooksLikeThreatEvidence(sourceEvent) ||
         tokenLooksLikeThreatEvidence(strField(op, "operator_id")))
     {
         return true;
     }
 
-    const bool threatEntity = tokenLooksLikeThreatEvidence(entity);
+    const bool threatEntity =
+        tokenLooksLikeThreatEvidence(entity) ||
+        tokenLooksLikeThreatEvidence(sourceEntity);
     if (!threatEntity) return false;
 
     return typ == "entity_present" ||
            typ == "entity_absent" ||
            typ == "count_events_in_window" ||
+           typ == "analyze_events_at_interval" ||
            typ == "seen_n_times_in_window_by_entity" ||
            typ == "entered_zone" ||
            typ == "left_zone" ||
@@ -1637,6 +1976,15 @@ inline void normalizeOperators(json& plan) {
             }
             ensureEventInCatalog(plan, eventName);
             op["params"] = params;
+        } else if (typ == "analyze_events_at_interval") {
+            json params = normalizeAnalyzeEventsAtIntervalParams(
+                op.value("params", json::object()));
+            const json source = params.value("source", json::object());
+            const std::string sourceEvent = trim(strField(source, "event"));
+            if (!sourceEvent.empty()) {
+                ensureEventInCatalog(plan, sourceEvent);
+            }
+            op["params"] = std::move(params);
         }
     }
 }
@@ -2187,6 +2535,94 @@ inline json extractTraitsFromNode(const json& node) {
     return json::array();
 }
 
+inline bool validateAnalyzeEventsAtIntervalParams(
+    const json& params,
+    const std::unordered_set<std::string>& entityKeys,
+    const std::unordered_set<std::string>& events,
+    std::string* outReason = nullptr)
+{
+    auto fail = [&](const std::string& reason) -> bool {
+        if (outReason) *outReason = reason;
+        return false;
+    };
+
+    if (!params.is_object()) return fail("operator_params_invalid");
+    const json normalizedParams = normalizeAnalyzeEventsAtIntervalParams(params);
+    const json schedule = normalizedParams.value("schedule", json::object());
+    const json source = normalizedParams.value("source", json::object());
+    const json analysis = normalizedParams.value("analysis", json::object());
+    const json decision = normalizedParams.value("decision", json::object());
+    const json output = normalizedParams.value("output", json::object());
+
+    if (!schedule.is_object()) return fail("operator_schedule_invalid");
+    if (!source.is_object()) return fail("operator_source_invalid");
+    if (!analysis.is_object()) return fail("operator_analysis_invalid");
+    if (!decision.is_object()) return fail("operator_decision_invalid");
+    if (!output.is_object()) return fail("operator_output_invalid");
+
+    const std::string scheduleMode =
+        normalizeAnalyzeIntervalScheduleModeToken(strField(schedule, "mode"));
+    const std::string anchorMode =
+        normalizeAnalyzeIntervalAnchorModeToken(strField(schedule, "anchor_mode"));
+    const std::string catchUpMode =
+        normalizeAnalyzeIntervalCatchUpModeToken(strField(schedule, "catch_up_mode", "latest_due_only"));
+    const int intervalSeconds = intField(schedule, "interval_seconds", 0);
+    if (!isAllowedAnalyzeIntervalScheduleMode(scheduleMode)) return fail("operator_schedule_mode_invalid");
+    if (!isAllowedAnalyzeIntervalAnchorMode(anchorMode)) return fail("operator_anchor_mode_invalid");
+    if (!isAllowedAnalyzeIntervalCatchUpMode(catchUpMode)) return fail("operator_catch_up_mode_invalid");
+    if (scheduleMode == "recurring" && intervalSeconds <= 0) return fail("operator_interval_seconds_invalid");
+    if (anchorMode != "fixed_time_local" && intervalSeconds <= 0) return fail("operator_interval_seconds_invalid");
+    if (anchorMode == "fixed_time_local") {
+        int parsedClockSeconds = 0;
+        if (!parseClockTimeSeconds(strField(schedule, "time_local"), parsedClockSeconds)) {
+            return fail("operator_time_local_invalid");
+        }
+        const std::string timezone = trim(strField(schedule, "timezone"));
+        if (timezone.empty()) return fail("operator_timezone_missing");
+        int parsedOffsetSeconds = 0;
+        if (!parseUtcOffsetSeconds(timezone, parsedOffsetSeconds)) {
+            return fail("operator_timezone_unsupported");
+        }
+    }
+
+    const std::string sourceEvent = trim(strField(source, "event"));
+    const std::string sourceEntity = trim(strField(source, "entity"));
+    if (sourceEvent.empty()) return fail("operator_source_event_missing");
+    if (events.find(sourceEvent) == events.end()) return fail("operator_source_event_missing");
+    if (!sourceEntity.empty() && entityKeys.find(sourceEntity) == entityKeys.end()) {
+        return fail("operator_source_entity_missing");
+    }
+
+    const std::string analysisKind =
+        normalizeAnalyzeIntervalKindToken(strField(analysis, "kind"));
+    const std::string windowMode =
+        normalizeAnalyzeIntervalWindowModeToken(strField(analysis, "window_mode"));
+    if (!isAllowedAnalyzeIntervalKind(analysisKind)) return fail("operator_analysis_kind_invalid");
+    if (!isAllowedAnalyzeIntervalWindowMode(windowMode)) return fail("operator_window_mode_invalid");
+    if (analysis.contains("window_seconds") && intField(analysis, "window_seconds", -1) < 0) {
+        return fail("operator_window_seconds_invalid");
+    }
+
+    const std::string decisionMode =
+        normalizeAnalyzeIntervalDecisionModeToken(strField(decision, "mode"));
+    if (!isAllowedAnalyzeIntervalDecisionMode(decisionMode)) return fail("operator_decision_mode_invalid");
+    if (decisionMode != "report_only") {
+        const std::string decisionOp =
+            normalizeAnalyzeIntervalDecisionOpToken(strField(decision, "op"));
+        if (!isAllowedAnalyzeIntervalDecisionOp(decisionOp)) return fail("operator_decision_op_invalid");
+        if (decisionOp == "between" || decisionOp == "outside") {
+            if (!decision.contains("min") || !decision.contains("max")) return fail("operator_decision_range_missing");
+            if (dblField(decision, "max", 0.0) < dblField(decision, "min", 0.0)) {
+                return fail("operator_decision_range_invalid");
+            }
+        } else if (decisionOp != "is_true" && decisionOp != "is_false") {
+            if (!decision.contains("value")) return fail("operator_decision_value_missing");
+        }
+    }
+
+    return true;
+}
+
 inline bool validatePlanEnvelope(const json& envelope, std::string* outReason = nullptr) {
     auto fail = [&](const std::string& reason) -> bool {
         if (outReason) *outReason = reason;
@@ -2236,6 +2672,15 @@ inline bool validatePlanEnvelope(const json& envelope, std::string* outReason = 
         if (opType.empty() || !isAllowedOperatorType(opType)) return fail("operator_type_invalid");
         const json params = op.value("params", json::object());
         if (!params.is_object()) return fail("operator_params_invalid");
+        const std::string normalizedOpType = lower(opType);
+
+        if (normalizedOpType == "analyze_events_at_interval") {
+            std::string analyzeReason;
+            if (!validateAnalyzeEventsAtIntervalParams(params, entityKeys, events, &analyzeReason)) {
+                return fail(analyzeReason);
+            }
+            continue;
+        }
 
         const std::string entity = trim(strField(params, "entity"));
         if (!entity.empty() && entityKeys.find(entity) == entityKeys.end()) {
@@ -2252,7 +2697,6 @@ inline bool validatePlanEnvelope(const json& envelope, std::string* outReason = 
             return fail("operator_without_event_missing");
         }
 
-        const std::string normalizedOpType = lower(opType);
         if (normalizedOpType == "stopped_for_more_than_without_event") {
             if (event.empty()) return fail("operator_event_missing");
             if (withoutEvent.empty()) return fail("operator_without_event_missing");
@@ -2422,7 +2866,13 @@ inline bool validateCompilerDecisionConsistency(const json& envelope, std::strin
 }
 
 inline std::string compileModelForFamily(const std::string& modelFamily) {
-    return lower(trim(modelFamily)) == "core" ? "GLM-4.6V-Flash" : "gpt-5.1";
+    const std::string normalized = lower(trim(modelFamily));
+    if (normalized == "core") return "GLM-4.6V-Flash";
+    if (normalized == "ultra_plus" || normalized == "ultra+" || normalized == "ultra-plus") {
+        return "gpt-5.4";
+    }
+    if (normalized == "light") return "gpt-5.4-mini";
+    return "gpt-5.1";
 }
 
 inline json compileInput(
@@ -2480,6 +2930,55 @@ inline json compileInput(
                     "quantas vezes em", "contar em janela", "cuantas veces en"
                 })}
             }},
+            { "analyze_events_at_interval", {
+                { "semantic_intent", "Evaluate confirmed event history only when a temporal checkpoint is reached, optionally reporting or alerting based on the analysis result." },
+                { "positive_cues", json::array({
+                    "after 30 minutes", "after x minutes", "at the end of the window", "only after the interval",
+                    "every 10 minutes", "report every", "partial count every", "accumulated over 30 minutes",
+                    "apos 30 minutos", "ao final de 30 minutos", "somente ao final", "a cada 10 minutos",
+                    "faca contagens parciais", "total acumulado", "janela acumulada", "depois de x minutos",
+                    "despues de 30 minutos", "cada 10 minutos", "solo al final", "conteo parcial"
+                })},
+                { "negative_cues", json::array({
+                    "alert immediately when threshold reached", "trigger as soon as count reaches", "instant alert on each event"
+                })},
+                { "canonical_schedule_modes", json::array({
+                    "once", "recurring"
+                })},
+                { "canonical_anchor_modes", json::array({
+                    "monitoring_start", "first_matching_event", "fixed_time_local"
+                })},
+                { "canonical_catch_up_modes", json::array({
+                    "latest_due_only", "emit_all_due"
+                })},
+                { "canonical_analysis_kinds", json::array({
+                    "count_occurrences", "count_distinct_entities", "has_any_event",
+                    "last_event_age_seconds", "first_event_ts", "last_event_ts",
+                    "event_rate", "window_buffer"
+                })},
+                { "canonical_window_modes", json::array({
+                    "cumulative_from_anchor", "bucket"
+                })},
+                { "canonical_decision_modes", json::array({
+                    "report_only", "alert_if_true", "report_and_alert_if_true"
+                })},
+                { "canonical_decision_ops", json::array({
+                    "<", "<=", ">", ">=", "==", "!=", "between", "outside", "is_true", "is_false"
+                })},
+                { "canonical_output_fields", json::array({
+                    "summary_label", "include_expected_value", "include_delta"
+                })},
+                { "semantic_mapping", json::array({
+                    "single checkpoint after elapsed time -> schedule.mode=once",
+                    "repeated checkpoints at a cadence -> schedule.mode=recurring",
+                    "accumulate from the anchor until the checkpoint -> analysis.window_mode=cumulative_from_anchor",
+                    "evaluate only the last X minutes ending at the checkpoint -> analysis.window_mode=bucket"
+                })},
+                { "forbidden_aliases", json::array({
+                    "relative", "rolling", "trailing", "threshold", "skip", "skip_missed",
+                    "include_current_value", "include_difference", "include_threshold"
+                })}
+            }},
             { "entity_present", {
                 { "semantic_intent", "Persistent presence semantics that truly require temporal state, not a simple one-shot detection." },
                 { "negative_cues", json::array({
@@ -2520,6 +3019,7 @@ inline json compileInput(
             "stopped_for_more_than_without_event","seen_n_times_in_window_by_entity",
             "schedule_at_time","summary_window","entity_present","entity_absent",
             "count_events_in_window","no_event_for_duration",
+            "analyze_events_at_interval",
             "cross_camera_track_after_trigger",
             "custom_expression"
         })},
@@ -2568,6 +3068,34 @@ You are TemporalPlanCompiler v1.
   required_params: event, window_seconds, threshold, entity(optional), zone(optional)
 - no_event_for_duration
   required_params: event, duration_seconds, entity(optional), zone(optional)
+- analyze_events_at_interval
+  required_params:
+    schedule(mode, anchor_mode, catch_up_mode(optional), interval_seconds(required whenever the checkpoint is defined by elapsed time from monitoring_start or first_matching_event, and also for recurring schedules), time_local+timezone(currently UTC or explicit offset such as -03:00) when anchor_mode=fixed_time_local),
+    source(event, entity(optional), zone(optional)),
+    analysis(kind, window_mode, window_seconds(optional)),
+    decision(mode, op/value or min/max when mode!=report_only),
+    output(optional)
+  canonical_enums:
+    schedule.mode = once|recurring
+    schedule.anchor_mode = monitoring_start|first_matching_event|fixed_time_local
+    schedule.catch_up_mode = latest_due_only|emit_all_due
+    analysis.kind = count_occurrences|count_distinct_entities|has_any_event|last_event_age_seconds|first_event_ts|last_event_ts|event_rate|window_buffer
+    analysis.window_mode = cumulative_from_anchor|bucket
+    decision.mode = report_only|alert_if_true|report_and_alert_if_true
+    decision.op = <|<=|>|>=|==|!=|between|outside|is_true|is_false
+    output fields = summary_label|include_expected_value|include_delta
+  semantic_mapping:
+    single checkpoint after elapsed time -> schedule.mode=once
+    repeated checkpoints at a cadence -> schedule.mode=recurring
+    accumulate from the anchor until the checkpoint -> analysis.window_mode=cumulative_from_anchor
+    evaluate only the last X minutes ending at the checkpoint -> analysis.window_mode=bucket
+  exact_examples:
+    once after 30 minutes -> schedule={mode:"once", anchor_mode:"monitoring_start", interval_seconds:1800}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
+    every 10 minutes on the last 10 minutes -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"bucket", window_seconds:600}
+    every 10 minutes with accumulated partials over a 30-minute horizon -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
+  forbidden_aliases:
+    relative, rolling, trailing, threshold, skip, skip_missed, include_current_value, include_difference, include_threshold
+  example: after 30 minutes count_distinct_entities of qualified_exit_porta_a and alert if result < 201
 - cross_camera_track_after_trigger
   required_params: scope(job_step), trigger_mode(alert_condition_true|event_observed), watch_ttl_seconds, alert_on_match
   optional_params: trigger_event, share_entity_types
@@ -2577,6 +3105,12 @@ You are TemporalPlanCompiler v1.
 - Never reduce threat/weapon prompts to generic presence, entry, exit or stopped operators on plain person entities.
 - cross_camera_track_after_trigger is opt-in only. If the prompt is only about local detection/alert in the current camera, DO NOT include it.
 - Prefer compile_status="not_temporal" over weakly approximating a local single-batch detection with entity_present or other generic operators.
+- Prefer analyze_events_at_interval when the request says to wait until a checkpoint such as "after X minutes", "at the end of 30 minutes", or "every X minutes" before reporting or alerting on accumulated event analysis.
+- For analyze_events_at_interval, infer checkpoint behavior semantically from the whole multilingual request, not by copying literal words. Use canonical enum values only.
+- If the request means a single elapsed checkpoint, emit schedule.mode="once". If it means repeated checkpoints, emit schedule.mode="recurring".
+- If the request means accumulation from the anchor until the checkpoint, emit analysis.window_mode="cumulative_from_anchor". If it means only the last X minutes ending at the checkpoint, emit analysis.window_mode="bucket".
+- Do not invent alias enums or ornamental output fields for analyze_events_at_interval. The runtime only accepts the canonical enums and the output fields summary_label, include_expected_value, include_delta.
+- For analyze_events_at_interval with anchor_mode=fixed_time_local, timezone currently supports UTC or explicit UTC offsets like -03:00. Do not emit IANA zone ids such as America/Sao_Paulo for this operator yet.
 
 3) Event catalog rules
 - Events must be atomic and observable from vision input.
@@ -2587,6 +3121,7 @@ You are TemporalPlanCompiler v1.
 - Do not create vague events (example: strange_behavior) unless explicitly requested.
 - Use entered_zone and left_zone only as events/runtime-variable inputs, never as operator.type.
 - For entry/exit alerts, prefer seen_n_times_in_window_by_entity over event entered_zone/left_zone.
+- analyze_events_at_interval is event-centric: it analyzes confirmed events already stored by the temporal engine, not arbitrary scene state snapshots.
 
 4) Runtime variables rules
 - Create only variables needed by operators/output_policy.
@@ -2692,6 +3227,13 @@ OUTPUT_JSON_EXATO:
 }
 
 When compile_status="not_temporal", keep intent_assessment.requires_temporal_engine=false, selected_operator_types=[], and set plan_json to null.
+When type="analyze_events_at_interval", use only the canonical enum values from SYSTEM GUIDELINES. Do not invent aliases such as relative, rolling, trailing, threshold, skip or skip_missed.
+For analyze_events_at_interval, decide from semantic intent:
+- single checkpoint after elapsed time -> schedule.mode="once"
+- repeated checkpoints -> schedule.mode="recurring"
+- accumulated from the anchor until the checkpoint -> analysis.window_mode="cumulative_from_anchor"
+- last X minutes ending at the checkpoint -> analysis.window_mode="bucket"
+For analyze_events_at_interval output, use only summary_label, include_expected_value and include_delta.
 )";
 }
 
@@ -2831,6 +3373,9 @@ inline json defaultState() {
             { "last_report_ts_utc", "" },
             { "last_round_evidence_keys", json::array() },
             { "last_round_candidate_decisions", json::array() },
+            { "first_round_start_ts_utc", "" },
+            { "last_round_start_ts_utc", "" },
+            { "last_round_end_ts_utc", "" },
             { "operator_state", json::object() }
         } }
     };
@@ -2852,6 +3397,15 @@ inline void ensureState(json& st) {
         !st["meta"]["last_round_candidate_decisions"].is_array())
     {
         st["meta"]["last_round_candidate_decisions"] = json::array();
+    }
+    if (!st["meta"].contains("first_round_start_ts_utc") || !st["meta"]["first_round_start_ts_utc"].is_string()) {
+        st["meta"]["first_round_start_ts_utc"] = "";
+    }
+    if (!st["meta"].contains("last_round_start_ts_utc") || !st["meta"]["last_round_start_ts_utc"].is_string()) {
+        st["meta"]["last_round_start_ts_utc"] = "";
+    }
+    if (!st["meta"].contains("last_round_end_ts_utc") || !st["meta"]["last_round_end_ts_utc"].is_string()) {
+        st["meta"]["last_round_end_ts_utc"] = "";
     }
     if (!st["meta"].contains("operator_state") || !st["meta"]["operator_state"].is_object()) st["meta"]["operator_state"] = json::object();
 }
@@ -4016,6 +4570,102 @@ inline long long countDistinctEventEntities(
     return static_cast<long long>(seen.size());
 }
 
+inline long long countLoggedEventsBetween(
+    const json& st,
+    const std::string& rawEventName,
+    const std::string& startIsoUtc,
+    const std::string& endIsoUtc,
+    const std::string& entityFilter = std::string(),
+    const std::string& zoneFilter = std::string())
+{
+    if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
+    const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
+    long long count = 0;
+    for (const auto& item : st["events"]) {
+        if (!item.is_object()) continue;
+        if (eventRepresentsSyntheticAbsence(st, item)) continue;
+        if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
+        if (!eventMatchesFilter(st, item, entityFilter)) continue;
+        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc)) continue;
+        ++count;
+    }
+    return count;
+}
+
+inline long long countDistinctLoggedEventEntitiesBetween(
+    const json& st,
+    const std::string& rawEventName,
+    const std::string& startIsoUtc,
+    const std::string& endIsoUtc,
+    const std::string& entityFilter = std::string(),
+    const std::string& zoneFilter = std::string())
+{
+    if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
+    const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
+    std::unordered_set<std::string> seen;
+    for (const auto& item : st["events"]) {
+        if (!item.is_object()) continue;
+        if (eventRepresentsSyntheticAbsence(st, item)) continue;
+        if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
+        if (!eventMatchesFilter(st, item, entityFilter)) continue;
+        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc)) continue;
+        const std::string entityToken = eventEntityToken(item);
+        if (entityToken.empty()) continue;
+        seen.insert(lower(entityToken));
+    }
+    return static_cast<long long>(seen.size());
+}
+
+inline std::string earliestLoggedEventTsBetween(
+    const json& st,
+    const std::string& rawEventName,
+    const std::string& startIsoUtc,
+    const std::string& endIsoUtc,
+    const std::string& entityFilter = std::string(),
+    const std::string& zoneFilter = std::string())
+{
+    if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return std::string();
+    const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
+    std::string earliest;
+    for (const auto& item : st["events"]) {
+        if (!item.is_object()) continue;
+        if (eventRepresentsSyntheticAbsence(st, item)) continue;
+        if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
+        if (!eventMatchesFilter(st, item, entityFilter)) continue;
+        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        std::string normalizedTs;
+        if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
+        if (earliest.empty() || normalizedTs < earliest) earliest = normalizedTs;
+    }
+    return earliest;
+}
+
+inline std::string latestLoggedEventTsBetween(
+    const json& st,
+    const std::string& rawEventName,
+    const std::string& startIsoUtc,
+    const std::string& endIsoUtc,
+    const std::string& entityFilter = std::string(),
+    const std::string& zoneFilter = std::string())
+{
+    if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return std::string();
+    const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
+    std::string latest;
+    for (const auto& item : st["events"]) {
+        if (!item.is_object()) continue;
+        if (eventRepresentsSyntheticAbsence(st, item)) continue;
+        if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
+        if (!eventMatchesFilter(st, item, entityFilter)) continue;
+        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        std::string normalizedTs;
+        if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
+        if (latest.empty() || normalizedTs > latest) latest = normalizedTs;
+    }
+    return latest;
+}
+
 inline std::string latestPresentTimestampInState(
     const json& st,
     const std::string& entityFilter = std::string(),
@@ -4626,6 +5276,13 @@ inline void applyRound(json& st,
     if (nowTs.empty()) nowTs = decisionAnchorUtc(nowIso());
     const std::string segmentStartTs = normalizeFlexibleTs(segmentStartTsRaw);
     const std::string segmentEndTs = normalizeFlexibleTs(segmentEndTsRaw);
+    const std::string roundStartTs = segmentStartTs.empty() ? nowTs : segmentStartTs;
+    const std::string roundEndTs = segmentEndTs.empty() ? nowTs : segmentEndTs;
+    if (trim(strField(st["meta"], "first_round_start_ts_utc")).empty()) {
+        st["meta"]["first_round_start_ts_utc"] = roundStartTs;
+    }
+    st["meta"]["last_round_start_ts_utc"] = roundStartTs;
+    st["meta"]["last_round_end_ts_utc"] = roundEndTs;
     const std::string defaultRoundEventTs = !segmentEndTs.empty() ? segmentEndTs : nowTs;
     const json plan = effectivePlan(envelope);
     const json identityPolicy = plan.value("identity_policy", json::object());
@@ -6553,7 +7210,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
         const std::string opId = strField(op, "operator_id");
         const std::string typ = lower(trim(strField(op, "type")));
         const json p = op.value("params", json::object());
-        const bool canDriveLocalAlert =
+        bool canDriveLocalAlert =
             typ != "schedule_at_time" &&
             typ != "summary_window" &&
             typ != "cross_camera_track_after_trigger";
@@ -6923,6 +7580,503 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         );
                         if (!contributingEvents.empty()) {
                             result["contributing_events"] = std::move(contributingEvents);
+                        }
+                    }
+                }
+            }
+        } else if (typ == "analyze_events_at_interval") {
+            const json normalizedParams = normalizeAnalyzeEventsAtIntervalParams(p);
+            const json schedule = normalizedParams.value("schedule", json::object());
+            const json source = normalizedParams.value("source", json::object());
+            const json analysis = normalizedParams.value("analysis", json::object());
+            const json decision = normalizedParams.value("decision", json::object());
+            const json output = normalizedParams.value("output", json::object());
+
+            const std::string scheduleMode =
+                normalizeAnalyzeIntervalScheduleModeToken(strField(schedule, "mode", "once"));
+            const std::string anchorMode =
+                normalizeAnalyzeIntervalAnchorModeToken(
+                    strField(schedule, "anchor_mode", "monitoring_start"));
+            const std::string catchUpMode =
+                normalizeAnalyzeIntervalCatchUpModeToken(
+                    strField(schedule, "catch_up_mode", "latest_due_only"));
+            const int intervalSeconds = intField(schedule, "interval_seconds", 0);
+            const std::string timeLocal = trim(strField(schedule, "time_local"));
+            const std::string timezone = trim(strField(schedule, "timezone"));
+            const std::string eventName = strField(source, "event");
+            const std::string ent = strField(source, "entity");
+            const std::string zone = extractZoneField(source);
+            const std::string analysisKind =
+                normalizeAnalyzeIntervalKindToken(strField(analysis, "kind", "count_occurrences"));
+            const std::string windowMode =
+                normalizeAnalyzeIntervalWindowModeToken(
+                    strField(analysis, "window_mode", "bucket"));
+            const int windowSeconds = std::max(0, intField(analysis, "window_seconds", 0));
+            const std::string decisionMode =
+                normalizeAnalyzeIntervalDecisionModeToken(
+                    strField(decision, "mode", "alert_if_true"));
+            const std::string decisionOp =
+                normalizeAnalyzeIntervalDecisionOpToken(strField(decision, "op"));
+            const std::string summaryLabel = trim(strField(output, "summary_label", eventName));
+
+            bool includeExpectedValue = false;
+            bool includeDelta = false;
+            boolFieldAny(output, { "include_expected_value" }, includeExpectedValue);
+            boolFieldAny(output, { "include_delta" }, includeDelta);
+
+            canDriveLocalAlert = canDriveLocalAlert && decisionMode != "report_only";
+            result["event"] = eventName;
+            result["entity_filter"] = ent;
+            result["analysis_kind"] = analysisKind;
+            result["window_mode"] = windowMode;
+            result["schedule_mode"] = scheduleMode;
+            result["anchor_mode"] = anchorMode;
+            result["decision_mode"] = decisionMode;
+            if (!decisionOp.empty()) result["decision_op"] = decisionOp;
+            if (!trim(zone).empty()) result["zone"] = zone;
+            if (intervalSeconds > 0) result["interval_seconds"] = intervalSeconds;
+            if (windowSeconds > 0) result["window_seconds"] = windowSeconds;
+            if (!catchUpMode.empty()) result["catch_up_mode"] = catchUpMode;
+            if (!timeLocal.empty()) result["time_local"] = timeLocal;
+            if (!timezone.empty()) result["timezone"] = timezone;
+            if (!summaryLabel.empty()) result["summary_label"] = summaryLabel;
+
+            if (!isAllowedAnalyzeIntervalScheduleMode(scheduleMode) ||
+                !isAllowedAnalyzeIntervalAnchorMode(anchorMode) ||
+                !isAllowedAnalyzeIntervalCatchUpMode(catchUpMode) ||
+                !isAllowedAnalyzeIntervalKind(analysisKind) ||
+                !isAllowedAnalyzeIntervalWindowMode(windowMode) ||
+                !isAllowedAnalyzeIntervalDecisionMode(decisionMode))
+            {
+                unk = true;
+            }
+            else if (trim(eventName).empty()) {
+                unk = true;
+            }
+            else {
+                const bool needsDecisionEvaluation = decisionMode != "report_only";
+                if (needsDecisionEvaluation && !isAllowedAnalyzeIntervalDecisionOp(decisionOp)) {
+                    unk = true;
+                }
+            }
+
+            if (!unk) {
+                const std::string opStateKey = opId.empty() ? typ : opId;
+                json& opState = operatorState[opStateKey];
+                if (!opState.is_object()) opState = json::object();
+                if (!opState.contains("finalized") || !opState["finalized"].is_boolean()) {
+                    opState["finalized"] = false;
+                }
+
+                const std::string normalizedNowTs = normalizeFlexibleTs(nowIsoUtc);
+                const std::string monitoringStartTs = trim(strField(
+                    st["meta"],
+                    "first_round_start_ts_utc",
+                    strField(st["meta"], "last_round_start_ts_utc", normalizedNowTs)));
+
+                auto describeScalarValue = [&](const json& node) -> std::string {
+                    if (node.is_boolean()) return node.get<bool>() ? "true" : "false";
+                    if (node.is_number_integer()) return std::to_string(node.get<long long>());
+                    if (node.is_number_unsigned()) return std::to_string(node.get<unsigned long long>());
+                    if (node.is_number_float()) {
+                        std::ostringstream oss;
+                        oss << std::fixed << std::setprecision(3) << node.get<double>();
+                        std::string out = oss.str();
+                        while (out.size() > 2 && out.back() == '0' && out[out.size() - 2] != '.') out.pop_back();
+                        if (!out.empty() && out.back() == '.') out.pop_back();
+                        return out;
+                    }
+                    if (node.is_string()) return node.get<std::string>();
+                    if (node.is_array()) return std::to_string(node.size()) + " items";
+                    if (node.is_object()) return node.dump();
+                    return "null";
+                };
+
+                auto nodeTruthy = [&](const json& node) -> bool {
+                    if (node.is_null()) return false;
+                    bool parsed = false;
+                    if (tryParseBoolValue(node, parsed)) return parsed;
+                    if (node.is_string()) return !trim(node.get<std::string>()).empty();
+                    if (node.is_array()) return !node.empty();
+                    if (node.is_object()) return !node.empty();
+                    return false;
+                };
+
+                auto extractNumericNode = [&](const json& node, double& outValue) -> bool {
+                    if (node.is_number()) {
+                        outValue = node.get<double>();
+                        return true;
+                    }
+                    bool parsedBool = false;
+                    if (tryParseBoolValue(node, parsedBool)) {
+                        outValue = parsedBool ? 1.0 : 0.0;
+                        return true;
+                    }
+                    if (node.is_string()) {
+                        try {
+                            outValue = std::stod(node.get<std::string>());
+                            return true;
+                        } catch (...) {
+                        }
+                    }
+                    return false;
+                };
+
+                auto collectMatchingEventsBetweenDocs = [&](const std::string& startTs,
+                                                            const std::string& endTs,
+                                                            int maxItems = 20) -> json {
+                    json docs = json::array();
+                    std::unordered_set<std::string> seenContributionKeys;
+                    if (!st.contains("events") || !st["events"].is_array()) return docs;
+                    const std::string normalizedEvent = lower(trim(normalizeEventName(eventName)));
+                    for (auto it = st["events"].rbegin(); it != st["events"].rend(); ++it) {
+                        if (!it->is_object()) continue;
+                        if (eventRepresentsSyntheticAbsence(st, *it)) continue;
+                        if (!normalizedEvent.empty() &&
+                            lower(trim(strField(*it, "event"))) != normalizedEvent)
+                        {
+                            continue;
+                        }
+                        if (!trim(ent).empty() && !eventMatchesFilter(st, *it, ent)) continue;
+                        if (!zoneMatchesFilter(extractZoneField(*it), zone)) continue;
+                        std::string normalizedTs;
+                        if (!normalizeTsBetweenInclusive(strField(*it, "ts_utc"), startTs, endTs, &normalizedTs)) {
+                            continue;
+                        }
+                        json doc = makeContributionDoc(*it, trim(ent), eventName);
+                        if (!doc.is_object() || doc.empty()) continue;
+                        doc["ts_utc"] = normalizedTs;
+                        appendContributionDoc(docs, seenContributionKeys, doc);
+                        if (maxItems > 0 && static_cast<int>(docs.size()) >= maxItems) break;
+                    }
+                    std::reverse(docs.begin(), docs.end());
+                    return docs;
+                };
+
+                auto computeAnalysisValue = [&](const std::string& startTs,
+                                                const std::string& endTs,
+                                                json& outContributingEvents) -> json {
+                    outContributingEvents = collectMatchingEventsBetweenDocs(
+                        startTs,
+                        endTs,
+                        analysisKind == "window_buffer" ? 50 : 20);
+                    if (analysisKind == "count_occurrences") {
+                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone));
+                    }
+                    if (analysisKind == "count_distinct_entities") {
+                        return json(countDistinctLoggedEventEntitiesBetween(st, eventName, startTs, endTs, ent, zone));
+                    }
+                    if (analysisKind == "has_any_event") {
+                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone) > 0);
+                    }
+                    if (analysisKind == "last_event_age_seconds") {
+                        const std::string latestTs =
+                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                        return latestTs.empty() ? json(nullptr) : json(std::max(0LL, ageSeconds(latestTs, endTs)));
+                    }
+                    if (analysisKind == "first_event_ts") {
+                        const std::string firstTs =
+                            earliestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                        return firstTs.empty() ? json(nullptr) : json(firstTs);
+                    }
+                    if (analysisKind == "last_event_ts") {
+                        const std::string lastTs =
+                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                        return lastTs.empty() ? json(nullptr) : json(lastTs);
+                    }
+                    if (analysisKind == "event_rate") {
+                        const long long count =
+                            countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone);
+                        const long long seconds = (std::max)(1LL, ageSeconds(startTs, endTs));
+                        return json(static_cast<double>(count) / static_cast<double>(seconds));
+                    }
+                    if (analysisKind == "window_buffer") {
+                        return outContributingEvents;
+                    }
+                    return json(nullptr);
+                };
+
+                auto evaluateDecisionOnValue = [&](const json& analysisValue,
+                                                   json& checkpoint,
+                                                   bool& conditionTrue,
+                                                   bool& conditionKnown) {
+                    conditionTrue = false;
+                    conditionKnown = decisionMode == "report_only";
+                    if (decisionMode == "report_only") return;
+
+                    checkpoint["decision_op"] = decisionOp;
+                    if (decisionOp == "is_true") {
+                        conditionKnown = true;
+                        conditionTrue = nodeTruthy(analysisValue);
+                        return;
+                    }
+                    if (decisionOp == "is_false") {
+                        conditionKnown = true;
+                        conditionTrue = !nodeTruthy(analysisValue);
+                        return;
+                    }
+
+                    double actual = 0.0;
+                    if (!extractNumericNode(analysisValue, actual)) {
+                        conditionKnown = false;
+                        return;
+                    }
+
+                    checkpoint["actual_value_numeric"] = actual;
+                    if (decisionOp == "between" || decisionOp == "outside") {
+                        const double minValue = dblField(decision, "min", 0.0);
+                        const double maxValue = dblField(decision, "max", 0.0);
+                        checkpoint["expected_min"] = minValue;
+                        checkpoint["expected_max"] = maxValue;
+                        conditionKnown = true;
+                        const bool inside = actual >= minValue && actual <= maxValue;
+                        conditionTrue = decisionOp == "between" ? inside : !inside;
+                        return;
+                    }
+
+                    const double expectedValue = dblField(decision, "value", 0.0);
+                    checkpoint["expected_value"] = expectedValue;
+                    const double delta = actual - expectedValue;
+                    checkpoint["delta"] = delta;
+                    if (actual < expectedValue) checkpoint["deficit"] = expectedValue - actual;
+                    if (actual > expectedValue) checkpoint["surplus"] = actual - expectedValue;
+                    conditionKnown = true;
+                    if (decisionOp == "<") conditionTrue = actual < expectedValue;
+                    else if (decisionOp == "<=") conditionTrue = actual <= expectedValue;
+                    else if (decisionOp == ">") conditionTrue = actual > expectedValue;
+                    else if (decisionOp == ">=") conditionTrue = actual >= expectedValue;
+                    else if (decisionOp == "==") conditionTrue = actual == expectedValue;
+                    else if (decisionOp == "!=") conditionTrue = actual != expectedValue;
+                    else conditionKnown = false;
+                };
+
+                std::string analysisAnchorTs = trim(strField(opState, "analysis_anchor_ts_utc"));
+                std::string firstDueTs = trim(strField(opState, "first_due_ts_utc"));
+                std::string horizonEndTs = trim(strField(opState, "horizon_end_ts_utc"));
+
+                if (analysisAnchorTs.empty() || firstDueTs.empty()) {
+                    if (anchorMode == "monitoring_start") {
+                        analysisAnchorTs = monitoringStartTs;
+                        if (intervalSeconds > 0) firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
+                    } else if (anchorMode == "first_matching_event") {
+                        analysisAnchorTs =
+                            earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), ent, zone);
+                        if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
+                            firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
+                        }
+                    } else if (anchorMode == "fixed_time_local") {
+                        analysisAnchorTs = monitoringStartTs;
+                        if (!computeNextFixedLocalCheckpointUtc(monitoringStartTs, timeLocal, timezone, firstDueTs)) {
+                            unk = true;
+                            result["reason"] = "operator_fixed_time_local_unsupported";
+                        }
+                    }
+
+                    if (!analysisAnchorTs.empty()) opState["analysis_anchor_ts_utc"] = analysisAnchorTs;
+                    if (!firstDueTs.empty()) opState["first_due_ts_utc"] = firstDueTs;
+                }
+
+                if (!unk && windowMode == "cumulative_from_anchor" &&
+                    windowSeconds > 0 && !analysisAnchorTs.empty())
+                {
+                    horizonEndTs = addSecondsIso(analysisAnchorTs, windowSeconds);
+                    if (!horizonEndTs.empty()) opState["horizon_end_ts_utc"] = horizonEndTs;
+                }
+
+                result["analysis_anchor_ts_utc"] = analysisAnchorTs;
+                result["first_due_ts_utc"] = firstDueTs;
+                if (!horizonEndTs.empty()) result["horizon_end_ts_utc"] = horizonEndTs;
+
+                const bool alreadyFinalized =
+                    opState.contains("finalized") &&
+                    opState["finalized"].is_boolean() &&
+                    opState["finalized"].get<bool>();
+                result["finalized"] = alreadyFinalized;
+
+                if (!unk) {
+                    if (analysisAnchorTs.empty() || firstDueTs.empty()) {
+                        result["anchor_pending"] = true;
+                        result["checkpoint_due"] = false;
+                    }
+                    else if (alreadyFinalized) {
+                        result["checkpoint_due"] = false;
+                    }
+                    else {
+                        const std::string lastEmittedDueTs = trim(strField(opState, "last_emitted_due_ts_utc"));
+                        std::vector<std::string> dueTimes;
+                        if (scheduleMode == "once") {
+                            if (firstDueTs <= normalizedNowTs &&
+                                (lastEmittedDueTs.empty() || firstDueTs > lastEmittedDueTs))
+                            {
+                                dueTimes.push_back(firstDueTs);
+                            }
+                        } else {
+                            std::string dueTs = firstDueTs;
+                            int guard = 0;
+                            while (!dueTs.empty() && dueTs <= normalizedNowTs && guard < 4096) {
+                                if ((horizonEndTs.empty() || dueTs <= horizonEndTs) &&
+                                    (lastEmittedDueTs.empty() || dueTs > lastEmittedDueTs))
+                                {
+                                    dueTimes.push_back(dueTs);
+                                }
+                                if (intervalSeconds <= 0) break;
+                                const std::string nextDueTs = addSecondsIso(dueTs, intervalSeconds);
+                                if (nextDueTs.empty() || nextDueTs <= dueTs) break;
+                                dueTs = nextDueTs;
+                                ++guard;
+                            }
+                            if (!horizonEndTs.empty() &&
+                                horizonEndTs <= normalizedNowTs &&
+                                (lastEmittedDueTs.empty() || horizonEndTs > lastEmittedDueTs))
+                            {
+                                if (dueTimes.empty() || dueTimes.back() < horizonEndTs) {
+                                    dueTimes.push_back(horizonEndTs);
+                                }
+                            }
+                        }
+
+                        if (catchUpMode == "latest_due_only" && dueTimes.size() > 1) {
+                            dueTimes = { dueTimes.back() };
+                        }
+
+                        result["checkpoint_due"] = !dueTimes.empty();
+                        result["due_count"] = static_cast<int>(dueTimes.size());
+                        if (!dueTimes.empty()) {
+                            json checkpoints = json::array();
+                            bool shouldReport = false;
+                            bool anyConditionTrue = false;
+                            std::string latestDueTs;
+                            json latestCheckpoint = json::object();
+
+                            for (const auto& dueTs : dueTimes) {
+                                std::string windowStartTs;
+                                std::string windowEndTs = dueTs;
+                                if (windowMode == "cumulative_from_anchor") {
+                                    windowStartTs = analysisAnchorTs;
+                                    if (!horizonEndTs.empty() && windowEndTs > horizonEndTs) {
+                                        windowEndTs = horizonEndTs;
+                                    }
+                                } else {
+                                    const int effectiveWindowSeconds =
+                                        windowSeconds > 0 ? windowSeconds : intervalSeconds;
+                                    windowStartTs =
+                                        effectiveWindowSeconds > 0
+                                            ? addSecondsIso(windowEndTs, -effectiveWindowSeconds)
+                                            : analysisAnchorTs;
+                                }
+
+                                if (windowStartTs.empty() ||
+                                    windowEndTs.empty() ||
+                                    windowEndTs < windowStartTs)
+                                {
+                                    unk = true;
+                                    break;
+                                }
+
+                                json checkpoint = {
+                                    { "checkpoint_end_ts_utc", dueTs },
+                                    { "window_start_ts_utc", windowStartTs },
+                                    { "window_end_ts_utc", windowEndTs },
+                                    { "analysis_kind", analysisKind }
+                                };
+                                json contributingEvents = json::array();
+                                const json analysisValue =
+                                    computeAnalysisValue(windowStartTs, windowEndTs, contributingEvents);
+                                checkpoint["analysis_value"] = analysisValue;
+                                if (contributingEvents.is_array() && !contributingEvents.empty() &&
+                                    analysisKind != "window_buffer")
+                                {
+                                    checkpoint["contributing_events"] = contributingEvents;
+                                }
+
+                                bool checkpointConditionTrue = false;
+                                bool checkpointConditionKnown = decisionMode == "report_only";
+                                evaluateDecisionOnValue(
+                                    analysisValue,
+                                    checkpoint,
+                                    checkpointConditionTrue,
+                                    checkpointConditionKnown);
+                                checkpoint["condition_evaluable"] = checkpointConditionKnown;
+                                if (checkpointConditionKnown) checkpoint["condition_true"] = checkpointConditionTrue;
+                                else if (decisionMode != "report_only") {
+                                    unk = true;
+                                    checkpoint["condition_true"] = "unknown";
+                                }
+
+                                checkpoints.push_back(checkpoint);
+                                latestDueTs = dueTs;
+                                latestCheckpoint = checkpoint;
+                                if (decisionMode == "report_only" ||
+                                    decisionMode == "report_and_alert_if_true")
+                                {
+                                    shouldReport = true;
+                                }
+                                if ((decisionMode == "alert_if_true" ||
+                                     decisionMode == "report_and_alert_if_true") &&
+                                    checkpointConditionTrue)
+                                {
+                                    anyConditionTrue = true;
+                                }
+                            }
+
+                            if (!unk) {
+                                result["checkpoints"] = checkpoints;
+                                if (latestCheckpoint.is_object() && !latestCheckpoint.empty()) {
+                                    result["latest_checkpoint"] = latestCheckpoint;
+                                    if (latestCheckpoint.contains("analysis_value")) {
+                                        result["current_value"] = latestCheckpoint["analysis_value"];
+                                    }
+                                    if (latestCheckpoint.contains("condition_true")) {
+                                        result["condition_true"] = latestCheckpoint["condition_true"];
+                                    }
+                                    if (latestCheckpoint.contains("contributing_events")) {
+                                        result["contributing_events"] =
+                                            latestCheckpoint["contributing_events"];
+                                    }
+                                }
+
+                                opState["last_emitted_due_ts_utc"] = latestDueTs;
+                                opState["last_evaluated_ts_utc"] = normalizedNowTs;
+                                if (scheduleMode == "once" ||
+                                    (!horizonEndTs.empty() && latestDueTs >= horizonEndTs))
+                                {
+                                    opState["finalized"] = true;
+                                    result["finalized"] = true;
+                                }
+
+                                if (shouldReport) r.report = true;
+                                v = anyConditionTrue;
+
+                                if (shouldReport || v) {
+                                    const std::string label =
+                                        summaryLabel.empty() ? eventName : summaryLabel;
+                                    std::ostringstream summary;
+                                    summary << label << " = " << describeScalarValue(
+                                        latestCheckpoint.value("analysis_value", json(nullptr)));
+                                    if (includeExpectedValue &&
+                                        latestCheckpoint.contains("expected_value"))
+                                    {
+                                        summary << "; expected=" << describeScalarValue(
+                                            latestCheckpoint["expected_value"]);
+                                    }
+                                    if (includeDelta) {
+                                        if (latestCheckpoint.contains("deficit")) {
+                                            summary << "; deficit=" << describeScalarValue(
+                                                latestCheckpoint["deficit"]);
+                                        } else if (latestCheckpoint.contains("delta")) {
+                                            summary << "; delta=" << describeScalarValue(
+                                                latestCheckpoint["delta"]);
+                                        }
+                                    }
+                                    if (!latestDueTs.empty()) {
+                                        summary << " at " << latestDueTs;
+                                    }
+                                    if (dueTimes.size() > 1) {
+                                        summary << " (" << dueTimes.size() << " checkpoints due)";
+                                    }
+                                    summaryParts.push_back(summary.str());
+                                }
+                            }
                         }
                     }
                 }

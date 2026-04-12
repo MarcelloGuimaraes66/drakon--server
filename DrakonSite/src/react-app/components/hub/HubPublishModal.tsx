@@ -9,6 +9,7 @@ interface HubPublishModalProps {
   defaultDescription?: string | null;
   itemLabel: string;
   submitting?: boolean;
+  submissionError?: string | null;
   onClose: () => void;
   onSubmit: (payload: {
     title: string;
@@ -26,6 +27,7 @@ export default function HubPublishModal({
   defaultDescription,
   itemLabel,
   submitting = false,
+  submissionError = null,
   onClose,
   onSubmit,
 }: HubPublishModalProps) {
@@ -33,6 +35,7 @@ export default function HubPublishModal({
   const [formSummary, setFormSummary] = useState(defaultSummary);
   const [formDescription, setFormDescription] = useState(defaultDescription || "");
   const [formTags, setFormTags] = useState("");
+  const [localError, setLocalError] = useState<string | null>(submissionError);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -40,7 +43,16 @@ export default function HubPublishModal({
     setFormSummary(defaultSummary);
     setFormDescription(defaultDescription || "");
     setFormTags("");
+    setLocalError(null);
   }, [defaultDescription, defaultSummary, defaultTitle, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setLocalError(null);
+      return;
+    }
+    setLocalError(submissionError || null);
+  }, [isOpen, submissionError]);
 
   if (!isOpen) return null;
 
@@ -64,21 +76,36 @@ export default function HubPublishModal({
         </div>
 
         <div className="space-y-4 px-6 py-6">
+          {localError ? (
+            <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+              {localError}
+            </div>
+          ) : null}
           <div>
             <label className="mb-2 block text-sm font-medium text-gray-300">Title</label>
             <input
               type="text"
               value={formTitle}
-              onChange={(event) => setFormTitle(event.target.value)}
+              onChange={(event) => {
+                setFormTitle(event.target.value);
+                if (localError) setLocalError(null);
+              }}
               className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
               placeholder="Enter a title"
             />
+            <p className="mt-2 text-xs text-gray-500">
+              Use a unique title. If another {itemLabel} already has the same name in the Hub, change
+              it before publishing.
+            </p>
           </div>
           <div>
             <label className="mb-2 block text-sm font-medium text-gray-300">Summary</label>
             <textarea
               value={formSummary}
-              onChange={(event) => setFormSummary(event.target.value)}
+              onChange={(event) => {
+                setFormSummary(event.target.value);
+                if (localError) setLocalError(null);
+              }}
               rows={3}
               className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
               placeholder="Short summary for the Hub card"
@@ -88,7 +115,10 @@ export default function HubPublishModal({
             <label className="mb-2 block text-sm font-medium text-gray-300">Description</label>
             <textarea
               value={formDescription}
-              onChange={(event) => setFormDescription(event.target.value)}
+              onChange={(event) => {
+                setFormDescription(event.target.value);
+                if (localError) setLocalError(null);
+              }}
               rows={5}
               className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
               placeholder="Explain how this item should be used"
@@ -99,7 +129,10 @@ export default function HubPublishModal({
             <input
               type="text"
               value={formTags}
-              onChange={(event) => setFormTags(event.target.value)}
+              onChange={(event) => {
+                setFormTags(event.target.value);
+                if (localError) setLocalError(null);
+              }}
               className="w-full rounded-2xl border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
               placeholder="security, warehouse, xray"
             />

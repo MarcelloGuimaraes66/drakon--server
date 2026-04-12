@@ -44249,6 +44249,16 @@ app.post("/api/agent/events", async (c) => {
     const planVersion = planVersionRaw || null;
     const planEnvelopeJson = JSON.stringify(planEnvelope || {});
     const planExplainJsonText = JSON.stringify(planExplainJson || {});
+    const persistPlanCacheRaw =
+      (compileDetails as any).persist_plan_cache ?? (compileDetails as any).persistPlanCache;
+    const persistPlanCache =
+      typeof persistPlanCacheRaw === "boolean"
+        ? persistPlanCacheRaw
+        : typeof persistPlanCacheRaw === "number"
+        ? persistPlanCacheRaw !== 0
+        : typeof persistPlanCacheRaw === "string"
+        ? !["", "0", "false", "no"].includes(persistPlanCacheRaw.trim().toLowerCase())
+        : true;
 
     if (sourceType === "chat_session") {
       return c.json({ success: true, recorded: true, persisted: false });
@@ -44270,6 +44280,14 @@ app.post("/api/agent/events", async (c) => {
         .first();
       if (!owned) {
         return c.json({ success: true, recorded: false, reason: "source_not_found_or_forbidden" });
+      }
+      if (!persistPlanCache) {
+        return c.json({
+          success: true,
+          recorded: true,
+          persisted: false,
+          reason: "temporal_plan_cache_update_skipped",
+        });
       }
 
       await c.env.DB.prepare(
@@ -44320,6 +44338,14 @@ app.post("/api/agent/events", async (c) => {
           recorded: true,
           persisted: false,
           reason: "temporal_context_disabled",
+        });
+      }
+      if (!persistPlanCache) {
+        return c.json({
+          success: true,
+          recorded: true,
+          persisted: false,
+          reason: "temporal_plan_cache_update_skipped",
         });
       }
 
@@ -48828,6 +48854,109 @@ app.get("/api/hub/items/:itemId", anyAuthMiddleware, async (c) => {
   });
 });
 
+app.delete("/api/hub/items/:itemId", async (c) => {
+  await ensureRuntimeSchema(c.env);
+
+  const itemId = Number(c.req.param("itemId"));
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return c.json({ error: "Invalid Hub item id" }, 400);
+  }
+
+  const requestedSource = normalizeText(c.req.query("source")).toLowerCase();
+  const source = requestedSource === "cache" ? "cache" : "hub";
+  const authorizationHeader =
+    c.req.header("authorization") || c.req.header("Authorization") || "";
+
+  try {
+    if (authorizationHeader.startsWith("Bearer ") && isCentralIdentityServerConfigured(c.env)) {
+      const actorResult = await resolveHubCatalogActor(c);
+      if ("error" in actorResult) {
+        return actorResult.error;
+      }
+
+      const item = await archiveHubItemForOwner(c.env.DB, itemId, [actorResult.actor.userId], actorResult.actor.userId);
+      await upsertHubItemsCache(c.env.DB, [item]);
+      return c.json({ success: true, item });
+    }
+
+    const auth = await ensureAnyAuthUser(c);
+    if ("error" in auth) {
+      return auth.error;
+    }
+    const user = auth.user;
+
+    if (
+      source === "cache" &&
+      isCentralIdentityClientConfigured(c.env) &&
+      !isCentralIdentityServerConfigured(c.env)
+    ) {
+      let centralContext: CentralUserRelayContext;
+      try {
+        centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+      } catch (error: unknown) {
+        return c.json(
+          {
+            error:
+              error instanceof Error
+                ? normalizeText(error.message) ||
+                  "Unable to resolve central identity credentials for this account."
+                : "Unable to resolve central identity credentials for this account.",
+          },
+          409
+        );
+      }
+
+      const remote = await callCentralIdentityAuthorizedEndpoint(
+        c.env,
+        `/api/hub/items/${itemId}`,
+        {
+          method: "DELETE",
+          token: centralContext.grantToken,
+        }
+      );
+      if (!remote.response.ok) {
+        const message = normalizeRemoteHttpErrorMessage(
+          remote.response,
+          remote.data,
+          "Failed to delete Hub item."
+        );
+        return c.json({ error: message }, remote.response.status as any);
+      }
+
+      const item =
+        remote.data?.item && typeof remote.data.item === "object" && !Array.isArray(remote.data.item)
+          ? (remote.data.item as Record<string, unknown>)
+          : null;
+      if (item) {
+        await upsertHubItemsCache(c.env.DB, [item]);
+      }
+      return c.json({ success: true, item });
+    }
+
+    const ownerIds = Array.from(await resolveHubOwnerIdentityIdsForUser(c.env.DB, user));
+    const item = await archiveHubItemForOwner(c.env.DB, itemId, ownerIds, normalizeText(user.id));
+    await upsertHubItemsCache(c.env.DB, [item]);
+    return c.json({ success: true, item });
+  } catch (error: unknown) {
+    const statusCode =
+      error && typeof error === "object" && "statusCode" in error
+        ? Number((error as { statusCode?: unknown }).statusCode || 0)
+        : 0;
+    if (statusCode === 403 || statusCode === 404) {
+      return c.json(
+        {
+          error:
+            (error instanceof Error ? normalizeText(error.message) : "") ||
+            "Unable to delete this Hub item.",
+        },
+        statusCode
+      );
+    }
+    console.error("[HUB] Failed to delete item", error);
+    return c.json({ error: "Failed to delete Hub item" }, 500);
+  }
+});
+
 app.get("/api/hub/my-items", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const itemType = normalizeHubItemType(c.req.query("type"));
@@ -48911,7 +49040,21 @@ app.post("/api/hub/items", async (c) => {
       changelog: normalizeText(body.changelog) || null,
     });
     return c.json({ item }, 201);
-  } catch (error) {
+  } catch (error: unknown) {
+    const statusCode =
+      error && typeof error === "object" && "statusCode" in error
+        ? Number((error as { statusCode?: unknown }).statusCode || 0)
+        : 0;
+    if (statusCode === 409) {
+      return c.json(
+        {
+          error:
+            (error instanceof Error ? normalizeText(error.message) : "") ||
+            "An item with this name already exists in the Hub. Change the name before uploading.",
+        },
+        409
+      );
+    }
     console.error("[HUB] Failed to create item", error);
     return c.json({ error: "Failed to create Hub item" }, 500);
   }
@@ -48938,7 +49081,9 @@ app.get("/api/hub/sync", async (c) => {
 });
 
 app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
   const itemType = normalizeHubItemType(c.req.query("type"));
+  let source: HubCatalogSource = "cache";
   let items = await listHubCatalogItems(c.env.DB, {
     source: "cache",
     itemType,
@@ -48949,6 +49094,7 @@ app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
   });
 
   if (items.length === 0) {
+    source = "hub";
     items = await listHubCatalogItems(c.env.DB, {
       source: "hub",
       itemType,
@@ -48959,7 +49105,11 @@ app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
     });
   }
 
-  return c.json({ items, next_cursor: null });
+  const ownerIds = await resolveHubOwnerIdentityIdsForUser(c.env.DB, user);
+  return c.json({
+    items: decorateHubCatalogItemsForViewer(items, source, ownerIds),
+    next_cursor: null,
+  });
 });
 
 app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
@@ -49151,7 +49301,21 @@ app.post("/api/hub/agents/publish-from-camera/:algorithmId", anyAuthMiddleware, 
       tags: payload.tags,
     });
     return c.json({ item }, 201);
-  } catch (error) {
+  } catch (error: unknown) {
+    const statusCode =
+      error && typeof error === "object" && "statusCode" in error
+        ? Number((error as { statusCode?: unknown }).statusCode || 0)
+        : 0;
+    if (statusCode === 409) {
+      return c.json(
+        {
+          error:
+            (error instanceof Error ? normalizeText(error.message) : "") ||
+            "An agent with this name already exists in the Hub. Change the name before uploading.",
+        },
+        409
+      );
+    }
     console.error("[HUB] Failed to publish agent", error);
     return c.json({ error: "Failed to publish Hub agent" }, 500);
   }
@@ -49247,7 +49411,21 @@ app.post("/api/hub/tasks/publish-from-job/:jobId", anyAuthMiddleware, async (c) 
       tags: payload.tags,
     });
     return c.json({ item }, 201);
-  } catch (error) {
+  } catch (error: unknown) {
+    const statusCode =
+      error && typeof error === "object" && "statusCode" in error
+        ? Number((error as { statusCode?: unknown }).statusCode || 0)
+        : 0;
+    if (statusCode === 409) {
+      return c.json(
+        {
+          error:
+            (error instanceof Error ? normalizeText(error.message) : "") ||
+            "A task with this name already exists in the Hub. Change the name before uploading.",
+        },
+        409
+      );
+    }
     console.error("[HUB] Failed to publish task", error);
     return c.json({ error: "Failed to publish Hub task" }, 500);
   }
@@ -51651,6 +51829,59 @@ type HubCatalogActor = {
   source: "app" | "central";
 };
 
+async function resolveHubOwnerIdentityIdsForUser(
+  db: D1Database,
+  user: { id?: unknown; email?: unknown }
+): Promise<Set<string>> {
+  const ownerIds = new Set<string>();
+  const userId = normalizeText(user.id);
+  if (userId) {
+    ownerIds.add(userId);
+  }
+
+  if (userId) {
+    const appUserRow = await db
+      .prepare(`SELECT central_public_id FROM app_users WHERE id = ? LIMIT 1`)
+      .bind(userId)
+      .first();
+    const centralPublicId = normalizeText((appUserRow as { central_public_id?: unknown } | null)?.central_public_id);
+    if (centralPublicId) {
+      ownerIds.add(centralPublicId);
+    }
+  }
+
+  const localIdentity = await findLocalUserIdentityCache(db, {
+    email: normalizeText(user.email) || null,
+    serverPublicId: userId || null,
+  });
+  const serverPublicId = normalizeText(
+    (localIdentity as { server_public_id?: unknown } | null)?.server_public_id
+  );
+  if (serverPublicId) {
+    ownerIds.add(serverPublicId);
+  }
+
+  return ownerIds;
+}
+
+function decorateHubCatalogItemsForViewer(
+  items: Array<Record<string, unknown>>,
+  source: HubCatalogSource,
+  ownerIds: Set<string>
+) {
+  return items.map((item) => {
+    const ownerUserId = normalizeText(
+      (item as { owner_user_id?: unknown; owner?: { user_id?: unknown } }).owner_user_id ??
+        (item as { owner?: { user_id?: unknown } }).owner?.user_id
+    );
+    return {
+      ...item,
+      catalog_source: source,
+      can_delete: ownerUserId ? ownerIds.has(ownerUserId) : false,
+    };
+  });
+}
+
 type HubAgentSnapshot = {
   type: "agent";
   display_name: string;
@@ -52214,6 +52445,29 @@ async function createHubItemFromSnapshot(
 ) {
   const now = new Date().toISOString();
   const title = normalizeText(input.title) || `${input.itemType} item`;
+  const existingTitleMatch = await db
+    .prepare(
+      `SELECT id
+         FROM hub_items
+        WHERE item_type = ?
+          AND status <> 'archived'
+          AND lower(trim(coalesce(title, ''))) = ?
+        LIMIT 1`
+    )
+    .bind(input.itemType, title.toLowerCase())
+    .first();
+  if (existingTitleMatch) {
+    const itemLabel = input.itemType === "task" ? "task" : "agent";
+    throw Object.assign(
+      new Error(
+        `A ${itemLabel} with this name already exists in the Hub. Change the name before uploading.`
+      ),
+      {
+        code: "hub_duplicate_title",
+        statusCode: 409,
+      }
+    );
+  }
   const slug = await reserveHubSlug(db, input.itemType, title, input.requestedSlug || null);
   const snapshotText = JSON.stringify(input.snapshotJson || {});
   const snapshotHash = await sha256Base64Url(snapshotText);
@@ -52319,6 +52573,64 @@ async function createHubItemFromSnapshot(
     includeNonPublished: true,
     ownerUserId: input.actor.userId,
   });
+}
+
+async function archiveHubItemForOwner(
+  db: D1Database,
+  itemId: number,
+  allowedOwnerIds: Iterable<string>,
+  actorUserId: string
+) {
+  const normalizedActorUserId = normalizeText(actorUserId);
+  const ownerIdSet = new Set(
+    Array.from(allowedOwnerIds)
+      .map((value) => normalizeText(value))
+      .filter(Boolean)
+  );
+  const existing = await getHubCatalogItemById(db, itemId, "hub", {
+    includeNonPublished: true,
+  });
+  if (!existing) {
+    throw Object.assign(new Error("Hub item not found."), { statusCode: 404 });
+  }
+  if (!ownerIdSet.has(normalizeText(existing.owner_user_id))) {
+    throw Object.assign(new Error("Only the uploader can delete this Hub item."), {
+      statusCode: 403,
+    });
+  }
+  if (existing.status === "archived") {
+    return existing;
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(`UPDATE hub_items SET status = 'archived', updated_at = ? WHERE id = ?`)
+    .bind(now, itemId)
+    .run();
+  await db
+    .prepare(
+      `INSERT INTO hub_moderation_events (item_id, version_id, actor_user_id, action, notes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      itemId,
+      Number(existing.version_id || 0) || null,
+      normalizedActorUserId || normalizeText(existing.owner_user_id),
+      "archive",
+      "Removed by uploader",
+      now
+    )
+    .run();
+
+  const archivedItem = await getHubCatalogItemById(db, itemId, "hub", {
+    includeNonPublished: true,
+  });
+  if (!archivedItem) {
+    throw Object.assign(new Error("Failed to reload the archived Hub item."), {
+      statusCode: 500,
+    });
+  }
+  return archivedItem;
 }
 
 async function fetchOwnedHubJob(
@@ -54367,7 +54679,7 @@ async function listPublishedHubSyncRows(
 ) {
   const cursor = parseHubSyncCursor(input.cursor);
   const values: any[] = [];
-  const clauses: string[] = [`hi.status = 'published'`];
+  const clauses: string[] = [`hi.status IN ('published', 'archived')`];
   if (input.itemType) {
     clauses.push(`hi.item_type = ?`);
     values.push(input.itemType);
@@ -54496,14 +54808,14 @@ async function upsertHubItemsCache(
         normalizeText(item?.cover_image_url) || null,
         normalizeHubStatus(item?.status, "published"),
         normalizeHubVisibility(item?.visibility),
-        Number(item?.current_version_id || 0),
+        Number(item?.current_version_id ?? item?.version_id ?? 0),
         Number(item?.version_number || 1),
         normalizeText(item?.schema_version),
         JSON.stringify(item?.snapshot_json || {}),
         normalizeText(item?.snapshot_hash),
         Math.max(0, Number(item?.download_count || 0)),
         normalizeText(item?.published_at) || null,
-        normalizeText(item?.remote_updated_at),
+        normalizeText(item?.remote_updated_at ?? item?.updated_at),
         now
       )
       .run();

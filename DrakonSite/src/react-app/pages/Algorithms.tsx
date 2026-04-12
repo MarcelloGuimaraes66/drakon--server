@@ -1,4 +1,4 @@
-import { useParams, useNavigate, useSearchParams } from "react-router";
+import { useLocation, useParams, useNavigate, useSearchParams } from "react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
@@ -86,6 +86,7 @@ const AGENT_TUTORIAL_COMPLETION_STEPS = new Set([
 export default function Algorithms() {
   const { t } = useTranslation();
   const { cameraId } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const {
@@ -97,6 +98,13 @@ export default function Algorithms() {
   } = useOnboarding();
   const tutorialManagedEditorRef = useRef(false);
   const numericCameraId = Number(cameraId || 0);
+  const currentAlgorithmsPath = `${location.pathname}${location.search}`;
+  const locationState =
+    location.state && typeof location.state === "object"
+      ? (location.state as { returnSource?: string })
+      : null;
+  const returnTo = searchParams.get("returnTo");
+  const canReturnToAiAgentsHistory = locationState?.returnSource === "ai-agents";
   const isTutorialCamera =
     typeof tutorialCameraId === "number" &&
     Number.isInteger(tutorialCameraId) &&
@@ -133,6 +141,7 @@ export default function Algorithms() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [publishingCustomAgent, setPublishingCustomAgent] = useState<CustomAlgorithm | null>(null);
   const [publishingToHub, setPublishingToHub] = useState(false);
+  const [hubPublishError, setHubPublishError] = useState<string | null>(null);
   const customEditorTarget: CameraAgentEditorTarget | null =
     numericCameraId > 0
       ? {
@@ -157,9 +166,23 @@ export default function Algorithms() {
   const openHubAgentBrowser = () => {
     navigate(
       `/hub?type=agent&installTarget=camera&cameraId=${cameraId}&returnTo=${encodeURIComponent(
-        `/algorithms/${cameraId}`
+        currentAlgorithmsPath
       )}`
     );
+  };
+
+  const handleBackToAiAgents = () => {
+    if (canReturnToAiAgentsHistory) {
+      navigate(-1);
+      return;
+    }
+
+    if (returnTo?.startsWith("/ai-agents")) {
+      navigate(returnTo);
+      return;
+    }
+
+    navigate("/ai-agents");
   };
 
   const publishCustomAgentToHub = async (payload: {
@@ -169,6 +192,7 @@ export default function Algorithms() {
     tags: string[];
   }) => {
     if (!publishingCustomAgent) return;
+    setHubPublishError(null);
     setPublishingToHub(true);
     try {
       const response = await fetch(
@@ -183,10 +207,13 @@ export default function Algorithms() {
       if (!response.ok) {
         throw new Error(data?.error || "Failed to publish agent to Hub");
       }
+      setHubPublishError(null);
       setPublishingCustomAgent(null);
       showToast("Hub publish complete", "The agent was uploaded to the Hub.");
-    } catch (error: any) {
-      showToast("Hub publish failed", String(error?.message || error), "destructive");
+    } catch (error: unknown) {
+      setHubPublishError(
+        error instanceof Error ? error.message : "Failed to publish agent to Hub"
+      );
     } finally {
       setPublishingToHub(false);
     }
@@ -1053,7 +1080,7 @@ export default function Algorithms() {
         {/* Header */}
         <div className="mb-6 md:mb-8">
           <button
-            onClick={() => navigate("/ai-agents")}
+            onClick={handleBackToAiAgents}
             className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors min-h-[44px] md:min-h-0"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -1254,7 +1281,10 @@ export default function Algorithms() {
 
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => setPublishingCustomAgent(custom)}
+                        onClick={() => {
+                          setHubPublishError(null);
+                          setPublishingCustomAgent(custom);
+                        }}
                         className="p-2 text-orange-300 hover:bg-orange-500/10 rounded-lg transition-colors"
                         title="Publish to Hub"
                       >
@@ -1834,8 +1864,10 @@ export default function Algorithms() {
           }
           defaultDescription={publishingCustomAgent?.prompt_template || ""}
           submitting={publishingToHub}
+          submissionError={hubPublishError}
           onClose={() => {
             if (publishingToHub) return;
+            setHubPublishError(null);
             setPublishingCustomAgent(null);
           }}
           onSubmit={publishCustomAgentToHub}
@@ -1844,7 +1876,7 @@ export default function Algorithms() {
         {/* Back to AI Agents button */}
         <div className="flex justify-end">
           <button
-            onClick={() => navigate("/ai-agents")}
+            onClick={handleBackToAiAgents}
             className="w-full md:w-auto px-6 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg font-medium transition-colors min-h-[44px]"
           >
             {t("algorithms.backToDashboard")}

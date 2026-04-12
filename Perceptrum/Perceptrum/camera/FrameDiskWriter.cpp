@@ -81,10 +81,12 @@ static bool copyTenSecondClipToInferenceTemp(
         }
 
         std::filesystem::path dst = dir / std::filesystem::path(srcPath).filename();
+        std::filesystem::path dstTmp = dst;
+        dstTmp += ".tmp";
 
         std::filesystem::copy_file(
             srcPath,
-            dst,
+            dstTmp,
             std::filesystem::copy_options::overwrite_existing,
             ec
         );
@@ -92,7 +94,18 @@ static bool copyTenSecondClipToInferenceTemp(
             Logger::instance().logDebug(
                 cameraId,
                 "FrameDiskWriter: copy 10s clip to inference temp failed: " +
-                ec.message() + " | src=" + srcPath + " | dst=" + dst.string()
+                ec.message() + " | src=" + srcPath + " | dst=" + dstTmp.string()
+            );
+            return false;
+        }
+
+        std::filesystem::rename(dstTmp, dst, ec);
+        if (ec) {
+            std::filesystem::remove(dstTmp, ec);
+            Logger::instance().logDebug(
+                cameraId,
+                "FrameDiskWriter: rename inference temp tmp->final failed: " +
+                ec.message() + " | tmp=" + dstTmp.string() + " | dst=" + dst.string()
             );
             return false;
         }

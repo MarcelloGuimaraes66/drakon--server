@@ -16717,7 +16717,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             }
 
             nlohmann::json envelope = chatTemporalState.planEnvelope;
-            const std::string modelFamily = (modelTier == "core") ? "core" : "ultra";
+            const std::string modelFamily = normalizeChatModelTierName(modelTier);
             const bool temporalReady = ensureTemporalPlanForRuntime(
                 "chat_session",
                 chatSessionId,
@@ -32738,8 +32738,10 @@ bool AgentCore::compileTemporalPlanWithModel_(
     }
 
     try {
+        const std::string safeCompileModelName =
+            compileModelName.empty() ? std::string("gpt-5.1") : compileModelName;
         nlohmann::json body = {
-            { "model", compileModelName.empty() ? "gpt-5.1" : compileModelName },
+            { "model", safeCompileModelName },
             { "messages", nlohmann::json::array({
                 {
                     { "role", "system" },
@@ -32751,44 +32753,97 @@ bool AgentCore::compileTemporalPlanWithModel_(
                 }
             })}
         };
-        applyOpenAITemperatureField_(body, compileModelName, 0.0);
-        applyOpenAITokenLimitField_(body, compileModelName, 2200);
+        applyOpenAITemperatureField_(body, safeCompileModelName, 0.0);
+        const bool useResponsesTransport =
+            shouldUseOpenAIResponsesTransportForModel_(safeCompileModelName);
+        if (useResponsesTransport) {
+            body["response_format"] = {
+                { "type", "json_object" }
+            };
+        }
+        const int firstEffectiveLimit =
+            resolveOpenAITokenLimitForModel_(safeCompileModelName, 4000);
+        const int secondEffectiveLimit =
+            (std::max)(8000, firstEffectiveLimit);
 
-        std::string rawResp = postOpenAIChatCompletionsWithCoreLease_(
-            compileApiKey,
-            body,
-            []() { MaybeNotifyFirstRetry(); },
-            false,
-            {},
-            "compile_temporal_plan",
-            runtimeLogId
-        );
+        std::string rawResp;
+        OpenAITextObjectResponse_ parsedResponse;
+        auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            nlohmann::json reqBody = body;
+            applyOpenAITokenLimitField_(reqBody, safeCompileModelName, requestedLimit);
 
-        nlohmann::json respJson = nlohmann::json::parse(rawResp, nullptr, false);
-        const std::string finishReason = extractOpenAIFinishReason(respJson);
-        const std::string extractedContent =
-            (respJson.is_discarded() || !respJson.is_object())
-                ? std::string()
-                : extractOpenAITextFromResponse(respJson);
-        logCompile(
-            "compileTemporalPlanWithModel_: response model=" +
-            (compileModelName.empty() ? std::string("gpt-5.1") : compileModelName) +
-            " finish_reason=" + (finishReason.empty() ? std::string("<empty>") : finishReason) +
-            " message_content_len=" + std::to_string(extractedContent.size()) +
-            " raw_response=" + truncateForLog_(rawResp, 2500)
-        );
-        if (respJson.is_discarded() || !respJson.is_object()) {
+            rawResp = useResponsesTransport
+                ? postOpenAIResponsesWithCoreLease_(
+                    compileApiKey,
+                    reqBody,
+                    []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "compile_temporal_plan",
+                    runtimeLogId
+                )
+                : postOpenAIChatCompletionsWithCoreLease_(
+                    compileApiKey,
+                    reqBody,
+                    []() { MaybeNotifyFirstRetry(); },
+                    false,
+                    {},
+                    "compile_temporal_plan",
+                    runtimeLogId
+                );
+
+            parsedResponse = extractOpenAITextObjectResponse_(rawResp);
+            logCompile(
+                "compileTemporalPlanWithModel_: response model=" +
+                safeCompileModelName +
+                " attempt=" + std::to_string(attemptNo) +
+                " finish_reason=" +
+                (parsedResponse.finishReason.empty()
+                    ? std::string("<empty>")
+                    : parsedResponse.finishReason) +
+                " message_content_len=" + std::to_string(parsedResponse.text.size()) +
+                " raw_response=" + truncateForLog_(rawResp, 2500)
+            );
+            if (!parsedResponse.hasValidResponseJson) {
+                return failWithReason(
+                    "invalid_raw_response_json",
+                    "compileTemporalPlanWithModel_: invalid raw response JSON"
+                );
+            }
+            return true;
+        };
+
+        if (!postAndParse(firstEffectiveLimit, 1)) {
+            return false;
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse) &&
+            secondEffectiveLimit > firstEffectiveLimit)
+        {
+            logCompile(
+                "compileTemporalPlanWithModel_: finish_reason=length with incomplete JSON; retrying once with higher token limit " +
+                std::to_string(secondEffectiveLimit)
+            );
+            if (!postAndParse(secondEffectiveLimit, 2)) {
+                return false;
+            }
+        }
+
+        if (shouldRetryOpenAITextObjectResponseForLength_(parsedResponse)) {
             return failWithReason(
-                "invalid_raw_response_json",
-                "compileTemporalPlanWithModel_: invalid raw response JSON"
+                "finish_reason_length",
+                "compileTemporalPlanWithModel_: finish_reason=length before completing a valid JSON object"
             );
         }
 
-        std::string text = extractedContent;
+        std::string text = parsedResponse.text;
         logCompile(
             "compileTemporalPlanWithModel_: extracted_text model=" +
-            (compileModelName.empty() ? std::string("gpt-5.1") : compileModelName) +
-            " finish_reason=" + (finishReason.empty() ? std::string("<empty>") : finishReason) +
+            safeCompileModelName +
+            " finish_reason=" +
+            (parsedResponse.finishReason.empty()
+                ? std::string("<empty>")
+                : parsedResponse.finishReason) +
             " text_len=" + std::to_string(text.size()) +
             " text_preview=" + truncateForLog_(text, 1200)
         );
@@ -32799,22 +32854,20 @@ bool AgentCore::compileTemporalPlanWithModel_(
             );
         }
 
-        std::string jsonSlice;
-        if (!tryExtractJsonObjectSlice(text, jsonSlice)) {
+        if (!parsedResponse.hasJsonObjectSlice) {
             return failWithReason(
                 "no_json",
                 "compileTemporalPlanWithModel_: no JSON object in model text"
             );
         }
 
-        nlohmann::json parsed = nlohmann::json::parse(jsonSlice, nullptr, false);
-        if (!parsed.is_object()) {
+        if (!parsedResponse.hasValidJsonObject) {
             return failWithReason(
                 "malformed_envelope_json",
                 "compileTemporalPlanWithModel_: malformed envelope JSON"
             );
         }
-        outEnvelope = std::move(parsed);
+        outEnvelope = parsedResponse.jsonObject;
         return true;
     }
     catch (const std::exception& e) {
@@ -32835,7 +32888,8 @@ void AgentCore::postTemporalCompileResultEvent_(
     const std::string& sourceType,
     int sourceId,
     const nlohmann::json& envelope,
-    const std::string& compileModel)
+    const std::string& compileModel,
+    bool persistPlanCache)
 {
     if (sourceType.empty() || sourceId <= 0) return;
     if (sourceType != "camera_algorithm" && sourceType != "job_step_agent") return;
@@ -32849,6 +32903,7 @@ void AgentCore::postTemporalCompileResultEvent_(
         { "compile_confidence", canonicalEnvelope.is_object() ? canonicalEnvelope.value("compile_confidence", 0.0) : 0.0 },
         { "compile_model", compileModel },
         { "compiled_at", temporal::nowIso() },
+        { "persist_plan_cache", persistPlanCache },
         { "plan_hash", plan.is_object() ? plan.value("plan_hash", std::string()) : std::string() },
         { "plan_version", plan.is_object() ? plan.value("schema_version", std::string("temporal-plan/1.0")) : std::string("temporal-plan/1.0") },
         { "plan_envelope", canonicalEnvelope }
@@ -32933,7 +32988,8 @@ bool AgentCore::ensureTemporalPlanForRuntime(
                     inputType,
                     language
                 ),
-                modelTag.empty() ? std::string("temporal_guard") : modelTag
+                modelTag.empty() ? std::string("temporal_guard") : modelTag,
+                false
             );
         }
     };
@@ -33107,7 +33163,7 @@ bool AgentCore::ensureTemporalPlanForRuntime(
                 : std::string("invalid_compiler_decision:") +
                     (invalidReason.empty() ? std::string("unknown") : invalidReason);
         if (compiled && persistResult) {
-            postTemporalCompileResultEvent_(sourceType, sourceId, envelope, compileModel);
+            postTemporalCompileResultEvent_(sourceType, sourceId, envelope, compileModel, false);
         }
         if (runtimeGuardEnforced && !runtimeGuardConfig.allowSafeFallback) {
             emitRuntimeGuardDecision("legacy_fallback_blocked", fallbackReason, true, compileModel);
