@@ -10,8 +10,68 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$workspaceRoot = "C:\dev\Workspace"
-$appHostRoot = Join-Path $workspaceRoot "AppHost"
+function Resolve-CheckoutRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptRoot
+    )
+
+    $resolvedRoot = Resolve-Path -Path (Join-Path $ScriptRoot "..\..") -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Path -First 1
+
+    if (-not $resolvedRoot) {
+        throw "Unable to determine the repository root from script path '$ScriptRoot'."
+    }
+
+    return $resolvedRoot
+}
+
+function Resolve-MSBuildCommand {
+    $msbuildCommand = Get-Command msbuild.exe -ErrorAction SilentlyContinue
+    if ($msbuildCommand) {
+        return $msbuildCommand.Source
+    }
+
+    $discoveredCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\amd64\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"),
+        (Join-Path ${env:ProgramFiles} "Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe")
+    )
+    $vswherePath = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+
+    if (Test-Path $vswherePath) {
+        $discoveredCandidates += & $vswherePath -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\Current\Bin\MSBuild.exe" 2>$null
+        $discoveredCandidates += & $vswherePath -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\Current\Bin\amd64\MSBuild.exe" 2>$null
+
+        $installationRoots = @(
+            & $vswherePath -all -products * -requires Microsoft.Component.MSBuild -property installationPath 2>$null
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        foreach ($installationRoot in $installationRoots) {
+            $discoveredCandidates += Join-Path $installationRoot "MSBuild\Current\Bin\MSBuild.exe"
+            $discoveredCandidates += Join-Path $installationRoot "MSBuild\Current\Bin\amd64\MSBuild.exe"
+        }
+    }
+
+    foreach ($candidate in $discoveredCandidates | Where-Object { $_ } | Select-Object -Unique) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+
+    throw (
+        "MSBuild.exe was not found. Install Visual Studio Build Tools with the MSBuild workload " +
+        "or add MSBuild.exe to PATH."
+    )
+}
+
+$workspaceRoot = Resolve-CheckoutRoot -ScriptRoot $PSScriptRoot
+$appHostRoot = Split-Path -Path $PSScriptRoot -Parent
 $drakonSiteRoot = Join-Path $workspaceRoot "DrakonSite"
 $packagingRoot = Join-Path $appHostRoot "Packaging"
 $artifactsRoot = Join-Path $appHostRoot "artifacts"
@@ -23,7 +83,7 @@ $brandConfigPath = Join-Path $workspaceRoot "brand.config.json"
 $applyBrandScriptPath = Join-Path $workspaceRoot "branding\apply-brand.mjs"
 $stageRuntimeScriptPath = Join-Path $packagingRoot "stage-runtime.mjs"
 $appHostIssPath = Join-Path $packagingRoot "AppHost.iss"
-$msbuild = (Get-Command msbuild.exe -ErrorAction Stop).Source
+$msbuild = Resolve-MSBuildCommand
 $iscc = $null
 
 function Resolve-IsccCommand {
@@ -81,6 +141,48 @@ function Resolve-WindowsAppRuntimeInstallerPath {
     }
 
     return $null
+}
+
+function Invoke-ExternalCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [string[]]$ArgumentList = @()
+    )
+
+    $resolvedFilePath = $FilePath
+
+    if (-not [System.IO.Path]::IsPathRooted($FilePath)) {
+        $applicationCommand = Get-Command $FilePath -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($applicationCommand) {
+            $resolvedFilePath = $applicationCommand.Source
+        } else {
+            $resolvedCommand = Get-Command $FilePath -ErrorAction Stop | Select-Object -First 1
+            $resolvedFilePath = $resolvedCommand.Source
+
+            if ($resolvedCommand.CommandType -eq [System.Management.Automation.CommandTypes]::ExternalScript) {
+                $cmdCandidate = [System.IO.Path]::ChangeExtension($resolvedCommand.Source, ".cmd")
+                if (Test-Path $cmdCandidate) {
+                    $resolvedFilePath = $cmdCandidate
+                }
+            }
+        }
+    }
+
+    & $resolvedFilePath @ArgumentList
+
+    if ($LASTEXITCODE -ne 0) {
+        $renderedArgs = ($ArgumentList | ForEach-Object {
+            if ($_ -match '\s') {
+                '"' + $_ + '"'
+            } else {
+                $_
+            }
+        }) -join ' '
+
+        throw ("Command failed with exit code {0}: {1} {2}" -f $LASTEXITCODE, $resolvedFilePath, $renderedArgs)
+    }
 }
 
 function Ensure-Directory {
@@ -153,7 +255,7 @@ function Stage-WindowsAppRuntimeInstaller {
 }
 
 function Invoke-BrandApply {
-    & node $applyBrandScriptPath --brand $Brand
+    Invoke-ExternalCommand -FilePath "node" -ArgumentList @($applyBrandScriptPath, "--brand", $Brand)
 }
 
 function Get-BrandMetadata {
@@ -334,21 +436,31 @@ function Invoke-BuildStep {
     Write-Host "Building frontend bundle..."
     Push-Location $drakonSiteRoot
     try {
-        npm run build
+        Invoke-ExternalCommand -FilePath "npm" -ArgumentList @("run", "build")
     } finally {
         Pop-Location
     }
 
     Write-Host "Preparing isolated stage at $($BrandMetadata.ArtifactStageRoot)..."
-    & node $stageRuntimeScriptPath --out $BrandMetadata.ArtifactStageRoot
+    Invoke-ExternalCommand -FilePath "node" -ArgumentList @($stageRuntimeScriptPath, "--out", $BrandMetadata.ArtifactStageRoot)
 
     if (Test-Path $binOutputRoot) {
         Get-ChildItem -Path $binOutputRoot -Force | Remove-Item -Recurse -Force
     }
 
     Write-Host "Compiling native projects..."
-    & $msbuild (Join-Path $workspaceRoot "Perceptrum\PerceptrumCore\PerceptrumCore.vcxproj") /t:Rebuild /p:Configuration=$Configuration /p:Platform=x64
-    & $msbuild (Join-Path $appHostRoot "AppHost.vcxproj") /t:Rebuild /p:Configuration=$Configuration /p:Platform=x64
+    Invoke-ExternalCommand -FilePath $msbuild -ArgumentList @(
+        (Join-Path $workspaceRoot "Perceptrum\PerceptrumCore\PerceptrumCore.vcxproj"),
+        "/t:Rebuild",
+        "/p:Configuration=$Configuration",
+        "/p:Platform=x64"
+    )
+    Invoke-ExternalCommand -FilePath $msbuild -ArgumentList @(
+        (Join-Path $appHostRoot "AppHost.vcxproj"),
+        "/t:Rebuild",
+        "/p:Configuration=$Configuration",
+        "/p:Platform=x64"
+    )
 
     $binItems = @(Get-ChildItem -Path $binOutputRoot -Force)
     if ($binItems.Count -eq 0) {
@@ -445,7 +557,7 @@ function Invoke-PackageStep {
     }
 
     Write-Host "Building installer..."
-    & $iscc.Source $appHostIssPath
+    Invoke-ExternalCommand -FilePath $iscc.Source -ArgumentList @($appHostIssPath)
 
     if (-not (Test-Path $BrandMetadata.InstallerOutputPath)) {
         throw "Expected installer not found at $($BrandMetadata.InstallerOutputPath)."

@@ -105,6 +105,7 @@
     <CppWinRTPackageDir>$(NuGetPackageRoot)microsoft.windows.cppwinrt\$(CppWinRTPackageVersion)\</CppWinRTPackageDir>
     <WebView2PackageDir>$(NuGetPackageRoot)microsoft.web.webview2\$(WebView2PackageVersion)\</WebView2PackageDir>
     <MicrosoftWindowsAppSDKPackageDir>$(WindowsAppSDKPackageDir)</MicrosoftWindowsAppSDKPackageDir>
+    <GetCppWinRTPlatformWinMDReferencesDependsOn>CppWinRTImplicitlyExpandTargetPlatform;$(GetCppWinRTPlatformWinMDReferencesDependsOn)</GetCppWinRTPlatformWinMDReferencesDependsOn>
   </PropertyGroup>
 
   <Import Project="$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.props" Condition="Exists('$(WindowsSdkBuildToolsPackageDir)buildTransitive\Microsoft.Windows.SDK.BuildTools.props')" />
@@ -119,8 +120,15 @@
       <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>$(PostgreSqlRoot)include;..\Perceptrum\Perceptrum;C:\libs\opencv-4.11.0\build\include;C:\dev\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions>%(AdditionalOptions) /bigobj</AdditionalOptions>
+      <AdditionalOptions>%(AdditionalOptions) /FS /bigobj</AdditionalOptions>
     </ClCompile>
+    <Midl>
+      <EnableWindowsRuntime>true</EnableWindowsRuntime>
+      <Enumclass>true</Enumclass>
+      <PrependWithABINamepsace>true</PrependWithABINamepsace>
+      <MetadataFileName>$(OutDir)%(Filename).winmd</MetadataFileName>
+      <AdditionalMetadataDirectories>$(WindowsSDK_UnionMetadataPath);%(AdditionalMetadataDirectories)</AdditionalMetadataDirectories>
+    </Midl>
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
