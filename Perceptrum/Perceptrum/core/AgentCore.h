@@ -233,6 +233,13 @@ public:
         int& outOutputTokens,
         int& outTotalTokens);
 
+    bool materializeOperationalIdentityCards(
+        VideoHit& hit,
+        nlohmann::json& temporalState,
+        nlohmann::json& visualState,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string());
+
     bool isRunning() const;
 
     bool ensureTemporalPlanForRuntime(

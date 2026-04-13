@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "@getmocha/users-service/react";
-import { useLocation } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
 import SettingsTabs, {
@@ -127,6 +127,7 @@ export default function Settings() {
     currentStepId,
   } = useOnboarding();
   const location = useLocation();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<SettingsTabView>("user");
   const [pairCode, setPairCode] = useState("");
   const [expiresAt, setExpiresAt] = useState("");
@@ -180,6 +181,12 @@ export default function Settings() {
   const [deletingAccount, setDeletingAccount] = useState(false);
   const [isDeleteAccountModalOpen, setIsDeleteAccountModalOpen] = useState(false);
   const [showDeleteAccountDetails, setShowDeleteAccountDetails] = useState(false);
+
+  const selectSettingsTab = (tab: SettingsTabView) => {
+    setActiveTab(tab);
+    const nextPath = tab === "alerts" ? "/settings/alerts" : "/settings";
+    navigate(nextPath);
+  };
 
   const fetchPairingStatus = async () => {
     try {
@@ -778,6 +785,10 @@ export default function Settings() {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const focus = params.get("focus");
+    if (location.pathname === "/settings/alerts" || params.get("tab") === "alerts") {
+      setActiveTab("alerts");
+      return;
+    }
     if (focus === "openai") {
       setActiveTab("api-keys");
       setHighlightOpenAiCard(true);
@@ -806,7 +817,7 @@ export default function Settings() {
         window.clearTimeout(timeoutId);
       };
     }
-  }, [location.search]);
+  }, [location.pathname, location.search]);
 
   useEffect(() => {
     if (
@@ -859,10 +870,10 @@ export default function Settings() {
           <div className="flex justify-center xl:justify-self-center">
             <SettingsTabs
               activeView={activeTab}
-              onSelectUser={() => setActiveTab("user")}
-              onSelectApiKeys={() => setActiveTab("api-keys")}
-              onSelectAlerts={() => setActiveTab("alerts")}
-              onSelectConnectivity={() => setActiveTab("connectivity")}
+              onSelectUser={() => selectSettingsTab("user")}
+              onSelectApiKeys={() => selectSettingsTab("api-keys")}
+              onSelectAlerts={() => selectSettingsTab("alerts")}
+              onSelectConnectivity={() => selectSettingsTab("connectivity")}
             />
           </div>
           <div className="hidden xl:block" />
@@ -1783,18 +1794,18 @@ export default function Settings() {
             <h2 className="text-lg font-semibold text-gray-100">Telegram Alerts</h2>
           </div>
 
-          <div className="space-y-6">
-            {/* Enable Toggle */}
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">
-                  Enable Telegram Notifications
-                </label>
-                <p className="text-xs text-gray-500">
-                  {`Receive ${brand.displayName} alerts directly in your Telegram chat`}
-                </p>
-              </div>
-              <button
+            <div className="space-y-6">
+              {/* Enable Toggle */}
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Enable Telegram Integration
+                  </label>
+                  <p className="text-xs text-gray-500">
+                  Register the Telegram bot and chat used when AI Agents or Job alerts have Telegram delivery enabled.
+                  </p>
+                </div>
+                <button
                 onClick={() => setTelegramEnabled(!telegramEnabled)}
                 disabled={telegramLoading}
                 className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-gray-900 ${
@@ -1850,9 +1861,8 @@ export default function Settings() {
                     disabled={
                       telegramSaving ||
                       telegramLoading ||
-                      !telegramEnabled ||
-                      !telegramChatId.trim() ||
-                      !telegramBotToken.trim()
+                      (telegramEnabled &&
+                        (!telegramChatId.trim() || !telegramBotToken.trim()))
                     }
                     className="px-5 py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg font-medium transition-colors shadow-lg shadow-blue-500/30 disabled:shadow-none flex items-center gap-2"
                   >
@@ -1862,7 +1872,7 @@ export default function Settings() {
                         Saving...
                       </>
                     ) : (
-                      "Save Settings"
+                      "Save Integration"
                     )}
                   </button>
                 </div>
@@ -1875,12 +1885,15 @@ export default function Settings() {
                 <AlertCircle className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
                 <div className="space-y-2 text-sm text-gray-300">
                   <p className="font-medium text-blue-400">How to get your Chat ID and Bot Token:</p>
+                  <p className="text-gray-400">
+                    AI Agents only send Telegram for agents whose Telegram icon is enabled. Jobs only send Telegram for steps with a Telegram alert configured.
+                  </p>
                   <ol className="space-y-1 list-decimal list-inside text-gray-400">
                     <li>Search for @BotFather in Telegram and create a new bot</li>
                     <li>Copy the Bot Token from BotFather's message</li>
                     <li>Search for @userinfobot in Telegram and start it</li>
                     <li>Copy your Chat ID from the bot's response</li>
-                    <li>Enter both values above and enable notifications</li>
+                    <li>Enter both values above and enable the integration</li>
                   </ol>
                 </div>
               </div>

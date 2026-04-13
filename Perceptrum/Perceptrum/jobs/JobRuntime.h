@@ -82,6 +82,7 @@ private:
     struct TemporalRuntimeSlot {
         json planEnvelope = json::object();
         json state = json::object();
+        json visualState = json::object();
         std::string promptHash;
         std::chrono::steady_clock::time_point touchedAt{};
     };

@@ -117,6 +117,7 @@ import {
   persistIdentityCardOccurrences,
   persistStructuredAgentEvent,
   type IdentityCardOccurrenceDraft,
+  type OperationalCorrelationIds,
   upsertStructuredAgentErrorLog,
 } from "./operationalPersistence";
 
@@ -324,6 +325,74 @@ async function buildEnabledAlgorithmsPayloadForCamera(
     algorithmDescriptions: ALGORITHM_DESCRIPTIONS,
     algorithmDisplayNames: ALGORITHM_DISPLAY_NAMES,
   });
+}
+
+function normalizeAlertChannelEnabledInput(value: unknown, fallback = false): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+  }
+  return fallback;
+}
+
+function normalizeAlertChannelsInput(
+  value: unknown
+): Record<string, Record<string, unknown> & { enabled: boolean }> {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const out: Record<string, Record<string, unknown> & { enabled: boolean }> = {};
+  for (const [rawChannel, rawConfig] of Object.entries(parsed as Record<string, unknown>)) {
+    const channel = rawChannel.trim().toLowerCase();
+    if (!channel) continue;
+
+    const normalizedConfig =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? { ...(rawConfig as Record<string, unknown>) }
+        : {};
+    const enabledSource =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? (rawConfig as Record<string, unknown>).enabled
+        : rawConfig;
+    normalizedConfig.enabled = normalizeAlertChannelEnabledInput(enabledSource, false);
+    out[channel] = normalizedConfig as Record<string, unknown> & { enabled: boolean };
+  }
+
+  return out;
+}
+
+function serializeAlertChannelsInput(value: unknown): string | null {
+  const normalized = normalizeAlertChannelsInput(value);
+  return Object.keys(normalized).length > 0 ? JSON.stringify(normalized) : null;
+}
+
+function attachAlertChannelsToCameraAlgorithmRow(row: any): any {
+  if (!row || typeof row !== "object") return row;
+  return {
+    ...row,
+    alert_channels: normalizeAlertChannelsInput(
+      (row as any).alert_channels ?? (row as any).alert_channels_json
+    ),
+  };
 }
 
 function normalizeOpenAIApiKeyInput(value: unknown): string {
@@ -7573,6 +7642,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN only_capture_on_motion INTEGER DEFAULT 1`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE camera_algorithms ADD COLUMN alert_channels_json TEXT`
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN temporal_plan_json TEXT`
@@ -24894,6 +24966,7 @@ async function enqueueUpdateAlgorithmsIfCameraRunning(
   if (!camera || Number((camera as any)?.is_service_running) !== 1) return;
 
   const enabledAlgorithms = await buildEnabledAlgorithmsPayloadForCamera(db, userId, cameraId);
+  const telegram = await getTelegramSettingsForUser(db, userId);
   const requiresOpenAiForEnabledCustomAgents = enabledAlgorithms.some((algo: any) => {
     const algorithmType = String(algo?.algorithm_type || "").trim().toLowerCase();
     if (!algorithmType.startsWith("custom_")) return false;
@@ -24936,6 +25009,9 @@ async function enqueueUpdateAlgorithmsIfCameraRunning(
       JSON.stringify({
         camera_id: cameraId,
         enabled_algorithms: enabledAlgorithms,
+        telegram_enabled: telegram.enabled,
+        telegram_chat_id: telegram.chat_id,
+        telegram_bot_token: telegram.bot_token,
       }),
       now,
       now
@@ -25158,7 +25234,9 @@ app.get("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, async (c) => {
     .bind(cameraId)
     .all();
 
-  const rows = (results || []).map((row: any) => ({ ...row }));
+  const rows = (results || []).map((row: any) =>
+    attachAlertChannelsToCameraAlgorithmRow({ ...row })
+  );
   const hasCustom = rows.some((row: any) =>
     String(row?.algorithm_type || "").startsWith("custom_")
   );
@@ -25175,14 +25253,14 @@ app.get("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, async (c) => {
   for (const agent of customAgents || []) {
     const type = String((agent as any)?.algorithm_type || "").trim();
     if (!type) continue;
-    customByType.set(type, agent);
+    customByType.set(type, attachAlertChannelsToCameraAlgorithmRow(agent));
   }
 
   const merged = rows.map((row: any) => {
     const type = String(row?.algorithm_type || "").trim();
     if (!type.startsWith("custom_")) return row;
     const enriched = customByType.get(type);
-    return enriched ? { ...row, ...enriched } : row;
+    return enriched ? attachAlertChannelsToCameraAlgorithmRow({ ...row, ...enriched }) : row;
   });
 
   return c.json(merged);
@@ -25364,6 +25442,13 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
     )
       .bind(cameraId, algorithmType)
       .first();
+    const storedAlertChannelsJson =
+      data.alert_channels === undefined
+        ? typeof (existing as any)?.alert_channels_json === "string" &&
+          String((existing as any).alert_channels_json).trim()
+          ? String((existing as any).alert_channels_json).trim()
+          : null
+        : serializeAlertChannelsInput(data.alert_channels);
 
     const willEnableCoreCustomAgent =
       isCustomAgent &&
@@ -25424,6 +25509,7 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
              llm_prompt = ?,
              image_region = ?,
              config_json = ?,
+             alert_channels_json = ?,
              prompt_template = ?,
              alert_condition = ?,
              negative_condition = ?,
@@ -25442,6 +25528,7 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
           data.llm_prompt || null,
           data.image_region || null,
           JSON.stringify(configJsonObject),
+          storedAlertChannelsJson,
           isCustomAgent ? storedPromptTemplate : null,
           isCustomAgent ? normalizedPromptParts.alert_condition : null,
           isCustomAgent ? normalizedPromptParts.negative_condition : null,
@@ -25478,10 +25565,11 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
       const insertResult = await c.env.DB.prepare(
         `INSERT INTO camera_algorithms (
            camera_id, algorithm_type, is_enabled, llm_prompt, image_region, config_json,
+           alert_channels_json,
            prompt_template, alert_condition, negative_condition, analysis_regions,
            input_type, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           cameraId,
@@ -25490,6 +25578,7 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
           data.llm_prompt || null,
           data.image_region || null,
           JSON.stringify(configJsonObject),
+          storedAlertChannelsJson,
           isCustomAgent ? storedPromptTemplate : null,
           isCustomAgent ? normalizedPromptParts.alert_condition : null,
           isCustomAgent ? normalizedPromptParts.negative_condition : null,
@@ -25537,7 +25626,7 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
 
     await enqueueUpdateAlgorithmsIfCameraRunning(c.env.DB, user.id, Number(cameraId));
 
-    return c.json(algorithm || {});
+    return c.json(attachAlertChannelsToCameraAlgorithmRow(algorithm || {}));
   } catch (error) {
     console.error("Error in /api/cameras/:cameraId/algorithms:", error);
     return c.json({ error: "Failed to save algorithm configuration" }, 500);
@@ -25756,6 +25845,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       run_every?: unknown;
       only_capture_on_motion?: unknown;
       config_json?: unknown;
+      alert_channels?: unknown;
     }>()
     .catch(() => null);
   if (!body) {
@@ -25896,6 +25986,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     else if (!cfg.display_name) cfg.display_name = algorithmType;
     return cfg;
   })();
+  const storedAlertChannelsJson = serializeAlertChannelsInput(body.alert_channels);
 
   const now = new Date().toISOString();
   const isEnabled = normalizeJobStepOnlyCaptureOnMotion(body.is_enabled, false);
@@ -25923,11 +26014,12 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     .prepare(
       `INSERT INTO camera_algorithms (
          camera_id, algorithm_type, is_enabled, llm_prompt, image_region, config_json,
+         alert_channels_json,
          prompt_template, alert_condition, negative_condition, analysis_regions,
          input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
          created_at, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       cameraId,
@@ -25936,6 +26028,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       promptTemplate,
       null,
       JSON.stringify(configJsonObject),
+      storedAlertChannelsJson,
       buildPromptTemplateFromParts({
         prompt_template: promptTemplate,
         alert_condition: alertCondition,
@@ -26024,6 +26117,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
       run_every?: unknown;
       only_capture_on_motion?: unknown;
       config_json?: unknown;
+      alert_channels?: unknown;
     }>()
     .catch(() => null);
   if (!body) {
@@ -26230,6 +26324,13 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
   } else if (!configJsonObject.display_name) {
     configJsonObject.display_name = algorithmType;
   }
+  const storedAlertChannelsJson =
+    body.alert_channels === undefined
+      ? typeof (ownedAlgorithm as any)?.alert_channels_json === "string" &&
+        String((ownedAlgorithm as any).alert_channels_json).trim()
+        ? String((ownedAlgorithm as any).alert_channels_json).trim()
+        : null
+      : serializeAlertChannelsInput(body.alert_channels);
 
   const onlyCaptureOnMotion =
     body.only_capture_on_motion === undefined
@@ -26274,6 +26375,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
        SET is_enabled = ?,
            llm_prompt = ?,
            config_json = ?,
+           alert_channels_json = ?,
            prompt_template = ?,
            alert_condition = ?,
            negative_condition = ?,
@@ -26292,6 +26394,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
       isEnabled ? 1 : 0,
       promptTemplate,
       JSON.stringify(configJsonObject),
+      storedAlertChannelsJson,
       buildPromptTemplateFromParts({
         prompt_template: promptTemplate,
         alert_condition: alertCondition,
@@ -33811,6 +33914,7 @@ const hydrateCustomCameraAgentRows = async (
     return {
       ...agent,
       config_json: configJsonObj,
+      alert_channels: normalizeAlertChannelsInput(agent?.alert_channels ?? agent?.alert_channels_json),
       prompt_template: promptParts.prompt_template,
       alert_condition: promptParts.alert_condition,
       negative_condition: promptParts.negative_condition,
@@ -34235,6 +34339,111 @@ function readChatIdentityPortraitDataUrl(
     }
   }
   return null;
+}
+
+function readChatIdentityCropReference(rawCard: unknown): string | null {
+  if (!rawCard || typeof rawCard !== "object" || Array.isArray(rawCard)) {
+    return null;
+  }
+
+  const raw = rawCard as Record<string, unknown>;
+  const primaryPortrait =
+    raw.primary_portrait && typeof raw.primary_portrait === "object" && !Array.isArray(raw.primary_portrait)
+      ? (raw.primary_portrait as Record<string, unknown>)
+      : null;
+  const contextPortrait =
+    raw.context_portrait && typeof raw.context_portrait === "object" && !Array.isArray(raw.context_portrait)
+      ? (raw.context_portrait as Record<string, unknown>)
+      : null;
+  const candidate = normalizeText(
+    primaryPortrait?.image_path ??
+      primaryPortrait?.image_url ??
+      contextPortrait?.image_path ??
+      contextPortrait?.image_url ??
+      raw.portrait_path ??
+      raw.portrait_url
+  ).slice(0, 800);
+
+  if (!candidate || parseDataUrl(candidate)) {
+    return null;
+  }
+  return candidate;
+}
+
+function buildOperationalIdentityCardOccurrenceDrafts(input: {
+  rawIdentityCards: unknown;
+  details: Record<string, unknown>;
+  correlationIds: OperationalCorrelationIds;
+  eventType: unknown;
+  eventDbId?: number | null;
+  cameraId?: number | null;
+}): IdentityCardOccurrenceDraft[] {
+  const rawIdentityCards = Array.isArray(input.rawIdentityCards) ? input.rawIdentityCards : [];
+  if (rawIdentityCards.length === 0) {
+    return [];
+  }
+
+  const details = input.details || {};
+  const fallbackCameraIdRaw =
+    input.cameraId ??
+    details.camera_id ??
+    details.cameraId;
+  const fallbackCameraId =
+    Number.isInteger(Number(fallbackCameraIdRaw)) && Number(fallbackCameraIdRaw) > 0
+      ? Number(fallbackCameraIdRaw)
+      : null;
+  const fallbackCameraName =
+    normalizeText(details.camera_name ?? details.cameraName).slice(0, 200) || null;
+  const normalizedEventType = normalizeText(input.eventType).slice(0, 64);
+  const sourceType =
+    normalizeText(details.source_type ?? details.sourceType).slice(0, 64) ||
+    normalizedEventType ||
+    "agent_event";
+  const sourceEventId =
+    normalizeText(
+      input.correlationIds.externalEventId ??
+        details.event_id ??
+        details.external_event_id ??
+        (Number.isInteger(Number(input.eventDbId)) && Number(input.eventDbId) > 0
+          ? `event:${Number(input.eventDbId)}`
+          : "")
+    ).slice(0, 160) || null;
+
+  return rawIdentityCards
+    .map((rawCard): IdentityCardOccurrenceDraft | null => {
+      const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
+      if (!snapshot) return null;
+      const rawCardRecord =
+        rawCard && typeof rawCard === "object" && !Array.isArray(rawCard)
+          ? (rawCard as Record<string, unknown>)
+          : snapshot;
+      const explicitIdentityCardId = normalizeText(
+        rawCardRecord.identity_card_id ??
+          rawCardRecord.card_id ??
+          rawCardRecord.entity_id ??
+          details.primary_identity_card_id ??
+          details.primaryIdentityCardId ??
+          input.correlationIds.identityCardId
+      ).slice(0, 160);
+      return {
+        chatSessionId: null,
+        identityCardId: explicitIdentityCardId || null,
+        card: snapshot,
+        sourceType,
+        sourceEventId,
+        jobRunId: input.correlationIds.jobRunId,
+        stepRunId: input.correlationIds.stepRunId,
+        agentRunId: input.correlationIds.agentRunId,
+        cameraId: fallbackCameraId,
+        cameraName: fallbackCameraName,
+        portraitDataUrl: readChatIdentityPortraitDataUrl(
+          rawCardRecord.portrait_data_url,
+          rawCardRecord
+        ),
+        cropUrl: readChatIdentityCropReference(rawCard),
+      };
+    })
+    .filter((item: IdentityCardOccurrenceDraft | null): item is IdentityCardOccurrenceDraft => !!item);
 }
 
 function buildChatIdentityUpdatePendingMessage(languageInput: unknown): string {
@@ -36655,6 +36864,22 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
     )
       .bind(id, user.id, enabled, chatId, botToken, now, now)
       .run();
+  }
+
+  const { results: runningCameraRows } = await c.env.DB
+    .prepare(
+      `SELECT id
+       FROM cameras
+       WHERE user_id = ?
+         AND is_service_running = 1`
+    )
+    .bind(user.id)
+    .all();
+
+  for (const row of runningCameraRows || []) {
+    const runningCameraId = Number((row as any)?.id);
+    if (!Number.isInteger(runningCameraId) || runningCameraId <= 0) continue;
+    await enqueueUpdateAlgorithmsIfCameraRunning(c.env.DB, user.id, runningCameraId);
   }
 
   // Return the saved settings
@@ -43363,34 +43588,6 @@ app.post("/api/agent/chat-response", async (c) => {
       Array.isArray(camera_names) && camera_names.length === 1 && typeof camera_names[0] === "string"
         ? camera_names[0].trim().slice(0, 200)
         : null;
-    const readChatIdentityCropReference = (rawCard: unknown): string | null => {
-      if (!rawCard || typeof rawCard !== "object" || Array.isArray(rawCard)) {
-        return null;
-      }
-
-      const raw = rawCard as Record<string, unknown>;
-      const primaryPortrait =
-        raw.primary_portrait && typeof raw.primary_portrait === "object" && !Array.isArray(raw.primary_portrait)
-          ? (raw.primary_portrait as Record<string, unknown>)
-          : null;
-      const contextPortrait =
-        raw.context_portrait && typeof raw.context_portrait === "object" && !Array.isArray(raw.context_portrait)
-          ? (raw.context_portrait as Record<string, unknown>)
-          : null;
-      const candidate = normalizeText(
-        primaryPortrait?.image_path ??
-          primaryPortrait?.image_url ??
-          contextPortrait?.image_path ??
-          contextPortrait?.image_url ??
-          raw.portrait_path ??
-          raw.portrait_url
-      ).slice(0, 800);
-
-      if (!candidate || parseDataUrl(candidate)) {
-        return null;
-      }
-      return candidate;
-    };
     const sanitizedIdentityCards = identity_cards
       .map((rawCard: unknown) => {
         const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
@@ -43944,6 +44141,8 @@ app.post("/api/agent/events", async (c) => {
     step_run_id?: string | null;
     agent_run_id?: string | null;
     identity_card_id?: string | null;
+    primary_identity_card_id?: string | null;
+    identity_cards?: unknown[];
     event_type: string;
     message?: string;
     details?: any;
@@ -43980,6 +44179,35 @@ app.post("/api/agent/events", async (c) => {
     detailsObject = sanitizeAgentApiErrorDetails(detailsObject);
     details = detailsObject;
   }
+  const rawOperationalIdentityCards = Array.isArray(body.identity_cards)
+    ? body.identity_cards
+    : Array.isArray(detailsObject.identity_cards)
+    ? detailsObject.identity_cards
+    : [];
+  const sanitizedOperationalIdentityCards = rawOperationalIdentityCards
+    .map((rawCard) => sanitizeChatIdentityCardSnapshot(rawCard))
+    .filter((item: Record<string, unknown> | null): item is Record<string, unknown> => !!item);
+  if (sanitizedOperationalIdentityCards.length > 0) {
+    detailsObject.identity_cards = sanitizedOperationalIdentityCards;
+  } else if (Array.isArray(detailsObject.identity_cards)) {
+    delete detailsObject.identity_cards;
+  }
+  const primaryOperationalIdentityCardId =
+    normalizeText(
+      body.primary_identity_card_id ??
+        detailsObject.primary_identity_card_id ??
+        detailsObject.primaryIdentityCardId ??
+        detailsObject.identity_card_id ??
+        detailsObject.identityCardId ??
+        (sanitizedOperationalIdentityCards[0]?.card_id ?? sanitizedOperationalIdentityCards[0]?.entity_id)
+    ).slice(0, 160) || "";
+  if (primaryOperationalIdentityCardId) {
+    detailsObject.primary_identity_card_id = primaryOperationalIdentityCardId;
+    if (!normalizeText(detailsObject.identity_card_id).slice(0, 160)) {
+      detailsObject.identity_card_id = primaryOperationalIdentityCardId;
+    }
+  }
+  details = detailsObject;
   const eventStartOrigin =
     typeof detailsObject.start_origin === "string"
       ? detailsObject.start_origin.trim().toLowerCase()
@@ -44487,6 +44715,31 @@ app.post("/api/agent/events", async (c) => {
         correlationIds: existingCorrelationIds,
         nowIso: now,
       });
+
+      const duplicateIdentityCardOccurrenceDrafts = buildOperationalIdentityCardOccurrenceDrafts({
+        rawIdentityCards:
+          rawOperationalIdentityCards.length > 0
+            ? rawOperationalIdentityCards
+            : existingDetails.identity_cards,
+        details:
+          rawOperationalIdentityCards.length > 0
+            ? detailsObject
+            : existingDetails,
+        correlationIds: existingCorrelationIds,
+        eventType,
+        eventDbId: Number((existingEvent as any)?.id || 0),
+        cameraId: existingCameraId,
+      });
+      if (duplicateIdentityCardOccurrenceDrafts.length > 0) {
+        await persistIdentityCardOccurrences({
+          db: c.env.DB,
+          bucket: c.env.R2_BUCKET,
+          publicBaseUrl: c.env.R2_PUBLIC_BASE_URL,
+          userId: String(userId),
+          drafts: duplicateIdentityCardOccurrenceDrafts,
+          nowIso: now,
+        });
+      }
 
       return c.json({
         success: true,
@@ -45400,6 +45653,28 @@ app.post("/api/agent/events", async (c) => {
     correlationIds,
     nowIso: now,
   });
+
+  const operationalIdentityCardOccurrenceDrafts = buildOperationalIdentityCardOccurrenceDrafts({
+    rawIdentityCards:
+      rawOperationalIdentityCards.length > 0
+        ? rawOperationalIdentityCards
+        : detailsObject.identity_cards,
+    details: detailsObject,
+    correlationIds,
+    eventType,
+    eventDbId: eventId,
+    cameraId,
+  });
+  if (operationalIdentityCardOccurrenceDrafts.length > 0) {
+    await persistIdentityCardOccurrences({
+      db: c.env.DB,
+      bucket: c.env.R2_BUCKET,
+      publicBaseUrl: c.env.R2_PUBLIC_BASE_URL,
+      userId: String(userId),
+      drafts: operationalIdentityCardOccurrenceDrafts,
+      nowIso: now,
+    });
+  }
 
   const readTrimmedString = (...values: unknown[]): string => {
     for (const value of values) {

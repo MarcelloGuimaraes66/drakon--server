@@ -189,10 +189,18 @@ const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
 const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
 const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
 const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
+const PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS =
+  "rounded-xl border border-gray-700 bg-gray-800/70 shadow-[0_40px_120px_-50px_rgba(0,0,0,1)]";
+const PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS =
+  "max-h-[84vh] overflow-y-auto px-4 py-4 sm:px-5 sm:py-5";
 const PROMPT_DOCUMENT_INPUT_CLASS =
   "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
 const PROMPT_DOCUMENT_TEXTAREA_CLASS =
   "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS =
+  "w-full resize-none overflow-hidden border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS =
+  "inline-flex h-7 w-7 items-center justify-center rounded border border-gray-600 bg-gray-800 text-gray-300 transition-colors hover:border-gray-500 hover:text-gray-100";
 
 const extractOptionalSuffix = (label: string): string => {
   const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
@@ -203,6 +211,62 @@ const formatPromptDocumentHeading = (
   label: string,
   options?: { optional?: boolean; optionalSuffix?: string }
 ): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
+
+type AutoGrowingTextareaProps = {
+  ariaLabel: string;
+  className: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  readOnly?: boolean;
+  rows?: number;
+  value: string;
+};
+
+function AutoGrowingTextarea({
+  ariaLabel,
+  className,
+  onChange,
+  placeholder,
+  readOnly = false,
+  rows = 1,
+  value,
+}: AutoGrowingTextareaProps) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+    textarea.style.overflowY = "hidden";
+  }, [rows, value]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.style.height = "0px";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+      textarea.style.overflowY = "hidden";
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      rows={rows}
+      readOnly={readOnly}
+      className={className}
+      placeholder={placeholder}
+    />
+  );
+}
 
 const clamp01 = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
 
@@ -913,6 +977,7 @@ export default function CameraCustomAgentEditorModal({
   const [newFaceTargetDescription, setNewFaceTargetDescription] = useState("");
   const [newFaceTargetFile, setNewFaceTargetFile] = useState<File | null>(null);
   const [targetFacesExpanded, setTargetFacesExpanded] = useState(false);
+  const [promptDocumentExpanded, setPromptDocumentExpanded] = useState(false);
   const [creatingFaceTarget, setCreatingFaceTarget] = useState(false);
   const [faceTargetUploadingId, setFaceTargetUploadingId] = useState<number | null>(null);
   const [faceTargetDeletingImageId, setFaceTargetDeletingImageId] = useState<number | null>(null);
@@ -1225,6 +1290,7 @@ export default function CameraCustomAgentEditorModal({
     setSelectedRegionId(null);
     setSuggestion(null);
     setTargetFacesExpanded(false);
+    setPromptDocumentExpanded(false);
     setCreatingFaceTarget(false);
     setFaceTargetUploadingId(null);
     setFaceTargetDeletingImageId(null);
@@ -1258,6 +1324,19 @@ export default function CameraCustomAgentEditorModal({
       })
       .finally(() => setSnapshotLoading(false));
   }, [open, initialAgent?.id, previewCameraId, stepId, targetType]);
+
+  useEffect(() => {
+    if (!promptDocumentExpanded) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setPromptDocumentExpanded(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [promptDocumentExpanded]);
 
   useEffect(() => {
     if (!open || !snapshotUrl) {
@@ -2331,6 +2410,178 @@ export default function CameraCustomAgentEditorModal({
       : t("jobs.runEveryOption.seconds60");
   };
 
+  const renderPromptDocument = (options?: { expanded?: boolean }) => {
+    const expanded = options?.expanded ?? false;
+    const togglePromptDocumentLabel = expanded
+      ? t("jobs.promptEditor.collapseDocument", {
+          defaultValue: "Collapse prompt document",
+        })
+      : t("jobs.promptEditor.expandDocument", {
+          defaultValue: "Expand prompt document",
+        });
+    const sectionClassName = expanded
+      ? "space-y-2"
+      : PROMPT_DOCUMENT_SECTION_CLASS;
+    const promptCoreSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const alertConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const negativeConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+
+    const documentSections = (
+      <>
+        <div className={sectionClassName}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="font-mono text-[13px] font-semibold text-gray-100">
+                {formatPromptDocumentHeading("Agent Name")}
+              </span>
+              <span className="text-red-600">*</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPromptDocumentExpanded((prev) => !prev)}
+              className={PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS}
+              title={togglePromptDocumentLabel}
+              aria-label={togglePromptDocumentLabel}
+              aria-expanded={expanded}
+            >
+              {expanded ? (
+                <Minimize2 className="h-3.5 w-3.5" />
+              ) : (
+                <Maximize2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+          <input
+            aria-label="Agent Name"
+            type="text"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            className={PROMPT_DOCUMENT_INPUT_CLASS}
+            placeholder="Custom agent name"
+          />
+        </div>
+        <div className={promptCoreSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.promptCoreLabel")}
+              value={fields.prompt_template}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, prompt_template: value }))
+              }
+              rows={8}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.promptCoreLabel")}
+              value={fields.prompt_template}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, prompt_template: e.target.value }))
+              }
+              rows={8}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          )}
+        </div>
+        <div className={alertConditionSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.alertConditionLabel")}
+              value={fields.alert_condition}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, alert_condition: value }))
+              }
+              rows={5}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.alertConditionLabel")}
+              value={fields.alert_condition}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, alert_condition: e.target.value }))
+              }
+              rows={5}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          )}
+        </div>
+        <div className={negativeConditionSectionClassName}>
+          <div className="font-mono text-[13px] font-semibold text-gray-100">
+            {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+              optional: true,
+              optionalSuffix: localizedOptionalSuffix,
+            })}
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={fields.negative_condition}
+              onChange={(value) =>
+                setFields((prev) => ({ ...prev, negative_condition: value }))
+              }
+              rows={4}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={fields.negative_condition}
+              onChange={(e) =>
+                setFields((prev) => ({ ...prev, negative_condition: e.target.value }))
+              }
+              rows={4}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          )}
+        </div>
+      </>
+    );
+
+    if (expanded) {
+      return (
+        <div className={PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS}>
+          <div className={PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS}>
+            <div className="space-y-5">{documentSections}</div>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={PROMPT_DOCUMENT_BLOCK_CLASS}
+        data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorFields}
+      >
+        {documentSections}
+      </div>
+    );
+  };
+
   if (!open) return null;
 
   const draftPoints = draftRect ? buildRectPolygonFromPoints(draftRect.start, draftRect.end) : [];
@@ -3106,81 +3357,7 @@ export default function CameraCustomAgentEditorModal({
                     </div>
                   ) : null}
                 </div>
-                <div
-                  className={PROMPT_DOCUMENT_BLOCK_CLASS}
-                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorFields}
-                >
-                  <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[13px] font-semibold text-gray-100">
-                        {formatPromptDocumentHeading("Agent Name")}
-                      </span>
-                      <span className="text-red-600">*</span>
-                    </div>
-                    <input
-                      aria-label="Agent Name"
-                      type="text"
-                      value={displayName}
-                      onChange={(e) => setDisplayName(e.target.value)}
-                      className={PROMPT_DOCUMENT_INPUT_CLASS}
-                      placeholder="Custom agent name"
-                    />
-                  </div>
-                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[13px] font-semibold text-gray-100">
-                        {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
-                      </span>
-                      <span className="text-red-600">*</span>
-                    </div>
-                    <textarea
-                      aria-label={t("jobs.promptEditor.promptCoreLabel")}
-                      value={fields.prompt_template}
-                      onChange={(e) =>
-                        setFields((prev) => ({ ...prev, prompt_template: e.target.value }))
-                      }
-                      rows={8}
-                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                      placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
-                    />
-                  </div>
-                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-[13px] font-semibold text-gray-100">
-                        {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
-                      </span>
-                      <span className="text-red-600">*</span>
-                    </div>
-                    <textarea
-                      aria-label={t("jobs.promptEditor.alertConditionLabel")}
-                      value={fields.alert_condition}
-                      onChange={(e) =>
-                        setFields((prev) => ({ ...prev, alert_condition: e.target.value }))
-                      }
-                      rows={5}
-                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                      placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
-                    />
-                  </div>
-                  <div className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}>
-                    <div className="font-mono text-[13px] font-semibold text-gray-100">
-                      {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
-                        optional: true,
-                        optionalSuffix: localizedOptionalSuffix,
-                      })}
-                    </div>
-                    <textarea
-                      aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
-                      value={fields.negative_condition}
-                      onChange={(e) =>
-                        setFields((prev) => ({ ...prev, negative_condition: e.target.value }))
-                      }
-                      rows={4}
-                      className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                      placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
-                    />
-                  </div>
-                </div>
+                {renderPromptDocument()}
                   <div className="space-y-2">
                   <label className="block font-mono text-[13px] font-semibold text-gray-100">
                     {formatPromptDocumentHeading("Negative Reference Images", {
@@ -3304,6 +3481,22 @@ export default function CameraCustomAgentEditorModal({
           ) : null}
         </div>
       </div>
+
+      {promptDocumentExpanded ? (
+        <div className="fixed inset-0 z-[96] flex items-center justify-center px-4 py-6">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/55 backdrop-blur-md"
+            onClick={() => setPromptDocumentExpanded(false)}
+            aria-label={t("jobs.promptEditor.collapseDocument", {
+              defaultValue: "Collapse prompt document",
+            })}
+          />
+          <div className="relative w-full max-w-5xl">
+            {renderPromptDocument({ expanded: true })}
+          </div>
+        </div>
+      ) : null}
 
       {showRegionDialog ? (
         <div className="fixed inset-0 z-[95] flex items-center justify-center px-4 py-6">

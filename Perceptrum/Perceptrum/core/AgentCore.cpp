@@ -4970,6 +4970,27 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         }
         return fallback;
     };
+    auto parseAlertChannels = [](const json& node, const char* key) {
+        nlohmann::json out = nlohmann::json::object();
+        if (!node.contains(key)) return out;
+        const auto& value = node[key];
+        if (value.is_object()) return value;
+        if (value.is_string()) {
+            try {
+                nlohmann::json parsed = nlohmann::json::parse(
+                    value.get<std::string>(),
+                    nullptr,
+                    false
+                );
+                if (parsed.is_object()) {
+                    return parsed;
+                }
+            }
+            catch (...) {
+            }
+        }
+        return out;
+    };
     auto parseFrameWindowNorm = [](const json& holder) {
         AlgorithmConfig::FrameWindowNorm out;
         const json* node = nullptr;
@@ -5071,6 +5092,7 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         ac.temporalCompiledAt = trimLocal(jsonStringOr(a, "temporal_compiled_at"));
         ac.temporalCompileModel = trimLocal(jsonStringOr(a, "temporal_compile_model"));
         ac.temporalPlanEnvelope = nlohmann::json::object();
+        ac.alertChannels = parseAlertChannels(a, "alert_channels");
         if (a.contains("temporal_plan_json")) {
             if (a["temporal_plan_json"].is_object()) {
                 ac.temporalPlanEnvelope = a["temporal_plan_json"];
@@ -5181,6 +5203,15 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         newAlgos.push_back(std::move(ac));
     }
 
+    if (payload.contains("telegram_enabled") ||
+        payload.contains("telegram_bot_token") ||
+        payload.contains("telegram_chat_id"))
+    {
+        const bool telegramEnabled = jsonBoolOr(payload, "telegram_enabled", false);
+        const std::string telegramBotToken = trimLocal(jsonStringOr(payload, "telegram_bot_token"));
+        const std::string telegramChatId = trimLocal(jsonStringOr(payload, "telegram_chat_id"));
+        session->updateTelegramSettings(telegramEnabled, telegramBotToken, telegramChatId);
+    }
 
 
     session->updateAlgorithms(std::move(newAlgos));
@@ -6510,6 +6541,27 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
             }
             return fallback;
         };
+        auto parseAlertChannels = [](const json& node, const char* key) {
+            nlohmann::json out = nlohmann::json::object();
+            if (!node.contains(key)) return out;
+            const auto& value = node[key];
+            if (value.is_object()) return value;
+            if (value.is_string()) {
+                try {
+                    nlohmann::json parsed = nlohmann::json::parse(
+                        value.get<std::string>(),
+                        nullptr,
+                        false
+                    );
+                    if (parsed.is_object()) {
+                        return parsed;
+                    }
+                }
+                catch (...) {
+                }
+            }
+            return out;
+        };
         auto parseFrameWindowNorm = [](const json& holder) {
             AlgorithmConfig::FrameWindowNorm out;
             const json* node = nullptr;
@@ -6618,6 +6670,7 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
             ac.temporalCompiledAt = trimLocal(jsonStringOr(algo, "temporal_compiled_at"));
             ac.temporalCompileModel = trimLocal(jsonStringOr(algo, "temporal_compile_model"));
             ac.temporalPlanEnvelope = nlohmann::json::object();
+            ac.alertChannels = parseAlertChannels(algo, "alert_channels");
             if (algo.contains("temporal_plan_json")) {
                 if (algo["temporal_plan_json"].is_object()) {
                     ac.temporalPlanEnvelope = algo["temporal_plan_json"];
@@ -6818,6 +6871,11 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
             if (directStart) {
                 it->second->setDirectServiceRequested(true);
             }
+            it->second->updateTelegramSettings(
+                cfg.telegramEnabled,
+                cfg.telegramBotToken,
+                cfg.telegramChatId
+            );
             it->second->updateAlgorithms(cfg.algorithms);
             if (directStart) {
                 setCameraServiceRunning_(cameraId, true, "agentcore_idempotent_start");
@@ -28285,6 +28343,39 @@ VideoHit AgentCore::runCameraCustomImageInference(
     return hit;
 }
 
+bool AgentCore::materializeOperationalIdentityCards(
+    VideoHit& hit,
+    nlohmann::json& temporalState,
+    nlohmann::json& visualState,
+    const std::string& logStreamId,
+    const std::string& scopeTag)
+{
+    try {
+        return forceIdentityCardForPositiveHit_(
+            hit,
+            temporalState,
+            visualState,
+            logStreamId,
+            scopeTag
+        );
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            logStreamId.empty() ? std::string("agent") : logStreamId,
+            "materializeOperationalIdentityCards: exception scope=" + scopeTag +
+            " error=" + ex.what()
+        );
+        return false;
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            logStreamId.empty() ? std::string("agent") : logStreamId,
+            "materializeOperationalIdentityCards: unknown exception scope=" + scopeTag
+        );
+        return false;
+    }
+}
+
 DrakonFindInferenceResult AgentCore::runDrakonFindImageInference_(
     int cameraId,
     const std::string& jpegBase64,
@@ -33022,6 +33113,18 @@ bool AgentCore::ensureTemporalPlanForRuntime(
             plan["plan_hash"] = promptHash;
             plan["schema_version"] = schemaVersion;
             plan["prompt_fingerprint"] = env["prompt_fingerprint"];
+            nlohmann::json executionContext = {
+                { "source_type", sourceType },
+                { "source_id", sourceId },
+                { "timezone", machineTimezoneForBackend_.empty() ? std::string("UTC") : machineTimezoneForBackend_ }
+            };
+            const std::string fixedTimeTimezoneHint =
+                temporal::canonicalFixedLocalTimezone(
+                    machineTimezoneForBackend_.empty() ? std::string("UTC") : machineTimezoneForBackend_);
+            if (!fixedTimeTimezoneHint.empty()) {
+                executionContext["fixed_time_timezone_hint"] = fixedTimeTimezoneHint;
+            }
+            plan["execution_context"] = std::move(executionContext);
             env["plan_json"] = std::move(plan);
         } else {
             env.erase("plan_json");

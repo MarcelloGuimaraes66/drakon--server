@@ -30,6 +30,7 @@ struct AlgorithmConfig {
     std::string temporalCompiledAt;
     std::string temporalCompileModel;
     nlohmann::json temporalPlanEnvelope = nlohmann::json::object();
+    nlohmann::json alertChannels = nlohmann::json::object();
 
     struct AnalysisRegionPoint {
         double x = 0.0;

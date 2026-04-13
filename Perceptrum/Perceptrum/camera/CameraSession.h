@@ -82,6 +82,7 @@ public:
 
 
     void updateAlgorithms(std::vector<AlgorithmConfig> algos);
+    void updateTelegramSettings(bool enabled, std::string botToken, std::string chatId);
     bool matchesStartConfig(const CameraConfig& cfg) const;
 
     std::string getLastJobStillJpegBase64() const;
@@ -187,6 +188,7 @@ private:
     struct TemporalRuntimeSlot {
         nlohmann::json planEnvelope = nlohmann::json::object();
         nlohmann::json state = nlohmann::json::object();
+        nlohmann::json visualState = nlohmann::json::object();
         std::string promptHash;
         std::chrono::steady_clock::time_point touchedAt{};
     };

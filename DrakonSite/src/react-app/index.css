@@ -314,6 +314,10 @@ body {
   background-color: rgb(248 250 252 / 0.94);
 }
 
+.light .bg-gray-800\/70 {
+  background-color: rgb(248 250 252 / 0.76);
+}
+
 .light .bg-gray-800\/60 {
   background-color: rgb(248 250 252 / 0.8);
 }

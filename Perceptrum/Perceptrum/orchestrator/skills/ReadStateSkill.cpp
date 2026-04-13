@@ -4,6 +4,7 @@
 #include <cctype>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../ChatModelConfig.h"
@@ -65,6 +66,37 @@ void configureActionModelClient_(LocalLlmClient& llm, const nlohmann::json& payl
     }
 }
 
+std::string parseErrorMessage_(const HttpResponse& response)
+{
+    if (!response.body.empty()) {
+        const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+        if (parsed.is_object()) {
+            if (parsed.contains("error") && parsed["error"].is_string()) {
+                const std::string error = trimCopy_(parsed["error"].get<std::string>());
+                if (!error.empty()) {
+                    return error;
+                }
+            }
+            if (parsed.contains("message") && parsed["message"].is_string()) {
+                const std::string message = trimCopy_(parsed["message"].get<std::string>());
+                if (!message.empty()) {
+                    return message;
+                }
+            }
+        }
+    }
+
+    if (!response.error.empty()) {
+        return response.error;
+    }
+
+    if (response.statusCode > 0) {
+        return "HTTP " + std::to_string(response.statusCode);
+    }
+
+    return "unknown_error";
+}
+
 std::string jsonStringOr_(
     const nlohmann::json& value,
     const char* key,
@@ -99,6 +131,20 @@ std::string firstStringAtPaths_(
 std::string detectFocus_(const std::string& query)
 {
     const std::string normalized = lowerAsciiCopy_(query);
+    if (containsAny_(normalized, {
+            "identity card", "identity cards", "id card", "id cards",
+            "card de identidade", "cards de identidade", "identidade", "identidades",
+            "crop", "crops", "portrait", "portraits", "rosto", "face"
+        })) {
+        return "identity_cards";
+    }
+    if (containsAny_(normalized, {
+            "history", "historico", "ledger", "audit", "auditoria",
+            "timeline", "yesterday", "ontem", "recent", "recently",
+            "job run", "job runs", "step run", "step runs", "agent run", "agent runs"
+        })) {
+        return "history";
+    }
     if (containsAny_(normalized, {
             "billing", "payment", "payments", "subscription", "tokens",
             "saldo", "cartao", "assinatura"
@@ -187,6 +233,47 @@ std::string clientIdFromPayload_(const nlohmann::json& payload, const AgentCore&
     return agent.getClientId();
 }
 
+bool queryNeedsOperationalContext_(const std::string& query)
+{
+    const std::string normalized = lowerAsciiCopy_(query);
+
+    if (containsAny_(normalized, {
+            "identity card", "identity cards", "id card", "id cards",
+            "card de identidade", "cards de identidade",
+            "crop", "crops", "portrait", "portraits",
+            "identity", "identidade", "identidades"
+        })) {
+        return true;
+    }
+
+    if (containsAny_(normalized, {
+            "history", "historico", "ledger", "audit", "auditoria",
+            "timeline", "ontem", "yesterday", "recent", "recently",
+            "job run", "job runs", "step run", "step runs",
+            "agent run", "agent runs", "camera session", "camera sessions",
+            "session", "sessions", "connectivity", "conectividade"
+        })) {
+        return true;
+    }
+
+    const bool mentionsOperationalEntity = containsAny_(normalized, {
+        "job", "jobs", "workflow", "task", "tasks", "tarefa", "tarefas",
+        "step", "steps", "etapa", "etapas", "agent", "agents", "agente", "agentes"
+    });
+    const bool asksForRead = containsAny_(normalized, {
+        "show", "list", "listar", "mostrar", "mostre", "traga", "bring",
+        "which", "quais", "how many", "quantos", "quantas",
+        "count", "conte", "tell me", "me diga", "me traga"
+    });
+    const bool hasTimeWindow = containsAny_(normalized, {
+        "today", "hoje", "yesterday", "ontem", "last", "ultimo", "ultimos",
+        "recent", "recently", "between", "entre", "during", "durante",
+        "hour", "hours", "hora", "horas", "minute", "minutes", "minuto", "minutos"
+    });
+
+    return mentionsOperationalEntity && (asksForRead || hasTimeWindow);
+}
+
 nlohmann::json fetchDetailedCameraInventory_(AgentCore& agent, const nlohmann::json& payload)
 {
     const std::string clientId = clientIdFromPayload_(payload, agent);
@@ -201,6 +288,64 @@ nlohmann::json fetchDetailedCameraInventory_(AgentCore& agent, const nlohmann::j
     return parsed.is_array() ? parsed : nlohmann::json::array();
 }
 
+nlohmann::json fetchOperationalContext_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const std::string& replyLanguage,
+    std::string* outError = nullptr)
+{
+    if (outError != nullptr) {
+        outError->clear();
+    }
+    if (!payload.is_object()) {
+        return nlohmann::json::object();
+    }
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        if (outError != nullptr) {
+            *outError = "missing_chat_session_id";
+        }
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json request = {
+        { "chat_session_id", chatSessionId },
+        { "query", payload.value("query", std::string()) },
+        { "reply_language", replyLanguage },
+    };
+    const int beforeMessageId = payload.value("context_before_message_id", 0);
+    if (beforeMessageId > 0) {
+        request["context_before_message_id"] = beforeMessageId;
+    }
+
+    const std::string url =
+        agent.getBackendBaseUrl() +
+        "/api/agent/reports/build-context?client_id=" + clientIdFromPayload_(payload, agent);
+    const HttpResponse response = postJson(
+        url,
+        request.dump(),
+        agent.getExeToken(),
+        {},
+        20000);
+
+    if (!response.ok()) {
+        if (outError != nullptr) {
+            *outError = parseErrorMessage_(response);
+        }
+        return nlohmann::json::object();
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        if (outError != nullptr) {
+            *outError = "invalid_operational_context";
+        }
+        return nlohmann::json::object();
+    }
+    return parsed;
+}
+
 nlohmann::json truncateArray_(const nlohmann::json& value, std::size_t maxItems)
 {
     if (!value.is_array() || value.size() <= maxItems) {
@@ -212,6 +357,17 @@ nlohmann::json truncateArray_(const nlohmann::json& value, std::size_t maxItems)
         truncated.push_back(value[index]);
     }
     return truncated;
+}
+
+void truncateObjectArrayField_(
+    nlohmann::json& object,
+    const char* key,
+    std::size_t maxItems)
+{
+    if (!object.is_object() || key == nullptr || !object.contains(key) || !object[key].is_array()) {
+        return;
+    }
+    object[key] = truncateArray_(object[key], maxItems);
 }
 
 nlohmann::json buildStateForAnalysis_(
@@ -245,6 +401,88 @@ nlohmann::json buildStateForAnalysis_(
         { "items", truncateArray_(cameraInventory, 180) },
     });
 
+    return state;
+}
+
+nlohmann::json buildOperationalContextForAnalysis_(nlohmann::json context)
+{
+    if (!context.is_object()) {
+        return nlohmann::json::object();
+    }
+
+    context.erase("report_id");
+    context.erase("chat_discussion");
+    context.erase("evidence_candidates");
+
+    if (context.contains("top_findings_seed") && context["top_findings_seed"].is_array()) {
+        context["top_findings_seed"] = truncateArray_(context["top_findings_seed"], 8);
+    }
+    if (context.contains("limitations") && context["limitations"].is_array()) {
+        context["limitations"] = truncateArray_(context["limitations"], 8);
+    }
+
+    if (context.contains("current_state") && context["current_state"].is_object()) {
+        auto& currentState = context["current_state"];
+        truncateObjectArrayField_(currentState, "camera_snapshots", 12);
+        truncateObjectArrayField_(currentState, "running_jobs", 12);
+        truncateObjectArrayField_(currentState, "step_snapshots", 16);
+        truncateObjectArrayField_(currentState, "active_camera_sessions", 8);
+        truncateObjectArrayField_(currentState, "active_job_runs", 8);
+    }
+
+    if (context.contains("history") && context["history"].is_object()) {
+        auto& history = context["history"];
+        truncateObjectArrayField_(history, "recent_events", 20);
+        truncateObjectArrayField_(history, "recent_commands", 20);
+        truncateObjectArrayField_(history, "recent_detections", 16);
+        truncateObjectArrayField_(history, "recent_alerts", 20);
+        truncateObjectArrayField_(history, "error_logs", 16);
+        truncateObjectArrayField_(history, "recent_job_runs", 20);
+        truncateObjectArrayField_(history, "recent_step_runs", 20);
+        truncateObjectArrayField_(history, "recent_agent_runs", 20);
+        truncateObjectArrayField_(history, "recent_camera_sessions", 12);
+        truncateObjectArrayField_(history, "recent_identity_cards", 20);
+        truncateObjectArrayField_(history, "recent_connectivity_incidents", 12);
+    }
+
+    if (context.contains("comparisons") && context["comparisons"].is_object()) {
+        auto& comparisons = context["comparisons"];
+        truncateObjectArrayField_(comparisons, "cameras", 12);
+        truncateObjectArrayField_(comparisons, "jobs", 12);
+        truncateObjectArrayField_(comparisons, "agents", 12);
+        truncateObjectArrayField_(comparisons, "steps", 12);
+        truncateObjectArrayField_(comparisons, "alerts_by_camera", 12);
+        truncateObjectArrayField_(comparisons, "alerts_by_job", 12);
+        truncateObjectArrayField_(comparisons, "sessions_by_camera", 12);
+        truncateObjectArrayField_(comparisons, "identity_cards_by_camera", 12);
+    }
+
+    if (context.contains("details") && context["details"].is_object()) {
+        auto& details = context["details"];
+        truncateObjectArrayField_(details, "job_runs", 20);
+        truncateObjectArrayField_(details, "step_runs", 24);
+        truncateObjectArrayField_(details, "agent_runs", 24);
+        truncateObjectArrayField_(details, "camera_agent_runs", 24);
+        truncateObjectArrayField_(details, "step_results", 20);
+        truncateObjectArrayField_(details, "alerts", 20);
+        truncateObjectArrayField_(details, "camera_sessions", 12);
+        truncateObjectArrayField_(details, "connectivity_incidents", 12);
+        truncateObjectArrayField_(details, "identity_cards", 24);
+        truncateObjectArrayField_(details, "structured_errors", 16);
+        truncateObjectArrayField_(details, "response_timeline", 16);
+        truncateObjectArrayField_(details, "no_positive_detection_reasons", 8);
+    }
+
+    return context;
+}
+
+nlohmann::json extractLiveState_(const nlohmann::json& state)
+{
+    if (state.is_object() &&
+        state.contains("live_state") &&
+        state["live_state"].is_object()) {
+        return state["live_state"];
+    }
     return state;
 }
 
@@ -447,13 +685,14 @@ std::string buildLeadingZeroIpAuditAnswer_(
 
 std::string buildOverviewAnswer_(const nlohmann::json& state)
 {
-    const auto cameras = state.value("cameras", nlohmann::json::object());
-    const auto jobs = state.value("jobs", nlohmann::json::object());
-    const auto cameraAgents = state.value("camera_agents", nlohmann::json::object());
-    const auto jobAgents = state.value("job_agents", nlohmann::json::object());
-    const auto billing = state.value("billing", nlohmann::json::object());
-    const auto pairing = state.value("pairing", nlohmann::json::object());
-    const auto apiKeys = state.value("api_keys", nlohmann::json::object());
+    const nlohmann::json liveState = extractLiveState_(state);
+    const auto cameras = liveState.value("cameras", nlohmann::json::object());
+    const auto jobs = liveState.value("jobs", nlohmann::json::object());
+    const auto cameraAgents = liveState.value("camera_agents", nlohmann::json::object());
+    const auto jobAgents = liveState.value("job_agents", nlohmann::json::object());
+    const auto billing = liveState.value("billing", nlohmann::json::object());
+    const auto pairing = liveState.value("pairing", nlohmann::json::object());
+    const auto apiKeys = liveState.value("api_keys", nlohmann::json::object());
 
     const auto tokenBalance = billing.value("token_balance", nlohmann::json::object());
     const bool pairingConnected = lowerAsciiCopy_(jsonStringOr_(pairing, "status")) == "connected";
@@ -485,8 +724,9 @@ std::string buildOverviewAnswer_(const nlohmann::json& state)
 
 std::string buildAccountAnswer_(const nlohmann::json& state)
 {
-    const auto account = state.value("account", nlohmann::json::object());
-    const auto profile = state.value("profile", nlohmann::json::object());
+    const nlohmann::json liveState = extractLiveState_(state);
+    const auto account = liveState.value("account", nlohmann::json::object());
+    const auto profile = liveState.value("profile", nlohmann::json::object());
 
     const std::string email = firstStringAtPaths_(
         account,
@@ -519,15 +759,57 @@ std::string buildFocusedAnswer_(
     const std::string& focus,
     const nlohmann::json& cameraInventory)
 {
-    const auto cameras = state.value("cameras", nlohmann::json::object());
-    const auto jobs = state.value("jobs", nlohmann::json::object());
-    const auto cameraAgents = state.value("camera_agents", nlohmann::json::object());
-    const auto jobAgents = state.value("job_agents", nlohmann::json::object());
-    const auto billing = state.value("billing", nlohmann::json::object());
-    const auto pairing = state.value("pairing", nlohmann::json::object());
-    const auto apiKeys = state.value("api_keys", nlohmann::json::object());
+    const nlohmann::json liveState = extractLiveState_(state);
+    const auto operational =
+        state.is_object() && state.contains("operational_context") && state["operational_context"].is_object()
+            ? state["operational_context"]
+            : nlohmann::json::object();
+    const auto cameras = liveState.value("cameras", nlohmann::json::object());
+    const auto jobs = liveState.value("jobs", nlohmann::json::object());
+    const auto cameraAgents = liveState.value("camera_agents", nlohmann::json::object());
+    const auto jobAgents = liveState.value("job_agents", nlohmann::json::object());
+    const auto billing = liveState.value("billing", nlohmann::json::object());
+    const auto pairing = liveState.value("pairing", nlohmann::json::object());
+    const auto apiKeys = liveState.value("api_keys", nlohmann::json::object());
 
     std::ostringstream out;
+
+    if (focus == "identity_cards") {
+        const auto history = operational.value("history", nlohmann::json::object());
+        const auto details = operational.value("details", nlohmann::json::object());
+        const nlohmann::json cards =
+            details.contains("identity_cards") && details["identity_cards"].is_array()
+                ? details["identity_cards"]
+                : history.value("recent_identity_cards", nlohmann::json::array());
+        const std::string cardNames = joinNames_(cards, "display_name", 5);
+
+        out << "## Identity cards\n\n"
+            << "- Persisted cards in the current operational window: "
+            << (cards.is_array() ? cards.size() : 0) << ".";
+        if (!cardNames.empty()) {
+            out << "\n- Sample cards: " << cardNames << ".";
+        }
+        if (cards.is_array() && !cards.empty()) {
+            const auto& first = cards[0];
+            if (first.is_object() && !firstStringAtPaths_(first, { "crop_url" }).empty()) {
+                out << "\n- Crop evidence is available in the operational ledger.";
+            }
+        }
+        return out.str();
+    }
+
+    if (focus == "history" && !operational.empty()) {
+        const auto scope = operational.value("scope", nlohmann::json::object());
+        const auto stats = operational.value("stats", nlohmann::json::object());
+        out << "## Operational history\n\n"
+            << "- Window: " << jsonStringOr_(scope, "label", "current operational window") << ".\n"
+            << "- Job runs: " << stats.value("structured_job_runs_in_window", 0) << ".\n"
+            << "- Step runs: " << stats.value("structured_step_runs_in_window", 0) << ".\n"
+            << "- Agent runs: " << stats.value("structured_agent_runs_in_window", 0) << ".\n"
+            << "- Camera sessions: " << stats.value("camera_sessions_in_window", 0) << ".\n"
+            << "- Identity cards: " << stats.value("identity_cards_in_window", 0) << ".";
+        return out.str();
+    }
 
     if (focus == "cameras") {
         const std::string cameraNames = joinNames_(
@@ -616,15 +898,22 @@ std::string buildStateAnalysisSystemPrompt_()
     std::ostringstream out;
     out
         << "/no_think\n"
-        << "You answer questions about the current live app state for the desktop assistant.\n"
+        << "You answer questions about the current app state and recent operational history for the desktop assistant.\n"
         << "Use only current_state from the user prompt.\n"
-        << "camera_inventory.items contains the detailed camera fields such as ip_address, manufacturer, connection_method, channel, subtype, scene_description, and service status.\n"
-        << "current_state.jobs.items, current_state.camera_agents.items, and current_state.job_agents.items contain the live job and agent records available right now.\n"
+        << "When current_state.live_state is present, it contains the live app configuration and runtime summary.\n"
+        << "live_state.camera_inventory.items contains detailed camera fields such as ip_address, manufacturer, connection_method, channel, subtype, scene_description, and service status.\n"
+        << "live_state.jobs.items, live_state.camera_agents.items, and live_state.job_agents.items contain the live job and agent records available right now.\n"
+        << "When current_state.operational_context is present, it contains time-windowed app/database history for the current request.\n"
+        << "operational_context.scope describes the analyzed window, and operational_context.resolved_entities maps the user's words to cameras, jobs, steps, and agents.\n"
+        << "operational_context.history contains recent job runs, step runs, agent runs, camera sessions, alerts, identity cards, and connectivity incidents.\n"
+        << "operational_context.details.identity_cards contains the richest persisted identity-card rows, including crop_url, crop_storage_key, job_run_id, step_run_id, agent_run_id, resolved_identity, and card when those fields exist.\n"
+        << "For questions about yesterday, historical activity, persisted runs, identity cards, crops, or operational linkage, prefer operational_context first.\n"
+        << "For questions about current inventory, configuration, balances, or live enablement, prefer live_state first.\n"
         << "If the user asks which items match a condition, filter the arrays and list only the matching items.\n"
         << "If the user asks how many match, give the count first.\n"
         << "If nothing matches, say that explicitly.\n"
-        << "If a requested field is missing from current_state, say that the current state payload does not expose it.\n"
-        << "Never invent cameras, jobs, agents, or settings.\n"
+        << "If a requested field is missing from both live_state and operational_context, say that the current app state does not expose it.\n"
+        << "Never invent cameras, jobs, agents, identity cards, runs, or settings.\n"
         << "Never mention JSON, payloads, routers, endpoints, or internal tools.\n"
         << "Keep the answer concise, factual, and user-facing.\n";
     return out.str();
@@ -655,12 +944,30 @@ std::string analyzeStateWithLlm_(
         buildStateAnalysisSystemPrompt_(),
         promptPayload.dump(2),
         0.0,
-        760,
+        980,
         20000,
         1,
         false);
 
     return outcome.ok ? trimCopy_(outcome.content) : std::string();
+}
+
+std::string buildOperationalContextFailureAnswer_(
+    const std::string& language,
+    const std::string& error)
+{
+    const std::string normalizedLanguage = normalizeAssistantLanguageTag(language);
+    if (normalizedLanguage == "pt") {
+        if (!error.empty()) {
+            return "Consegui ler o estado atual, mas nao consegui carregar o historico operacional completo agora. Detalhe: " + error + ".";
+        }
+        return "Consegui ler o estado atual, mas nao consegui carregar o historico operacional completo agora.";
+    }
+
+    if (!error.empty()) {
+        return "I could read the live app state, but I could not load the full operational history right now. Detail: " + error + ".";
+    }
+    return "I could read the live app state, but I could not load the full operational history right now.";
 }
 
 } // namespace
@@ -669,7 +976,7 @@ SkillDefinition ReadStateSkill::definition() const
 {
     return SkillDefinition{
         "read_state",
-        "Reads cameras, jobs, agents, balances, and configs.",
+        "Reads live state plus recent operational history, runs, identity cards, balances, and configs.",
         true,
     };
 }
@@ -697,6 +1004,16 @@ SkillRunResult ReadStateSkill::execute(
     const bool wantsLeadingZeroIpAudit = queryRequestsLeadingZeroIpAudit_(query);
     const bool hasDetailedCameraInventory =
         cameraInventory.is_array() && !cameraInventory.empty();
+    const bool wantsOperationalContext = queryNeedsOperationalContext_(query);
+    std::string operationalContextError;
+    nlohmann::json operationalContext = nlohmann::json::object();
+    if (wantsOperationalContext) {
+        operationalContext = fetchOperationalContext_(
+            agent,
+            payload,
+            progressLanguage,
+            &operationalContextError);
+    }
 
     if (wantsLeadingZeroIpAudit && hasDetailedCameraInventory) {
         result.status = SkillExecutionStatus::Completed;
@@ -717,7 +1034,23 @@ SkillRunResult ReadStateSkill::execute(
     const std::string url =
         agent.getBackendBaseUrl() + "/api/agent/orchestrator/state?client_id=" + agent.getClientId();
     const HttpResponse response = getUrl(url, agent.getExeToken(), {}, 6000);
-    if (!response.ok()) {
+    const bool hasOperationalContext =
+        operationalContext.is_object() && !operationalContext.empty();
+    nlohmann::json state = nlohmann::json::object();
+    if (response.ok()) {
+        state = nlohmann::json::parse(response.body, nullptr, false);
+        if (!state.is_object()) {
+            if (!hasOperationalContext) {
+                result.status = SkillExecutionStatus::Failed;
+                result.error = "invalid_state_payload";
+                result.answer = "I received an invalid payload while trying to read the current app state.";
+                return result;
+            }
+            state = nlohmann::json::object();
+            result.metadata["live_state_error"] = "invalid_state_payload";
+        }
+    }
+    else if (!hasOperationalContext) {
         result.status = SkillExecutionStatus::Failed;
         result.error = response.error.empty()
             ? ("http_status_" + std::to_string(response.statusCode))
@@ -725,13 +1058,10 @@ SkillRunResult ReadStateSkill::execute(
         result.answer = "I could not check the live app state right now. Please try again in a moment.";
         return result;
     }
-
-    const nlohmann::json state = nlohmann::json::parse(response.body, nullptr, false);
-    if (!state.is_object()) {
-        result.status = SkillExecutionStatus::Failed;
-        result.error = "invalid_state_payload";
-        result.answer = "I received an invalid payload while trying to read the current app state.";
-        return result;
+    else {
+        result.metadata["live_state_error"] = response.error.empty()
+            ? nlohmann::json("http_status_" + std::to_string(response.statusCode))
+            : nlohmann::json(response.error);
     }
 
     LocalLlmClient llm;
@@ -743,7 +1073,14 @@ SkillRunResult ReadStateSkill::execute(
         result.answer = buildLeadingZeroIpAuditAnswer_(cameraInventory, progressLanguage);
     }
     else {
-        const nlohmann::json stateForAnalysis = buildStateForAnalysis_(state, cameraInventory);
+        nlohmann::json stateForAnalysis = buildStateForAnalysis_(state, cameraInventory);
+        if (hasOperationalContext) {
+            stateForAnalysis = nlohmann::json::object({
+                { "live_state", std::move(stateForAnalysis) },
+                { "operational_context", buildOperationalContextForAnalysis_(operationalContext) },
+            });
+        }
+
         result.answer = analyzeStateWithLlm_(
             llm,
             payload,
@@ -753,7 +1090,19 @@ SkillRunResult ReadStateSkill::execute(
             stateForAnalysis);
 
         if (result.answer.empty()) {
-            result.answer = buildFocusedAnswer_(state, focus, cameraInventory);
+            if (wantsOperationalContext && !hasOperationalContext && !operationalContextError.empty()) {
+                result.answer = buildOperationalContextFailureAnswer_(
+                    progressLanguage,
+                    operationalContextError);
+            }
+            else {
+                result.answer = buildFocusedAnswer_(stateForAnalysis, focus, cameraInventory);
+            }
+        }
+
+        result.metadata["has_operational_context"] = hasOperationalContext;
+        if (!operationalContextError.empty()) {
+            result.metadata["operational_context_error"] = operationalContextError;
         }
     }
 

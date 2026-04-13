@@ -48,7 +48,7 @@ type UpsertStructuredAgentErrorLogInput = {
 };
 
 export type IdentityCardOccurrenceDraft = {
-  chatSessionId: number;
+  chatSessionId: number | null;
   commandId?: number | null;
   occurrenceId?: string | null;
   identityCardId?: string | null;
@@ -517,6 +517,8 @@ export function extractOperationalCorrelationIds(input: {
         input.identityCardId,
         details?.identity_card_id,
         details?.identityCardId,
+        details?.primary_identity_card_id,
+        details?.primaryIdentityCardId,
         details?.card_id
       ),
       160
@@ -1963,6 +1965,18 @@ export async function persistIdentityCardOccurrences(
 ): Promise<void> {
   const nowIso = input.nowIso || new Date().toISOString();
   for (const [index, draft] of input.drafts.entries()) {
+    const occurrenceScopeId =
+      truncateText(
+        draft.chatSessionId !== null && draft.chatSessionId !== undefined
+          ? String(draft.chatSessionId)
+          : readNonEmptyString(
+              draft.sourceEventId,
+              draft.agentRunId,
+              draft.stepRunId,
+              draft.jobRunId
+            ),
+        160
+      ) || "operational";
     const card = draft.card;
     const primaryPortrait = asRecord(card.primary_portrait);
     const contextPortrait = asRecord(card.context_portrait);
@@ -1978,7 +1992,7 @@ export async function persistIdentityCardOccurrences(
       truncateText(draft.occurrenceId || null, 160) ||
       buildDeterministicId(
         "icard",
-        draft.chatSessionId,
+        occurrenceScopeId,
         draft.commandId || 0,
         identityCardId,
         index
@@ -2001,7 +2015,7 @@ export async function persistIdentityCardOccurrences(
         const extension = parsedPortrait.contentType.includes("png") ? ".png" : ".jpg";
         cropStorageKey =
           `identity-cards/${sanitizePathSegment(input.userId, "user")}` +
-          `/sessions/${sanitizePathSegment(draft.chatSessionId, "session")}` +
+          `/sessions/${sanitizePathSegment(occurrenceScopeId, "session")}` +
           `/cards/${sanitizePathSegment(identityCardId, "card")}` +
           `/${Date.now()}_${sanitizePathSegment(index, "0")}${extension}`;
         await input.bucket.put(cropStorageKey, bytes, {
@@ -2083,7 +2097,7 @@ export async function persistIdentityCardOccurrences(
         occurrenceId,
         identityCardId,
         input.userId,
-        draft.chatSessionId,
+        draft.chatSessionId ?? null,
         cameraId,
         cameraName,
         truncateText(draft.sourceType || "chat_response", 64),

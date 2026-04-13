@@ -27,6 +27,9 @@ Name: "{autodesktop}\{#MyShortcutName}"; Filename: "{app}\{#MyExeName}"; Working
 [Tasks]
 Name: "desktopicon"; Description: "Create desktop shortcuts"; GroupDescription: "Additional icons:"
 
+[Run]
+Filename: "{app}\{#MyExeName}"; Description: "Abrir {#MyAppName}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
 [Code]
 const
   WindowsAppRuntimeInstallerFileName = 'WindowsAppRuntimeInstall-x64.exe';
@@ -275,6 +278,16 @@ end;
 procedure InitializeWizard();
 begin
   InitializeLlmInstallDialog();
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpFinished then
+  begin
+    WizardForm.FinishedHeadingLabel.Caption := 'Instalacao concluida';
+    WizardForm.FinishedLabel.Caption := 'Clique em Concluir para sair do instalador.';
+    WizardForm.NextButton.Caption := '&Concluir';
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

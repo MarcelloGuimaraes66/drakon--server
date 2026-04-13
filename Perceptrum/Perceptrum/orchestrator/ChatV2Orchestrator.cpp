@@ -476,6 +476,62 @@ bool shouldUseReadStateForCameraInventory_(
         });
 }
 
+bool hasIdentityCardCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "identity card", "identity cards", "id card", "id cards",
+        "card de identidade", "cards de identidade",
+        "identidade", "identidades", "crop", "crops"
+    });
+}
+
+bool hasOperationalHistoryCue_(const std::string& normalized)
+{
+    return containsAny_(normalized, {
+        "history", "historico", "ledger", "audit", "auditoria",
+        "timeline", "recent", "recently", "yesterday", "ontem",
+        "job run", "job runs", "step run", "step runs",
+        "agent run", "agent runs", "camera session", "camera sessions",
+        "session", "sessions"
+    });
+}
+
+bool shouldUseReadStateForOperationalHistory_(
+    const std::string& normalized,
+    const RoutingLexiconSignals& signals)
+{
+    if (signals.wantsCreate || signals.wantsEdit || signals.wantsStart || signals.wantsStop) {
+        return false;
+    }
+
+    if (isReportGenerationRequest_(normalized)) {
+        return false;
+    }
+
+    const bool asksIdentityCards = hasIdentityCardCue_(normalized);
+    const bool asksOperationalHistory = hasOperationalHistoryCue_(normalized);
+    const bool looksLikeFootageObservation =
+        hasVideoMediumCue_(normalized) &&
+        (hasObservationCue_(normalized) || hasQuickPresenceCue_(normalized)) &&
+        !asksIdentityCards &&
+        !hasConnectionConfigCue_(normalized);
+
+    if (looksLikeFootageObservation) {
+        return false;
+    }
+
+    if (asksIdentityCards) {
+        return true;
+    }
+
+    if ((signals.mentionsJob || signals.mentionsStep || signals.mentionsCameraAgent) &&
+        (signals.wantsRead || asksOperationalHistory || normalized.find('?') != std::string::npos)) {
+        return true;
+    }
+
+    return signals.mentionsCamera && asksOperationalHistory;
+}
+
 bool shouldUseEditCamerasBatch_(
     const SkillSelection& selection,
     const std::string& normalized,
@@ -902,6 +958,20 @@ SkillSelection applyRoutingLexiconCorrections_(
             clearRuntimeActionArgument();
             return selection;
         }
+    }
+
+    if (shouldUseReadStateForOperationalHistory_(normalizedMessage, signals)) {
+        selection.selectedSkill = "read_state";
+        selection.mode = "read";
+        selection.entity = "state";
+        selection.intent = "read";
+        selection.operationType.clear();
+        selection.groundingRequired = false;
+        selection.confidence = (std::max)(selection.confidence, 0.94);
+        selection.reason = "operational_history_read_request";
+        selection.replyPreview = "Vou analisar o historico operacional.";
+        clearRuntimeActionArgument();
+        return selection;
     }
 
     return selection;

@@ -59,6 +59,66 @@ using json = nlohmann::json;
 
 namespace fs = std::filesystem;
 
+static bool jsonBoolLikeCamera_(const nlohmann::json& value, bool fallback = false)
+{
+    try {
+        if (value.is_boolean()) return value.get<bool>();
+        if (value.is_number_integer()) return value.get<int>() != 0;
+        if (value.is_number()) return std::abs(value.get<double>()) > 1e-9;
+        if (value.is_string()) {
+            std::string normalized = value.get<std::string>();
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+                });
+            if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+                return true;
+            }
+            if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+                return false;
+            }
+        }
+    }
+    catch (...) {
+    }
+    return fallback;
+}
+
+static bool isAlertChannelEnabledForAlgorithmCamera_(
+    const AlgorithmConfig& algo,
+    const std::string& channelName)
+{
+    if (!algo.alertChannels.is_object()) {
+        return false;
+    }
+
+    const auto directIt = algo.alertChannels.find(channelName);
+    if (directIt != algo.alertChannels.end()) {
+        const nlohmann::json& channel = *directIt;
+        if (channel.is_object() && channel.contains("enabled")) {
+            return jsonBoolLikeCamera_(channel["enabled"], false);
+        }
+        return jsonBoolLikeCamera_(channel, false);
+    }
+
+    std::string normalizedChannel = channelName;
+    std::transform(normalizedChannel.begin(), normalizedChannel.end(), normalizedChannel.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+        });
+    for (auto it = algo.alertChannels.begin(); it != algo.alertChannels.end(); ++it) {
+        std::string candidate = it.key();
+        std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+            });
+        if (candidate != normalizedChannel) continue;
+        if (it.value().is_object() && it.value().contains("enabled")) {
+            return jsonBoolLikeCamera_(it.value()["enabled"], false);
+        }
+        return jsonBoolLikeCamera_(it.value(), false);
+    }
+
+    return false;
+}
+
 static std::wstring utf8ToWide(const std::string& str);
 static std::string getExecutableDir();
 
@@ -6120,6 +6180,14 @@ std::string build_multi_algo_question(
 
 
 
+void CameraSession::updateTelegramSettings(bool enabled, std::string botToken, std::string chatId)
+{
+    std::lock_guard<std::mutex> lock(algorithmsMutex_);
+    config_.telegramEnabled = enabled;
+    config_.telegramBotToken = std::move(botToken);
+    config_.telegramChatId = std::move(chatId);
+}
+
 void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
 {
     using TemporalEvidenceTrail = std::deque<CameraSession::TemporalEvidenceItem>;
@@ -7207,9 +7275,13 @@ void CameraSession::inferenceLoop_() {
                             ? customAlgo.temporalPlanEnvelope
                             : nlohmann::json::object();
                         temporalSlot.state = temporal::defaultState();
+                        temporalSlot.visualState = nlohmann::json::object();
                     }
                     if (!temporalSlot.state.is_object() || temporalSlot.state.empty()) {
                         temporalSlot.state = temporal::defaultState();
+                    }
+                    if (!temporalSlot.visualState.is_object()) {
+                        temporalSlot.visualState = nlohmann::json::object();
                     }
                     temporalSlot.promptHash = temporalPromptHash;
 
@@ -7393,6 +7465,22 @@ void CameraSession::inferenceLoop_() {
                         }
                     }
 
+                    const bool identityCardsMaterialized =
+                        owner_ &&
+                        owner_->materializeOperationalIdentityCards(
+                            primaryHit,
+                            temporalSlot.state,
+                            temporalSlot.visualState,
+                            config_.id,
+                            "CameraSession::inferenceLoop_(image)"
+                        );
+                    if (identityCardsMaterialized) {
+                        temporalSlot.touchedAt = std::chrono::steady_clock::now();
+                        temporalSlot.promptHash = temporalPromptHash;
+                        std::lock_guard<std::mutex> lock(temporalMutex_);
+                        temporalByAlgo_[temporalSlotKey] = temporalSlot;
+                    }
+
                     const std::string cameraAgentEventAtUtc =
                         !primaryHit.eventTimestampUtcIso.empty()
                             ? primaryHit.eventTimestampUtcIso
@@ -7422,6 +7510,13 @@ void CameraSession::inferenceLoop_() {
                         cameraAgentResultDetails["decision_source"] = decisionSource;
                         cameraAgentResultDetails["llm_alert_condition"] = llmAlertCondition;
                         cameraAgentResultDetails["final_alert_condition"] = finalAlert;
+                        if (!primaryHit.primaryIdentityCardId.empty()) {
+                            cameraAgentResultDetails["primary_identity_card_id"] =
+                                primaryHit.primaryIdentityCardId;
+                        }
+                        if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                            cameraAgentResultDetails["identity_cards"] = primaryHit.identityCards;
+                        }
                         cameraAgentResultDetails["prompt_tokens"] = primaryPromptTokens;
                         cameraAgentResultDetails["output_tokens"] = primaryOutputTokens;
                         cameraAgentResultDetails["total_tokens"] = primaryTotalTokens;
@@ -7468,6 +7563,13 @@ void CameraSession::inferenceLoop_() {
                         reportDetails["decision_source"] = decisionSource;
                         reportDetails["llm_alert_condition"] = llmAlertCondition;
                         reportDetails["final_alert_condition"] = finalAlert;
+                        if (!primaryHit.primaryIdentityCardId.empty()) {
+                            reportDetails["primary_identity_card_id"] =
+                                primaryHit.primaryIdentityCardId;
+                        }
+                        if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                            reportDetails["identity_cards"] = primaryHit.identityCards;
+                        }
                         reportDetails["prompt_tokens"] = primaryPromptTokens;
                         reportDetails["output_tokens"] = primaryOutputTokens;
                         reportDetails["total_tokens"] = primaryTotalTokens;
@@ -7528,6 +7630,12 @@ void CameraSession::inferenceLoop_() {
                         extra["agent_run_id"] = cameraAgentRunId;
                         extra["agent_label"] = eventDisplayName;
                         extra["answer"] = primaryHit.answer;
+                        if (!primaryHit.primaryIdentityCardId.empty()) {
+                            extra["primary_identity_card_id"] = primaryHit.primaryIdentityCardId;
+                        }
+                        if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                            extra["identity_cards"] = primaryHit.identityCards;
+                        }
                         if (!config_.cameraSessionId.empty()) {
                             extra["camera_session_id"] = config_.cameraSessionId;
                         }
@@ -7668,6 +7776,61 @@ void CameraSession::inferenceLoop_() {
 
                 }
             }
+
+            auto buildTelegramSettingsSnapshot = [&]() {
+                TelegramSettings ts;
+                std::lock_guard<std::mutex> lock(algorithmsMutex_);
+                if (config_.telegramEnabled &&
+                    !config_.telegramBotToken.empty() &&
+                    !config_.telegramChatId.empty())
+                {
+                    ts.enabled = true;
+                    ts.profile = "camera_" + config_.id;
+                    ts.chat_id = config_.telegramChatId;
+                    ts.bot_token = config_.telegramBotToken;
+                }
+                return ts;
+                };
+
+            auto sendTelegramAlertForAlgorithm = [&](const AlgorithmConfig& algo,
+                const std::string& alertClipPath,
+                const std::string& caption)
+            {
+                if (!isAlertChannelEnabledForAlgorithmCamera_(algo, "telegram")) {
+                    return;
+                }
+                if (alertClipPath.empty()) {
+                    Logger::instance().logDebug(
+                        config_.id,
+                        "Telegram alert skipped because clip path is empty for algo=" + algo.type
+                    );
+                    return;
+                }
+
+                TelegramSettings ts = buildTelegramSettingsSnapshot();
+                if (!ts.enabled) {
+                    Logger::instance().logDebug(
+                        config_.id,
+                        "Telegram alert skipped because Telegram integration is not configured for algo=" + algo.type
+                    );
+                    return;
+                }
+
+                std::string err;
+                const bool ok = TelegramNotifier::SendDocument(ts, alertClipPath, caption, &err);
+                if (!ok) {
+                    Logger::instance().logDebug(
+                        config_.id,
+                        "Telegram SendDocument failed for algo=" + algo.type + ": " + err
+                    );
+                }
+                else {
+                    Logger::instance().logDebug(
+                        config_.id,
+                        "Telegram alert sent successfully for algo=" + algo.type
+                    );
+                }
+                };
 
 
             /*
@@ -7941,6 +8104,13 @@ void CameraSession::inferenceLoop_() {
                             if (owner_) {
                                 std::string display =
                                     algoDisplayNames.count(algoType) ? algoDisplayNames[algoType] : algoType;
+                                const AlgorithmConfig* matchedAlgoConfig = nullptr;
+                                for (const auto& configuredAlgo : algosCopy) {
+                                    if (configuredAlgo.type == algoType) {
+                                        matchedAlgoConfig = &configuredAlgo;
+                                        break;
+                                    }
+                                }
 
                                 // ? If faceid matched, append the name so the frontend receives it immediately
                                 if (algoType == "faceid" && !matchedFaceTargetName.empty()) {
@@ -7955,48 +8125,13 @@ void CameraSession::inferenceLoop_() {
                                     "video",
                                     videoB64
                                 );
-
-
-
-                                // ------------- send telegram ----------------
-                                if (config_.telegramEnabled &&
-                                    !config_.telegramBotToken.empty() &&
-                                    !config_.telegramChatId.empty())
-                                {
-                                    TelegramSettings ts;
-                                    ts.enabled = true;
-                                    ts.profile = "camera_" + config_.id;   // just a label
-                                    ts.chat_id = config_.telegramChatId;
-                                    ts.bot_token = config_.telegramBotToken;
-
-                                    // Same info that the frontend sees, compact
-                                    std::string caption =
+                                if (matchedAlgoConfig != nullptr) {
+                                    const std::string caption =
                                         "Camera: " + config_.name +
                                         " | Evento: " + display +
                                         " | " + timestampIso;
-
-                                    std::string err;
-                                    bool ok = TelegramNotifier::SendDocument(
-                                        ts,
-                                        clipPath,   // the 10s MP4 we just processed
-                                        caption,
-                                        &err
-                                    );
-
-                                    if (!ok) {
-                                        Logger::instance().logDebug(
-                                            config_.id,
-                                            "Telegram SendDocument failed: " + err
-                                        );
-                                    }
-                                    else {
-                                        Logger::instance().logDebug(
-                                            config_.id,
-                                            "Telegram: alert sent successfully for algo=" + algoType
-                                        );
-                                    }
+                                    sendTelegramAlertForAlgorithm(*matchedAlgoConfig, clipPath, caption);
                                 }
-
 
                             }
                         }
@@ -8573,6 +8708,7 @@ void CameraSession::inferenceLoop_() {
                                 ? customAlgo.temporalPlanEnvelope
                                 : nlohmann::json::object();
                             temporalSlot.state = temporal::defaultState();
+                            temporalSlot.visualState = nlohmann::json::object();
                             {
                                 std::lock_guard<std::mutex> lock(temporalMutex_);
                                 this->temporalEvidenceByAlgo_[temporalSlotKey].clear();
@@ -8580,6 +8716,9 @@ void CameraSession::inferenceLoop_() {
                         }
                         if (!temporalSlot.state.is_object() || temporalSlot.state.empty()) {
                             temporalSlot.state = temporal::defaultState();
+                        }
+                        if (!temporalSlot.visualState.is_object()) {
+                            temporalSlot.visualState = nlohmann::json::object();
                         }
                         temporalSlot.promptHash = temporalPromptHash;
 
@@ -8783,6 +8922,22 @@ void CameraSession::inferenceLoop_() {
                             }
                         }
 
+                        const bool identityCardsMaterialized =
+                            owner_ &&
+                            owner_->materializeOperationalIdentityCards(
+                                primaryHit,
+                                temporalSlot.state,
+                                temporalSlot.visualState,
+                                config_.id,
+                                "CameraSession::inferenceLoop_(video)"
+                            );
+                        if (identityCardsMaterialized) {
+                            temporalSlot.touchedAt = std::chrono::steady_clock::now();
+                            temporalSlot.promptHash = temporalPromptHash;
+                            std::lock_guard<std::mutex> lock(temporalMutex_);
+                            temporalByAlgo_[temporalSlotKey] = temporalSlot;
+                        }
+
                         const std::string cameraAgentEventAtUtc =
                             !primaryHit.eventTimestampUtcIso.empty()
                                 ? primaryHit.eventTimestampUtcIso
@@ -8824,6 +8979,13 @@ void CameraSession::inferenceLoop_() {
                             cameraAgentResultDetails["decision_source"] = decisionSource;
                             cameraAgentResultDetails["llm_alert_condition"] = llmAlertCondition;
                             cameraAgentResultDetails["final_alert_condition"] = finalAlert;
+                            if (!primaryHit.primaryIdentityCardId.empty()) {
+                                cameraAgentResultDetails["primary_identity_card_id"] =
+                                    primaryHit.primaryIdentityCardId;
+                            }
+                            if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                                cameraAgentResultDetails["identity_cards"] = primaryHit.identityCards;
+                            }
                             cameraAgentResultDetails["prompt_tokens"] = primaryPromptTokens;
                             cameraAgentResultDetails["output_tokens"] = primaryOutputTokens;
                             cameraAgentResultDetails["total_tokens"] = primaryTotalTokens;
@@ -8893,6 +9055,13 @@ void CameraSession::inferenceLoop_() {
                             reportDetails["decision_source"] = decisionSource;
                             reportDetails["llm_alert_condition"] = llmAlertCondition;
                             reportDetails["final_alert_condition"] = finalAlert;
+                            if (!primaryHit.primaryIdentityCardId.empty()) {
+                                reportDetails["primary_identity_card_id"] =
+                                    primaryHit.primaryIdentityCardId;
+                            }
+                            if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                                reportDetails["identity_cards"] = primaryHit.identityCards;
+                            }
                             reportDetails["prompt_tokens"] = primaryPromptTokens;
                             reportDetails["output_tokens"] = primaryOutputTokens;
                             reportDetails["total_tokens"] = primaryTotalTokens;
@@ -8960,6 +9129,12 @@ void CameraSession::inferenceLoop_() {
                             extra["agent_run_id"] = cameraAgentRunId;
                             extra["agent_label"] = eventDisplayName;
                             extra["answer"] = primaryHit.answer;
+                            if (!primaryHit.primaryIdentityCardId.empty()) {
+                                extra["primary_identity_card_id"] = primaryHit.primaryIdentityCardId;
+                            }
+                            if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                                extra["identity_cards"] = primaryHit.identityCards;
+                            }
                             if (!config_.cameraSessionId.empty()) {
                                 extra["camera_session_id"] = config_.cameraSessionId;
                             }
@@ -9026,6 +9201,16 @@ void CameraSession::inferenceLoop_() {
                                     "video",
                                     videoB64,
                                     extra
+                                );
+
+                                const std::string caption =
+                                    "Camera: " + config_.name +
+                                    " | Evento: " + eventDisplayName +
+                                    " | " + timestampIso;
+                                sendTelegramAlertForAlgorithm(
+                                    customAlgo,
+                                    primarySegment.sourceFilePath,
+                                    caption
                                 );
                             }
                         }

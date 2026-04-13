@@ -2,6 +2,7 @@ import { useLocation, useParams, useNavigate, useSearchParams } from "react-rout
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
+import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import CameraCustomAgentEditorModal, {
   type CameraAgentEditorTarget,
   type CameraCustomAgentRow,
@@ -13,7 +14,7 @@ import {
   emitOpenAiKeyRequiredPrompt,
   isOpenAiKeyRequiredError,
 } from "@/react-app/utils/openAiKeyGuard";
-import { Algorithm, ReIDTarget } from "@/shared/types";
+import { Algorithm, ReIDTarget, type AlertChannels } from "@/shared/types";
 import { ArrowLeft, Cpu, Plus, Trash2, MapPin, X, Pencil, Upload, AlertCircle, Sparkles } from "lucide-react";
 
 // Algorithm state structure - keyed by algorithm_type
@@ -23,6 +24,7 @@ type AlgorithmState = {
     llm_prompt?: string | null;
     image_region?: string | null;
     config_json?: any | null;
+    alert_channels?: AlertChannels;
   };
 };
 
@@ -49,6 +51,7 @@ type CustomAlgorithm = {
   face_target_ids: number[];
   negative_reference_images: Array<{ id: number; image_url: string }>;
   analysis_regions: unknown[];
+  alert_channels: AlertChannels;
 };
 
 type FaceIdTarget = ReIDTarget & {
@@ -82,6 +85,111 @@ const AGENT_TUTORIAL_COMPLETION_STEPS = new Set([
   "agent-execution",
   "agent-save",
 ]);
+
+function TelegramIcon({ className = "w-4 h-4" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+      <path d="M21.2 4.36c.84-.33 1.64.42 1.37 1.28l-3.02 9.66c-.3.97-.64 1.9-1.74 1.9-.54 0-1.08-.2-1.64-.61l-2.72-2-1.46 1.41c-.53.52-.92.9-1.67.9-.88 0-1.25-.62-1.49-1.4L7.3 12.1l-2.9-.9c-.84-.26-.9-1.43-.09-1.77L21.2 4.36Zm-12 7.38 1.51 4.96.19-2.96 6.48-5.93-8.18 3.93Z" />
+    </svg>
+  );
+}
+
+type TelegramAlertButtonProps = {
+  enabled: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  title: string;
+};
+
+function TelegramAlertButton({
+  enabled,
+  disabled = false,
+  onClick,
+  title,
+}: TelegramAlertButtonProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={title}
+      className={`inline-flex h-9 w-9 items-center justify-center rounded-lg border transition-colors ${
+        enabled
+          ? "border-sky-400/40 bg-sky-500/15 text-sky-300 hover:bg-sky-500/20"
+          : "border-transparent bg-transparent text-gray-500 hover:border-sky-500/20 hover:bg-sky-500/10 hover:text-sky-300"
+      } ${disabled ? "cursor-not-allowed opacity-50" : ""}`}
+    >
+      <TelegramIcon className="h-4 w-4" />
+    </button>
+  );
+}
+
+const normalizeAlertChannelEnabled = (value: unknown, fallback = false): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+  }
+  return fallback;
+};
+
+const normalizeAlertChannels = (value: unknown): AlertChannels => {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const out: AlertChannels = {};
+  for (const [rawChannel, rawConfig] of Object.entries(parsed as Record<string, unknown>)) {
+    const channel = rawChannel.trim().toLowerCase();
+    if (!channel) continue;
+    const normalizedConfig =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? { ...(rawConfig as Record<string, unknown>) }
+        : {};
+    const enabledSource =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? (rawConfig as Record<string, unknown>).enabled
+        : rawConfig;
+    normalizedConfig.enabled = normalizeAlertChannelEnabled(enabledSource, false);
+    out[channel] = normalizedConfig;
+  }
+
+  return out;
+};
+
+const isTelegramAlertEnabled = (value: unknown): boolean =>
+  !!normalizeAlertChannels(value)?.telegram?.enabled;
+
+const buildNextAlertChannels = (
+  value: unknown,
+  channel: "telegram",
+  enabled: boolean
+): AlertChannels => {
+  const next = normalizeAlertChannels(value);
+  next[channel] = {
+    ...(next[channel] || {}),
+    enabled,
+  };
+  return next;
+};
 
 export default function Algorithms() {
   const { t } = useTranslation();
@@ -142,6 +250,10 @@ export default function Algorithms() {
   const [publishingCustomAgent, setPublishingCustomAgent] = useState<CustomAlgorithm | null>(null);
   const [publishingToHub, setPublishingToHub] = useState(false);
   const [hubPublishError, setHubPublishError] = useState<string | null>(null);
+  const [telegramRegistered, setTelegramRegistered] = useState(false);
+  const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
+  const [telegramSetupPromptAgent, setTelegramSetupPromptAgent] = useState<string | null>(null);
+  const [savingAlertKey, setSavingAlertKey] = useState<string | null>(null);
   const customEditorTarget: CameraAgentEditorTarget | null =
     numericCameraId > 0
       ? {
@@ -161,6 +273,28 @@ export default function Algorithms() {
 
   const dismissToast = (id: number) => {
     setToasts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const getAlertSaveKey = (agentKey: string | number) => `telegram:${String(agentKey)}`;
+
+  const fetchTelegramRegistration = async () => {
+    setTelegramStatusLoading(true);
+    try {
+      const response = await fetch("/api/telegram-settings");
+      const data = await response.json().catch(() => ({}));
+      const configured =
+        !!data?.enabled &&
+        typeof data?.chat_id === "string" &&
+        data.chat_id.trim().length > 0 &&
+        typeof data?.bot_token === "string" &&
+        data.bot_token.trim().length > 0;
+      setTelegramRegistered(configured);
+    } catch (error) {
+      console.error("Failed to fetch Telegram registration:", error);
+      setTelegramRegistered(false);
+    } finally {
+      setTelegramStatusLoading(false);
+    }
   };
 
   const openHubAgentBrowser = () => {
@@ -237,6 +371,7 @@ export default function Algorithms() {
       fetchCustomAlgorithms();
       fetchReIDTargets();
       fetchFaceIdTargets();
+      fetchTelegramRegistration();
     }
   }, [cameraId]);
 
@@ -262,6 +397,7 @@ export default function Algorithms() {
             llm_prompt: alg.llm_prompt || null,
             image_region: alg.image_region || null,
             config_json: alg.config_json ? JSON.parse(alg.config_json) : null,
+            alert_channels: normalizeAlertChannels(alg.alert_channels),
           };
         });
 
@@ -273,6 +409,7 @@ export default function Algorithms() {
             llm_prompt: null,
             image_region: null,
             config_json: null,
+            alert_channels: {},
           };
         }
       });
@@ -392,6 +529,7 @@ export default function Algorithms() {
               : [],
             negative_reference_images: negativeReferenceImages,
             analysis_regions: Array.isArray(row?.analysis_regions) ? row.analysis_regions : [],
+            alert_channels: normalizeAlertChannels(row?.alert_channels),
           } as CustomAlgorithm;
         })
         .filter(Boolean) as CustomAlgorithm[];
@@ -685,6 +823,171 @@ export default function Algorithms() {
         error instanceof Error ? error.message : "Failed to update custom agent",
         "destructive"
       );
+    }
+  };
+
+  const openTelegramSetupPrompt = (agentName: string) => {
+    setTelegramSetupPromptAgent(agentName);
+  };
+
+  const goToTelegramSettings = () => {
+    setTelegramSetupPromptAgent(null);
+    navigate("/settings/alerts", {
+      state: {
+        returnTo: currentAlgorithmsPath,
+      },
+    });
+  };
+
+  const toggleAlgorithmTelegramAlert = async (
+    algorithmType: string,
+    algorithmName: string
+  ) => {
+    const currentState = algorithmState[algorithmType] || {
+      is_enabled: false,
+      llm_prompt: null,
+      image_region: null,
+      config_json: null,
+      alert_channels: {},
+    };
+    const nextEnabled = !isTelegramAlertEnabled(currentState.alert_channels);
+    if (nextEnabled && !telegramRegistered) {
+      openTelegramSetupPrompt(algorithmName);
+      return;
+    }
+
+    const nextAlertChannels = buildNextAlertChannels(
+      currentState.alert_channels,
+      "telegram",
+      nextEnabled
+    );
+    const saveKey = getAlertSaveKey(algorithmType);
+
+    setSavingAlertKey(saveKey);
+    setAlgorithmState((prev) => ({
+      ...prev,
+      [algorithmType]: {
+        ...currentState,
+        alert_channels: nextAlertChannels,
+      },
+    }));
+
+    try {
+      const requestBody: any = {
+        camera_id: Number(cameraId),
+        algorithm_type: algorithmType,
+        is_enabled: currentState.is_enabled ? 1 : 0,
+        alert_channels: nextAlertChannels,
+      };
+
+      if (currentState.llm_prompt) {
+        requestBody.llm_prompt = currentState.llm_prompt;
+      }
+      if (currentState.image_region) {
+        requestBody.image_region = currentState.image_region;
+      }
+      if (currentState.config_json) {
+        requestBody.config_json =
+          typeof currentState.config_json === "string"
+            ? currentState.config_json
+            : JSON.stringify(currentState.config_json);
+      }
+
+      const response = await fetch(`/api/cameras/${cameraId}/algorithms`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to update Telegram alerts");
+      }
+
+      showToast(
+        nextEnabled ? "Telegram alert enabled" : "Telegram alert disabled",
+        nextEnabled
+          ? `Telegram alerts are now enabled for ${algorithmName}.`
+          : `Telegram alerts are now disabled for ${algorithmName}.`
+      );
+    } catch (error) {
+      console.error("Failed to update algorithm Telegram alert:", error);
+      setAlgorithmState((prev) => ({
+        ...prev,
+        [algorithmType]: currentState,
+      }));
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to update Telegram alerts",
+        "destructive"
+      );
+    } finally {
+      setSavingAlertKey(null);
+    }
+  };
+
+  const toggleCustomAlgorithmTelegramAlert = async (custom: CustomAlgorithm) => {
+    const nextEnabled = !isTelegramAlertEnabled(custom.alert_channels);
+    if (nextEnabled && !telegramRegistered) {
+      openTelegramSetupPrompt(custom.display_name);
+      return;
+    }
+
+    const nextAlertChannels = buildNextAlertChannels(
+      custom.alert_channels,
+      "telegram",
+      nextEnabled
+    );
+    const saveKey = getAlertSaveKey(custom.id);
+
+    setSavingAlertKey(saveKey);
+    setCustomAlgorithms((prev) =>
+      prev.map((row) =>
+        row.id === custom.id
+          ? {
+              ...row,
+              alert_channels: nextAlertChannels,
+            }
+          : row
+      )
+    );
+
+    try {
+      const response = await fetch(`/api/cameras/${cameraId}/custom-agents/${custom.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alert_channels: nextAlertChannels }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.message || data?.error || "Failed to update Telegram alerts");
+      }
+
+      await fetchCustomAlgorithms();
+      showToast(
+        nextEnabled ? "Telegram alert enabled" : "Telegram alert disabled",
+        nextEnabled
+          ? `Telegram alerts are now enabled for ${custom.display_name}.`
+          : `Telegram alerts are now disabled for ${custom.display_name}.`
+      );
+    } catch (error) {
+      console.error("Failed to update custom agent Telegram alert:", error);
+      setCustomAlgorithms((prev) =>
+        prev.map((row) =>
+          row.id === custom.id
+            ? {
+                ...row,
+                alert_channels: custom.alert_channels,
+              }
+            : row
+        )
+      );
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to update Telegram alerts",
+        "destructive"
+      );
+    } finally {
+      setSavingAlertKey(null);
     }
   };
 
@@ -1076,6 +1379,20 @@ export default function Algorithms() {
             </div>
           ))}
         </div>
+        <ConfirmDialog
+          isOpen={telegramSetupPromptAgent !== null}
+          title="Telegram setup required"
+          message={
+            telegramSetupPromptAgent
+              ? `To enable Telegram alerts for ${telegramSetupPromptAgent}, first register your Telegram chat and bot in Settings > Alerts.`
+              : "To enable Telegram alerts for this agent, first register your Telegram chat and bot in Settings > Alerts."
+          }
+          confirmLabel="Go to Alerts"
+          cancelLabel="Not now"
+          variant="warning"
+          onCancel={() => setTelegramSetupPromptAgent(null)}
+          onConfirm={goToTelegramSettings}
+        />
 
         {/* Header */}
         <div className="mb-6 md:mb-8">
@@ -1246,6 +1563,7 @@ export default function Algorithms() {
               const negativeCount = Array.isArray(custom.negative_reference_images)
                 ? custom.negative_reference_images.length
                 : 0;
+              const telegramAlertEnabled = isTelegramAlertEnabled(custom.alert_channels);
               return (
                 <div
                   key={custom.id}
@@ -1280,6 +1598,16 @@ export default function Algorithms() {
                     </div>
 
                     <div className="flex items-center gap-2">
+                      <TelegramAlertButton
+                        enabled={telegramAlertEnabled}
+                        disabled={telegramStatusLoading || savingAlertKey === getAlertSaveKey(custom.id)}
+                        onClick={() => void toggleCustomAlgorithmTelegramAlert(custom)}
+                        title={
+                          telegramAlertEnabled
+                            ? `Disable Telegram alerts for ${custom.display_name}`
+                            : `Enable Telegram alerts for ${custom.display_name}`
+                        }
+                      />
                       <button
                         onClick={() => {
                           setHubPublishError(null);
@@ -1353,18 +1681,30 @@ export default function Algorithms() {
                 </p>
               </div>
               
-              <button
-                onClick={() => toggleAlgorithm(faceIdAlgorithm.id)}
-                className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ml-4 flex-shrink-0 ${
-                  algorithmState[faceIdAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
-                }`}
-              >
-                <span
-                  className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                    algorithmState[faceIdAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
-                  }`}
+              <div className="ml-4 flex items-center gap-2">
+                <TelegramAlertButton
+                  enabled={isTelegramAlertEnabled(algorithmState[faceIdAlgorithm.id]?.alert_channels)}
+                  disabled={telegramStatusLoading || savingAlertKey === getAlertSaveKey(faceIdAlgorithm.id)}
+                  onClick={() => void toggleAlgorithmTelegramAlert(faceIdAlgorithm.id, faceIdAlgorithm.name)}
+                  title={
+                    isTelegramAlertEnabled(algorithmState[faceIdAlgorithm.id]?.alert_channels)
+                      ? `Disable Telegram alerts for ${faceIdAlgorithm.name}`
+                      : `Enable Telegram alerts for ${faceIdAlgorithm.name}`
+                  }
                 />
-              </button>
+                <button
+                  onClick={() => toggleAlgorithm(faceIdAlgorithm.id)}
+                  className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
+                    algorithmState[faceIdAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
+                      algorithmState[faceIdAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
 
             {/* Face list */}
@@ -1535,6 +1875,7 @@ export default function Algorithms() {
         <div className="space-y-3 mb-6 md:mb-8">
           {simpleAlgorithms.map((algorithm) => {
             const state = algorithmState[algorithm.id] || { is_enabled: false };
+            const telegramAlertEnabled = isTelegramAlertEnabled(state.alert_channels);
             return (
               <div
                 key={algorithm.id}
@@ -1559,18 +1900,30 @@ export default function Algorithms() {
                     <p className="text-sm text-gray-400">{algorithm.description}</p>
                   </div>
 
-                  <button
-                    onClick={() => toggleAlgorithm(algorithm.id)}
-                    className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
-                      state.is_enabled ? "bg-blue-500" : "bg-gray-700"
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                        state.is_enabled ? "translate-x-7" : "translate-x-1"
-                      }`}
+                  <div className="flex items-center gap-2">
+                    <TelegramAlertButton
+                      enabled={telegramAlertEnabled}
+                      disabled={telegramStatusLoading || savingAlertKey === getAlertSaveKey(algorithm.id)}
+                      onClick={() => void toggleAlgorithmTelegramAlert(algorithm.id, algorithm.name)}
+                      title={
+                        telegramAlertEnabled
+                          ? `Disable Telegram alerts for ${algorithm.name}`
+                          : `Enable Telegram alerts for ${algorithm.name}`
+                      }
                     />
-                  </button>
+                    <button
+                      onClick={() => toggleAlgorithm(algorithm.id)}
+                      className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
+                        state.is_enabled ? "bg-blue-500" : "bg-gray-700"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
+                          state.is_enabled ? "translate-x-7" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
               </div>
             );
@@ -1601,18 +1954,30 @@ export default function Algorithms() {
                 </p>
               </div>
               
-              <button
-                onClick={() => toggleAlgorithm(intruderAlgorithm.id)}
-                className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ml-4 flex-shrink-0 ${
-                  algorithmState[intruderAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
-                }`}
-              >
-                <span
-                  className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                    algorithmState[intruderAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
-                  }`}
+              <div className="ml-4 flex items-center gap-2">
+                <TelegramAlertButton
+                  enabled={isTelegramAlertEnabled(algorithmState[intruderAlgorithm.id]?.alert_channels)}
+                  disabled={telegramStatusLoading || savingAlertKey === getAlertSaveKey(intruderAlgorithm.id)}
+                  onClick={() => void toggleAlgorithmTelegramAlert(intruderAlgorithm.id, intruderAlgorithm.name)}
+                  title={
+                    isTelegramAlertEnabled(algorithmState[intruderAlgorithm.id]?.alert_channels)
+                      ? `Disable Telegram alerts for ${intruderAlgorithm.name}`
+                      : `Enable Telegram alerts for ${intruderAlgorithm.name}`
+                  }
                 />
-              </button>
+                <button
+                  onClick={() => toggleAlgorithm(intruderAlgorithm.id)}
+                  className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
+                    algorithmState[intruderAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
+                      algorithmState[intruderAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
 
             {/* Areas section */}
@@ -1734,18 +2099,30 @@ export default function Algorithms() {
                 </p>
               </div>
               
-              <button
-                onClick={() => toggleAlgorithm(reidAlgorithm.id)}
-                className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ml-4 flex-shrink-0 ${
-                  algorithmState[reidAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
-                }`}
-              >
-                <span
-                  className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
-                    algorithmState[reidAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
-                  }`}
+              <div className="ml-4 flex items-center gap-2">
+                <TelegramAlertButton
+                  enabled={isTelegramAlertEnabled(algorithmState[reidAlgorithm.id]?.alert_channels)}
+                  disabled={telegramStatusLoading || savingAlertKey === getAlertSaveKey(reidAlgorithm.id)}
+                  onClick={() => void toggleAlgorithmTelegramAlert(reidAlgorithm.id, reidAlgorithm.name)}
+                  title={
+                    isTelegramAlertEnabled(algorithmState[reidAlgorithm.id]?.alert_channels)
+                      ? `Disable Telegram alerts for ${reidAlgorithm.name}`
+                      : `Enable Telegram alerts for ${reidAlgorithm.name}`
+                  }
                 />
-              </button>
+                <button
+                  onClick={() => toggleAlgorithm(reidAlgorithm.id)}
+                  className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors flex-shrink-0 ${
+                    algorithmState[reidAlgorithm.id]?.is_enabled ? "bg-blue-500" : "bg-gray-700"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
+                      algorithmState[reidAlgorithm.id]?.is_enabled ? "translate-x-7" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
 
             {/* Target list */}

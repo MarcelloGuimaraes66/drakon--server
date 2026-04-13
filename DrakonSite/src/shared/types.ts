@@ -55,6 +55,14 @@ export const LookupAddressSchema = z.object({
   country: z.string().trim().min(1).max(120).optional(),
 });
 
+export const AlertChannelSchema = z
+  .object({
+    enabled: z.union([z.boolean(), z.number(), z.string()]).optional(),
+  })
+  .passthrough();
+
+export const AlertChannelsSchema = z.record(AlertChannelSchema);
+
 // Algorithm schema
 export const CreateAlgorithmSchema = z.object({
   algorithm_type: z.string(),
@@ -75,6 +83,7 @@ export const CreateAlgorithmSchema = z.object({
   running_resolution: z.number().optional(),
   only_capture_on_motion: z.union([z.boolean(), z.number(), z.string()]).optional(),
   face_target_ids: z.array(z.number()).optional(),
+  alert_channels: AlertChannelsSchema.optional(),
 });
 
 // ReID Target schema
@@ -362,9 +371,17 @@ export interface Algorithm {
   run_every?: number;
   running_resolution?: number | null;
   only_capture_on_motion?: number;
+  alert_channels?: AlertChannels;
   created_at: string;
   updated_at: string;
 }
+
+export interface AlertChannelConfig {
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+export type AlertChannels = Record<string, AlertChannelConfig>;
 
 export interface ReIDTarget {
   id: number;

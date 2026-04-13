@@ -6374,9 +6374,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 ? agent.temporal_plan_envelope
                 : nlohmann::json::object();
             slot.state = temporal::defaultState();
+            slot.visualState = json::object();
         }
         if (!slot.state.is_object() || slot.state.empty()) {
             slot.state = temporal::defaultState();
+        }
+        if (!slot.visualState.is_object()) {
+            slot.visualState = json::object();
         }
         slot.promptHash = temporalPromptHash;
         return slot;
@@ -8286,6 +8290,21 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             saveTemporalSlot(temporalSlot);
         }
 
+        const bool identityCardsMaterialized =
+            owner_ &&
+            owner_->materializeOperationalIdentityCards(
+                hit,
+                temporalSlot.state,
+                temporalSlot.visualState,
+                "job",
+                "runAgentInferenceOnCamera_(image)"
+            );
+        if (identityCardsMaterialized) {
+            temporalSlot.touchedAt = std::chrono::steady_clock::now();
+            temporalSlot.promptHash = temporalPromptHash;
+            saveTemporalSlot(temporalSlot);
+        }
+
         const json crossCameraMatchResults =
             buildCrossCameraMatchResults(hit, activeCrossCameraWatchlist);
         if (hit.crossCameraWatchlistMatches.is_array() && !hit.crossCameraWatchlistMatches.empty()) {
@@ -8465,6 +8484,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (!mergedFaceNames.empty()) {
             out["faceid_target_names"] = mergedFaceNames;
         }
+        if (!hit.primaryIdentityCardId.empty()) {
+            out["primary_identity_card_id"] = hit.primaryIdentityCardId;
+        }
+        if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+            out["identity_cards"] = hit.identityCards;
+        }
         out["start_condition_step_id"] =
             (startConditionStepId >= 0) ? json(startConditionStepId) : json(false);
         out["prompt_tokens"] = sumPromptTokens;
@@ -8494,23 +8519,30 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             out["image_ts_utc"] = tsUtcIso;
         }
         if (temporalPlanActive && temporalReport && owner_) {
+            json reportDetails = {
+                { "job_id", jobId },
+                { "step_id", stepId },
+                { "camera_id", cameraId },
+                { "agent_id", agent.id },
+                { "operator_results", temporalOperatorResults },
+                { "answer", representativeAnswer },
+                { "decision_source", decisionSource },
+                { "llm_alert_condition", llmAlertCondition },
+                { "final_alert_condition", finalAlertAny },
+                { "temporal_decision_summary", temporalDecisionSummary }
+            };
+            if (!hit.primaryIdentityCardId.empty()) {
+                reportDetails["primary_identity_card_id"] = hit.primaryIdentityCardId;
+            }
+            if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+                reportDetails["identity_cards"] = hit.identityCards;
+            }
             owner_->postAgentEvent(
                 "temporal_report",
                 std::optional<int>(cameraId),
                 "",
                 "",
-                json{
-                    { "job_id", jobId },
-                    { "step_id", stepId },
-                    { "camera_id", cameraId },
-                    { "agent_id", agent.id },
-                    { "operator_results", temporalOperatorResults },
-                    { "answer", representativeAnswer },
-                    { "decision_source", decisionSource },
-                    { "llm_alert_condition", llmAlertCondition },
-                    { "final_alert_condition", finalAlertAny },
-                    { "temporal_decision_summary", temporalDecisionSummary }
-                }
+                reportDetails
             );
         }
 
@@ -9067,6 +9099,21 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         saveTemporalSlot(temporalSlot);
     }
 
+    const bool identityCardsMaterialized =
+        owner_ &&
+        owner_->materializeOperationalIdentityCards(
+            hit,
+            temporalSlot.state,
+            temporalSlot.visualState,
+            "job",
+            "runAgentInferenceOnCamera_(video)"
+        );
+    if (identityCardsMaterialized) {
+        temporalSlot.touchedAt = std::chrono::steady_clock::now();
+        temporalSlot.promptHash = temporalPromptHash;
+        saveTemporalSlot(temporalSlot);
+    }
+
     const json crossCameraMatchResults =
         buildCrossCameraMatchResults(hit, activeCrossCameraWatchlist);
     if (hit.crossCameraWatchlistMatches.is_array() && !hit.crossCameraWatchlistMatches.empty()) {
@@ -9242,6 +9289,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     if (!mergedFaceNames.empty()) {
         out["faceid_target_names"] = mergedFaceNames;
     }
+    if (!hit.primaryIdentityCardId.empty()) {
+        out["primary_identity_card_id"] = hit.primaryIdentityCardId;
+    }
+    if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+        out["identity_cards"] = hit.identityCards;
+    }
     out["start_condition_step_id"] =
         (startConditionStepId >= 0) ? json(startConditionStepId) : json(false);
     out["prompt_tokens"] = sumPromptTokens;
@@ -9277,23 +9330,30 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     }
 
     if (temporalPlanActive && temporalReport && owner_) {
+        json reportDetails = {
+            { "job_id", jobId },
+            { "step_id", stepId },
+            { "camera_id", cameraId },
+            { "agent_id", agent.id },
+            { "operator_results", temporalOperatorResults },
+            { "answer", representativeAnswer },
+            { "decision_source", decisionSource },
+            { "llm_alert_condition", llmAlertCondition },
+            { "final_alert_condition", finalAlertAny },
+            { "temporal_decision_summary", temporalDecisionSummary }
+        };
+        if (!hit.primaryIdentityCardId.empty()) {
+            reportDetails["primary_identity_card_id"] = hit.primaryIdentityCardId;
+        }
+        if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+            reportDetails["identity_cards"] = hit.identityCards;
+        }
         owner_->postAgentEvent(
             "temporal_report",
             std::optional<int>(cameraId),
             "",
             "",
-            json{
-                { "job_id", jobId },
-                { "step_id", stepId },
-                { "camera_id", cameraId },
-                { "agent_id", agent.id },
-                { "operator_results", temporalOperatorResults },
-                { "answer", representativeAnswer },
-                { "decision_source", decisionSource },
-                { "llm_alert_condition", llmAlertCondition },
-                { "final_alert_condition", finalAlertAny },
-                { "temporal_decision_summary", temporalDecisionSummary }
-            }
+            reportDetails
         );
     }
 
@@ -10697,6 +10757,8 @@ void JobRuntime::maybeFireAlerts_(
     json motionTriggerRegionIds = json::array();
     json motionTriggerRegionNames = json::array();
     json overlayRegionIds = json::array();
+    json identityCards = json::array();
+    std::string primaryIdentityCardId;
     std::string decisionSource;
     bool llmAlertCondition = false;
     bool finalAlertCondition = false;
@@ -10768,6 +10830,12 @@ void JobRuntime::maybeFireAlerts_(
         }
         if (j.contains("overlay_region_ids") && j["overlay_region_ids"].is_array()) {
             overlayRegionIds = j["overlay_region_ids"];
+        }
+        if (j.contains("identity_cards") && j["identity_cards"].is_array()) {
+            identityCards = j["identity_cards"];
+        }
+        if (j.contains("primary_identity_card_id") && j["primary_identity_card_id"].is_string()) {
+            primaryIdentityCardId = j["primary_identity_card_id"].get<std::string>();
         }
         answer = resolveAlertAnswerText_(answer, temporalDecisionSummary, decisionSource);
     }
@@ -11092,6 +11160,12 @@ void JobRuntime::maybeFireAlerts_(
         }
         if (overlayRegionIds.is_array() && !overlayRegionIds.empty()) {
             details["overlay_region_ids"] = overlayRegionIds;
+        }
+        if (!primaryIdentityCardId.empty()) {
+            details["primary_identity_card_id"] = primaryIdentityCardId;
+        }
+        if (identityCards.is_array() && !identityCards.empty()) {
+            details["identity_cards"] = identityCards;
         }
 
         if (!cameraName.empty())

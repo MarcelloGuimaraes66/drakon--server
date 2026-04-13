@@ -33,6 +33,16 @@ inline void appendUniqueStringsToArray(json& target, const json& value);
 inline std::string normalizeEventName(const std::string& rawEvent);
 inline std::string strField(const json& n, const char* key, const std::string& fallback);
 inline int intField(const json& n, const char* key, int fallback);
+inline bool parseClockTimeSeconds(const std::string& raw, int& outSeconds);
+inline bool parseUtcOffsetSeconds(const std::string& raw, int& outSeconds);
+inline std::string formatUtcOffsetSeconds(int offsetSeconds);
+inline bool normalizeClockTimeString(const std::string& raw, std::string& outTime);
+inline bool normalizeLocalDateString(const std::string& raw, std::string& outDate);
+inline bool splitAndNormalizeLocalDateTime(
+    const std::string& raw,
+    std::string& outDate,
+    std::string& outTime);
+inline std::string canonicalFixedLocalTimezone(const std::string& raw);
 
 inline std::string trim(const std::string& s) {
     const auto a = s.find_first_not_of(" \t\r\n");
@@ -858,17 +868,103 @@ inline json normalizeAnalyzeEventsAtIntervalParams(const json& rawParams) {
     json output = params.value("output", json::object());
     if (!output.is_object()) output = json::object();
 
+    const std::string rawDatetimeLocal = trim(strField(
+        schedule,
+        "datetime_local",
+        strField(schedule, "local_datetime", std::string())));
+    const std::string rawDateLocal = trim(strField(
+        schedule,
+        "date_local",
+        strField(schedule, "local_date", std::string())));
+    const std::string rawTimeLocal = trim(strField(
+        schedule,
+        "time_local",
+        strField(schedule, "local_time", std::string())));
+    const std::string rawTimezone = trim(strField(schedule, "timezone", std::string()));
+
+    std::string normalizedDateLocal;
+    std::string normalizedTimeLocal;
+    if (!rawDatetimeLocal.empty()) {
+        splitAndNormalizeLocalDateTime(rawDatetimeLocal, normalizedDateLocal, normalizedTimeLocal);
+    }
+
+    std::string explicitDateLocal;
+    if (!rawDateLocal.empty()) {
+        if (normalizeLocalDateString(rawDateLocal, explicitDateLocal)) {
+            normalizedDateLocal = explicitDateLocal;
+        } else {
+            normalizedDateLocal.clear();
+            schedule["date_local"] = rawDateLocal;
+        }
+    }
+
+    std::string explicitTimeLocal;
+    if (!rawTimeLocal.empty()) {
+        if (normalizeClockTimeString(rawTimeLocal, explicitTimeLocal)) {
+            normalizedTimeLocal = explicitTimeLocal;
+        } else {
+            normalizedTimeLocal.clear();
+            schedule["time_local"] = rawTimeLocal;
+        }
+    }
+
+    const bool fixedLocalFieldsPresent =
+        !normalizedDateLocal.empty() ||
+        !normalizedTimeLocal.empty() ||
+        !rawDateLocal.empty() ||
+        !rawTimeLocal.empty() ||
+        !rawDatetimeLocal.empty();
+
     const std::string scheduleMode =
         normalizeAnalyzeIntervalScheduleModeToken(strField(schedule, "mode", std::string()));
     schedule["mode"] = scheduleMode.empty() ? "once" : scheduleMode;
 
     const std::string anchorMode =
         normalizeAnalyzeIntervalAnchorModeToken(strField(schedule, "anchor_mode", std::string()));
-    schedule["anchor_mode"] = anchorMode.empty() ? "monitoring_start" : anchorMode;
+    schedule["anchor_mode"] =
+        anchorMode.empty()
+            ? (fixedLocalFieldsPresent ? "fixed_time_local" : "monitoring_start")
+            : anchorMode;
 
     const std::string catchUpMode = normalizeAnalyzeIntervalCatchUpModeToken(
         strField(schedule, "catch_up_mode", "latest_due_only"));
     schedule["catch_up_mode"] = catchUpMode.empty() ? "latest_due_only" : catchUpMode;
+
+    if (!normalizedDateLocal.empty()) {
+        schedule["date_local"] = normalizedDateLocal;
+    } else if (schedule.contains("date_local") && schedule["date_local"].is_string()) {
+        schedule["date_local"] = trim(schedule["date_local"].get<std::string>());
+    }
+
+    if (!normalizedTimeLocal.empty()) {
+        schedule["time_local"] = normalizedTimeLocal;
+    } else if (schedule.contains("time_local") && schedule["time_local"].is_string()) {
+        schedule["time_local"] = trim(schedule["time_local"].get<std::string>());
+    }
+
+    if (schedule.contains("datetime_local")) {
+        schedule.erase("datetime_local");
+    }
+    if (schedule.contains("local_datetime")) {
+        schedule.erase("local_datetime");
+    }
+
+    const std::string normalizedTimezone = canonicalFixedLocalTimezone(rawTimezone);
+    if (!normalizedTimezone.empty()) {
+        schedule["timezone"] = normalizedTimezone;
+    } else if (!rawTimezone.empty()) {
+        schedule["timezone"] = rawTimezone;
+    }
+
+    const std::string normalizedAnchorMode =
+        normalizeAnalyzeIntervalAnchorModeToken(strField(schedule, "anchor_mode", std::string()));
+    if (normalizedAnchorMode == "fixed_time_local" &&
+        strField(schedule, "mode", std::string()) == "recurring" &&
+        trim(strField(schedule, "date_local", std::string())).empty() &&
+        intField(schedule, "interval_seconds", 0) <= 0)
+    {
+        schedule["interval_seconds"] = 86400;
+    }
 
     const std::string sourceEvent = normalizeEventName(strField(source, "event", std::string()));
     if (!sourceEvent.empty()) source["event"] = sourceEvent;
@@ -1090,6 +1186,114 @@ inline bool normalizeTsBetweenInclusive(const std::string& rawTs,
     return true;
 }
 
+inline bool isLeapYear(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+inline int daysInMonth(int year, int month) {
+    static const std::array<int, 12> kDays = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    if (month < 1 || month > 12) return 0;
+    if (month == 2 && isLeapYear(year)) return 29;
+    return kDays[static_cast<std::size_t>(month - 1)];
+}
+
+inline bool parseLocalDateParts(const std::string& raw, int& outYear, int& outMonth, int& outDay) {
+    const std::string s = trim(raw);
+    if (s.empty()) return false;
+
+    char separator = '\0';
+    for (char candidate : { '-', '/', '.' }) {
+        if (s.find(candidate) != std::string::npos) {
+            separator = candidate;
+            break;
+        }
+    }
+    if (separator == '\0') return false;
+
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= s.size()) {
+        const std::size_t pos = s.find(separator, start);
+        const std::string piece = trim(s.substr(start, pos == std::string::npos ? std::string::npos : pos - start));
+        if (piece.empty()) return false;
+        parts.push_back(piece);
+        if (pos == std::string::npos) break;
+        start = pos + 1;
+    }
+    if (parts.size() != 3) return false;
+
+    int a = 0;
+    int b = 0;
+    int c = 0;
+    try {
+        a = std::stoi(parts[0]);
+        b = std::stoi(parts[1]);
+        c = std::stoi(parts[2]);
+    } catch (...) {
+        return false;
+    }
+
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (parts[0].size() == 4) {
+        year = a;
+        month = b;
+        day = c;
+    } else if (parts[2].size() == 4) {
+        day = a;
+        month = b;
+        year = c;
+    } else {
+        return false;
+    }
+
+    if (year < 1900 || year > 9999) return false;
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > daysInMonth(year, month)) return false;
+
+    outYear = year;
+    outMonth = month;
+    outDay = day;
+    return true;
+}
+
+inline std::string formatLocalDateIso(int year, int month, int day) {
+    std::ostringstream oss;
+    oss << std::setfill('0')
+        << std::setw(4) << year
+        << "-"
+        << std::setw(2) << month
+        << "-"
+        << std::setw(2) << day;
+    return oss.str();
+}
+
+inline bool normalizeLocalDateString(const std::string& raw, std::string& outDate) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (!parseLocalDateParts(raw, year, month, day)) return false;
+    outDate = formatLocalDateIso(year, month, day);
+    return true;
+}
+
+inline std::string formatClockTimeSeconds(int totalSeconds, bool forceSeconds = false) {
+    if (totalSeconds < 0 || totalSeconds >= 24 * 3600) return std::string();
+    const int hh = totalSeconds / 3600;
+    const int mm = (totalSeconds % 3600) / 60;
+    const int ss = totalSeconds % 60;
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(2) << hh
+        << ":" << std::setw(2) << mm;
+    if (forceSeconds || ss != 0) {
+        oss << ":" << std::setw(2) << ss;
+    }
+    return oss.str();
+}
+
 inline bool parseClockTimeSeconds(const std::string& raw, int& outSeconds) {
     const std::string s = trim(raw);
     if (s.size() < 4 || s.size() > 8) return false;
@@ -1119,10 +1323,138 @@ inline bool parseClockTimeSeconds(const std::string& raw, int& outSeconds) {
     return true;
 }
 
+inline bool normalizeClockTimeString(const std::string& raw, std::string& outTime) {
+    const std::string trimmed = trim(raw);
+    if (trimmed.empty()) return false;
+
+    int parsedSeconds = 0;
+    if (parseClockTimeSeconds(trimmed, parsedSeconds)) {
+        outTime = formatClockTimeSeconds(parsedSeconds);
+        return !outTime.empty();
+    }
+
+    std::string lowered = lower(trimmed);
+    bool isPm = false;
+    bool isAm = false;
+
+    auto eraseToken = [&](const std::string& token, bool markAm, bool markPm) {
+        std::size_t pos = lowered.find(token);
+        if (pos == std::string::npos) return;
+        lowered.erase(pos, token.size());
+        if (markAm) isAm = true;
+        if (markPm) isPm = true;
+    };
+
+    eraseToken("da tarde", false, true);
+    eraseToken("da noite", false, true);
+    eraseToken("da manha", true, false);
+    eraseToken("pm", false, true);
+    eraseToken("p.m.", false, true);
+    eraseToken("p.m", false, true);
+    eraseToken("am", true, false);
+    eraseToken("a.m.", true, false);
+    eraseToken("a.m", true, false);
+
+    std::string compact;
+    compact.reserve(lowered.size());
+    for (char ch : lowered) {
+        if (!std::isspace(static_cast<unsigned char>(ch)) && ch != '.') {
+            compact.push_back(ch);
+        }
+    }
+    while (!compact.empty() && compact.back() == 'm') compact.pop_back();
+
+    std::string canonical = compact;
+    const std::size_t hPos = canonical.find('h');
+    if (hPos != std::string::npos) {
+        const std::string hours = canonical.substr(0, hPos);
+        const std::string suffix = canonical.substr(hPos + 1);
+        if (hours.empty()) return false;
+        if (suffix.empty()) {
+            canonical = hours + ":00";
+        } else if (suffix.size() == 2) {
+            canonical = hours + ":" + suffix;
+        } else if (suffix.size() == 4) {
+            canonical = hours + ":" + suffix.substr(0, 2) + ":" + suffix.substr(2, 2);
+        } else {
+            return false;
+        }
+    } else if ((isAm || isPm) && canonical.find(':') == std::string::npos) {
+        canonical += ":00";
+    }
+
+    if (!parseClockTimeSeconds(canonical, parsedSeconds)) return false;
+
+    int hour = parsedSeconds / 3600;
+    const int minute = (parsedSeconds % 3600) / 60;
+    const int second = parsedSeconds % 60;
+    if (isPm && hour < 12) {
+        hour += 12;
+    } else if (isAm && hour == 12) {
+        hour = 0;
+    }
+
+    outTime = formatClockTimeSeconds(hour * 3600 + minute * 60 + second);
+    return !outTime.empty();
+}
+
+inline bool splitAndNormalizeLocalDateTime(
+    const std::string& raw,
+    std::string& outDate,
+    std::string& outTime)
+{
+    const std::string s = trim(raw);
+    if (s.empty()) return false;
+
+    const std::size_t sep = s.find('T') != std::string::npos ? s.find('T') : s.find(' ');
+    if (sep == std::string::npos) return false;
+
+    const std::string datePart = trim(s.substr(0, sep));
+    const std::string timePart = trim(s.substr(sep + 1));
+    if (!normalizeLocalDateString(datePart, outDate)) return false;
+    if (!normalizeClockTimeString(timePart, outTime)) return false;
+    return true;
+}
+
+inline bool parseKnownFixedTimezoneAliasSeconds(const std::string& raw, int& outSeconds) {
+    static const std::unordered_map<std::string, int> kAliases = {
+        { "ETC/UTC", 0 },
+        { "ETC/GMT", 0 },
+        { "AMERICA/SAO_PAULO", -3 * 3600 },
+        { "AMERICA/BAHIA", -3 * 3600 },
+        { "AMERICA/FORTALEZA", -3 * 3600 },
+        { "AMERICA/RECIFE", -3 * 3600 },
+        { "AMERICA/MANAUS", -4 * 3600 },
+        { "AMERICA/CUIABA", -4 * 3600 }
+    };
+    const auto it = kAliases.find(upper(trim(raw)));
+    if (it == kAliases.end()) return false;
+    outSeconds = it->second;
+    return true;
+}
+
+inline std::string formatUtcOffsetSeconds(int offsetSeconds) {
+    if (offsetSeconds == 0) return "UTC";
+    const char sign = offsetSeconds >= 0 ? '+' : '-';
+    const int absSeconds = std::abs(offsetSeconds);
+    const int hours = absSeconds / 3600;
+    const int minutes = (absSeconds % 3600) / 60;
+    std::ostringstream out;
+    out << sign
+        << std::setfill('0')
+        << std::setw(2) << hours
+        << ":"
+        << std::setw(2) << minutes;
+    return out.str();
+}
+
 inline bool parseUtcOffsetSeconds(const std::string& raw, int& outSeconds) {
     std::string s = upper(trim(raw));
     if (s.empty() || s == "UTC" || s == "GMT" || s == "Z") {
         outSeconds = 0;
+        return true;
+    }
+    if (parseKnownFixedTimezoneAliasSeconds(s, outSeconds)) {
         return true;
     }
     if (s.rfind("UTC", 0) == 0) {
@@ -1132,6 +1464,9 @@ inline bool parseUtcOffsetSeconds(const std::string& raw, int& outSeconds) {
     }
     if (s.empty() || s == "Z") {
         outSeconds = 0;
+        return true;
+    }
+    if (parseKnownFixedTimezoneAliasSeconds(s, outSeconds)) {
         return true;
     }
     if (s.size() < 2 || (s[0] != '+' && s[0] != '-')) return false;
@@ -1157,6 +1492,48 @@ inline bool parseUtcOffsetSeconds(const std::string& raw, int& outSeconds) {
     if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return false;
     outSeconds = sign * (hh * 3600 + mm * 60);
     return true;
+}
+
+inline std::string canonicalFixedLocalTimezone(const std::string& raw) {
+    int offsetSeconds = 0;
+    if (!parseUtcOffsetSeconds(raw, offsetSeconds)) return std::string();
+    return formatUtcOffsetSeconds(offsetSeconds);
+}
+
+inline bool computeAbsoluteFixedLocalCheckpointUtc(const std::string& dateLocal,
+                                                   const std::string& timeLocal,
+                                                   const std::string& timezone,
+                                                   std::string& outDueIsoUtc) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (!parseLocalDateParts(dateLocal, year, month, day)) return false;
+
+    int localClockSeconds = 0;
+    if (!parseClockTimeSeconds(timeLocal, localClockSeconds)) return false;
+
+    int offsetSeconds = 0;
+    if (!parseUtcOffsetSeconds(timezone, offsetSeconds)) return false;
+
+    std::tm localTargetTm{};
+    localTargetTm.tm_year = year - 1900;
+    localTargetTm.tm_mon = month - 1;
+    localTargetTm.tm_mday = day;
+    localTargetTm.tm_hour = localClockSeconds / 3600;
+    localTargetTm.tm_min = (localClockSeconds % 3600) / 60;
+    localTargetTm.tm_sec = localClockSeconds % 60;
+
+#if defined(_WIN32)
+    std::time_t candidateLocalTt = _mkgmtime(&localTargetTm);
+#else
+    std::time_t candidateLocalTt = timegm(&localTargetTm);
+#endif
+    if (candidateLocalTt == static_cast<std::time_t>(-1)) return false;
+
+    const auto candidateUtcTp =
+        std::chrono::system_clock::from_time_t(candidateLocalTt - offsetSeconds);
+    outDueIsoUtc = formatIsoUtcNoSuffix(candidateUtcTp);
+    return !outDueIsoUtc.empty();
 }
 
 inline bool computeNextFixedLocalCheckpointUtc(const std::string& monitoringStartIsoUtc,
@@ -1198,6 +1575,26 @@ inline bool computeNextFixedLocalCheckpointUtc(const std::string& monitoringStar
     }
     outDueIsoUtc = formatIsoUtcNoSuffix(candidateUtcTp);
     return !outDueIsoUtc.empty();
+}
+
+inline bool computeFixedLocalCheckpointUtc(const std::string& monitoringStartIsoUtc,
+                                           const std::string& dateLocal,
+                                           const std::string& timeLocal,
+                                           const std::string& timezone,
+                                           std::string& outDueIsoUtc) {
+    const std::string normalizedDateLocal = trim(dateLocal);
+    if (!normalizedDateLocal.empty()) {
+        return computeAbsoluteFixedLocalCheckpointUtc(
+            normalizedDateLocal,
+            timeLocal,
+            timezone,
+            outDueIsoUtc);
+    }
+    return computeNextFixedLocalCheckpointUtc(
+        monitoringStartIsoUtc,
+        timeLocal,
+        timezone,
+        outDueIsoUtc);
 }
 
 inline std::string strField(const json& n, const char* key, const std::string& fallback = std::string()) {
@@ -2064,6 +2461,13 @@ inline void normalizeOperators(json& plan) {
     const int defaultWindowSeconds = std::max(
         1,
         intField(plan.value("retention_policy", json::object()), "state_ttl_seconds", 43200));
+    const json executionContext = plan.value("execution_context", json::object());
+    const std::string defaultFixedTimeTimezone = [&]() -> std::string {
+        const std::string hintedTimezone = canonicalFixedLocalTimezone(
+            strField(executionContext, "fixed_time_timezone_hint"));
+        if (!hintedTimezone.empty()) return hintedTimezone;
+        return canonicalFixedLocalTimezone(strField(executionContext, "timezone"));
+    }();
 
     for (auto& op : plan["operators"]) {
         if (!op.is_object()) continue;
@@ -2114,6 +2518,17 @@ inline void normalizeOperators(json& plan) {
         } else if (typ == "analyze_events_at_interval") {
             json params = normalizeAnalyzeEventsAtIntervalParams(
                 op.value("params", json::object()));
+            json schedule = params.value("schedule", json::object());
+            if (!schedule.is_object()) schedule = json::object();
+            const std::string anchorMode =
+                normalizeAnalyzeIntervalAnchorModeToken(strField(schedule, "anchor_mode"));
+            if (anchorMode == "fixed_time_local" &&
+                trim(strField(schedule, "timezone")).empty() &&
+                !defaultFixedTimeTimezone.empty())
+            {
+                schedule["timezone"] = defaultFixedTimeTimezone;
+                params["schedule"] = schedule;
+            }
             const json source = params.value("source", json::object());
             const std::string sourceEvent = trim(strField(source, "event"));
             if (!sourceEvent.empty()) {
@@ -2702,6 +3117,7 @@ inline bool validateAnalyzeEventsAtIntervalParams(
     const std::string catchUpMode =
         normalizeAnalyzeIntervalCatchUpModeToken(strField(schedule, "catch_up_mode", "latest_due_only"));
     const int intervalSeconds = intField(schedule, "interval_seconds", 0);
+    const std::string dateLocal = trim(strField(schedule, "date_local"));
     if (!isAllowedAnalyzeIntervalScheduleMode(scheduleMode)) return fail("operator_schedule_mode_invalid");
     if (!isAllowedAnalyzeIntervalAnchorMode(anchorMode)) return fail("operator_anchor_mode_invalid");
     if (!isAllowedAnalyzeIntervalCatchUpMode(catchUpMode)) return fail("operator_catch_up_mode_invalid");
@@ -2712,12 +3128,21 @@ inline bool validateAnalyzeEventsAtIntervalParams(
         if (!parseClockTimeSeconds(strField(schedule, "time_local"), parsedClockSeconds)) {
             return fail("operator_time_local_invalid");
         }
+        if (!dateLocal.empty()) {
+            std::string normalizedDateLocal;
+            if (!normalizeLocalDateString(dateLocal, normalizedDateLocal)) {
+                return fail("operator_date_local_invalid");
+            }
+            if (scheduleMode != "once") return fail("operator_date_local_requires_once");
+        }
         const std::string timezone = trim(strField(schedule, "timezone"));
         if (timezone.empty()) return fail("operator_timezone_missing");
         int parsedOffsetSeconds = 0;
         if (!parseUtcOffsetSeconds(timezone, parsedOffsetSeconds)) {
             return fail("operator_timezone_unsupported");
         }
+    } else if (!dateLocal.empty()) {
+        return fail("operator_date_local_requires_fixed_time_local");
     }
 
     const std::string sourceEvent = trim(strField(source, "event"));
@@ -3070,7 +3495,9 @@ inline json compileInput(
                 { "positive_cues", json::array({
                     "after 30 minutes", "after x minutes", "at the end of the window", "only after the interval",
                     "every 10 minutes", "report every", "partial count every", "accumulated over 30 minutes",
+                    "at 16:30", "at 4:30 pm", "on 2026-09-15 at 16:30",
                     "apos 30 minutos", "ao final de 30 minutos", "somente ao final", "a cada 10 minutos",
+                    "as 16h30", "dia 15/09/2026 as 16h30",
                     "faca contagens parciais", "total acumulado", "janela acumulada", "depois de x minutos",
                     "despues de 30 minutos", "cada 10 minutos", "solo al final", "conteo parcial"
                 })},
@@ -3106,6 +3533,8 @@ inline json compileInput(
                 { "semantic_mapping", json::array({
                     "single checkpoint after elapsed time -> schedule.mode=once",
                     "repeated checkpoints at a cadence -> schedule.mode=recurring",
+                    "single checkpoint at a specific local clock time -> schedule.mode=once + schedule.anchor_mode=fixed_time_local + schedule.time_local=HH:MM",
+                    "single checkpoint at an explicit local calendar date and time -> schedule.mode=once + schedule.anchor_mode=fixed_time_local + schedule.date_local=YYYY-MM-DD + schedule.time_local=HH:MM",
                     "accumulate from the anchor until the checkpoint -> analysis.window_mode=cumulative_from_anchor",
                     "evaluate only the last X minutes ending at the checkpoint -> analysis.window_mode=bucket"
                 })},
@@ -3127,13 +3556,26 @@ inline json compileInput(
                 })}
             }},
             { "schedule_at_time", {
-                { "semantic_intent", "Run or alert at a scheduled local time." }
+                { "semantic_intent", "Pure scheduling or reminder at a local time without event-history analysis." },
+                { "negative_cues", json::array({
+                    "analyze confirmed events at", "count events and report at", "summarize event history at",
+                    "analise e me informe as", "conte eventos e informe as", "resuma eventos as"
+                })}
             }},
             { "summary_window", {
                 { "semantic_intent", "Summarize activity over a daily, hourly, or custom reporting window." }
             }}
         }}
     };
+    json executionContext = {
+        { "source_type", sourceType },
+        { "source_id", sourceId },
+        { "timezone", timezone }
+    };
+    const std::string fixedTimeTimezoneHint = canonicalFixedLocalTimezone(timezone);
+    if (!fixedTimeTimezoneHint.empty()) {
+        executionContext["fixed_time_timezone_hint"] = fixedTimeTimezoneHint;
+    }
 
     return json{
         { "schema_version", "temporal-compile-input/1.0" },
@@ -3145,11 +3587,7 @@ inline json compileInput(
             { "input_type", inputType },
             { "language", language }
         }},
-        { "execution_context", {
-            { "source_type", sourceType },
-            { "source_id", sourceId },
-            { "timezone", timezone }
-        }},
+        { "execution_context", executionContext },
         { "allowed_operator_types", json::array({
             "stopped_for_more_than_without_event","seen_n_times_in_window_by_entity",
             "schedule_at_time","summary_window","entity_present","entity_absent",
@@ -3191,7 +3629,8 @@ You are TemporalPlanCompiler v1.
   example: same person picked_phone 3 times in 3600s
 - schedule_at_time
   required_params: time_local, timezone
-  example: trigger report at 17:00 America/Sao_Paulo
+  use_only_when: pure scheduling or reminder without confirmed-event analysis
+  example: trigger report at 17:00 -03:00
 - summary_window
   required_params: window(daily|hourly|custom), start_local(optional), end_local(optional), timezone
   example: summarize 08:00-17:00 daily
@@ -3205,7 +3644,7 @@ You are TemporalPlanCompiler v1.
   required_params: event, duration_seconds, entity(optional), zone(optional)
 - analyze_events_at_interval
   required_params:
-    schedule(mode, anchor_mode, catch_up_mode(optional), interval_seconds(required whenever the checkpoint is defined by elapsed time from monitoring_start or first_matching_event, and also for recurring schedules), time_local+timezone(currently UTC or explicit offset such as -03:00) when anchor_mode=fixed_time_local),
+    schedule(mode, anchor_mode, catch_up_mode(optional), interval_seconds(required whenever the checkpoint is defined by elapsed time from monitoring_start or first_matching_event, and also for recurring schedules), time_local+timezone when anchor_mode=fixed_time_local, date_local(optional for a specific local calendar day), datetime_local(optional input alias that must be normalized into date_local+time_local)),
     source(event, entity(optional), zone(optional)),
     analysis(kind, window_mode, window_seconds(optional)),
     decision(mode, op/value or min/max when mode!=report_only),
@@ -3228,6 +3667,8 @@ You are TemporalPlanCompiler v1.
     once after 30 minutes -> schedule={mode:"once", anchor_mode:"monitoring_start", interval_seconds:1800}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
     every 10 minutes on the last 10 minutes -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"bucket", window_seconds:600}
     every 10 minutes with accumulated partials over a 30-minute horizon -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
+    once at 16:30 local -> schedule={mode:"once", anchor_mode:"fixed_time_local", time_local:"16:30", timezone:INPUT_JSON.execution_context.fixed_time_timezone_hint}
+    once on 2026-09-15 at 16:30 local -> schedule={mode:"once", anchor_mode:"fixed_time_local", date_local:"2026-09-15", time_local:"16:30", timezone:INPUT_JSON.execution_context.fixed_time_timezone_hint}
   forbidden_aliases:
     relative, rolling, trailing, threshold, skip, skip_missed, include_current_value, include_difference, include_threshold
   example: after 30 minutes count_distinct_entities of qualified_exit_porta_a and alert if result < 201
@@ -3240,12 +3681,16 @@ You are TemporalPlanCompiler v1.
 - Never reduce threat/weapon prompts to generic presence, entry, exit or stopped operators on plain person entities.
 - cross_camera_track_after_trigger is opt-in only. If the prompt is only about local detection/alert in the current camera, DO NOT include it.
 - Prefer compile_status="not_temporal" over weakly approximating a local single-batch detection with entity_present or other generic operators.
-- Prefer analyze_events_at_interval when the request says to wait until a checkpoint such as "after X minutes", "at the end of 30 minutes", or "every X minutes" before reporting or alerting on accumulated event analysis.
+- Prefer analyze_events_at_interval when the request says to wait until a checkpoint such as "after X minutes", "at the end of 30 minutes", "every X minutes", "at 16:30", or "on 2026-09-15 at 16:30" before reporting or alerting on accumulated event analysis.
+- If the user wants confirmed-event analysis at a fixed local time or a fixed local date+time, use analyze_events_at_interval, not schedule_at_time.
+- Use schedule_at_time only for pure scheduling or reminder semantics without confirmed-event analysis.
 - For analyze_events_at_interval, infer checkpoint behavior semantically from the whole multilingual request, not by copying literal words. Use canonical enum values only.
 - If the request means a single elapsed checkpoint, emit schedule.mode="once". If it means repeated checkpoints, emit schedule.mode="recurring".
+- If the request gives only a local clock time, emit schedule.anchor_mode="fixed_time_local", normalize time_local to HH:MM, and omit date_local.
+- If the request gives a specific local calendar date and time, emit schedule.anchor_mode="fixed_time_local", normalize date_local to YYYY-MM-DD, and normalize time_local to HH:MM.
 - If the request means accumulation from the anchor until the checkpoint, emit analysis.window_mode="cumulative_from_anchor". If it means only the last X minutes ending at the checkpoint, emit analysis.window_mode="bucket".
 - Do not invent alias enums or ornamental output fields for analyze_events_at_interval. The runtime only accepts the canonical enums and the output fields summary_label, include_expected_value, include_delta.
-- For analyze_events_at_interval with anchor_mode=fixed_time_local, timezone currently supports UTC or explicit UTC offsets like -03:00. Do not emit IANA zone ids such as America/Sao_Paulo for this operator yet.
+- For analyze_events_at_interval with anchor_mode=fixed_time_local, prefer INPUT_JSON.execution_context.fixed_time_timezone_hint when it is present; otherwise use UTC or an explicit UTC offset like -03:00.
 
 3) Event catalog rules
 - Events must be atomic and observable from vision input.
@@ -3366,8 +3811,12 @@ When type="analyze_events_at_interval", use only the canonical enum values from 
 For analyze_events_at_interval, decide from semantic intent:
 - single checkpoint after elapsed time -> schedule.mode="once"
 - repeated checkpoints -> schedule.mode="recurring"
+- fixed local clock time such as 16:30 -> schedule.anchor_mode="fixed_time_local", schedule.time_local="HH:MM"
+- fixed local date and time such as 2026-09-15 16:30 -> schedule.anchor_mode="fixed_time_local", schedule.date_local="YYYY-MM-DD", schedule.time_local="HH:MM"
 - accumulated from the anchor until the checkpoint -> analysis.window_mode="cumulative_from_anchor"
 - last X minutes ending at the checkpoint -> analysis.window_mode="bucket"
+For analyze_events_at_interval fixed local checkpoints, prefer INPUT_JSON.execution_context.fixed_time_timezone_hint when present.
+Do not use schedule_at_time when the request is to analyze confirmed events at a specific local time or date/time.
 For analyze_events_at_interval output, use only summary_label, include_expected_value and include_delta.
 )";
 }
@@ -7103,6 +7552,7 @@ inline json buildConfirmedRefs(const json& envelope,
             const std::string anchorMode = lower(trim(strField(schedule, "anchor_mode", "monitoring_start")));
             const int intervalSeconds = intField(schedule, "interval_seconds", 0);
             const int windowSeconds = intField(analysis, "window_seconds", 0);
+            const std::string dateLocal = strField(schedule, "date_local");
             const std::string timeLocal = strField(schedule, "time_local");
             const std::string timezone = strField(schedule, "timezone");
             if (trim(eventName).empty() || trim(analysisKind).empty()) continue;
@@ -7115,8 +7565,36 @@ inline json buildConfirmedRefs(const json& envelope,
             std::string analysisAnchorTs = trim(strField(opState, "analysis_anchor_ts_utc"));
             std::string firstDueTs = trim(strField(opState, "first_due_ts_utc"));
             std::string horizonEndTs = trim(strField(opState, "horizon_end_ts_utc"));
+            std::string scheduledTargetTs = trim(strField(opState, "scheduled_target_ts_utc"));
+            bool fixedTimeOverdue =
+                opState.contains("fixed_time_local_overdue") &&
+                opState["fixed_time_local_overdue"].is_boolean() &&
+                opState["fixed_time_local_overdue"].get<bool>();
 
-            if (analysisAnchorTs.empty() || firstDueTs.empty()) {
+            if (anchorMode == "fixed_time_local") {
+                analysisAnchorTs = monitoringStartTs;
+                fixedTimeOverdue = false;
+                if (!analysisAnchorTs.empty()) {
+                    if (!computeFixedLocalCheckpointUtc(
+                            analysisAnchorTs,
+                            dateLocal,
+                            timeLocal,
+                            timezone,
+                            scheduledTargetTs))
+                    {
+                        firstDueTs.clear();
+                        scheduledTargetTs.clear();
+                    } else {
+                        fixedTimeOverdue =
+                            !trim(dateLocal).empty() &&
+                            scheduledTargetTs < analysisAnchorTs;
+                        firstDueTs =
+                            fixedTimeOverdue
+                                ? (cutoffTs.empty() ? analysisAnchorTs : cutoffTs)
+                                : scheduledTargetTs;
+                    }
+                }
+            } else if (analysisAnchorTs.empty() || firstDueTs.empty()) {
                 if (anchorMode == "monitoring_start") {
                     analysisAnchorTs = monitoringStartTs;
                     if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
@@ -7127,13 +7605,6 @@ inline json buildConfirmedRefs(const json& envelope,
                         earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), entityFilter, zoneFilter);
                     if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
                         firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
-                    }
-                } else if (anchorMode == "fixed_time_local") {
-                    analysisAnchorTs = monitoringStartTs;
-                    if (!analysisAnchorTs.empty()) {
-                        if (!computeNextFixedLocalCheckpointUtc(analysisAnchorTs, timeLocal, timezone, firstDueTs)) {
-                            firstDueTs.clear();
-                        }
                     }
                 }
             }
@@ -7208,8 +7679,13 @@ inline json buildConfirmedRefs(const json& envelope,
             if (!analysisAnchorTs.empty()) windowExtra["anchor_utc"] = analysisAnchorTs;
             if (!firstDueTs.empty()) windowExtra["first_due_ts_utc"] = firstDueTs;
             if (!horizonEndTs.empty()) windowExtra["horizon_end_ts_utc"] = horizonEndTs;
+            if (!scheduledTargetTs.empty()) windowExtra["scheduled_target_ts_utc"] = scheduledTargetTs;
             if (intervalSeconds > 0) windowExtra["interval_seconds"] = intervalSeconds;
             if (windowSeconds > 0) windowExtra["configured_window_seconds"] = windowSeconds;
+            if (!trim(dateLocal).empty()) windowExtra["date_local"] = trim(dateLocal);
+            if (!trim(timeLocal).empty()) windowExtra["time_local"] = trim(timeLocal);
+            if (!trim(timezone).empty()) windowExtra["timezone"] = trim(timezone);
+            if (fixedTimeOverdue) windowExtra["fixed_time_local_overdue"] = true;
 
             appendRef(
                 refPrefix + "__prior_confirmed_value",
@@ -8316,6 +8792,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                 normalizeAnalyzeIntervalCatchUpModeToken(
                     strField(schedule, "catch_up_mode", "latest_due_only"));
             const int intervalSeconds = intField(schedule, "interval_seconds", 0);
+            const std::string dateLocal = trim(strField(schedule, "date_local"));
             const std::string timeLocal = trim(strField(schedule, "time_local"));
             const std::string timezone = trim(strField(schedule, "timezone"));
             const std::string eventName = strField(source, "event");
@@ -8352,6 +8829,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (intervalSeconds > 0) result["interval_seconds"] = intervalSeconds;
             if (windowSeconds > 0) result["window_seconds"] = windowSeconds;
             if (!catchUpMode.empty()) result["catch_up_mode"] = catchUpMode;
+            if (!dateLocal.empty()) result["date_local"] = dateLocal;
             if (!timeLocal.empty()) result["time_local"] = timeLocal;
             if (!timezone.empty()) result["timezone"] = timezone;
             if (!summaryLabel.empty()) result["summary_label"] = summaryLabel;
@@ -8447,7 +8925,18 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                     if (includeDelta && !deltaValueText.empty()) {
                         summary << (hasDeficit ? "; deficit=" : "; delta=") << deltaValueText;
                     }
-                    if (!latestDueTs.empty()) {
+                    if (anchorMode == "fixed_time_local" && !timeLocal.empty()) {
+                        summary << " at local ";
+                        if (!dateLocal.empty()) summary << dateLocal << " ";
+                        summary << timeLocal;
+                        if (!timezone.empty()) summary << " " << timezone;
+                        if (checkpoint.contains("fixed_time_local_overdue") &&
+                            checkpoint["fixed_time_local_overdue"].is_boolean() &&
+                            checkpoint["fixed_time_local_overdue"].get<bool>())
+                        {
+                            summary << " (scheduled time already passed; evaluated now)";
+                        }
+                    } else if (!latestDueTs.empty()) {
                         summary << " at " << latestDueTs;
                     }
                     if (dueCount > 1) {
@@ -8617,8 +9106,35 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                 std::string analysisAnchorTs = trim(strField(opState, "analysis_anchor_ts_utc"));
                 std::string firstDueTs = trim(strField(opState, "first_due_ts_utc"));
                 std::string horizonEndTs = trim(strField(opState, "horizon_end_ts_utc"));
+                std::string scheduledTargetTs = trim(strField(opState, "scheduled_target_ts_utc"));
+                bool fixedTimeOverdue =
+                    opState.contains("fixed_time_local_overdue") &&
+                    opState["fixed_time_local_overdue"].is_boolean() &&
+                    opState["fixed_time_local_overdue"].get<bool>();
 
-                if (analysisAnchorTs.empty() || firstDueTs.empty()) {
+                if (anchorMode == "fixed_time_local") {
+                    analysisAnchorTs = monitoringStartTs;
+                    fixedTimeOverdue = false;
+                    if (!computeFixedLocalCheckpointUtc(
+                            monitoringStartTs,
+                            dateLocal,
+                            timeLocal,
+                            timezone,
+                            scheduledTargetTs))
+                    {
+                        firstDueTs.clear();
+                        scheduledTargetTs.clear();
+                        fixedTimeOverdue = false;
+                        unk = true;
+                        result["reason"] = "operator_fixed_time_local_unsupported";
+                    } else {
+                        fixedTimeOverdue =
+                            !dateLocal.empty() &&
+                            !analysisAnchorTs.empty() &&
+                            scheduledTargetTs < analysisAnchorTs;
+                        firstDueTs = fixedTimeOverdue ? normalizedNowTs : scheduledTargetTs;
+                    }
+                } else if (analysisAnchorTs.empty() || firstDueTs.empty()) {
                     if (anchorMode == "monitoring_start") {
                         analysisAnchorTs = monitoringStartTs;
                         if (intervalSeconds > 0) firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
@@ -8628,17 +9144,12 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
                             firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
                         }
-                    } else if (anchorMode == "fixed_time_local") {
-                        analysisAnchorTs = monitoringStartTs;
-                        if (!computeNextFixedLocalCheckpointUtc(monitoringStartTs, timeLocal, timezone, firstDueTs)) {
-                            unk = true;
-                            result["reason"] = "operator_fixed_time_local_unsupported";
-                        }
                     }
-
-                    if (!analysisAnchorTs.empty()) opState["analysis_anchor_ts_utc"] = analysisAnchorTs;
-                    if (!firstDueTs.empty()) opState["first_due_ts_utc"] = firstDueTs;
                 }
+                if (!analysisAnchorTs.empty()) opState["analysis_anchor_ts_utc"] = analysisAnchorTs;
+                if (!firstDueTs.empty()) opState["first_due_ts_utc"] = firstDueTs;
+                if (!scheduledTargetTs.empty()) opState["scheduled_target_ts_utc"] = scheduledTargetTs;
+                if (anchorMode == "fixed_time_local") opState["fixed_time_local_overdue"] = fixedTimeOverdue;
 
                 if (!unk && windowMode == "cumulative_from_anchor" &&
                     windowSeconds > 0 && !analysisAnchorTs.empty())
@@ -8650,6 +9161,8 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                 result["analysis_anchor_ts_utc"] = analysisAnchorTs;
                 result["first_due_ts_utc"] = firstDueTs;
                 if (!horizonEndTs.empty()) result["horizon_end_ts_utc"] = horizonEndTs;
+                if (!scheduledTargetTs.empty()) result["scheduled_target_ts_utc"] = scheduledTargetTs;
+                if (fixedTimeOverdue) result["fixed_time_local_overdue"] = true;
 
                 const bool alreadyFinalized =
                     opState.contains("finalized") &&
@@ -8743,6 +9256,10 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                                     { "window_end_ts_utc", windowEndTs },
                                     { "analysis_kind", analysisKind }
                                 };
+                                if (!scheduledTargetTs.empty()) {
+                                    checkpoint["scheduled_target_ts_utc"] = scheduledTargetTs;
+                                }
+                                if (fixedTimeOverdue) checkpoint["fixed_time_local_overdue"] = true;
                                 json contributingEvents = json::array();
                                 const json analysisValue =
                                     computeAnalysisValue(windowStartTs, windowEndTs, contributingEvents);

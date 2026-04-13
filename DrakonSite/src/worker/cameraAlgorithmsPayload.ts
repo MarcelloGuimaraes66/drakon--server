@@ -468,6 +468,58 @@ const parseConfigJson = (value: unknown): Record<string, any> => {
   return {};
 };
 
+const normalizeAlertChannelEnabled = (value: unknown, fallback = false): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+  }
+  return fallback;
+};
+
+const parseAlertChannels = (
+  value: unknown
+): Record<string, Record<string, unknown> & { enabled: boolean }> => {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim();
+    if (!trimmed) return {};
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+
+  const out: Record<string, Record<string, unknown> & { enabled: boolean }> = {};
+  for (const [rawChannel, rawConfig] of Object.entries(parsed as Record<string, unknown>)) {
+    const channel = rawChannel.trim().toLowerCase();
+    if (!channel) continue;
+    const normalizedConfig =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? { ...(rawConfig as Record<string, unknown>) }
+        : {};
+    const enabledSource =
+      rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+        ? (rawConfig as Record<string, unknown>).enabled
+        : rawConfig;
+    normalizedConfig.enabled = normalizeAlertChannelEnabled(enabledSource, false);
+    out[channel] = normalizedConfig as Record<string, unknown> & { enabled: boolean };
+  }
+
+  return out;
+};
+
 const normalizeInferenceModel = (value: unknown): CameraCustomInferenceModel => {
   if (typeof value !== "string") return FIXED_CAMERA_CUSTOM_INFERENCE_MODEL;
   const normalized = value.trim().toLowerCase();
@@ -749,6 +801,7 @@ export async function buildEnabledAlgorithmsForCamera(
     if (!configJson.display_name) {
       configJson.display_name = displayNames[algorithmType] || algorithmType;
     }
+    const alertChannels = parseAlertChannels(row.alert_channels ?? row.alert_channels_json);
 
     const isCustom = algorithmType.startsWith("custom_");
     if (!isCustom) {
@@ -758,6 +811,7 @@ export async function buildEnabledAlgorithmsForCamera(
         llm_prompt: llmPrompt || null,
         image_region: row.image_region || null,
         config_json: configJson,
+        alert_channels: alertChannels,
         temporal_plan_json: row.temporal_plan_json || null,
         temporal_plan_hash: row.temporal_plan_hash || null,
         temporal_plan_version: row.temporal_plan_version || null,
@@ -826,6 +880,7 @@ export async function buildEnabledAlgorithmsForCamera(
       llm_prompt: llmPrompt || null,
       image_region: row.image_region || null,
       config_json: configJson,
+      alert_channels: alertChannels,
       prompt_template: promptTemplate,
       alert_condition: alertCondition,
       negative_condition: negativeCondition,
