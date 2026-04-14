@@ -65,6 +65,12 @@ import {
   type PaidAgentBillingPlanId,
 } from "@/shared/agentBilling";
 import {
+  isValidSecretRecoveryAnswer,
+  normalizeSecretRecoveryAnswer,
+  normalizeSecretRecoveryQuestionKey,
+  type SecretRecoveryQuestionKey,
+} from "@/shared/securityRecovery";
+import {
   buildCentralIdentityEndpointUrl,
   createCentralIdentityDeviceSession,
   ensureCentralIdentitySchema,
@@ -90,6 +96,7 @@ import {
 } from "./sharedFindRelayState";
 import {
   getLocalSessionUserByToken,
+  migrateAppUserIdReferences,
   migrateLegacyLocalUserIdToCanonicalId,
   resolveCanonicalAppUserIdFromLocalUserRow,
   resolvePairingClientIdFromLocalUserRow,
@@ -325,12 +332,15 @@ async function buildEnabledAlgorithmsPayloadForCamera(
 ): Promise<any[]> {
   const openAiApiKey = await getUserOpenAIApiKey(db, userId);
   const zAiApiKey = await getUserZAIApiKey(db, userId);
+  const directCaptureOnMotionOnly =
+    await getCameraDirectCaptureOnMotionSettingForUser(db, userId, cameraId);
   return buildEnabledAlgorithmsForCamera({
     db,
     userId,
     cameraId,
     openAiApiKey,
     zAiApiKey,
+    directCaptureOnMotionOnly,
     onlyEnabled: true,
     algorithmDescriptions: ALGORITHM_DESCRIPTIONS,
     algorithmDisplayNames: ALGORITHM_DISPLAY_NAMES,
@@ -429,6 +439,39 @@ function maskZAIApiKeyPreview(apiKey: unknown): string {
   return `${raw.slice(0, visiblePrefixLength)}****`;
 }
 
+type ChatApiKeyProvider = "openai" | "zai";
+type ChatApiKeyAction = "save" | "clear";
+
+function normalizeChatApiKeyProvider(value: unknown): ChatApiKeyProvider | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "openai" || normalized === "open ai") return "openai";
+  if (normalized === "zai" || normalized === "z.ai" || normalized === "z ai") return "zai";
+  return null;
+}
+
+function normalizeChatApiKeyAction(value: unknown): ChatApiKeyAction | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "save" || normalized === "set" || normalized === "update") {
+    return "save";
+  }
+  if (normalized === "clear" || normalized === "remove" || normalized === "delete") {
+    return "clear";
+  }
+  return null;
+}
+
+function buildChatApiKeyProviderLabel(provider: ChatApiKeyProvider): string {
+  return provider === "openai" ? "OpenAI" : "Z.ai";
+}
+
+function maskChatApiKeyPreview(provider: ChatApiKeyProvider, apiKey: unknown): string {
+  return provider === "openai"
+    ? maskOpenAIApiKeyPreview(apiKey)
+    : maskZAIApiKeyPreview(apiKey);
+}
+
 function redactSensitiveForLog(value: unknown): unknown {
   const sensitiveKeys = new Set([
     "api_key",
@@ -469,9 +512,11 @@ function redactSensitiveForLog(value: unknown): unknown {
 }
 
 const OPENAI_KEY_REQUIRED_ERROR = "OPENAI_KEY_REQUIRED";
-const OPENAI_KEY_REQUIRED_MESSAGE = "OpenAI API key is not configured in Settings.";
+const OPENAI_KEY_REQUIRED_MESSAGE =
+  "OpenAI API key is not configured. Add it in Settings or paste it here in chat.";
 const ZAI_KEY_REQUIRED_ERROR = "ZAI_KEY_REQUIRED";
-const ZAI_KEY_REQUIRED_MESSAGE = "Z.ai API key is not configured in Settings.";
+const ZAI_KEY_REQUIRED_MESSAGE =
+  "Z.ai API key is not configured. Add it in Settings or paste it here in chat.";
 const enforcePerceptrumLicenseRules = brand.id === "perceptrum";
 const PERCEPTRUM_CHAT_TRIAL_DAYS = 30;
 const PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR = "PERCEPTRUM_CHAT_TRIAL_EXPIRED";
@@ -6972,6 +7017,36 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       await db.prepare(`
+        CREATE TABLE IF NOT EXISTS user_secret_recovery (
+          app_user_id TEXT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+          storage_scope TEXT NOT NULL DEFAULT 'local',
+          question_key TEXT,
+          answer_hash TEXT,
+          failed_attempts INTEGER NOT NULL DEFAULT 0,
+          locked_until TEXT,
+          configured_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN storage_scope TEXT NOT NULL DEFAULT 'local'`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN question_key TEXT`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN answer_hash TEXT`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN locked_until TEXT`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN configured_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN created_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE user_secret_recovery ADD COLUMN updated_at TEXT`);
+      await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_secret_recovery_app_user
+        ON user_secret_recovery(app_user_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_user_secret_recovery_locked_until
+        ON user_secret_recovery(locked_until)
+      `).run();
+
+      await db.prepare(`
         CREATE TABLE IF NOT EXISTS oauth_identities (
           provider TEXT NOT NULL,
           provider_subject TEXT NOT NULL,
@@ -7573,6 +7648,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN state_code TEXT`);
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN country_code TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE cameras ADD COLUMN direct_capture_on_motion_only INTEGER NOT NULL DEFAULT 0`
+        );
       }
 
       await db.prepare(
@@ -7651,7 +7729,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE camera_algorithms ADD COLUMN model_fps INTEGER NOT NULL DEFAULT 1`
         );
         await addColumnIfMissing(
-          `ALTER TABLE camera_algorithms ADD COLUMN only_capture_on_motion INTEGER DEFAULT 1`
+          `ALTER TABLE camera_algorithms ADD COLUMN only_capture_on_motion INTEGER DEFAULT 0`
         );
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN alert_channels_json TEXT`
@@ -7674,6 +7752,17 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN temporal_explain_json TEXT`
         );
+
+        await db.prepare(
+          `UPDATE camera_algorithms
+             SET only_capture_on_motion = 0
+           WHERE COALESCE(only_capture_on_motion, 0) != 0
+             AND camera_id IN (
+               SELECT id
+                 FROM cameras
+                WHERE COALESCE(direct_capture_on_motion_only, 0) = 0
+             )`
+        ).run();
       }
 
       await db.prepare(`
@@ -9722,6 +9811,37 @@ async function getAppUserProfile(
   return { created_at: null, handle, country_code: countryCode };
 }
 
+async function buildAuthenticatedUserPayload(
+  db: D1Database,
+  input: {
+    id: string;
+    email: string;
+    authProvider: "local" | "google";
+    countryCode?: string | null;
+    createdAt?: string | null;
+    handle?: string | null;
+    googleUserData?: any;
+    hasPassword?: boolean;
+  }
+): Promise<Record<string, unknown>> {
+  const secretRecovery = await getSecretRecoveryAuthState(db, input.id);
+
+  return {
+    id: input.id,
+    email: input.email,
+    auth_provider: input.authProvider,
+    country_code: input.countryCode || null,
+    created_at: input.createdAt || null,
+    handle: normalizeUserHandleInput(input.handle) || null,
+    requires_secret_recovery_setup: secretRecovery.requiresSecretRecoverySetup,
+    secret_recovery_configured: secretRecovery.secretRecoveryConfigured,
+    secret_recovery_question_key: secretRecovery.secretRecoveryQuestionKey,
+    secret_recovery_storage_scope: secretRecovery.secretRecoveryStorageScope,
+    has_password: Boolean(input.hasPassword),
+    ...(input.googleUserData ? { google_user_data: input.googleUserData } : {}),
+  };
+}
+
 async function hasUserEverPurchasedUnlockingPlan(
   db: D1Database,
   userId: string
@@ -10980,6 +11100,742 @@ function normalizeChatTaskState(value: unknown) {
   };
 }
 
+const CHAT_API_KEY_PROVIDER_OPENAI_PATTERN = /\bopen\s*ai\b|\bopenai\b/i;
+const CHAT_API_KEY_PROVIDER_ZAI_PATTERN = /\bz\s*\.?\s*ai\b|\bzai\b/i;
+const CHAT_API_KEY_PHRASE_PATTERN =
+  /\b(?:api[\s-]?key|apikey|chave(?:s)?(?:\s+de)?\s+api|clave(?:s)?(?:\s+de)?\s+api|cle(?:s)?(?:\s+d['e])?\s*api|token(?:s)?)\b/i;
+const CHAT_API_KEY_SAVE_ACTION_PATTERN =
+  /\b(?:add|save|set|update|change|replace|edit|store|configure|use|adicionar|adicione|salvar|definir|atualizar|trocar|substituir|editar|configurar|usar|colocar|cadastrar|agregar|guardar|establecer|actualizar|cambiar|reemplazar|poner|ajouter|enregistrer|modifier|changer|remplacer|configurer|utiliser)\b/i;
+const CHAT_API_KEY_CLEAR_ACTION_PATTERN =
+  /\b(?:remove|delete|clear|erase|unset|drop|revoke|disconnect|remover|apagar|limpar|excluir|tirar|borrar|eliminar|quitar|limpiar|supprimer|effacer|retirer)\b/i;
+const CHAT_API_KEY_QUESTION_PATTERN =
+  /^\s*(?:how|what|where|why|when|can|could|should|would|do|does|is|are|como|onde|porque|por\s+que|posso|consigo|devo|qual|quais|o\s+que|que|comment|ou|pourquoi|puis[- ]?je|peux[- ]?tu|est[- ]?ce\s+que)\b/i;
+
+type ChatApiKeySkillContinuation = {
+  provider: ChatApiKeyProvider | null;
+  action: ChatApiKeyAction | null;
+  language: string;
+};
+
+type ChatApiKeySkillIntent = {
+  shouldHandle: boolean;
+  provider: ChatApiKeyProvider | null;
+  providerMentions: ChatApiKeyProvider[];
+  action: ChatApiKeyAction | null;
+  apiKeyCandidates: string[];
+  hasApiKeyPhrase: boolean;
+  continuation: ChatApiKeySkillContinuation | null;
+};
+
+function readChatApiKeySkillContinuation(taskStateInput: unknown): ChatApiKeySkillContinuation | null {
+  const taskState = normalizeChatTaskState(taskStateInput);
+  const activeTask =
+    taskState.active_task && typeof taskState.active_task === "object"
+      ? (taskState.active_task as Record<string, unknown>)
+      : null;
+  const activeTaskType =
+    typeof activeTask?.type === "string" ? activeTask.type.trim().slice(0, 80) : "";
+  if (!activeTask || activeTaskType !== "manage_api_key") {
+    return null;
+  }
+  const draft =
+    activeTask.draft && typeof activeTask.draft === "object" && !Array.isArray(activeTask.draft)
+      ? (activeTask.draft as Record<string, unknown>)
+      : {};
+  return {
+    provider: normalizeChatApiKeyProvider(draft.provider),
+    action: normalizeChatApiKeyAction(draft.action),
+    language:
+      normalizeSupportedChatLanguage(activeTask.reply_language, "") ||
+      normalizeSupportedChatLanguage(activeTask.language, "") ||
+      "en",
+  };
+}
+
+function detectChatApiKeyProviderMentions(content: string): ChatApiKeyProvider[] {
+  const providers: ChatApiKeyProvider[] = [];
+  if (CHAT_API_KEY_PROVIDER_OPENAI_PATTERN.test(content)) {
+    providers.push("openai");
+  }
+  if (CHAT_API_KEY_PROVIDER_ZAI_PATTERN.test(content)) {
+    providers.push("zai");
+  }
+  return providers;
+}
+
+function looksLikeChatApiKeyCandidate(value: string): boolean {
+  const normalized = value.trim();
+  if (!normalized || normalized.length < 12) return false;
+  if (/\s/.test(normalized)) return false;
+  if (/^https?:\/\//i.test(normalized)) return false;
+  if (/^[-:0-9.]+$/.test(normalized)) return false;
+  if (!/[A-Za-z]/.test(normalized)) return false;
+  if (normalized.startsWith("sk-")) return true;
+  if (/^[A-Za-z0-9_-]{24,}$/.test(normalized)) return true;
+  return normalized.length >= 16 && (/\d/.test(normalized) || /[-_.:]/.test(normalized));
+}
+
+function extractChatApiKeyCandidatesFromMessage(content: string): string[] {
+  const trimmed =
+    typeof content === "string" ? content.replace(/\s+/g, " ").trim().slice(0, 2400) : "";
+  if (!trimmed) {
+    return [];
+  }
+
+  const candidates: string[] = [];
+  const pushCandidate = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const normalized = value.trim().replace(/^[`'"]+|[`'"]+$/g, "").trim();
+    if (!looksLikeChatApiKeyCandidate(normalized) || candidates.includes(normalized)) {
+      return;
+    }
+    candidates.push(normalized);
+  };
+
+  const quotedPatterns = [/`([^`\r\n]+)`/g, /"([^"\r\n]+)"/g, /'([^'\r\n]+)'/g];
+  for (const pattern of quotedPatterns) {
+    let match: RegExpExecArray | null;
+    pattern.lastIndex = 0;
+    while ((match = pattern.exec(trimmed)) !== null) {
+      pushCandidate(match[1]);
+    }
+  }
+
+  const labeledPattern =
+    /(?:api[\s-]?key|apikey|key|token|chave(?:s)?(?:\s+de)?\s+api|clave(?:s)?(?:\s+de)?\s+api|cle(?:s)?(?:\s+d['e])?\s*api)\s*(?:is|=|:|-|e|eh)?\s*([^\s,;]+)/gi;
+  let labeledMatch: RegExpExecArray | null;
+  while ((labeledMatch = labeledPattern.exec(trimmed)) !== null) {
+    pushCandidate(labeledMatch[1]);
+  }
+
+  const genericMatches = trimmed.match(/[A-Za-z0-9][A-Za-z0-9._:-]{11,}/g) || [];
+  genericMatches.forEach((candidate) => pushCandidate(candidate));
+  pushCandidate(trimmed);
+
+  return candidates.sort((left, right) => {
+    const leftStartsWithSk = left.startsWith("sk-") ? 1 : 0;
+    const rightStartsWithSk = right.startsWith("sk-") ? 1 : 0;
+    if (leftStartsWithSk !== rightStartsWithSk) {
+      return rightStartsWithSk - leftStartsWithSk;
+    }
+    return right.length - left.length;
+  });
+}
+
+function parseChatApiKeySkillIntent(params: {
+  content: unknown;
+  taskState: unknown;
+}): ChatApiKeySkillIntent {
+  const content = typeof params.content === "string" ? params.content.trim() : "";
+  const continuation = readChatApiKeySkillContinuation(params.taskState);
+  if (!content) {
+    return {
+      shouldHandle: false,
+      provider: null,
+      providerMentions: [],
+      action: continuation?.action || null,
+      apiKeyCandidates: [],
+      hasApiKeyPhrase: false,
+      continuation,
+    };
+  }
+
+  const providerMentions = detectChatApiKeyProviderMentions(content);
+  const apiKeyCandidates = extractChatApiKeyCandidatesFromMessage(content);
+  const hasApiKeyPhrase = CHAT_API_KEY_PHRASE_PATTERN.test(content);
+  const wantsClear = CHAT_API_KEY_CLEAR_ACTION_PATTERN.test(content);
+  const wantsSave = CHAT_API_KEY_SAVE_ACTION_PATTERN.test(content);
+  const looksLikeStandaloneSecret =
+    apiKeyCandidates.length > 0 && content.split(/\s+/).filter(Boolean).length <= 4;
+  const maybeQuestion =
+    !continuation &&
+    apiKeyCandidates.length === 0 &&
+    (content.includes("?") || CHAT_API_KEY_QUESTION_PATTERN.test(content));
+
+  const provider =
+    providerMentions.length === 1
+      ? providerMentions[0]
+      : providerMentions.length === 0
+        ? continuation?.provider || null
+        : null;
+  const action = wantsClear
+    ? "clear"
+    : wantsSave || apiKeyCandidates.length > 0 || continuation?.action === "save"
+      ? "save"
+      : continuation?.action || null;
+  const shouldHandle =
+    !!continuation ||
+    looksLikeStandaloneSecret ||
+    (!maybeQuestion &&
+      ((providerMentions.length > 0 && (wantsClear || wantsSave || apiKeyCandidates.length > 0)) ||
+        (hasApiKeyPhrase && (wantsClear || wantsSave || apiKeyCandidates.length > 0))));
+
+  return {
+    shouldHandle,
+    provider,
+    providerMentions,
+    action,
+    apiKeyCandidates,
+    hasApiKeyPhrase,
+    continuation,
+  };
+}
+
+function buildChatApiKeyGoal(
+  provider: ChatApiKeyProvider | null,
+  action: ChatApiKeyAction | null
+): string {
+  const actionLabel = action === "clear" ? "clear" : "save";
+  return provider ? `${actionLabel} ${buildChatApiKeyProviderLabel(provider)} api key` : "manage api key";
+}
+
+function buildChatApiKeyPendingTaskSummary(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider | null,
+  awaitingField: "provider" | "api_key"
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = provider ? buildChatApiKeyProviderLabel(provider) : "API";
+  if (language === "pt") {
+    return awaitingField === "provider"
+      ? "Aguardando a escolha do provedor da chave de API"
+      : `Aguardando a chave da API da ${providerLabel}`;
+  }
+  if (language === "es") {
+    return awaitingField === "provider"
+      ? "Esperando el proveedor de la clave API"
+      : `Esperando la clave API de ${providerLabel}`;
+  }
+  if (language === "fr") {
+    return awaitingField === "provider"
+      ? "En attente du fournisseur de la cle API"
+      : `En attente de la cle API ${providerLabel}`;
+  }
+  return awaitingField === "provider"
+    ? "Waiting for the API key provider"
+    : `Waiting for the ${providerLabel} API key`;
+}
+
+function buildChatApiKeyCompletedTaskSummary(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider,
+  action: ChatApiKeyAction
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = buildChatApiKeyProviderLabel(provider);
+  if (language === "pt") {
+    return action === "clear"
+      ? `Chave da ${providerLabel} removida`
+      : `Chave da ${providerLabel} salva`;
+  }
+  if (language === "es") {
+    return action === "clear"
+      ? `Clave de ${providerLabel} eliminada`
+      : `Clave de ${providerLabel} guardada`;
+  }
+  if (language === "fr") {
+    return action === "clear"
+      ? `Cle ${providerLabel} supprimee`
+      : `Cle ${providerLabel} enregistree`;
+  }
+  return action === "clear"
+    ? `${providerLabel} API key removed`
+    : `${providerLabel} API key saved`;
+}
+
+function buildChatApiKeyPendingTaskState(
+  taskState: ReturnType<typeof normalizeChatTaskState>,
+  params: {
+    languageInput: unknown;
+    provider: ChatApiKeyProvider | null;
+    action: ChatApiKeyAction | null;
+    awaitingField: "provider" | "api_key";
+  }
+) {
+  const language = normalizeSupportedChatLanguage(params.languageInput, "en");
+  const existingRecent = Array.isArray(taskState.recent_tasks)
+    ? taskState.recent_tasks.filter((item) => item && typeof item === "object").slice(0, 4)
+    : [];
+  const existingSessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+  const action = params.action || "save";
+  const collectedFields = [
+    ...(params.provider ? ["provider"] : []),
+    ...(action ? ["action"] : []),
+  ];
+
+  return {
+    version: 2,
+    active_task: {
+      type: "manage_api_key",
+      entity_type: "integration",
+      intent: action === "clear" ? "delete" : "update",
+      status: "in_progress",
+      phase: params.awaitingField === "provider" ? "awaiting_provider" : "awaiting_api_key",
+      language,
+      reply_language: language,
+      goal: buildChatApiKeyGoal(params.provider, action),
+      summary: buildChatApiKeyPendingTaskSummary(language, params.provider, params.awaitingField),
+      missing_fields: params.awaitingField === "provider" ? ["provider"] : ["api_key"],
+      collected_fields: collectedFields,
+      draft: {
+        provider: params.provider,
+        action,
+      },
+    },
+    recent_tasks: existingRecent,
+    session_entities: {
+      ...existingSessionEntities,
+      ...(params.provider ? { last_api_key_provider: params.provider } : {}),
+    },
+  };
+}
+
+function buildChatApiKeyCompletedTaskState(
+  taskState: ReturnType<typeof normalizeChatTaskState>,
+  params: {
+    languageInput: unknown;
+    provider: ChatApiKeyProvider;
+    action: ChatApiKeyAction;
+    preview?: string;
+  }
+) {
+  const language = normalizeSupportedChatLanguage(params.languageInput, "en");
+  const existingRecent = Array.isArray(taskState.recent_tasks)
+    ? taskState.recent_tasks.filter((item) => item && typeof item === "object").slice(0, 3)
+    : [];
+  const existingSessionEntities =
+    taskState.session_entities && typeof taskState.session_entities === "object"
+      ? (taskState.session_entities as Record<string, unknown>)
+      : {};
+
+  const recentTask = {
+    type: "manage_api_key",
+    entity_type: "integration",
+    intent: params.action === "clear" ? "delete" : "update",
+    status: "completed",
+    phase: params.action === "clear" ? "cleared" : "saved",
+    language,
+    reply_language: language,
+    goal: buildChatApiKeyGoal(params.provider, params.action),
+    summary: buildChatApiKeyCompletedTaskSummary(language, params.provider, params.action),
+    missing_fields: [],
+    collected_fields: params.action === "clear" ? ["provider"] : ["provider", "api_key"],
+    draft: {
+      provider: params.provider,
+      action: params.action,
+      ...(params.preview ? { api_key_preview: params.preview } : {}),
+    },
+  };
+
+  return {
+    version: 2,
+    active_task: null,
+    recent_tasks: [recentTask, ...existingRecent],
+    session_entities: {
+      ...existingSessionEntities,
+      last_api_key_provider: params.provider,
+      last_api_key_action: params.action,
+      [`${params.provider}_api_key_configured`]: params.action !== "clear",
+    },
+  };
+}
+
+function buildChatApiKeyChooseProviderMessage(
+  languageInput: unknown,
+  mode: "generic" | "received_key" | "multiple"
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  if (language === "pt") {
+    if (mode === "received_key") {
+      return "Recebi a chave, mas preciso saber se ela e para OpenAI ou Z.ai. Responda so com OpenAI ou Z.ai e eu continuo.";
+    }
+    if (mode === "multiple") {
+      return "Consigo atualizar uma chave por vez. Diga se voce quer OpenAI ou Z.ai.";
+    }
+    return "Posso cuidar disso pelo chat. Qual chave voce quer gerenciar: OpenAI ou Z.ai?";
+  }
+  if (language === "es") {
+    if (mode === "received_key") {
+      return "Recibi la clave, pero necesito saber si es para OpenAI o Z.ai. Responde solo con OpenAI o Z.ai y continuo.";
+    }
+    if (mode === "multiple") {
+      return "Puedo actualizar una clave por vez. Dime si quieres OpenAI o Z.ai.";
+    }
+    return "Puedo hacer eso desde el chat. Que clave quieres gestionar: OpenAI o Z.ai?";
+  }
+  if (language === "fr") {
+    if (mode === "received_key") {
+      return "J'ai bien recu la cle, mais j'ai besoin de savoir si elle est pour OpenAI ou Z.ai. Repondez seulement OpenAI ou Z.ai et je continue.";
+    }
+    if (mode === "multiple") {
+      return "Je peux mettre a jour une cle a la fois. Dites-moi si vous voulez OpenAI ou Z.ai.";
+    }
+    return "Je peux m'en occuper directement dans le chat. Quelle cle voulez-vous gerer : OpenAI ou Z.ai ?";
+  }
+  if (mode === "received_key") {
+    return "I received the key, but I need to know whether it is for OpenAI or Z.ai. Reply with just OpenAI or Z.ai and I will continue.";
+  }
+  if (mode === "multiple") {
+    return "I can update one key at a time. Tell me whether you want OpenAI or Z.ai.";
+  }
+  return "I can handle that in chat. Which API key do you want to manage: OpenAI or Z.ai?";
+}
+
+function buildChatApiKeyPasteValueMessage(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = buildChatApiKeyProviderLabel(provider);
+  if (language === "pt") {
+    return `Certo. Cole aqui a chave da API da ${providerLabel}. Eu vou salva-la e redigir o segredo do historico do chat.`;
+  }
+  if (language === "es") {
+    return `Perfecto. Pega aqui la clave API de ${providerLabel}. La guardare y ocultare el secreto del historial del chat.`;
+  }
+  if (language === "fr") {
+    return `Parfait. Collez ici la cle API ${providerLabel}. Je vais l'enregistrer et masquer le secret dans l'historique du chat.`;
+  }
+  return `Okay. Paste the ${providerLabel} API key here. I will save it and redact the secret from the chat history.`;
+}
+
+function buildChatApiKeyPasteOnlyValueMessage(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = buildChatApiKeyProviderLabel(provider);
+  if (language === "pt") {
+    return `Entendi que voce quer atualizar a chave da ${providerLabel}, mas encontrei mais de um valor possivel. Cole so a chave na proxima mensagem e eu salvo sem deixar o segredo no historico.`;
+  }
+  if (language === "es") {
+    return `Entendi que quieres actualizar la clave de ${providerLabel}, pero encontre mas de un valor posible. Pega solo la clave en el proximo mensaje y la guardare sin dejar el secreto en el historial.`;
+  }
+  if (language === "fr") {
+    return `J'ai compris que vous voulez mettre a jour la cle ${providerLabel}, mais j'ai trouve plusieurs valeurs possibles. Collez seulement la cle dans le prochain message et je l'enregistrerai sans laisser le secret dans l'historique.`;
+  }
+  return `I understood that you want to update the ${providerLabel} key, but I found more than one possible value. Paste only the key in the next message and I will save it without leaving the secret in the history.`;
+}
+
+function buildChatApiKeySavedMessage(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider,
+  preview: string
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = buildChatApiKeyProviderLabel(provider);
+  if (language === "pt") {
+    return `Chave da ${providerLabel} salva. Preview: ${preview}.\nTambem redigi o segredo do historico do chat.`;
+  }
+  if (language === "es") {
+    return `Clave de ${providerLabel} guardada. Vista previa: ${preview}.\nTambien oculte el secreto del historial del chat.`;
+  }
+  if (language === "fr") {
+    return `Cle ${providerLabel} enregistree. Apercu : ${preview}.\nJ'ai aussi masque le secret dans l'historique du chat.`;
+  }
+  return `${providerLabel} API key saved. Preview: ${preview}.\nI also redacted the secret from the chat history.`;
+}
+
+function buildChatApiKeyClearedMessage(
+  languageInput: unknown,
+  provider: ChatApiKeyProvider,
+  hadExistingKey: boolean
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = buildChatApiKeyProviderLabel(provider);
+  if (language === "pt") {
+    return hadExistingKey
+      ? `Chave da ${providerLabel} removida.\nSe quiser, voce pode colar uma nova chave aqui no chat.`
+      : `Nao havia uma chave da ${providerLabel} salva. De qualquer forma, deixei a configuracao limpa.`;
+  }
+  if (language === "es") {
+    return hadExistingKey
+      ? `Clave de ${providerLabel} eliminada.\nSi quieres, ya puedes pegar una nueva clave aqui en el chat.`
+      : `No habia una clave de ${providerLabel} guardada. De todas formas, deje la configuracion limpia.`;
+  }
+  if (language === "fr") {
+    return hadExistingKey
+      ? `Cle ${providerLabel} supprimee.\nSi vous voulez, vous pouvez deja coller une nouvelle cle ici dans le chat.`
+      : `Aucune cle ${providerLabel} n'etait enregistree. Dans tous les cas, j'ai laisse la configuration vide.`;
+  }
+  return hadExistingKey
+    ? `${providerLabel} API key removed.\nIf you want, you can paste a new key here in chat now.`
+    : `There was no saved ${providerLabel} API key. I still left the configuration clean.`;
+}
+
+function buildChatApiKeyUserMessageSummary(
+  languageInput: unknown,
+  params: {
+    provider: ChatApiKeyProvider | null;
+    action: ChatApiKeyAction | null;
+    hasApiKey: boolean;
+  }
+): string {
+  const language = normalizeSupportedChatLanguage(languageInput, "en");
+  const providerLabel = params.provider ? buildChatApiKeyProviderLabel(params.provider) : "API";
+  if (language === "pt") {
+    if (params.action === "clear") {
+      return params.provider
+        ? `Solicitei a remocao da chave da ${providerLabel}.`
+        : "Solicitei a remocao de uma chave de API.";
+    }
+    if (params.provider && params.hasApiKey) {
+      return `Compartilhei a chave da ${providerLabel} pelo chat.`;
+    }
+    if (params.provider) {
+      return `Escolhi ${providerLabel} como provedora da chave de API.`;
+    }
+    if (params.hasApiKey) {
+      return "Compartilhei uma chave de API para configuracao no chat.";
+    }
+    return "Solicitei a configuracao de uma chave de API.";
+  }
+  if (language === "es") {
+    if (params.action === "clear") {
+      return params.provider
+        ? `Solicite eliminar la clave de ${providerLabel}.`
+        : "Solicite eliminar una clave API.";
+    }
+    if (params.provider && params.hasApiKey) {
+      return `Comparti la clave de ${providerLabel} por el chat.`;
+    }
+    if (params.provider) {
+      return `Elegi ${providerLabel} como proveedor de la clave API.`;
+    }
+    if (params.hasApiKey) {
+      return "Comparti una clave API para configurarla por el chat.";
+    }
+    return "Solicite configurar una clave API.";
+  }
+  if (language === "fr") {
+    if (params.action === "clear") {
+      return params.provider
+        ? `J'ai demande la suppression de la cle ${providerLabel}.`
+        : "J'ai demande la suppression d'une cle API.";
+    }
+    if (params.provider && params.hasApiKey) {
+      return `J'ai partage la cle ${providerLabel} dans le chat.`;
+    }
+    if (params.provider) {
+      return `J'ai choisi ${providerLabel} comme fournisseur de la cle API.`;
+    }
+    if (params.hasApiKey) {
+      return "J'ai partage une cle API pour la configurer dans le chat.";
+    }
+    return "J'ai demande la configuration d'une cle API.";
+  }
+  if (params.action === "clear") {
+    return params.provider
+      ? `I requested removal of the ${providerLabel} key.`
+      : "I requested removal of an API key.";
+  }
+  if (params.provider && params.hasApiKey) {
+    return `I shared the ${providerLabel} API key in chat.`;
+  }
+  if (params.provider) {
+    return `I selected ${providerLabel} as the API key provider.`;
+  }
+  if (params.hasApiKey) {
+    return "I shared an API key for chat configuration.";
+  }
+  return "I requested API key configuration.";
+}
+
+async function maybeHandleChatApiKeySkill(params: {
+  db: D1Database;
+  userId: string;
+  sessionId: number;
+  session: unknown;
+  content: string;
+  taskState: ReturnType<typeof normalizeChatTaskState>;
+  appLanguage: string;
+}): Promise<{ messages: unknown[] } | null> {
+  const intent = parseChatApiKeySkillIntent({
+    content: params.content,
+    taskState: params.taskState,
+  });
+  if (!intent.shouldHandle) {
+    return null;
+  }
+
+  const language =
+    (await resolveChatSessionReplyLanguageHint(
+      params.db,
+      params.userId,
+      params.sessionId,
+      intent.continuation?.language || params.appLanguage,
+      {
+        currentMessage: params.content,
+        taskState: params.taskState,
+      }
+    )) ||
+    intent.continuation?.language ||
+    params.appLanguage;
+  const now = new Date().toISOString();
+
+  const userMessageSummary = buildChatApiKeyUserMessageSummary(language, {
+    provider: intent.provider,
+    action: intent.action,
+    hasApiKey: intent.apiKeyCandidates.length > 0,
+  });
+
+  await params.db
+    .prepare(
+      `INSERT INTO chat_messages (
+         user_id,
+         session_id,
+         role,
+         content,
+         camera_ids,
+         tokens_used,
+         message_type,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'user', ?, NULL, 0, 'final', ?, ?)`
+    )
+    .bind(params.userId, params.sessionId, userMessageSummary, now, now)
+    .run();
+
+  const sessionRow = params.session as any;
+  if (isAutoGeneratedChatTitle(sessionRow?.title)) {
+    const messageCount = await params.db
+      .prepare(
+        `SELECT COUNT(*) as count
+         FROM chat_messages
+         WHERE session_id = ? AND role = 'user'`
+      )
+      .bind(params.sessionId)
+      .first();
+    const count = Number((messageCount as any)?.count ?? 0);
+    if (count <= 1) {
+      await params.db
+        .prepare(
+          `UPDATE chat_sessions
+           SET title = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`
+        )
+        .bind(buildChatSessionTitleFromFirstMessage(userMessageSummary), params.sessionId)
+        .run();
+    }
+  }
+
+  let assistantContent = "";
+  let nextTaskState = params.taskState;
+
+  if (intent.providerMentions.length > 1) {
+    assistantContent = buildChatApiKeyChooseProviderMessage(language, "multiple");
+    nextTaskState = buildChatApiKeyPendingTaskState(params.taskState, {
+      languageInput: language,
+      provider: null,
+      action: intent.action || "save",
+      awaitingField: "provider",
+    });
+  } else if (!intent.provider) {
+    assistantContent = buildChatApiKeyChooseProviderMessage(
+      language,
+      intent.apiKeyCandidates.length > 0 ? "received_key" : "generic"
+    );
+    nextTaskState = buildChatApiKeyPendingTaskState(params.taskState, {
+      languageInput: language,
+      provider: null,
+      action: intent.action || "save",
+      awaitingField: "provider",
+    });
+  } else if (intent.action === "clear") {
+    const existingKey = await getUserApiKeyForProvider(params.db, params.userId, intent.provider);
+    await upsertUserApiKeyForProvider(params.db, params.userId, intent.provider, "");
+    assistantContent = buildChatApiKeyClearedMessage(
+      language,
+      intent.provider,
+      Boolean(existingKey)
+    );
+    nextTaskState = buildChatApiKeyCompletedTaskState(params.taskState, {
+      languageInput: language,
+      provider: intent.provider,
+      action: "clear",
+    });
+  } else if (intent.apiKeyCandidates.length === 0) {
+    assistantContent = buildChatApiKeyPasteValueMessage(language, intent.provider);
+    nextTaskState = buildChatApiKeyPendingTaskState(params.taskState, {
+      languageInput: language,
+      provider: intent.provider,
+      action: "save",
+      awaitingField: "api_key",
+    });
+  } else if (intent.apiKeyCandidates.length > 1) {
+    assistantContent = buildChatApiKeyPasteOnlyValueMessage(language, intent.provider);
+    nextTaskState = buildChatApiKeyPendingTaskState(params.taskState, {
+      languageInput: language,
+      provider: intent.provider,
+      action: "save",
+      awaitingField: "api_key",
+    });
+  } else {
+    const savedKey = await upsertUserApiKeyForProvider(
+      params.db,
+      params.userId,
+      intent.provider,
+      intent.apiKeyCandidates[0]
+    );
+    const preview = maskChatApiKeyPreview(intent.provider, savedKey);
+    assistantContent = buildChatApiKeySavedMessage(language, intent.provider, preview);
+    nextTaskState = buildChatApiKeyCompletedTaskState(params.taskState, {
+      languageInput: language,
+      provider: intent.provider,
+      action: "save",
+      preview,
+    });
+  }
+
+  await persistChatSessionTaskState(params.db, params.userId, params.sessionId, nextTaskState);
+
+  await params.db
+    .prepare(
+      `INSERT INTO chat_messages (
+         user_id,
+         session_id,
+         role,
+         content,
+         camera_ids,
+         tokens_used,
+         message_type,
+         is_pending,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, 'assistant', ?, NULL, 0, 'final', 0, ?, ?)`
+    )
+    .bind(params.userId, params.sessionId, assistantContent, now, now)
+    .run();
+
+  await params.db
+    .prepare(
+      `UPDATE chat_sessions
+       SET updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    )
+    .bind(params.sessionId)
+    .run();
+
+  const { results } = await params.db
+    .prepare("SELECT * FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY id ASC")
+    .bind(params.userId, params.sessionId)
+    .all();
+
+  wsHandler.broadcast(params.sessionId, {
+    type: "message_update",
+    messages: results,
+  });
+
+  return {
+    messages: results || [],
+  };
+}
+
 function normalizeChatAgentTemporalState(value: unknown) {
   const fallback = buildDefaultChatAgentTemporalState();
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -11370,6 +12226,26 @@ function sanitizeChatIdentityTraitArray(
     .map((item) => item.value);
 }
 
+function splitChatIdentityTraitCandidatesFromText(value: unknown, maxItems = 8): string[] {
+  const normalized = normalizeText(value)
+    .replace(/^identity signature\s*:\s*/i, "")
+    .replace(/^assinatura de identidade\s*:\s*/i, "")
+    .replace(/^assinatura visual\s*:\s*/i, "")
+    .slice(0, 400);
+  if (!normalized) {
+    return [];
+  }
+  const parts = normalized
+    .split(/[\r\n,;|]+/)
+    .map((item) => normalizeText(item).slice(0, 160))
+    .filter(Boolean);
+  const deduped = Array.from(new Set(parts));
+  if (deduped.length > 0) {
+    return deduped.slice(0, Math.max(0, Math.floor(maxItems)));
+  }
+  return [normalized.slice(0, 160)];
+}
+
 function sanitizeChatIdentityDescriptionForContext(
   value: unknown,
   signatureTraits: string[]
@@ -11513,11 +12389,22 @@ function sanitizeChatIdentityCardSnapshot(value: unknown): Record<string, unknow
   const normalizedEntityType = normalizeChatIdentityEntityType(entityType);
   const displayName = normalizeText(source.display_name).slice(0, 160);
   const knownName = normalizeText(source.known_name).slice(0, 160);
-  const signatureTraits = sanitizeChatIdentityTraitArray(
+  const explicitSignatureTraits = sanitizeChatIdentityTraitArray(
     [source.identity_signature_traits, source.key_traits, source.stable_attributes],
     normalizedEntityType,
     8
   );
+  const signatureTraits =
+    explicitSignatureTraits.length > 0
+      ? explicitSignatureTraits
+      : sanitizeChatIdentityTraitArray(
+          [
+            splitChatIdentityTraitCandidatesFromText(source.identity_signature_summary, 8),
+            splitChatIdentityTraitCandidatesFromText(source.description, 8),
+          ],
+          normalizedEntityType,
+          8
+        );
   const description = sanitizeChatIdentityDescriptionForContext(
     source.description,
     signatureTraits
@@ -11742,6 +12629,230 @@ function buildChatLastPositiveHitSummary(input: {
   }
 
   return null;
+}
+
+function buildChatIdentityCardSnapshotFromOperationalRow(
+  value: unknown
+): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const source = value as Record<string, unknown>;
+  const cardSource =
+    source.card_json && typeof source.card_json === "object" && !Array.isArray(source.card_json)
+      ? ({ ...(source.card_json as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const snapshotSource: Record<string, unknown> = { ...cardSource };
+
+  const cardId = normalizeText(snapshotSource.card_id ?? source.identity_card_id).slice(0, 160);
+  const displayName = normalizeText(snapshotSource.display_name ?? source.display_name).slice(0, 160);
+  const createdAt = normalizeText(source.created_at).slice(0, 64);
+  const cameraId = clampInteger(source.camera_id);
+  const cameraName = normalizeText(source.camera_name).slice(0, 120);
+  const cropUrl = sanitizeChatExternalUrlForContext(
+    source.crop_url ??
+      source.portrait_url ??
+      ((snapshotSource.primary_portrait as Record<string, unknown> | undefined)?.image_url ?? "") ??
+      snapshotSource.portrait_url ??
+      "",
+    600
+  );
+  const portraitKind = normalizeText(
+    source.portrait_kind ??
+      ((snapshotSource.primary_portrait as Record<string, unknown> | undefined)?.portrait_kind ?? "") ??
+      snapshotSource.portrait_kind ??
+      ""
+  ).slice(0, 64);
+  const rowResolvedIdentity =
+    source.resolved_identity_json &&
+    typeof source.resolved_identity_json === "object" &&
+    !Array.isArray(source.resolved_identity_json)
+      ? ({ ...(source.resolved_identity_json as Record<string, unknown>) } as Record<string, unknown>)
+      : null;
+  const cardResolvedIdentity =
+    snapshotSource.resolved_identity &&
+    typeof snapshotSource.resolved_identity === "object" &&
+    !Array.isArray(snapshotSource.resolved_identity)
+      ? ({ ...(snapshotSource.resolved_identity as Record<string, unknown>) } as Record<string, unknown>)
+      : null;
+  const lastSeen =
+    snapshotSource.last_seen &&
+    typeof snapshotSource.last_seen === "object" &&
+    !Array.isArray(snapshotSource.last_seen)
+      ? ({ ...(snapshotSource.last_seen as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const primaryPortrait =
+    snapshotSource.primary_portrait &&
+    typeof snapshotSource.primary_portrait === "object" &&
+    !Array.isArray(snapshotSource.primary_portrait)
+      ? ({ ...(snapshotSource.primary_portrait as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+
+  if (cardId) snapshotSource.card_id = cardId;
+  if (displayName) snapshotSource.display_name = displayName;
+  if (rowResolvedIdentity || cardResolvedIdentity) {
+    snapshotSource.resolved_identity = {
+      ...(rowResolvedIdentity || {}),
+      ...(cardResolvedIdentity || {}),
+    };
+  }
+
+  if (!normalizeText(lastSeen.timestamp_utc_iso) && createdAt) {
+    lastSeen.timestamp_utc_iso = createdAt;
+  }
+  if (clampInteger(lastSeen.camera_id) <= 0 && cameraId > 0) {
+    lastSeen.camera_id = cameraId;
+  }
+  if (!normalizeText(lastSeen.camera_name) && cameraName) {
+    lastSeen.camera_name = cameraName;
+  }
+  if (Object.keys(lastSeen).length > 0) {
+    snapshotSource.last_seen = lastSeen;
+  }
+
+  if (!normalizeText(primaryPortrait.timestamp_utc_iso) && createdAt) {
+    primaryPortrait.timestamp_utc_iso = createdAt;
+  }
+  if (clampInteger(primaryPortrait.camera_id) <= 0 && cameraId > 0) {
+    primaryPortrait.camera_id = cameraId;
+  }
+  if (!normalizeText(primaryPortrait.camera_name) && cameraName) {
+    primaryPortrait.camera_name = cameraName;
+  }
+  if (!normalizeText(primaryPortrait.portrait_kind) && portraitKind) {
+    primaryPortrait.portrait_kind = portraitKind;
+  }
+  if (!normalizeText(primaryPortrait.image_url) && cropUrl) {
+    primaryPortrait.image_url = cropUrl;
+  }
+  if (Object.keys(primaryPortrait).length > 0) {
+    snapshotSource.primary_portrait = primaryPortrait;
+  }
+
+  if (!normalizeText(snapshotSource.portrait_url) && cropUrl) {
+    snapshotSource.portrait_url = cropUrl;
+  }
+  if (
+    portraitKind &&
+    portraitKind.toLowerCase() === "face" &&
+    typeof snapshotSource.face_available !== "boolean"
+  ) {
+    snapshotSource.face_available = true;
+  }
+
+  return sanitizeChatIdentityCardSnapshot(snapshotSource);
+}
+
+function buildChatIdentityCardMessageMetadataFromOperationalExecution(
+  execution: unknown
+): Record<string, unknown> | null {
+  if (!execution || typeof execution !== "object" || Array.isArray(execution)) {
+    return null;
+  }
+
+  const executionObject = execution as Record<string, unknown>;
+  const datasets =
+    executionObject.datasets &&
+    typeof executionObject.datasets === "object" &&
+    !Array.isArray(executionObject.datasets)
+      ? (executionObject.datasets as Record<string, unknown>)
+      : {};
+  const rawIdentityCardRows = Array.isArray(datasets.identity_cards) ? datasets.identity_cards : [];
+  if (rawIdentityCardRows.length === 0) {
+    return null;
+  }
+
+  const identityCards: Record<string, unknown>[] = [];
+  const seenKeys = new Set<string>();
+  const cameraIds: number[] = [];
+  const cameraNames: string[] = [];
+  let primaryIdentityCardId = "";
+  let primaryDisplayName = "";
+  let primaryPortraitUrl = "";
+  let updatedAt = "";
+  let jobRunId = "";
+  let stepRunId = "";
+  let agentRunId = "";
+
+  for (const rawRow of rawIdentityCardRows) {
+    if (!rawRow || typeof rawRow !== "object" || Array.isArray(rawRow)) {
+      continue;
+    }
+
+    const row = rawRow as Record<string, unknown>;
+    const snapshot = buildChatIdentityCardSnapshotFromOperationalRow(row);
+    if (!snapshot) {
+      continue;
+    }
+
+    const dedupeKey =
+      normalizeText(snapshot.card_id).slice(0, 160) ||
+      normalizeText(snapshot.entity_id).slice(0, 120);
+    if (!dedupeKey || seenKeys.has(dedupeKey)) {
+      continue;
+    }
+    seenKeys.add(dedupeKey);
+    identityCards.push(snapshot);
+
+    const rowCameraId = clampInteger(row.camera_id);
+    if (rowCameraId > 0 && !cameraIds.includes(rowCameraId)) {
+      cameraIds.push(rowCameraId);
+    }
+    const rowCameraName = normalizeText(row.camera_name).slice(0, 120);
+    if (rowCameraName && !cameraNames.includes(rowCameraName)) {
+      cameraNames.push(rowCameraName);
+    }
+
+    if (!primaryIdentityCardId) {
+      primaryIdentityCardId = normalizeText(snapshot.card_id).slice(0, 160);
+    }
+    if (!primaryDisplayName) {
+      primaryDisplayName = normalizeText(snapshot.display_name).slice(0, 160);
+    }
+    if (!primaryPortraitUrl) {
+      primaryPortraitUrl = sanitizeChatExternalUrlForContext(
+        snapshot.portrait_url ??
+          ((snapshot.primary_portrait as Record<string, unknown> | undefined)?.image_url ?? ""),
+        600
+      );
+    }
+    if (!updatedAt) {
+      updatedAt =
+        normalizeText((snapshot.last_seen as Record<string, unknown> | undefined)?.timestamp_utc_iso).slice(
+          0,
+          64
+        ) || normalizeText(row.created_at).slice(0, 64);
+    }
+    if (!jobRunId) {
+      jobRunId = normalizeText(row.job_run_id).slice(0, 160);
+    }
+    if (!stepRunId) {
+      stepRunId = normalizeText(row.step_run_id).slice(0, 160);
+    }
+    if (!agentRunId) {
+      agentRunId = normalizeText(row.agent_run_id).slice(0, 160);
+    }
+  }
+
+  if (identityCards.length === 0) {
+    return null;
+  }
+
+  const metadata: Record<string, unknown> = {
+    analysis_target: "operational_identity_cards",
+    identity_cards: identityCards,
+  };
+  if (cameraIds.length > 0) metadata.camera_ids = cameraIds;
+  if (cameraNames.length > 0) metadata.camera_names = cameraNames;
+  if (primaryIdentityCardId) metadata.primary_identity_card_id = primaryIdentityCardId;
+  if (primaryDisplayName) metadata.display_name = primaryDisplayName;
+  if (primaryPortraitUrl) metadata.portrait_url = primaryPortraitUrl;
+  if (updatedAt) metadata.updated_at = updatedAt;
+  if (jobRunId) metadata.job_run_id = jobRunId;
+  if (stepRunId) metadata.step_run_id = stepRunId;
+  if (agentRunId) metadata.agent_run_id = agentRunId;
+  return metadata;
 }
 
 function buildChatVideoRoutingContextFromTaskState(
@@ -12090,6 +13201,88 @@ async function persistChatSessionEntitiesMemory(
       lastCompactedMessageId,
       tokenEstimate,
       now,
+      now
+    )
+      .run();
+}
+
+async function persistChatSessionTaskState(
+  db: D1Database,
+  userId: string,
+  chatSessionId: number,
+  taskStateInput: unknown
+) {
+  const contextRow = await db
+    .prepare(
+      `SELECT compact_context_json,
+              task_state_json,
+              agent_temporal_state_json,
+              last_compacted_message_id,
+              token_estimate,
+              compacted_at,
+              created_at
+       FROM chat_session_contexts
+       WHERE user_id = ? AND session_id = ?
+       LIMIT 1`
+    )
+    .bind(userId, chatSessionId)
+    .first();
+
+  const compactContext = normalizeChatCompactContext(
+    parseCommandJsonColumn((contextRow as any)?.compact_context_json)
+  );
+  const agentTemporalState = normalizeChatAgentTemporalState(
+    parseCommandJsonColumn((contextRow as any)?.agent_temporal_state_json)
+  );
+  const lastCompactedMessageId = Math.max(
+    0,
+    Number((contextRow as any)?.last_compacted_message_id || 0)
+  );
+  const tokenEstimate = Math.max(0, Number((contextRow as any)?.token_estimate || 0));
+  const compactedAt =
+    typeof (contextRow as any)?.compacted_at === "string" && String((contextRow as any).compacted_at).trim()
+      ? String((contextRow as any).compacted_at).trim()
+      : null;
+  const createdAt =
+    typeof (contextRow as any)?.created_at === "string" && String((contextRow as any).created_at).trim()
+      ? String((contextRow as any).created_at).trim()
+      : null;
+  const now = new Date().toISOString();
+
+  await db
+    .prepare(
+      `INSERT INTO chat_session_contexts (
+         user_id,
+         session_id,
+         compact_context_json,
+         task_state_json,
+         agent_temporal_state_json,
+         last_compacted_message_id,
+         token_estimate,
+         compacted_at,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, session_id) DO UPDATE SET
+         compact_context_json = excluded.compact_context_json,
+         task_state_json = excluded.task_state_json,
+         agent_temporal_state_json = excluded.agent_temporal_state_json,
+         last_compacted_message_id = excluded.last_compacted_message_id,
+         token_estimate = excluded.token_estimate,
+         compacted_at = excluded.compacted_at,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      userId,
+      chatSessionId,
+      JSON.stringify(compactContext),
+      JSON.stringify(normalizeChatTaskState(taskStateInput)),
+      JSON.stringify(agentTemporalState),
+      lastCompactedMessageId,
+      tokenEstimate,
+      compactedAt,
+      createdAt || now,
       now
     )
     .run();
@@ -12884,6 +14077,95 @@ async function getUserZAIApiKey(db: D1Database, userId: string): Promise<string>
 
   if (!row) return "";
   return normalizeZAIApiKeyInput((row as any)?.api_key);
+}
+
+async function upsertUserOpenAIApiKey(
+  db: D1Database,
+  userId: string,
+  apiKeyInput: unknown
+): Promise<string> {
+  const apiKey = normalizeOpenAIApiKeyInput(apiKeyInput);
+  const now = new Date().toISOString();
+  const existing = await db
+    .prepare("SELECT id FROM openai_settings WHERE user_id = ? LIMIT 1")
+    .bind(userId)
+    .first();
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE openai_settings
+         SET api_key = ?, updated_at = ?
+         WHERE user_id = ?`
+      )
+      .bind(apiKey, now, userId)
+      .run();
+  } else {
+    await db
+      .prepare(
+        `INSERT INTO openai_settings (id, user_id, api_key, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .bind(generateUUID(), userId, apiKey, now, now)
+      .run();
+  }
+
+  return apiKey;
+}
+
+async function upsertUserZAIApiKey(
+  db: D1Database,
+  userId: string,
+  apiKeyInput: unknown
+): Promise<string> {
+  const apiKey = normalizeZAIApiKeyInput(apiKeyInput);
+  const now = new Date().toISOString();
+  const existing = await db
+    .prepare("SELECT id FROM zai_settings WHERE user_id = ? LIMIT 1")
+    .bind(userId)
+    .first();
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE zai_settings
+         SET api_key = ?, updated_at = ?
+         WHERE user_id = ?`
+      )
+      .bind(apiKey, now, userId)
+      .run();
+  } else {
+    await db
+      .prepare(
+        `INSERT INTO zai_settings (id, user_id, api_key, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .bind(generateUUID(), userId, apiKey, now, now)
+      .run();
+  }
+
+  return apiKey;
+}
+
+async function getUserApiKeyForProvider(
+  db: D1Database,
+  userId: string,
+  provider: ChatApiKeyProvider
+): Promise<string> {
+  return provider === "openai"
+    ? getUserOpenAIApiKey(db, userId)
+    : getUserZAIApiKey(db, userId);
+}
+
+async function upsertUserApiKeyForProvider(
+  db: D1Database,
+  userId: string,
+  provider: ChatApiKeyProvider,
+  apiKeyInput: unknown
+): Promise<string> {
+  return provider === "openai"
+    ? upsertUserOpenAIApiKey(db, userId, apiKeyInput)
+    : upsertUserZAIApiKey(db, userId, apiKeyInput);
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -13682,6 +14964,77 @@ async function resolveCurrentUserCentralRelayContext(
   return ensureFreshCentralRelayContext(env, legacyState);
 }
 
+async function resolveSecretRecoveryAuthStateForUser(
+  env: Env,
+  user: {
+    id: string;
+    email: string;
+    auth_provider: "local" | "google";
+    country_code?: string | null;
+  }
+): Promise<SecretRecoveryAuthState> {
+  const localState = await getSecretRecoveryAuthState(env.DB, user.id);
+  if (localState.secretRecoveryConfigured) {
+    return localState;
+  }
+
+  if (!isCentralIdentityClientConfigured(env)) {
+    return localState;
+  }
+
+  const localIdentity = await findLocalUserIdentityCache(env.DB, {
+    email: user.email,
+    serverPublicId: user.id,
+  });
+  const appUserState = await getAppUserCentralIdentityState(env.DB, user.id);
+  const hasCentralLink = Boolean(
+    normalizeText((localIdentity as any)?.server_public_id) || appUserState?.publicId
+  );
+  if (!hasCentralLink) {
+    return localState;
+  }
+
+  let centralContext: CentralUserRelayContext;
+  try {
+    centralContext = await resolveCurrentUserCentralRelayContext(env, user as any);
+  } catch {
+    return localState;
+  }
+
+  let remote:
+    | Awaited<ReturnType<typeof callCentralIdentityAuthorizedEndpoint>>
+    | null = null;
+  try {
+    remote = await callCentralIdentityAuthorizedEndpoint(env, "/api/identity/recovery/status", {
+      method: "GET",
+      token: centralContext.grantToken,
+    });
+  } catch {
+    return localState;
+  }
+
+  if (!remote?.response.ok || !remote.data?.configured) {
+    return localState;
+  }
+
+  const questionKey = normalizeSecretRecoveryQuestionKey(remote.data?.question_key);
+  if (!questionKey) {
+    return localState;
+  }
+
+  await upsertLocalSecretRecoveryMirror(env.DB, {
+    appUserId: user.id,
+    storageScope: "server",
+    questionKey,
+    answerHash: null,
+    configuredAt: normalizeIsoTimestamp(remote.data?.configured_at) || new Date().toISOString(),
+    failedAttempts: 0,
+    lockedUntil: null,
+  });
+
+  return getSecretRecoveryAuthState(env.DB, user.id);
+}
+
 async function requireVerifiedCentralGrantUser(c: any) {
   await ensureCentralIdentitySchema(c.env.DB);
 
@@ -13712,9 +15065,24 @@ async function requireVerifiedCentralGrantUser(c: any) {
     return { error: c.json({ error: "This account is not allowed to use shared find." }, 403) };
   }
 
+  const serverUser = await getServerUserByPublicId(c.env.DB, verifiedGrant.claims.public_id);
+  if (!serverUser) {
+    return { error: c.json({ error: "Central identity user not found." }, 404) };
+  }
+
+  if (!normalizeDbBoolean((serverUser as any).is_active, true)) {
+    return { error: c.json({ error: "This account is not allowed to use shared find." }, 403) };
+  }
+
+  const currentAuthVersion = Number((serverUser as any).auth_version || 0);
+  if (currentAuthVersion !== Number(verifiedGrant.claims.auth_version || 0)) {
+    return { error: c.json({ error: "Invalid or expired central identity grant." }, 401) };
+  }
+
   return {
     claims: verifiedGrant.claims,
     grantToken,
+    serverUser,
   };
 }
 
@@ -15480,6 +16848,875 @@ async function findLocalUserIdentityCache(
   return (byEmail as any) || null;
 }
 
+const SECRET_RECOVERY_MAX_FAILED_ATTEMPTS = 5;
+const SECRET_RECOVERY_LOCKOUT_MINUTES = 15;
+const GOOGLE_PASSWORD_PLACEHOLDER_PREFIX = "!google_oauth:";
+
+type SecretRecoveryStorageScope = "local" | "server";
+
+type SecretRecoveryMirrorRow = {
+  appUserId: string;
+  storageScope: SecretRecoveryStorageScope;
+  questionKey: SecretRecoveryQuestionKey | null;
+  answerHash: string | null;
+  failedAttempts: number;
+  lockedUntil: string | null;
+  configuredAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+type ServerSecretRecoveryRow = {
+  serverUserPublicId: string;
+  questionKey: SecretRecoveryQuestionKey | null;
+  answerHash: string | null;
+  failedAttempts: number;
+  lockedUntil: string | null;
+  configuredAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+type SecretRecoveryAuthState = {
+  requiresSecretRecoverySetup: boolean;
+  secretRecoveryConfigured: boolean;
+  secretRecoveryQuestionKey: SecretRecoveryQuestionKey | null;
+  secretRecoveryStorageScope: SecretRecoveryStorageScope | null;
+};
+
+function normalizeSecretRecoveryStorageScope(value: unknown): SecretRecoveryStorageScope {
+  return normalizeText(value).toLowerCase() === "server" ? "server" : "local";
+}
+
+function normalizeIsoTimestamp(value: unknown): string | null {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const parsedMs = Date.parse(normalized);
+  if (!Number.isFinite(parsedMs)) {
+    return null;
+  }
+
+  return new Date(parsedMs).toISOString();
+}
+
+function normalizeNonNegativeInteger(value: unknown): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(numeric));
+}
+
+function serverUserHasRealPasswordHash(value: unknown): boolean {
+  const normalized = normalizeText(value);
+  return Boolean(normalized) && !normalized.startsWith(GOOGLE_PASSWORD_PLACEHOLDER_PREFIX);
+}
+
+function mapSecretRecoveryMirrorRow(value: unknown): SecretRecoveryMirrorRow | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const appUserId = normalizeText(row.app_user_id ?? row.appUserId);
+  if (!appUserId) {
+    return null;
+  }
+
+  return {
+    appUserId,
+    storageScope: normalizeSecretRecoveryStorageScope(row.storage_scope ?? row.storageScope),
+    questionKey: normalizeSecretRecoveryQuestionKey(row.question_key ?? row.questionKey),
+    answerHash: normalizeText(row.answer_hash ?? row.answerHash) || null,
+    failedAttempts: normalizeNonNegativeInteger(row.failed_attempts ?? row.failedAttempts),
+    lockedUntil: normalizeIsoTimestamp(row.locked_until ?? row.lockedUntil),
+    configuredAt: normalizeIsoTimestamp(row.configured_at ?? row.configuredAt),
+    createdAt: normalizeIsoTimestamp(row.created_at ?? row.createdAt),
+    updatedAt: normalizeIsoTimestamp(row.updated_at ?? row.updatedAt),
+  };
+}
+
+function mapServerSecretRecoveryRow(value: unknown): ServerSecretRecoveryRow | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const row = value as Record<string, unknown>;
+  const serverUserPublicId = normalizeText(
+    row.server_user_public_id ?? row.serverUserPublicId
+  );
+  if (!serverUserPublicId) {
+    return null;
+  }
+
+  return {
+    serverUserPublicId,
+    questionKey: normalizeSecretRecoveryQuestionKey(row.question_key ?? row.questionKey),
+    answerHash: normalizeText(row.answer_hash ?? row.answerHash) || null,
+    failedAttempts: normalizeNonNegativeInteger(row.failed_attempts ?? row.failedAttempts),
+    lockedUntil: normalizeIsoTimestamp(row.locked_until ?? row.lockedUntil),
+    configuredAt: normalizeIsoTimestamp(row.configured_at ?? row.configuredAt),
+    createdAt: normalizeIsoTimestamp(row.created_at ?? row.createdAt),
+    updatedAt: normalizeIsoTimestamp(row.updated_at ?? row.updatedAt),
+  };
+}
+
+function isConfiguredSecretRecoveryMirrorRow(row: SecretRecoveryMirrorRow | null): boolean {
+  if (!row?.questionKey || !row.configuredAt) {
+    return false;
+  }
+
+  return row.storageScope === "server" || Boolean(row.answerHash);
+}
+
+function isConfiguredServerSecretRecoveryRow(row: ServerSecretRecoveryRow | null): boolean {
+  return Boolean(row?.questionKey && row.configuredAt && row.answerHash);
+}
+
+function isSecretRecoveryLocked(
+  lockedUntil: string | null | undefined,
+  nowIso: string = new Date().toISOString()
+): boolean {
+  const normalizedLockedUntil = normalizeIsoTimestamp(lockedUntil);
+  if (!normalizedLockedUntil) {
+    return false;
+  }
+
+  const lockedUntilMs = Date.parse(normalizedLockedUntil);
+  const nowMs = Date.parse(nowIso);
+  if (!Number.isFinite(lockedUntilMs) || !Number.isFinite(nowMs)) {
+    return false;
+  }
+
+  return lockedUntilMs > nowMs;
+}
+
+async function hashSecretRecoveryAnswer(answer: string): Promise<string> {
+  return bcrypt.hash(normalizeSecretRecoveryAnswer(answer), 10);
+}
+
+async function compareSecretRecoveryAnswer(
+  answer: string,
+  answerHash: string | null | undefined
+): Promise<boolean> {
+  const normalizedHash = normalizeText(answerHash);
+  if (!normalizedHash) {
+    return false;
+  }
+
+  const normalizedAnswer = normalizeSecretRecoveryAnswer(answer);
+  if (!normalizedAnswer) {
+    return false;
+  }
+
+  return bcrypt.compare(normalizedAnswer, normalizedHash);
+}
+
+async function getAppUserRowById(
+  db: D1Database,
+  appUserId: string | null | undefined
+): Promise<any | null> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(`SELECT * FROM app_users WHERE id = ? LIMIT 1`)
+    .bind(normalizedAppUserId)
+    .first();
+  return (row as any) || null;
+}
+
+async function getAppUserRowByEmail(
+  db: D1Database,
+  email: string | null | undefined
+): Promise<any | null> {
+  const normalizedEmail = normalizeEmail(email || "");
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(`SELECT * FROM app_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
+    .bind(normalizedEmail)
+    .first();
+  return (row as any) || null;
+}
+
+async function getLocalSecretRecoveryMirrorRow(
+  db: D1Database,
+  appUserId: string | null | undefined
+): Promise<SecretRecoveryMirrorRow | null> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(`SELECT * FROM user_secret_recovery WHERE app_user_id = ? LIMIT 1`)
+    .bind(normalizedAppUserId)
+    .first();
+  return mapSecretRecoveryMirrorRow(row);
+}
+
+async function getLocalSecretRecoveryMirrorRowByEmail(
+  db: D1Database,
+  email: string | null | undefined
+): Promise<SecretRecoveryMirrorRow | null> {
+  const normalizedEmail = normalizeEmail(email || "");
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT usr.*
+       FROM user_secret_recovery usr
+       JOIN app_users au ON au.id = usr.app_user_id
+       WHERE LOWER(au.email) = LOWER(?)
+       LIMIT 1`
+    )
+    .bind(normalizedEmail)
+    .first();
+  return mapSecretRecoveryMirrorRow(row);
+}
+
+async function getSecretRecoveryAuthState(
+  db: D1Database,
+  appUserId: string | null | undefined
+): Promise<SecretRecoveryAuthState> {
+  const row = await getLocalSecretRecoveryMirrorRow(db, appUserId);
+  const configured = isConfiguredSecretRecoveryMirrorRow(row);
+  return {
+    requiresSecretRecoverySetup: !configured,
+    secretRecoveryConfigured: configured,
+    secretRecoveryQuestionKey: configured ? row?.questionKey || null : null,
+    secretRecoveryStorageScope: configured ? row?.storageScope || null : null,
+  };
+}
+
+async function upsertLocalSecretRecoveryMirror(
+  db: D1Database,
+  input: {
+    appUserId: string;
+    storageScope: SecretRecoveryStorageScope;
+    questionKey: SecretRecoveryQuestionKey;
+    answerHash?: string | null;
+    configuredAt?: string | null;
+    failedAttempts?: number;
+    lockedUntil?: string | null;
+  }
+): Promise<void> {
+  const appUserId = normalizeText(input.appUserId);
+  if (!appUserId) {
+    throw new Error("A valid app user id is required to persist secret recovery.");
+  }
+
+  const questionKey = normalizeSecretRecoveryQuestionKey(input.questionKey);
+  if (!questionKey) {
+    throw new Error("A valid secret recovery question key is required.");
+  }
+
+  const nowIso = new Date().toISOString();
+  const configuredAt = normalizeIsoTimestamp(input.configuredAt) || nowIso;
+  const answerHash = normalizeText(input.answerHash) || null;
+
+  await db
+    .prepare(
+      `INSERT INTO user_secret_recovery (
+         app_user_id,
+         storage_scope,
+         question_key,
+         answer_hash,
+         failed_attempts,
+         locked_until,
+         configured_at,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(app_user_id) DO UPDATE SET
+         storage_scope = excluded.storage_scope,
+         question_key = excluded.question_key,
+         answer_hash = excluded.answer_hash,
+         failed_attempts = excluded.failed_attempts,
+         locked_until = excluded.locked_until,
+         configured_at = excluded.configured_at,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      appUserId,
+      normalizeSecretRecoveryStorageScope(input.storageScope),
+      questionKey,
+      answerHash,
+      Math.max(0, Math.trunc(input.failedAttempts ?? 0)),
+      normalizeIsoTimestamp(input.lockedUntil) || null,
+      configuredAt,
+      nowIso,
+      nowIso
+    )
+    .run();
+}
+
+async function clearLocalSecretRecoveryFailures(
+  db: D1Database,
+  appUserId: string
+): Promise<void> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE user_secret_recovery
+       SET failed_attempts = 0,
+           locked_until = NULL,
+           updated_at = ?
+       WHERE app_user_id = ?`
+    )
+    .bind(new Date().toISOString(), normalizedAppUserId)
+    .run();
+}
+
+async function registerLocalSecretRecoveryFailure(
+  db: D1Database,
+  appUserId: string
+): Promise<{ failedAttempts: number; lockedUntil: string | null }> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return {
+      failedAttempts: 0,
+      lockedUntil: null,
+    };
+  }
+
+  const existing = await getLocalSecretRecoveryMirrorRow(db, normalizedAppUserId);
+  const failedAttempts = Math.max(0, (existing?.failedAttempts || 0) + 1);
+  const lockedUntil =
+    failedAttempts >= SECRET_RECOVERY_MAX_FAILED_ATTEMPTS
+      ? new Date(Date.now() + SECRET_RECOVERY_LOCKOUT_MINUTES * 60 * 1000).toISOString()
+      : null;
+
+  await db
+    .prepare(
+      `UPDATE user_secret_recovery
+       SET failed_attempts = ?,
+           locked_until = ?,
+           updated_at = ?
+       WHERE app_user_id = ?`
+    )
+    .bind(failedAttempts, lockedUntil, new Date().toISOString(), normalizedAppUserId)
+    .run();
+
+  return {
+    failedAttempts,
+    lockedUntil,
+  };
+}
+
+async function getServerUserByEmail(
+  db: D1Database,
+  email: string | null | undefined
+): Promise<any | null> {
+  const normalizedEmail = normalizeEmail(email || "");
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(`SELECT * FROM server_users WHERE LOWER(email) = LOWER(?) LIMIT 1`)
+    .bind(normalizedEmail)
+    .first();
+  return (row as any) || null;
+}
+
+async function getServerSecretRecoveryRow(
+  db: D1Database,
+  serverUserPublicId: string | null | undefined
+): Promise<ServerSecretRecoveryRow | null> {
+  const normalizedPublicId = normalizeText(serverUserPublicId);
+  if (!normalizedPublicId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM server_user_secret_recovery
+       WHERE server_user_public_id = ?
+       LIMIT 1`
+    )
+    .bind(normalizedPublicId)
+    .first();
+  return mapServerSecretRecoveryRow(row);
+}
+
+async function upsertServerSecretRecovery(
+  db: D1Database,
+  input: {
+    serverUserPublicId: string;
+    questionKey: SecretRecoveryQuestionKey;
+    answerHash: string;
+    configuredAt?: string | null;
+    failedAttempts?: number;
+    lockedUntil?: string | null;
+  }
+): Promise<void> {
+  const serverUserPublicId = normalizeText(input.serverUserPublicId);
+  if (!serverUserPublicId) {
+    throw new Error("A valid server user public id is required.");
+  }
+
+  const questionKey = normalizeSecretRecoveryQuestionKey(input.questionKey);
+  if (!questionKey) {
+    throw new Error("A valid secret recovery question key is required.");
+  }
+
+  const answerHash = normalizeText(input.answerHash);
+  if (!answerHash) {
+    throw new Error("A hashed secret recovery answer is required.");
+  }
+
+  const nowIso = new Date().toISOString();
+  const configuredAt = normalizeIsoTimestamp(input.configuredAt) || nowIso;
+
+  await db
+    .prepare(
+      `INSERT INTO server_user_secret_recovery (
+         server_user_public_id,
+         question_key,
+         answer_hash,
+         failed_attempts,
+         locked_until,
+         configured_at,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(server_user_public_id) DO UPDATE SET
+         question_key = excluded.question_key,
+         answer_hash = excluded.answer_hash,
+         failed_attempts = excluded.failed_attempts,
+         locked_until = excluded.locked_until,
+         configured_at = excluded.configured_at,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      serverUserPublicId,
+      questionKey,
+      answerHash,
+      Math.max(0, Math.trunc(input.failedAttempts ?? 0)),
+      normalizeIsoTimestamp(input.lockedUntil) || null,
+      configuredAt,
+      nowIso,
+      nowIso
+    )
+    .run();
+}
+
+async function clearServerSecretRecoveryFailures(
+  db: D1Database,
+  serverUserPublicId: string
+): Promise<void> {
+  const normalizedPublicId = normalizeText(serverUserPublicId);
+  if (!normalizedPublicId) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE server_user_secret_recovery
+       SET failed_attempts = 0,
+           locked_until = NULL,
+           updated_at = ?
+       WHERE server_user_public_id = ?`
+    )
+    .bind(new Date().toISOString(), normalizedPublicId)
+    .run();
+}
+
+async function registerServerSecretRecoveryFailure(
+  db: D1Database,
+  serverUserPublicId: string
+): Promise<{ failedAttempts: number; lockedUntil: string | null }> {
+  const normalizedPublicId = normalizeText(serverUserPublicId);
+  if (!normalizedPublicId) {
+    return {
+      failedAttempts: 0,
+      lockedUntil: null,
+    };
+  }
+
+  const existing = await getServerSecretRecoveryRow(db, normalizedPublicId);
+  const failedAttempts = Math.max(0, (existing?.failedAttempts || 0) + 1);
+  const lockedUntil =
+    failedAttempts >= SECRET_RECOVERY_MAX_FAILED_ATTEMPTS
+      ? new Date(Date.now() + SECRET_RECOVERY_LOCKOUT_MINUTES * 60 * 1000).toISOString()
+      : null;
+
+  await db
+    .prepare(
+      `UPDATE server_user_secret_recovery
+       SET failed_attempts = ?,
+           locked_until = ?,
+           updated_at = ?
+       WHERE server_user_public_id = ?`
+    )
+    .bind(failedAttempts, lockedUntil, new Date().toISOString(), normalizedPublicId)
+    .run();
+
+  return {
+    failedAttempts,
+    lockedUntil,
+  };
+}
+
+async function revokeCentralDeviceSessionsForUser(
+  db: D1Database,
+  serverUserPublicId: string,
+  revokedAt: string = new Date().toISOString()
+): Promise<void> {
+  const normalizedPublicId = normalizeText(serverUserPublicId);
+  if (!normalizedPublicId) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `UPDATE central_device_sessions
+       SET revoked_at = COALESCE(revoked_at, ?),
+           updated_at = ?
+       WHERE user_public_id = ?
+         AND COALESCE(revoked_at, '') = ''`
+    )
+    .bind(revokedAt, revokedAt, normalizedPublicId)
+    .run();
+}
+
+async function updateServerUserPasswordForRecovery(
+  db: D1Database,
+  input: {
+    serverUserPublicId: string;
+    passwordHash: string;
+  }
+): Promise<any | null> {
+  const serverUserPublicId = normalizeText(input.serverUserPublicId);
+  const passwordHash = normalizeText(input.passwordHash);
+  if (!serverUserPublicId || !passwordHash) {
+    throw new Error("Server user public id and password hash are required.");
+  }
+
+  const nowIso = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE server_users
+       SET password_hash = ?,
+           auth_version = COALESCE(auth_version, 1) + 1,
+           updated_at = ?
+       WHERE public_id = ?`
+    )
+    .bind(passwordHash, nowIso, serverUserPublicId)
+    .run();
+
+  await revokeCentralDeviceSessionsForUser(db, serverUserPublicId, nowIso);
+
+  return getServerUserByPublicId(db, serverUserPublicId);
+}
+
+async function deleteLocalSessionsByLocalUserId(
+  db: D1Database,
+  localUserId: number | null | undefined
+): Promise<void> {
+  const normalizedLocalUserId = Number(localUserId);
+  if (!Number.isFinite(normalizedLocalUserId) || normalizedLocalUserId <= 0) {
+    return;
+  }
+
+  await db
+    .prepare(`DELETE FROM local_sessions WHERE user_id = ?`)
+    .bind(normalizedLocalUserId)
+    .run();
+}
+
+async function deleteGoogleSessionsByAppUserId(
+  db: D1Database,
+  appUserId: string | null | undefined
+): Promise<void> {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return;
+  }
+
+  await db
+    .prepare(`DELETE FROM oauth_sessions WHERE user_id = ?`)
+    .bind(normalizedAppUserId)
+    .run();
+}
+
+async function ensureLocalPasswordIdentityForAppUser(
+  db: D1Database,
+  input: {
+    appUserId: string;
+    email: string;
+    passwordHash: string;
+    countryCode?: string | null;
+    locale?: string | null;
+  }
+): Promise<any> {
+  const appUserId = normalizeText(input.appUserId);
+  const email = normalizeEmail(input.email || "");
+  const passwordHash = normalizeText(input.passwordHash);
+  if (!appUserId || !email || !passwordHash) {
+    throw new Error("App user id, email, and password hash are required.");
+  }
+
+  const nowIso = new Date().toISOString();
+  const countryCode = normalizeCountryCode(input.countryCode, null);
+  const locale = normalizeOptionalLocale(input.locale);
+  const existing = await findLocalUserIdentityCache(db, {
+    email,
+    serverPublicId: appUserId,
+  });
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE local_users
+         SET email = ?,
+             password_hash = ?,
+             country_code = COALESCE(?, country_code),
+             locale = COALESCE(?, locale),
+             server_public_id = COALESCE(NULLIF(TRIM(server_public_id), ''), ?),
+             identity_source = COALESCE(NULLIF(TRIM(identity_source), ''), 'local'),
+             identity_migrated_at = COALESCE(identity_migrated_at, ?),
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(
+        email,
+        passwordHash,
+        countryCode,
+        locale,
+        appUserId,
+        nowIso,
+        nowIso,
+        Number((existing as any).id || 0)
+      )
+      .run();
+
+    return db
+      .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+      .bind(Number((existing as any).id || 0))
+      .first();
+  }
+
+  const insertResult = await db
+    .prepare(
+      `INSERT INTO local_users (
+         email,
+         password_hash,
+         country_code,
+         locale,
+         last_login_at,
+         server_public_id,
+         is_active,
+         auth_version,
+         grant_expires_at,
+         last_server_sync_at,
+         status_signature,
+         identity_source,
+         pairing_client_id,
+         identity_migrated_at,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, NULL, ?, 1, 0, NULL, NULL, NULL, 'local', NULL, ?, ?, ?)`
+    )
+    .bind(email, passwordHash, countryCode, locale, appUserId, nowIso, nowIso, nowIso)
+    .run();
+
+  const localUserId = Number(insertResult.meta?.last_row_id || 0);
+  if (!Number.isFinite(localUserId) || localUserId <= 0) {
+    throw new Error("Failed to create the local password cache row.");
+  }
+
+  await db
+    .prepare(
+      `UPDATE local_users
+       SET pairing_client_id = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(`local:${localUserId}`, nowIso, localUserId)
+    .run();
+
+  return db.prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`).bind(localUserId).first();
+}
+
+async function syncLocalIdentityPasswordAfterCentralReset(
+  db: D1Database,
+  input: {
+    serverUser: any;
+    passwordHash: string;
+  }
+): Promise<{
+  localUserId: number;
+  canonicalUserId: string;
+}> {
+  const serverUser = input.serverUser;
+  if (!serverUser) {
+    throw new Error("The server user is required to sync the local password cache.");
+  }
+
+  const email = normalizeEmail(String(serverUser.email || ""));
+  const publicId = normalizeText(serverUser.public_id);
+  const passwordHash = normalizeText(input.passwordHash);
+  if (!email || !publicId || !passwordHash) {
+    throw new Error("Email, public id and password hash are required.");
+  }
+
+  const nowIso = new Date().toISOString();
+  const countryCode = normalizeCountryCode(serverUser.country_code, null);
+  const authVersion = Number(serverUser.auth_version || 0);
+  const existing = await findLocalUserIdentityCache(db, {
+    email,
+    serverPublicId: publicId,
+  });
+
+  let localUserId = 0;
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE local_users
+         SET email = ?,
+             password_hash = ?,
+             country_code = COALESCE(?, country_code),
+             server_user_id_bigint = ?,
+             server_public_id = ?,
+             is_active = ?,
+             auth_version = ?,
+             grant_expires_at = NULL,
+             last_server_sync_at = ?,
+             status_signature = NULL,
+             identity_source = 'server',
+             pairing_client_id = COALESCE(NULLIF(TRIM(pairing_client_id), ''), 'local:' || CAST(id AS TEXT)),
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(
+        email,
+        passwordHash,
+        countryCode,
+        serverUser.id || null,
+        publicId,
+        normalizeDbBoolean(serverUser.is_active, true) ? 1 : 0,
+        authVersion,
+        nowIso,
+        nowIso,
+        existing.id
+      )
+      .run();
+    localUserId = Number(existing.id || 0);
+  } else {
+    const insertResult = await db
+      .prepare(
+        `INSERT INTO local_users (
+           email,
+           password_hash,
+           country_code,
+           locale,
+           last_login_at,
+           server_user_id_bigint,
+           server_public_id,
+           is_active,
+           auth_version,
+           grant_expires_at,
+           last_server_sync_at,
+           status_signature,
+           identity_source,
+           identity_migrated_at,
+           created_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, ?, NULL, 'server', ?, ?, ?)`
+      )
+      .bind(
+        email,
+        passwordHash,
+        countryCode,
+        serverUser.id || null,
+        publicId,
+        normalizeDbBoolean(serverUser.is_active, true) ? 1 : 0,
+        authVersion,
+        nowIso,
+        nowIso,
+        nowIso
+      )
+      .run();
+
+    localUserId = Number(insertResult.meta?.last_row_id || 0);
+    if (!Number.isFinite(localUserId) || localUserId <= 0) {
+      throw new Error("Failed to create the local identity cache row after password reset.");
+    }
+
+    await db
+      .prepare(
+        `UPDATE local_users
+         SET pairing_client_id = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(`local:${localUserId}`, nowIso, localUserId)
+      .run();
+  }
+
+  let localUser = await db
+    .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+    .bind(localUserId)
+    .first();
+  if (!localUser) {
+    throw new Error("Failed to reload the local identity cache after password reset.");
+  }
+
+  const canonicalBeforeMigration = resolveCanonicalAppUserIdFromLocalUserRow(localUser as any);
+  if (canonicalBeforeMigration !== publicId) {
+    await migrateLegacyLocalUserIdToCanonicalId(db, {
+      localUserId,
+      newUserId: publicId,
+    });
+    localUser = await db
+      .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+      .bind(localUserId)
+      .first();
+    if (!localUser) {
+      throw new Error("Failed to reload the migrated local identity cache row.");
+    }
+  }
+
+  const appUserRow = await getAppUserRowById(db, publicId);
+  const handle = normalizeUserHandleInput(serverUser.handle) || deriveHandleFromEmail(email);
+  await ensureAppUserRow(db, {
+    id: publicId,
+    email,
+    auth_provider: normalizeText((appUserRow as any)?.auth_provider) || "local",
+    country_code: countryCode,
+    locale: normalizeOptionalLocale((appUserRow as any)?.locale),
+    handle,
+  });
+  await updateAppUserHandle(db, publicId, handle);
+
+  return {
+    localUserId,
+    canonicalUserId: publicId,
+  };
+}
+
 async function syncLocalIdentityCacheFromGrant(
   db: D1Database,
   input: {
@@ -15964,6 +18201,7 @@ type CameraInsertPayload = {
   retention_days?: number | null;
   webcam_index?: number | null;
   allowpublicaccess?: boolean | number | null;
+  direct_capture_on_motion_only?: boolean | number | string | null;
 };
 
 function normalizeCameraNameForConnectionMethod(name: string, connectionMethod: string) {
@@ -16038,6 +18276,10 @@ async function createCameraForUser(
   const descriptionFirstCheckSuccessAt = normalizedStructuredDescription
     ? new Date().toISOString()
     : null;
+  const directCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+    input.direct_capture_on_motion_only,
+    false
+  );
 
   const insertResult = await db
     .prepare(
@@ -16047,9 +18289,9 @@ async function createCameraForUser(
         connection_method, store_frames, retention_days, description,
         description_first_check_successful, description_first_check_success_at,
         street, number, city, state, state_code, zip_code, country, country_code,
-        webcam_index, allowpublicaccess, updated_at
+        webcam_index, allowpublicaccess, direct_capture_on_motion_only, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
     )
     .bind(
       userId,
@@ -16090,7 +18332,8 @@ async function createCameraForUser(
       normalizedGeo.countryText,
       normalizedGeo.countryCode,
       connectionMethod === "WEBCAM" ? input.webcam_index ?? null : null,
-      allowPublicAccess
+      allowPublicAccess,
+      directCaptureOnMotionOnly ? 1 : 0
     )
     .run();
 
@@ -16132,6 +18375,40 @@ async function getCameraForUser(
     .prepare("SELECT * FROM cameras WHERE id = ? AND user_id = ?")
     .bind(cameraId, userId)
     .first();
+}
+
+async function getCameraDirectCaptureOnMotionSettingForUser(
+  db: D1Database,
+  userId: string,
+  cameraId: number | string
+): Promise<boolean> {
+  const camera = await db
+    .prepare(
+      "SELECT direct_capture_on_motion_only FROM cameras WHERE id = ? AND user_id = ?"
+    )
+    .bind(cameraId, userId)
+    .first();
+
+  return normalizeCameraDirectCaptureOnMotion(
+    (camera as any)?.direct_capture_on_motion_only,
+    false
+  );
+}
+
+async function syncCameraAlgorithmCaptureModeForCamera(
+  db: D1Database,
+  cameraId: number | string,
+  directCaptureOnMotionOnly: boolean
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE camera_algorithms
+       SET only_capture_on_motion = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE camera_id = ?`
+    )
+    .bind(directCaptureOnMotionOnly ? 1 : 0, cameraId)
+    .run();
 }
 
 async function updateCameraForUser(
@@ -16191,6 +18468,7 @@ async function updateCameraForUser(
 
   const updates: string[] = [];
   const values: any[] = [];
+  let directCaptureOnMotionOnlyPatch: boolean | null = null;
 
   Object.entries(data).forEach(([key, value]) => {
     if (key === "store_frames") {
@@ -16204,6 +18482,14 @@ async function updateCameraForUser(
     } else if (key === "allowpublicaccess") {
       updates.push(`${key} = ?`);
       values.push(value ? 1 : 0);
+    } else if (key === "direct_capture_on_motion_only") {
+      const normalizedDirectCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+        value,
+        false
+      );
+      directCaptureOnMotionOnlyPatch = normalizedDirectCaptureOnMotionOnly;
+      updates.push(`${key} = ?`);
+      values.push(normalizedDirectCaptureOnMotionOnly ? 1 : 0);
     } else if (key === "webcam_index") {
       if (value === null) return;
       updates.push(`${key} = ?`);
@@ -16289,6 +18575,14 @@ async function updateCameraForUser(
       .run();
   }
 
+  if (directCaptureOnMotionOnlyPatch !== null) {
+    await syncCameraAlgorithmCaptureModeForCamera(
+      db,
+      cameraId,
+      directCaptureOnMotionOnlyPatch
+    );
+  }
+
   const updatedCamera = await getCameraForUser(db, userId, cameraId);
   const activeSubscription = enforcePerceptrumLicenseRules
     ? await db
@@ -16344,6 +18638,10 @@ async function updateCameraForUser(
       options?.targetExeId || null
     )
     .run();
+
+  if (directCaptureOnMotionOnlyPatch !== null) {
+    await enqueueUpdateAlgorithmsIfCameraRunning(db, userId, Number(cameraId));
+  }
 
   return updatedCamera;
 }
@@ -18269,6 +20567,376 @@ app.get("/api/auth/country", async (c) => {
   });
 });
 
+app.post("/api/account-security/setup", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      question_key?: string;
+      answer?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const questionKey = normalizeSecretRecoveryQuestionKey(body.question_key);
+  const answer = typeof body.answer === "string" ? body.answer : "";
+  if (!questionKey || !isValidSecretRecoveryAnswer(answer)) {
+    return c.json({ error: "Invalid secret recovery question or answer." }, 400);
+  }
+
+  await ensureAppUserRow(c.env.DB, {
+    id: user.id,
+    email: user.email,
+    auth_provider: user.auth_provider,
+    country_code: user.country_code || null,
+  });
+
+  const localIdentity = await findLocalUserIdentityCache(c.env.DB, {
+    email: user.email,
+    serverPublicId: user.id,
+  });
+  const appUserState = await getAppUserCentralIdentityState(c.env.DB, user.id);
+  const hasCentralLink = Boolean(
+    normalizeText((localIdentity as any)?.server_public_id) || appUserState?.publicId
+  );
+
+  if (isCentralIdentityClientConfigured(c.env) && hasCentralLink) {
+    let centralContext: CentralUserRelayContext;
+    try {
+      centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            normalizeText((error as any)?.message) ||
+            "Unable to resolve central identity credentials for this account.",
+        },
+        409
+      );
+    }
+
+    const remote = await callCentralIdentityAuthorizedEndpoint(
+      c.env,
+      "/api/identity/recovery/setup",
+      {
+        method: "POST",
+        token: centralContext.grantToken,
+        body: {
+          question_key: questionKey,
+          answer,
+        },
+      }
+    );
+
+    if (!remote.response.ok) {
+      return c.json(
+        {
+          error: normalizeResponseErrorMessage(
+            remote.data,
+            "Failed to save the secret recovery answer on the server."
+          ),
+        },
+        (remote.response.status || 502) as any
+      );
+    }
+
+    const configuredAt =
+      normalizeIsoTimestamp(remote.data?.configured_at) || new Date().toISOString();
+    await upsertLocalSecretRecoveryMirror(c.env.DB, {
+      appUserId: user.id,
+      storageScope: "server",
+      questionKey,
+      answerHash: null,
+      configuredAt,
+      failedAttempts: 0,
+      lockedUntil: null,
+    });
+
+    return c.json({
+      success: true,
+      configured: true,
+      question_key: questionKey,
+      configured_at: configuredAt,
+      storage_scope: "server",
+    });
+  }
+
+  const answerHash = await hashSecretRecoveryAnswer(answer);
+  const configuredAt = new Date().toISOString();
+  await upsertLocalSecretRecoveryMirror(c.env.DB, {
+    appUserId: user.id,
+    storageScope: "local",
+    questionKey,
+    answerHash,
+    configuredAt,
+    failedAttempts: 0,
+    lockedUntil: null,
+  });
+
+  return c.json({
+    success: true,
+    configured: true,
+    question_key: questionKey,
+    configured_at: configuredAt,
+    storage_scope: "local",
+  });
+});
+
+app.post("/api/auth/recovery/question", async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const body = await c.req
+    .json<{
+      email?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const email = normalizeEmail(body.email || "");
+  if (!isValidEmail(email)) {
+    return c.json({ error: "Invalid email format" }, 400);
+  }
+
+  const localMirror = await getLocalSecretRecoveryMirrorRowByEmail(c.env.DB, email);
+  if (
+    isConfiguredSecretRecoveryMirrorRow(localMirror) &&
+    localMirror?.storageScope === "local"
+  ) {
+    const localUser = await findLocalUserIdentityCache(c.env.DB, { email });
+    return c.json({
+      success: true,
+      question_key: localMirror.questionKey,
+      has_password: Boolean(normalizeText((localUser as any)?.password_hash)),
+      storage_scope: "local",
+    });
+  }
+
+  if (isCentralIdentityClientConfigured(c.env)) {
+    try {
+      const remote = await callCentralIdentityEndpoint(
+        c.env,
+        "/api/identity/recovery/question",
+        { email }
+      );
+
+      if (remote.response.ok) {
+        const questionKey = normalizeSecretRecoveryQuestionKey(remote.data?.question_key);
+        const appUser = await getAppUserRowByEmail(c.env.DB, email);
+        if (appUser && questionKey) {
+          await upsertLocalSecretRecoveryMirror(c.env.DB, {
+            appUserId: String((appUser as any).id || ""),
+            storageScope: "server",
+            questionKey,
+            answerHash: null,
+            configuredAt: new Date().toISOString(),
+            failedAttempts: 0,
+            lockedUntil: null,
+          });
+        }
+
+        return c.json({
+          success: true,
+          question_key: questionKey,
+          has_password: Boolean(remote.data?.has_password),
+          storage_scope: "server",
+        });
+      }
+
+      if (remote.response.status !== 404) {
+        return c.json(
+          {
+            error: normalizeResponseErrorMessage(
+              remote.data,
+              "Failed to look up password recovery for this account."
+            ),
+          },
+          (remote.response.status || 502) as any
+        );
+      }
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            normalizeText((error as any)?.message) ||
+            "Unable to reach the central identity server.",
+        },
+        502
+      );
+    }
+  }
+
+  return c.json({ error: "Password recovery is not configured for this account." }, 404);
+});
+
+app.post("/api/auth/recovery/reset", async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const body = await c.req
+    .json<{
+      email?: string;
+      question_key?: string;
+      answer?: string;
+      new_password?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const email = normalizeEmail(body.email || "");
+  const questionKey = normalizeSecretRecoveryQuestionKey(body.question_key);
+  const answer = typeof body.answer === "string" ? body.answer : "";
+  const newPassword = typeof body.new_password === "string" ? body.new_password : "";
+
+  if (!isValidEmail(email)) {
+    return c.json({ error: "Invalid email format" }, 400);
+  }
+  if (!questionKey || !isValidSecretRecoveryAnswer(answer)) {
+    return c.json({ error: "Invalid secret recovery question or answer." }, 400);
+  }
+  if (!isValidPassword(newPassword)) {
+    return c.json({ error: "Password must be at least 8 characters" }, 400);
+  }
+
+  const localMirror = await getLocalSecretRecoveryMirrorRowByEmail(c.env.DB, email);
+  if (
+    isConfiguredSecretRecoveryMirrorRow(localMirror) &&
+    localMirror?.storageScope === "local"
+  ) {
+    if (localMirror.questionKey !== questionKey) {
+      return c.json({ error: "Incorrect secret recovery answer." }, 401);
+    }
+    if (isSecretRecoveryLocked(localMirror.lockedUntil)) {
+      return c.json(
+        { error: "Too many secret answer attempts. Please try again later." },
+        429
+      );
+    }
+
+    const answerMatches = await compareSecretRecoveryAnswer(answer, localMirror.answerHash);
+    if (!answerMatches) {
+      const failure = await registerLocalSecretRecoveryFailure(
+        c.env.DB,
+        localMirror.appUserId
+      );
+      return c.json(
+        {
+          error: failure.lockedUntil
+            ? "Too many secret answer attempts. Please try again later."
+            : "Incorrect secret recovery answer.",
+        },
+        failure.lockedUntil ? 429 : 401
+      );
+    }
+
+    await clearLocalSecretRecoveryFailures(c.env.DB, localMirror.appUserId);
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    let localUser = await findLocalUserIdentityCache(c.env.DB, {
+      email,
+      serverPublicId: localMirror.appUserId,
+    });
+
+    if (localUser) {
+      await c.env.DB
+        .prepare(
+          `UPDATE local_users
+           SET password_hash = ?,
+               updated_at = ?
+           WHERE id = ?`
+        )
+        .bind(passwordHash, new Date().toISOString(), (localUser as any).id)
+        .run();
+    } else {
+      const appUserRow = await getAppUserRowById(c.env.DB, localMirror.appUserId);
+      localUser = await ensureLocalPasswordIdentityForAppUser(c.env.DB, {
+        appUserId: localMirror.appUserId,
+        email,
+        passwordHash,
+        countryCode: normalizeCountryCode((appUserRow as any)?.country_code, null),
+        locale: normalizeOptionalLocale((appUserRow as any)?.locale),
+      });
+    }
+
+    await deleteLocalSessionsByLocalUserId(c.env.DB, Number((localUser as any)?.id || 0));
+    await deleteGoogleSessionsByAppUserId(c.env.DB, localMirror.appUserId);
+
+    return c.json({
+      success: true,
+      storage_scope: "local",
+    });
+  }
+
+  if (isCentralIdentityClientConfigured(c.env)) {
+    let remote: Awaited<ReturnType<typeof callCentralIdentityEndpoint>>;
+    try {
+      remote = await callCentralIdentityEndpoint(
+        c.env,
+        "/api/identity/recovery/reset-password",
+        {
+          email,
+          question_key: questionKey,
+          answer,
+          new_password: newPassword,
+        }
+      );
+    } catch (error) {
+      return c.json(
+        {
+          error:
+            normalizeText((error as any)?.message) ||
+            "Unable to reach the central identity server.",
+        },
+        502
+      );
+    }
+
+    if (!remote.response.ok) {
+      return c.json(
+        {
+          error: normalizeResponseErrorMessage(
+            remote.data,
+            "Failed to reset the password on the central identity server."
+          ),
+        },
+        (remote.response.status || 502) as any
+      );
+    }
+
+    const serverUser = remote.data?.user || null;
+    if (serverUser?.public_id) {
+      const passwordHash = await bcrypt.hash(newPassword, 10);
+      const synced = await syncLocalIdentityPasswordAfterCentralReset(c.env.DB, {
+        serverUser,
+        passwordHash,
+      });
+      await deleteLocalSessionsByLocalUserId(c.env.DB, synced.localUserId);
+      await deleteGoogleSessionsByAppUserId(c.env.DB, synced.canonicalUserId);
+      await upsertLocalSecretRecoveryMirror(c.env.DB, {
+        appUserId: synced.canonicalUserId,
+        storageScope: "server",
+        questionKey,
+        answerHash: null,
+        configuredAt: new Date().toISOString(),
+        failedAttempts: 0,
+        lockedUntil: null,
+      });
+    }
+
+    return c.json({
+      success: true,
+      storage_scope: "server",
+    });
+  }
+
+  return c.json({ error: "Password recovery is not configured for this account." }, 404);
+});
+
 // Central identity endpoints
 app.post("/api/identity/signup", async (c) => {
   await ensureRuntimeSchema(c.env);
@@ -18669,6 +21337,208 @@ app.post("/api/identity/google-upsert", async (c) => {
   return c.json(response, statusCode as any);
 });
 
+app.get("/api/identity/recovery/status", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const recoveryRow = await getServerSecretRecoveryRow(
+    c.env.DB,
+    verified.claims.public_id
+  );
+  const configured = isConfiguredServerSecretRecoveryRow(recoveryRow);
+
+  return c.json({
+    success: true,
+    configured,
+    question_key: configured ? recoveryRow?.questionKey || null : null,
+    configured_at: configured ? recoveryRow?.configuredAt || null : null,
+    has_password: serverUserHasRealPasswordHash((verified.serverUser as any)?.password_hash),
+  });
+});
+
+app.post("/api/identity/recovery/setup", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      question_key?: string;
+      answer?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const questionKey = normalizeSecretRecoveryQuestionKey(body.question_key);
+  const answer = typeof body.answer === "string" ? body.answer : "";
+  if (!questionKey || !isValidSecretRecoveryAnswer(answer)) {
+    return c.json({ error: "Invalid secret recovery question or answer." }, 400);
+  }
+
+  const answerHash = await hashSecretRecoveryAnswer(answer);
+  const configuredAt = new Date().toISOString();
+
+  await upsertServerSecretRecovery(c.env.DB, {
+    serverUserPublicId: verified.claims.public_id,
+    questionKey,
+    answerHash,
+    configuredAt,
+    failedAttempts: 0,
+    lockedUntil: null,
+  });
+
+  return c.json({
+    success: true,
+    configured: true,
+    question_key: questionKey,
+    configured_at: configuredAt,
+  });
+});
+
+app.post("/api/identity/recovery/question", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  if (!isCentralIdentityServerConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const body = await c.req
+    .json<{
+      email?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const email = normalizeEmail(body.email || "");
+  if (!isValidEmail(email)) {
+    return c.json({ error: "Invalid email format" }, 400);
+  }
+
+  const serverUser = await getServerUserByEmail(c.env.DB, email);
+  if (!serverUser) {
+    return c.json({ error: "Password recovery is not configured for this account." }, 404);
+  }
+
+  const recoveryRow = await getServerSecretRecoveryRow(
+    c.env.DB,
+    String((serverUser as any).public_id || "")
+  );
+  if (!isConfiguredServerSecretRecoveryRow(recoveryRow)) {
+    return c.json({ error: "Password recovery is not configured for this account." }, 404);
+  }
+
+  return c.json({
+    success: true,
+    question_key: recoveryRow?.questionKey || null,
+    has_password: serverUserHasRealPasswordHash((serverUser as any).password_hash),
+  });
+});
+
+app.post("/api/identity/recovery/reset-password", async (c) => {
+  await ensureRuntimeSchema(c.env);
+  await ensureCentralIdentitySchema(c.env.DB);
+
+  if (!isCentralIdentityServerConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const body = await c.req
+    .json<{
+      email?: string;
+      question_key?: string;
+      answer?: string;
+      new_password?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const email = normalizeEmail(body.email || "");
+  const questionKey = normalizeSecretRecoveryQuestionKey(body.question_key);
+  const answer = typeof body.answer === "string" ? body.answer : "";
+  const newPassword = typeof body.new_password === "string" ? body.new_password : "";
+
+  if (!isValidEmail(email)) {
+    return c.json({ error: "Invalid email format" }, 400);
+  }
+  if (!questionKey || !isValidSecretRecoveryAnswer(answer)) {
+    return c.json({ error: "Invalid secret recovery question or answer." }, 400);
+  }
+  if (!isValidPassword(newPassword)) {
+    return c.json({ error: "Password must be at least 8 characters" }, 400);
+  }
+
+  const serverUser = await getServerUserByEmail(c.env.DB, email);
+  if (!serverUser) {
+    return c.json({ error: "Password recovery is not configured for this account." }, 404);
+  }
+
+  const serverPublicId = String((serverUser as any).public_id || "");
+  const recoveryRow = await getServerSecretRecoveryRow(c.env.DB, serverPublicId);
+  if (!isConfiguredServerSecretRecoveryRow(recoveryRow)) {
+    return c.json({ error: "Password recovery is not configured for this account." }, 404);
+  }
+
+  if (recoveryRow?.questionKey !== questionKey) {
+    return c.json({ error: "Incorrect secret recovery answer." }, 401);
+  }
+
+  if (isSecretRecoveryLocked(recoveryRow?.lockedUntil)) {
+    return c.json(
+      { error: "Too many secret answer attempts. Please try again later." },
+      429
+    );
+  }
+
+  const answerMatches = await compareSecretRecoveryAnswer(answer, recoveryRow?.answerHash);
+  if (!answerMatches) {
+    const failure = await registerServerSecretRecoveryFailure(c.env.DB, serverPublicId);
+    return c.json(
+      {
+        error: failure.lockedUntil
+          ? "Too many secret answer attempts. Please try again later."
+          : "Incorrect secret recovery answer.",
+      },
+      failure.lockedUntil ? 429 : 401
+    );
+  }
+
+  await clearServerSecretRecoveryFailures(c.env.DB, serverPublicId);
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  const updatedUser = await updateServerUserPasswordForRecovery(c.env.DB, {
+    serverUserPublicId: serverPublicId,
+    passwordHash,
+  });
+  if (!updatedUser) {
+    return c.json({ error: "Failed to update the server password." }, 500);
+  }
+
+  return c.json({
+    success: true,
+    user: {
+      public_id: String((updatedUser as any).public_id || ""),
+      email: String((updatedUser as any).email || ""),
+      handle: normalizeUserHandleInput((updatedUser as any).handle),
+      country_code: normalizeCountryCode((updatedUser as any).country_code, null),
+      auth_version: Number((updatedUser as any).auth_version || 0),
+      updated_at: String((updatedUser as any).updated_at || ""),
+      has_password: true,
+    },
+  });
+});
+
 app.patch("/api/identity/handle", async (c) => {
   await ensureRuntimeSchema(c.env);
   await ensureCentralIdentitySchema(c.env.DB);
@@ -18677,22 +21547,9 @@ app.patch("/api/identity/handle", async (c) => {
     return c.json({ error: "Central identity server is not configured." }, 503);
   }
 
-  const authorizationHeader =
-    c.req.header("authorization") || c.req.header("Authorization");
-  if (!authorizationHeader || !authorizationHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Authorization header" }, 401);
-  }
-
-  const grantToken = authorizationHeader.slice("Bearer ".length).trim();
-  let verifiedGrant: Awaited<ReturnType<typeof verifyCentralIdentityGrant>> | null = null;
-  try {
-    verifiedGrant = await verifyCentralIdentityGrant(c.env, grantToken);
-  } catch (error) {
-    console.error("[IDENTITY] Handle update grant verification failed:", error);
-    return c.json({ error: "Invalid or expired central identity grant." }, 401);
-  }
-  if (!verifiedGrant) {
-    return c.json({ error: "Invalid or expired central identity grant." }, 401);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) {
+    return verified.error;
   }
 
   const body = await c.req
@@ -18709,8 +21566,8 @@ app.patch("/api/identity/handle", async (c) => {
     return c.json({ error: "Handle cannot be empty or contain spaces" }, 400);
   }
 
-  const publicId = verifiedGrant.claims.public_id;
-  const serverUser = await getServerUserByPublicId(c.env.DB, publicId);
+  const publicId = verified.claims.public_id;
+  const serverUser = verified.serverUser;
   if (!serverUser) {
     return c.json({ error: "Central identity user not found." }, 404);
   }
@@ -19519,18 +22376,22 @@ app.post("/api/auth/local/signup", async (c) => {
       }
 
       await createLocalAuthSession(c, synced.localUserId);
+      const signedInUser = await buildAuthenticatedUserPayload(c.env.DB, {
+        id: synced.canonicalUserId,
+        email,
+        authProvider: "local",
+        countryCode:
+          normalizeCountryCode(centralResult.data?.user?.country_code, null) || countryCode,
+        handle:
+          normalizeUserHandleInput(centralResult.data?.user?.handle) ||
+          deriveHandleFromEmail(email),
+        hasPassword: true,
+      });
 
       return c.json(
         {
           success: true,
-          user: {
-            id: synced.canonicalUserId,
-            email,
-            country_code: countryCode,
-            handle:
-              normalizeUserHandleInput(centralResult.data?.user?.handle) ||
-              deriveHandleFromEmail(email),
-          },
+          user: signedInUser,
         },
         201
       );
@@ -19580,14 +22441,20 @@ app.post("/api/auth/local/signup", async (c) => {
 
     // Create session
     await createLocalAuthSession(c, Number(localUserId || 0));
+    const profile = await getAppUserProfile(c.env.DB, appUserId);
+    const signedInUser = await buildAuthenticatedUserPayload(c.env.DB, {
+      id: appUserId,
+      email,
+      authProvider: "local",
+      countryCode,
+      createdAt: profile.created_at,
+      handle: profile.handle,
+      hasPassword: true,
+    });
 
     return c.json({ 
       success: true,
-      user: {
-        id: appUserId,
-        email,
-        country_code: countryCode,
-      }
+      user: signedInUser,
     }, 201);
   } catch (error) {
     console.error("Signup error:", error);
@@ -19610,7 +22477,6 @@ app.post("/api/auth/local/login", async (c) => {
       return c.json({ error: "Invalid email or password" }, 400);
     }
 
-    // Find user
     const user = await findLocalUserIdentityCache(c.env.DB, { email });
     const userData = (user as any) || null;
     const hasLocalPassword = Boolean(userData?.password_hash);
@@ -19619,69 +22485,122 @@ app.post("/api/auth/local/login", async (c) => {
         ? await bcrypt.compare(password, String(userData.password_hash || ""))
         : false;
 
-    if (!userData || !passwordMatches) {
-      return c.json({ error: "Invalid email or password" }, 401);
-    }
+    let effectiveLocalUser = userData;
 
-    const now = new Date().toISOString();
-    await c.env.DB
-      .prepare(
-        `UPDATE local_users
-         SET last_login_at = ?,
-             updated_at = ?,
-             pairing_client_id = COALESCE(NULLIF(TRIM(pairing_client_id), ''), 'local:' || CAST(id AS TEXT))
-         WHERE id = ?`
-      )
-      .bind(now, now, userData.id)
-      .run();
+    if (!effectiveLocalUser || !passwordMatches) {
+      if (!isCentralIdentityClientConfigured(c.env)) {
+        return c.json({ error: "Invalid email or password" }, 401);
+      }
 
-    const refreshedLocalUser = await c.env.DB
-      .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
-      .bind(userData.id)
-      .first();
-    if (!refreshedLocalUser) {
-      throw new Error("Failed to reload the local user after login.");
-    }
-
-    let effectiveLocalUser = refreshedLocalUser as any;
-    if (isCentralIdentityClientConfigured(c.env)) {
-      let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
+      let centralLoginResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
       try {
-        centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/migrate-login", {
+        centralLoginResult = await callCentralIdentityEndpoint(c.env, "/api/identity/login", {
           email,
           password,
           handle: deriveHandleFromEmail(email),
-          country_code: normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+          country_code: normalizeCountryCode((userData as any)?.country_code, null),
         });
       } catch (error) {
-        console.error("[AUTH] Central migrate-login request failed during local login:", error);
+        console.error("[AUTH] Central login request failed during local login:", error);
       }
 
-      if (centralResult?.response.ok && centralResult.verifiedGrant) {
-        const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
-          email,
-          passwordHash: String((refreshedLocalUser as any).password_hash || ""),
-          countryCode:
-            normalizeCountryCode(centralResult.data?.user?.country_code, null) ||
-            normalizeCountryCode((refreshedLocalUser as any).country_code, null),
-          locale: normalizeOptionalLocale((refreshedLocalUser as any).locale),
-          serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
-          verifiedGrant: centralResult.verifiedGrant,
-          deviceSession: normalizeCentralIdentityDeviceSessionPayload(
-            centralResult.data?.device_session
-          ),
-        });
-        effectiveLocalUser =
-          (await c.env.DB
-            .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
-            .bind(synced.localUserId)
-            .first()) || effectiveLocalUser;
-      } else if (centralResult) {
-        console.error(
-          "[AUTH] Central migrate-login rejected local login session refresh:",
-          centralResult.response.status,
-          centralResult.data
+      if (!centralLoginResult?.response.ok || !centralLoginResult.verifiedGrant) {
+        return c.json({ error: "Invalid email or password" }, 401);
+      }
+
+      if (!centralLoginResult.verifiedGrant.claims.login_allowed) {
+        return c.json(
+          {
+            error:
+              centralLoginResult.verifiedGrant.claims.reason ||
+              "This account is not allowed to log in.",
+          },
+          403
         );
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10);
+      const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
+        email,
+        passwordHash,
+        countryCode:
+          normalizeCountryCode(centralLoginResult.data?.user?.country_code, null) ||
+          normalizeCountryCode((userData as any)?.country_code, null),
+        locale: normalizeOptionalLocale((userData as any)?.locale),
+        serverHandle: normalizeUserHandleInput(centralLoginResult.data?.user?.handle),
+        verifiedGrant: centralLoginResult.verifiedGrant,
+        deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+          centralLoginResult.data?.device_session
+        ),
+      });
+      effectiveLocalUser = await c.env.DB
+        .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+        .bind(synced.localUserId)
+        .first();
+      if (!effectiveLocalUser) {
+        throw new Error("Failed to reload the local user after central login.");
+      }
+    } else {
+      const now = new Date().toISOString();
+      await c.env.DB
+        .prepare(
+          `UPDATE local_users
+           SET last_login_at = ?,
+               updated_at = ?,
+               pairing_client_id = COALESCE(NULLIF(TRIM(pairing_client_id), ''), 'local:' || CAST(id AS TEXT))
+           WHERE id = ?`
+        )
+        .bind(now, now, effectiveLocalUser.id)
+        .run();
+
+      const refreshedLocalUser = await c.env.DB
+        .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+        .bind(effectiveLocalUser.id)
+        .first();
+      if (!refreshedLocalUser) {
+        throw new Error("Failed to reload the local user after login.");
+      }
+
+      effectiveLocalUser = refreshedLocalUser as any;
+      if (isCentralIdentityClientConfigured(c.env)) {
+        let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
+        try {
+          centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/migrate-login", {
+            email,
+            password,
+            handle: deriveHandleFromEmail(email),
+            country_code: normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+          });
+        } catch (error) {
+          console.error("[AUTH] Central migrate-login request failed during local login:", error);
+        }
+
+        if (centralResult?.response.ok && centralResult.verifiedGrant) {
+          const synced = await syncLocalIdentityCacheFromGrant(c.env.DB, {
+            email,
+            passwordHash: String((refreshedLocalUser as any).password_hash || ""),
+            countryCode:
+              normalizeCountryCode(centralResult.data?.user?.country_code, null) ||
+              normalizeCountryCode((refreshedLocalUser as any).country_code, null),
+            locale: normalizeOptionalLocale((refreshedLocalUser as any).locale),
+            serverHandle: normalizeUserHandleInput(centralResult.data?.user?.handle),
+            verifiedGrant: centralResult.verifiedGrant,
+            deviceSession: normalizeCentralIdentityDeviceSessionPayload(
+              centralResult.data?.device_session
+            ),
+          });
+          effectiveLocalUser =
+            (await c.env.DB
+              .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+              .bind(synced.localUserId)
+              .first()) || effectiveLocalUser;
+        } else if (centralResult) {
+          console.error(
+            "[AUTH] Central migrate-login rejected local login session refresh:",
+            centralResult.response.status,
+            centralResult.data
+          );
+        }
       }
     }
 
@@ -19695,15 +22614,28 @@ app.post("/api/auth/local/login", async (c) => {
       locale: (effectiveLocalUser as any).locale || null,
     });
 
+    await resolveSecretRecoveryAuthStateForUser(c.env, {
+      id: appUserId,
+      email: String((effectiveLocalUser as any).email || ""),
+      auth_provider: "local",
+      country_code: (effectiveLocalUser as any).country_code || null,
+    });
+
     await createLocalAuthSession(c, Number((effectiveLocalUser as any).id || 0));
+    const profile = await getAppUserProfile(c.env.DB, appUserId);
+    const signedInUser = await buildAuthenticatedUserPayload(c.env.DB, {
+      id: appUserId,
+      email: String((effectiveLocalUser as any).email || ""),
+      authProvider: "local",
+      countryCode: (effectiveLocalUser as any).country_code || null,
+      createdAt: profile.created_at,
+      handle: profile.handle,
+      hasPassword: true,
+    });
 
     return c.json({
       success: true,
-      user: {
-        id: appUserId,
-        email: (effectiveLocalUser as any).email,
-        country_code: (effectiveLocalUser as any).country_code,
-      },
+      user: signedInUser,
     });
   } catch (error) {
     console.error("Login error:", error);
@@ -19751,6 +22683,29 @@ app.get("/api/auth/me", async (c) => {
       const user = await getGoogleSessionUser(c.env.DB, googleCookie);
 
       if (user) {
+        await resolveSecretRecoveryAuthStateForUser(c.env, {
+          id: user.id,
+          email: user.email,
+          auth_provider: "google",
+          country_code: user.country_code || null,
+        });
+        const localIdentity = await findLocalUserIdentityCache(c.env.DB, {
+          email: user.email,
+          serverPublicId: user.id,
+        });
+        const authUser = await buildAuthenticatedUserPayload(c.env.DB, {
+          id: user.id,
+          email: user.email,
+          authProvider: "google",
+          countryCode: user.country_code || null,
+          createdAt: user.created_at,
+          handle: user.handle,
+          googleUserData: user.google_user_data,
+          hasPassword: Boolean(
+            normalizeText((localIdentity as any)?.password_hash) &&
+              serverUserHasRealPasswordHash((localIdentity as any)?.password_hash)
+          ),
+        });
         void maybeEnsureSharedFindRelayForUser(c.env, {
           id: user.id,
           email: user.email,
@@ -19759,14 +22714,7 @@ app.get("/api/auth/me", async (c) => {
         return c.json({
           isAuthenticated: true,
           authProvider: "google",
-          user: {
-            id: user.id,
-            email: user.email,
-            country_code: user.country_code || null,
-            google_user_data: user.google_user_data,
-            created_at: user.created_at,
-            handle: user.handle,
-          },
+          user: authUser,
         });
       }
     } catch (error) {
@@ -19791,7 +22739,22 @@ app.get("/api/auth/me", async (c) => {
         country_code: sessionData.country_code || null,
         locale: sessionData.locale || null,
       });
+      await resolveSecretRecoveryAuthStateForUser(c.env, {
+        id: appUserId,
+        email: sessionData.email,
+        auth_provider: "local",
+        country_code: sessionData.country_code || null,
+      });
       const profile = await getAppUserProfile(c.env.DB, appUserId);
+      const authUser = await buildAuthenticatedUserPayload(c.env.DB, {
+        id: appUserId,
+        email: sessionData.email,
+        authProvider: "local",
+        countryCode: sessionData.country_code || null,
+        createdAt: profile.created_at,
+        handle: profile.handle,
+        hasPassword: true,
+      });
       void maybeEnsureSharedFindRelayForUser(c.env, {
         id: appUserId,
         email: sessionData.email,
@@ -19800,13 +22763,7 @@ app.get("/api/auth/me", async (c) => {
       return c.json({
         isAuthenticated: true,
         authProvider: "local",
-        user: {
-          id: appUserId,
-          email: sessionData.email,
-          country_code: sessionData.country_code,
-          created_at: profile.created_at,
-          handle: profile.handle,
-        },
+        user: authUser,
       });
     }
   }
@@ -20185,11 +23142,11 @@ app.post("/api/sessions", async (c) => {
         ? normalizeCountryCode(getCookie(c, GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME), null)
         : null;
     let effectiveGoogleCountryCode = requestedCountryCode;
-    const canonicalUserId =
+    let canonicalUserId =
       googleIntent === "signup"
         ? await resolveOrCreateGoogleAppUser(c.env.DB, googleUser, requestedCountryCode)
         : await resolveExistingGoogleAppUser(c.env.DB, googleUser);
-    const googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
+    let googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
 
     const requireCentralGoogleSync = googleIntent === "signup";
     if (isCentralIdentityClientConfigured(c.env)) {
@@ -20248,6 +23205,22 @@ app.post("/api/sessions", async (c) => {
             );
             const remoteHandle = normalizeUserHandleInput(centralGoogleResult.data?.user?.handle);
             effectiveGoogleCountryCode = remoteCountryCode || effectiveGoogleCountryCode;
+            const centralPublicId = normalizeText(
+              centralGoogleResult.verifiedGrant.claims.public_id
+            );
+
+            if (
+              centralPublicId &&
+              canonicalUserId.startsWith("google:") &&
+              centralPublicId !== canonicalUserId
+            ) {
+              await migrateAppUserIdReferences(c.env.DB, {
+                oldUserId: canonicalUserId,
+                newUserId: centralPublicId,
+              });
+              canonicalUserId = centralPublicId;
+              googleProfile = await getAppUserProfile(c.env.DB, canonicalUserId);
+            }
 
             await ensureAppUserRow(c.env.DB, {
               id: canonicalUserId,
@@ -20309,15 +23282,29 @@ app.post("/api/sessions", async (c) => {
     // Clear any existing local session to prevent dual sessions
     await clearLocalSession(c);
     clearGoogleOAuthFlowCookies(c);
+    await resolveSecretRecoveryAuthStateForUser(c.env, {
+      id: canonicalUserId,
+      email: googleUser.email,
+      auth_provider: "google",
+      country_code: responseCountryCode,
+    });
+    const localIdentity = await findLocalUserIdentityCache(c.env.DB, {
+      email: googleUser.email,
+      serverPublicId: canonicalUserId,
+    });
+    const signedInUser = await buildAuthenticatedUserPayload(c.env.DB, {
+      id: canonicalUserId,
+      email: googleUser.email,
+      authProvider: "google",
+      countryCode: responseCountryCode,
+      createdAt: googleProfile.created_at,
+      handle: googleProfile.handle,
+      hasPassword: serverUserHasRealPasswordHash((localIdentity as any)?.password_hash),
+    });
     
     return c.json({ 
       success: true,
-      user: {
-        id: canonicalUserId,
-        email: googleUser.email,
-        auth_provider: "google",
-        country_code: responseCountryCode,
-      }
+      user: signedInUser,
     }, 200);
   } catch (error) {
     console.error("[GOOGLE LOGIN] Failed to resolve canonical user:", error);
@@ -20364,15 +23351,23 @@ app.get("/api/users/me", async (c) => {
         country_code: sessionData.country_code || null,
         locale: sessionData.locale || null,
       });
-      const profile = await getAppUserProfile(c.env.DB, appUserId);
-      return c.json({
+      await resolveSecretRecoveryAuthStateForUser(c.env, {
         id: appUserId,
         email: sessionData.email,
         auth_provider: "local",
-        country_code: sessionData.country_code,
-        created_at: profile.created_at,
-        handle: profile.handle,
+        country_code: sessionData.country_code || null,
       });
+      const profile = await getAppUserProfile(c.env.DB, appUserId);
+      const authUser = await buildAuthenticatedUserPayload(c.env.DB, {
+        id: appUserId,
+        email: sessionData.email,
+        authProvider: "local",
+        countryCode: sessionData.country_code || null,
+        createdAt: profile.created_at,
+        handle: profile.handle,
+        hasPassword: true,
+      });
+      return c.json(authUser);
     }
   }
 
@@ -20384,15 +23379,27 @@ app.get("/api/users/me", async (c) => {
       const user = await getGoogleSessionUser(c.env.DB, googleSessionToken);
 
       if (user) {
-        return c.json({
+        await resolveSecretRecoveryAuthStateForUser(c.env, {
           id: user.id,
           email: user.email,
           auth_provider: "google",
           country_code: user.country_code || null,
-          google_user_data: user.google_user_data,
-          created_at: user.created_at,
-          handle: user.handle,
         });
+        const localIdentity = await findLocalUserIdentityCache(c.env.DB, {
+          email: user.email,
+          serverPublicId: user.id,
+        });
+        const authUser = await buildAuthenticatedUserPayload(c.env.DB, {
+          id: user.id,
+          email: user.email,
+          authProvider: "google",
+          countryCode: user.country_code || null,
+          createdAt: user.created_at,
+          handle: user.handle,
+          googleUserData: user.google_user_data,
+          hasPassword: serverUserHasRealPasswordHash((localIdentity as any)?.password_hash),
+        });
+        return c.json(authUser);
       }
     } catch (error) {
       console.error("Failed to get Google OAuth user:", error);
@@ -24215,6 +27222,10 @@ async function enqueueStartCameraCommand(
 
     // Billing no longer disables AI agents. Keep the configured agents active
     // as long as their provider keys are available.
+    const directCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+      cam.direct_capture_on_motion_only,
+      false
+    );
     const enabledAlgorithms = await buildEnabledAlgorithmsPayloadForCamera(
       env.DB,
       userId,
@@ -24306,6 +27317,7 @@ async function enqueueStartCameraCommand(
       manufacturer: normalizeCameraTransportField(cam.manufacturer),
       connection_method: normalizeCameraTransportField(cam.connection_method),
       start_origin: "direct",
+      direct_capture_on_motion_only: directCaptureOnMotionOnly,
       enabled_algorithms: enabledAlgorithms,
       store_frames: cam.store_frames === 1,
       retention_days: cam.retention_days,
@@ -24969,13 +27981,19 @@ async function enqueueUpdateAlgorithmsIfCameraRunning(
   cameraId: number
 ): Promise<void> {
   const camera = await db
-    .prepare("SELECT is_service_running FROM cameras WHERE id = ? AND user_id = ?")
+    .prepare(
+      "SELECT is_service_running, direct_capture_on_motion_only FROM cameras WHERE id = ? AND user_id = ?"
+    )
     .bind(cameraId, userId)
     .first();
 
   if (!camera || Number((camera as any)?.is_service_running) !== 1) return;
 
   const enabledAlgorithms = await buildEnabledAlgorithmsPayloadForCamera(db, userId, cameraId);
+  const directCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+    (camera as any)?.direct_capture_on_motion_only,
+    false
+  );
   const telegram = await getTelegramSettingsForUser(db, userId);
   const requiresOpenAiForEnabledCustomAgents = enabledAlgorithms.some((algo: any) => {
     const algorithmType = String(algo?.algorithm_type || "").trim().toLowerCase();
@@ -25018,6 +28036,7 @@ async function enqueueUpdateAlgorithmsIfCameraRunning(
       cameraId,
       JSON.stringify({
         camera_id: cameraId,
+        direct_capture_on_motion_only: directCaptureOnMotionOnly,
         enabled_algorithms: enabledAlgorithms,
         telegram_enabled: telegram.enabled,
         telegram_chat_id: telegram.chat_id,
@@ -25375,9 +28394,9 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
           requestedModelFps
         )
       : null;
-    const normalizedOnlyCaptureOnMotion = normalizeJobStepOnlyCaptureOnMotion(
-      data.only_capture_on_motion,
-      true
+    const normalizedOnlyCaptureOnMotion = normalizeCameraDirectCaptureOnMotion(
+      (camera as any)?.direct_capture_on_motion_only,
+      false
     );
     const requestedFaceTargetIds = normalizeFaceTargetIdsInput(data.face_target_ids);
     const requestedAnalysisRegions =
@@ -25734,7 +28753,9 @@ app.get("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) => 
   }
 
   const camera = await c.env.DB
-    .prepare("SELECT id FROM cameras WHERE id = ? AND user_id = ?")
+    .prepare(
+      "SELECT id, direct_capture_on_motion_only FROM cameras WHERE id = ? AND user_id = ?"
+    )
     .bind(cameraId, user.id)
     .first();
   if (!camera) {
@@ -26020,6 +29041,10 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       }
     }
   }
+  const directCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+    (camera as any)?.direct_capture_on_motion_only,
+    false
+  );
   const inserted = await c.env.DB
     .prepare(
       `INSERT INTO camera_algorithms (
@@ -26053,7 +29078,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       executionSettings.modelFps,
       executionSettings.runEvery,
       executionSettings.runningResolution,
-      normalizeJobStepOnlyCaptureOnMotion(body.only_capture_on_motion, true) ? 1 : 0,
+      directCaptureOnMotionOnly ? 1 : 0,
       now,
       now
     )
@@ -26343,9 +29368,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
       : serializeAlertChannelsInput(body.alert_channels);
 
   const onlyCaptureOnMotion =
-    body.only_capture_on_motion === undefined
-      ? normalizeJobStepOnlyCaptureOnMotion((ownedAlgorithm as any).only_capture_on_motion, true)
-      : normalizeJobStepOnlyCaptureOnMotion(body.only_capture_on_motion, true);
+    await getCameraDirectCaptureOnMotionSettingForUser(c.env.DB, user.id, cameraId);
   const isEnabled =
     body.is_enabled === undefined
       ? normalizeJobStepOnlyCaptureOnMotion((ownedAlgorithm as any).is_enabled, false)
@@ -28399,6 +31422,24 @@ function normalizeDetectionStorageKey(kind: "image" | "video", value: unknown): 
   if (!raw) return "";
   if (raw.includes("/")) return raw;
   return kind === "video" ? `detections_videos/${raw}` : `detections/${raw}`;
+}
+
+function inferReportEvidenceKind(
+  storageKey: string,
+  preferredKind?: "image" | "video" | null
+): "image" | "video" {
+  if (preferredKind === "image" || preferredKind === "video") {
+    return preferredKind;
+  }
+  const normalized = storageKey.trim().toLowerCase();
+  if (
+    normalized.startsWith("detections_videos/") ||
+    normalized.includes("/videos/") ||
+    /\.(mp4|mov|avi|mkv|webm|m4v)(?:$|\?)/.test(normalized)
+  ) {
+    return "video";
+  }
+  return "image";
 }
 
 function sanitizeReportSecretText(value: string): string {
@@ -30744,9 +33785,10 @@ async function collectReportEvidenceAssets(
   const imageEvidence: ReportDocxImageEvidence[] = [];
   const videoEvidence: ReportDocxVideoEvidence[] = [];
   const manifest: Array<Record<string, unknown>> = [];
+  const usedArchivePaths = new Set<string>();
   let zipFileCount = 0;
 
-  for (const candidate of candidates.slice(0, 10)) {
+  for (const candidate of candidates) {
     const object = await bucket.get(candidate.storage_key);
     if (!object) {
       continue;
@@ -30764,16 +33806,41 @@ async function collectReportEvidenceAssets(
         ? "video/mp4"
         : candidate.filename.toLowerCase().endsWith(".png")
         ? "image/png"
+        : candidate.filename.toLowerCase().endsWith(".gif")
+        ? "image/gif"
+        : candidate.filename.toLowerCase().endsWith(".webp")
+        ? "image/webp"
+        : candidate.filename.toLowerCase().endsWith(".bmp")
+        ? "image/bmp"
         : "image/jpeg";
+    const normalizedContentType = normalizeReportText(contentType, 80)
+      .toLowerCase()
+      .split(";")[0]
+      .trim();
 
     const folder = candidate.kind === "video" ? "videos" : "images";
-    zip.file(`${folder}/${candidate.filename}`, bytes);
+    const extensionIndex = candidate.filename.lastIndexOf(".");
+    const filenameStem =
+      extensionIndex > 0 ? candidate.filename.slice(0, extensionIndex) : candidate.filename;
+    const filenameExtension =
+      extensionIndex > 0 ? candidate.filename.slice(extensionIndex) : "";
+    let archiveFilename = candidate.filename;
+    let archivePath = `${folder}/${archiveFilename}`;
+    let archiveSuffix = 2;
+    while (usedArchivePaths.has(archivePath.toLowerCase())) {
+      archiveFilename = `${filenameStem}-${archiveSuffix}${filenameExtension}`;
+      archivePath = `${folder}/${archiveFilename}`;
+      archiveSuffix += 1;
+    }
+    usedArchivePaths.add(archivePath.toLowerCase());
+
+    zip.file(archivePath, bytes);
     zipFileCount += 1;
 
     const downloadUrl = buildAbsoluteDownloadUrl(origin, candidate.download_path);
     manifest.push({
       kind: candidate.kind,
-      filename: candidate.filename,
+      filename: archiveFilename,
       title: candidate.title,
       caption: candidate.caption || null,
       detected_at: candidate.detected_at || null,
@@ -30784,18 +33851,21 @@ async function collectReportEvidenceAssets(
 
     if (
       candidate.kind === "image" &&
-      imageEvidence.length < 4 &&
-      (contentType === "image/jpeg" ||
-        contentType === "image/jpg" ||
-        contentType === "image/png" ||
-        contentType === "image/gif")
+      (normalizedContentType === "image/jpeg" ||
+        normalizedContentType === "image/jpg" ||
+        normalizedContentType === "image/png" ||
+        normalizedContentType === "image/gif" ||
+        normalizedContentType === "image/webp" ||
+        normalizedContentType === "image/bmp" ||
+        normalizedContentType === "image/x-ms-bmp")
     ) {
       imageEvidence.push({
-        filename: candidate.filename,
+        filename: archiveFilename,
         title: candidate.title,
         caption: candidate.caption,
         bytes,
-        contentType,
+        contentType:
+          normalizedContentType === "image/x-ms-bmp" ? "image/bmp" : normalizedContentType,
         downloadUrl,
         localPath: candidate.local_path,
         detectedAt: candidate.detected_at || undefined,
@@ -30804,12 +33874,12 @@ async function collectReportEvidenceAssets(
       continue;
     }
 
-    if (candidate.kind === "video" && videoEvidence.length < 6) {
+    if (candidate.kind === "video") {
       videoEvidence.push({
         title: candidate.title,
         caption: candidate.caption,
         downloadUrl,
-        filename: candidate.filename,
+        filename: archiveFilename,
         localPath: candidate.local_path,
         detectedAt: candidate.detected_at || undefined,
         sourceLabel: candidate.source_label,
@@ -33248,21 +36318,55 @@ async function buildReportContext(params: {
 
   const sanitizedRecentAlerts = recentAlertRows.slice(0, 16).map((row) => {
     const details = parseJsonObject((row as any).details_json);
+    const mediaStorageKey =
+      normalizeReportText((row as any).media_storage_key, 260) ||
+      normalizeReportText(
+        (details as any).media_storage_key ?? (details as any).mediaStorageKey,
+        260
+      );
+    const mediaType = normalizeReportText(
+      (details as any).media_type ?? (details as any).mediaType,
+      40
+    ).toLowerCase();
+    const mediaKind = mediaStorageKey
+      ? inferReportEvidenceKind(
+          mediaStorageKey,
+          mediaType.includes("video")
+            ? "video"
+            : mediaType.startsWith("image")
+            ? "image"
+            : null
+        )
+      : null;
     const imageKey = normalizeDetectionStorageKey(
       "image",
-      (details as any).image_key ?? (details as any).imageKey
+      (details as any).image_key ??
+        (details as any).imageKey ??
+        (mediaKind === "image" ? mediaStorageKey : null)
     );
     const videoKey = normalizeDetectionStorageKey(
       "video",
-      (details as any).video_key ?? (details as any).videoKey
+      (details as any).video_key ??
+        (details as any).videoKey ??
+        (mediaKind === "video" ? mediaStorageKey : null)
     );
     return {
       id: Number((row as any).id || 0),
+      job_id: Number((row as any).job_id || 0) || null,
+      step_id: Number((row as any).step_id || 0) || null,
+      agent_run_id: normalizeReportText((row as any).agent_run_id, 160) || null,
       camera_id: Number((row as any).camera_id || 0) || null,
       camera_name:
         normalizeReportText((details as any).camera_name, 120) ||
         normalizeReportText((row as any).camera_name, 120),
-      event_type: normalizeReportText((row as any).event_type, 80),
+      event_type:
+        normalizeReportText(
+          (details as any).event_type ??
+            (details as any).eventType ??
+            (row as any).channel ??
+            (row as any).priority_level,
+          80
+        ) || null,
       algo_type:
         normalizeReportText(
           (details as any).algo_type ??
@@ -33274,6 +36378,7 @@ async function buildReportContext(params: {
       message: sanitizeReportSecretText(normalizeReportText((row as any).message, 220)),
       created_at: typeof (row as any).created_at === "string" ? (row as any).created_at : null,
       details: sanitizeReportValue(details),
+      media_storage_key: mediaStorageKey || null,
       image_key: imageKey || null,
       video_key: videoKey || null,
       image_download_path: imageKey ? buildMediaDownloadPathFromStorageKey(imageKey) : null,
@@ -33323,8 +36428,8 @@ async function buildReportContext(params: {
       const details = ((row as any).details || {}) as Record<string, unknown>;
       return matchesFocusedScope({
         cameraId: (row as any).camera_id ?? details.camera_id ?? details.cameraId,
-        jobId: details.job_id ?? details.jobId,
-        stepId: details.step_id ?? details.stepId,
+        jobId: (row as any).job_id ?? details.job_id ?? details.jobId,
+        stepId: (row as any).step_id ?? details.step_id ?? details.stepId,
         agentText: `${(row as any).algo_type || ""} ${details.agent_key || ""}`,
       });
     })
@@ -33347,6 +36452,132 @@ async function buildReportContext(params: {
     if (evidenceMap.has(candidate.storage_key)) return;
     evidenceMap.set(candidate.storage_key, candidate);
   };
+
+  const addResolvedEvidence = (params: {
+    storageKey: unknown;
+    preferredKind?: "image" | "video" | null;
+    filenameFallback: string;
+    title: string;
+    caption?: string;
+    detectedAt?: string | null;
+    downloadPath?: string | null;
+    localPath?: string | null;
+    sourceLabel?: string;
+  }) => {
+    const rawStorageKey = normalizeReportText(params.storageKey, 260);
+    if (!rawStorageKey) return;
+    const kind = inferReportEvidenceKind(rawStorageKey, params.preferredKind);
+    const storageKey = normalizeDetectionStorageKey(kind, rawStorageKey);
+    if (!storageKey) return;
+    addEvidence({
+      kind,
+      storage_key: storageKey,
+      filename: storageKey.split("/").pop() || params.filenameFallback,
+      title: params.title,
+      caption: params.caption,
+      detected_at: params.detectedAt ?? null,
+      download_path:
+        normalizeReportText(params.downloadPath, 400) ||
+        buildMediaDownloadPathFromStorageKey(storageKey),
+      local_path: normalizeReportText(params.localPath, 400) || undefined,
+      source_label: params.sourceLabel,
+    });
+  };
+
+  for (const alert of sanitizedAlertsLedger) {
+    const details =
+      alert.details && typeof alert.details === "object" && !Array.isArray(alert.details)
+        ? (alert.details as Record<string, unknown>)
+        : {};
+    const mediaType = normalizeReportText(
+      details.media_type ?? details.mediaType,
+      40
+    ).toLowerCase();
+    const mediaKind =
+      mediaType.includes("video") ? "video" : mediaType.startsWith("image") ? "image" : null;
+    const alertLabel =
+      normalizeReportText(alert.camera_name, 120) ||
+      normalizeReportText(alert.priority_level, 40) ||
+      "Alert evidence";
+    const alertCaption =
+      normalizeReportText(alert.message, 220) || normalizeReportText(alert.created_at, 80) || undefined;
+    const alertSourceLabel =
+      normalizeReportText(alert.camera_name, 120) ||
+      normalizeReportText(alert.priority_level, 40) ||
+      undefined;
+
+    addResolvedEvidence({
+      storageKey:
+        alert.media_storage_key ??
+        details.media_storage_key ??
+        details.mediaStorageKey,
+      preferredKind: mediaKind,
+      filenameFallback: mediaKind === "video" ? "alert.mp4" : "alert.jpg",
+      title: alertLabel,
+      caption: alertCaption,
+      detectedAt: alert.created_at,
+      sourceLabel: alertSourceLabel,
+    });
+    addResolvedEvidence({
+      storageKey: details.image_key ?? details.imageKey,
+      preferredKind: "image",
+      filenameFallback: "alert.jpg",
+      title: alertLabel,
+      caption: alertCaption,
+      detectedAt: alert.created_at,
+      sourceLabel: alertSourceLabel,
+    });
+    addResolvedEvidence({
+      storageKey: details.video_key ?? details.videoKey,
+      preferredKind: "video",
+      filenameFallback: "alert.mp4",
+      title: alertLabel,
+      caption: alertCaption,
+      detectedAt: alert.created_at,
+      sourceLabel: alertSourceLabel,
+    });
+  }
+
+  for (const identityCard of sanitizedIdentityCards) {
+    if (typeof identityCard.crop_storage_key === "string" && identityCard.crop_storage_key) {
+      addResolvedEvidence({
+        storageKey: identityCard.crop_storage_key,
+        preferredKind: "image",
+        filenameFallback: "identity-card.jpg",
+        title:
+          identityCard.display_name ||
+          identityCard.camera_name ||
+          identityCard.identity_card_id ||
+          "Identity card",
+        caption:
+          normalizeReportText(identityCard.created_at, 80) ||
+          normalizeReportText(identityCard.camera_name, 120) ||
+          undefined,
+        detectedAt: identityCard.created_at,
+        sourceLabel: identityCard.camera_name || identityCard.source_type || undefined,
+      });
+    }
+  }
+
+  for (const result of sanitizedStepRunResults) {
+    if (typeof result.media_storage_key === "string" && result.media_storage_key) {
+      addResolvedEvidence({
+        storageKey: result.media_storage_key,
+        preferredKind: inferReportEvidenceKind(result.media_storage_key),
+        filenameFallback: "result-media",
+        title:
+          result.camera_name ||
+          result.result_uid ||
+          "Result media",
+        caption:
+          normalizeReportText(result.output_preview, 220) ||
+          normalizeReportText(result.created_at, 80) ||
+          undefined,
+        detectedAt: result.created_at,
+        sourceLabel: result.camera_name || result.model || undefined,
+      });
+    }
+  }
 
   for (const detection of filteredRecentDetections) {
     if (typeof detection.image_key === "string" && detection.image_key) {
@@ -33390,7 +36621,10 @@ async function buildReportContext(params: {
         title: alert.camera_name
           ? `${alert.camera_name} - ${alert.event_type || "alert"}`
           : alert.event_type || "Alert image",
-        caption: alert.created_at || undefined,
+        caption:
+          normalizeReportText((alert as any).message, 220) ||
+          normalizeReportText(alert.created_at, 80) ||
+          undefined,
         detected_at: alert.created_at,
         download_path:
           typeof alert.image_download_path === "string" ? alert.image_download_path : "",
@@ -33405,7 +36639,10 @@ async function buildReportContext(params: {
         title: alert.camera_name
           ? `${alert.camera_name} - ${alert.event_type || "alert"}`
           : alert.event_type || "Alert video",
-        caption: alert.created_at || undefined,
+        caption:
+          normalizeReportText((alert as any).message, 220) ||
+          normalizeReportText(alert.created_at, 80) ||
+          undefined,
         detected_at: alert.created_at,
         download_path:
           typeof alert.video_download_path === "string" ? alert.video_download_path : "",
@@ -33414,44 +36651,7 @@ async function buildReportContext(params: {
     }
   }
 
-  for (const identityCard of sanitizedIdentityCards.slice(0, 12)) {
-    if (typeof identityCard.crop_storage_key === "string" && identityCard.crop_storage_key) {
-      addEvidence({
-        kind: "image",
-        storage_key: identityCard.crop_storage_key,
-        filename: identityCard.crop_storage_key.split("/").pop() || "identity-card.jpg",
-        title:
-          identityCard.display_name ||
-          identityCard.camera_name ||
-          identityCard.identity_card_id ||
-          "Identity card",
-        caption: identityCard.created_at || undefined,
-        detected_at: identityCard.created_at,
-        download_path: buildMediaDownloadPathFromStorageKey(identityCard.crop_storage_key),
-        source_label: identityCard.camera_name || identityCard.source_type || undefined,
-      });
-    }
-  }
-
-  for (const result of sanitizedStepRunResults.slice(0, 12)) {
-    if (typeof result.media_storage_key === "string" && result.media_storage_key) {
-      addEvidence({
-        kind: result.media_storage_key.toLowerCase().endsWith(".mp4") ? "video" : "image",
-        storage_key: result.media_storage_key,
-        filename: result.media_storage_key.split("/").pop() || "result-media",
-        title:
-          result.camera_name ||
-          result.result_uid ||
-          "Result media",
-        caption: result.created_at || undefined,
-        detected_at: result.created_at,
-        download_path: buildMediaDownloadPathFromStorageKey(result.media_storage_key),
-        source_label: result.camera_name || result.model || undefined,
-      });
-    }
-  }
-
-  const evidenceCandidates = Array.from(evidenceMap.values()).slice(0, 10);
+  const evidenceCandidates = Array.from(evidenceMap.values());
   const detailCameraIdSet = new Set(
     [
       ...sanitizedStepRuns.map((row) => Number(row.camera_id || 0)),
@@ -33945,6 +37145,24 @@ function normalizeSemanticIntentFamilyHint(value: unknown): SemanticIntentFamily
   return null;
 }
 
+function normalizeCameraDirectCaptureOnMotion(
+  value: unknown,
+  fallback = false
+): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+  }
+  return fallback;
+}
+
 function semanticIntentFamilyFromPreferredSkill(value: unknown): SemanticIntentFamily | null {
   const skill = normalizeReportText(value, 80).toLowerCase();
   if (skill === "read_state") return "read_operational";
@@ -34404,6 +37622,12 @@ const hydrateCustomCameraAgentRows = async (
     } else if (agent?.config_json && typeof agent.config_json === "object") {
       configJsonObj = agent.config_json;
     }
+    const effectiveOnlyCaptureOnMotion = normalizeCameraDirectCaptureOnMotion(
+      agent?.camera_direct_capture_on_motion_only ??
+        agent?.direct_capture_on_motion_only ??
+        agent?.only_capture_on_motion,
+      false
+    );
 
     return {
       ...agent,
@@ -34440,10 +37664,7 @@ const hydrateCustomCameraAgentRows = async (
           running_resolution: execution.runningResolution,
         };
       })(),
-      only_capture_on_motion: normalizeJobStepOnlyCaptureOnMotion(
-        agent?.only_capture_on_motion,
-        true
-      ),
+      only_capture_on_motion: effectiveOnlyCaptureOnMotion,
       face_target_ids: faceTargetIds,
       negative_reference_images: negativeImages,
       analysis_regions: parseStoredAnalysisRegions(agent?.analysis_regions, {
@@ -34464,7 +37685,8 @@ const listCustomCameraAgents = async (
 ): Promise<any[]> => {
   const { results } = await db
     .prepare(
-      `SELECT ca.*
+      `SELECT ca.*,
+              c.direct_capture_on_motion_only AS camera_direct_capture_on_motion_only
        FROM camera_algorithms ca
        JOIN cameras c ON c.id = ca.camera_id
        WHERE ca.camera_id = ?
@@ -34489,7 +37711,8 @@ const listOwnedCustomCameraAgents = async (
               c.description AS camera_description,
               c.ip_address AS camera_ip_address,
               c.manufacturer AS camera_manufacturer,
-              c.connection_method AS camera_connection_method
+              c.connection_method AS camera_connection_method,
+              c.direct_capture_on_motion_only AS camera_direct_capture_on_motion_only
        FROM camera_algorithms ca
        JOIN cameras c ON c.id = ca.camera_id
        WHERE c.user_id = ?
@@ -34912,6 +38135,7 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
     const fallbackEntityType =
       normalizeText(details.entity_type ?? details.entityType).slice(0, 64) ||
       normalizeText(fallbackEntityId).replace(/[_-]?\d.*$/, "").slice(0, 64);
+    const normalizedFallbackEntityType = normalizeChatIdentityEntityType(fallbackEntityType);
     const fallbackDisplayName =
       normalizeText(
         details.display_name ??
@@ -34920,12 +38144,62 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
           details.knownName ??
           fallbackEntityId
       ).slice(0, 160) || fallbackEntityId;
+    const fallbackKnownName = normalizeText(
+      details.known_name ??
+        details.knownName
+    ).slice(0, 160);
+    const fallbackTraits = sanitizeChatIdentityTraitArray(
+      [
+        details.identity_signature_traits,
+        details.key_traits,
+        details.stable_attributes,
+      ],
+      normalizedFallbackEntityType,
+      8
+    );
+    const fallbackDescription = sanitizeChatIdentityDescriptionForContext(
+      details.description,
+      fallbackTraits
+    ).slice(0, 400);
+    const fallbackSignatureSummary = normalizeText(
+      details.identity_signature_summary
+    ).slice(0, 400);
+    const fallbackAliases = normalizeChatStringArrayForContext(details.aliases, 8, 120);
+    const fallbackContextTraits = sanitizeChatIdentityContextTraitArray(
+      details.identity_context_traits,
+      4
+    );
+    const fallbackReferenceImageUrls = normalizeChatStringArrayForContext(
+      details.reference_image_urls,
+      6,
+      500
+    )
+      .map((item) => sanitizeChatExternalUrlForContext(item, 500))
+      .filter(Boolean);
+    const fallbackResolvedIdentity = sanitizeChatResolvedIdentitySnapshot(
+      details.resolved_identity
+    );
+    const fallbackLastSeen =
+      details.last_seen && typeof details.last_seen === "object" && !Array.isArray(details.last_seen)
+        ? details.last_seen
+        : null;
     const fallbackCard: Record<string, unknown> = {
       card_id: fallbackIdentityCardId,
     };
     if (fallbackEntityId) fallbackCard.entity_id = fallbackEntityId;
     if (fallbackEntityType) fallbackCard.entity_type = fallbackEntityType;
     if (fallbackDisplayName) fallbackCard.display_name = fallbackDisplayName;
+    if (fallbackKnownName) fallbackCard.known_name = fallbackKnownName;
+    if (fallbackDescription) fallbackCard.description = fallbackDescription;
+    if (fallbackSignatureSummary) fallbackCard.identity_signature_summary = fallbackSignatureSummary;
+    if (fallbackTraits.length > 0) fallbackCard.identity_signature_traits = fallbackTraits;
+    if (fallbackAliases.length > 0) fallbackCard.aliases = fallbackAliases;
+    if (fallbackContextTraits.length > 0) fallbackCard.identity_context_traits = fallbackContextTraits;
+    if (fallbackReferenceImageUrls.length > 0) {
+      fallbackCard.reference_image_urls = fallbackReferenceImageUrls;
+    }
+    if (fallbackResolvedIdentity) fallbackCard.resolved_identity = fallbackResolvedIdentity;
+    if (fallbackLastSeen) fallbackCard.last_seen = fallbackLastSeen;
     if (details.primary_portrait && typeof details.primary_portrait === "object") {
       fallbackCard.primary_portrait = details.primary_portrait;
     }
@@ -34938,6 +38212,9 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
     if (typeof details.portrait_data_url === "string" && details.portrait_data_url.trim()) {
       fallbackCard.portrait_data_url = details.portrait_data_url;
     }
+    if (typeof details.face_available === "boolean") {
+      fallbackCard.face_available = details.face_available;
+    }
     rawIdentityCards.push(fallbackCard);
   }
 
@@ -34948,12 +38225,10 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
   const seenIdentityCardIds = new Set<string>();
   return rawIdentityCards
     .map((rawCard): IdentityCardOccurrenceDraft | null => {
-      const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
-      if (!snapshot) return null;
       const rawCardRecord =
         rawCard && typeof rawCard === "object" && !Array.isArray(rawCard)
           ? (rawCard as Record<string, unknown>)
-          : snapshot;
+          : {};
       const explicitIdentityCardId = normalizeText(
         rawCardRecord.identity_card_id ??
           rawCardRecord.card_id ??
@@ -34962,6 +38237,27 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
           details.primaryIdentityCardId ??
           input.correlationIds.identityCardId
       ).slice(0, 160);
+      const shouldMergeTopLevelDetails =
+        rawIdentityCards.length === 1 &&
+        (!fallbackIdentityCardId ||
+          !explicitIdentityCardId ||
+          explicitIdentityCardId === fallbackIdentityCardId ||
+          explicitIdentityCardId === fallbackIdentityCardId.replace(/^identity_card:/, ""));
+      const mergedRawCardRecord = shouldMergeTopLevelDetails
+        ? {
+            ...details,
+            ...rawCardRecord,
+            resolved_identity:
+              rawCardRecord.resolved_identity ?? details.resolved_identity,
+            primary_portrait:
+              rawCardRecord.primary_portrait ?? details.primary_portrait,
+            context_portrait:
+              rawCardRecord.context_portrait ?? details.context_portrait,
+            last_seen: rawCardRecord.last_seen ?? details.last_seen,
+          }
+        : rawCardRecord;
+      const snapshot = sanitizeChatIdentityCardSnapshot(mergedRawCardRecord);
+      if (!snapshot) return null;
       const dedupeKey =
         explicitIdentityCardId ||
         normalizeText(snapshot.card_id ?? snapshot.entity_id).slice(0, 160);
@@ -34983,10 +38279,10 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
         cameraId: fallbackCameraId,
         cameraName: fallbackCameraName,
         portraitDataUrl: readChatIdentityPortraitDataUrl(
-          rawCardRecord.portrait_data_url,
-          rawCardRecord
+          mergedRawCardRecord.portrait_data_url,
+          mergedRawCardRecord
         ),
-        cropUrl: readChatIdentityCropReference(rawCard),
+        cropUrl: readChatIdentityCropReference(mergedRawCardRecord),
       };
     })
     .filter((item: IdentityCardOccurrenceDraft | null): item is IdentityCardOccurrenceDraft => !!item);
@@ -37242,32 +40538,7 @@ app.post("/api/openai-settings", anyAuthMiddleware, async (c) => {
   if (!clear && !apiKey) {
     return c.json({ error: "api_key is required" }, 400);
   }
-
-  const now = new Date().toISOString();
-  const existing = await c.env.DB
-    .prepare("SELECT id FROM openai_settings WHERE user_id = ?")
-    .bind(user.id)
-    .first();
-
-  if (existing) {
-    await c.env.DB
-      .prepare(
-        `UPDATE openai_settings
-         SET api_key = ?, updated_at = ?
-         WHERE user_id = ?`
-      )
-      .bind(apiKey, now, user.id)
-      .run();
-  } else {
-    const id = generateUUID();
-    await c.env.DB
-      .prepare(
-        `INSERT INTO openai_settings (id, user_id, api_key, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`
-      )
-      .bind(id, user.id, apiKey, now, now)
-      .run();
-  }
+  await upsertUserOpenAIApiKey(c.env.DB, user.id, apiKey);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -37308,32 +40579,7 @@ app.post("/api/zai-settings", anyAuthMiddleware, async (c) => {
   if (!clear && !apiKey) {
     return c.json({ error: "api_key is required" }, 400);
   }
-
-  const now = new Date().toISOString();
-  const existing = await c.env.DB
-    .prepare("SELECT id FROM zai_settings WHERE user_id = ?")
-    .bind(user.id)
-    .first();
-
-  if (existing) {
-    await c.env.DB
-      .prepare(
-        `UPDATE zai_settings
-         SET api_key = ?, updated_at = ?
-         WHERE user_id = ?`
-      )
-      .bind(apiKey, now, user.id)
-      .run();
-  } else {
-    const id = generateUUID();
-    await c.env.DB
-      .prepare(
-        `INSERT INTO zai_settings (id, user_id, api_key, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`
-      )
-      .bind(id, user.id, apiKey, now, now)
-      .run();
-  }
+  await upsertUserZAIApiKey(c.env.DB, user.id, apiKey);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -38710,6 +41956,52 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     return c.json(buildPerceptrumChatTrialExpiredErrorBody(chatAccess), 403);
   }
 
+  const userPrefs = await c.env.DB.prepare(
+    "SELECT language FROM user_preferences WHERE user_id = ?"
+  )
+    .bind(user.id)
+    .first();
+  const appLanguage = normalizeSupportedChatLanguage((userPrefs as any)?.language || "en", "en");
+  let persistedTaskState = buildDefaultChatTaskState();
+  const contextRow = await c.env.DB.prepare(
+    `SELECT task_state_json
+     FROM chat_session_contexts
+     WHERE user_id = ? AND session_id = ?
+     LIMIT 1`
+  )
+    .bind(user.id, sessionId)
+    .first();
+  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
+    try {
+      persistedTaskState = normalizeChatTaskState(
+        JSON.parse(String((contextRow as any).task_state_json || "{}"))
+      );
+    } catch {
+      persistedTaskState = buildDefaultChatTaskState();
+    }
+  }
+
+  const localApiKeyResult = await maybeHandleChatApiKeySkill({
+    db: c.env.DB,
+    userId: user.id,
+    sessionId:
+      Number.isInteger(numericSessionId) && numericSessionId > 0
+        ? numericSessionId
+        : Number(sessionId),
+    session,
+    content: body.content,
+    taskState: persistedTaskState,
+    appLanguage,
+  });
+  if (localApiKeyResult) {
+    return c.json({
+      messages: localApiKeyResult.messages,
+    });
+  }
+
+  const queryLanguageInfo = detectChatMessageLanguage(body.content, appLanguage);
+  const queryLanguage = queryLanguageInfo.language;
+  const queryLanguageSource = queryLanguageInfo.source;
   const normalizedChatModelTier = normalizeChatModelTier(body.model_tier);
   const userOpenAiApiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
   const userZAiApiKey = await getUserZAIApiKey(c.env.DB, user.id);
@@ -38803,35 +42095,6 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
     }
   }
 
-  // Fetch user's language preference
-  const userPrefs = await c.env.DB.prepare(
-    "SELECT language FROM user_preferences WHERE user_id = ?"
-  )
-    .bind(user.id)
-    .first();
-  
-  const appLanguage = normalizeSupportedChatLanguage((userPrefs as any)?.language || "en", "en");
-  const queryLanguageInfo = detectChatMessageLanguage(body.content, appLanguage);
-  const queryLanguage = queryLanguageInfo.language;
-  const queryLanguageSource = queryLanguageInfo.source;
-  let persistedTaskState = buildDefaultChatTaskState();
-  const contextRow = await c.env.DB.prepare(
-    `SELECT task_state_json
-     FROM chat_session_contexts
-     WHERE user_id = ? AND session_id = ?
-     LIMIT 1`
-  )
-    .bind(user.id, sessionId)
-    .first();
-  if (contextRow && typeof (contextRow as any).task_state_json === "string") {
-    try {
-      persistedTaskState = normalizeChatTaskState(
-        JSON.parse(String((contextRow as any).task_state_json || "{}"))
-      );
-    } catch {
-      persistedTaskState = buildDefaultChatTaskState();
-    }
-  }
   const videoRoutingContext = buildChatVideoRoutingContextFromTaskState(persistedTaskState);
   const preferIdentityRecall = shouldPreferIdentityRecallQuery(body.content);
   const replyLanguageHint = await resolveChatSessionReplyLanguageHint(
@@ -43209,6 +46472,12 @@ app.post("/api/agent/query/execute", async (c) => {
     plan: resolvedPlan,
     context: plannerContext,
   });
+  const executionMessageMetadata = buildChatIdentityCardMessageMetadataFromOperationalExecution(
+    execution
+  );
+  if (executionMessageMetadata) {
+    execution.message_metadata = executionMessageMetadata;
+  }
   await safePersistSemanticPlanMemory({
     db: c.env.DB,
     userId: pairing.userId,
@@ -43222,6 +46491,7 @@ app.post("/api/agent/query/execute", async (c) => {
     semantic_plan: semanticPlan,
     semantic_shadow: semanticShadow,
     execution,
+    message_metadata: executionMessageMetadata ?? null,
     context,
     context_report_id: context.report_id,
   });
@@ -52286,7 +55556,7 @@ const FIXED_JOB_STEP_RUN_EVERY_SECONDS: JobStepRunEverySeconds = 60;
 type JobStepRunningResolution = 640 | 1024;
 const DEFAULT_CORE_RUNNING_RESOLUTION: JobStepRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
 const MIN_JOB_STEP_TIMEOUT_SECONDS = 120;
 type JobStepPriorityLevel = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
 
@@ -54227,7 +57497,7 @@ async function buildHubAgentSnapshotFromCameraAlgorithm(
     running_resolution: execution.runningResolution,
     only_capture_on_motion: normalizeJobStepOnlyCaptureOnMotion(
       agent?.only_capture_on_motion,
-      true
+      false
     ),
     use_temporal_context: true,
     prompt_template: promptParts.prompt_template,
@@ -54344,7 +57614,7 @@ function buildHubAgentSnapshotFromCustomCameraAgentRow(agent: any): HubAgentSnap
     running_resolution: execution.runningResolution,
     only_capture_on_motion: normalizeJobStepOnlyCaptureOnMotion(
       agent?.only_capture_on_motion,
-      true
+      false
     ),
     use_temporal_context: true,
     prompt_template: promptParts.prompt_template,
@@ -54933,12 +58203,20 @@ async function createCameraAlgorithmFromHubSnapshot(
   versionId: number
 ): Promise<number> {
   const camera = await db
-    .prepare(`SELECT id FROM cameras WHERE id = ? AND user_id = ? LIMIT 1`)
+    .prepare(
+      `SELECT id, direct_capture_on_motion_only
+       FROM cameras
+       WHERE id = ? AND user_id = ? LIMIT 1`
+    )
     .bind(cameraId, userId)
     .first();
   if (!camera) {
     throw new Error("Camera not found");
   }
+  const directCaptureOnMotionOnly = normalizeCameraDirectCaptureOnMotion(
+    (camera as any)?.direct_capture_on_motion_only,
+    false
+  );
 
   const promptParts = parsePromptTemplateParts(
     snapshot.prompt_template,
@@ -55019,7 +58297,7 @@ async function createCameraAlgorithmFromHubSnapshot(
       execution.modelFps,
       execution.runEvery,
       execution.runningResolution,
-      normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
+      directCaptureOnMotionOnly ? 1 : 0,
       now,
       now
     )
@@ -55061,6 +58339,11 @@ async function updateCameraAlgorithmFromHubSnapshot(
   if (Number((ownedAlgorithm as any)?.camera_id) !== cameraId) {
     throw new Error("Camera agent not found for this camera");
   }
+  const directCaptureOnMotionOnly = await getCameraDirectCaptureOnMotionSettingForUser(
+    db,
+    userId,
+    cameraId
+  );
 
   const existingAlgorithmType = normalizeText((ownedAlgorithm as any)?.algorithm_type);
   if (!existingAlgorithmType.startsWith("custom_")) {
@@ -55173,7 +58456,7 @@ async function updateCameraAlgorithmFromHubSnapshot(
       execution.modelFps,
       execution.runEvery,
       execution.runningResolution,
-      normalizeJobStepOnlyCaptureOnMotion(snapshot.only_capture_on_motion, true) ? 1 : 0,
+      directCaptureOnMotionOnly ? 1 : 0,
       now,
       algorithmId
     )

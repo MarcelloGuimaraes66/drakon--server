@@ -555,6 +555,11 @@ void CameraSession::setDirectServiceRequested(bool requested)
     directServiceRequested_.store(requested, std::memory_order_relaxed);
 }
 
+void CameraSession::updateDirectCaptureOnMotion(bool onlyCaptureOnMotion)
+{
+    directCaptureOnMotionOnly_.store(onlyCaptureOnMotion, std::memory_order_relaxed);
+}
+
 std::string CameraSession::currentStartOrigin_() const
 {
     if (directServiceRequested_.load(std::memory_order_relaxed)) {
@@ -1407,6 +1412,7 @@ CameraSession::CameraSession(const CameraConfig& cfg,
         !cfg.isVideoSearchTemporarySession &&
         (cfg.startOrigin.empty() || cfg.startOrigin == "direct")
     ),
+    directCaptureOnMotionOnly_(cfg.directCaptureOnMotionOnly),
     lastThumbnailSent_(std::chrono::steady_clock::now() - std::chrono::seconds(60))
 {
     frameDiskWriter_.setInferenceCopyEnabledProvider([this]() -> bool {
@@ -2580,9 +2586,34 @@ void CameraSession::captureLoop_() {
         telemetryInferenceErrorCount_.store(0, std::memory_order_relaxed);
 
         auto shouldOnlyCaptureOnMotion = [&]() -> bool {
-            if (!owner_ || cameraNumericId <= 0) return true;
-            if (!owner_->isJobsCaptureEnabled(cameraNumericId)) return true;
-            return owner_->shouldOnlyCaptureOnMotion(cameraNumericId);
+            const bool directServiceRequested =
+                directServiceRequested_.load(std::memory_order_relaxed);
+            const bool directCaptureOnMotionOnly =
+                directCaptureOnMotionOnly_.load(std::memory_order_relaxed);
+
+            bool jobsCaptureEnabled = false;
+            bool jobsOnlyCaptureOnMotion = true;
+            if (owner_ && cameraNumericId > 0) {
+                jobsCaptureEnabled = owner_->isJobsCaptureEnabled(cameraNumericId);
+                if (jobsCaptureEnabled) {
+                    jobsOnlyCaptureOnMotion = owner_->shouldOnlyCaptureOnMotion(cameraNumericId);
+                }
+            }
+
+            bool hasActiveConsumer = false;
+            bool onlyCaptureOnMotion = true;
+
+            if (directServiceRequested) {
+                hasActiveConsumer = true;
+                onlyCaptureOnMotion = onlyCaptureOnMotion && directCaptureOnMotionOnly;
+            }
+            if (jobsCaptureEnabled) {
+                hasActiveConsumer = true;
+                onlyCaptureOnMotion = onlyCaptureOnMotion && jobsOnlyCaptureOnMotion;
+            }
+
+            if (!hasActiveConsumer) return true;
+            return onlyCaptureOnMotion;
         };
 
         auto consumeBootstrapCaptureOnce = [&]() -> bool {
@@ -7095,13 +7126,13 @@ void CameraSession::inferenceLoop_() {
                         collectPolygonRegionsForAlgo_(customAlgo),
                         frameWindow
                     );
-                        std::vector<AlgorithmConfig::AnalysisRegion> motionRegions = polygonRegions;
-                        if (motionRegions.empty() && hasFrameWindow) {
-                            AlgorithmConfig::AnalysisRegion viewportRegion;
-                            viewportRegion.enabled = true;
-                            viewportRegion.fullFrame = false;
-                            viewportRegion.polygonNorm = {
-                                { 0.0, 0.0 },
+                    std::vector<AlgorithmConfig::AnalysisRegion> motionRegions = polygonRegions;
+                    if (motionRegions.empty() && hasFrameWindow) {
+                        AlgorithmConfig::AnalysisRegion viewportRegion;
+                        viewportRegion.enabled = true;
+                        viewportRegion.fullFrame = false;
+                        viewportRegion.polygonNorm = {
+                            { 0.0, 0.0 },
                             { 1.0, 0.0 },
                             { 1.0, 1.0 },
                             { 0.0, 1.0 }
@@ -7109,7 +7140,12 @@ void CameraSession::inferenceLoop_() {
                         motionRegions.push_back(std::move(viewportRegion));
                     }
 
-                    if (!motionRegions.empty() && customAlgo.onlyCaptureOnMotion) {
+                    const bool motionGateEnabledForAlgo =
+                        customAlgo.onlyCaptureOnMotion &&
+                        directServiceRequested_.load(std::memory_order_relaxed) &&
+                        directCaptureOnMotionOnly_.load(std::memory_order_relaxed);
+
+                    if (!motionRegions.empty() && motionGateEnabledForAlgo) {
                         if (snapshotFrameForAlgo.empty()) {
                             shouldInfer = false;
                             Logger::instance().logDebug(
@@ -7166,7 +7202,7 @@ void CameraSession::inferenceLoop_() {
                             }
                         }
                     }
-                    else if (customAlgo.onlyCaptureOnMotion) {
+                    else if (motionGateEnabledForAlgo) {
                         shouldInfer = inferenceEnabled_.load(std::memory_order_relaxed);
                     }
 
@@ -8384,7 +8420,11 @@ void CameraSession::inferenceLoop_() {
                         }
                         std::vector<std::string> motionTriggeredRegionIds;
                         bool shouldInfer = true;
-                        if (!motionRegions.empty() && customAlgo.onlyCaptureOnMotion) {
+                        const bool motionGateEnabledForAlgo =
+                            customAlgo.onlyCaptureOnMotion &&
+                            directServiceRequested_.load(std::memory_order_relaxed) &&
+                            directCaptureOnMotionOnly_.load(std::memory_order_relaxed);
+                        if (!motionRegions.empty() && motionGateEnabledForAlgo) {
                             bool hasRegionMotion = false;
                             std::string motionErr;
                             if (!detectMotionInAnyRegionFromClipCamera_(
@@ -8410,7 +8450,7 @@ void CameraSession::inferenceLoop_() {
                                 );
                             }
                         }
-                        else if (customAlgo.onlyCaptureOnMotion) {
+                        else if (motionGateEnabledForAlgo) {
                             shouldInfer = inferenceEnabled_.load(std::memory_order_relaxed);
                         }
                         if (!shouldInfer) {

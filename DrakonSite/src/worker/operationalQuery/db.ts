@@ -8,6 +8,8 @@ import type {
   ResolvedOperationalPlan,
 } from "./schema";
 
+type JsonRecord = Record<string, unknown>;
+
 type QueryWindow = {
   startAt: string;
   endAt: string;
@@ -49,6 +51,187 @@ function asNonEmptyStringList(values: Array<number | string>): string[] {
         .filter((value) => value.length > 0)
     )
   );
+}
+
+function parseJsonRecord(value: unknown): JsonRecord | null {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as JsonRecord;
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "null") return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as JsonRecord)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeStringArray(value: unknown, maxItems = 12): string[] {
+  const source = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of source) {
+    if (typeof entry !== "string") continue;
+    const normalized = normalizePlannerText(entry, 240);
+    if (!normalized) continue;
+    const dedupeKey = normalized.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(normalized);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function mergeJsonRecords(primary: JsonRecord | null, fallback: JsonRecord | null): JsonRecord | null {
+  if (!primary && !fallback) return null;
+  if (!primary) return fallback ? { ...fallback } : null;
+  if (!fallback) return primary ? { ...primary } : null;
+
+  const merged: JsonRecord = { ...fallback, ...primary };
+
+  for (const nestedKey of ["resolved_identity", "last_seen", "primary_portrait", "context_portrait"]) {
+    const primaryNested = parseJsonRecord(primary[nestedKey]);
+    const fallbackNested = parseJsonRecord(fallback[nestedKey]);
+    if (primaryNested || fallbackNested) {
+      merged[nestedKey] = {
+        ...(fallbackNested || {}),
+        ...(primaryNested || {}),
+      };
+    }
+  }
+
+  for (const arrayKey of [
+    "identity_signature_traits",
+    "key_traits",
+    "stable_attributes",
+    "aliases",
+    "identity_context_traits",
+    "reference_image_urls",
+  ]) {
+    const mergedArray = normalizeStringArray(
+      [
+        ...normalizeStringArray(primary[arrayKey]),
+        ...normalizeStringArray(fallback[arrayKey]),
+      ],
+      arrayKey === "identity_context_traits" ? 6 : 12
+    );
+    if (mergedArray.length > 0) {
+      merged[arrayKey] = mergedArray;
+    }
+  }
+
+  return merged;
+}
+
+function computeIdentityCardRichness(row: Record<string, unknown>): number {
+  const card = parseJsonRecord(row.card_json);
+  const resolvedIdentity =
+    parseJsonRecord(row.resolved_identity_json) || parseJsonRecord(card?.resolved_identity);
+  const signatureTraits = normalizeStringArray([
+    ...normalizeStringArray(card?.identity_signature_traits),
+    ...normalizeStringArray(card?.key_traits),
+    ...normalizeStringArray(card?.stable_attributes),
+  ]);
+  const contextTraits = normalizeStringArray(card?.identity_context_traits, 6);
+  let score = 0;
+  if (normalizePlannerText(row.crop_url, 260)) score += 5;
+  if (normalizePlannerText(row.portrait_kind, 80)) score += 2;
+  if (normalizePlannerText(row.display_name, 160)) score += 1;
+  if (signatureTraits.length > 0) score += signatureTraits.length * 4;
+  if (normalizePlannerText(card?.identity_signature_summary, 400)) score += 5;
+  if (normalizePlannerText(card?.description, 400)) score += 4;
+  if (normalizePlannerText(card?.known_name, 160)) score += 2;
+  if (normalizePlannerText(card?.portrait_url, 260)) score += 2;
+  if (normalizePlannerText(parseJsonRecord(card?.last_seen)?.zone, 120)) score += 1;
+  if (contextTraits.length > 0) score += contextTraits.length;
+  if (resolvedIdentity) score += 4;
+  if (normalizePlannerText(resolvedIdentity?.target_name, 160)) score += 2;
+  if (normalizePlannerText(resolvedIdentity?.target_description, 400)) score += 2;
+  return score;
+}
+
+function queryPrefersLatestIdentityCard(query: string): boolean {
+  return queryIncludesAny(query, [
+    " latest ",
+    " most recent ",
+    " recent ",
+    " last ",
+    " latest id ",
+    " latest card ",
+    " ultimo ",
+    " ultima ",
+    " ultimos ",
+    " ultimas ",
+    " mais recente ",
+    " mais recentes ",
+    " recente ",
+    " recentes ",
+    " agora ",
+    " now ",
+  ]);
+}
+
+function mergeIdentityCardRows(rows: Array<Record<string, unknown>>): Record<string, unknown> {
+  if (rows.length === 0) return {};
+  const recentRows = sortRowsByIsoDesc(rows, "created_at");
+  const richestRows = [...rows].sort((left, right) => {
+    const scoreDelta = computeIdentityCardRichness(right) - computeIdentityCardRichness(left);
+    if (scoreDelta !== 0) return scoreDelta;
+    return (reportPickIso(right.created_at) || "").localeCompare(reportPickIso(left.created_at) || "");
+  });
+
+  const merged = { ...recentRows[0] };
+  let mergedCard = parseJsonRecord(merged.card_json);
+  let mergedResolvedIdentity = parseJsonRecord(merged.resolved_identity_json);
+
+  for (const row of richestRows) {
+    mergedCard = mergeJsonRecords(mergedCard, parseJsonRecord(row.card_json));
+    mergedResolvedIdentity = mergeJsonRecords(
+      mergedResolvedIdentity,
+      parseJsonRecord(row.resolved_identity_json)
+    );
+
+    if (!normalizePlannerText(merged.display_name, 160)) {
+      merged.display_name = normalizePlannerText(row.display_name, 160) || null;
+    }
+    if (!normalizePlannerText(merged.portrait_kind, 80)) {
+      merged.portrait_kind = normalizePlannerText(row.portrait_kind, 80) || null;
+    }
+    if (!normalizePlannerText(merged.crop_storage_key, 260)) {
+      merged.crop_storage_key = normalizePlannerText(row.crop_storage_key, 260) || null;
+    }
+    if (!normalizePlannerText(merged.crop_url, 260)) {
+      merged.crop_url = normalizePlannerText(row.crop_url, 260) || null;
+    }
+    if (!normalizePlannerText(merged.camera_name, 120)) {
+      merged.camera_name = normalizePlannerText(row.camera_name, 120) || null;
+    }
+    if (
+      (typeof merged.confidence !== "number" || !Number.isFinite(merged.confidence)) &&
+      typeof row.confidence === "number" &&
+      Number.isFinite(row.confidence)
+    ) {
+      merged.confidence = row.confidence;
+    }
+  }
+
+  if (mergedResolvedIdentity) {
+    merged.resolved_identity_json = mergedResolvedIdentity;
+    mergedCard = mergeJsonRecords(
+      mergedCard,
+      { resolved_identity: mergedResolvedIdentity }
+    );
+  } else {
+    merged.resolved_identity_json = null;
+  }
+  merged.card_json = mergedCard;
+  return merged;
 }
 
 function buildNumberInClause(
@@ -735,6 +918,7 @@ async function queryIdentityCardsDb(params: {
 }): Promise<Array<Record<string, unknown>>> {
   const runContext = buildRunContext(params.plan);
   const window = buildQueryWindow(params.plan, params.context);
+  const normalizedQuery = normalizeQueryForMatch(params.context.requested_query, 800);
   const cameraFilter = buildNumberInClause("camera_id", runContext.cameraIds);
   const jobRunFilter = buildTextInClause("job_run_id", runContext.jobRunIds);
   const stepRunFilter = buildTextInClause("step_run_id", runContext.stepRunIds);
@@ -796,6 +980,8 @@ async function queryIdentityCardsDb(params: {
   const relationClause =
     relationFragments.length > 0 ? ` AND (${relationFragments.join(" OR ")})` : "";
 
+  const requestedLimit = Math.max(1, Math.min(params.plan.intent.filters.limit, 120));
+  const candidateLimit = Math.max(requestedLimit, Math.min(Math.max(requestedLimit * 12, 24), 180));
   const rows = await runQuery(
     params.db,
     `SELECT
@@ -810,16 +996,19 @@ async function queryIdentityCardsDb(params: {
        agent_run_id,
        display_name,
        confidence,
+       resolved_target_id,
        portrait_kind,
        crop_storage_key,
        crop_url,
+       resolved_identity_json,
+       card_json,
        created_at
      FROM identity_card_occurrences
      WHERE user_id = ?
        AND created_at >= ?
        AND created_at <= ?${cameraFilter.clause}${jobRunFilter.clause}${stepRunFilter.clause}${agentRunFilter.clause}${identityFilter.clause}${relationClause}
      ORDER BY created_at DESC
-     LIMIT ${Math.max(1, Math.min(params.plan.intent.filters.limit, 120))}`,
+     LIMIT ${candidateLimit}`,
     [
       params.userId,
       window.startAt,
@@ -833,7 +1022,7 @@ async function queryIdentityCardsDb(params: {
     ]
   );
 
-  return rows.map((row) => ({
+  const mappedRows = rows.map((row) => ({
     occurrence_id: normalizePlannerText(row.occurrence_id, 160),
     identity_card_id: normalizePlannerText(row.identity_card_id, 160),
     camera_id: Number(row.camera_id || 0) || null,
@@ -843,13 +1032,51 @@ async function queryIdentityCardsDb(params: {
     job_run_id: normalizePlannerText(row.job_run_id, 160) || null,
     step_run_id: normalizePlannerText(row.step_run_id, 160) || null,
     agent_run_id: normalizePlannerText(row.agent_run_id, 160) || null,
+    resolved_target_id: Number(row.resolved_target_id || 0) || null,
     display_name: normalizePlannerText(row.display_name, 160) || null,
     confidence: typeof row.confidence === "number" ? row.confidence : Number(row.confidence || 0) || null,
     portrait_kind: normalizePlannerText(row.portrait_kind, 80) || null,
     crop_storage_key: normalizePlannerText(row.crop_storage_key, 260) || null,
     crop_url: normalizePlannerText(row.crop_url, 260) || null,
+    resolved_identity_json: parseJsonRecord(row.resolved_identity_json),
+    card_json: parseJsonRecord(row.card_json),
     created_at: reportPickIso(row.created_at),
   }));
+
+  const grouped = new Map<string, Array<Record<string, unknown>>>();
+  for (const row of mappedRows) {
+    const groupKey =
+      normalizePlannerText(row.identity_card_id, 160) ||
+      normalizePlannerText(row.occurrence_id, 160);
+    if (!groupKey) continue;
+    const bucket = grouped.get(groupKey) || [];
+    bucket.push(row);
+    grouped.set(groupKey, bucket);
+  }
+
+  const mergedRows = Array.from(grouped.values()).map((bucket) => mergeIdentityCardRows(bucket));
+  const preferLatest =
+    (params.plan.intent.filters.identity_refs || []).length > 0 ||
+    queryPrefersLatestIdentityCard(normalizedQuery);
+
+  return mergedRows
+    .sort((left, right) => {
+      if (!preferLatest) {
+        const scoreDelta = computeIdentityCardRichness(right) - computeIdentityCardRichness(left);
+        if (scoreDelta !== 0) return scoreDelta;
+      }
+      const timeDelta = (reportPickIso(right.created_at) || "").localeCompare(
+        reportPickIso(left.created_at) || ""
+      );
+      if (timeDelta !== 0) return timeDelta;
+      if (preferLatest) {
+        return computeIdentityCardRichness(right) - computeIdentityCardRichness(left);
+      }
+      return (normalizePlannerText(right.display_name, 160) || "").localeCompare(
+        normalizePlannerText(left.display_name, 160) || ""
+      );
+    })
+    .slice(0, requestedLimit);
 }
 
 async function queryJobRunsDb(params: {

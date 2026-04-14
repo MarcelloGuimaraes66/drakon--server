@@ -394,6 +394,89 @@ export async function getLocalSessionUserByToken(
     .first()) as LocalIdentityRow | null;
 }
 
+export async function migrateAppUserIdReferences(
+  db: D1Database,
+  options: {
+    oldUserId: string;
+    newUserId: string;
+  }
+): Promise<{
+  oldUserId: string;
+  newUserId: string;
+  migrated: boolean;
+  updatedColumns: Array<{
+    tableName: string;
+    columnName: string;
+    changes: number;
+  }>;
+}> {
+  const oldUserId = normalizeText(options.oldUserId);
+  const newUserId = normalizeText(options.newUserId);
+
+  if (!oldUserId || !newUserId) {
+    throw new Error("Both old and new app user ids are required for identity migration.");
+  }
+
+  if (oldUserId === newUserId) {
+    return {
+      oldUserId,
+      newUserId,
+      migrated: false,
+      updatedColumns: [],
+    };
+  }
+
+  if (isPgLikeDatabase(db)) {
+    throw new Error(
+      "Generic app user identity migration is only supported on the SQLite desktop runtime."
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+  const updatedColumns: Array<{ tableName: string; columnName: string; changes: number }> = [];
+
+  try {
+    await db.prepare("BEGIN IMMEDIATE").run();
+    await db.prepare("PRAGMA defer_foreign_keys = ON").run();
+
+    const identityColumns = await listSqliteIdentityColumns(db);
+    for (const ref of identityColumns) {
+      const updateResult = await db
+        .prepare(
+          `UPDATE ${quoteSqliteIdentifier(ref.tableName)}
+           SET ${quoteSqliteIdentifier(ref.columnName)} = ?
+           WHERE ${quoteSqliteIdentifier(ref.columnName)} = ?`
+        )
+        .bind(newUserId, oldUserId)
+        .run();
+
+      updatedColumns.push({
+        tableName: ref.tableName,
+        columnName: ref.columnName,
+        changes: Number(updateResult.meta?.changes || 0),
+      });
+    }
+
+    await mergeAppUserRowsForCanonicalId(db, oldUserId, newUserId, nowIso);
+
+    await db.prepare("COMMIT").run();
+  } catch (error) {
+    try {
+      await db.prepare("ROLLBACK").run();
+    } catch {
+      // Ignore rollback failures and preserve the original error.
+    }
+    throw error;
+  }
+
+  return {
+    oldUserId,
+    newUserId,
+    migrated: true,
+    updatedColumns,
+  };
+}
+
 export async function migrateLegacyLocalUserIdToCanonicalId(
   db: D1Database,
   options: {

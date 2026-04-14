@@ -1090,6 +1090,25 @@ CREATE TABLE public.local_users (
 ALTER TABLE public.local_users OWNER TO postgres;
 
 --
+-- Name: user_secret_recovery; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.user_secret_recovery (
+    app_user_id text NOT NULL PRIMARY KEY REFERENCES public.app_users(id) ON DELETE CASCADE,
+    storage_scope text DEFAULT 'local'::text NOT NULL,
+    question_key text,
+    answer_hash text,
+    failed_attempts integer DEFAULT 0 NOT NULL,
+    locked_until text,
+    configured_at text,
+    created_at text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at text DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+ALTER TABLE public.user_secret_recovery OWNER TO postgres;
+
+--
 -- TOC entry 270 (class 1259 OID 43033)
 -- Name: local_users_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
 --
@@ -5141,6 +5160,13 @@ CREATE INDEX idx_local_users_email ON public.local_users USING btree (email);
 --
 
 CREATE INDEX idx_local_users_reset_token ON public.local_users USING btree (reset_token);
+
+
+--
+-- Name: idx_user_secret_recovery_locked_until; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_user_secret_recovery_locked_until ON public.user_secret_recovery USING btree (locked_until);
 
 
 --

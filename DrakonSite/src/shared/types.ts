@@ -22,6 +22,7 @@ export const CreateCameraSchema = z.object({
   retention_days: z.number().optional(),
   webcam_index: z.number().optional(),
   allowpublicaccess: z.boolean().optional(),
+  direct_capture_on_motion_only: z.boolean().optional(),
 });
 
 export const UpdateCameraSchema = z.object({
@@ -46,6 +47,7 @@ export const UpdateCameraSchema = z.object({
   retention_days: z.number().optional(),
   webcam_index: z.number().int().nonnegative().nullable().optional(),
   allowpublicaccess: z.boolean().optional(),
+  direct_capture_on_motion_only: z.boolean().optional(),
   is_service_running: z.number().min(0).max(1).optional(),
 });
 

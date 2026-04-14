@@ -65,6 +65,10 @@ type ToastMessage = {
   variant: "default" | "destructive";
 };
 
+type CameraConfiguration = {
+  direct_capture_on_motion_only: boolean;
+};
+
 const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
   "agent-model",
   "agent-input-type",
@@ -85,6 +89,24 @@ const AGENT_TUTORIAL_COMPLETION_STEPS = new Set([
   "agent-execution",
   "agent-save",
 ]);
+
+const normalizeCameraDirectCaptureOnMotion = (
+  value: unknown,
+  fallback = false
+): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+  }
+  return fallback;
+};
 
 function TelegramIcon({ className = "w-4 h-4" }: { className?: string }) {
   return (
@@ -254,6 +276,8 @@ export default function Algorithms() {
   const [telegramStatusLoading, setTelegramStatusLoading] = useState(true);
   const [telegramSetupPromptAgent, setTelegramSetupPromptAgent] = useState<string | null>(null);
   const [savingAlertKey, setSavingAlertKey] = useState<string | null>(null);
+  const [cameraConfig, setCameraConfig] = useState<CameraConfiguration | null>(null);
+  const [savingDirectCaptureMode, setSavingDirectCaptureMode] = useState(false);
   const customEditorTarget: CameraAgentEditorTarget | null =
     numericCameraId > 0
       ? {
@@ -377,9 +401,70 @@ export default function Algorithms() {
 
   const fetchCamera = async () => {
     try {
-      await fetch(`/api/cameras/${cameraId}`);
+      const response = await fetch(`/api/cameras/${cameraId}`);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to fetch camera");
+      }
+      setCameraConfig({
+        direct_capture_on_motion_only: normalizeCameraDirectCaptureOnMotion(
+          data?.direct_capture_on_motion_only,
+          false
+        ),
+      });
     } catch (error) {
       console.error("Failed to fetch camera:", error);
+      setCameraConfig((prev) =>
+        prev ?? {
+          direct_capture_on_motion_only: false,
+        }
+      );
+    }
+  };
+
+  const handleDirectCaptureModeChange = async (checked: boolean) => {
+    if (!cameraId || savingDirectCaptureMode) return;
+
+    const previousCameraConfig = cameraConfig ?? {
+      direct_capture_on_motion_only: false,
+    };
+
+    setCameraConfig({
+      ...previousCameraConfig,
+      direct_capture_on_motion_only: checked,
+    });
+    setSavingDirectCaptureMode(true);
+
+    try {
+      const response = await fetch(`/api/cameras/${cameraId}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          direct_capture_on_motion_only: checked,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data?.error || "Failed to update capture mode");
+      }
+      setCameraConfig({
+        direct_capture_on_motion_only: normalizeCameraDirectCaptureOnMotion(
+          data?.direct_capture_on_motion_only,
+          checked
+        ),
+      });
+    } catch (error) {
+      console.error("Failed to update direct camera capture mode:", error);
+      setCameraConfig(previousCameraConfig);
+      showToast(
+        "Error",
+        error instanceof Error ? error.message : "Failed to update capture mode",
+        "destructive"
+      );
+    } finally {
+      setSavingDirectCaptureMode(false);
     }
   };
 
@@ -1403,15 +1488,67 @@ export default function Algorithms() {
             <ArrowLeft className="w-4 h-4" />
             {t("algorithms.backToDashboard")}
           </button>
-          <div className="flex items-center gap-3 mb-2">
-            <div className="w-10 md:w-12 h-10 md:h-12 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center flex-shrink-0">
-              <Cpu className="w-5 md:w-6 h-5 md:h-6 text-white" />
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+            <div className="flex items-center gap-3 mb-2 xl:mb-0">
+              <div className="w-10 md:w-12 h-10 md:h-12 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center flex-shrink-0">
+                <Cpu className="w-5 md:w-6 h-5 md:h-6 text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl md:text-3xl font-bold text-gray-100">
+                  {t("algorithms.title")}
+                </h1>
+                <p className="text-sm md:text-base text-gray-400">Camera #{cameraId}</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-2xl md:text-3xl font-bold text-gray-100">
-                {t("algorithms.title")}
-              </h1>
-              <p className="text-sm md:text-base text-gray-400">Camera #{cameraId}</p>
+
+            <div className="w-full xl:max-w-md rounded-2xl border border-gray-800 bg-gray-900/70 p-4 shadow-lg shadow-black/20">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="text-[10px] uppercase tracking-[0.24em] text-gray-500">
+                      {t("jobs.captureMode")}
+                    </div>
+                    <p className="mt-1 text-sm leading-6 text-gray-400">
+                      {t("algorithms.captureModeDescription", {
+                        defaultValue:
+                          "Choose when this camera should capture frames for AI Agents running directly on this camera.",
+                      })}
+                    </p>
+                  </div>
+                  <span
+                    className={`inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium ${
+                      savingDirectCaptureMode
+                        ? "border-amber-400/25 bg-amber-500/12 text-amber-100"
+                        : "border-blue-400/25 bg-blue-500/12 text-blue-100"
+                    }`}
+                  >
+                    {savingDirectCaptureMode
+                      ? t("algorithms.captureModeSaving", { defaultValue: "Saving" })
+                      : t("algorithms.captureModeAvailable", { defaultValue: "Available" })}
+                  </span>
+                </div>
+
+                <label className="flex items-start gap-3 rounded-xl border border-gray-800 bg-gray-950/40 px-4 py-3 text-gray-200 sm:items-center">
+                  <input
+                    type="checkbox"
+                    checked={cameraConfig?.direct_capture_on_motion_only ?? false}
+                    onChange={(e) => void handleDirectCaptureModeChange(e.target.checked)}
+                    disabled={savingDirectCaptureMode}
+                    className="mt-1 h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-blue-500 disabled:opacity-50 sm:mt-0"
+                  />
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-gray-100">
+                      {t("jobs.onlyCaptureMotion")}
+                    </div>
+                    <div className="mt-1 text-xs leading-5 text-gray-500">
+                      {t("algorithms.captureModeHelp", {
+                        defaultValue:
+                          "Leave it unchecked to keep capturing even without motion, matching the default capture behavior from jobs and steps.",
+                      })}
+                    </div>
+                  </div>
+                </label>
+              </div>
             </div>
           </div>
         </div>

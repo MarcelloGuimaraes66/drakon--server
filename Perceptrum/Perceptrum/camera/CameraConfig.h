@@ -122,6 +122,10 @@ struct CameraConfig {
     std::string descriptionModelName{ "gpt-5.1" };
     std::string descriptionModelApiKey;
 
+    // Direct camera AI Agents can inherit a camera-wide capture policy that
+    // mirrors the Jobs/Steps capture mode control.
+    bool directCaptureOnMotionOnly{ false };
+
     // Preserve legacy manual behavior: when camera is started directly with no
     // enabled inference agents, keep recording video even if image-only demands
     // appear later (e.g., from jobs).

@@ -4891,6 +4891,28 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
     }
 
     CameraSession* session = it->second.get();
+    const bool directCaptureOnMotionOnly = [&]() -> bool {
+        if (!payload.is_object()) return session->directCaptureOnMotion();
+        if (!payload.contains("direct_capture_on_motion_only")) return session->directCaptureOnMotion();
+        const auto& value = payload["direct_capture_on_motion_only"];
+        if (value.is_boolean()) return value.get<bool>();
+        if (value.is_number_integer()) return value.get<int>() != 0;
+        if (value.is_number()) return std::abs(value.get<double>()) > 1e-9;
+        if (value.is_string()) {
+            std::string normalized = value.get<std::string>();
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+                return true;
+            }
+            if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+                return false;
+            }
+        }
+        return session->directCaptureOnMotion();
+    }();
+    session->updateDirectCaptureOnMotion(directCaptureOnMotionOnly);
 
     if (!payload.contains("enabled_algorithms") ||
         !payload["enabled_algorithms"].is_array()) {
@@ -5051,7 +5073,7 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
             jsonIntOr(a, "runningResolution", 640)
         );
         ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
-        ac.onlyCaptureOnMotion = jsonBoolOr(a, "only_capture_on_motion", true);
+        ac.onlyCaptureOnMotion = jsonBoolOr(a, "only_capture_on_motion", directCaptureOnMotionOnly);
         ac.modelFps = normalizeAlgorithmModelFps_(
             jsonIntOr(a, "model_fps", 1),
             ac.inferenceModel,
@@ -6496,6 +6518,27 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
     cfg.enabledAlgorithms.clear();
     cfg.algorithms.clear();
 
+    const bool directCaptureOnMotionOnly = [&]() -> bool {
+        if (!p.contains("direct_capture_on_motion_only")) return false;
+        const auto& value = p["direct_capture_on_motion_only"];
+        if (value.is_boolean()) return value.get<bool>();
+        if (value.is_number_integer()) return value.get<int>() != 0;
+        if (value.is_number()) return std::abs(value.get<double>()) > 1e-9;
+        if (value.is_string()) {
+            std::string normalized = value.get<std::string>();
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+                return true;
+            }
+            if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+                return false;
+            }
+        }
+        return false;
+    }();
+
     if (p.contains("enabled_algorithms") && p["enabled_algorithms"].is_array()) {
         auto jsonStringOr = [](const json& node, const char* key, const std::string& fallback = std::string()) {
             if (node.contains(key) && node[key].is_string()) return node[key].get<std::string>();
@@ -6629,7 +6672,11 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 jsonIntOr(algo, "runningResolution", 640)
             );
             ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
-            ac.onlyCaptureOnMotion = jsonBoolOr(algo, "only_capture_on_motion", true);
+            ac.onlyCaptureOnMotion = jsonBoolOr(
+                algo,
+                "only_capture_on_motion",
+                directCaptureOnMotionOnly
+            );
         ac.modelFps = normalizeAlgorithmModelFps_(
             jsonIntOr(algo, "model_fps", 1),
             ac.inferenceModel,
@@ -6785,6 +6832,8 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
         }
     }
 
+    cfg.directCaptureOnMotionOnly = directCaptureOnMotionOnly;
+
     cfg.forceVideoRecordingWithoutInference =
         (!startedByJob && cfg.algorithms.empty() && !cfg.isDrakonFindTemporarySession);
 
@@ -6871,6 +6920,7 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
             if (directStart) {
                 it->second->setDirectServiceRequested(true);
             }
+            it->second->updateDirectCaptureOnMotion(cfg.directCaptureOnMotionOnly);
             it->second->updateTelegramSettings(
                 cfg.telegramEnabled,
                 cfg.telegramBotToken,
@@ -6918,6 +6968,8 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         " rtspUrlCandidates=" + cfg.rtspUrl +
         " frameCaptureIntervalSeconds=" + std::to_string(cfg.frameCaptureIntervalSeconds) +
         " timeOffsetSeconds=" + std::to_string(cfg.timeOffsetSeconds) +
+        " directCaptureOnMotionOnly=" +
+        std::string(cfg.directCaptureOnMotionOnly ? "true" : "false") +
         " forceVideoRecordingWithoutInference=" +
         std::string(cfg.forceVideoRecordingWithoutInference ? "true" : "false") +
         " isVideoSearchTemporarySession=" +

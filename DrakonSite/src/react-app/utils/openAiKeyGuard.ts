@@ -2,10 +2,10 @@ import { getBrandWindowEventName } from "@/shared/brand";
 
 export const OPENAI_KEY_REQUIRED_ERROR_CODE = "OPENAI_KEY_REQUIRED";
 export const OPENAI_KEY_REQUIRED_DEFAULT_MESSAGE =
-  "OpenAI API key is required. Add it in Settings.";
+  "OpenAI API key is required. Add it in Settings or paste it in chat.";
 export const ZAI_KEY_REQUIRED_ERROR_CODE = "ZAI_KEY_REQUIRED";
 export const ZAI_KEY_REQUIRED_DEFAULT_MESSAGE =
-  "Z.ai API key is required. Add it in Settings.";
+  "Z.ai API key is required. Add it in Settings or paste it in chat.";
 
 const toMessageString = (payload: Record<string, unknown>): string =>
   String(payload.message || payload.error || "").toLowerCase();

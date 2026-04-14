@@ -1175,6 +1175,9 @@ SkillRunResult ReadStateSkill::execute(
             result.metadata["focus"] = focus;
             result.metadata["planner_mode"] = "operational_query";
             result.metadata["planner_execution"] = execution;
+            if (execution.contains("message_metadata") && execution["message_metadata"].is_object()) {
+                result.metadata["message_metadata"] = execution["message_metadata"];
+            }
             if (operationalQueryExecution.contains("plan") && operationalQueryExecution["plan"].is_object()) {
                 result.metadata["query_plan"] = operationalQueryExecution["plan"];
             }

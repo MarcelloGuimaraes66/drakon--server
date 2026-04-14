@@ -6,6 +6,8 @@ import type {
   ResolvedOperationalPlan,
 } from "./schema";
 
+type JsonRecord = Record<string, unknown>;
+
 function asFiniteNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -13,6 +15,178 @@ function asFiniteNumber(value: unknown): number | null {
 function normalizeText(value: unknown, maxLength = 240): string {
   if (typeof value !== "string") return "";
   return value.replace(/\s+/g, " ").trim().slice(0, Math.max(0, maxLength));
+}
+
+function parseJsonRecord(value: unknown): JsonRecord | null {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as JsonRecord;
+  }
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "null") return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as JsonRecord)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTextArray(value: unknown, maxItems = 8): string[] {
+  const rawEntries = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of rawEntries) {
+    if (typeof entry !== "string") continue;
+    const normalized = normalizeText(entry, 240);
+    if (!normalized) continue;
+    const dedupeKey = normalized.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(normalized);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function normalizeIdentitySummary(value: unknown): string {
+  const text = normalizeText(value, 320);
+  if (!text) return "";
+  return text
+    .replace(/^identity signature\s*:\s*/i, "")
+    .replace(/^assinatura de identidade\s*:\s*/i, "")
+    .replace(/^assinatura visual\s*:\s*/i, "")
+    .trim();
+}
+
+function isAggregateIdentityDescription(text: string): boolean {
+  const normalized = text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  return (
+    normalized.includes("contagem parcial") ||
+    normalized.includes("total acumulado") ||
+    normalized.includes("partial count") ||
+    normalized.includes("total so far") ||
+    normalized.includes("window") ||
+    normalized.includes("segment")
+  );
+}
+
+function extractIdentityTraitLines(card: JsonRecord | null): string[] {
+  if (!card) return [];
+  const explicitTraits = normalizeTextArray([
+    ...normalizeTextArray(card.identity_signature_traits, 12),
+    ...normalizeTextArray(card.key_traits, 12),
+    ...normalizeTextArray(card.stable_attributes, 12),
+  ], 12);
+  if (explicitTraits.length > 0) {
+    return explicitTraits.slice(0, 6);
+  }
+
+  const summary = normalizeIdentitySummary(card.identity_signature_summary);
+  if (summary) {
+    return summary
+      .split(/[;,|]/)
+      .map((entry) => normalizeText(entry, 120))
+      .filter(Boolean)
+      .slice(0, 6);
+  }
+
+  const description = normalizeText(card.description, 280);
+  if (description && !isAggregateIdentityDescription(description)) {
+    return [description];
+  }
+  return [];
+}
+
+function formatPortraitKind(value: unknown, isPt: boolean): string {
+  const normalized = normalizeText(value, 80).toLowerCase();
+  if (!normalized) return isPt ? "nao informado" : "not specified";
+  if (normalized === "face") return isPt ? "rosto" : "face";
+  if (normalized === "full_object") return isPt ? "objeto inteiro" : "full object";
+  return normalized;
+}
+
+function formatIdentityCardEntry(
+  row: Record<string, unknown>,
+  index: number,
+  isPt: boolean
+): string {
+  const card = parseJsonRecord(row.card_json);
+  const resolvedIdentity =
+    parseJsonRecord(row.resolved_identity_json) || parseJsonRecord(card?.resolved_identity);
+  const lastSeen = parseJsonRecord(card?.last_seen);
+  const displayName =
+    normalizeText(row.display_name, 120) ||
+    normalizeText(card?.display_name, 120) ||
+    normalizeText(row.identity_card_id, 120) ||
+    (isPt ? "Identidade" : "Identity");
+  const resolvedName =
+    normalizeText(resolvedIdentity?.target_name, 120) ||
+    normalizeText(card?.known_name, 120);
+  const title = resolvedName ? `${displayName} -> ${resolvedName}` : displayName;
+  const createdAt =
+    formatIsoShort(row.created_at) ||
+    formatIsoShort(lastSeen?.timestamp_utc_iso) ||
+    (isPt ? "horario n/a" : "time n/a");
+  const cameraName =
+    normalizeText(row.camera_name, 120) ||
+    normalizeText(lastSeen?.camera_name, 120) ||
+    (isPt ? "camera n/a" : "camera n/a");
+  const zone = normalizeText(lastSeen?.zone, 120);
+  const hasCrop = normalizeText(row.crop_url, 240).length > 0;
+  const cropText = isPt ? (hasCrop ? "sim" : "nao") : hasCrop ? "yes" : "no";
+  const portraitKind = formatPortraitKind(row.portrait_kind || card?.portrait_kind, isPt);
+  const traits = extractIdentityTraitLines(card);
+  const description = normalizeText(card?.description, 280);
+  const signatureSummary = normalizeIdentitySummary(card?.identity_signature_summary);
+  const contextTraits = normalizeTextArray(card?.identity_context_traits, 4);
+  const resolvedDescription = normalizeText(resolvedIdentity?.target_description, 280);
+
+  const lines = [
+    `### ${index + 1}. ${title}`,
+    isPt ? `- Camera: ${cameraName}` : `- Camera: ${cameraName}`,
+    isPt ? `- Horario: ${createdAt}` : `- Time: ${createdAt}`,
+    zone ? (isPt ? `- Zona: ${zone}` : `- Zone: ${zone}`) : "",
+    isPt ? `- Crop: ${cropText}` : `- Crop: ${cropText}`,
+    isPt ? `- Retrato: ${portraitKind}` : `- Portrait: ${portraitKind}`,
+    resolvedName && resolvedDescription
+      ? isPt
+        ? `- Perfil conhecido: ${resolvedName} | ${resolvedDescription}`
+        : `- Known profile: ${resolvedName} | ${resolvedDescription}`
+      : resolvedName
+      ? isPt
+        ? `- Identidade resolvida: ${resolvedName}`
+        : `- Resolved identity: ${resolvedName}`
+      : "",
+    traits.length > 0
+      ? isPt
+        ? `- Caracteristicas: ${traits.join("; ")}`
+        : `- Traits: ${traits.join("; ")}`
+      : signatureSummary
+      ? isPt
+        ? `- Assinatura visual: ${signatureSummary}`
+        : `- Visual signature: ${signatureSummary}`
+      : description && !isAggregateIdentityDescription(description)
+      ? isPt
+        ? `- Descricao: ${description}`
+        : `- Description: ${description}`
+      : isPt
+      ? "- Caracteristicas persistidas: nao disponiveis neste card."
+      : "- Persisted traits: not available for this card.",
+    contextTraits.length > 0
+      ? isPt
+        ? `- Contexto visual: ${contextTraits.join("; ")}`
+        : `- Visual context: ${contextTraits.join("; ")}`
+      : "",
+  ];
+
+  return lines.filter((entry) => entry.length > 0).join("\n");
 }
 
 function toNumberSet(values: Array<number | string>): Set<number> {
@@ -145,17 +319,9 @@ function buildIdentityCardsAnswer(
       : "I did not find persisted identity cards in that operational window.";
   }
 
-  const lines = rows.slice(0, plan.intent.filters.limit).map((row, index) => {
-    const displayName =
-      normalizeText(row.display_name, 120) ||
-      normalizeText(row.identity_card_id, 120) ||
-      (isPt ? "Identidade" : "Identity");
-    const cameraName = normalizeText(row.camera_name, 120) || "camera n/a";
-    const createdAt = formatIsoShort(row.created_at) || (isPt ? "horario n/a" : "time n/a");
-    const hasCrop = normalizeText(row.crop_url, 240).length > 0;
-    const cropText = isPt ? (hasCrop ? "crop: sim" : "crop: nao") : hasCrop ? "crop: yes" : "crop: no";
-    return `${index + 1}. ${displayName} | ${cameraName} | ${createdAt} | ${cropText}`;
-  });
+  const lines = rows
+    .slice(0, plan.intent.filters.limit)
+    .map((row, index) => formatIdentityCardEntry(row, index, isPt));
 
   const header = isPt ? "## Identity cards persistidos" : "## Persisted identity cards";
   const intro = buildCountIntro(

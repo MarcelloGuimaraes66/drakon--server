@@ -15,6 +15,11 @@ type AuthUser = {
   country_code?: string | null;
   created_at?: string | null;
   handle?: string | null;
+  requires_secret_recovery_setup?: boolean;
+  secret_recovery_configured?: boolean;
+  secret_recovery_question_key?: string | null;
+  secret_recovery_storage_scope?: "local" | "server" | null;
+  has_password?: boolean;
   google_user_data?: any;
 };
 
@@ -28,6 +33,7 @@ type GoogleAuthRedirectOptions = {
 type AuthContextValue = {
   user: AuthUser | null;
   isPending: boolean;
+  refreshUser: () => Promise<AuthUser | null>;
   redirectToLogin: (options?: GoogleAuthRedirectOptions) => Promise<void>;
   exchangeCodeForSessionToken: () => Promise<AuthUser | null>;
   logout: () => Promise<void>;
@@ -207,11 +213,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     () => ({
       user,
       isPending,
+      refreshUser: loadUser,
       redirectToLogin,
       exchangeCodeForSessionToken,
       logout,
     }),
-    [user, isPending, redirectToLogin, exchangeCodeForSessionToken, logout]
+    [user, isPending, loadUser, redirectToLogin, exchangeCodeForSessionToken, logout]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

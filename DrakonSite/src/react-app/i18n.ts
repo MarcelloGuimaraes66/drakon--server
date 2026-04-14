@@ -3,6 +3,7 @@ import { initReactI18next } from "react-i18next";
 import { deepReplaceKnownBrandTokens } from "@/shared/brand";
 import { drakonFindOverrides } from "@/react-app/drakonFindI18n";
 import { billingPageTranslations } from "@/react-app/billingTranslations";
+import { securityRecoveryTranslations } from "@/react-app/securityRecoveryTranslations";
 import { tutorialFeatureTranslations } from "@/react-app/tutorialTranslations";
 import { tutorialCameraStepTranslations } from "@/react-app/tutorialCameraStepTranslations";
 import { tutorialAgentStepTranslations } from "@/react-app/tutorialAgentStepTranslations";
@@ -4130,6 +4131,10 @@ for (const [lang, entries] of Object.entries(tutorialCameraStepTranslations)) {
 }
 
 for (const [lang, entries] of Object.entries(tutorialAgentStepTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(securityRecoveryTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 

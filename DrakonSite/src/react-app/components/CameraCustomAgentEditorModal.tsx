@@ -176,7 +176,7 @@ const DEFAULT_CAMERA_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "frame_seq
 const DEFAULT_LIGHT_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x2";
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
 const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
   "agent-model",
   "agent-input-type",
@@ -933,7 +933,7 @@ export default function CameraCustomAgentEditorModal({
     DEFAULT_CORE_RUNNING_RESOLUTION
   );
   const [modelFps, setModelFps] = useState<number>(DEFAULT_ULTRA_VIDEO_MODEL_FPS);
-  const [onlyCaptureOnMotion, setOnlyCaptureOnMotion] = useState(true);
+  const [onlyCaptureOnMotion, setOnlyCaptureOnMotion] = useState(false);
   const [fields, setFields] = useState<PromptEditorFields>({
     prompt_template: "",
     alert_condition: "",
@@ -1255,7 +1255,7 @@ export default function CameraCustomAgentEditorModal({
     setRunEvery(execution.runEvery);
     setRunningResolution(execution.runningResolution);
     setModelFps(execution.modelFps);
-    setOnlyCaptureOnMotion(normalizeBool(agent?.only_capture_on_motion, true));
+    setOnlyCaptureOnMotion(normalizeBool(agent?.only_capture_on_motion, false));
     setFields(parsedFields);
     const normalizedRegions = normalizeRegionsFromApi(
       agent?.analysis_regions,
@@ -1517,7 +1517,7 @@ export default function CameraCustomAgentEditorModal({
       setRunEvery(execution.runEvery);
       setRunningResolution(execution.runningResolution);
       setModelFps(execution.modelFps);
-      setOnlyCaptureOnMotion(true);
+      setOnlyCaptureOnMotion(false);
       setFields({
         prompt_template: t("tutorial.agentPreset.promptCore"),
         alert_condition: t("tutorial.agentPreset.alertCondition"),

@@ -143,10 +143,18 @@ type PromptEnhanceSuggestion = PromptEditorFields & {
 const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
 const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
 const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
+const PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS =
+  "rounded-xl border border-gray-700 bg-gray-800/70 shadow-[0_40px_120px_-50px_rgba(0,0,0,1)]";
+const PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS =
+  "max-h-[84vh] overflow-y-auto px-4 py-4 sm:px-5 sm:py-5";
 const PROMPT_DOCUMENT_INPUT_CLASS =
   "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
 const PROMPT_DOCUMENT_TEXTAREA_CLASS =
   "w-full border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS =
+  "w-full resize-none overflow-hidden border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
+const PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS =
+  "inline-flex h-7 w-7 items-center justify-center rounded border border-gray-600 bg-gray-800 text-gray-300 transition-colors hover:border-gray-500 hover:text-gray-100";
 
 const extractOptionalSuffix = (label: string): string => {
   const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
@@ -157,6 +165,62 @@ const formatPromptDocumentHeading = (
   label: string,
   options?: { optional?: boolean; optionalSuffix?: string }
 ): string => `# ${label}${options?.optional ? options.optionalSuffix || " (optional)" : ""}`;
+
+type AutoGrowingTextareaProps = {
+  ariaLabel: string;
+  className: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  readOnly?: boolean;
+  rows?: number;
+  value: string;
+};
+
+function AutoGrowingTextarea({
+  ariaLabel,
+  className,
+  onChange,
+  placeholder,
+  readOnly = false,
+  rows = 1,
+  value,
+}: AutoGrowingTextareaProps) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+    textarea.style.overflowY = "hidden";
+  }, [rows, value]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.style.height = "0px";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+      textarea.style.overflowY = "hidden";
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  return (
+    <textarea
+      ref={textareaRef}
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      rows={rows}
+      readOnly={readOnly}
+      className={className}
+      placeholder={placeholder}
+    />
+  );
+}
 
 const parsePromptTemplate = (
   template: string,
@@ -942,7 +1006,7 @@ type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
 const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_2x2";
 
@@ -4571,6 +4635,7 @@ function StepCard({
   
   const [agentForm, setAgentForm] = useState<AgentFormState>(buildEmptyAgentForm);
   const [showPromptEditor, setShowPromptEditor] = useState(false);
+  const [promptDocumentExpanded, setPromptDocumentExpanded] = useState(false);
   const [savedAgentLibrary, setSavedAgentLibrary] = useState<SavedAgentLibraryEntry[]>([]);
   const [savedAgentLibraryLoading, setSavedAgentLibraryLoading] = useState(false);
   const [savedAgentLibraryError, setSavedAgentLibraryError] = useState<string | null>(null);
@@ -5506,6 +5571,19 @@ function StepCard({
       cancelled = true;
     };
   }, [showPromptEditor]);
+
+  useEffect(() => {
+    if (!promptDocumentExpanded) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setPromptDocumentExpanded(false);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [promptDocumentExpanded]);
 
   const fetchLatestAgentForPromptEditor = async (cameraId: number): Promise<Agent | null> => {
     if (!Number.isInteger(cameraId) || cameraId <= 0) return null;
@@ -6838,6 +6916,7 @@ function StepCard({
   const closePromptEditor = () => {
     if (enhancingPrompt) return;
     setShowPromptEditor(false);
+    setPromptDocumentExpanded(false);
     setPromptEditorInputTypeDraft("video");
     setPromptEnhanceSuggestion(null);
     setPolygonDrawEnabled(false);
@@ -7009,6 +7088,7 @@ function StepCard({
     setPromptEditorSnapshotLoading(true);
     void fetchFaceTargetsLibraryData();
     setPromptEnhanceSuggestion(null);
+    setPromptDocumentExpanded(false);
     setShowPromptEditor(true);
 
     if (selectedCameraId === null) {
@@ -8292,6 +8372,203 @@ function StepCard({
       FIXED_AGENT_RUN_EVERY_SECONDS
     );
     return getRunEveryOptionLabel(normalized);
+  };
+
+  const updatePromptEditorPromptCore = (value: string) => {
+    setPromptEditorDraft((prev) => ({
+      ...prev,
+      prompt_template: value,
+    }));
+    setPromptEditorRegions((prev) =>
+      prev.map((region) => ({
+        ...region,
+        prompt_core: value,
+      }))
+    );
+  };
+
+  const updatePromptEditorAlertCondition = (value: string) => {
+    setPromptEditorDraft((prev) => ({
+      ...prev,
+      alert_condition: value,
+    }));
+    setPromptEditorRegions((prev) =>
+      prev.map((region) => ({
+        ...region,
+        alert_condition: value,
+      }))
+    );
+  };
+
+  const updatePromptEditorNegativeCondition = (value: string) => {
+    setPromptEditorDraft((prev) => ({
+      ...prev,
+      negative_condition: value,
+    }));
+    setPromptEditorRegions((prev) =>
+      prev.map((region) => ({
+        ...region,
+        negative_condition: value,
+      }))
+    );
+  };
+
+  const renderPromptEditorDocument = (options?: { expanded?: boolean }) => {
+    const expanded = options?.expanded ?? false;
+    const togglePromptDocumentLabel = expanded
+      ? t("jobs.promptEditor.collapseDocument", {
+          defaultValue: "Collapse prompt document",
+        })
+      : t("jobs.promptEditor.expandDocument", {
+          defaultValue: "Expand prompt document",
+        });
+    const sectionClassName = expanded
+      ? "space-y-2"
+      : PROMPT_DOCUMENT_SECTION_CLASS;
+    const promptCoreSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const alertConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+    const negativeConditionSectionClassName = expanded
+      ? sectionClassName
+      : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+
+    const documentSections = (
+      <>
+        <div className={sectionClassName}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="font-mono text-[13px] font-semibold text-gray-100">
+                {formatPromptDocumentHeading(t("jobs.agentKey"))}
+              </span>
+              <span className="text-red-600">*</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPromptDocumentExpanded((prev) => !prev)}
+              className={PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS}
+              title={togglePromptDocumentLabel}
+              aria-label={togglePromptDocumentLabel}
+              aria-expanded={expanded}
+            >
+              {expanded ? (
+                <Minimize2 className="h-3.5 w-3.5" />
+              ) : (
+                <Maximize2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+          <input
+            aria-label={t("jobs.agentKey")}
+            type="text"
+            value={agentForm.agent_key}
+            onChange={(e) =>
+              setAgentForm((prev) => ({
+                ...prev,
+                agent_key: e.target.value,
+              }))
+            }
+            className={PROMPT_DOCUMENT_INPUT_CLASS}
+            placeholder={t("jobs.agentKeyPlaceholder")}
+          />
+        </div>
+        <div className={promptCoreSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.promptCoreLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.promptCoreLabel")}
+              value={promptEditorDraft.prompt_template}
+              onChange={updatePromptEditorPromptCore}
+              rows={8}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.promptCoreLabel")}
+              value={promptEditorDraft.prompt_template}
+              onChange={(e) => updatePromptEditorPromptCore(e.target.value)}
+              rows={8}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
+            />
+          )}
+        </div>
+        <div className={alertConditionSectionClassName}>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[13px] font-semibold text-gray-100">
+              {formatPromptDocumentHeading(t("jobs.promptEditor.alertConditionLabel"))}
+            </span>
+            <span className="text-red-600">*</span>
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={t("jobs.promptEditor.alertConditionLabel")}
+              value={promptEditorDraft.alert_condition}
+              onChange={updatePromptEditorAlertCondition}
+              rows={5}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={t("jobs.promptEditor.alertConditionLabel")}
+              value={promptEditorDraft.alert_condition}
+              onChange={(e) => updatePromptEditorAlertCondition(e.target.value)}
+              rows={5}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
+            />
+          )}
+        </div>
+        <div className={negativeConditionSectionClassName}>
+          <div className="font-mono text-[13px] font-semibold text-gray-100">
+            {formatPromptDocumentHeading(t("jobs.promptEditor.negativeConditionLabel"), {
+              optional: true,
+              optionalSuffix: localizedOptionalSuffix,
+            })}
+          </div>
+          {expanded ? (
+            <AutoGrowingTextarea
+              ariaLabel={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={promptEditorDraft.negative_condition}
+              onChange={updatePromptEditorNegativeCondition}
+              rows={4}
+              className={PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          ) : (
+            <textarea
+              aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
+              value={promptEditorDraft.negative_condition}
+              onChange={(e) => updatePromptEditorNegativeCondition(e.target.value)}
+              rows={4}
+              className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
+              placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
+            />
+          )}
+        </div>
+      </>
+    );
+
+    if (expanded) {
+      return (
+        <div className={PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS}>
+          <div className={PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS}>
+            <div className="space-y-5">{documentSections}</div>
+          </div>
+        </div>
+      );
+    }
+
+    return <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>{documentSections}</div>;
   };
 
   useEffect(() => {
@@ -9873,126 +10150,7 @@ function StepCard({
                                 </label>
                               </div>
                             ) : null} */}
-                            <div className={PROMPT_DOCUMENT_BLOCK_CLASS}>
-                              <div className={PROMPT_DOCUMENT_SECTION_CLASS}>
-                                <div className="flex items-center gap-2">
-                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
-                                    {formatPromptDocumentHeading(t("jobs.agentKey"))}
-                                  </span>
-                                  <span className="text-red-600">*</span>
-                                </div>
-                                <input
-                                  aria-label={t("jobs.agentKey")}
-                                  type="text"
-                                  value={agentForm.agent_key}
-                                  onChange={(e) =>
-                                    setAgentForm((prev) => ({
-                                      ...prev,
-                                      agent_key: e.target.value,
-                                    }))
-                                  }
-                                  className={PROMPT_DOCUMENT_INPUT_CLASS}
-                                  placeholder={t("jobs.agentKeyPlaceholder")}
-                                />
-                              </div>
-                              <div
-                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
-                              >
-                                <div className="flex items-center gap-2">
-                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
-                                    {formatPromptDocumentHeading(
-                                      t("jobs.promptEditor.promptCoreLabel")
-                                    )}
-                                  </span>
-                                  <span className="text-red-600">*</span>
-                                </div>
-                                <textarea
-                                  aria-label={t("jobs.promptEditor.promptCoreLabel")}
-                                  value={promptEditorDraft.prompt_template}
-                                  onChange={(e) => {
-                                    const value = e.target.value;
-                                    setPromptEditorDraft((prev) => ({
-                                      ...prev,
-                                      prompt_template: value,
-                                    }));
-                                    setPromptEditorRegions((prev) =>
-                                      prev.map((region) => ({
-                                        ...region,
-                                        prompt_core: value,
-                                      }))
-                                    );
-                                  }}
-                                  rows={8}
-                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                                  placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
-                                />
-                              </div>
-                              <div
-                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
-                              >
-                                <div className="flex items-center gap-2">
-                                  <span className="font-mono text-[13px] font-semibold text-gray-100">
-                                    {formatPromptDocumentHeading(
-                                      t("jobs.promptEditor.alertConditionLabel")
-                                    )}
-                                  </span>
-                                  <span className="text-red-600">*</span>
-                                </div>
-                                <textarea
-                                  aria-label={t("jobs.promptEditor.alertConditionLabel")}
-                                  value={promptEditorDraft.alert_condition}
-                                  onChange={(e) => {
-                                    const value = e.target.value;
-                                    setPromptEditorDraft((prev) => ({
-                                      ...prev,
-                                      alert_condition: value,
-                                    }));
-                                    setPromptEditorRegions((prev) =>
-                                      prev.map((region) => ({
-                                        ...region,
-                                        alert_condition: value,
-                                      }))
-                                    );
-                                  }}
-                                  rows={5}
-                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                                  placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
-                                />
-                              </div>
-                              <div
-                                className={`${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`}
-                              >
-                                <div className="font-mono text-[13px] font-semibold text-gray-100">
-                                  {formatPromptDocumentHeading(
-                                    t("jobs.promptEditor.negativeConditionLabel"),
-                                    {
-                                      optional: true,
-                                      optionalSuffix: localizedOptionalSuffix,
-                                    }
-                                  )}
-                                </div>
-                                <textarea
-                                  aria-label={`${t("jobs.promptEditor.negativeConditionLabel")}${localizedOptionalSuffix}`}
-                                  value={promptEditorDraft.negative_condition}
-                                  onChange={(e) => {
-                                    const value = e.target.value;
-                                    setPromptEditorDraft((prev) => ({
-                                      ...prev,
-                                      negative_condition: value,
-                                    }));
-                                    setPromptEditorRegions((prev) =>
-                                      prev.map((region) => ({
-                                        ...region,
-                                        negative_condition: value,
-                                      }))
-                                    );
-                                  }}
-                                  rows={4}
-                                  className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
-                                  placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
-                                />
-                              </div>
-                            </div>
+                            {renderPromptEditorDocument()}
                             <div className="space-y-2">
                               <label className="block font-mono text-[13px] font-semibold text-gray-100">
                                 {formatPromptDocumentHeading("Negative Reference Images", {
@@ -11091,6 +11249,21 @@ function StepCard({
                           </div>
                         </div>
                       )}
+                      {promptDocumentExpanded ? (
+                        <div className="fixed inset-0 z-[96] flex items-center justify-center px-4 py-6">
+                          <button
+                            type="button"
+                            className="absolute inset-0 bg-black/55 backdrop-blur-md"
+                            onClick={() => setPromptDocumentExpanded(false)}
+                            aria-label={t("jobs.promptEditor.collapseDocument", {
+                              defaultValue: "Collapse prompt document",
+                            })}
+                          />
+                          <div className="relative w-full max-w-5xl">
+                            {renderPromptEditorDocument({ expanded: true })}
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   </div>,
                   document.body

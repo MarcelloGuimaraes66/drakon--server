@@ -185,4 +185,5 @@ export type OperationalExecutionResult = {
     evidence_sources: string[];
   };
   datasets: Partial<Record<OperationalExecutionSource, Array<Record<string, unknown>>>>;
+  message_metadata?: Record<string, unknown>;
 };

@@ -81,12 +81,17 @@ export interface ReportKpiCard {
   tone: ReportTone;
 }
 
+export interface ReportChartDatum {
+  label: string;
+  value: number;
+  tone?: ReportTone;
+}
+
 export interface ReportChartBlock {
   title: string;
   caption?: string;
-  filename: string;
-  bytes: Uint8Array;
-  contentType: string;
+  items: ReportChartDatum[];
+  maxValue?: number;
 }
 
 export interface ReportTableColumn {
@@ -121,9 +126,6 @@ export interface ReportMediaLocation {
 }
 
 export interface ReportVideoCard extends ReportDocxVideoEvidence {
-  posterBytes: Uint8Array;
-  posterContentType: string;
-  posterFilename: string;
 }
 
 export interface ReportEvidenceLayout {

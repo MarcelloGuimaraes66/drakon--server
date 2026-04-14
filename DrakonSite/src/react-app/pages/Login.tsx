@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from "react-router";
 import { Loader2, Eye, EyeOff, Search, Globe } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import BrandLogo from "@/react-app/components/BrandLogo";
+import ForgotPasswordDialog from "@/react-app/components/ForgotPasswordDialog";
 import { brand } from "@/shared/brand";
 import { COUNTRIES } from "../data/countries";
 
@@ -101,6 +102,7 @@ export default function Login() {
   const [showCountryDropdown, setShowCountryDropdown] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
+  const [isForgotPasswordOpen, setIsForgotPasswordOpen] = useState(false);
   const [error, setError] = useState<string>("");
   const [showLanguageDropdown, setShowLanguageDropdown] = useState(false);
   const [layoutMetrics, setLayoutMetrics] = useState<LoginLayoutMetrics>({
@@ -405,6 +407,11 @@ export default function Login() {
     }
   };
 
+  const openForgotPasswordDialog = () => {
+    setError("");
+    setIsForgotPasswordOpen(true);
+  };
+
   if (isPending) {
     return (
       <div className="flex min-h-[100dvh] items-center justify-center bg-gray-950">
@@ -567,7 +574,11 @@ export default function Login() {
               </div>
 
               <div className="flex items-center justify-between">
-                <button type="button" className={subtleButtonClass}>
+                <button
+                  type="button"
+                  onClick={openForgotPasswordDialog}
+                  className={subtleButtonClass}
+                >
                   {t("login.forgotPassword")}
                 </button>
                 <button
@@ -849,6 +860,17 @@ export default function Login() {
           </div>
         </div>
       </div>
+      <ForgotPasswordDialog
+        isOpen={isForgotPasswordOpen}
+        initialEmail={email}
+        onClose={() => setIsForgotPasswordOpen(false)}
+        onRecoveredEmail={(nextEmail) => {
+          setActiveTab("login");
+          setEmail(nextEmail);
+          setPassword("");
+          setError("");
+        }}
+      />
     </div>
   );
 }

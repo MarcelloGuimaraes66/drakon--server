@@ -119,6 +119,15 @@ const DEFAULT_PERSISTED_STATE: PersistedOnboardingState = {
   tutorialProceedWithoutWebcam: false,
 };
 
+function normalizeOnboardingStorageUserSegment(userId?: string | null): string {
+  if (typeof userId !== "string") {
+    return "anonymous";
+  }
+
+  const normalized = userId.trim();
+  return normalized ? `user:${normalized}` : "anonymous";
+}
+
 function isValidStepId(value: unknown): value is OnboardingStepId {
   return (
     value === "welcome" ||
@@ -188,17 +197,17 @@ function normalizePersistedCameraId(value: unknown): number | null {
   return null;
 }
 
-export function getOnboardingStorageKey(): string {
-  return `${brand.id}:guided-onboarding:v${ONBOARDING_STORAGE_VERSION}`;
+export function getOnboardingStorageKey(userId?: string | null): string {
+  return `${brand.id}:guided-onboarding:${normalizeOnboardingStorageUserSegment(userId)}:v${ONBOARDING_STORAGE_VERSION}`;
 }
 
-export function readOnboardingState(): PersistedOnboardingState {
+export function readOnboardingState(userId?: string | null): PersistedOnboardingState {
   if (typeof window === "undefined") {
     return DEFAULT_PERSISTED_STATE;
   }
 
   try {
-    const raw = window.localStorage.getItem(getOnboardingStorageKey());
+    const raw = window.localStorage.getItem(getOnboardingStorageKey(userId));
     if (!raw) {
       return DEFAULT_PERSISTED_STATE;
     }
@@ -229,13 +238,16 @@ export function readOnboardingState(): PersistedOnboardingState {
   }
 }
 
-export function writeOnboardingState(state: PersistedOnboardingState): void {
+export function writeOnboardingState(
+  state: PersistedOnboardingState,
+  userId?: string | null
+): void {
   if (typeof window === "undefined") {
     return;
   }
 
   try {
-    window.localStorage.setItem(getOnboardingStorageKey(), JSON.stringify(state));
+    window.localStorage.setItem(getOnboardingStorageKey(userId), JSON.stringify(state));
   } catch {
     // Ignore storage failures. The tutorial should remain optional.
   }

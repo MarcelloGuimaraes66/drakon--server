@@ -1186,7 +1186,7 @@ export default function Layout({ children }: LayoutProps) {
                   OpenAI API Key Required
                 </h4>
                 <p className="text-sm text-gray-300 mb-3">
-                  Configure your OpenAI API key in Settings to enable AI agents, jobs, and chat inference.
+                  Configure your OpenAI API key in Settings, or paste it directly in chat, to enable AI agents, jobs, and chat inference.
                 </p>
                 <div className="flex items-center justify-end gap-2">
                   <button
@@ -1222,7 +1222,7 @@ export default function Layout({ children }: LayoutProps) {
                   Z.ai API Key Required
                 </h4>
                 <p className="text-sm text-gray-300 mb-3">
-                  Configure your Z.ai API key in Settings to enable Core model inference.
+                  Configure your Z.ai API key in Settings, or paste it directly in chat, to enable Core model inference.
                 </p>
                 <div className="flex items-center justify-end gap-2">
                   <button

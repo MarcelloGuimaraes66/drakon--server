@@ -57,6 +57,7 @@ type BuildEnabledAlgorithmsArgs = {
   cameraId: number;
   openAiApiKey?: string;
   zAiApiKey?: string;
+  directCaptureOnMotionOnly?: boolean;
   onlyEnabled?: boolean;
   algorithmDescriptions?: Record<string, string>;
   algorithmDisplayNames?: Record<string, string>;
@@ -71,7 +72,7 @@ const FIXED_CAMERA_CUSTOM_INFERENCE_MODEL: CameraCustomInferenceModel = "ultra";
 const DEFAULT_CAMERA_CUSTOM_RUN_EVERY = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraCustomRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
 const ANALYSIS_REGION_MIN_POINTS = 3;
 const ANALYSIS_REGION_MAX_POINTS = 20;
 const ANALYSIS_REGION_MAX_PER_AGENT = 6;
@@ -717,6 +718,10 @@ export async function buildEnabledAlgorithmsForCamera(
   const { db, userId, cameraId, onlyEnabled = true } = args;
   const descriptions = args.algorithmDescriptions || {};
   const displayNames = args.algorithmDisplayNames || {};
+  const directCaptureOnMotionOnly =
+    typeof args.directCaptureOnMotionOnly === "boolean"
+      ? args.directCaptureOnMotionOnly
+      : false;
 
   let openAiApiKey = trimToNull(args.openAiApiKey) || "";
   if (!openAiApiKey) {
@@ -812,6 +817,7 @@ export async function buildEnabledAlgorithmsForCamera(
         image_region: row.image_region || null,
         config_json: configJson,
         alert_channels: alertChannels,
+        only_capture_on_motion: directCaptureOnMotionOnly,
         temporal_plan_json: row.temporal_plan_json || null,
         temporal_plan_hash: row.temporal_plan_hash || null,
         temporal_plan_version: row.temporal_plan_version || null,
@@ -890,7 +896,7 @@ export async function buildEnabledAlgorithmsForCamera(
       inference_model: executionSettings.inferenceModel,
       run_every: executionSettings.runEvery,
       running_resolution: executionSettings.runningResolution,
-      only_capture_on_motion: normalizeBool(row.only_capture_on_motion, true),
+      only_capture_on_motion: directCaptureOnMotionOnly,
       model_fps: executionSettings.modelFps,
       model_name: executionSettings.modelName,
       validator_model_name: executionSettings.validatorModelName,

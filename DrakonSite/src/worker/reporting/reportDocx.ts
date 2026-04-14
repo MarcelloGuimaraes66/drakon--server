@@ -11,7 +11,12 @@ import {
   type ReportTable,
   type ReportVideoCard,
 } from "./reportBlocks";
-import { REPORT_THEME, reportContentWidthTwips, reportToneFill } from "./reportTheme";
+import {
+  REPORT_THEME,
+  reportContentWidthTwips,
+  reportToneFill,
+  reportToneInk,
+} from "./reportTheme";
 
 export type {
   ReportChartBlock,
@@ -221,9 +226,19 @@ function normalizeImageExtension(contentType: string, filename: string): string 
   if (normalizedType === "image/svg+xml") return "svg";
   if (normalizedType === "image/png") return "png";
   if (normalizedType === "image/gif") return "gif";
+  if (normalizedType === "image/webp") return "webp";
+  if (normalizedType === "image/bmp" || normalizedType === "image/x-ms-bmp") return "bmp";
   if (normalizedType === "image/jpeg" || normalizedType === "image/jpg") return "jpeg";
   const extension = filename.split(".").pop()?.trim().toLowerCase() || "";
-  if (extension === "svg" || extension === "png" || extension === "gif") return extension;
+  if (
+    extension === "svg" ||
+    extension === "png" ||
+    extension === "gif" ||
+    extension === "webp" ||
+    extension === "bmp"
+  ) {
+    return extension;
+  }
   if (extension === "jpg" || extension === "jpeg") return "jpeg";
   return "jpeg";
 }
@@ -242,6 +257,10 @@ function buildContentTypesXml(imageExtensions: readonly string[]): string {
           ? "image/png"
           : extension === "gif"
           ? "image/gif"
+          : extension === "webp"
+          ? "image/webp"
+          : extension === "bmp"
+          ? "image/bmp"
           : extension === "svg"
           ? "image/svg+xml"
           : "image/jpeg";
@@ -620,18 +639,78 @@ function renderCalloutPanelXml(title: string, body: string, findings: readonly s
   });
 }
 
-function renderChartSectionXml(chart: ReportChartBlock, relationshipId: string, docPrId: number): string[] {
+function formatChartValue(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  if (Number.isInteger(value)) return String(value);
+  const fixed = value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
+  return fixed.replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+}
+
+function renderChartSectionXml(chart: ReportChartBlock): string[] {
+  if (chart.items.length === 0) return [];
+  const segmentCount = 10;
+  const labelWidth = Math.floor(CONTENT_WIDTH_TWIPS * 0.34);
+  const barTotalWidth = Math.floor(CONTENT_WIDTH_TWIPS * 0.46);
+  const segmentWidth = Math.max(120, Math.floor(barTotalWidth / segmentCount));
+  const normalizedBarWidth = segmentWidth * segmentCount;
+  const valueWidth = CONTENT_WIDTH_TWIPS - labelWidth - normalizedBarWidth;
+  const maxValue = Math.max(chart.maxValue || 0, ...chart.items.map((item) => item.value), 1);
+
+  const rows = chart.items.map<TableCellSpec[]>((item) => {
+    const ratio = Math.max(0, Math.min(1, item.value / maxValue));
+    const filledSegments =
+      item.value > 0 ? Math.max(1, Math.round(ratio * segmentCount)) : 0;
+    const cells: TableCellSpec[] = [
+      {
+        content: paragraphXml(item.label, {
+          styleId: "TableCell",
+          spacingAfter: 0,
+        }),
+        widthTwips: labelWidth,
+        shading: REPORT_THEME.colors.surface,
+        verticalAlign: "center",
+        marginsTwips: 100,
+      },
+    ];
+
+    for (let index = 0; index < segmentCount; index += 1) {
+      cells.push({
+        content: emptyParagraphXml(),
+        widthTwips: segmentWidth,
+        shading:
+          index < filledSegments
+            ? reportToneInk(item.tone || "primary")
+            : REPORT_THEME.colors.surfaceMuted,
+        verticalAlign: "center",
+        marginsTwips: 48,
+      });
+    }
+
+    cells.push({
+      content: paragraphXml(formatChartValue(item.value), {
+        styleId: "TableCell",
+        alignment: "right",
+        spacingAfter: 0,
+      }),
+      widthTwips: valueWidth,
+      shading: REPORT_THEME.colors.surface,
+      verticalAlign: "center",
+      marginsTwips: 100,
+      noWrap: true,
+    });
+
+    return cells;
+  });
+
   return [
     paragraphXml(chart.title, { styleId: "SubsectionHeading", spacingAfter: 60 }),
-    imageXml(
-      relationshipId,
-      docPrId,
-      chart.title,
-      chart.caption || chart.title,
-      REPORT_THEME.media.chartWidthEmu,
-      REPORT_THEME.media.chartHeightEmu
-    ),
-    chart.caption ? paragraphXml(chart.caption, { styleId: "CaptionText", alignment: "center" }) : "",
+    chart.caption ? paragraphXml(chart.caption, { styleId: "CaptionText" }) : "",
+    tableXml({
+      columnWidths: [labelWidth, ...new Array(segmentCount).fill(segmentWidth), valueWidth],
+      rows,
+      outsideBorderColor: REPORT_THEME.colors.line,
+      cellMarginTwips: 40,
+    }),
   ].filter(Boolean);
 }
 
@@ -701,8 +780,8 @@ function renderImageGalleryXml(
   ];
   for (let index = 0; index < images.length; index += 2) {
     const row = images.slice(index, index + 2);
-    const cells: TableCellSpec[] = row.map((image) => {
-      const relId = relationshipIdByKey.get(`gallery:${image.filename}`);
+    const cells: TableCellSpec[] = row.map((image, offset) => {
+      const relId = relationshipIdByKey.get(`gallery:${index + offset}`);
       const imageMarkup =
         relId &&
         imageXml(
@@ -748,18 +827,36 @@ function renderImageGalleryXml(
 
 function renderVideoCardsXml(
   videos: readonly ReportVideoCard[],
-  relationshipIdByKey: Map<string, string>,
   hyperlinkIdByKey: Map<string, string>,
-  docPrIdRef: { value: number },
   isPt: boolean
 ): string[] {
   if (videos.length === 0) return [];
   const rows: string[] = [
     paragraphXml(isPt ? "Vídeos relacionados" : "Related videos", { styleId: "SectionHeading" }),
   ];
-  for (const video of videos) {
-    const posterRelId = relationshipIdByKey.get(`poster:${video.posterFilename}`);
-    const downloadRelId = hyperlinkIdByKey.get(`video:${video.filename || video.title}`);
+  for (let index = 0; index < videos.length; index += 1) {
+    const video = videos[index];
+    const downloadRelId = hyperlinkIdByKey.get(`video:${index}`);
+    const summaryValue =
+      normalizeText(video.sourceLabel) ||
+      normalizeText(video.filename) ||
+      normalizeText(video.title) ||
+      (isPt ? "Arquivo associado" : "Linked file");
+    const summary: string[] = [
+      paragraphXml(isPt ? "Arquivo associado" : "Linked file", {
+        styleId: "SmallLabel",
+        spacingAfter: 24,
+      }),
+      paragraphXml(summaryValue, { styleId: "CardValue", spacingAfter: 24 }),
+    ];
+    if (video.detectedAt) {
+      summary.push(
+        paragraphXml(
+          `${isPt ? "Registrado em" : "Captured at"}: ${video.detectedAt}`,
+          { styleId: "CaptionText", spacingAfter: 0 }
+        )
+      );
+    }
     const details: string[] = [
       paragraphXml(video.title, { styleId: "SubsectionHeading", spacingAfter: 40 }),
     ];
@@ -775,28 +872,19 @@ function renderVideoCardsXml(
     }
     rows.push(
       tableXml({
-        columnWidths: [Math.floor(CONTENT_WIDTH_TWIPS * 0.48), Math.floor(CONTENT_WIDTH_TWIPS * 0.52)],
+        columnWidths: [Math.floor(CONTENT_WIDTH_TWIPS * 0.36), Math.floor(CONTENT_WIDTH_TWIPS * 0.64)],
         rows: [
           [
             {
-              content: posterRelId
-                ? imageXml(
-                    posterRelId,
-                    docPrIdRef.value++,
-                    video.title,
-                    video.caption || video.title,
-                    REPORT_THEME.media.posterWidthEmu,
-                    REPORT_THEME.media.posterHeightEmu
-                  )
-                : emptyParagraphXml(),
-              widthTwips: Math.floor(CONTENT_WIDTH_TWIPS * 0.48),
-              shading: REPORT_THEME.colors.surfaceAlt,
+              content: summary,
+              widthTwips: Math.floor(CONTENT_WIDTH_TWIPS * 0.36),
+              shading: REPORT_THEME.colors.accentSoft,
               verticalAlign: "center",
               marginsTwips: 140,
             },
             {
               content: details,
-              widthTwips: Math.floor(CONTENT_WIDTH_TWIPS * 0.52),
+              widthTwips: Math.floor(CONTENT_WIDTH_TWIPS * 0.64),
               shading: REPORT_THEME.colors.surfaceAlt,
               verticalAlign: "center",
               marginsTwips: 140,
@@ -834,20 +922,22 @@ function renderAppendixXml(
         { key: "title", label: isPt ? "Título" : "Title", widthWeight: 2.7 },
         { key: "location", label: isPt ? "Local / link" : "Location / link", widthWeight: 4.2 },
       ],
-      rows: model.appendix.mediaLocations.slice(0, 8).map((item) => ({
+      rows: model.appendix.mediaLocations.map((item) => ({
         kind: item.kind === "video" ? (isPt ? "Vídeo" : "Video") : isPt ? "Imagem" : "Image",
         title: item.title,
         location: item.localPath || item.downloadUrl || "—",
       })),
     };
     rows.push(...renderDataTableXml(mediaTable));
-    const linkedItems = model.appendix.mediaLocations.filter((item) => item.downloadUrl).slice(0, 4);
+    const linkedItems = model.appendix.mediaLocations
+      .map((item, index) => ({ item, index }))
+      .filter((entry) => entry.item.downloadUrl);
     if (linkedItems.length > 0) {
       rows.push(paragraphXml(isPt ? "Links rápidos" : "Quick links", { styleId: "SubsectionHeading" }));
-      for (const item of linkedItems) {
-        const relId = hyperlinkIdByKey.get(`appendix:${item.kind}:${item.title}`);
+      for (const entry of linkedItems) {
+        const relId = hyperlinkIdByKey.get(`appendix:${entry.index}`);
         if (!relId) continue;
-        rows.push(hyperlinkParagraphXml(item.title, relId));
+        rows.push(hyperlinkParagraphXml(entry.item.title, relId));
       }
     }
   }
@@ -869,31 +959,15 @@ function normalizeExternalLinkTarget(downloadUrl?: string, localPath?: string): 
 }
 
 function buildMediaAssets(model: ReportDocumentModel): MediaAsset[] {
-  const chartAssets = model.charts.map((chart, index) => ({
-    key: `chart:${index}`,
-    filename: `chart-${index + 1}.${normalizeImageExtension(chart.contentType, chart.filename)}`,
-    title: chart.title,
-    altText: chart.caption || chart.title,
-    bytes: chart.bytes,
-    contentType: chart.contentType,
-  }));
   const galleryAssets = model.evidence.imageGallery.map((image, index) => ({
-    key: `gallery:${image.filename}`,
+    key: `gallery:${index}`,
     filename: `evidence-image-${index + 1}.${normalizeImageExtension(image.contentType, image.filename)}`,
     title: image.title,
     altText: image.caption || image.title,
     bytes: image.bytes,
     contentType: image.contentType,
   }));
-  const posterAssets = model.evidence.videoCards.map((video, index) => ({
-    key: `poster:${video.posterFilename}`,
-    filename: `video-poster-${index + 1}.${normalizeImageExtension(video.posterContentType, video.posterFilename)}`,
-    title: video.title,
-    altText: video.caption || video.title,
-    bytes: video.posterBytes,
-    contentType: video.posterContentType,
-  }));
-  return [...chartAssets, ...galleryAssets, ...posterAssets];
+  return [...galleryAssets];
 }
 
 export async function buildReportDocxBuffer(input: ReportDocxInput): Promise<Uint8Array> {
@@ -926,18 +1000,20 @@ export async function buildReportDocxBuffer(input: ReportDocxInput): Promise<Uin
     zip.file(`word/${target}`, asset.bytes);
   }
 
-  for (const video of model.evidence.videoCards) {
+  for (let index = 0; index < model.evidence.videoCards.length; index += 1) {
+    const video = model.evidence.videoCards[index];
     const target = normalizeExternalLinkTarget(video.downloadUrl, video.localPath);
     if (!target) continue;
     const relationshipId = `rId${nextRelationshipId++}`;
     relationships.push({ id: relationshipId, kind: "hyperlink", target });
-    hyperlinkIdByKey.set(`video:${video.filename || video.title}`, relationshipId);
+    hyperlinkIdByKey.set(`video:${index}`, relationshipId);
   }
 
-  for (const item of model.appendix.mediaLocations) {
+  for (let index = 0; index < model.appendix.mediaLocations.length; index += 1) {
+    const item = model.appendix.mediaLocations[index];
     const target = normalizeExternalLinkTarget(item.downloadUrl, item.localPath);
     if (!target) continue;
-    const key = `appendix:${item.kind}:${item.title}`;
+    const key = `appendix:${index}`;
     if (hyperlinkIdByKey.has(key)) continue;
     const relationshipId = `rId${nextRelationshipId++}`;
     relationships.push({ id: relationshipId, kind: "hyperlink", target });
@@ -995,10 +1071,8 @@ export async function buildReportDocxBuffer(input: ReportDocxInput): Promise<Uin
 
   if (model.charts.length > 0) {
     bodyParts.push(paragraphXml(isPt ? "Visualizações" : "Visualizations", { styleId: "SectionHeading" }));
-    for (let index = 0; index < model.charts.length; index++) {
-      const relId = relationshipIdByKey.get(`chart:${index}`);
-      if (!relId) continue;
-      bodyParts.push(...renderChartSectionXml(model.charts[index], relId, nextDocPrId++));
+    for (const chart of model.charts) {
+      bodyParts.push(...renderChartSectionXml(chart));
     }
   }
 
@@ -1019,8 +1093,7 @@ export async function buildReportDocxBuffer(input: ReportDocxInput): Promise<Uin
   }
 
   if (model.evidence.videoCards.length > 0) {
-    bodyParts.push(...renderVideoCardsXml(model.evidence.videoCards, relationshipIdByKey, hyperlinkIdByKey, { value: nextDocPrId }, isPt));
-    nextDocPrId += model.evidence.videoCards.length;
+    bodyParts.push(...renderVideoCardsXml(model.evidence.videoCards, hyperlinkIdByKey, isPt));
   }
 
   bodyParts.push(...renderAppendixXml(model, isPt, hyperlinkIdByKey));

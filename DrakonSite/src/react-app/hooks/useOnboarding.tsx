@@ -7,8 +7,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useAuth } from "@getmocha/users-service/react";
 import { useLocation, useNavigate } from "react-router";
 import {
+  getOnboardingStorageKey,
   getOnboardingRoute,
   type OnboardingProviderKind,
   type OnboardingStepId,
@@ -72,8 +74,14 @@ function normalizeCameraId(value: unknown): number | null {
 }
 
 export function OnboardingProvider({ children }: { children: ReactNode }) {
+  const { user, isPending: isAuthPending } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const onboardingUserId = user?.id || null;
+  const onboardingStorageKey = useMemo(
+    () => getOnboardingStorageKey(onboardingUserId),
+    [onboardingUserId]
+  );
   const [isHydrated, setIsHydrated] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [status, setStatus] = useState<OnboardingStatus>("never_started");
@@ -84,6 +92,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const [tutorialProceedWithoutWebcam, setTutorialProceedWithoutWebcam] = useState(false);
   const [providerStatus, setProviderStatus] = useState<ProviderStatusMap>(DEFAULT_PROVIDER_STATUS);
   const [inlineMessage, setInlineMessage] = useState("");
+  const [loadedStorageKey, setLoadedStorageKey] = useState<string | null>(null);
 
   const moveToStep = useCallback((stepId: OnboardingStepId) => {
     setInlineMessage("");
@@ -93,7 +102,11 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    const persisted = readOnboardingState();
+    if (isAuthPending) {
+      return;
+    }
+
+    const persisted = readOnboardingState(onboardingUserId);
     setStatus(persisted.status);
     setCurrentStepId(persisted.currentStepId);
     setSelectedProvider(persisted.selectedProvider);
@@ -102,12 +115,15 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setTutorialProceedWithoutWebcam(persisted.tutorialProceedWithoutWebcam);
     if (persisted.status === "in_progress" && persisted.currentStepId) {
       setIsOpen(true);
+    } else {
+      setIsOpen(false);
     }
+    setLoadedStorageKey(onboardingStorageKey);
     setIsHydrated(true);
-  }, []);
+  }, [isAuthPending, onboardingStorageKey, onboardingUserId]);
 
   useEffect(() => {
-    if (!isHydrated) {
+    if (!isHydrated || loadedStorageKey !== onboardingStorageKey) {
       return;
     }
 
@@ -119,10 +135,13 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       tutorialCameraId,
       tutorialAgentId,
       tutorialProceedWithoutWebcam,
-    });
+    }, onboardingUserId);
   }, [
     currentStepId,
     isHydrated,
+    loadedStorageKey,
+    onboardingStorageKey,
+    onboardingUserId,
     selectedProvider,
     status,
     tutorialAgentId,
@@ -131,15 +150,28 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   ]);
 
   useEffect(() => {
-    if (!isHydrated || isOpen || status !== "never_started" || isAuthOnlyRoute(location.pathname)) {
+    if (
+      !isHydrated ||
+      isOpen ||
+      status !== "never_started" ||
+      isAuthOnlyRoute(location.pathname) ||
+      user?.requires_secret_recovery_setup
+    ) {
       return;
     }
 
     moveToStep("welcome");
-  }, [isHydrated, isOpen, location.pathname, moveToStep, status]);
+  }, [
+    isHydrated,
+    isOpen,
+    location.pathname,
+    moveToStep,
+    status,
+    user?.requires_secret_recovery_setup,
+  ]);
 
   useEffect(() => {
-    if (!isOpen || !currentStepId) {
+    if (!isOpen || !currentStepId || user?.requires_secret_recovery_setup) {
       return;
     }
 
@@ -149,7 +181,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     }
 
     navigate(route, { replace: true });
-  }, [currentStepId, isOpen, location.pathname, navigate, tutorialCameraId]);
+  }, [currentStepId, isOpen, location.pathname, navigate, tutorialCameraId, user?.requires_secret_recovery_setup]);
 
   useEffect(() => {
     if (!isOpen || !selectedProvider || !providerStatus[selectedProvider]) {

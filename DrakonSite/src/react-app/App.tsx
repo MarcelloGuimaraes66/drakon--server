@@ -18,6 +18,7 @@ import BillingPage from "@/react-app/pages/Billing";
 import SettingsPage from "@/react-app/pages/Settings";
 import DrakonFindPage from "@/react-app/pages/DrakonFind";
 import HubPage from "@/react-app/pages/Hub";
+import SecretRecoverySetupOverlay from "@/react-app/components/SecretRecoverySetupOverlay";
 import { brand } from "@/shared/brand";
 import { Loader2 } from "lucide-react";
 
@@ -36,7 +37,12 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     return <Navigate to="/login" replace />;
   }
 
-  return <>{children}</>;
+  return (
+    <>
+      {children}
+      <SecretRecoverySetupOverlay />
+    </>
+  );
 }
 
 function AppRoutes() {

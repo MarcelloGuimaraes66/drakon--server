@@ -79,6 +79,8 @@ public:
 
     void setOwner(AgentCore* owner);
     void setDirectServiceRequested(bool requested);
+    void updateDirectCaptureOnMotion(bool onlyCaptureOnMotion);
+    bool directCaptureOnMotion() const { return directCaptureOnMotionOnly_.load(std::memory_order_relaxed); }
 
 
     void updateAlgorithms(std::vector<AlgorithmConfig> algos);
@@ -110,6 +112,7 @@ private:
     std::atomic<bool> running_{ false };
     std::atomic<bool> streamOnline_{ false };
     std::atomic<bool> directServiceRequested_{ false };
+    std::atomic<bool> directCaptureOnMotionOnly_{ false };
     std::thread        captureThread_;
     std::thread     inferenceThread_;
 
