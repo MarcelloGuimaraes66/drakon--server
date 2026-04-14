@@ -717,6 +717,73 @@ nlohmann::json fetchJobSnapshot(AgentCore& agent, const nlohmann::json& payload,
     });
 }
 
+nlohmann::json resolveMutationGrounding(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const nlohmann::json& request,
+    int timeoutMs)
+{
+    if (!request.is_object()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_mutation_grounding_request" },
+            { "plan", nlohmann::json::object() },
+        });
+    }
+
+    nlohmann::json effectiveRequest = request;
+    if (!effectiveRequest.is_object()) {
+        effectiveRequest = nlohmann::json::object();
+    }
+    if (!effectiveRequest.contains("chat_session_id") &&
+        payload.is_object() &&
+        payload.contains("chat_session_id") &&
+        payload["chat_session_id"].is_number_integer()) {
+        effectiveRequest["chat_session_id"] = payload["chat_session_id"];
+    }
+    if (!effectiveRequest.contains("context_before_message_id") &&
+        payload.is_object() &&
+        payload.contains("context_before_message_id") &&
+        payload["context_before_message_id"].is_number_integer()) {
+        effectiveRequest["context_before_message_id"] = payload["context_before_message_id"];
+    }
+
+    const std::string clientId = clientIdFromPayload(payload).empty()
+        ? agent.getClientId()
+        : clientIdFromPayload(payload);
+    const std::string url =
+        agent.getBackendBaseUrl() + "/api/agent/mutation/resolve?client_id=" + clientId;
+    const HttpResponse response = postJson(
+        url,
+        effectiveRequest.dump(),
+        agent.getExeToken(),
+        {},
+        timeoutMs);
+    if (!response.ok()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", parseErrorMessage(response) },
+            { "plan", nlohmann::json::object() },
+        });
+    }
+
+    nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        return nlohmann::json::object({
+            { "ok", false },
+            { "error", "invalid_mutation_grounding_payload" },
+            { "plan", nlohmann::json::object() },
+        });
+    }
+    if (!parsed.contains("ok")) {
+        parsed["ok"] = true;
+    }
+    if (!parsed.contains("error") || !parsed["error"].is_string()) {
+        parsed["error"] = "";
+    }
+    return parsed;
+}
+
 nlohmann::json compactAuthoringContextForPrompt(
     const nlohmann::json& authoringContext,
     std::size_t cameraLimit,

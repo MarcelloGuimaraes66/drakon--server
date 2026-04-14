@@ -180,6 +180,24 @@ json refreshResolvedJob_(AgentCore& agent, const json& payload, const json& job)
     return buildResolvedJob_(resolution["item"]);
 }
 
+json fetchMutationGrounding_(
+    AgentCore& agent,
+    const json& payload,
+    const std::string& language,
+    const std::string& action,
+    const json& draft)
+{
+    json request = {
+        { "query", payload.is_object() ? payload.value("query", std::string()) : std::string() },
+        { "reply_language", language },
+        { "operation_type", "control_job" },
+        { "runtime_action", action },
+        { "target_selector", draft.value("target_selector", json::object()) },
+        { "resolved_job", draft.value("resolved_job", json::object()) },
+    };
+    return shared::resolveMutationGrounding(agent, payload, request);
+}
+
 std::string jobName_(const json& job)
 {
     const std::string name = safeText_(job, "name");
@@ -437,76 +455,158 @@ SkillRunResult ControlJobSkill::execute(
         makeProgressUpdate(language, "control_job", "resolving_target", 2, 2, 3),
         2000);
 
-    const json inventory = shared::fetchJobInventory(agent, payload);
-    if (!inventory.value("ok", false)) {
-        result.answer = buildFailureAnswer_(language, action, safeText_(inventory, "error"));
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_inventory",
-            isPt_(language) ? "Falha ao consultar jobs" : "Failed to load jobs",
-            result.answer,
-            {},
-            false);
-        return result;
+    const json mutationGrounding = fetchMutationGrounding_(agent, payload, language, action, draft);
+    const bool hasMutationGroundingPlan =
+        mutationGrounding.is_object() &&
+        mutationGrounding.value("ok", false) &&
+        mutationGrounding.contains("plan") &&
+        mutationGrounding["plan"].is_object();
+    if (hasMutationGroundingPlan) {
+        result.metadata["mutation_grounding"] = mutationGrounding;
+        const json plan = mutationGrounding["plan"];
+        const json canonicalArguments = plan.value("canonical_arguments", json::object());
+        if (canonicalArguments.contains("target_selector") && canonicalArguments["target_selector"].is_object()) {
+            draft["target_selector"] = canonicalArguments["target_selector"];
+        }
+        const std::string groundedAction = normalizedAction_(safeText_(canonicalArguments, "runtime_action"));
+        if (!groundedAction.empty()) {
+            draft["runtime_action"] = groundedAction;
+        }
+
+        const std::string groundingStatus = safeText_(plan, "status");
+        if (groundingStatus == "missing_target") {
+            result.answer = buildNeedTargetAnswer_(language, action);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Aguardando job" : "Waiting for the job",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "ambiguous") {
+            draft["candidate_jobs"] = plan.value("candidate_targets", json::array());
+            result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_jobs"]);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target_confirmation",
+                isPt_(language) ? "Aguardando confirmacao do job" : "Waiting for job confirmation",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "not_found") {
+            result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Job nao encontrado" : "Job not found",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "resolved" &&
+            canonicalArguments.contains("resolved_job") &&
+            canonicalArguments["resolved_job"].is_object()) {
+            draft["resolved_job"] = canonicalArguments["resolved_job"];
+            draft.erase("candidate_jobs");
+        }
+    }
+    else {
+        const std::string groundingError = safeText_(mutationGrounding, "error");
+        if (!groundingError.empty()) {
+            result.metadata["mutation_grounding_error"] = groundingError;
+        }
     }
 
-    const json resolution = shared::resolveJob(
-        inventory,
-        draft.value("target_selector", json::object()),
-        draft.value("resolved_job", json::object()));
-    const std::string resolutionStatus = safeText_(resolution, "status");
-    if (resolutionStatus == "missing_target") {
-        result.answer = buildNeedTargetAnswer_(language, action);
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target",
-            isPt_(language) ? "Aguardando job" : "Waiting for the job",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+    json resolvedJob = draft.value("resolved_job", json::object());
+    if (!resolvedJob.is_object() || resolvedJob.empty()) {
+        const json inventory = shared::fetchJobInventory(agent, payload);
+        if (!inventory.value("ok", false)) {
+            result.answer = buildFailureAnswer_(language, action, safeText_(inventory, "error"));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_inventory",
+                isPt_(language) ? "Falha ao consultar jobs" : "Failed to load jobs",
+                result.answer,
+                {},
+                false);
+            return result;
+        }
 
-    if (resolutionStatus == "ambiguous") {
-        draft["candidate_jobs"] = resolution.value("candidates", json::array());
-        result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_jobs"]);
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target_confirmation",
-            isPt_(language) ? "Aguardando confirmacao do job" : "Waiting for job confirmation",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+        const json resolution = shared::resolveJob(
+            inventory,
+            draft.value("target_selector", json::object()),
+            draft.value("resolved_job", json::object()));
+        const std::string resolutionStatus = safeText_(resolution, "status");
+        if (resolutionStatus == "missing_target") {
+            result.answer = buildNeedTargetAnswer_(language, action);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Aguardando job" : "Waiting for the job",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
 
-    if (resolutionStatus != "resolved" || !resolution.contains("item") || !resolution["item"].is_object()) {
-        result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target",
-            isPt_(language) ? "Job nao encontrado" : "Job not found",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+        if (resolutionStatus == "ambiguous") {
+            draft["candidate_jobs"] = resolution.value("candidates", json::array());
+            result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_jobs"]);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target_confirmation",
+                isPt_(language) ? "Aguardando confirmacao do job" : "Waiting for job confirmation",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
 
-    const json resolvedJob = buildResolvedJob_(resolution["item"]);
-    draft["resolved_job"] = resolvedJob;
-    draft.erase("candidate_jobs");
+        if (resolutionStatus != "resolved" || !resolution.contains("item") || !resolution["item"].is_object()) {
+            result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Job nao encontrado" : "Job not found",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        resolvedJob = buildResolvedJob_(resolution["item"]);
+        draft["resolved_job"] = resolvedJob;
+        draft.erase("candidate_jobs");
+    }
 
     const std::string runtimeStatus = runtimeStatus_(resolvedJob);
     if (action == "start" && runtimeStatus == "running") {

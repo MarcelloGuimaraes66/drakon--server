@@ -56,7 +56,12 @@ export default function CameraTargetCard({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <div className={`truncate font-semibold text-gray-100 ${isCompact ? "text-[13px]" : "text-[15px]"}`}>{title}</div>
+              <div
+                className={`truncate font-semibold text-gray-100 ${isCompact ? "text-[13px]" : "text-[15px]"}`}
+                title={title}
+              >
+                {title}
+              </div>
               {badges ? (
                 <div className={`mt-1.5 flex flex-wrap items-center ${isCompact ? "gap-1.5" : "gap-2"}`}>
                   {badges}

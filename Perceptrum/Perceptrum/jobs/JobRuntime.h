@@ -120,7 +120,9 @@ private:
     // inference + alert
     std::string runAgentInferenceOnCamera_(int jobId, int stepId, int cameraId, const JobAgentDef& agent, const std::string& injectedInput,
         const std::string& alertConditionText, const std::string& startConditionText,
-        const std::string& modelTier, int timeoutSeconds, std::atomic<bool>& cancel);
+        const std::string& modelTier, const std::string& jobRunId,
+        const std::string& stepRunId, const std::string& agentRunId,
+        int timeoutSeconds, std::atomic<bool>& cancel);
     //void maybeFireAlerts_(const JobStartPayload& payload, const JobStepDef& step, int cameraId, const std::string& inferenceOutput);
 
     void maybeFireAlerts_(

@@ -318,6 +318,12 @@ nlohmann::json fetchOperationalContext_(
     if (beforeMessageId > 0) {
         request["context_before_message_id"] = beforeMessageId;
     }
+    if (payload.contains("timezone_iana") && payload["timezone_iana"].is_string()) {
+        request["timezone"] = payload["timezone_iana"].get<std::string>();
+    }
+    else if (payload.contains("timezone") && payload["timezone"].is_string()) {
+        request["timezone"] = payload["timezone"].get<std::string>();
+    }
 
     const std::string url =
         agent.getBackendBaseUrl() +
@@ -340,6 +346,128 @@ nlohmann::json fetchOperationalContext_(
     if (!parsed.is_object()) {
         if (outError != nullptr) {
             *outError = "invalid_operational_context";
+        }
+        return nlohmann::json::object();
+    }
+    return parsed;
+}
+
+bool jsonBoolAt_(const nlohmann::json& object, const char* key, bool fallback = false)
+{
+    if (!object.is_object() || key == nullptr || !object.contains(key)) {
+        return fallback;
+    }
+    const auto& value = object[key];
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_number_integer()) {
+        return value.get<int>() != 0;
+    }
+    if (value.is_string()) {
+        const std::string normalized = lowerAsciiCopy_(trimCopy_(value.get<std::string>()));
+        if (normalized == "true" || normalized == "1" || normalized == "yes") {
+            return true;
+        }
+        if (normalized == "false" || normalized == "0" || normalized == "no") {
+            return false;
+        }
+    }
+    return fallback;
+}
+
+bool selectionRouteHintBool_(
+    const SkillSelection& selection,
+    const char* key,
+    bool fallback = false)
+{
+    if (!selection.routeHints.is_object()) {
+        return fallback;
+    }
+    return jsonBoolAt_(selection.routeHints, key, fallback);
+}
+
+bool shouldUseOperationalQueryPlanner_(
+    const SkillSelection& selection,
+    const nlohmann::json& payload,
+    const std::string& query)
+{
+    if (jsonBoolAt_(payload, "disable_operational_query_planner", false)) {
+        return false;
+    }
+    if (jsonBoolAt_(payload, "enable_operational_query_planner", false)) {
+        return true;
+    }
+    if (selection.plannerMode == "operational_query") {
+        return true;
+    }
+    if (selection.intentFamily == "read_operational" &&
+        queryNeedsOperationalContext_(query)) {
+        return true;
+    }
+    return selectionRouteHintBool_(selection, "use_operational_query_planner", false);
+}
+
+nlohmann::json fetchOperationalQueryExecution_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const std::string& replyLanguage,
+    std::string* outError = nullptr)
+{
+    if (outError != nullptr) {
+        outError->clear();
+    }
+    if (!payload.is_object()) {
+        return nlohmann::json::object();
+    }
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        if (outError != nullptr) {
+            *outError = "missing_chat_session_id";
+        }
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json request = {
+        { "chat_session_id", chatSessionId },
+        { "query", payload.value("query", std::string()) },
+        { "reply_language", replyLanguage },
+        { "intent_family", "read_operational" },
+        { "preferred_skill", "read_state" },
+    };
+    const int beforeMessageId = payload.value("context_before_message_id", 0);
+    if (beforeMessageId > 0) {
+        request["context_before_message_id"] = beforeMessageId;
+    }
+    if (payload.contains("timezone_iana") && payload["timezone_iana"].is_string()) {
+        request["timezone"] = payload["timezone_iana"].get<std::string>();
+    }
+    else if (payload.contains("timezone") && payload["timezone"].is_string()) {
+        request["timezone"] = payload["timezone"].get<std::string>();
+    }
+
+    const std::string url =
+        agent.getBackendBaseUrl() +
+        "/api/agent/query/execute?client_id=" + clientIdFromPayload_(payload, agent);
+    const HttpResponse response = postJson(
+        url,
+        request.dump(),
+        agent.getExeToken(),
+        {},
+        20000);
+
+    if (!response.ok()) {
+        if (outError != nullptr) {
+            *outError = parseErrorMessage_(response);
+        }
+        return nlohmann::json::object();
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        if (outError != nullptr) {
+            *outError = "invalid_operational_query_execution";
         }
         return nlohmann::json::object();
     }
@@ -1005,15 +1133,8 @@ SkillRunResult ReadStateSkill::execute(
     const bool hasDetailedCameraInventory =
         cameraInventory.is_array() && !cameraInventory.empty();
     const bool wantsOperationalContext = queryNeedsOperationalContext_(query);
-    std::string operationalContextError;
-    nlohmann::json operationalContext = nlohmann::json::object();
-    if (wantsOperationalContext) {
-        operationalContext = fetchOperationalContext_(
-            agent,
-            payload,
-            progressLanguage,
-            &operationalContextError);
-    }
+    const bool wantsOperationalPlanner =
+        shouldUseOperationalQueryPlanner_(selection, payload, query);
 
     if (wantsLeadingZeroIpAudit && hasDetailedCameraInventory) {
         result.status = SkillExecutionStatus::Completed;
@@ -1029,6 +1150,87 @@ SkillRunResult ReadStateSkill::execute(
             payload,
             makeProgressUpdate(progressLanguage, "read_state", "finalizing", 3, 3, 3));
         return result;
+    }
+
+    std::string operationalQueryError;
+    nlohmann::json operationalQueryExecution = nlohmann::json::object();
+    if (wantsOperationalPlanner) {
+        operationalQueryExecution = fetchOperationalQueryExecution_(
+            agent,
+            payload,
+            progressLanguage,
+            &operationalQueryError);
+    }
+    const bool hasOperationalQueryExecution =
+        operationalQueryExecution.is_object() &&
+        operationalQueryExecution.value("ok", false) &&
+        operationalQueryExecution.contains("execution") &&
+        operationalQueryExecution["execution"].is_object();
+    if (hasOperationalQueryExecution) {
+        const nlohmann::json execution = operationalQueryExecution["execution"];
+        const std::string draftAnswer = jsonStringOr_(execution, "draft_answer");
+        if (!draftAnswer.empty()) {
+            result.status = SkillExecutionStatus::Completed;
+            result.answer = draftAnswer;
+            result.metadata["focus"] = focus;
+            result.metadata["planner_mode"] = "operational_query";
+            result.metadata["planner_execution"] = execution;
+            if (operationalQueryExecution.contains("plan") && operationalQueryExecution["plan"].is_object()) {
+                result.metadata["query_plan"] = operationalQueryExecution["plan"];
+            }
+            if (operationalQueryExecution.contains("semantic_plan") &&
+                operationalQueryExecution["semantic_plan"].is_object()) {
+                result.metadata["semantic_plan"] = operationalQueryExecution["semantic_plan"];
+            }
+            if (operationalQueryExecution.contains("semantic_shadow") &&
+                operationalQueryExecution["semantic_shadow"].is_object()) {
+                result.metadata["semantic_shadow"] = operationalQueryExecution["semantic_shadow"];
+            }
+            result.metadata["camera_inventory_count"] =
+                cameraInventory.is_array() ? static_cast<int>(cameraInventory.size()) : 0;
+            result.metadata["reply_language"] = selection.replyLanguage.empty()
+                ? nlohmann::json(nullptr)
+                : nlohmann::json(selection.replyLanguage);
+            postChatProgress(
+                agent,
+                payload,
+                makeProgressUpdate(progressLanguage, "read_state", "finalizing", 3, 3, 3));
+            return result;
+        }
+    }
+    else if (wantsOperationalPlanner) {
+        const std::string effectiveOperationalQueryError =
+            operationalQueryError.empty()
+                ? std::string("operational_query_unavailable")
+                : operationalQueryError;
+        result.status = SkillExecutionStatus::Completed;
+        result.answer = buildOperationalContextFailureAnswer_(
+            progressLanguage,
+            effectiveOperationalQueryError);
+        result.metadata["focus"] = focus;
+        result.metadata["planner_mode"] = "operational_query";
+        result.metadata["operational_query_failed"] = true;
+        result.metadata["operational_query_error"] = effectiveOperationalQueryError;
+        result.metadata["camera_inventory_count"] =
+            cameraInventory.is_array() ? static_cast<int>(cameraInventory.size()) : 0;
+        result.metadata["reply_language"] = selection.replyLanguage.empty()
+            ? nlohmann::json(nullptr)
+            : nlohmann::json(selection.replyLanguage);
+        postChatProgress(
+            agent,
+            payload,
+            makeProgressUpdate(progressLanguage, "read_state", "finalizing", 3, 3, 3));
+        return result;
+    }
+
+    std::string operationalContextError;
+    nlohmann::json operationalContext = nlohmann::json::object();
+    if (wantsOperationalContext) {
+        operationalContext = fetchOperationalContext_(
+            agent,
+            payload,
+            progressLanguage,
+            &operationalContextError);
     }
 
     const std::string url =
@@ -1103,6 +1305,9 @@ SkillRunResult ReadStateSkill::execute(
         result.metadata["has_operational_context"] = hasOperationalContext;
         if (!operationalContextError.empty()) {
             result.metadata["operational_context_error"] = operationalContextError;
+        }
+        if (!operationalQueryError.empty()) {
+            result.metadata["operational_query_error"] = operationalQueryError;
         }
     }
 

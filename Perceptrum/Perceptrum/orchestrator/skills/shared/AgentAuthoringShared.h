@@ -37,6 +37,11 @@ nlohmann::json fetchCameraInventory(AgentCore& agent, const nlohmann::json& payl
 nlohmann::json fetchJobInventory(AgentCore& agent, const nlohmann::json& payload);
 nlohmann::json fetchAuthoringContext(AgentCore& agent, const nlohmann::json& payload);
 nlohmann::json fetchJobSnapshot(AgentCore& agent, const nlohmann::json& payload, int jobId);
+nlohmann::json resolveMutationGrounding(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const nlohmann::json& request,
+    int timeoutMs = 12000);
 nlohmann::json compactAuthoringContextForPrompt(
     const nlohmann::json& authoringContext,
     std::size_t cameraLimit = 40,

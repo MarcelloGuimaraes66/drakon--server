@@ -239,6 +239,9 @@ public:
         nlohmann::json& visualState,
         const std::string& logStreamId = std::string(),
         const std::string& scopeTag = std::string());
+    nlohmann::json collectOperationalIdentityCards(
+        const nlohmann::json& temporalState,
+        nlohmann::json& visualState);
 
     bool isRunning() const;
 

@@ -5155,6 +5155,9 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             /*alertConditionText*/ agent->alert_condition_text,
                             /*startConditionText*/ startConditionText,
                             /*modelTier*/ modelTier,
+                            /*jobRunId*/ job->payload.job_run_id,
+                            /*stepRunId*/ step.step_run_id,
+                            /*agentRunId*/ agent->agent_run_id,
                             /*timeoutSeconds*/ 15,
                             job->cancel
                         );
@@ -6309,6 +6312,9 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     const std::string& alertConditionText,
     const std::string& startConditionText,
     const std::string& modelTier,
+    const std::string& jobRunId,
+    const std::string& stepRunId,
+    const std::string& agentRunId,
     int timeoutSeconds,
     std::atomic<bool>& cancel
 ) {
@@ -8519,6 +8525,19 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             out["image_ts_utc"] = tsUtcIso;
         }
         if (temporalPlanActive && temporalReport && owner_) {
+            const json reportIdentityCards =
+                owner_->collectOperationalIdentityCards(temporalSlot.state, temporalSlot.visualState);
+            std::string reportPrimaryIdentityCardId = hit.primaryIdentityCardId;
+            if (reportPrimaryIdentityCardId.empty() &&
+                reportIdentityCards.is_array() &&
+                !reportIdentityCards.empty() &&
+                reportIdentityCards[0].is_object() &&
+                reportIdentityCards[0].contains("card_id") &&
+                reportIdentityCards[0]["card_id"].is_string())
+            {
+                reportPrimaryIdentityCardId =
+                    trimCopyRuntime_(reportIdentityCards[0]["card_id"].get<std::string>());
+            }
             json reportDetails = {
                 { "job_id", jobId },
                 { "step_id", stepId },
@@ -8531,10 +8550,22 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 { "final_alert_condition", finalAlertAny },
                 { "temporal_decision_summary", temporalDecisionSummary }
             };
-            if (!hit.primaryIdentityCardId.empty()) {
-                reportDetails["primary_identity_card_id"] = hit.primaryIdentityCardId;
+            if (!jobRunId.empty()) {
+                reportDetails["job_run_id"] = jobRunId;
             }
-            if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+            if (!stepRunId.empty()) {
+                reportDetails["step_run_id"] = stepRunId;
+            }
+            if (!agentRunId.empty()) {
+                reportDetails["agent_run_id"] = agentRunId;
+            }
+            if (!reportPrimaryIdentityCardId.empty()) {
+                reportDetails["primary_identity_card_id"] = reportPrimaryIdentityCardId;
+            }
+            if (reportIdentityCards.is_array() && !reportIdentityCards.empty()) {
+                reportDetails["identity_cards"] = reportIdentityCards;
+            }
+            else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
                 reportDetails["identity_cards"] = hit.identityCards;
             }
             owner_->postAgentEvent(
@@ -9330,6 +9361,19 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     }
 
     if (temporalPlanActive && temporalReport && owner_) {
+        const json reportIdentityCards =
+            owner_->collectOperationalIdentityCards(temporalSlot.state, temporalSlot.visualState);
+        std::string reportPrimaryIdentityCardId = hit.primaryIdentityCardId;
+        if (reportPrimaryIdentityCardId.empty() &&
+            reportIdentityCards.is_array() &&
+            !reportIdentityCards.empty() &&
+            reportIdentityCards[0].is_object() &&
+            reportIdentityCards[0].contains("card_id") &&
+            reportIdentityCards[0]["card_id"].is_string())
+        {
+            reportPrimaryIdentityCardId =
+                trimCopyRuntime_(reportIdentityCards[0]["card_id"].get<std::string>());
+        }
         json reportDetails = {
             { "job_id", jobId },
             { "step_id", stepId },
@@ -9342,10 +9386,22 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             { "final_alert_condition", finalAlertAny },
             { "temporal_decision_summary", temporalDecisionSummary }
         };
-        if (!hit.primaryIdentityCardId.empty()) {
-            reportDetails["primary_identity_card_id"] = hit.primaryIdentityCardId;
+        if (!jobRunId.empty()) {
+            reportDetails["job_run_id"] = jobRunId;
         }
-        if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+        if (!stepRunId.empty()) {
+            reportDetails["step_run_id"] = stepRunId;
+        }
+        if (!agentRunId.empty()) {
+            reportDetails["agent_run_id"] = agentRunId;
+        }
+        if (!reportPrimaryIdentityCardId.empty()) {
+            reportDetails["primary_identity_card_id"] = reportPrimaryIdentityCardId;
+        }
+        if (reportIdentityCards.is_array() && !reportIdentityCards.empty()) {
+            reportDetails["identity_cards"] = reportIdentityCards;
+        }
+        else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
             reportDetails["identity_cards"] = hit.identityCards;
         }
         owner_->postAgentEvent(

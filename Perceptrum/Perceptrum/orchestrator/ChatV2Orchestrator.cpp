@@ -846,6 +846,58 @@ std::string normalizeSemanticToken_(std::string value)
     return value;
 }
 
+std::string defaultIntentFamilyForSelection_(const SkillSelection& selection)
+{
+    if (selection.selectedSkill == "read_state") {
+        return "read_operational";
+    }
+    if (selection.selectedSkill == "video_search") {
+        return "search_media";
+    }
+    if (selection.selectedSkill == "generate_report") {
+        return "report";
+    }
+    if (selection.selectedSkill == "create_camera" ||
+        selection.selectedSkill == "create_cameras_batch" ||
+        selection.selectedSkill == "create_camera_agent" ||
+        selection.selectedSkill == "create_job") {
+        return "create_config";
+    }
+    if (selection.selectedSkill == "edit_camera" ||
+        selection.selectedSkill == "edit_cameras_batch" ||
+        selection.selectedSkill == "edit_camera_agent" ||
+        selection.selectedSkill == "edit_job") {
+        return "edit_config";
+    }
+    if (selection.selectedSkill == "control_camera" ||
+        selection.selectedSkill == "control_job" ||
+        selection.selectedSkill == "scan_network") {
+        return "run_action";
+    }
+    return "answer";
+}
+
+std::string defaultPlannerModeForSelection_(const SkillSelection& selection)
+{
+    if (selection.selectedSkill == "read_state" ||
+        selection.selectedSkill == "generate_report") {
+        return "operational_query";
+    }
+    if (selection.selectedSkill == "create_camera" ||
+        selection.selectedSkill == "create_cameras_batch" ||
+        selection.selectedSkill == "create_camera_agent" ||
+        selection.selectedSkill == "create_job" ||
+        selection.selectedSkill == "edit_camera" ||
+        selection.selectedSkill == "edit_cameras_batch" ||
+        selection.selectedSkill == "edit_camera_agent" ||
+        selection.selectedSkill == "edit_job" ||
+        selection.selectedSkill == "control_camera" ||
+        selection.selectedSkill == "control_job") {
+        return "mutation_grounding";
+    }
+    return "none";
+}
+
 SkillSelection applyRoutingLexiconCorrections_(
     SkillSelection selection,
     const std::string& userMessage,
@@ -860,15 +912,35 @@ SkillSelection applyRoutingLexiconCorrections_(
         return selection;
     }
 
+    const bool routeHintsWantDocument =
+        selection.routeHints.is_object() &&
+        selection.routeHints.contains("wants_document") &&
+        ((selection.routeHints["wants_document"].is_boolean() &&
+          selection.routeHints["wants_document"].get<bool>()) ||
+         (selection.routeHints["wants_document"].is_number_integer() &&
+          selection.routeHints["wants_document"].get<int>() != 0) ||
+         (selection.routeHints["wants_document"].is_string() &&
+          lowerAsciiCopy_(trimCopy_(selection.routeHints["wants_document"].get<std::string>())) == "true"));
+    const bool selectionLockedToReport =
+        selection.selectedSkill == "generate_report" ||
+        selection.operationType == "generate_report" ||
+        selection.intentFamily == "report" ||
+        selection.entity == "report" ||
+        routeHintsWantDocument;
+    if (selectionLockedToReport) {
+        return selection;
+    }
+
     const RoutingLexiconSignals signals = detectRoutingLexiconSignals(userMessage);
     const std::string runtimeAction = runtimeActionFromRoutingSignals(signals);
     const bool selectionPrefersCreateJob =
         selection.selectedSkill == "create_job" ||
         selection.operationType == "create_job" ||
-        selection.intent == "create";
+        (selection.entity == "job" && selection.intent == "create");
     const bool selectionPrefersEditJob =
         selection.selectedSkill == "edit_job" ||
-        selection.operationType == "edit_job";
+        selection.operationType == "edit_job" ||
+        (selection.entity == "job" && selection.intent == "update");
 
     auto ensureArgumentsObject = [&]() -> nlohmann::json& {
         if (!selection.arguments.is_object()) {
@@ -1278,6 +1350,8 @@ SkillSelection applySemanticSelectionPlan_(
     selection.mode = normalizeSemanticToken_(selection.mode);
     selection.entity = normalizeSemanticToken_(selection.entity);
     selection.intent = normalizeSemanticToken_(selection.intent);
+    selection.intentFamily = normalizeSemanticToken_(selection.intentFamily);
+    selection.plannerMode = normalizeSemanticToken_(selection.plannerMode);
     selection.operationType = normalizeSemanticToken_(selection.operationType);
     selection.operationPhase = normalizeSemanticToken_(selection.operationPhase);
     selection = applyRoutingLexiconCorrections_(std::move(selection), userMessage, conversationContext);
@@ -1396,6 +1470,33 @@ SkillSelection applySemanticSelectionPlan_(
         else if (selection.selectedSkill == "explain_app") {
             selection.mode = "answer";
         }
+    }
+
+    if (selection.intentFamily.empty()) {
+        selection.intentFamily = defaultIntentFamilyForSelection_(selection);
+    }
+    if (selection.plannerMode.empty()) {
+        selection.plannerMode = defaultPlannerModeForSelection_(selection);
+    }
+    if (selection.routeVersion.empty()) {
+        selection.routeVersion = "v2";
+    }
+    if (!selection.routeHints.is_object()) {
+        selection.routeHints = nlohmann::json::object();
+    }
+    if (!selection.routeHints.contains("needs_entity_grounding")) {
+        const bool needsEntityGrounding =
+            selection.plannerMode == "operational_query" ||
+            selection.plannerMode == "mutation_grounding";
+        selection.routeHints["needs_entity_grounding"] = needsEntityGrounding;
+    }
+    if (!selection.routeHints.contains("needs_time_grounding")) {
+        selection.routeHints["needs_time_grounding"] =
+            selection.selectedSkill == "read_state" ||
+            selection.selectedSkill == "generate_report";
+    }
+    if (!selection.routeHints.contains("wants_document")) {
+        selection.routeHints["wants_document"] = selection.selectedSkill == "generate_report";
     }
 
     return selection;
@@ -3179,6 +3280,9 @@ void ChatV2Orchestrator::recordRoutingTelemetry_(
         { "semantic_mode", selection.mode.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.mode) },
         { "semantic_entity", selection.entity.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.entity) },
         { "semantic_intent", selection.intent.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.intent) },
+        { "intent_family", selection.intentFamily.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.intentFamily) },
+        { "planner_mode", selection.plannerMode.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.plannerMode) },
+        { "route_version", selection.routeVersion.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.routeVersion) },
         { "continue_active_task", selection.continueActiveTask },
         { "grounding_required", selection.groundingRequired },
         { "operation_type", selection.operationType.empty() ? nlohmann::json(nullptr) : nlohmann::json(selection.operationType) },
@@ -3196,6 +3300,9 @@ void ChatV2Orchestrator::recordRoutingTelemetry_(
     }
     if (!selection.arguments.is_null() && !selection.arguments.empty()) {
         metadata["arguments"] = selection.arguments;
+    }
+    if (!selection.routeHints.is_null() && !selection.routeHints.empty()) {
+        metadata["route_hints"] = selection.routeHints;
     }
 
     nlohmann::json telemetryPayload = {

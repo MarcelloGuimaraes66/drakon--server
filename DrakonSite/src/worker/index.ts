@@ -120,6 +120,16 @@ import {
   type OperationalCorrelationIds,
   upsertStructuredAgentErrorLog,
 } from "./operationalPersistence";
+import {
+  executeOperationalPlanDbFirst,
+  resolveOperationalPlanAgainstDb,
+} from "./operationalQuery/db";
+import { buildOperationalPlan } from "./operationalQuery/planner";
+import type { OperationalPlannerContext } from "./operationalQuery/schema";
+import { resolveConversationMemory, applyConversationMemoryToOperationalPlan, buildSemanticPlanMemoryPatch } from "./semantic/conversationMemory";
+import { composeSemanticPlan } from "./semantic/planComposer";
+import { buildSemanticShadow } from "./semantic/shadow";
+import type { SemanticIntentFamily, SemanticPlan } from "./semantic/schema";
 
 // AI agent descriptions mapping
 const ALGORITHM_DESCRIPTIONS: Record<string, string> = {
@@ -27624,9 +27634,70 @@ function inferReportKindFromQuery(queryInput: string): { kind: ReportKind; focus
   return { kind: "general", focus: Array.from(focus) };
 }
 
-function inferReportTimeWindow(queryInput: string, language: string) {
+function formatTimezoneLocalDateKey(parts: Omit<TimezoneLocalDateTimeParts, "hour" | "minute">): string {
+  return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(
+    parts.day
+  ).padStart(2, "0")}`;
+}
+
+function shiftIsoLocalDateByDaysInTimezone(
+  localDate: string,
+  offsetDays: number,
+  timezoneInput: string
+): string | null {
+  const dateParts = parseIsoLocalDateParts(localDate);
+  const timezone = normalizeTimezoneInput(timezoneInput) || DEFAULT_GLOBAL_TIMEZONE;
+  if (!dateParts) return null;
+  const anchor = new Date(Date.UTC(dateParts.year, dateParts.month - 1, dateParts.day + offsetDays, 12, 0, 0));
+  const shifted = getLocalDateTimePartsInTimezone(timezone, anchor);
+  if (!shifted) return null;
+  return formatTimezoneLocalDateKey(shifted);
+}
+
+function buildCalendarDayReportWindow(
+  offsetDays: number,
+  language: string,
+  timezoneInput: string
+) {
+  const timezone = normalizeTimezoneInput(timezoneInput) || DEFAULT_GLOBAL_TIMEZONE;
+  const localNow = getLocalDateTimePartsInTimezone(timezone, new Date());
+  if (!localNow) return null;
+
+  const baseLocalDate = formatTimezoneLocalDateKey(localNow);
+  const targetLocalDate = shiftIsoLocalDateByDaysInTimezone(baseLocalDate, offsetDays, timezone);
+  const nextLocalDate = shiftIsoLocalDateByDaysInTimezone(baseLocalDate, offsetDays + 1, timezone);
+  if (!targetLocalDate || !nextLocalDate) return null;
+
+  const startAt = localDateTimeInTimezoneToUtcIso(targetLocalDate, "00:00", timezone);
+  const nextStartAt = localDateTimeInTimezoneToUtcIso(nextLocalDate, "00:00", timezone);
+  if (!startAt || !nextStartAt) return null;
+
+  const startMs = Date.parse(startAt);
+  const nextStartMs = Date.parse(nextStartAt);
+  if (!Number.isFinite(startMs) || !Number.isFinite(nextStartMs)) return null;
+
+  const endMs = Math.max(startMs, nextStartMs - 1);
+  const hours = Math.max(1, Math.round((endMs - startMs + 1) / (60 * 60 * 1000)));
+  const isPt = reportLanguageIsPt(language);
+  const relativeLabel =
+    offsetDays === 0 ? (isPt ? "hoje" : "today") : offsetDays === -1 ? (isPt ? "ontem" : "yesterday") : targetLocalDate;
+
+  return {
+    hours,
+    startAt: new Date(startMs).toISOString(),
+    endAt: new Date(endMs).toISOString(),
+    startDateKey: targetLocalDate,
+    endDateKey: targetLocalDate,
+    label: isPt
+      ? `${relativeLabel} (dia-calendario ${targetLocalDate}, ${timezone})`
+      : `${relativeLabel} (calendar day ${targetLocalDate}, ${timezone})`,
+  };
+}
+
+function inferReportTimeWindow(queryInput: string, language: string, timezoneInput?: string | null) {
   const query = queryInput.trim().toLowerCase();
   let hours = 24 * 7;
+  const timezone = normalizeTimezoneInput(timezoneInput) || DEFAULT_GLOBAL_TIMEZONE;
 
   const numericMatch = query.match(/(\d{1,3})\s*(hora|horas|hour|hours|dia|dias|day|days|semana|semanas|week|weeks|mes|meses|month|months)/i);
   if (numericMatch) {
@@ -27643,9 +27714,19 @@ function inferReportTimeWindow(queryInput: string, language: string) {
         hours = value * 24 * 30;
       }
     }
-  } else if (reportQueryIncludesAny(query, ["agora", "now", "today", "hoje"])) {
+  } else if (reportQueryIncludesAny(query, ["today", "hoje"])) {
+    const calendarDayWindow = buildCalendarDayReportWindow(0, language, timezone);
+    if (calendarDayWindow) {
+      return calendarDayWindow;
+    }
+    hours = 24;
+  } else if (reportQueryIncludesAny(query, ["agora", "now"])) {
     hours = 24;
   } else if (reportQueryIncludesAny(query, ["ontem", "yesterday"])) {
+    const calendarDayWindow = buildCalendarDayReportWindow(-1, language, timezone);
+    if (calendarDayWindow) {
+      return calendarDayWindow;
+    }
     hours = 48;
   } else if (reportQueryIncludesAny(query, ["semana", "week"])) {
     hours = 24 * 7;
@@ -28054,6 +28135,144 @@ function resolveReportEntities(params: {
   };
 }
 
+type MutationEntityKind = "camera" | "job";
+
+function normalizeMutationOperationType(value: unknown): string {
+  return normalizeReportText(value, 80).toLowerCase().replace(/\s+/g, "_");
+}
+
+function mutationEntityKindFromOperationType(value: string): MutationEntityKind | null {
+  if (!value) return null;
+  if (value.includes("camera")) return "camera";
+  if (value.includes("job")) return "job";
+  return null;
+}
+
+function normalizeMutationRuntimeAction(value: unknown, queryInput = ""): string {
+  const normalized = normalizeReportText(value, 40).toLowerCase();
+  if (["start", "stop", "pause", "resume"].includes(normalized)) {
+    return normalized;
+  }
+
+  const query = normalizeReportMatchText(queryInput);
+  if (
+    reportQueryIncludesAny(query, [" start ", " ligar ", " ligue ", " iniciar ", " inicie ", " resume ", " retome "])
+  ) {
+    return "start";
+  }
+  if (
+    reportQueryIncludesAny(query, [" stop ", " parar ", " pare ", " desliga ", " desligue ", " pause ", " pausar "])
+  ) {
+    return "stop";
+  }
+  return "";
+}
+
+function normalizeMutationTargetSelector(value: unknown): Record<string, unknown> {
+  const source =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const normalized: Record<string, unknown> = {};
+
+  const numericId = Number(source.id || 0);
+  if (Number.isInteger(numericId) && numericId > 0) {
+    normalized.id = numericId;
+  }
+
+  for (const key of [
+    "name",
+    "description",
+    "scene_label",
+    "scene_description",
+    "ip_address",
+    "manufacturer",
+    "connection_method",
+    "channel",
+    "subtype",
+  ]) {
+    const text = normalizeReportText(source[key], 160);
+    if (text) normalized[key] = text;
+  }
+
+  return normalized;
+}
+
+function mutationSelectorHasData(selector: Record<string, unknown>): boolean {
+  return Object.keys(selector).length > 0;
+}
+
+function buildMutationResolveQuery(params: {
+  entityKind: MutationEntityKind;
+  query: string;
+  selector: Record<string, unknown>;
+  activeResolved: Record<string, unknown>;
+}): string {
+  const parts: string[] = [];
+  const alias = params.entityKind === "camera" ? "camera" : "job";
+
+  const push = (value: unknown) => {
+    const text = normalizeReportText(value, 180);
+    if (text) parts.push(text);
+  };
+
+  const selectorId = Number(params.selector.id || 0);
+  if (Number.isInteger(selectorId) && selectorId > 0) {
+    parts.push(`${alias} id ${selectorId}`);
+  }
+  const activeId = Number(params.activeResolved.id || 0);
+  if (!mutationSelectorHasData(params.selector) && Number.isInteger(activeId) && activeId > 0) {
+    parts.push(`${alias} id ${activeId}`);
+  }
+
+  for (const key of [
+    "name",
+    "description",
+    "scene_label",
+    "scene_description",
+    "ip_address",
+    "manufacturer",
+    "connection_method",
+    "channel",
+    "subtype",
+  ]) {
+    push(params.selector[key]);
+  }
+
+  push(params.query);
+  return parts.join(" ").trim();
+}
+
+function mutationResolvedTargetFromCameraRow(row: Record<string, unknown>): Record<string, unknown> {
+  const scene = splitAgentSceneParts(row.description);
+  return {
+    id: Number(row.id || 0),
+    name: normalizeReportText(row.name, 160),
+    description: normalizeReportText(row.description, 240),
+    scene_label: scene.scene_label,
+    scene_description: scene.scene_description,
+    ip_address: normalizeReportText(row.ip_address, 80),
+    manufacturer: normalizeReportText(row.manufacturer, 80),
+    connection_method: normalizeReportText(row.connection_method, 40),
+    channel: normalizeReportText(row.channel, 40),
+    subtype: normalizeReportText(row.subtype, 40),
+    is_service_running: Number(row.is_service_running ?? 0) === 1,
+  };
+}
+
+function mutationResolvedTargetFromJobRow(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: Number(row.id || 0),
+    name: normalizeReportText(row.name, 160),
+    description: normalizeReportText(row.description, 240),
+    status: normalizeReportText(row.status, 40),
+    schedule_mode: normalizeReportText(row.schedule_mode, 80),
+    timezone: normalizeReportText(row.timezone, 80),
+    runtime_status: normalizeReportText(row.runtime_status, 40).toLowerCase(),
+    is_active: Number(row.is_active ?? 0) === 1,
+  };
+}
+
 function buildReportNumericInClause(
   column: string,
   values: readonly number[]
@@ -28066,6 +28285,26 @@ function buildReportNumericInClause(
   }
   return {
     clause: ` AND ${column} IN (${normalizedValues.map(() => "?").join(", ")})`,
+    params: [...normalizedValues],
+  };
+}
+
+function buildReportAgentErrorLogCameraFilter(
+  values: readonly number[]
+): { clause: string; params: number[] } {
+  const normalizedValues = Array.from(
+    new Set(values.filter((entry) => Number.isInteger(entry) && entry > 0))
+  );
+  if (normalizedValues.length === 0) {
+    return { clause: "", params: [] };
+  }
+  const placeholders = normalizedValues.map(() => "?").join(", ");
+  return {
+    clause:
+      ` AND COALESCE(` +
+      `CAST(json_extract(context_json, '$.camera_id') AS INTEGER), ` +
+      `CAST(json_extract(context_json, '$.cameraId') AS INTEGER)` +
+      `) IN (${placeholders})`,
     params: [...normalizedValues],
   };
 }
@@ -30609,11 +30848,15 @@ async function buildReportContext(params: {
   beforeMessageId: number;
   query: string;
   replyLanguage: string;
+  timezoneInput?: string | null;
 }): Promise<ReportBuildContext> {
   const requestedQuery = normalizeReportText(params.query, 1800);
   const replyLanguage = normalizeSupportedChatLanguage(params.replyLanguage, "en");
   const kindInfo = inferReportKindFromQuery(requestedQuery);
-  const timeWindow = inferReportTimeWindow(requestedQuery, replyLanguage);
+  const resolvedTimezone =
+    normalizeTimezoneInput(params.timezoneInput) ||
+    (await resolveUserGlobalTimezone(params.db, params.userId));
+  const timeWindow = inferReportTimeWindow(requestedQuery, replyLanguage, resolvedTimezone);
   const reportId = crypto.randomUUID();
   const generatedAt = new Date().toISOString();
   const isPt = reportLanguageIsPt(replyLanguage);
@@ -30833,10 +31076,7 @@ async function buildReportContext(params: {
   const structuredJobFilter = buildReportNumericInClause("job_id", resolvedJobIds);
   const structuredStepFilter = buildReportNumericInClause("step_id", resolvedStepIds);
   const structuredStepAgentFilter = buildReportNumericInClause("step_agent_id", resolvedStepAgentIds);
-  const structuredErrorCameraFilter = buildReportNumericInClause(
-    "camera_id",
-    resolvedCameraIds
-  );
+  const structuredErrorCameraFilter = buildReportAgentErrorLogCameraFilter(resolvedCameraIds);
   const structuredDetailLimit = hasSpecificEntityFocus ? 2000 : 600;
 
   const [
@@ -33667,6 +33907,260 @@ async function buildReportContext(params: {
   };
 }
 
+function toOperationalPlannerContext(context: ReportBuildContext): OperationalPlannerContext {
+  return {
+    report_id: context.report_id,
+    requested_query: context.requested_query,
+    reply_language: context.reply_language,
+    scope: {
+      start_at: context.scope.start_at,
+      end_at: context.scope.end_at,
+      time_window_hours: context.scope.time_window_hours,
+      label: context.scope.label,
+      focus: Array.isArray(context.scope.focus) ? context.scope.focus : [],
+    },
+    stats: context.stats,
+    current_state: context.current_state,
+    history: context.history,
+    comparisons: context.comparisons,
+    chat_discussion: context.chat_discussion,
+    resolved_entities: context.resolved_entities,
+    details: context.details,
+  };
+}
+
+function normalizeSemanticIntentFamilyHint(value: unknown): SemanticIntentFamily | null {
+  const normalized = normalizeReportText(value, 80).toLowerCase();
+  if (
+    normalized === "read_operational" ||
+    normalized === "report" ||
+    normalized === "create_config" ||
+    normalized === "edit_config" ||
+    normalized === "run_action" ||
+    normalized === "search_media" ||
+    normalized === "answer"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function semanticIntentFamilyFromPreferredSkill(value: unknown): SemanticIntentFamily | null {
+  const skill = normalizeReportText(value, 80).toLowerCase();
+  if (skill === "read_state") return "read_operational";
+  if (skill === "generate_report") return "report";
+  if (skill === "control_camera" || skill === "control_job" || skill === "scan_network") {
+    return "run_action";
+  }
+  if (
+    skill === "create_camera" ||
+    skill === "create_cameras_batch" ||
+    skill === "create_job" ||
+    skill === "create_camera_agent"
+  ) {
+    return "create_config";
+  }
+  if (
+    skill === "edit_camera" ||
+    skill === "edit_cameras_batch" ||
+    skill === "edit_job" ||
+    skill === "edit_camera_agent"
+  ) {
+    return "edit_config";
+  }
+  if (skill === "video_search") return "search_media";
+  if (skill === "explain_app") return "answer";
+  return null;
+}
+
+function semanticIntentFamilyFromMutationOperation(operationType: string): SemanticIntentFamily {
+  if (operationType === "control_camera" || operationType === "control_job") {
+    return "run_action";
+  }
+  if (
+    operationType === "create_camera" ||
+    operationType === "create_cameras_batch" ||
+    operationType === "create_job" ||
+    operationType === "create_camera_agent"
+  ) {
+    return "create_config";
+  }
+  if (
+    operationType === "edit_camera" ||
+    operationType === "edit_cameras_batch" ||
+    operationType === "edit_job" ||
+    operationType === "edit_camera_agent"
+  ) {
+    return "edit_config";
+  }
+  return "answer";
+}
+
+function buildEmptyOperationalPlannerContext(params: {
+  query: string;
+  replyLanguage: string;
+  chatDiscussion?: Record<string, unknown> | null;
+}): OperationalPlannerContext {
+  return {
+    requested_query: params.query,
+    reply_language: params.replyLanguage,
+    scope: {
+      start_at: "",
+      end_at: "",
+      time_window_hours: 0,
+      label: "current conversation context",
+      focus: [],
+    },
+    chat_discussion: params.chatDiscussion || {},
+    stats: {},
+    current_state: {},
+    history: {},
+    comparisons: {},
+    resolved_entities: {},
+    details: {},
+  };
+}
+
+async function loadSemanticConversationContext(params: {
+  db: D1Database;
+  userId: string;
+  chatSessionId: number;
+  beforeMessageId: number;
+  query: string;
+  replyLanguage: string;
+}): Promise<OperationalPlannerContext> {
+  if (!Number.isInteger(params.chatSessionId) || params.chatSessionId <= 0) {
+    return buildEmptyOperationalPlannerContext({
+      query: params.query,
+      replyLanguage: params.replyLanguage,
+      chatDiscussion: null,
+    });
+  }
+  const snapshot = await loadChatContextSnapshotForReport(
+    params.db,
+    params.userId,
+    params.chatSessionId,
+    params.beforeMessageId
+  );
+  return buildEmptyOperationalPlannerContext({
+    query: params.query,
+    replyLanguage: params.replyLanguage,
+    chatDiscussion: snapshot,
+  });
+}
+
+async function safePersistSemanticPlanMemory(params: {
+  db: D1Database;
+  userId: string;
+  chatSessionId: number;
+  plan: SemanticPlan;
+}) {
+  if (!Number.isInteger(params.chatSessionId) || params.chatSessionId <= 0) {
+    return;
+  }
+  try {
+    await persistChatSessionEntitiesMemory(
+      params.db,
+      params.userId,
+      params.chatSessionId,
+      buildSemanticPlanMemoryPatch(params.plan)
+    );
+  } catch {
+    // Semantic memory should never block the main response path.
+  }
+}
+
+async function buildOperationalSemanticBundle(params: {
+  db: D1Database;
+  userId: string;
+  context: ReportBuildContext;
+  query: string;
+  replyLanguage: string;
+  timezone: string;
+  intentFamily: SemanticIntentFamily;
+  preferredSkill?: string;
+}): Promise<{
+  plannerContext: OperationalPlannerContext;
+  resolvedPlan: import("./operationalQuery/schema").ResolvedOperationalPlan;
+  semanticPlan: SemanticPlan;
+  semanticShadow: Record<string, unknown>;
+}> {
+  const plannerContext = toOperationalPlannerContext(params.context);
+  const conversationMemory = resolveConversationMemory(plannerContext, params.query);
+  const basePlan = buildOperationalPlan({
+    query: params.query,
+    replyLanguage: params.replyLanguage,
+    timezone: params.timezone,
+    context: plannerContext,
+  });
+  const memoryAwarePlan = applyConversationMemoryToOperationalPlan({
+    plan: basePlan,
+    memory: conversationMemory,
+    query: params.query,
+  });
+  const resolvedPlan = await resolveOperationalPlanAgainstDb({
+    db: params.db,
+    userId: params.userId,
+    plan: memoryAwarePlan,
+    context: plannerContext,
+  });
+  const semanticPlan = composeSemanticPlan({
+    query: params.query,
+    replyLanguage: params.replyLanguage,
+    intentFamily: params.intentFamily,
+    preferredSkill: params.preferredSkill,
+    operationalPlan: resolvedPlan,
+    conversationMemory,
+  });
+  const semanticShadow = buildSemanticShadow({
+    intentFamily: params.intentFamily,
+    preferredSkill: params.preferredSkill,
+    plan: semanticPlan,
+    source: "query_plan",
+  });
+  return {
+    plannerContext,
+    resolvedPlan,
+    semanticPlan,
+    semanticShadow,
+  };
+}
+
+async function buildMutationSemanticPlan(params: {
+  db: D1Database;
+  userId: string;
+  chatSessionId: number;
+  beforeMessageId: number;
+  query: string;
+  replyLanguage: string;
+  operationType: string;
+  runtimeAction: string | null;
+  legacyPlan: Record<string, unknown>;
+  intentFamilyHint?: SemanticIntentFamily | null;
+  preferredSkill?: string;
+}): Promise<SemanticPlan> {
+  const conversationContext = await loadSemanticConversationContext({
+    db: params.db,
+    userId: params.userId,
+    chatSessionId: params.chatSessionId,
+    beforeMessageId: params.beforeMessageId,
+    query: params.query,
+    replyLanguage: params.replyLanguage,
+  });
+  const memory = resolveConversationMemory(conversationContext, params.query);
+  return composeSemanticPlan({
+    query: params.query,
+    replyLanguage: params.replyLanguage,
+    intentFamily:
+      params.intentFamilyHint || semanticIntentFamilyFromMutationOperation(params.operationType),
+    preferredSkill: params.preferredSkill,
+    mutationPlan: params.legacyPlan,
+    operationType: params.operationType,
+    runtimeAction: params.runtimeAction,
+    conversationMemory: memory,
+  });
+}
+
 const buildFaceTargetStorageKey = (userId: string, targetId: number, mimeType: string): string => {
   const extMap: Record<string, string> = {
     "image/jpeg": "jpg",
@@ -34378,12 +34872,8 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
   eventDbId?: number | null;
   cameraId?: number | null;
 }): IdentityCardOccurrenceDraft[] {
-  const rawIdentityCards = Array.isArray(input.rawIdentityCards) ? input.rawIdentityCards : [];
-  if (rawIdentityCards.length === 0) {
-    return [];
-  }
-
   const details = input.details || {};
+  const rawIdentityCards = Array.isArray(input.rawIdentityCards) ? [...input.rawIdentityCards] : [];
   const fallbackCameraIdRaw =
     input.cameraId ??
     details.camera_id ??
@@ -34408,7 +34898,54 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
           ? `event:${Number(input.eventDbId)}`
           : "")
     ).slice(0, 160) || null;
+  const fallbackIdentityCardId = normalizeText(
+    details.primary_identity_card_id ??
+      details.primaryIdentityCardId ??
+      details.identity_card_id ??
+      details.identityCardId ??
+      input.correlationIds.identityCardId
+  ).slice(0, 160);
+  if (rawIdentityCards.length === 0 && fallbackIdentityCardId) {
+    const fallbackEntityId = fallbackIdentityCardId.startsWith("identity_card:")
+      ? fallbackIdentityCardId.slice("identity_card:".length)
+      : "";
+    const fallbackEntityType =
+      normalizeText(details.entity_type ?? details.entityType).slice(0, 64) ||
+      normalizeText(fallbackEntityId).replace(/[_-]?\d.*$/, "").slice(0, 64);
+    const fallbackDisplayName =
+      normalizeText(
+        details.display_name ??
+          details.displayName ??
+          details.known_name ??
+          details.knownName ??
+          fallbackEntityId
+      ).slice(0, 160) || fallbackEntityId;
+    const fallbackCard: Record<string, unknown> = {
+      card_id: fallbackIdentityCardId,
+    };
+    if (fallbackEntityId) fallbackCard.entity_id = fallbackEntityId;
+    if (fallbackEntityType) fallbackCard.entity_type = fallbackEntityType;
+    if (fallbackDisplayName) fallbackCard.display_name = fallbackDisplayName;
+    if (details.primary_portrait && typeof details.primary_portrait === "object") {
+      fallbackCard.primary_portrait = details.primary_portrait;
+    }
+    if (details.context_portrait && typeof details.context_portrait === "object") {
+      fallbackCard.context_portrait = details.context_portrait;
+    }
+    if (typeof details.portrait_url === "string" && details.portrait_url.trim()) {
+      fallbackCard.portrait_url = details.portrait_url;
+    }
+    if (typeof details.portrait_data_url === "string" && details.portrait_data_url.trim()) {
+      fallbackCard.portrait_data_url = details.portrait_data_url;
+    }
+    rawIdentityCards.push(fallbackCard);
+  }
 
+  if (rawIdentityCards.length === 0) {
+    return [];
+  }
+
+  const seenIdentityCardIds = new Set<string>();
   return rawIdentityCards
     .map((rawCard): IdentityCardOccurrenceDraft | null => {
       const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
@@ -34425,6 +34962,15 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
           details.primaryIdentityCardId ??
           input.correlationIds.identityCardId
       ).slice(0, 160);
+      const dedupeKey =
+        explicitIdentityCardId ||
+        normalizeText(snapshot.card_id ?? snapshot.entity_id).slice(0, 160);
+      if (dedupeKey && seenIdentityCardIds.has(dedupeKey)) {
+        return null;
+      }
+      if (dedupeKey) {
+        seenIdentityCardIds.add(dedupeKey);
+      }
       return {
         chatSessionId: null,
         identityCardId: explicitIdentityCardId || null,
@@ -42462,6 +43008,9 @@ app.post("/api/agent/reports/build-context", async (c) => {
     context_before_message_id?: number;
     query?: string;
     reply_language?: string;
+    timezone?: string;
+    intent_family?: string;
+    preferred_skill?: string;
   }>();
 
   const chatSessionId = Number(body?.chat_session_id || 0);
@@ -42486,9 +43035,557 @@ app.post("/api/agent/reports/build-context", async (c) => {
     beforeMessageId: Number(body?.context_before_message_id || 0),
     query: typeof body?.query === "string" ? body.query : "",
     replyLanguage: typeof body?.reply_language === "string" ? body.reply_language : "en",
+    timezoneInput:
+      normalizeTimezoneInput(body?.timezone) ||
+      normalizeTimezoneInput((pairing as any)?.timezone_iana),
   });
 
   return c.json(context);
+});
+
+app.post("/api/agent/query/plan", async (c) => {
+  await ensureSchema(c.env.DB);
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    chat_session_id?: number;
+    context_before_message_id?: number;
+    query?: string;
+    reply_language?: string;
+    timezone?: string;
+    intent_family?: string;
+    preferred_skill?: string;
+  }>();
+
+  const chatSessionId = Number(body?.chat_session_id || 0);
+  if (!Number.isInteger(chatSessionId) || chatSessionId <= 0) {
+    return c.json({ error: "chat_session_id is required" }, 400);
+  }
+
+  const session = await c.env.DB
+    .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(chatSessionId, pairing.userId)
+    .first();
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  const query = typeof body?.query === "string" ? body.query : "";
+  const replyLanguage = typeof body?.reply_language === "string" ? body.reply_language : "en";
+  const timezone =
+    normalizeTimezoneInput(body?.timezone) ||
+    normalizeTimezoneInput((pairing as any)?.timezone_iana) ||
+    "UTC";
+  const context = await buildReportContext({
+    db: c.env.DB,
+    userId: pairing.userId,
+    clientId: pairing.clientId,
+    exeId: pairing.exeId,
+    chatSessionId,
+    beforeMessageId: Number(body?.context_before_message_id || 0),
+    query,
+    replyLanguage,
+    timezoneInput: timezone,
+  });
+  const intentFamily =
+    normalizeSemanticIntentFamilyHint(body?.intent_family) ||
+    semanticIntentFamilyFromPreferredSkill(body?.preferred_skill) ||
+    "read_operational";
+  const { resolvedPlan, semanticPlan, semanticShadow } = await buildOperationalSemanticBundle({
+    db: c.env.DB,
+    userId: pairing.userId,
+    context,
+    query,
+    replyLanguage,
+    timezone,
+    intentFamily,
+    preferredSkill: normalizeReportText(body?.preferred_skill, 80) || undefined,
+  });
+  await safePersistSemanticPlanMemory({
+    db: c.env.DB,
+    userId: pairing.userId,
+    chatSessionId,
+    plan: semanticPlan,
+  });
+
+  return c.json({
+    ok: true,
+    plan: resolvedPlan,
+    semantic_plan: semanticPlan,
+    semantic_shadow: semanticShadow,
+    context_report_id: context.report_id,
+  });
+});
+
+app.post("/api/agent/query/execute", async (c) => {
+  await ensureSchema(c.env.DB);
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    chat_session_id?: number;
+    context_before_message_id?: number;
+    query?: string;
+    reply_language?: string;
+    timezone?: string;
+    intent_family?: string;
+    preferred_skill?: string;
+  }>();
+
+  const chatSessionId = Number(body?.chat_session_id || 0);
+  if (!Number.isInteger(chatSessionId) || chatSessionId <= 0) {
+    return c.json({ error: "chat_session_id is required" }, 400);
+  }
+
+  const session = await c.env.DB
+    .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+    .bind(chatSessionId, pairing.userId)
+    .first();
+  if (!session) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+
+  const query = typeof body?.query === "string" ? body.query : "";
+  const replyLanguage = typeof body?.reply_language === "string" ? body.reply_language : "en";
+  const timezone =
+    normalizeTimezoneInput(body?.timezone) ||
+    normalizeTimezoneInput((pairing as any)?.timezone_iana) ||
+    "UTC";
+  const context = await buildReportContext({
+    db: c.env.DB,
+    userId: pairing.userId,
+    clientId: pairing.clientId,
+    exeId: pairing.exeId,
+    chatSessionId,
+    beforeMessageId: Number(body?.context_before_message_id || 0),
+    query,
+    replyLanguage,
+    timezoneInput: timezone,
+  });
+  const intentFamily =
+    normalizeSemanticIntentFamilyHint(body?.intent_family) ||
+    semanticIntentFamilyFromPreferredSkill(body?.preferred_skill) ||
+    "read_operational";
+  const { plannerContext, resolvedPlan, semanticPlan } = await buildOperationalSemanticBundle({
+    db: c.env.DB,
+    userId: pairing.userId,
+    context,
+    query,
+    replyLanguage,
+    timezone,
+    intentFamily,
+    preferredSkill: normalizeReportText(body?.preferred_skill, 80) || undefined,
+  });
+  const semanticShadow = buildSemanticShadow({
+    intentFamily,
+    preferredSkill: normalizeReportText(body?.preferred_skill, 80) || undefined,
+    plan: semanticPlan,
+    source: "query_execute",
+  });
+  const execution = await executeOperationalPlanDbFirst({
+    db: c.env.DB,
+    userId: pairing.userId,
+    plan: resolvedPlan,
+    context: plannerContext,
+  });
+  await safePersistSemanticPlanMemory({
+    db: c.env.DB,
+    userId: pairing.userId,
+    chatSessionId,
+    plan: semanticPlan,
+  });
+
+  return c.json({
+    ok: true,
+    plan: resolvedPlan,
+    semantic_plan: semanticPlan,
+    semantic_shadow: semanticShadow,
+    execution,
+    context,
+    context_report_id: context.report_id,
+  });
+});
+
+app.post("/api/agent/mutation/resolve", async (c) => {
+  await ensureSchema(c.env.DB);
+  const url = new URL(c.req.url);
+  const clientId = url.searchParams.get("client_id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    chat_session_id?: number;
+    context_before_message_id?: number;
+    query?: string;
+    reply_language?: string;
+    intent_family?: string;
+    preferred_skill?: string;
+    operation_type?: string;
+    runtime_action?: string;
+    target_selector?: unknown;
+    target_scope?: unknown;
+    draft_patch?: unknown;
+    resolved_camera?: unknown;
+    resolved_job?: unknown;
+  }>();
+
+  const operationType = normalizeMutationOperationType(body?.operation_type);
+  const entityKind = mutationEntityKindFromOperationType(operationType);
+  if (!entityKind) {
+    return c.json({ error: "unsupported_operation_type" }, 400);
+  }
+
+  const chatSessionId = Number(body?.chat_session_id || 0);
+  const beforeMessageId = Number(body?.context_before_message_id || 0);
+  if (chatSessionId > 0) {
+    const session = await c.env.DB
+      .prepare("SELECT id FROM chat_sessions WHERE id = ? AND user_id = ? LIMIT 1")
+      .bind(chatSessionId, pairing.userId)
+      .first();
+    if (!session) {
+      return c.json({ error: "Session not found" }, 404);
+    }
+  }
+
+  const query = normalizeReportText(body?.query, 1800);
+  const replyLanguage = normalizeSupportedChatLanguage(
+    typeof body?.reply_language === "string" ? body.reply_language : "en",
+    "en"
+  );
+  const mutationConversationContext = await loadSemanticConversationContext({
+    db: c.env.DB,
+    userId: pairing.userId,
+    chatSessionId,
+    beforeMessageId,
+    query,
+    replyLanguage,
+  });
+  const mutationConversationMemory = resolveConversationMemory(mutationConversationContext, query);
+  const runtimeAction = normalizeMutationRuntimeAction(body?.runtime_action, query);
+  let targetSelector = normalizeMutationTargetSelector(body?.target_selector);
+  let activeResolvedTarget =
+    entityKind === "camera"
+      ? normalizeMutationTargetSelector(body?.resolved_camera)
+      : normalizeMutationTargetSelector(body?.resolved_job);
+  if (
+    !mutationSelectorHasData(targetSelector) &&
+    Object.keys(activeResolvedTarget).length === 0 &&
+    mutationConversationMemory.carry_forward_requested
+  ) {
+    const lastSemanticPlan =
+      mutationConversationMemory.last_semantic_plan &&
+      typeof mutationConversationMemory.last_semantic_plan === "object"
+        ? (mutationConversationMemory.last_semantic_plan as Record<string, unknown>)
+        : {};
+    const resolvedTarget =
+      lastSemanticPlan.resolved_target &&
+      typeof lastSemanticPlan.resolved_target === "object" &&
+      !Array.isArray(lastSemanticPlan.resolved_target)
+        ? normalizeMutationTargetSelector(lastSemanticPlan.resolved_target)
+        : {};
+    if (Object.keys(resolvedTarget).length > 0) {
+      activeResolvedTarget = resolvedTarget;
+      if (Object.keys(targetSelector).length === 0) {
+        targetSelector = resolvedTarget;
+      }
+    }
+  }
+  const resolveQuery = buildMutationResolveQuery({
+    entityKind,
+    query,
+    selector: targetSelector,
+    activeResolved: activeResolvedTarget,
+  });
+
+  const planBase = {
+    operation_type: operationType,
+    scope_mode: "single",
+    entity_kind: entityKind,
+    status: "missing_target",
+    confidence: 0.0,
+    resolved_targets: [] as Array<Record<string, unknown>>,
+    candidate_targets: [] as Array<Record<string, unknown>>,
+    canonical_arguments: {
+      runtime_action: runtimeAction || null,
+      target_selector: targetSelector,
+      target_scope:
+        body?.target_scope && typeof body.target_scope === "object" && !Array.isArray(body.target_scope)
+          ? (body.target_scope as Record<string, unknown>)
+          : {},
+      draft_patch:
+        body?.draft_patch && typeof body.draft_patch === "object" && !Array.isArray(body.draft_patch)
+          ? (body.draft_patch as Record<string, unknown>)
+          : {},
+    } as Record<string, unknown>,
+  };
+
+  const respondMutation = async (params: {
+    requiresClarification: boolean;
+    clarificationOptions: string[];
+    plan: Record<string, unknown>;
+  }) => {
+    const resolvedIntentFamily =
+      normalizeSemanticIntentFamilyHint(body?.intent_family) ||
+      semanticIntentFamilyFromPreferredSkill(body?.preferred_skill) ||
+      semanticIntentFamilyFromMutationOperation(operationType);
+    const resolvedPreferredSkill = normalizeReportText(body?.preferred_skill, 80) || undefined;
+    const semanticPlan = await buildMutationSemanticPlan({
+      db: c.env.DB,
+      userId: pairing.userId,
+      chatSessionId,
+      beforeMessageId,
+      query,
+      replyLanguage,
+      operationType,
+      runtimeAction: runtimeAction || null,
+      legacyPlan: params.plan,
+      intentFamilyHint: resolvedIntentFamily,
+      preferredSkill: resolvedPreferredSkill,
+    });
+    const semanticShadow = buildSemanticShadow({
+      intentFamily: resolvedIntentFamily,
+      preferredSkill: resolvedPreferredSkill,
+      plan: semanticPlan,
+      source: "mutation_resolve",
+    });
+    await safePersistSemanticPlanMemory({
+      db: c.env.DB,
+      userId: pairing.userId,
+      chatSessionId,
+      plan: semanticPlan,
+    });
+    return c.json({
+      ok: true,
+      requires_clarification: params.requiresClarification,
+      clarification_options: params.clarificationOptions,
+      plan: params.plan,
+      semantic_plan: semanticPlan,
+      semantic_shadow: semanticShadow,
+      reply_language: replyLanguage,
+    });
+  };
+
+  if (!mutationSelectorHasData(targetSelector) && Object.keys(activeResolvedTarget).length === 0) {
+    return respondMutation({
+      requiresClarification: true,
+      clarificationOptions: ["target_selector"],
+      plan: planBase,
+    });
+  }
+
+  if (entityKind === "camera") {
+    const { results } = await c.env.DB
+      .prepare(
+        `SELECT id, name, description, ip_address, manufacturer, connection_method, channel, subtype, is_service_running
+         FROM cameras
+         WHERE user_id = ?
+         ORDER BY created_at ASC`
+      )
+      .bind(pairing.userId)
+      .all();
+
+    const cameraRows = Array.isArray(results)
+      ? results.map((row) => (row as Record<string, unknown>))
+      : [];
+    const resolvedMatches = resolveReportEntityMatches(
+      resolveQuery,
+      cameraRows.map((row) => {
+        const scene = splitAgentSceneParts(row.description);
+        return {
+          entity_type: "camera" as const,
+          id: Number(row.id || 0),
+          name: normalizeReportText(row.name, 160),
+          label: normalizeReportText(row.name, 160) || `Camera ${Number(row.id || 0)}`,
+          aliases: ["camera", "cameras", "cam", "rtsp", "camera id", "camera #", "camera numero"],
+          haystackValues: [
+            row.name,
+            row.id,
+            row.description,
+            scene.scene_label,
+            scene.scene_description,
+            row.ip_address,
+            row.manufacturer,
+            row.connection_method,
+            row.channel,
+            row.subtype,
+          ],
+          camera_id: Number(row.id || 0),
+          camera_name: normalizeReportText(row.name, 160),
+        };
+      })
+    );
+
+    if (resolvedMatches.length === 1) {
+      const resolvedId = Number(resolvedMatches[0].id || 0);
+      const resolvedRow = cameraRows.find((row) => Number(row.id || 0) === resolvedId);
+      if (resolvedRow) {
+        const resolvedTarget = mutationResolvedTargetFromCameraRow(resolvedRow);
+        return respondMutation({
+          requiresClarification: false,
+          clarificationOptions: [],
+          plan: {
+            ...planBase,
+            status: "resolved",
+            confidence: 0.94,
+            resolved_targets: [resolvedTarget],
+            canonical_arguments: {
+              ...planBase.canonical_arguments,
+              resolved_camera: resolvedTarget,
+            },
+          },
+        });
+      }
+    }
+
+    if (resolvedMatches.length > 1) {
+      const candidateTargets = resolvedMatches
+        .map((entry) => {
+          const row = cameraRows.find((candidate) => Number(candidate.id || 0) === Number(entry.id || 0));
+          return row ? mutationResolvedTargetFromCameraRow(row) : null;
+        })
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+        .slice(0, 5);
+      return respondMutation({
+        requiresClarification: true,
+        clarificationOptions: candidateTargets
+          .map((entry) => normalizeReportText(entry.name, 160))
+          .filter((entry) => entry.length > 0),
+        plan: {
+          ...planBase,
+          status: "ambiguous",
+          confidence: 0.62,
+          candidate_targets: candidateTargets,
+        },
+      });
+    }
+  } else {
+    const { results } = await c.env.DB
+      .prepare(
+        `SELECT
+           j.id,
+           j.name,
+           j.description,
+           j.status,
+           COALESCE(j.is_active, 1) AS is_active,
+           j.schedule_mode,
+           j.timezone,
+           jrs.status AS runtime_status
+         FROM jobs j
+         LEFT JOIN job_runtime_states jrs ON jrs.job_id = j.id
+         WHERE j.user_id = ?
+         ORDER BY j.created_at DESC`
+      )
+      .bind(pairing.userId)
+      .all();
+
+    const jobRows = Array.isArray(results)
+      ? results.map((row) => (row as Record<string, unknown>))
+      : [];
+    const resolvedMatches = resolveReportEntityMatches(
+      resolveQuery,
+      jobRows.map((row) => ({
+        entity_type: "job" as const,
+        id: Number(row.id || 0),
+        name: normalizeReportText(row.name, 160),
+        label: normalizeReportText(row.name, 160) || `Job ${Number(row.id || 0)}`,
+        aliases: ["job", "jobs", "tarefa", "tarefas", "task", "tasks", "workflow"],
+        haystackValues: [
+          row.name,
+          row.id,
+          row.description,
+          row.status,
+          row.schedule_mode,
+          row.timezone,
+          row.runtime_status,
+        ],
+        job_id: Number(row.id || 0),
+        job_name: normalizeReportText(row.name, 160),
+      }))
+    );
+
+    if (resolvedMatches.length === 1) {
+      const resolvedId = Number(resolvedMatches[0].id || 0);
+      const resolvedRow = jobRows.find((row) => Number(row.id || 0) === resolvedId);
+      if (resolvedRow) {
+        const resolvedTarget = mutationResolvedTargetFromJobRow(resolvedRow);
+        return respondMutation({
+          requiresClarification: false,
+          clarificationOptions: [],
+          plan: {
+            ...planBase,
+            status: "resolved",
+            confidence: 0.94,
+            resolved_targets: [resolvedTarget],
+            canonical_arguments: {
+              ...planBase.canonical_arguments,
+              resolved_job: resolvedTarget,
+            },
+          },
+        });
+      }
+    }
+
+    if (resolvedMatches.length > 1) {
+      const candidateTargets = resolvedMatches
+        .map((entry) => {
+          const row = jobRows.find((candidate) => Number(candidate.id || 0) === Number(entry.id || 0));
+          return row ? mutationResolvedTargetFromJobRow(row) : null;
+        })
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+        .slice(0, 5);
+      return respondMutation({
+        requiresClarification: true,
+        clarificationOptions: candidateTargets
+          .map((entry) => normalizeReportText(entry.name, 160))
+          .filter((entry) => entry.length > 0),
+        plan: {
+          ...planBase,
+          status: "ambiguous",
+          confidence: 0.62,
+          candidate_targets: candidateTargets,
+        },
+      });
+    }
+  }
+
+  return respondMutation({
+    requiresClarification: false,
+    clarificationOptions: [],
+    plan: {
+      ...planBase,
+      status: "not_found",
+      confidence: 0.18,
+    },
+  });
 });
 
 app.post("/api/agent/reports/create", async (c) => {
@@ -42511,6 +43608,7 @@ app.post("/api/agent/reports/create", async (c) => {
     context_before_message_id?: number;
     query?: string;
     reply_language?: string;
+    timezone?: string;
     title?: string;
     summary?: string;
     sections?: unknown;
@@ -42551,6 +43649,9 @@ app.post("/api/agent/reports/create", async (c) => {
       beforeMessageId: Number(body?.context_before_message_id || 0),
       query: typeof body?.query === "string" ? body.query : "",
       replyLanguage,
+      timezoneInput:
+        normalizeTimezoneInput(body?.timezone) ||
+        normalizeTimezoneInput((pairing as any)?.timezone_iana),
     }));
 
   const reportId =

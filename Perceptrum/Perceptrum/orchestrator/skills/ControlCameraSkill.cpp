@@ -160,6 +160,24 @@ json buildResolvedCamera_(const json& camera)
     });
 }
 
+json fetchMutationGrounding_(
+    AgentCore& agent,
+    const json& payload,
+    const std::string& language,
+    const std::string& action,
+    const json& draft)
+{
+    json request = {
+        { "query", payload.is_object() ? payload.value("query", std::string()) : std::string() },
+        { "reply_language", language },
+        { "operation_type", "control_camera" },
+        { "runtime_action", action },
+        { "target_selector", draft.value("target_selector", json::object()) },
+        { "resolved_camera", draft.value("resolved_camera", json::object()) },
+    };
+    return shared::resolveMutationGrounding(agent, payload, request);
+}
+
 std::string cameraName_(const json& camera)
 {
     const std::string name = safeText_(camera, "name");
@@ -406,76 +424,158 @@ SkillRunResult ControlCameraSkill::execute(
         makeProgressUpdate(language, "control_camera", "resolving_target", 2, 2, 3),
         2000);
 
-    const json inventory = shared::fetchCameraInventory(agent, payload);
-    if (!inventory.value("ok", false)) {
-        result.answer = buildFailureAnswer_(language, action, safeText_(inventory, "error"));
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_inventory",
-            isPt_(language) ? "Falha ao consultar cameras" : "Failed to load cameras",
-            result.answer,
-            {},
-            false);
-        return result;
+    const json mutationGrounding = fetchMutationGrounding_(agent, payload, language, action, draft);
+    const bool hasMutationGroundingPlan =
+        mutationGrounding.is_object() &&
+        mutationGrounding.value("ok", false) &&
+        mutationGrounding.contains("plan") &&
+        mutationGrounding["plan"].is_object();
+    if (hasMutationGroundingPlan) {
+        result.metadata["mutation_grounding"] = mutationGrounding;
+        const json plan = mutationGrounding["plan"];
+        const json canonicalArguments = plan.value("canonical_arguments", json::object());
+        if (canonicalArguments.contains("target_selector") && canonicalArguments["target_selector"].is_object()) {
+            draft["target_selector"] = canonicalArguments["target_selector"];
+        }
+        const std::string groundedAction = normalizedAction_(safeText_(canonicalArguments, "runtime_action"));
+        if (!groundedAction.empty()) {
+            draft["runtime_action"] = groundedAction;
+        }
+
+        const std::string groundingStatus = safeText_(plan, "status");
+        if (groundingStatus == "missing_target") {
+            result.answer = buildNeedTargetAnswer_(language, action);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Aguardando camera" : "Waiting for the camera",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "ambiguous") {
+            draft["candidate_cameras"] = plan.value("candidate_targets", json::array());
+            result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_cameras"]);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target_confirmation",
+                isPt_(language) ? "Aguardando confirmacao da camera" : "Waiting for camera confirmation",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "not_found") {
+            result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Camera nao encontrada" : "Camera not found",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        if (groundingStatus == "resolved" &&
+            canonicalArguments.contains("resolved_camera") &&
+            canonicalArguments["resolved_camera"].is_object()) {
+            draft["resolved_camera"] = canonicalArguments["resolved_camera"];
+            draft.erase("candidate_cameras");
+        }
+    }
+    else {
+        const std::string groundingError = safeText_(mutationGrounding, "error");
+        if (!groundingError.empty()) {
+            result.metadata["mutation_grounding_error"] = groundingError;
+        }
     }
 
-    const json resolution = shared::resolveCamera(
-        inventory,
-        draft.value("target_selector", json::object()),
-        draft.value("resolved_camera", json::object()));
-    const std::string resolutionStatus = safeText_(resolution, "status");
-    if (resolutionStatus == "missing_target") {
-        result.answer = buildNeedTargetAnswer_(language, action);
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target",
-            isPt_(language) ? "Aguardando camera" : "Waiting for the camera",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+    json resolvedCamera = draft.value("resolved_camera", json::object());
+    if (!resolvedCamera.is_object() || resolvedCamera.empty()) {
+        const json inventory = shared::fetchCameraInventory(agent, payload);
+        if (!inventory.value("ok", false)) {
+            result.answer = buildFailureAnswer_(language, action, safeText_(inventory, "error"));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_inventory",
+                isPt_(language) ? "Falha ao consultar cameras" : "Failed to load cameras",
+                result.answer,
+                {},
+                false);
+            return result;
+        }
 
-    if (resolutionStatus == "ambiguous") {
-        draft["candidate_cameras"] = resolution.value("candidates", json::array());
-        result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_cameras"]);
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target_confirmation",
-            isPt_(language) ? "Aguardando confirmacao da camera" : "Waiting for camera confirmation",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+        const json resolution = shared::resolveCamera(
+            inventory,
+            draft.value("target_selector", json::object()),
+            draft.value("resolved_camera", json::object()));
+        const std::string resolutionStatus = safeText_(resolution, "status");
+        if (resolutionStatus == "missing_target") {
+            result.answer = buildNeedTargetAnswer_(language, action);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Aguardando camera" : "Waiting for the camera",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
 
-    if (resolutionStatus != "resolved" || !resolution.contains("item") || !resolution["item"].is_object()) {
-        result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_target",
-            isPt_(language) ? "Camera nao encontrada" : "Camera not found",
-            result.answer,
-            { "target_selector" },
-            false);
-        return result;
-    }
+        if (resolutionStatus == "ambiguous") {
+            draft["candidate_cameras"] = resolution.value("candidates", json::array());
+            result.answer = buildAmbiguousAnswer_(language, action, draft["candidate_cameras"]);
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target_confirmation",
+                isPt_(language) ? "Aguardando confirmacao da camera" : "Waiting for camera confirmation",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
 
-    const json resolvedCamera = buildResolvedCamera_(resolution["item"]);
-    draft["resolved_camera"] = resolvedCamera;
-    draft.erase("candidate_cameras");
+        if (resolutionStatus != "resolved" || !resolution.contains("item") || !resolution["item"].is_object()) {
+            result.answer = buildNotFoundAnswer_(language, action, draft.value("target_selector", json::object()));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_target",
+                isPt_(language) ? "Camera nao encontrada" : "Camera not found",
+                result.answer,
+                { "target_selector" },
+                false);
+            return result;
+        }
+
+        resolvedCamera = buildResolvedCamera_(resolution["item"]);
+        draft["resolved_camera"] = resolvedCamera;
+        draft.erase("candidate_cameras");
+    }
 
     const bool isRunning = boolField_(resolvedCamera, "is_service_running");
     if ((action == "start" && isRunning) || (action == "stop" && !isRunning)) {

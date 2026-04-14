@@ -34,6 +34,10 @@ struct SkillSelection {
     std::string mode;
     std::string entity;
     std::string intent;
+    std::string intentFamily;
+    std::string plannerMode;
+    std::string routeVersion = "v2";
+    nlohmann::json routeHints = nlohmann::json::object();
     bool continueActiveTask = false;
     bool groundingRequired = false;
     std::string operationType;

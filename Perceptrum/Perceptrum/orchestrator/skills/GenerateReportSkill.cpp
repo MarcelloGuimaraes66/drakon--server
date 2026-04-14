@@ -82,6 +82,74 @@ std::string clientIdFromPayload_(const nlohmann::json& payload, const AgentCore&
     return agent.getClientId();
 }
 
+std::string parseErrorMessage_(const HttpResponse& response);
+
+nlohmann::json fetchOperationalQueryExecution_(
+    AgentCore& agent,
+    const nlohmann::json& payload,
+    const std::string& replyLanguage,
+    std::string* outError = nullptr)
+{
+    if (outError != nullptr) {
+        outError->clear();
+    }
+    if (!payload.is_object()) {
+        return nlohmann::json::object();
+    }
+
+    const int chatSessionId = payload.value("chat_session_id", -1);
+    if (chatSessionId <= 0) {
+        if (outError != nullptr) {
+            *outError = "missing_chat_session_id";
+        }
+        return nlohmann::json::object();
+    }
+
+    nlohmann::json request = {
+        { "chat_session_id", chatSessionId },
+        { "query", payload.value("query", std::string()) },
+        { "reply_language", replyLanguage },
+        { "intent_family", "report" },
+        { "preferred_skill", "generate_report" },
+    };
+    const int beforeMessageId = payload.value("context_before_message_id", 0);
+    if (beforeMessageId > 0) {
+        request["context_before_message_id"] = beforeMessageId;
+    }
+    if (payload.contains("timezone_iana") && payload["timezone_iana"].is_string()) {
+        request["timezone"] = payload["timezone_iana"].get<std::string>();
+    }
+    else if (payload.contains("timezone") && payload["timezone"].is_string()) {
+        request["timezone"] = payload["timezone"].get<std::string>();
+    }
+
+    const std::string url =
+        agent.getBackendBaseUrl() +
+        "/api/agent/query/execute?client_id=" + clientIdFromPayload_(payload, agent);
+    const HttpResponse response = postJson(
+        url,
+        request.dump(),
+        agent.getExeToken(),
+        {},
+        20000);
+
+    if (!response.ok()) {
+        if (outError != nullptr) {
+            *outError = parseErrorMessage_(response);
+        }
+        return nlohmann::json::object();
+    }
+
+    const nlohmann::json parsed = nlohmann::json::parse(response.body, nullptr, false);
+    if (!parsed.is_object()) {
+        if (outError != nullptr) {
+            *outError = "invalid_operational_query_execution";
+        }
+        return nlohmann::json::object();
+    }
+    return parsed;
+}
+
 nlohmann::json loadConversationContext_(
     AgentCore& agent,
     const nlohmann::json& payload)
@@ -363,31 +431,77 @@ SkillRunResult GenerateReportSkill::execute(
     if (beforeMessageId > 0) {
         contextRequest["context_before_message_id"] = beforeMessageId;
     }
-
-    const std::string contextUrl =
-        agent.getBackendBaseUrl() +
-        "/api/agent/reports/build-context?client_id=" + clientIdFromPayload_(payload, agent);
-    const HttpResponse contextResponse = postJson(
-        contextUrl,
-        contextRequest.dump(),
-        agent.getExeToken(),
-        {},
-        20000);
-
-    if (!contextResponse.ok()) {
-        const std::string errorMessage = parseErrorMessage_(contextResponse);
-        result.answer = language == "pt"
-            ? "Tentei preparar o contexto do relatorio, mas nao consegui concluir agora. Detalhe: " + errorMessage + "."
-            : "I tried to prepare the report context, but I could not complete it right now. Detail: " + errorMessage + ".";
-        return result;
+    if (payload.contains("timezone_iana") && payload["timezone_iana"].is_string()) {
+        contextRequest["timezone"] = payload["timezone_iana"].get<std::string>();
+    }
+    else if (payload.contains("timezone") && payload["timezone"].is_string()) {
+        contextRequest["timezone"] = payload["timezone"].get<std::string>();
     }
 
-    const nlohmann::json reportContext = nlohmann::json::parse(contextResponse.body, nullptr, false);
-    if (!reportContext.is_object()) {
-        result.answer = language == "pt"
-            ? "Consegui iniciar a geracao do relatorio, mas o contexto voltou em um formato invalido."
-            : "I was able to start the report generation, but the context came back in an invalid format.";
-        return result;
+    std::string operationalQueryError;
+    const nlohmann::json operationalQueryExecution = fetchOperationalQueryExecution_(
+        agent,
+        payload,
+        language,
+        &operationalQueryError);
+    const bool hasOperationalQueryContext =
+        operationalQueryExecution.is_object() &&
+        operationalQueryExecution.value("ok", false) &&
+        operationalQueryExecution.contains("context") &&
+        operationalQueryExecution["context"].is_object();
+
+    nlohmann::json reportContext = nlohmann::json::object();
+    if (hasOperationalQueryContext) {
+        reportContext = operationalQueryExecution["context"];
+        if (operationalQueryExecution.contains("plan") && operationalQueryExecution["plan"].is_object()) {
+            reportContext["query_plan"] = operationalQueryExecution["plan"];
+            result.metadata["query_plan"] = operationalQueryExecution["plan"];
+        }
+        if (operationalQueryExecution.contains("execution") && operationalQueryExecution["execution"].is_object()) {
+            reportContext["query_execution"] = operationalQueryExecution["execution"];
+            result.metadata["planner_execution"] = operationalQueryExecution["execution"];
+        }
+        if (operationalQueryExecution.contains("semantic_plan") &&
+            operationalQueryExecution["semantic_plan"].is_object()) {
+            reportContext["semantic_plan"] = operationalQueryExecution["semantic_plan"];
+            result.metadata["semantic_plan"] = operationalQueryExecution["semantic_plan"];
+        }
+        if (operationalQueryExecution.contains("semantic_shadow") &&
+            operationalQueryExecution["semantic_shadow"].is_object()) {
+            reportContext["semantic_shadow"] = operationalQueryExecution["semantic_shadow"];
+            result.metadata["semantic_shadow"] = operationalQueryExecution["semantic_shadow"];
+        }
+        result.metadata["planner_mode"] = "operational_query";
+    }
+    else {
+        const std::string contextUrl =
+            agent.getBackendBaseUrl() +
+            "/api/agent/reports/build-context?client_id=" + clientIdFromPayload_(payload, agent);
+        const HttpResponse contextResponse = postJson(
+            contextUrl,
+            contextRequest.dump(),
+            agent.getExeToken(),
+            {},
+            20000);
+
+        if (!contextResponse.ok()) {
+            const std::string errorMessage = parseErrorMessage_(contextResponse);
+            result.answer = language == "pt"
+                ? "Tentei preparar o contexto do relatorio, mas nao consegui concluir agora. Detalhe: " + errorMessage + "."
+                : "I tried to prepare the report context, but I could not complete it right now. Detail: " + errorMessage + ".";
+            return result;
+        }
+
+        reportContext = nlohmann::json::parse(contextResponse.body, nullptr, false);
+        if (!reportContext.is_object()) {
+            result.answer = language == "pt"
+                ? "Consegui iniciar a geracao do relatorio, mas o contexto voltou em um formato invalido."
+                : "I was able to start the report generation, but the context came back in an invalid format.";
+            return result;
+        }
+    }
+    if (!operationalQueryError.empty()) {
+        result.metadata["operational_query_error"] = operationalQueryError;
     }
 
     postChatProgress(

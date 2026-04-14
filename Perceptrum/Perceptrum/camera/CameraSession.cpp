@@ -7545,6 +7545,22 @@ void CameraSession::inferenceLoop_() {
                     }
 
                     if (temporalPlanActive && temporalReport && owner_) {
+                        const nlohmann::json reportIdentityCards =
+                            owner_->collectOperationalIdentityCards(
+                                temporalSlot.state,
+                                temporalSlot.visualState
+                            );
+                        std::string reportPrimaryIdentityCardId = primaryHit.primaryIdentityCardId;
+                        if (reportPrimaryIdentityCardId.empty() &&
+                            reportIdentityCards.is_array() &&
+                            !reportIdentityCards.empty() &&
+                            reportIdentityCards[0].is_object() &&
+                            reportIdentityCards[0].contains("card_id") &&
+                            reportIdentityCards[0]["card_id"].is_string())
+                        {
+                            reportPrimaryIdentityCardId =
+                                reportIdentityCards[0]["card_id"].get<std::string>();
+                        }
                         nlohmann::json reportDetails = nlohmann::json::object();
                         reportDetails["camera_id"] = cameraIdNumeric;
                         reportDetails["camera_name"] = config_.name;
@@ -7563,11 +7579,14 @@ void CameraSession::inferenceLoop_() {
                         reportDetails["decision_source"] = decisionSource;
                         reportDetails["llm_alert_condition"] = llmAlertCondition;
                         reportDetails["final_alert_condition"] = finalAlert;
-                        if (!primaryHit.primaryIdentityCardId.empty()) {
+                        if (!reportPrimaryIdentityCardId.empty()) {
                             reportDetails["primary_identity_card_id"] =
-                                primaryHit.primaryIdentityCardId;
+                                reportPrimaryIdentityCardId;
                         }
-                        if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                        if (reportIdentityCards.is_array() && !reportIdentityCards.empty()) {
+                            reportDetails["identity_cards"] = reportIdentityCards;
+                        }
+                        else if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
                             reportDetails["identity_cards"] = primaryHit.identityCards;
                         }
                         reportDetails["prompt_tokens"] = primaryPromptTokens;
@@ -9036,6 +9055,22 @@ void CameraSession::inferenceLoop_() {
                         }
 
                         if (temporalPlanActive && temporalReport && owner_) {
+                            const nlohmann::json reportIdentityCards =
+                                owner_->collectOperationalIdentityCards(
+                                    temporalSlot.state,
+                                    temporalSlot.visualState
+                                );
+                            std::string reportPrimaryIdentityCardId = primaryHit.primaryIdentityCardId;
+                            if (reportPrimaryIdentityCardId.empty() &&
+                                reportIdentityCards.is_array() &&
+                                !reportIdentityCards.empty() &&
+                                reportIdentityCards[0].is_object() &&
+                                reportIdentityCards[0].contains("card_id") &&
+                                reportIdentityCards[0]["card_id"].is_string())
+                            {
+                                reportPrimaryIdentityCardId =
+                                    reportIdentityCards[0]["card_id"].get<std::string>();
+                            }
                             nlohmann::json reportDetails = nlohmann::json::object();
                             reportDetails["camera_id"] = primarySegment.cameraId;
                             reportDetails["camera_name"] = primarySegment.cameraName;
@@ -9055,11 +9090,14 @@ void CameraSession::inferenceLoop_() {
                             reportDetails["decision_source"] = decisionSource;
                             reportDetails["llm_alert_condition"] = llmAlertCondition;
                             reportDetails["final_alert_condition"] = finalAlert;
-                            if (!primaryHit.primaryIdentityCardId.empty()) {
+                            if (!reportPrimaryIdentityCardId.empty()) {
                                 reportDetails["primary_identity_card_id"] =
-                                    primaryHit.primaryIdentityCardId;
+                                    reportPrimaryIdentityCardId;
                             }
-                            if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
+                            if (reportIdentityCards.is_array() && !reportIdentityCards.empty()) {
+                                reportDetails["identity_cards"] = reportIdentityCards;
+                            }
+                            else if (primaryHit.identityCards.is_array() && !primaryHit.identityCards.empty()) {
                                 reportDetails["identity_cards"] = primaryHit.identityCards;
                             }
                             reportDetails["prompt_tokens"] = primaryPromptTokens;

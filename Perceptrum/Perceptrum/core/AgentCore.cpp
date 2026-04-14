@@ -28376,6 +28376,26 @@ bool AgentCore::materializeOperationalIdentityCards(
     }
 }
 
+nlohmann::json AgentCore::collectOperationalIdentityCards(
+    const nlohmann::json& temporalState,
+    nlohmann::json& visualState)
+{
+    try {
+        return collectAllChatIdentityCards_(temporalState, visualState);
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("collectOperationalIdentityCards: exception error=") + ex.what());
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "collectOperationalIdentityCards: unknown exception");
+    }
+    return nlohmann::json::array();
+}
+
 DrakonFindInferenceResult AgentCore::runDrakonFindImageInference_(
     int cameraId,
     const std::string& jpegBase64,

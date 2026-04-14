@@ -336,6 +336,15 @@ bool populateSkillSelectionFromPartialText_(
     if (extractJsonStringFieldPartial_(partialText, "intent", stringValue, false)) {
         selection.intent = trimLowerCopy_(stringValue);
     }
+    if (extractJsonStringFieldPartial_(partialText, "intent_family", stringValue, false)) {
+        selection.intentFamily = trimLowerCopy_(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "planner_mode", stringValue, false)) {
+        selection.plannerMode = trimLowerCopy_(stringValue);
+    }
+    if (extractJsonStringFieldPartial_(partialText, "route_version", stringValue, false)) {
+        selection.routeVersion = trimCopy(stringValue);
+    }
     if (extractJsonStringFieldPartial_(partialText, "operation_type", stringValue, false)) {
         selection.operationType = trimCopy(stringValue);
     }
@@ -351,6 +360,8 @@ bool populateSkillSelectionFromPartialText_(
         !selection.mode.empty() ||
         !selection.entity.empty() ||
         !selection.intent.empty() ||
+        !selection.intentFamily.empty() ||
+        !selection.plannerMode.empty() ||
         selection.continueActiveTask ||
         selection.groundingRequired ||
         !trimCopy(selection.operationType).empty() ||
@@ -880,6 +891,18 @@ bool populateSkillSelectionFromStructured_(
     if (structured.contains("intent") && structured["intent"].is_string()) {
         selection.intent = trimLowerCopy_(structured["intent"].get<std::string>());
     }
+    if (structured.contains("intent_family") && structured["intent_family"].is_string()) {
+        selection.intentFamily = trimLowerCopy_(structured["intent_family"].get<std::string>());
+    }
+    if (structured.contains("planner_mode") && structured["planner_mode"].is_string()) {
+        selection.plannerMode = trimLowerCopy_(structured["planner_mode"].get<std::string>());
+    }
+    if (structured.contains("route_version") && structured["route_version"].is_string()) {
+        selection.routeVersion = trimCopy(structured["route_version"].get<std::string>());
+    }
+    if (structured.contains("route_hints") && structured["route_hints"].is_object()) {
+        selection.routeHints = structured["route_hints"];
+    }
     selection.continueActiveTask =
         parseBoolField_(structured, "continue_active_task", false);
     selection.groundingRequired =
@@ -950,6 +973,8 @@ bool populateSkillSelectionFromStructured_(
         !selection.mode.empty() ||
         !selection.entity.empty() ||
         !selection.intent.empty() ||
+        !selection.intentFamily.empty() ||
+        !selection.plannerMode.empty() ||
         selection.continueActiveTask ||
         selection.groundingRequired ||
         !trimCopy(selection.operationType).empty() ||

@@ -1,0 +1,42 @@
+[
+  {
+    "language": "pt-BR",
+    "query": "agora so dessas mesmas pessoas",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "en",
+    "query": "now just those same people",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "es",
+    "query": "ahora solo de esas mismas personas",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "fr",
+    "query": "maintenant seulement pour ces memes personnes",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "de",
+    "query": "jetzt nur dieselben personen",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "it",
+    "query": "adesso solo di queste stesse persone",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "ar",
+    "query": "الآن فقط نفس الأشخاص",
+    "expectedCarryForward": true
+  },
+  {
+    "language": "zh",
+    "query": "现在只看这些相同的人",
+    "expectedCarryForward": true
+  }
+]
