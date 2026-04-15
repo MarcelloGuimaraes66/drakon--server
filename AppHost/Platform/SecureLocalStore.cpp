@@ -27,6 +27,34 @@ namespace
         return value;
     }
 
+    bool LooksLikeBase64(std::string const& value)
+    {
+        bool seenPadding = false;
+        for (auto const ch : value)
+        {
+            auto const unsignedCh = static_cast<unsigned char>(ch);
+            auto const isBase64Character =
+                std::isalnum(unsignedCh) != 0 || ch == '+' || ch == '/' || ch == '=';
+            if (!isBase64Character)
+            {
+                return false;
+            }
+
+            if (ch == '=')
+            {
+                seenPadding = true;
+                continue;
+            }
+
+            if (seenPadding)
+            {
+                return false;
+            }
+        }
+
+        return !value.empty();
+    }
+
     std::string FileEntropy(std::filesystem::path const& path)
     {
         auto const fileName = path.filename().string();
@@ -70,11 +98,15 @@ namespace
             return std::nullopt;
         }
 
-        encoded.resize(required > 0 ? static_cast<size_t>(required) - 1 : 0);
+        encoded.resize(static_cast<size_t>(required));
+        while (!encoded.empty() && encoded.back() == '\0')
+        {
+            encoded.pop_back();
+        }
         return encoded;
     }
 
-    std::optional<std::string> DecodeBase64(std::string const& encoded)
+    std::optional<std::string> DecodeBase64Exact(std::string const& encoded)
     {
         DWORD required = 0;
         if (!CryptStringToBinaryA(
@@ -104,6 +136,30 @@ namespace
 
         decoded.resize(required);
         return decoded;
+    }
+
+    std::optional<std::string> DecodeBase64(std::string const& encoded)
+    {
+        if (auto decoded = DecodeBase64Exact(encoded))
+        {
+            return decoded;
+        }
+
+        // Older builds truncated the final base64 padding character when
+        // persisting DPAPI blobs. Add the missing padding back so those
+        // installs can recover in place.
+        if (!LooksLikeBase64(encoded) || (encoded.size() % 4) == 0)
+        {
+            return std::nullopt;
+        }
+
+        auto legacyEncoded = encoded;
+        while ((legacyEncoded.size() % 4) != 0)
+        {
+            legacyEncoded.push_back('=');
+        }
+
+        return DecodeBase64Exact(legacyEncoded);
     }
 
     std::optional<std::string> ProtectText(std::string_view plainText, std::filesystem::path const& path)
@@ -190,6 +246,17 @@ namespace DrakonDesktop::platform
         }
 
         return *raw;
+    }
+
+    std::optional<std::string> ReadProtectedLocalTextStrict(std::filesystem::path const& path)
+    {
+        auto const raw = ReadRawFile(path);
+        if (!raw.has_value() || raw->empty())
+        {
+            return std::nullopt;
+        }
+
+        return UnprotectText(*raw, path);
     }
 
     bool WriteProtectedLocalText(std::filesystem::path const& path, std::string_view value)

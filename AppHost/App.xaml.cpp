@@ -74,6 +74,7 @@ namespace
             serviceSessionDirectory / "service-cpp.log",
             serviceSessionDirectory / "logs",
             serviceSessionDirectory / "webview2",
+            serviceSessionDirectory / "sqlite_key_v1.txt",
             serviceSessionDirectory / "exe_token.txt",
             serviceSessionDirectory / "client_id.txt",
             serviceSessionDirectory / "exe_id.txt",

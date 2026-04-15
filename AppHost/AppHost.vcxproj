@@ -132,7 +132,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libcurl.lib;avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libcurl.lib;avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -167,6 +167,7 @@
     </ClInclude>
     <ClInclude Include="BootstrapTrace.h" />
     <ClInclude Include="Platform\AppRuntimeConfig.h" />
+    <ClInclude Include="Platform\DesktopDatabaseKeyStore.h" />
     <ClInclude Include="Platform\LocalBackendHost.h" />
     <ClInclude Include="Platform\PerceptrumRuntimeHost.h" />
     <ClInclude Include="Platform\SecureLocalStore.h" />
@@ -199,6 +200,7 @@
     </ClCompile>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Platform\AppRuntimeConfig.cpp" />
+    <ClCompile Include="Platform\DesktopDatabaseKeyStore.cpp" />
     <ClCompile Include="Platform\LocalBackendHost.cpp" />
     <ClCompile Include="Platform\PerceptrumRuntimeHost.cpp" />
     <ClCompile Include="Platform\SecureLocalStore.cpp" />

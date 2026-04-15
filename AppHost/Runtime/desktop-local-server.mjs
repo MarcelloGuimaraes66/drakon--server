@@ -16,6 +16,14 @@ import { loadEnv } from "../../DrakonSite/server/env.ts";
 import { LocalR2Bucket } from "../../DrakonSite/server/local-r2.ts";
 import { PgD1Database } from "../../DrakonSite/server/pg-d1.ts";
 import { SqliteD1Database } from "../../DrakonSite/server/sqlite-d1.ts";
+import {
+  checkpointPlaintextSqlite,
+  createDesktopSqliteDatabase,
+  encryptPlaintextSqliteInPlace,
+  hasPlaintextSqliteHeader,
+  isDesktopSqliteEncryptionRequired,
+  resolveDesktopSqliteEncryptionConfig,
+} from "../../DrakonSite/server/sqlite-encryption.ts";
 import worker from "../../DrakonSite/src/worker/index.ts";
 
 if (!globalThis.crypto) {
@@ -47,6 +55,13 @@ const serviceSessionDir = process.env.APP_SERVICE_SESSION_DIR
   : path.resolve(storageRoot, "desktop-session");
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
+let sqliteEncryptionConfig = null;
+let sqliteEncryptionConfigError = null;
+try {
+  sqliteEncryptionConfig = resolveDesktopSqliteEncryptionConfig(process.env);
+} catch (error) {
+  sqliteEncryptionConfigError = summarizeError(error);
+}
 const runtimeHealthRoute = "/api/runtime/health";
 const sqliteCriticalTables = [
   "app_users",
@@ -83,6 +98,14 @@ function createRuntimeState(overrides = {}) {
       brand: activeBrand.id,
       port,
       staticRoot: staticRoot || null,
+      sqliteEncryption:
+        databaseBackend === "sqlite"
+          ? sqliteEncryptionConfig?.mode || (sqliteEncryptionConfigError ? "invalid" : "off")
+          : "off",
+      sqliteKeyVersion:
+        databaseBackend === "sqlite" && sqliteEncryptionConfig
+          ? sqliteEncryptionConfig.keyVersion
+          : null,
     },
     env: null,
   };
@@ -213,8 +236,28 @@ function backupSqliteArtifacts(sqlitePath, reason) {
   }
 }
 
+function snapshotSqliteArtifacts(sqlitePath, reason) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
+    if (!fs.existsSync(artifactPath)) {
+      continue;
+    }
+
+    const backupPath = `${artifactPath}.${reason}.${stamp}.bak`;
+    fs.copyFileSync(artifactPath, backupPath);
+  }
+}
+
 function removeSqliteSidecars(sqlitePath) {
   for (const artifactPath of sqliteArtifactPaths(sqlitePath).slice(1)) {
+    if (fs.existsSync(artifactPath)) {
+      fs.rmSync(artifactPath, { force: true });
+    }
+  }
+}
+
+function removeSqliteArtifacts(sqlitePath) {
+  for (const artifactPath of sqliteArtifactPaths(sqlitePath)) {
     if (fs.existsSync(artifactPath)) {
       fs.rmSync(artifactPath, { force: true });
     }
@@ -225,6 +268,37 @@ function copyBundledSqliteSeed(seedPath, sqlitePath) {
   fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
   removeSqliteSidecars(sqlitePath);
   fs.copyFileSync(seedPath, sqlitePath);
+}
+
+function sqliteEncryptionRequired() {
+  return Boolean(
+    sqliteEncryptionConfig && isDesktopSqliteEncryptionRequired(sqliteEncryptionConfig)
+  );
+}
+
+function openSqliteForInspection(sqlitePath) {
+  if (hasPlaintextSqliteHeader(sqlitePath)) {
+    return new SqliteD1Database(sqlitePath);
+  }
+
+  if (!sqliteEncryptionRequired()) {
+    throw new Error(
+      "SQLite database appears encrypted or unreadable, but desktop encryption is disabled for this runtime."
+    );
+  }
+
+  return createDesktopSqliteDatabase(sqlitePath, sqliteEncryptionConfig);
+}
+
+async function createEncryptedSqliteTempFromSource(sourcePath, tempPath) {
+  if (!sqliteEncryptionRequired()) {
+    throw new Error("Desktop SQLite encryption is required, but no encryption config is loaded.");
+  }
+
+  removeSqliteArtifacts(tempPath);
+  fs.mkdirSync(path.dirname(tempPath), { recursive: true });
+  fs.copyFileSync(sourcePath, tempPath);
+  await encryptPlaintextSqliteInPlace(tempPath, sqliteEncryptionConfig);
 }
 
 async function inspectSqliteSchema(sqlitePath) {
@@ -239,7 +313,7 @@ async function inspectSqliteSchema(sqlitePath) {
 
   let db = null;
   try {
-    db = new SqliteD1Database(sqlitePath);
+    db = openSqliteForInspection(sqlitePath);
     const { results = [] } = await db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -274,6 +348,20 @@ async function inspectSqliteSchema(sqlitePath) {
 async function provisionSqliteDatabase(sqlitePath, seedPath) {
   const actions = [];
   const seedExists = fs.existsSync(seedPath);
+  const encryptionRequired = sqliteEncryptionRequired();
+
+  if (sqliteEncryptionConfigError) {
+    return {
+      ready: false,
+      summary: sqliteEncryptionConfigError,
+      details: {
+        sqlitePath,
+        seedPath: seedExists ? seedPath : null,
+        actions,
+        missingCriticalTables: [...sqliteCriticalTables],
+      },
+    };
+  }
 
   if (!fs.existsSync(sqlitePath)) {
     if (!seedExists) {
@@ -289,12 +377,83 @@ async function provisionSqliteDatabase(sqlitePath, seedPath) {
       };
     }
 
-    copyBundledSqliteSeed(seedPath, sqlitePath);
-    actions.push("copied bundled SQLite seed because the local database was missing");
+    if (encryptionRequired) {
+      const tempPath = `${sqlitePath}.provisioning`;
+      try {
+        await createEncryptedSqliteTempFromSource(seedPath, tempPath);
+        removeSqliteArtifacts(sqlitePath);
+        fs.renameSync(tempPath, sqlitePath);
+      } catch (error) {
+        removeSqliteArtifacts(tempPath);
+        return {
+          ready: false,
+          summary: "Failed to create the encrypted local SQLite database from the bundled seed.",
+          details: {
+            sqlitePath,
+            seedPath,
+            actions,
+            missingCriticalTables: [...sqliteCriticalTables],
+            encryptionError: summarizeError(error),
+          },
+        };
+      }
+      actions.push("created the local SQLite database from the bundled seed");
+      actions.push("encrypted the local SQLite database with the desktop installation key");
+    } else {
+      copyBundledSqliteSeed(seedPath, sqlitePath);
+      actions.push("copied bundled SQLite seed because the local database was missing");
+    }
+  } else if (encryptionRequired && hasPlaintextSqliteHeader(sqlitePath)) {
+    const tempPath = `${sqlitePath}.encrypting`;
+    try {
+      await checkpointPlaintextSqlite(sqlitePath);
+      await createEncryptedSqliteTempFromSource(sqlitePath, tempPath);
+      const tempInspection = await inspectSqliteSchema(tempPath);
+      if (!tempInspection.ok) {
+        throw new Error(
+          tempInspection.error ||
+            `Encrypted SQLite temp database is missing required tables: ${tempInspection.missingCriticalTables.join(", ")}`
+        );
+      }
+      snapshotSqliteArtifacts(sqlitePath, "plaintext-backup");
+      removeSqliteArtifacts(sqlitePath);
+      fs.renameSync(tempPath, sqlitePath);
+      actions.push("encrypted the existing local SQLite database with the desktop installation key");
+    } catch (error) {
+      removeSqliteArtifacts(tempPath);
+      return {
+        ready: false,
+        summary: "Failed to migrate the existing local SQLite database to encrypted storage.",
+        details: {
+          sqlitePath,
+          seedPath: seedExists ? seedPath : null,
+          actions,
+          missingCriticalTables: [...sqliteCriticalTables],
+          migrationError: summarizeError(error),
+        },
+      };
+    }
   }
 
+  const sqliteLooksPlaintext = hasPlaintextSqliteHeader(sqlitePath);
   let inspection = await inspectSqliteSchema(sqlitePath);
   if (!inspection.ok) {
+    if (!sqliteLooksPlaintext) {
+      return {
+        ready: false,
+        summary:
+          inspection.error ||
+          "Encrypted SQLite database could not be opened with the current desktop key.",
+        details: {
+          sqlitePath,
+          seedPath: seedExists ? seedPath : null,
+          actions,
+          missingCriticalTables: inspection.missingCriticalTables,
+          inspectionError: inspection.error,
+        },
+      };
+    }
+
     if (!seedExists) {
       return {
         ready: false,
@@ -312,10 +471,36 @@ async function provisionSqliteDatabase(sqlitePath, seedPath) {
     }
 
     backupSqliteArtifacts(sqlitePath, "invalid-schema");
-    copyBundledSqliteSeed(seedPath, sqlitePath);
+    if (encryptionRequired) {
+      const tempPath = `${sqlitePath}.reseed`;
+      try {
+        await createEncryptedSqliteTempFromSource(seedPath, tempPath);
+        removeSqliteArtifacts(sqlitePath);
+        fs.renameSync(tempPath, sqlitePath);
+      } catch (error) {
+        removeSqliteArtifacts(tempPath);
+        return {
+          ready: false,
+          summary: "Failed to rebuild the encrypted local SQLite database from the bundled seed.",
+          details: {
+            sqlitePath,
+            seedPath,
+            actions,
+            missingCriticalTables: inspection.missingCriticalTables,
+            inspectionError: inspection.error,
+            encryptionError: summarizeError(error),
+          },
+        };
+      }
+    } else {
+      copyBundledSqliteSeed(seedPath, sqlitePath);
+    }
     actions.push(
       "replaced the local SQLite database with the bundled seed after schema validation failed"
     );
+    if (encryptionRequired) {
+      actions.push("encrypted the rebuilt local SQLite database with the desktop installation key");
+    }
     inspection = await inspectSqliteSchema(sqlitePath);
   }
 
@@ -339,13 +524,15 @@ async function provisionSqliteDatabase(sqlitePath, seedPath) {
     ready: true,
     summary:
       actions.length > 0
-        ? "SQLite database provisioned from the bundled seed."
+        ? "SQLite database prepared for the local runtime."
         : "SQLite database schema already available.",
     details: {
       sqlitePath,
       seedPath: seedExists ? seedPath : null,
       actions,
       tableCount: inspection.tableNames.length,
+      sqliteEncryption:
+        sqliteEncryptionConfig?.mode || (sqliteEncryptionConfigError ? "invalid" : "off"),
     },
   };
 }
@@ -436,8 +623,13 @@ async function createDatabase(sqlitePathOverride = null) {
   if (databaseBackend === "sqlite") {
     const sqlitePath =
       sqlitePathOverride || resolveDefaultSqlitePath(activeBrand, storageRoot);
-    sqliteDb = new SqliteD1Database(sqlitePath);
-    console.log(`[desktop-server] SQLite database: ${sqlitePath}`);
+    sqliteDb = createDesktopSqliteDatabase(
+      sqlitePath,
+      sqliteEncryptionConfig || resolveDesktopSqliteEncryptionConfig(process.env)
+    );
+    console.log(
+      `[desktop-server] SQLite database: ${sqlitePath} (encryption=${sqliteEncryptionConfig?.mode || "off"})`
+    );
     return sqliteDb;
   }
 

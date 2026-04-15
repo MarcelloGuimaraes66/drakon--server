@@ -2,6 +2,7 @@
 #include "LocalBackendHost.h"
 
 #include "AppRuntimeConfig.h"
+#include "DesktopDatabaseKeyStore.h"
 #include "SecureLocalStore.h"
 #include "../BootstrapTrace.h"
 
@@ -409,6 +410,25 @@ namespace DrakonDesktop::platform
         startupInfo.hStdError = logHandle;
         startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
+        auto const packagedDesktopUsesSqlite = !config.backendUsesTsx;
+        auto const desktopBackend = packagedDesktopUsesSqlite
+            ? std::wstring(L"sqlite")
+            : (config.brandId == "drakon" ? std::wstring(L"postgres") : std::wstring(L"sqlite"));
+        auto const desktopSqliteEncryptionMode = packagedDesktopUsesSqlite ? std::wstring(L"required") : std::wstring(L"off");
+        std::wstring desktopSqliteKeyHex;
+        if (packagedDesktopUsesSqlite)
+        {
+            auto const protectedSqliteKey = GetOrCreateDesktopSqliteKeyHex(config.serviceSessionDirectory);
+            if (!protectedSqliteKey.has_value())
+            {
+                error = L"Unable to read or create the protected desktop SQLite key.";
+                CloseHandle(logHandle);
+                return false;
+            }
+
+            desktopSqliteKeyHex = AsciiToWide(*protectedSqliteKey);
+        }
+
         PROCESS_INFORMATION processInfo{};
         std::wstring commandLine;
         if (config.backendUsesTsx)
@@ -425,11 +445,6 @@ namespace DrakonDesktop::platform
                 config.desktopServerScriptPath.wstring() + L"\"";
         }
 
-        auto const packagedDesktopUsesSqlite = !config.backendUsesTsx;
-        auto const desktopBackend = packagedDesktopUsesSqlite
-            ? std::wstring(L"sqlite")
-            : (config.brandId == "drakon" ? std::wstring(L"postgres") : std::wstring(L"sqlite"));
-
         auto environmentBlock = BuildEnvironmentBlock({
             { L"DRAKON_WORKSPACE_ROOT", config.workspaceRoot.wstring() },
             { L"APP_RUNTIME_ROOT", config.runtimeRoot.wstring() },
@@ -443,6 +458,11 @@ namespace DrakonDesktop::platform
             { L"APP_SERVICE_SESSION_DIR", config.serviceSessionDirectory.wstring() },
             { L"STORAGE_ROOT", config.storageRoot.wstring() },
             { L"APP_DB_BACKEND", desktopBackend },
+            { L"APP_SQLITE_ENCRYPTION", desktopSqliteEncryptionMode },
+            { L"APP_SQLITE_KEY_HEX", desktopSqliteKeyHex },
+            { L"APP_SQLITE_KEY_VERSION", packagedDesktopUsesSqlite ? std::wstring(L"v1") : std::wstring{} },
+            { L"APP_SQLITE_CIPHER", packagedDesktopUsesSqlite ? std::wstring(L"sqlcipher") : std::wstring{} },
+            { L"APP_SQLITE_LEGACY", packagedDesktopUsesSqlite ? std::wstring(L"4") : std::wstring{} },
             { L"APP_PROVISIONED_EXE_ID", AsciiToWide(provisionedExeId) },
         });
 

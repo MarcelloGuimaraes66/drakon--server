@@ -17,6 +17,7 @@ const runtimeBrandingRoot = path.join(runtimeRoot, "branding");
 const runtimeBootstrapRoot = path.join(runtimeRoot, "bootstrap");
 const runtimeDrakonSiteRoot = path.join(runtimeRoot, "drakonsite");
 const runtimeNodeRoot = path.join(runtimeRoot, "node");
+const runtimeNodeModulesRoot = path.join(runtimeRoot, "node_modules");
 const bundledBackendPath = path.join(runtimeRoot, "desktop-local-server.cjs");
 const configPath = path.join(workspaceRoot, "brand.config.json");
 const brandSelectorPath = path.join(workspaceRoot, "brand.txt");
@@ -69,8 +70,10 @@ await fs.mkdir(runtimeBrandingRoot, { recursive: true });
 await fs.mkdir(runtimeBootstrapRoot, { recursive: true });
 await fs.mkdir(runtimeDrakonSiteRoot, { recursive: true });
 await fs.mkdir(runtimeNodeRoot, { recursive: true });
+await fs.mkdir(runtimeNodeModulesRoot, { recursive: true });
 
 await bundleDesktopLocalBackend();
+await stageDesktopNativeNodePackages();
 await fs.copyFile(configPath, path.join(stageRoot, "brand.config.json"));
 await fs.copyFile(configPath, path.join(runtimeRoot, "brand.config.json"));
 if (await exists(brandSelectorPath)) {
@@ -126,6 +129,7 @@ async function bundleDesktopLocalBackend() {
     },
     bundle: true,
     conditions: ["node", "require", "default"],
+    external: ["better-sqlite3-multiple-ciphers"],
     format: "cjs",
     logLevel: "info",
     minify: false,
@@ -135,6 +139,25 @@ async function bundleDesktopLocalBackend() {
     sourcemap: false,
     target: "node22",
   });
+}
+
+async function stageDesktopNativeNodePackages() {
+  for (const packageName of [
+    "better-sqlite3-multiple-ciphers",
+    "bindings",
+    "file-uri-to-path",
+  ]) {
+    const sourcePath = path.join(
+      drakonSiteRoot,
+      "node_modules",
+      ...packageName.split("/")
+    );
+    const destinationPath = path.join(
+      runtimeNodeModulesRoot,
+      ...packageName.split("/")
+    );
+    await copyDir(sourcePath, destinationPath);
+  }
 }
 
 async function copyBrandAsset(relativeSourcePath, destinationDir, stem, brandId) {

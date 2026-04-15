@@ -74,6 +74,9 @@
     <ClCompile Include="Platform\LocalBackendHost.cpp">
       <Filter>Platform</Filter>
     </ClCompile>
+    <ClCompile Include="Platform\DesktopDatabaseKeyStore.cpp">
+      <Filter>Platform</Filter>
+    </ClCompile>
     <ClCompile Include="Platform\PerceptrumRuntimeHost.cpp">
       <Filter>Platform</Filter>
     </ClCompile>
@@ -141,6 +144,9 @@
       <Filter>Resources</Filter>
     </ClInclude>
     <ClInclude Include="Platform\LocalBackendHost.h">
+      <Filter>Platform</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\DesktopDatabaseKeyStore.h">
       <Filter>Platform</Filter>
     </ClInclude>
     <ClInclude Include="Platform\PerceptrumRuntimeHost.h">
