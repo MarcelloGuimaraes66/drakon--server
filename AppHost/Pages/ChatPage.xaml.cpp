@@ -218,7 +218,7 @@ namespace winrt::DrakonDesktop::implementation
         }
         tierCombo.SelectedIndex(0);
 
-        for (auto fps : { 1, 2, 5, 10 })
+        for (auto fps : { 1, 2, 5 })
         {
             ComboBoxItem item;
             item.Content(box_value(to_hstring(fps) + L" FPS"));

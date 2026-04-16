@@ -1559,6 +1559,11 @@ CREATE TABLE public.video_uploads (
     original_name text,
     mime_type text,
     size_bytes integer,
+    thumbnail_filename text,
+    thumbnail_width integer,
+    thumbnail_height integer,
+    duration_seconds double precision,
+    preview_frame_seconds double precision,
     created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );

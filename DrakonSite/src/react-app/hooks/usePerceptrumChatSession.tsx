@@ -540,7 +540,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
       runningResolution,
     }: SendMessageOptions) => {
       const targetSessionId = sessionIdOverride ?? sessionId;
-      if (!targetSessionId || (!content.trim() && !uploadedImageBase64 && !uploadedVideoId)) return;
+      if (!targetSessionId || (!content.trim() && !uploadedImageBase64 && !uploadedVideoId)) return false;
 
       setIsLoading(true);
       setError(null);
@@ -581,7 +581,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
             sanitizeAiApiErrorText((data as any).message) || "OpenAI API key is required in Settings."
           );
           setIsLoading(false);
-          return;
+          return false;
         }
         if (isZAiKeyRequiredError(data)) {
           emitZAiKeyRequiredPrompt();
@@ -590,7 +590,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
             sanitizeAiApiErrorText((data as any).message) || "Z.ai API key is required in Settings."
           );
           setIsLoading(false);
-          return;
+          return false;
         }
 
         if (!response.ok) {
@@ -614,6 +614,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         upsertMessages((data as any).messages);
 
         // Keep loading state active (will be cleared when final answer arrives via WebSocket)
+        return true;
       } catch (err) {
         console.error("Failed to send message:", err);
         setError(
@@ -623,6 +624,7 @@ export function usePerceptrumChatSession({ sessionId, onMessagesUpdate }: ChatSe
         );
         setWarning(null);
         setIsLoading(false);
+        return false;
       }
     },
     [sessionId, upsertMessages]

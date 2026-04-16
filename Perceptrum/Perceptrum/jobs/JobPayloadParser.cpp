@@ -183,7 +183,7 @@ static int normalizeModelFpsValue(
 
     int effective = raw > 0 ? raw : fallback;
     if (effective < 1) effective = 1;
-    if (effective > 10) effective = 10;
+    if (effective > 5) effective = 5;
     return effective;
 }
 

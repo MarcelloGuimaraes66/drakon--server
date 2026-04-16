@@ -39,9 +39,17 @@ const port = Number(process.env.PORT || 4000);
 const bindHost = process.env.APP_BIND_HOST || "127.0.0.1";
 const runtimeProfile = (process.env.APP_RUNTIME_ENV || "local").toLowerCase();
 const isServerRuntime = runtimeProfile === "server";
+const moduleFilename =
+  typeof __filename === "string" && __filename
+    ? __filename
+    : import.meta?.url
+      ? fileURLToPath(import.meta.url)
+      : "";
 const runtimeRoot = process.env.APP_RUNTIME_ROOT
   ? path.resolve(process.env.APP_RUNTIME_ROOT)
-  : path.dirname(fileURLToPath(import.meta.url));
+  : moduleFilename
+    ? path.dirname(moduleFilename)
+    : path.resolve(process.cwd(), "..");
 const storageRoot = process.env.STORAGE_ROOT
   ? path.resolve(process.env.STORAGE_ROOT)
   : path.resolve(process.cwd(), "storage");

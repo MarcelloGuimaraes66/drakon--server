@@ -1752,7 +1752,7 @@ struct AlertValidationMeta_ {
 
 static int clampModelInputFps_(int fps) {
     if (fps < 1) return 1;
-    if (fps > 10) return 10;
+    if (fps > 5) return 5;
     return fps;
 }
 

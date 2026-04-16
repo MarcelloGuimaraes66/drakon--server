@@ -6772,6 +6772,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
         `).run();
       }
 
+      if (await tableExists("video_uploads")) {
+        await addColumnIfMissing(`ALTER TABLE video_uploads ADD COLUMN thumbnail_filename TEXT`);
+        await addColumnIfMissing(`ALTER TABLE video_uploads ADD COLUMN thumbnail_width INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE video_uploads ADD COLUMN thumbnail_height INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE video_uploads ADD COLUMN duration_seconds REAL`);
+        await addColumnIfMissing(`ALTER TABLE video_uploads ADD COLUMN preview_frame_seconds REAL`);
+      }
+
       if (await tableExists("subscription_token_usage")) {
         await db.prepare(`
           CREATE INDEX IF NOT EXISTS idx_subscription_token_usage_subscription_event_time
@@ -23421,17 +23429,38 @@ app.get("/api/logout", async (c) => {
 // Video upload endpoint
 app.post("/api/video-uploads", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  let uploadedVideoStorageKey: string | null = null;
+  let uploadedThumbnailStorageKey: string | null = null;
 
   console.log("[VIDEO UPLOAD] Received upload request from user:", user.id);
 
   try {
     const formData = await c.req.formData();
-    const file = formData.get("file") as File;
+    const fileEntry = formData.get("file");
+    const thumbnailEntry = formData.get("thumbnail");
+    const durationEntry = formData.get("duration_seconds");
+    const previewFrameEntry = formData.get("preview_frame_seconds");
 
-    if (!file) {
+    const parseOptionalNonNegativeNumber = (value: unknown): number | null => {
+      if (typeof value !== "string" || !value.trim()) return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    };
+
+    if (!(fileEntry instanceof File)) {
       console.log("[VIDEO UPLOAD] Error: No file provided");
       return c.json({ error: "No file provided" }, 400);
     }
+
+    const file = fileEntry;
+    const thumbnailFile = thumbnailEntry instanceof File ? thumbnailEntry : null;
+    if (thumbnailEntry !== null && thumbnailFile === null) {
+      console.log("[VIDEO UPLOAD] Error: Invalid thumbnail payload");
+      return c.json({ error: "Invalid thumbnail payload" }, 400);
+    }
+
+    const durationSeconds = parseOptionalNonNegativeNumber(durationEntry);
+    const previewFrameSeconds = parseOptionalNonNegativeNumber(previewFrameEntry);
 
     // Validate file type
     const allowedTypes = ["video/mp4", "video/webm", "video/quicktime"];
@@ -23457,11 +23486,44 @@ app.post("/api/video-uploads", anyAuthMiddleware, async (c) => {
       }, 400);
     }
 
+    let thumbnailFilename: string | null = null;
+    let thumbnailWidth: number | null = null;
+    let thumbnailHeight: number | null = null;
+
+    if (thumbnailFile) {
+      const allowedThumbnailTypes = ["image/jpeg", "image/png", "image/webp"];
+      if (!allowedThumbnailTypes.includes(thumbnailFile.type)) {
+        console.log("[VIDEO UPLOAD] Error: Invalid thumbnail type:", thumbnailFile.type);
+        return c.json({ error: "Invalid thumbnail type" }, 400);
+      }
+
+      const maxThumbnailSize = 5 * 1024 * 1024;
+      if (thumbnailFile.size > maxThumbnailSize) {
+        console.log("[VIDEO UPLOAD] Error: Thumbnail too large:", thumbnailFile.size, "bytes");
+        return c.json({ error: "Thumbnail file is too large." }, 400);
+      }
+
+      thumbnailWidth = parseOptionalNonNegativeNumber(formData.get("thumbnail_width"));
+      thumbnailHeight = parseOptionalNonNegativeNumber(formData.get("thumbnail_height"));
+    }
+
     // Generate storage key
     const timestamp = Date.now();
     const random = Math.random().toString(36).substring(2, 15);
     const extension = fileName.substring(fileName.lastIndexOf("."));
     const storageKey = `videos/${user.id}/${timestamp}-${random}${extension}`;
+    uploadedVideoStorageKey = storageKey;
+
+    if (thumbnailFile) {
+      const thumbnailExtension =
+        thumbnailFile.type === "image/png"
+          ? ".png"
+          : thumbnailFile.type === "image/webp"
+            ? ".webp"
+            : ".jpg";
+      thumbnailFilename = `video_upload_${String(user.id).replace(/[^a-zA-Z0-9_-]/g, "_")}_${timestamp}_${random}${thumbnailExtension}`;
+      uploadedThumbnailStorageKey = `thumbs/${thumbnailFilename}`;
+    }
 
     console.log("[VIDEO UPLOAD] Uploading to R2:", storageKey);
 
@@ -23473,14 +23535,41 @@ app.post("/api/video-uploads", anyAuthMiddleware, async (c) => {
       },
     });
 
+    if (thumbnailFile && uploadedThumbnailStorageKey) {
+      const thumbnailBuffer = await thumbnailFile.arrayBuffer();
+      await c.env.R2_BUCKET.put(uploadedThumbnailStorageKey, thumbnailBuffer, {
+        httpMetadata: {
+          contentType: thumbnailFile.type,
+        },
+      });
+    }
+
     // Generate public URL
-    const publicUrl = `${c.req.header("origin")}/api/video-downloads/${encodeURIComponent(storageKey)}`;
+    const requestOrigin = c.req.header("origin") || new URL(c.req.url).origin;
+    const publicUrl = `${requestOrigin}/api/video-downloads/${encodeURIComponent(storageKey)}`;
+    const thumbnailUrl = thumbnailFilename
+      ? `/api/thumbnails/${encodeURIComponent(thumbnailFilename)}`
+      : null;
 
     // Insert into database
     const now = new Date().toISOString();
     const result = await c.env.DB.prepare(
-      `INSERT INTO video_uploads (user_id, storage_key, public_url, original_name, mime_type, size_bytes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO video_uploads (
+         user_id,
+         storage_key,
+         public_url,
+         original_name,
+         mime_type,
+         size_bytes,
+         thumbnail_filename,
+         thumbnail_width,
+         thumbnail_height,
+         duration_seconds,
+         preview_frame_seconds,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         user.id,
@@ -23489,6 +23578,11 @@ app.post("/api/video-uploads", anyAuthMiddleware, async (c) => {
         file.name,
         file.type,
         file.size,
+        thumbnailFilename,
+        thumbnailWidth,
+        thumbnailHeight,
+        durationSeconds,
+        previewFrameSeconds,
         now,
         now
       )
@@ -23506,10 +23600,91 @@ app.post("/api/video-uploads", anyAuthMiddleware, async (c) => {
       size_bytes: file.size,
       created_at: now,
       storage_key: storageKey,
+      thumbnail_url: thumbnailUrl,
+      thumbnail_filename: thumbnailFilename,
+      thumbnail_width: thumbnailWidth,
+      thumbnail_height: thumbnailHeight,
+      duration_seconds: durationSeconds,
+      preview_frame_seconds: previewFrameSeconds,
     }, 201);
   } catch (error) {
     console.error("[VIDEO UPLOAD] Error uploading video:", error);
+    if (uploadedThumbnailStorageKey) {
+      try {
+        await c.env.R2_BUCKET.delete(uploadedThumbnailStorageKey);
+      } catch (cleanupError) {
+        console.warn("[VIDEO UPLOAD] Failed to delete uploaded thumbnail after error:", cleanupError);
+      }
+    }
+    if (uploadedVideoStorageKey) {
+      try {
+        await c.env.R2_BUCKET.delete(uploadedVideoStorageKey);
+      } catch (cleanupError) {
+        console.warn("[VIDEO UPLOAD] Failed to delete uploaded video after error:", cleanupError);
+      }
+    }
     return c.json({ error: "Failed to upload video" }, 500);
+  }
+});
+
+app.delete("/api/video-uploads/:id", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const uploadId = Number.parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(uploadId) || uploadId <= 0) {
+    return c.json({ error: "Invalid video upload id" }, 400);
+  }
+
+  const videoUpload = await c.env.DB.prepare(
+    `SELECT id, storage_key, thumbnail_filename
+       FROM video_uploads
+      WHERE id = ? AND user_id = ?`
+  )
+    .bind(uploadId, user.id)
+    .first();
+
+  if (!videoUpload) {
+    return c.json({ error: "Video upload not found" }, 404);
+  }
+
+  const referencedMessage = await c.env.DB.prepare(
+    `SELECT id
+       FROM chat_messages
+      WHERE user_id = ?
+        AND role = 'user'
+        AND json_extract(COALESCE(camera_selection_json, '{}'), '$.uploaded_video_id') = ?
+      LIMIT 1`
+  )
+    .bind(user.id, uploadId)
+    .first();
+
+  if (referencedMessage) {
+    return c.json({ error: "Video upload is already attached to a chat message" }, 409);
+  }
+
+  try {
+    const storageKey =
+      typeof (videoUpload as any).storage_key === "string" ? String((videoUpload as any).storage_key) : "";
+    const thumbnailFilename =
+      typeof (videoUpload as any).thumbnail_filename === "string"
+        ? String((videoUpload as any).thumbnail_filename)
+        : "";
+
+    if (storageKey) {
+      await c.env.R2_BUCKET.delete(storageKey);
+    }
+    if (thumbnailFilename) {
+      await c.env.R2_BUCKET.delete(`thumbs/${thumbnailFilename}`);
+    }
+
+    await c.env.DB.prepare("DELETE FROM video_uploads WHERE id = ? AND user_id = ?")
+      .bind(uploadId, user.id)
+      .run();
+
+    return c.json({ success: true });
+  } catch (error) {
+    console.error("[VIDEO UPLOAD DELETE] Failed to delete upload:", error);
+    return c.json({ error: "Failed to delete video upload" }, 500);
   }
 });
 
@@ -42030,6 +42205,15 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
 
   // Handle uploaded video reference
   let uploadedVideoUrl: string | null = null;
+  let uploadedVideoOriginalName: string | null = null;
+  let uploadedVideoMimeType: string | null = null;
+  let uploadedVideoSizeBytes: number | null = null;
+  let uploadedVideoThumbnailFilename: string | null = null;
+  let uploadedVideoThumbnailUrl: string | null = null;
+  let uploadedVideoThumbnailWidth: number | null = null;
+  let uploadedVideoThumbnailHeight: number | null = null;
+  let uploadedVideoDurationSeconds: number | null = null;
+  let uploadedVideoPreviewFrameSeconds: number | null = null;
   if (body.uploaded_video_id) {
     console.log("[CHAT MESSAGE] Looking up video upload ID:", body.uploaded_video_id);
     
@@ -42041,6 +42225,52 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
 
     if (videoUpload) {
       uploadedVideoUrl = (videoUpload as any).public_url;
+      uploadedVideoOriginalName =
+        typeof (videoUpload as any).original_name === "string"
+          ? String((videoUpload as any).original_name)
+          : null;
+      uploadedVideoMimeType =
+        typeof (videoUpload as any).mime_type === "string"
+          ? String((videoUpload as any).mime_type)
+          : null;
+      uploadedVideoSizeBytes =
+        typeof (videoUpload as any).size_bytes === "number"
+          ? Number((videoUpload as any).size_bytes)
+          : typeof (videoUpload as any).size_bytes === "string"
+            ? Number((videoUpload as any).size_bytes)
+            : null;
+      uploadedVideoThumbnailFilename =
+        typeof (videoUpload as any).thumbnail_filename === "string" &&
+        String((videoUpload as any).thumbnail_filename).trim()
+          ? String((videoUpload as any).thumbnail_filename).trim()
+          : null;
+      uploadedVideoThumbnailUrl = uploadedVideoThumbnailFilename
+        ? `/api/thumbnails/${encodeURIComponent(uploadedVideoThumbnailFilename)}`
+        : null;
+      uploadedVideoThumbnailWidth =
+        typeof (videoUpload as any).thumbnail_width === "number"
+          ? Number((videoUpload as any).thumbnail_width)
+          : typeof (videoUpload as any).thumbnail_width === "string"
+            ? Number((videoUpload as any).thumbnail_width)
+            : null;
+      uploadedVideoThumbnailHeight =
+        typeof (videoUpload as any).thumbnail_height === "number"
+          ? Number((videoUpload as any).thumbnail_height)
+          : typeof (videoUpload as any).thumbnail_height === "string"
+            ? Number((videoUpload as any).thumbnail_height)
+            : null;
+      uploadedVideoDurationSeconds =
+        typeof (videoUpload as any).duration_seconds === "number"
+          ? Number((videoUpload as any).duration_seconds)
+          : typeof (videoUpload as any).duration_seconds === "string"
+            ? Number((videoUpload as any).duration_seconds)
+            : null;
+      uploadedVideoPreviewFrameSeconds =
+        typeof (videoUpload as any).preview_frame_seconds === "number"
+          ? Number((videoUpload as any).preview_frame_seconds)
+          : typeof (videoUpload as any).preview_frame_seconds === "string"
+            ? Number((videoUpload as any).preview_frame_seconds)
+            : null;
       console.log("[CHAT MESSAGE] ✓ Found video upload. URL:", uploadedVideoUrl);
     } else {
       console.log("[CHAT MESSAGE] WARNING: Video upload not found for ID:", body.uploaded_video_id);
@@ -42051,6 +42281,15 @@ app.post("/api/chat/sessions/:id/messages", anyAuthMiddleware, async (c) => {
   const videoMetadata = body.uploaded_video_id ? JSON.stringify({
     uploaded_video_id: body.uploaded_video_id,
     uploaded_video_url: uploadedVideoUrl,
+    uploaded_video_original_name: uploadedVideoOriginalName,
+    uploaded_video_mime_type: uploadedVideoMimeType,
+    uploaded_video_size_bytes: uploadedVideoSizeBytes,
+    uploaded_video_thumbnail_filename: uploadedVideoThumbnailFilename,
+    uploaded_video_thumbnail_url: uploadedVideoThumbnailUrl,
+    uploaded_video_thumbnail_width: uploadedVideoThumbnailWidth,
+    uploaded_video_thumbnail_height: uploadedVideoThumbnailHeight,
+    uploaded_video_duration_seconds: uploadedVideoDurationSeconds,
+    uploaded_video_preview_frame_seconds: uploadedVideoPreviewFrameSeconds,
   }) : null;
 
   const userMessageInsert = await c.env.DB.prepare(

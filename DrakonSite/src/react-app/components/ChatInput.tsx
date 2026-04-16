@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { Image as ImageIcon, Plus, Send, Video, X } from "lucide-react";
+import { Image as ImageIcon, Plus, Send, Video } from "lucide-react";
+import UploadedVideoAttachment from "@/react-app/components/UploadedVideoAttachment";
 import {
   FACE_ID_MAX_IMAGE_SIDE_PX,
   FACE_ID_MAX_UPLOAD_BYTES,
   normalizeFaceIdImage,
 } from "@/react-app/utils/faceIdImage";
+import { generateVideoThumbnail } from "@/react-app/utils/videoThumbnail";
+import type { UploadedVideoAttachment as UploadedVideoAttachmentData, VideoUploadResponse } from "@/shared/types";
 
 const CHAT_INPUT_MAX_HEIGHT_PX = 180;
 const CHAT_INPUT_BASE_HEIGHT_PX = {
@@ -12,12 +15,12 @@ const CHAT_INPUT_BASE_HEIGHT_PX = {
   "chat-page": 48,
 } as const;
 
-interface UploadedVideo {
-  id: number;
-  publicUrl: string;
-  originalName: string;
-  sizeBytes: number;
-}
+const SAFE_VIDEO_UPLOAD_UI_MESSAGES = new Set<string>([
+  "Please select a video file (MP4, WebM, or MOV).",
+  "Video file is too large. Maximum size is 500MB.",
+  "Your session expired. Please sign in again and retry the video upload.",
+  "Failed to upload video. Please try again.",
+]);
 
 interface ChatInputProps {
   value: string;
@@ -33,9 +36,80 @@ interface ChatInputProps {
   uploadedImage?: string | null;
   onImageUpload?: (base64: string) => void;
   onImageRemove?: () => void;
-  uploadedVideo?: UploadedVideo | null;
-  onVideoUpload?: (video: UploadedVideo) => void;
+  uploadedVideo?: UploadedVideoAttachmentData | null;
+  onVideoUpload?: (video: UploadedVideoAttachmentData) => void;
   onVideoRemove?: () => void;
+}
+
+function buildThumbnailFileName(originalName: string, mimeType: string): string {
+  const baseName = originalName.replace(/\.[^.]+$/, "").trim() || "video-preview";
+  const extension =
+    mimeType === "image/png" ? ".png" : mimeType === "image/webp" ? ".webp" : ".jpg";
+  return `${baseName}-thumb${extension}`;
+}
+
+function mapVideoUploadResponseToAttachment(
+  response: VideoUploadResponse,
+  fallbackThumbnailUrl: string | null = null,
+): UploadedVideoAttachmentData {
+  return {
+    id: response.id,
+    publicUrl: response.public_url,
+    originalName: response.original_name,
+    sizeBytes: response.size_bytes,
+    mimeType: response.mime_type,
+    thumbnailUrl:
+      typeof response.thumbnail_url === "string" && response.thumbnail_url.trim()
+        ? response.thumbnail_url.trim()
+        : fallbackThumbnailUrl,
+    thumbnailFilename:
+      typeof response.thumbnail_filename === "string" && response.thumbnail_filename.trim()
+        ? response.thumbnail_filename.trim()
+        : null,
+    thumbnailWidth:
+      typeof response.thumbnail_width === "number" && Number.isFinite(response.thumbnail_width)
+        ? response.thumbnail_width
+        : null,
+    thumbnailHeight:
+      typeof response.thumbnail_height === "number" && Number.isFinite(response.thumbnail_height)
+        ? response.thumbnail_height
+        : null,
+    durationSeconds:
+      typeof response.duration_seconds === "number" && Number.isFinite(response.duration_seconds)
+        ? response.duration_seconds
+        : null,
+    previewFrameSeconds:
+      typeof response.preview_frame_seconds === "number" && Number.isFinite(response.preview_frame_seconds)
+        ? response.preview_frame_seconds
+        : null,
+  };
+}
+
+function getSafeVideoUploadErrorMessage(status: number, errorBody: unknown): string {
+  const rawError =
+    typeof (errorBody as any)?.error === "string" ? String((errorBody as any).error).trim().toLowerCase() : "";
+
+  if (rawError.includes("invalid file type")) {
+    return "Please select a video file (MP4, WebM, or MOV).";
+  }
+
+  if (rawError.includes("too large")) {
+    return "Video file is too large. Maximum size is 500MB.";
+  }
+
+  if (status === 401 || status === 403) {
+    return "Your session expired. Please sign in again and retry the video upload.";
+  }
+
+  return "Failed to upload video. Please try again.";
+}
+
+function getSafeUnexpectedVideoUploadErrorMessage(error: unknown): string {
+  if (error instanceof Error && SAFE_VIDEO_UPLOAD_UI_MESSAGES.has(error.message)) {
+    return error.message;
+  }
+
+  return "Failed to upload video. Please try again.";
 }
 
 export default function ChatInput({
@@ -63,10 +137,13 @@ export default function ChatInput({
   const [isProcessing, setIsProcessing] = useState(false);
   const [isUploadingVideo, setIsUploadingVideo] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [pendingVideoPreview, setPendingVideoPreview] = useState<UploadedVideoAttachmentData | null>(null);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const isChatPageVariant = variant === "chat-page";
   const baseTextareaHeight = isChatPageVariant
     ? CHAT_INPUT_BASE_HEIGHT_PX["chat-page"]
     : CHAT_INPUT_BASE_HEIGHT_PX.default;
+  const displayedVideo = uploadedVideo ?? pendingVideoPreview;
 
   const syncTextareaHeight = () => {
     const textarea = textareaRef.current;
@@ -113,6 +190,13 @@ export default function ChatInput({
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
+  useEffect(() => {
+    if (uploadedVideo) {
+      setPendingVideoPreview(null);
+      setAttachmentError(null);
+    }
+  }, [uploadedVideo]);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (isRunning) return;
@@ -146,13 +230,21 @@ export default function ChatInput({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setAttachmentError(null);
+
     if (!file.type.startsWith("image/")) {
-      alert("Please select an image file (JPEG or PNG)");
+      setAttachmentError("Please select an image file (JPEG or PNG).");
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
       return;
     }
 
     if (file.size > FACE_ID_MAX_UPLOAD_BYTES) {
-      alert("Image file is too large. Please select an image under 10MB.");
+      setAttachmentError("Image file is too large. Please select an image under 10MB.");
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
       return;
     }
 
@@ -165,7 +257,7 @@ export default function ChatInput({
       onImageUpload?.(normalized.dataUrl);
     } catch (error) {
       console.error("Failed to process image:", error);
-      alert("Failed to process image. Please try another file.");
+      setAttachmentError("Failed to process image. Please try another file.");
     } finally {
       setIsProcessing(false);
       if (fileInputRef.current) {
@@ -182,12 +274,14 @@ export default function ChatInput({
   const handleSearchByFace = () => {
     setShowDropdown(false);
     if (uploadedImage || isProcessing) return;
+    setAttachmentError(null);
     fileInputRef.current?.click();
   };
 
   const handleSearchInVideo = () => {
     setShowDropdown(false);
-    if (uploadedVideo || isUploadingVideo) return;
+    if (uploadedVideo || pendingVideoPreview || isUploadingVideo) return;
+    setAttachmentError(null);
     videoInputRef.current?.click();
   };
 
@@ -195,22 +289,83 @@ export default function ChatInput({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    setAttachmentError(null);
+
     const allowedTypes = ["video/mp4", "video/webm", "video/quicktime"];
     if (!allowedTypes.includes(file.type)) {
-      alert("Please select a video file (MP4, WebM, or MOV)");
+      setAttachmentError("Please select a video file (MP4, WebM, or MOV).");
+      if (videoInputRef.current) {
+        videoInputRef.current.value = "";
+      }
       return;
     }
 
     if (file.size > 500 * 1024 * 1024) {
-      alert("Video file is too large. Maximum size is 500MB.");
+      setAttachmentError("Video file is too large. Maximum size is 500MB.");
+      if (videoInputRef.current) {
+        videoInputRef.current.value = "";
+      }
       return;
     }
 
     setIsUploadingVideo(true);
 
+    let thumbnailDataUrl: string | null = null;
+    let thumbnailBlob: Blob | null = null;
+    let thumbnailMimeType = "image/jpeg";
+    let thumbnailWidth: number | null = null;
+    let thumbnailHeight: number | null = null;
+    let durationSeconds: number | null = null;
+    let previewFrameSeconds: number | null = null;
+
     try {
+      try {
+        const thumbnail = await generateVideoThumbnail(file);
+        thumbnailDataUrl = thumbnail.dataUrl;
+        thumbnailBlob = thumbnail.blob;
+        thumbnailMimeType = thumbnail.mimeType;
+        thumbnailWidth = thumbnail.width;
+        thumbnailHeight = thumbnail.height;
+        durationSeconds = thumbnail.durationSeconds;
+        previewFrameSeconds = thumbnail.previewFrameSeconds;
+      } catch (thumbnailError) {
+        console.warn("Failed to generate local video thumbnail. Continuing without thumbnail.", thumbnailError);
+      }
+
+      setPendingVideoPreview({
+        originalName: file.name,
+        sizeBytes: file.size,
+        mimeType: file.type,
+        thumbnailUrl: thumbnailDataUrl,
+        thumbnailWidth,
+        thumbnailHeight,
+        durationSeconds,
+        previewFrameSeconds,
+      });
+
       const formData = new FormData();
       formData.append("file", file);
+      if (thumbnailBlob) {
+        formData.append(
+          "thumbnail",
+          new File([thumbnailBlob], buildThumbnailFileName(file.name, thumbnailMimeType), {
+            type: thumbnailMimeType,
+            lastModified: Date.now(),
+          }),
+        );
+      }
+      if (thumbnailWidth) {
+        formData.append("thumbnail_width", String(thumbnailWidth));
+      }
+      if (thumbnailHeight) {
+        formData.append("thumbnail_height", String(thumbnailHeight));
+      }
+      if (durationSeconds !== null) {
+        formData.append("duration_seconds", String(durationSeconds));
+      }
+      if (previewFrameSeconds !== null) {
+        formData.append("preview_frame_seconds", String(previewFrameSeconds));
+      }
 
       const res = await fetch("/api/video-uploads", {
         method: "POST",
@@ -219,20 +374,18 @@ export default function ChatInput({
       });
 
       if (!res.ok) {
-        throw new Error(`Video upload failed: ${res.status}`);
+        const errorBody = await res.json().catch(() => ({}));
+        throw new Error(getSafeVideoUploadErrorMessage(res.status, errorBody));
       }
 
-      const result = await res.json();
-
-      onVideoUpload?.({
-        id: result.id,
-        publicUrl: result.public_url,
-        originalName: result.original_name,
-        sizeBytes: result.size_bytes,
-      });
+      const result = (await res.json()) as VideoUploadResponse;
+      onVideoUpload?.(mapVideoUploadResponseToAttachment(result, thumbnailDataUrl));
+      setPendingVideoPreview(null);
+      setAttachmentError(null);
     } catch (error) {
       console.error("Failed to upload video:", error);
-      alert("Failed to upload video. Please try again.");
+      setPendingVideoPreview(null);
+      setAttachmentError(getSafeUnexpectedVideoUploadErrorMessage(error));
     } finally {
       setIsUploadingVideo(false);
       if (videoInputRef.current) {
@@ -242,17 +395,14 @@ export default function ChatInput({
   };
 
   const handleRemoveImage = () => {
+    setAttachmentError(null);
     onImageRemove?.();
   };
 
   const handleRemoveVideo = () => {
+    setPendingVideoPreview(null);
+    setAttachmentError(null);
     onVideoRemove?.();
-  };
-
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
   const actionButtonDisabled = isRunning
@@ -268,7 +418,7 @@ export default function ChatInput({
             : "flex flex-col gap-2"
         }
       >
-        {(uploadedImage || uploadedVideo) && (
+        {(uploadedImage || displayedVideo) && (
           <div className={isChatPageVariant ? "flex flex-wrap gap-3 px-1" : "flex flex-wrap gap-2"}>
             {uploadedImage && (
               <div className="relative inline-block">
@@ -287,34 +437,23 @@ export default function ChatInput({
                   className="absolute -right-2 -top-2 rounded-full bg-red-600 p-1 text-white transition-colors hover:bg-red-700"
                   aria-label="Remove image"
                 >
-                  <X className="h-3 w-3" />
+                  <span className="sr-only">Remove image</span>
+                  <svg className="h-3 w-3" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M2 2l8 8M10 2L2 10" />
+                  </svg>
                 </button>
               </div>
             )}
 
-            {uploadedVideo && (
-              <div
-                className={`flex max-w-[300px] items-center gap-2 px-3 py-2 ${
-                  isChatPageVariant
-                    ? "rounded-2xl border border-white/[0.08] bg-white/[0.04]"
-                    : "rounded-lg border border-gray-700 bg-gray-800"
-                }`}
-              >
-                <Video className="h-4 w-4 flex-shrink-0 text-sky-400" />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm text-gray-200">{uploadedVideo.originalName}</p>
-                  <p className="text-xs text-gray-500">{formatFileSize(uploadedVideo.sizeBytes)}</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleRemoveVideo}
-                  className="flex-shrink-0 rounded-full bg-red-600 p-1 text-white transition-colors hover:bg-red-700"
-                  aria-label="Remove video"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </div>
-            )}
+            {displayedVideo ? (
+              <UploadedVideoAttachment
+                attachment={displayedVideo}
+                mode="composer"
+                pendingLabel={isUploadingVideo ? "Uploading..." : null}
+                onRemove={uploadedVideo && !isUploadingVideo ? handleRemoveVideo : undefined}
+                disabled={isUploadingVideo}
+              />
+            ) : null}
           </div>
         )}
 
@@ -333,7 +472,7 @@ export default function ChatInput({
             accept="video/mp4,video/webm,video/quicktime"
             onChange={handleVideoSelect}
             className="hidden"
-            disabled={disabled || isUploadingVideo || !!uploadedVideo}
+            disabled={disabled || isUploadingVideo || !!uploadedVideo || !!pendingVideoPreview}
           />
 
           <div className="relative" ref={dropdownRef}>
@@ -377,7 +516,7 @@ export default function ChatInput({
                 <button
                   type="button"
                   onClick={handleSearchInVideo}
-                  disabled={!!uploadedVideo || isUploadingVideo}
+                  disabled={!!uploadedVideo || !!pendingVideoPreview || isUploadingVideo}
                   className={`w-full rounded-b-2xl px-4 py-3 text-left text-sm text-gray-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                     isChatPageVariant ? "hover:bg-white/[0.06]" : "rounded-b-lg hover:bg-gray-700"
                   }`}
@@ -432,6 +571,12 @@ export default function ChatInput({
         {isProcessing && <p className="text-xs text-gray-400">Processing image...</p>}
 
         {isUploadingVideo && <p className="text-xs text-gray-400">Uploading video...</p>}
+
+        {attachmentError && (
+          <p className="text-xs text-red-400" role="alert">
+            {attachmentError}
+          </p>
+        )}
       </div>
     </form>
   );

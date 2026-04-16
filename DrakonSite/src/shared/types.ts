@@ -133,6 +133,36 @@ export const SendChatMessageSchema = z.object({
   camera_id: z.number().optional(),
 });
 
+export interface UploadedVideoAttachment {
+  id?: number | null;
+  publicUrl?: string | null;
+  originalName?: string | null;
+  sizeBytes?: number | null;
+  mimeType?: string | null;
+  thumbnailUrl?: string | null;
+  thumbnailFilename?: string | null;
+  thumbnailWidth?: number | null;
+  thumbnailHeight?: number | null;
+  durationSeconds?: number | null;
+  previewFrameSeconds?: number | null;
+}
+
+export interface VideoUploadResponse {
+  id: number;
+  public_url: string;
+  original_name: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: string;
+  storage_key: string;
+  thumbnail_url?: string | null;
+  thumbnail_filename?: string | null;
+  thumbnail_width?: number | null;
+  thumbnail_height?: number | null;
+  duration_seconds?: number | null;
+  preview_frame_seconds?: number | null;
+}
+
 // Preferences schema
 export const UpdatePreferencesSchema = z.object({
   theme: z.enum(["light", "dark"]).optional(),

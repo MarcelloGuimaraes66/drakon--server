@@ -784,7 +784,7 @@ static json makeTemporalRuntimeGuardEnvelope_(
 static int clampRequestedModelFps_(int fps)
 {
     if (fps < 1) return 1;
-    if (fps > 10) return 10;
+    if (fps > 5) return 5;
     return fps;
 }
 
@@ -1381,6 +1381,7 @@ static std::string detectMachineTimezoneForBackendHeaders()
 
 // MAX seconds per Gemini video segment
 static constexpr int kMaxSegmentSeconds = 300;
+static constexpr int kMaxOpenAIVideoFramesPerRequest = 300;
 
 
 
@@ -15245,6 +15246,26 @@ static std::string buildUploadedVideoDownloadFailureAnswer_(
     }
 }
 
+static std::string buildUploadedVideoAnalysisFailureAnswer_(
+    const std::string& userLocale)
+{
+    switch (langFromLocale(userLocale)) {
+    case Lang::PT:
+        return "Nao consegui analisar o video enviado por completo com seguranca. Tente novamente.";
+    case Lang::ES:
+        return "No pude analizar por completo el video enviado con seguridad. Intenta nuevamente.";
+    case Lang::FR:
+        return "Je n'ai pas pu analyser completement la video envoyee de maniere fiable. Reessayez.";
+    case Lang::AR:
+        return "I couldn't reliably analyze the full uploaded video. Please try again.";
+    case Lang::ZH:
+        return "I couldn't reliably analyze the full uploaded video. Please try again.";
+    case Lang::EN:
+    default:
+        return "I couldn't reliably analyze the full uploaded video. Please try again.";
+    }
+}
+
 static std::string buildVideoSearchIndeterminateAnswer_(
     const std::string& userLocale)
 {
@@ -15759,6 +15780,779 @@ static std::vector<uint8_t> extractMp4ClipAtTime(
     Logger::instance().logDebug("agent", "extractMp4ClipAtTime: not implemented on this platform");
     return out;
 #endif
+}
+
+static int deriveSyntheticUploadedVideoCameraId_(const std::string& seed)
+{
+    const std::string normalizedSeed = trimAscii(seed.empty() ? std::string("uploaded_video") : seed);
+    const std::size_t rawHash = std::hash<std::string>{}(normalizedSeed);
+    const int positiveId = static_cast<int>((rawHash % 1000000000ULL) + 1ULL);
+    return -positiveId;
+}
+
+static bool parseClockTokenToSeconds_(const std::string& rawToken, double& outSeconds)
+{
+    outSeconds = 0.0;
+    const std::string token = trimAscii(rawToken);
+    if (token.empty()) {
+        return false;
+    }
+
+    int hh = 0;
+    int mm = 0;
+    double ss = 0.0;
+    if (sscanf_s(token.c_str(), "%d:%d:%lf", &hh, &mm, &ss) != 3) {
+        return false;
+    }
+    if (hh < 0 || mm < 0 || ss < 0.0) {
+        return false;
+    }
+
+    outSeconds =
+        static_cast<double>(hh * 3600) +
+        static_cast<double>(mm * 60) +
+        ss;
+    return outSeconds > 0.0;
+}
+
+static std::string compactProbeLogSnippet_(const std::string& raw, std::size_t maxChars = 320)
+{
+    if (raw.empty()) {
+        return std::string();
+    }
+
+    std::string compact;
+    compact.reserve((std::min)(raw.size(), maxChars));
+    bool lastWasSpace = false;
+    for (const char rawCh : raw) {
+        char ch = rawCh;
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            ch = ' ';
+        }
+        if (std::isspace(static_cast<unsigned char>(ch)) != 0) {
+            ch = ' ';
+        }
+        if (ch == ' ') {
+            if (lastWasSpace) {
+                continue;
+            }
+            lastWasSpace = true;
+        }
+        else {
+            lastWasSpace = false;
+        }
+        compact.push_back(ch);
+        if (compact.size() >= maxChars) {
+            break;
+        }
+    }
+    if (raw.size() > compact.size()) {
+        compact += "...";
+    }
+    return compact;
+}
+
+static bool probeUploadedVideoStatsWithFfmpeg_(
+    const std::string& videoPath,
+    double& outDurationSec,
+    double& outSourceFps,
+    int& outSourceFrameCount,
+    const std::string& logStreamId = "agent")
+{
+#ifdef _WIN32
+    const std::string effectiveLogStreamId =
+        trimAscii(logStreamId).empty() ? std::string("agent") : trimAscii(logStreamId);
+    auto logProbe = [&](const std::string& msg) {
+        Logger::instance().logDebug(
+            effectiveLogStreamId,
+            "probeUploadedVideoStatsWithFfmpeg_: " + msg);
+    };
+
+    if (videoPath.empty()) {
+        logProbe("video path is empty");
+        return false;
+    }
+    if (!fs::exists(videoPath)) {
+        logProbe("video path does not exist path=" + videoPath);
+        return false;
+    }
+
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+    if (!fs::exists(ffmpegPath)) {
+        logProbe("ffmpeg executable missing path=" + ffmpegPath.string());
+        return false;
+    }
+
+    const std::string command =
+        "\"" + ffmpegPath.string() + "\" -hide_banner -i \"" + videoPath + "\" 2>&1";
+    logProbe("running ffmpeg metadata probe path=" + videoPath +
+             " ffmpeg=" + ffmpegPath.string());
+    FILE* pipe = _popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        logProbe("failed to start ffmpeg metadata probe via _popen");
+        return false;
+    }
+
+    std::string output;
+    char buffer[512];
+    while (std::fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        output += buffer;
+    }
+    const int closeCode = _pclose(pipe);
+
+    if (output.empty()) {
+        logProbe("ffmpeg probe produced empty output close_code=" + std::to_string(closeCode));
+        return false;
+    }
+
+    double durationSec = 0.0;
+    std::string durationToken;
+    bool durationParsed = false;
+    const std::size_t durationPos = output.find("Duration:");
+    if (durationPos != std::string::npos) {
+        const std::size_t tokenStart = durationPos + std::string("Duration:").size();
+        const std::size_t tokenEnd = output.find(',', tokenStart);
+        durationToken =
+            tokenEnd == std::string::npos
+                ? output.substr(tokenStart)
+                : output.substr(tokenStart, tokenEnd - tokenStart);
+        durationParsed = parseClockTokenToSeconds_(durationToken, durationSec);
+    }
+
+    double detectedFps = 0.0;
+    std::string fpsSourceLine;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("Video:") == std::string::npos) {
+            continue;
+        }
+        fpsSourceLine = line;
+
+        std::size_t fpsPos = line.find(" fps");
+        while (fpsPos != std::string::npos) {
+            std::size_t tokenEnd = fpsPos;
+            while (tokenEnd > 0 &&
+                   std::isspace(static_cast<unsigned char>(line[tokenEnd - 1])) != 0)
+            {
+                --tokenEnd;
+            }
+            std::size_t tokenStart = tokenEnd;
+            while (tokenStart > 0) {
+                const char ch = line[tokenStart - 1];
+                if ((ch >= '0' && ch <= '9') || ch == '.') {
+                    --tokenStart;
+                    continue;
+                }
+                break;
+            }
+            if (tokenStart < tokenEnd) {
+                try {
+                    detectedFps = std::stod(line.substr(tokenStart, tokenEnd - tokenStart));
+                }
+                catch (...) {
+                    detectedFps = 0.0;
+                }
+                if (detectedFps > 0.0) {
+                    break;
+                }
+            }
+            fpsPos = line.find(" fps", fpsPos + 4);
+        }
+        if (detectedFps > 0.0) {
+            break;
+        }
+    }
+
+    if (durationSec <= 0.0) {
+        logProbe(
+            "failed to parse duration from ffmpeg output duration_token=" +
+            trimAscii(durationToken) +
+            " duration_parsed=" + std::string(durationParsed ? "true" : "false") +
+            " detected_fps=" + std::to_string(detectedFps) +
+            " close_code=" + std::to_string(closeCode) +
+            " output_preview=" + compactProbeLogSnippet_(output));
+        return false;
+    }
+
+    outDurationSec = durationSec;
+    if (detectedFps > 0.0) {
+        outSourceFps = detectedFps;
+        outSourceFrameCount =
+            (std::max)(0, static_cast<int>(std::llround(durationSec * detectedFps)));
+    }
+    logProbe(
+        "success duration_s=" + std::to_string(outDurationSec) +
+        " source_fps=" + std::to_string(outSourceFps) +
+        " source_frame_count=" + std::to_string(outSourceFrameCount) +
+        " close_code=" + std::to_string(closeCode) +
+        " duration_token=" + trimAscii(durationToken) +
+        " fps_line=" + compactProbeLogSnippet_(fpsSourceLine));
+    return true;
+#else
+    (void)videoPath;
+    (void)outDurationSec;
+    (void)outSourceFps;
+    (void)outSourceFrameCount;
+    (void)logStreamId;
+    return false;
+#endif
+}
+
+static nlohmann::json buildUploadVideoSequentialPlanEnvelope_(
+    const std::string& promptCore,
+    const std::string& language)
+{
+    const std::string normalizedPrompt = trimAscii(promptCore);
+    const std::string normalizedLanguage = trimAscii(language).empty()
+        ? std::string("en")
+        : trimAscii(language);
+    const std::string planHash =
+        temporal::computePromptRevisionHash(
+            normalizedPrompt + "\n[uploaded_video_continuation]",
+            "");
+
+    return nlohmann::json{
+        { "schema_version", "temporal-plan/1.0" },
+        { "plan_id", std::string("upload_continuation_") + planHash },
+        { "plan_hash", planHash },
+        { "prompt_fingerprint", {
+            { "prompt_core", normalizedPrompt },
+            { "alert_condition", "" },
+            { "negative_condition", "" },
+            { "input_type", "video" },
+            { "language", normalizedLanguage }
+        } },
+        { "intent_assessment", {
+            { "requires_temporal_engine", false },
+            { "selected_operator_types", nlohmann::json::array() }
+        } },
+        { "identity_policy", {
+            { "entity_scope", "per_camera" },
+            { "match_threshold", 0.80 },
+            { "new_entity_threshold", 0.62 },
+            { "unknown_threshold", 0.45 },
+            { "max_identity_age_seconds", 43200 },
+            { "discovery_mode", "guided" },
+            { "max_inferred_support_entities", 8 }
+        } },
+        { "entities", nlohmann::json::array({
+            nlohmann::json{ { "entity_key", "person" }, { "entity_type", "person" }, { "track_identity", true } },
+            nlohmann::json{ { "entity_key", "vehicle" }, { "entity_type", "vehicle" }, { "track_identity", true } },
+            nlohmann::json{ { "entity_key", "animal" }, { "entity_type", "animal" }, { "track_identity", true } },
+            nlohmann::json{ { "entity_key", "object" }, { "entity_type", "object" }, { "track_identity", false } }
+        }) },
+        { "event_catalog", nlohmann::json::array({
+            "present",
+            "entered_zone",
+            "left_zone",
+            "interaction",
+            "picked_up_object",
+            "handed_object",
+            "picked_phone",
+            "entered_vehicle",
+            "exited_vehicle",
+            "vehicle_arrived",
+            "vehicle_departed",
+            "opened_door",
+            "closed_door"
+        }) },
+        { "operators", nlohmann::json::array() },
+        { "runtime_variables", nlohmann::json::array() }
+    };
+}
+
+static bool probeUploadedVideoStatsForChat_(
+    const std::string& videoPath,
+    double& outDurationSec,
+    double& outSourceFps,
+    int& outSourceFrameCount,
+    const std::string& logStreamId = "agent")
+{
+    const std::string effectiveLogStreamId =
+        trimAscii(logStreamId).empty() ? std::string("agent") : trimAscii(logStreamId);
+    auto logProbe = [&](const std::string& msg) {
+        Logger::instance().logDebug(
+            effectiveLogStreamId,
+            "probeUploadedVideoStatsForChat_: " + msg);
+    };
+
+    outDurationSec = 0.0;
+    outSourceFps = 0.0;
+    outSourceFrameCount = 0;
+
+    if (videoPath.empty()) {
+        logProbe("video path is empty");
+        return false;
+    }
+    if (!fs::exists(videoPath)) {
+        logProbe("video path does not exist path=" + videoPath);
+        return false;
+    }
+
+    std::error_code fileSizeEc;
+    const auto fileSize = fs::file_size(videoPath, fileSizeEc);
+    logProbe(
+        "starting upload metadata probe path=" + videoPath +
+        " size_bytes=" +
+        (fileSizeEc ? std::string("unknown") : std::to_string(fileSize)));
+
+    cv::VideoCapture cap(videoPath);
+    if (cap.isOpened()) {
+        const double fps = cap.get(cv::CAP_PROP_FPS);
+        const double frameCount = cap.get(cv::CAP_PROP_FRAME_COUNT);
+        cap.release();
+
+        if (fps > 0.0) {
+            outSourceFps = fps;
+        }
+        if (frameCount > 0.0) {
+            outSourceFrameCount = (std::max)(0, static_cast<int>(std::llround(frameCount)));
+        }
+        if (outSourceFps > 0.0 && frameCount > 0.0) {
+            outDurationSec = frameCount / outSourceFps;
+        }
+        logProbe(
+            "OpenCV probe opened video source_fps=" + std::to_string(fps) +
+            " source_frame_count=" + std::to_string(frameCount) +
+            " computed_duration_s=" + std::to_string(outDurationSec));
+        if (outDurationSec > 0.0) {
+            logProbe("using OpenCV metadata");
+            return true;
+        }
+        logProbe("OpenCV metadata incomplete, falling back to ffmpeg probe");
+    }
+    else {
+        logProbe("OpenCV failed to open video, falling back to ffmpeg probe");
+    }
+
+    const bool ffmpegOk = probeUploadedVideoStatsWithFfmpeg_(
+        videoPath,
+        outDurationSec,
+        outSourceFps,
+        outSourceFrameCount,
+        effectiveLogStreamId);
+    if (ffmpegOk) {
+        logProbe(
+            "using ffmpeg metadata duration_s=" + std::to_string(outDurationSec) +
+            " source_fps=" + std::to_string(outSourceFps) +
+            " source_frame_count=" + std::to_string(outSourceFrameCount));
+    }
+    else {
+        logProbe("ffmpeg metadata probe failed");
+    }
+    return ffmpegOk;
+}
+
+static bool extractUploadedVideoSubclipToTempFile_(
+    const std::string& videoPath,
+    double startSeconds,
+    double durationSeconds,
+    const std::string& fileStem,
+    std::string& outClipPath)
+{
+    outClipPath.clear();
+    if (videoPath.empty() || !fs::exists(videoPath) || durationSeconds <= 0.0) {
+        return false;
+    }
+
+#ifdef _WIN32
+    startSeconds = (std::max)(0.0, startSeconds);
+    durationSeconds = (std::max)(0.001, durationSeconds);
+
+    auto formatFfmpegTime = [](double sec) -> std::string {
+        if (sec < 0.0) sec = 0.0;
+        const long long totalMs = static_cast<long long>(std::llround(sec * 1000.0));
+        const int ms = static_cast<int>(totalMs % 1000);
+        const long long totalSec = totalMs / 1000;
+        const int h = static_cast<int>(totalSec / 3600);
+        const int m = static_cast<int>((totalSec % 3600) / 60);
+        const int s = static_cast<int>(totalSec % 60);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", h, m, s, ms);
+        return std::string(buf);
+    };
+
+    fs::path tmpDir = fs::temp_directory_path() / AppBrand::kUploadedVideosTempDirName;
+    std::error_code ec;
+    fs::create_directories(tmpDir, ec);
+    if (ec) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractUploadedVideoSubclipToTempFile_: failed to create tmpDir " +
+                tmpDir.string() + " error=" + ec.message());
+        return false;
+    }
+
+    std::string normalizedStem = trimAscii(fileStem);
+    if (normalizedStem.empty()) {
+        normalizedStem = "upload_chunk";
+    }
+    for (char& ch : normalizedStem) {
+        const bool alphaLower = ch >= 'a' && ch <= 'z';
+        const bool alphaUpper = ch >= 'A' && ch <= 'Z';
+        const bool digit = ch >= '0' && ch <= '9';
+        const bool safePunct = ch == '_' || ch == '-';
+        if (!(alphaLower || alphaUpper || digit || safePunct)) {
+            ch = '_';
+        }
+    }
+
+    fs::path outMp4Path = sanitizeFilename(tmpDir / (normalizedStem + ".mp4"));
+    fs::path ffmpegPath = fs::path(getExecutableDir()) / "ffmpeg.exe";
+
+    const std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    const std::wstring inW = utf8ToWide(videoPath);
+    const std::wstring outW = utf8ToWide(outMp4Path.string());
+    const std::wstring ssW = utf8ToWide(formatFfmpegTime(startSeconds));
+    const std::wstring durW = utf8ToWide(formatFfmpegTime(durationSeconds));
+
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -y"
+        L" -i \"" + inW + L"\""
+        L" -ss " + ssW +
+        L" -t " + durW +
+        L" -map 0:v:0 -an "
+        L" -c:v libx264 -preset veryfast -crf 28 "
+        L" -movflags +faststart "
+        L" \"" + outW + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    const BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    if (!ok) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractUploadedVideoSubclipToTempFile_: CreateProcessW(ffmpeg) failed");
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (exitCode != 0) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractUploadedVideoSubclipToTempFile_: ffmpeg exit=" + std::to_string(exitCode));
+        fs::remove(outMp4Path, ec);
+        return false;
+    }
+
+    if (!fs::exists(outMp4Path)) {
+        Logger::instance().logDebug(
+            "agent",
+            "extractUploadedVideoSubclipToTempFile_: ffmpeg produced no output file");
+        return false;
+    }
+
+    outClipPath = outMp4Path.string();
+    return true;
+#else
+    (void)videoPath;
+    (void)startSeconds;
+    (void)durationSeconds;
+    (void)fileStem;
+    return false;
+#endif
+}
+
+static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
+    const std::string& uploadedVideoPath,
+    int requestedModelFps,
+    int syntheticCameraId,
+    const std::string& uploadSeed,
+    std::vector<std::string>& outAdditionalCleanupPaths,
+    const std::string& logStreamId = std::string(),
+    std::string* outFailureReason = nullptr)
+{
+    std::vector<EncodedVideoSegment> out;
+    if (outFailureReason != nullptr) {
+        *outFailureReason = std::string();
+    }
+
+    auto rememberCleanupPath = [&](const std::string& rawPath) {
+        const std::string path = trimAscii(rawPath);
+        if (path.empty()) {
+            return;
+        }
+        if (std::find(outAdditionalCleanupPaths.begin(), outAdditionalCleanupPaths.end(), path) ==
+            outAdditionalCleanupPaths.end())
+        {
+            outAdditionalCleanupPaths.push_back(path);
+        }
+    };
+
+    auto setFailure = [&](const std::string& reason) {
+        if (outFailureReason != nullptr) {
+            *outFailureReason = reason;
+        }
+        if (!logStreamId.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                "buildEncodedVideosFromUploadedMp4_: " + reason);
+        }
+        rememberCleanupPath(uploadedVideoPath);
+    };
+
+    double durationSec = 0.0;
+    double sourceFps = 0.0;
+    int sourceFrameCount = 0;
+    if (!probeUploadedVideoStatsForChat_(
+            uploadedVideoPath,
+            durationSec,
+            sourceFps,
+            sourceFrameCount,
+            logStreamId))
+    {
+        setFailure("failed probing upload stats for uploaded video");
+        return out;
+    }
+    if (!logStreamId.empty()) {
+        Logger::instance().logDebug(
+            logStreamId,
+            "buildEncodedVideosFromUploadedMp4_: probe result duration_s=" +
+                std::to_string(durationSec) +
+                " source_fps=" + std::to_string(sourceFps) +
+                " source_frame_count=" + std::to_string(sourceFrameCount));
+    }
+
+    int effectiveFps = clampRequestedModelFps_(requestedModelFps);
+    if (sourceFps > 0.0) {
+        const int roundedSourceFps = (std::max)(1, static_cast<int>(sourceFps + 0.5));
+        effectiveFps = (std::min)(effectiveFps, roundedSourceFps);
+    }
+    if (effectiveFps < 1) {
+        effectiveFps = 1;
+    }
+    if (durationSec <= 0.0) {
+        setFailure("invalid uploaded video duration after probe");
+        return out;
+    }
+
+    int totalSamples = 0;
+    if (sourceFps > 0.0 &&
+        sourceFrameCount > 0 &&
+        sourceFps <= static_cast<double>(effectiveFps) + 0.001)
+    {
+        totalSamples = sourceFrameCount;
+    }
+    else {
+        totalSamples = static_cast<int>(durationSec * static_cast<double>(effectiveFps) + 1e-6);
+    }
+    if (totalSamples < 1) {
+        totalSamples = 1;
+    }
+
+    const int chunkCount =
+        (totalSamples + kMaxOpenAIVideoFramesPerRequest - 1) / kMaxOpenAIVideoFramesPerRequest;
+    if (chunkCount < 1) {
+        setFailure("computed zero chunks for uploaded video manifest");
+        return out;
+    }
+
+    const auto nowTp = std::chrono::system_clock::now();
+    const auto totalDurationMs = std::chrono::milliseconds(
+        static_cast<long long>(std::llround(durationSec * 1000.0)));
+    const auto baseStartTp = nowTp - totalDurationMs;
+
+    auto buildSegmentTimestamps = [&](double startSeconds, double endSeconds,
+                                      std::string& outStartTs, std::string& outEndTs) {
+        const auto startTp = baseStartTp + std::chrono::milliseconds(
+            static_cast<long long>(std::llround(startSeconds * 1000.0)));
+        const auto endTp = baseStartTp + std::chrono::milliseconds(
+            static_cast<long long>(std::llround(endSeconds * 1000.0)));
+        outStartTs = formatTimePointToIsoUtcZ_(startTp);
+        outEndTs = formatTimePointToIsoUtcZ_(endTp >= startTp ? endTp : startTp);
+    };
+
+    auto appendManifestFields = [&](EncodedVideoSegment& seg,
+                                    int chunkIndex,
+                                    int chunkSampleStart,
+                                    int chunkSampleCount,
+                                    double chunkStartSec,
+                                    double chunkDurationSec) {
+        seg.uploadAnalysisSegment = true;
+        seg.uploadChunkIndex = chunkIndex;
+        seg.uploadChunkCount = chunkCount;
+        seg.uploadPlannedSampleStart = chunkSampleStart;
+        seg.uploadPlannedSampleCount = chunkSampleCount;
+        seg.uploadPlannedTotalSamples = totalSamples;
+        seg.uploadPlannedFps = effectiveFps;
+        seg.uploadStartSeconds = chunkStartSec;
+        seg.uploadDurationSeconds = chunkDurationSec;
+    };
+
+    if (!logStreamId.empty()) {
+        Logger::instance().logDebug(
+            logStreamId,
+            "buildEncodedVideosFromUploadedMp4_: duration_s=" + std::to_string(durationSec) +
+                " source_fps=" + std::to_string(sourceFps) +
+                " source_frame_count=" + std::to_string(sourceFrameCount) +
+                " requested_fps=" + std::to_string(requestedModelFps) +
+                " effective_fps=" + std::to_string(effectiveFps) +
+                " total_samples=" + std::to_string(totalSamples) +
+                " chunk_count=" + std::to_string(chunkCount));
+    }
+
+    if (chunkCount <= 1) {
+        EncodedVideoSegment seg;
+        seg.sourceFilePath = uploadedVideoPath;
+        seg.isTempFile = true;
+        seg.cameraId = syntheticCameraId;
+        seg.cameraName = "UPLOADED_VIDEO";
+        std::string startTs;
+        std::string endTs;
+        buildSegmentTimestamps(0.0, durationSec, startTs, endTs);
+        seg.startTs = startTs;
+        seg.endTs = endTs;
+        appendManifestFields(
+            seg,
+            /*chunkIndex=*/0,
+            /*chunkSampleStart=*/0,
+            totalSamples,
+            /*chunkStartSec=*/0.0,
+            durationSec);
+        out.push_back(std::move(seg));
+        return out;
+    }
+
+    std::vector<std::string> createdChunkPaths;
+    createdChunkPaths.reserve(static_cast<std::size_t>(chunkCount));
+
+    for (int chunkIndex = 0; chunkIndex < chunkCount; ++chunkIndex) {
+        const int sampleStart = chunkIndex * kMaxOpenAIVideoFramesPerRequest;
+        const int sampleCount = (std::min)(
+            kMaxOpenAIVideoFramesPerRequest,
+            totalSamples - sampleStart);
+        if (sampleCount <= 0) {
+            continue;
+        }
+
+        const double chunkStartSec =
+            static_cast<double>(sampleStart) / static_cast<double>(effectiveFps);
+        const double nominalChunkDurationSec =
+            static_cast<double>(sampleCount) / static_cast<double>(effectiveFps);
+        const double chunkEndSec =
+            durationSec > 0.0
+                ? (std::min)(durationSec, chunkStartSec + nominalChunkDurationSec)
+                : (chunkStartSec + nominalChunkDurationSec);
+        const double chunkDurationSec =
+            (std::max)(0.001, chunkEndSec - chunkStartSec);
+
+        std::string clipPath;
+        const std::string chunkStem =
+            "upload_chunk_" + uploadSeed +
+            "_" + std::to_string(chunkIndex + 1) +
+            "_of_" + std::to_string(chunkCount);
+        if (!extractUploadedVideoSubclipToTempFile_(
+                uploadedVideoPath,
+                chunkStartSec,
+                chunkDurationSec,
+                chunkStem,
+                clipPath))
+        {
+            for (const auto& rawPath : createdChunkPaths) {
+                std::error_code rmEc;
+                fs::remove(rawPath, rmEc);
+            }
+            out.clear();
+            setFailure(
+                "subclip extraction failed at chunk=" +
+                std::to_string(chunkIndex + 1));
+            return out;
+        }
+
+        createdChunkPaths.push_back(clipPath);
+
+        EncodedVideoSegment seg;
+        seg.sourceFilePath = clipPath;
+        seg.isTempFile = true;
+        seg.cameraId = syntheticCameraId;
+        seg.cameraName = "UPLOADED_VIDEO";
+        buildSegmentTimestamps(chunkStartSec, chunkEndSec, seg.startTs, seg.endTs);
+        appendManifestFields(
+            seg,
+            chunkIndex,
+            sampleStart,
+            sampleCount,
+            chunkStartSec,
+            chunkDurationSec);
+        out.push_back(std::move(seg));
+    }
+
+    int manifestSampleSum = 0;
+    int expectedSampleStart = 0;
+    for (const auto& seg : out) {
+        if (!seg.uploadAnalysisSegment ||
+            seg.uploadPlannedFps != effectiveFps ||
+            seg.uploadPlannedSampleCount <= 0)
+        {
+            for (const auto& rawPath : createdChunkPaths) {
+                std::error_code rmEc;
+                fs::remove(rawPath, rmEc);
+            }
+            out.clear();
+            setFailure("upload manifest validation failed: invalid chunk metadata");
+            return out;
+        }
+        if (seg.uploadPlannedSampleStart != expectedSampleStart) {
+            for (const auto& rawPath : createdChunkPaths) {
+                std::error_code rmEc;
+                fs::remove(rawPath, rmEc);
+            }
+            out.clear();
+            setFailure("upload manifest validation failed: non-contiguous chunk sample ranges");
+            return out;
+        }
+        expectedSampleStart += seg.uploadPlannedSampleCount;
+        manifestSampleSum += seg.uploadPlannedSampleCount;
+    }
+    if (manifestSampleSum != totalSamples) {
+        for (const auto& rawPath : createdChunkPaths) {
+            std::error_code rmEc;
+            fs::remove(rawPath, rmEc);
+        }
+        out.clear();
+        setFailure(
+            "upload manifest validation failed: planned_samples=" +
+            std::to_string(totalSamples) +
+            " validated_samples=" + std::to_string(manifestSampleSum));
+        return out;
+    }
+
+    if (!out.empty()) {
+        rememberCleanupPath(uploadedVideoPath);
+        if (!logStreamId.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                "buildEncodedVideosFromUploadedMp4_: validated manifest planned_samples=" +
+                    std::to_string(totalSamples) +
+                    " chunk_count=" + std::to_string(chunkCount));
+        }
+    }
+    return out;
 }
 
 
@@ -16577,6 +17371,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         {
             uploadedVideoUrl = payload["uploaded_video_url"].get<std::string>();
         }
+        const bool hasUploadedVideo = !uploadedVideoUrl.empty();
 
         std::string userLocale = resolveChatReplyLocaleFromPayload_(payload);
         Lang currentUserLang = langFromLocale(userLocale);
@@ -16874,6 +17669,51 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 }
                 chatTemporalActive = true;
             }
+            else if (hasUploadedVideo && isOpenAIChatModelTier(modelTier)) {
+                nlohmann::json uploadEnvelope =
+                    buildUploadVideoSequentialPlanEnvelope_(
+                        userQuestion,
+                        userLocale.empty() ? "en" : userLocale);
+                if (temporal::planUsable(uploadEnvelope)) {
+                    chatTemporalState.planEnvelope = std::move(uploadEnvelope);
+                    chatTemporalState.promptHash =
+                        chatTemporalState.planEnvelope.value("plan_hash", std::string());
+                    chatTemporalActive = true;
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: using uploaded-video continuation plan chat_session_id=" +
+                            std::to_string(chatSessionId) +
+                            " plan_hash=" + chatTemporalState.promptHash);
+                }
+                else {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: uploaded-video continuation plan was not usable");
+                }
+            }
+        }
+
+        if (!chatTemporalActive &&
+            hasUploadedVideo &&
+            isOpenAIChatModelTier(modelTier))
+        {
+            temporal::ensureState(chatTemporalState.state);
+            ensureChatTemporalVisualState_(chatTemporalState.visualState);
+            nlohmann::json uploadEnvelope =
+                buildUploadVideoSequentialPlanEnvelope_(
+                    userQuestion,
+                    userLocale.empty() ? "en" : userLocale);
+            if (temporal::planUsable(uploadEnvelope)) {
+                chatTemporalState.planEnvelope = std::move(uploadEnvelope);
+                chatTemporalState.promptHash =
+                    chatTemporalState.planEnvelope.value("plan_hash", std::string());
+                chatTemporalActive = true;
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: upload fallback continuation plan activated chat_session_id=" +
+                        std::to_string(chatSessionId) +
+                        " plan_hash=" + chatTemporalState.promptHash);
+            }
         }
 
         if (chatSessionId > 0 &&
@@ -16934,6 +17774,36 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             };
         RetryUiGuard retryUiGuard(postStillAnalyzing);
 
+        auto postUploadedVideoFailureAnswer = [&](const std::string& answerText) {
+            json postBody;
+            postBody["chat_session_id"] = chatSessionId;
+            postBody["command_id"] = commandId;
+            postBody["original_query"] = userQuestion;
+            postBody["camera_ids"] = json::array();
+            postBody["camera_names"] = json::array();
+            postBody["all_cameras"] = false;
+            postBody["time_window_minutes_before_now"] = 0;
+            postBody["start_timestamp"] = "";
+            postBody["end_timestamp"] = "";
+            postBody["search_paths"] = json::array();
+            postBody["answer"] = answerText;
+            postBody["reply_language"] = userLocale;
+            postBody["model_prompt_tokens"] = 0;
+            postBody["model_output_tokens"] = 0;
+            postBody["model_total_tokens"] = 0;
+            postBody["vision_hits"] = json::array();
+            postBody["response_type"] = "final_answer";
+            postBody["status"] = "vision_done";
+
+            std::string url =
+                baseUrl_ + "/api/agent/chat-response?client_id=" + clientId_;
+            std::string respBody;
+            if (abortIfCancelled("before_uploaded_video_failure_post")) {
+                return;
+            }
+            HttpPostJson(url, exeToken_, postBody.dump(), respBody);
+        };
+
 
 
         // ------------------------------------------------------------
@@ -16944,8 +17814,6 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         int routerPromptTokens = 0;
         int routerOutputTokens = 0;
         int routerTotalTokens = 0;
-
-        const bool hasUploadedVideo = !uploadedVideoUrl.empty();
 
         postVideoSearchProgress("searching_footage", 2, 2);
 
@@ -17722,6 +18590,37 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         // Build encodedVideos (conditional)
         // ------------------------------------------------------------
         std::vector<EncodedVideoSegment> encodedVideos;
+        std::vector<std::string> extraTempUploadedPaths;
+        ScopeExit_ cleanupChatTempFilesGuard{
+            [&encodedVideos, &extraTempUploadedPaths]() {
+#ifdef _WIN32
+                std::unordered_set<std::string> seenPaths;
+                auto cleanupPath = [&](const std::string& rawPath) {
+                    const std::string normalizedPath = trimAscii(rawPath);
+                    if (normalizedPath.empty() || !seenPaths.insert(normalizedPath).second) {
+                        return;
+                    }
+                    std::error_code delEc;
+                    fs::remove(normalizedPath, delEc);
+                    if (delEc) {
+                        Logger::instance().logDebug(
+                            "agent",
+                            "cleanupTempSegments: failed to remove " +
+                                normalizedPath + " error=" + delEc.message());
+                    }
+                };
+
+                for (const auto& seg : encodedVideos) {
+                    if (seg.isTempFile && !seg.sourceFilePath.empty()) {
+                        cleanupPath(seg.sourceFilePath);
+                    }
+                }
+                for (const auto& rawPath : extraTempUploadedPaths) {
+                    cleanupPath(rawPath);
+                }
+#endif
+            }
+        };
         const bool useSequentialTemporalVideoRunner =
             chatTemporalActive &&
             isOpenAIChatModelTier(modelTier) &&
@@ -18175,20 +19074,30 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 Logger::instance().logDebug("agent", "handleChatQuery_: failed to strip audio via ffmpeg, using raw");
             }
             // ---------------------------------------------------------
-
-
-            EncodedVideoSegment seg;
-            seg.bytes = std::move(bytes);
-
-            // so hit-builder can extract jpeg frames:
-            seg.sourceFilePath = tmpMp4.string();
-            seg.isTempFile = true;
-
-            // timestamps are optional for uploaded videos; keep something non-empty for logs
-            seg.startTs = "UPLOADED_VIDEO";
-            seg.endTs = "UPLOADED_VIDEO";
-
-            encodedVideos.push_back(std::move(seg));
+            const std::string uploadIdentitySeed =
+                commandId > 0
+                    ? (std::to_string(commandId) + "#" + std::to_string(chatSessionId))
+                    : (tmpMp4.string() + "#" + std::to_string(chatSessionId));
+            const int syntheticUploadCameraId =
+                deriveSyntheticUploadedVideoCameraId_(uploadIdentitySeed);
+            std::string uploadBuildFailureReason;
+            encodedVideos = buildEncodedVideosFromUploadedMp4_(
+                tmpMp4.string(),
+                modelInputFps,
+                syntheticUploadCameraId,
+                std::to_string(chatSessionId) + "_" + std::to_string(syntheticUploadCameraId * -1),
+                extraTempUploadedPaths,
+                "agent",
+                &uploadBuildFailureReason);
+            if (encodedVideos.empty()) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "handleChatQuery_: uploaded video chunk builder returned no segments reason=" +
+                        trimAscii(uploadBuildFailureReason));
+                postUploadedVideoFailureAnswer(
+                    buildUploadedVideoAnalysisFailureAnswer_(userLocale));
+                return;
+            }
 #else
             // If you need non-Windows support later, you can implement same logic with std::filesystem + ofstream.
             Logger::instance().logDebug("agent", "handleChatQuery_: uploaded video path not implemented on this platform");
@@ -18207,7 +19116,12 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         std::string visionAnswer;
 
         std::vector<VideoHit> videoHits;
+        std::vector<VideoHit> allVideoHits;
         bool temporalHandledInline = false;
+        const bool useSequentialIdentityVideoRunner =
+            !useSequentialTemporalVideoRunner &&
+            hasUploadedVideo &&
+            encodedVideos.size() > 1;
         if (isOpenAIChatModelTier(modelTier)) {
             const std::string openAiModelName = chatOpenAIModelNameForTier(modelTier);
             Logger::instance().logDebug(
@@ -18232,6 +19146,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                         isCancelled
                     );
                 videoHits = std::move(temporalResult.visibleHits);
+                allVideoHits = std::move(temporalResult.allHits);
                 visionPromptTokens = temporalResult.promptTokens;
                 visionOutputTokens = temporalResult.outputTokens;
                 visionTotalTokens = temporalResult.totalTokens;
@@ -18245,6 +19160,52 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 }
                 if (!temporalResult.temporalSummary.empty()) {
                     chatTemporalSummary = std::move(temporalResult.temporalSummary);
+                }
+                if (!trimAscii(temporalResult.failureReason).empty()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: uploaded sequential temporal analysis failed reason=" +
+                            trimAscii(temporalResult.failureReason) +
+                            " planned_samples=" + std::to_string(temporalResult.plannedSampleCount) +
+                            " processed_samples=" + std::to_string(temporalResult.processedSampleCount));
+                    postUploadedVideoFailureAnswer(
+                        buildUploadedVideoAnalysisFailureAnswer_(userLocale));
+                    return;
+                }
+                temporalHandledInline = true;
+            }
+            else if (useSequentialIdentityVideoRunner) {
+                ChatTemporalVideoAnalysisResult temporalResult =
+                    analyzeVideosWithOpenAISequentialIdentityChat_(
+                        encodedVideos,
+                        routerResult,
+                        userQuestion,
+                        uploadedImageBase64,
+                        openAiModelName,
+                        modelApiKey,
+                        modelInputFps,
+                        runningResolution,
+                        chatSessionId,
+                        chatTemporalState,
+                        coreChatPriorityActive,
+                        isCancelled
+                    );
+                videoHits = std::move(temporalResult.visibleHits);
+                allVideoHits = std::move(temporalResult.allHits);
+                visionPromptTokens = temporalResult.promptTokens;
+                visionOutputTokens = temporalResult.outputTokens;
+                visionTotalTokens = temporalResult.totalTokens;
+                visionAnswer = std::move(temporalResult.modelAnswer);
+                if (!trimAscii(temporalResult.failureReason).empty()) {
+                    Logger::instance().logDebug(
+                        "agent",
+                        "handleChatQuery_: uploaded sequential identity analysis failed reason=" +
+                            trimAscii(temporalResult.failureReason) +
+                            " planned_samples=" + std::to_string(temporalResult.plannedSampleCount) +
+                            " processed_samples=" + std::to_string(temporalResult.processedSampleCount));
+                    postUploadedVideoFailureAnswer(
+                        buildUploadedVideoAnalysisFailureAnswer_(userLocale));
+                    return;
                 }
                 temporalHandledInline = true;
             }
@@ -18324,7 +19285,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             }
             (void)persistChatTemporalState_(chatSessionId, chatTemporalState);
         }
-        else if (!chatTemporalActive && chatSessionId > 0) {
+        else if (!chatTemporalActive && chatSessionId > 0 && !temporalHandledInline) {
             bool identityStateChanged = false;
             for (auto& hitTemporal : videoHits) {
                 const std::string identityDecisionNowIso =
@@ -18361,9 +19322,11 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
 
         // Build final natural-language answer (keep your existing logic)
         std::string finalAnswer;
-        if (!videoHits.empty()) {
+        const std::vector<VideoHit>* answerSourceHits =
+            !allVideoHits.empty() ? &allVideoHits : &videoHits;
+        if (answerSourceHits != nullptr && !answerSourceHits->empty()) {
             // (Opcional) ordenar por comeÃƒÆ’Ã‚Â§o do segmento pra ficar bonito
-            std::vector<VideoHit> sorted = videoHits;
+            std::vector<VideoHit> sorted = *answerSourceHits;
             std::sort(sorted.begin(), sorted.end(),
                 [](const VideoHit& a, const VideoHit& b) {
                     return a.segmentStartTs < b.segmentStartTs;
@@ -18372,6 +19335,10 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             std::ostringstream oss;
             for (const auto& h : sorted) {
                 if (h.answer.empty()) continue;
+                if (hasUploadedVideo) {
+                    oss << h.answer << "<br/><br/>";
+                    continue;
+                }
 
                 // Para uploads, segmentStartTs pode ser "UPLOADED_VIDEO"
                 std::string startHuman = formatTsHumanBR(h.segmentStartTs);
@@ -18894,6 +19861,43 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             hitsJson.push_back(std::move(hitObj));
         }
 
+        if (hasUploadedVideo && answerSourceHits != nullptr && !answerSourceHits->empty()) {
+            std::vector<std::string> uploadedEntityIds;
+            for (const auto& hit : *answerSourceHits) {
+                if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
+                    for (const auto& card : hit.identityCards) {
+                        if (!card.is_object()) continue;
+                        const std::string cardId = trimAscii(card.value("card_id", ""));
+                        if (cardId.empty()) continue;
+                        identityCardsById[cardId] = card;
+                    }
+                }
+                if (!hit.matchedEntityIds.is_array()) continue;
+                for (const auto& entityNode : hit.matchedEntityIds) {
+                    if (!entityNode.is_string()) continue;
+                    const std::string entityId = trimAscii(entityNode.get<std::string>());
+                    if (!entityId.empty()) {
+                        uploadedEntityIds.push_back(entityId);
+                    }
+                }
+            }
+            if (!uploadedEntityIds.empty()) {
+                const nlohmann::json uploadedCards =
+                    collectChatIdentityCardsForEntityIds_(
+                        uploadedEntityIds,
+                        chatTemporalState.state,
+                        chatTemporalState.visualState);
+                if (uploadedCards.is_array()) {
+                    for (const auto& card : uploadedCards) {
+                        if (!card.is_object()) continue;
+                        const std::string cardId = trimAscii(card.value("card_id", ""));
+                        if (cardId.empty()) continue;
+                        identityCardsById[cardId] = card;
+                    }
+                }
+            }
+        }
+
         postBody["vision_hits"] = hitsJson;
         if (!identityCardsById.empty()) {
             nlohmann::json identityCardsJson = nlohmann::json::array();
@@ -18933,24 +19937,6 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             );
         }
 
-        // cleanup temp segments (your existing block already does this)
-#ifdef _WIN32
-        {
-            std::error_code delEc;
-            for (const auto& seg : encodedVideos) {
-                if (seg.isTempFile && !seg.sourceFilePath.empty()) {
-                    fs::remove(seg.sourceFilePath, delEc);
-                    if (delEc) {
-                        Logger::instance().logDebug(
-                            "agent",
-                            "cleanupTempSegments: failed to remove " +
-                            seg.sourceFilePath + " error=" + delEc.message()
-                        );
-                    }
-                }
-            }
-        }
-#endif
     }
     catch (const CoreModelLeaseAborted& e) {
         Logger::instance().logDebug(
@@ -25233,14 +26219,24 @@ namespace {
         const std::string& logStreamId = "",
         const std::string& segmentStartTs = "",
         const std::string& segmentEndTs = "",
-        double* outAnalyzedDurationSeconds = nullptr)
+        double* outAnalyzedDurationSeconds = nullptr,
+        const EncodedVideoSegment* manifestSegment = nullptr,
+        int* outPlannedFrameCount = nullptr,
+        std::string* outFailureReason = nullptr)
     {
         std::vector<PromptVideoFrame> out;
         if (outAnalyzedDurationSeconds) *outAnalyzedDurationSeconds = 0.0;
+        if (outPlannedFrameCount) *outPlannedFrameCount = 0;
+        if (outFailureReason) outFailureReason->clear();
         if (videoPath.empty() || maxFrames <= 0) return out;
 
         const bool useZAiCoreModel = isZAiCoreModelName_(openAiModelName);
         runningResolution = (runningResolution == 1024) ? 1024 : 640;
+        const bool useUploadManifest =
+            manifestSegment != nullptr &&
+            manifestSegment->uploadAnalysisSegment &&
+            manifestSegment->uploadPlannedSampleCount > 0 &&
+            manifestSegment->uploadPlannedFps > 0;
 
         auto normalizeFps = [](int fps) -> int {
             return clampRequestedModelFps_(fps);
@@ -25249,7 +26245,10 @@ namespace {
         const bool hasExpectedWindow = expectedWindowSeconds > 0;
         if (expectedWindowSeconds < 0) expectedWindowSeconds = 0;
 
-        double durationSec = 10.0; // safe fallback
+        double durationSec =
+            (useUploadManifest && manifestSegment->uploadDurationSeconds > 0.0)
+                ? manifestSegment->uploadDurationSeconds
+                : 10.0; // safe fallback
         double sourceFps = 0.0;
         double sourceFrameCount = 0.0;
         bool durationFromOpenCv = false;
@@ -25269,6 +26268,12 @@ namespace {
                 }
                 cap.release();
             }
+        }
+
+        if (useUploadManifest && durationSec <= 0.0) {
+            durationSec =
+                static_cast<double>(manifestSegment->uploadPlannedSampleCount) /
+                static_cast<double>((std::max)(1, manifestSegment->uploadPlannedFps));
         }
 
         int clipNominalSeconds = 0;
@@ -25323,6 +26328,13 @@ namespace {
                 " source_fps=" + std::to_string(sourceFps) +
                 " source_frame_count=" + std::to_string(sourceFrameCount) +
                 " duration_sec_final=" + std::to_string(durationSec) +
+                " upload_manifest=" + std::string(useUploadManifest ? "true" : "false") +
+                " upload_chunk=" + std::to_string(
+                    useUploadManifest ? manifestSegment->uploadChunkIndex + 1 : 0) +
+                "/" + std::to_string(
+                    useUploadManifest ? manifestSegment->uploadChunkCount : 0) +
+                " upload_planned_frames=" + std::to_string(
+                    useUploadManifest ? manifestSegment->uploadPlannedSampleCount : 0) +
                 " clip_nominal_s=" + std::to_string(clipNominalSeconds) +
                 " clip_range_s=" + std::to_string(clipRangeSeconds) +
                 " segment_range_s=" + std::to_string(clipDurationFromSegmentBounds) +
@@ -25400,7 +26412,29 @@ namespace {
             };
 
         std::vector<double> sampleSeconds;
-        if (useZAiCoreModel) {
+        if (useUploadManifest) {
+            const int effectiveFps = (std::max)(1, manifestSegment->uploadPlannedFps);
+            const int sampleCount = manifestSegment->uploadPlannedSampleCount;
+            if (sampleCount > maxFrames) {
+                if (outFailureReason) {
+                    *outFailureReason =
+                        "upload_manifest_sample_count_exceeds_request_limit";
+                }
+                if (!logStreamId.empty()) {
+                    Logger::instance().logDebug(
+                        logStreamId,
+                        "buildOpenAIVideoFrameInputs: upload manifest exceeds frame limit planned=" +
+                            std::to_string(sampleCount) +
+                            " max_frames=" + std::to_string(maxFrames));
+                }
+                return std::vector<PromptVideoFrame>{};
+            }
+            sampleSeconds.reserve(sampleCount);
+            for (int i = 0; i < sampleCount; ++i) {
+                sampleSeconds.push_back(static_cast<double>(i) / static_cast<double>(effectiveFps));
+            }
+        }
+        else if (useZAiCoreModel) {
             if (runningResolution == 1024) {
                 // Core/1024: ~1 frame every 3s (20 frames per 60s), uniformly sampled.
                 int desiredCount = 0;
@@ -25435,13 +26469,13 @@ namespace {
         }
         else {
             int effectiveFps = requestedFps;
+            int sampleCount = 0;
             if (sourceFps > 0.0) {
                 const int srcRounded = (std::max)(1, (int)(sourceFps + 0.5));
                 effectiveFps = (std::min)(requestedFps, srcRounded);
             }
             if (effectiveFps < 1) effectiveFps = 1;
 
-            int sampleCount = 0;
             if (hasExpectedWindow) {
                 sampleCount = (std::max)(1, expectedWindowSeconds * effectiveFps);
             }
@@ -25454,6 +26488,9 @@ namespace {
             for (int i = 0; i < sampleCount; ++i) {
                 sampleSeconds.push_back(static_cast<double>(i) / static_cast<double>(effectiveFps));
             }
+        }
+        if (outPlannedFrameCount) {
+            *outPlannedFrameCount = static_cast<int>(sampleSeconds.size());
         }
 
         out.reserve(sampleSeconds.size());
@@ -25496,6 +26533,22 @@ namespace {
         }
 
         if ((int)out.size() < (int)sampleSeconds.size()) {
+            if (useUploadManifest) {
+                if (outFailureReason) {
+                    *outFailureReason =
+                        "upload_manifest_missing_frames planned=" +
+                        std::to_string(sampleSeconds.size()) +
+                        " extracted=" + std::to_string(out.size());
+                }
+                if (!logStreamId.empty()) {
+                    Logger::instance().logDebug(
+                        logStreamId,
+                        "buildOpenAIVideoFrameInputs: upload manifest extracted " +
+                            std::to_string(out.size()) + "/" + std::to_string(sampleSeconds.size()) +
+                            " frames, treating as failure video=" + videoPath);
+                }
+                return std::vector<PromptVideoFrame>{};
+            }
             if (logStreamId.empty()) {
                 return out;
             }
@@ -27391,10 +28444,12 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         const std::string camLogId = std::to_string(segment.cameraId);
         const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
         double analyzedDurationSeconds = 0.0;
+        int plannedFrameCount = 0;
+        std::string frameBuildFailureReason;
         const std::vector<PromptVideoFrame> frames =
             buildOpenAIVideoFrameInputs(
                 videoPath,
-                300,
+                kMaxOpenAIVideoFramesPerRequest,
                 modelInputFps,
                 modelName,
                 expectedWindowSeconds,
@@ -27402,11 +28457,40 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                 camLogId,
                 segment.startTs,
                 segment.endTs,
-                &analyzedDurationSeconds
+                &analyzedDurationSeconds,
+                &segment,
+                &plannedFrameCount,
+                &frameBuildFailureReason
             );
+        hit.plannedFrameCount = plannedFrameCount;
+        hit.extractedFrameCount = static_cast<int>(frames.size());
 
         if (frames.empty()) {
-            Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: no frames extracted");
+            hit.analysisFailed = segment.uploadAnalysisSegment;
+            hit.analysisFailureReason =
+                !trimAscii(frameBuildFailureReason).empty()
+                    ? trimAscii(frameBuildFailureReason)
+                    : std::string("no_frames_extracted");
+            Logger::instance().logDebug(
+                "agent",
+                "callOpenAIVisionVideoSegment_: no frames extracted reason=" +
+                    hit.analysisFailureReason +
+                    " planned_frames=" + std::to_string(hit.plannedFrameCount) +
+                    " extracted_frames=" + std::to_string(hit.extractedFrameCount));
+            return hit;
+        }
+        if (segment.uploadAnalysisSegment &&
+            hit.plannedFrameCount > 0 &&
+            hit.extractedFrameCount != hit.plannedFrameCount)
+        {
+            hit.analysisFailed = true;
+            hit.analysisFailureReason =
+                "upload_manifest_frame_mismatch planned=" +
+                std::to_string(hit.plannedFrameCount) +
+                " extracted=" + std::to_string(hit.extractedFrameCount);
+            Logger::instance().logDebug(
+                "agent",
+                "callOpenAIVisionVideoSegment_: " + hit.analysisFailureReason);
             return hit;
         }
 
@@ -27868,7 +28952,7 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
         const std::vector<PromptVideoFrame> frames =
             buildOpenAIVideoFrameInputs(
                 videoPath,
-                300,
+                kMaxOpenAIVideoFramesPerRequest,
                 modelInputFps,
                 modelName,
                 expectedWindowSeconds,
@@ -28742,7 +29826,7 @@ DrakonFindInferenceResult AgentCore::runDrakonFindVideoInference_(
         const std::vector<PromptVideoFrame> frames =
             buildOpenAIVideoFrameInputs(
                 videoPath,
-                300,
+                kMaxOpenAIVideoFramesPerRequest,
                 clampRequestedModelFps_(modelInputFps),
                 safeModelName,
                 safeWindow,
@@ -32641,7 +33725,7 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
         prompt << "- Valid input_type values: video, image.\n";
         prompt << "- Valid video_packaging_mode values: mosaic_2x2, mosaic_3x3, frame_sequence.\n";
         prompt << "- Valid inference_model values: ultra, ultra_plus, light, core, legacy, pro.\n";
-        prompt << "- model_fps must be 1-10 when input_type=video; use 1 otherwise.\n";
+        prompt << "- model_fps must be 1-5 when input_type=video; use 1 otherwise.\n";
         prompt << "- run_every should normally be 10 or 60 seconds.\n";
         prompt << "- running_resolution should be 640 or 1024.\n";
         prompt << "- only_capture_on_motion and use_temporal_context must be booleans.\n";
@@ -33775,6 +34859,7 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
     if (videos.empty()) {
         return result;
     }
+    temporal::ensureState(chatTemporalState.state);
     ensureChatTemporalVisualState_(chatTemporalState.visualState);
 
     const std::vector<std::size_t> orderedIndices =
@@ -33782,7 +34867,13 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
     if (orderedIndices.empty()) {
         return result;
     }
-
+    for (const std::size_t orderedIndex : orderedIndices) {
+        if (orderedIndex >= videos.size()) continue;
+        const EncodedVideoSegment& segment = videos[orderedIndex];
+        if (segment.uploadAnalysisSegment && segment.uploadPlannedSampleCount > 0) {
+            result.plannedSampleCount += segment.uploadPlannedSampleCount;
+        }
+    }
     const std::string effectiveModelName =
         openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName;
 
@@ -33881,6 +34972,22 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
         if (!hit.answer.empty()) {
             result.modelAnswer = hit.answer;
         }
+        if (hit.analysisFailed) {
+            result.failureReason = trimAscii(hit.analysisFailureReason);
+            if (result.failureReason.empty()) {
+                result.failureReason = "uploaded_video_chunk_analysis_failed";
+            }
+            result.aborted = true;
+            Logger::instance().logDebug(
+                "agent",
+                "analyzeVideosWithOpenAISequentialTemporalChat_: aborting at round=" +
+                    std::to_string(executionPos + 1) +
+                    " failure_reason=" + result.failureReason);
+            break;
+        }
+        if (segment.uploadAnalysisSegment && segment.uploadPlannedSampleCount > 0) {
+            result.processedSampleCount += segment.uploadPlannedSampleCount;
+        }
 
         const std::string roundEndTs =
             trimAscii(hit.segmentEndTs).empty() ? segment.endTs : hit.segmentEndTs;
@@ -33913,6 +35020,7 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
 
         persistTemporalState();
         ++executedRounds;
+        result.allHits.push_back(hit);
 
         if (hit.hasMatch) {
             result.visibleHits.push_back(std::move(hit));
@@ -33924,8 +35032,171 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
         "analyzeVideosWithOpenAISequentialTemporalChat_: completed rounds=" +
         std::to_string(executedRounds) + "/" + std::to_string(orderedIndices.size()) +
         " visible_hits=" + std::to_string(result.visibleHits.size()) +
+        " all_hits=" + std::to_string(result.allHits.size()) +
+        " planned_samples=" + std::to_string(result.plannedSampleCount) +
+        " processed_samples=" + std::to_string(result.processedSampleCount) +
+        " failure_reason=" + trimAscii(result.failureReason) +
         " aborted=" + std::string(result.aborted ? "true" : "false")
     );
+
+    return result;
+}
+
+AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISequentialIdentityChat_(
+    const std::vector<EncodedVideoSegment>& videos,
+    const nlohmann::json& routerResult,
+    const std::string& userQuestionBase,
+    const std::string& uploadedImageBase64,
+    const std::string& openAiModelName,
+    const std::string& openAiApiKey,
+    int modelInputFps,
+    int runningResolution,
+    int chatSessionId,
+    ChatTemporalState& chatTemporalState,
+    bool requestCoreChatPriority,
+    const std::function<bool()>& shouldAbort)
+{
+    ChatTemporalVideoAnalysisResult result;
+    if (videos.empty()) {
+        return result;
+    }
+
+    temporal::ensureState(chatTemporalState.state);
+    ensureChatTemporalVisualState_(chatTemporalState.visualState);
+
+    const std::vector<std::size_t> orderedIndices =
+        buildChatTemporalExecutionOrder_(videos, routerResult);
+    if (orderedIndices.empty()) {
+        return result;
+    }
+    for (const std::size_t orderedIndex : orderedIndices) {
+        if (orderedIndex >= videos.size()) continue;
+        const EncodedVideoSegment& segment = videos[orderedIndex];
+        if (segment.uploadAnalysisSegment && segment.uploadPlannedSampleCount > 0) {
+            result.plannedSampleCount += segment.uploadPlannedSampleCount;
+        }
+    }
+
+    const std::string effectiveModelName =
+        openAiModelName.empty() ? std::string("gpt-5-mini") : openAiModelName;
+
+    auto persistIdentityState = [&]() {
+        chatTemporalState.touchedAt = std::chrono::steady_clock::now();
+        if (chatSessionId > 0) {
+            {
+                std::lock_guard<std::mutex> lock(chatTemporalMu_);
+                chatTemporalBySession_[chatSessionId] = chatTemporalState;
+            }
+            (void)persistChatTemporalState_(chatSessionId, chatTemporalState);
+        }
+    };
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithOpenAISequentialIdentityChat_: videos=" +
+            std::to_string(videos.size()) +
+            " ordered_rounds=" + std::to_string(orderedIndices.size()) +
+            " model=" + effectiveModelName +
+            " fps=" + std::to_string(modelInputFps) +
+            " running_resolution=" + std::to_string(runningResolution));
+
+    std::size_t executedRounds = 0;
+    for (std::size_t executionPos = 0; executionPos < orderedIndices.size(); ++executionPos) {
+        if (shouldAbort && shouldAbort()) {
+            result.aborted = true;
+            break;
+        }
+
+        const std::size_t segmentIndex = orderedIndices[executionPos];
+        const EncodedVideoSegment& segment = videos[segmentIndex];
+
+        std::string roundPrompt = userQuestionBase;
+        const std::string identityMemoryAppendix =
+            buildDirectChatIdentityMemoryPromptAppendix_(chatTemporalState.state);
+        if (!identityMemoryAppendix.empty()) {
+            roundPrompt += identityMemoryAppendix;
+        }
+
+        int batchPrompt = 0;
+        int batchOutput = 0;
+        int batchTotal = 0;
+        VideoHit hit = callOpenAIVisionVideoSegment_(
+            segment,
+            roundPrompt,
+            uploadedImageBase64,
+            std::vector<FaceReferenceImage>{},
+            std::vector<NegativeReferenceImage>{},
+            std::string(),
+            std::string(),
+            effectiveModelName,
+            openAiApiKey,
+            modelInputFps,
+            /*expectedWindowSeconds*/ 0,
+            runningResolution,
+            std::string("mosaic"),
+            batchPrompt,
+            batchOutput,
+            batchTotal,
+            requestCoreChatPriority,
+            shouldAbort
+        );
+
+        hit.segmentIndex = segmentIndex;
+
+        result.promptTokens += batchPrompt;
+        result.outputTokens += batchOutput;
+        result.totalTokens += batchTotal;
+        if (!hit.answer.empty()) {
+            result.modelAnswer = hit.answer;
+        }
+        if (hit.analysisFailed) {
+            result.failureReason = trimAscii(hit.analysisFailureReason);
+            if (result.failureReason.empty()) {
+                result.failureReason = "uploaded_video_chunk_analysis_failed";
+            }
+            result.aborted = true;
+            Logger::instance().logDebug(
+                "agent",
+                "analyzeVideosWithOpenAISequentialIdentityChat_: aborting at round=" +
+                    std::to_string(executionPos + 1) +
+                    " failure_reason=" + result.failureReason);
+            break;
+        }
+        if (segment.uploadAnalysisSegment && segment.uploadPlannedSampleCount > 0) {
+            result.processedSampleCount += segment.uploadPlannedSampleCount;
+        }
+
+        const std::string identityDecisionNowIso =
+            temporal::decisionAnchorUtc(temporal::nowIso(), hit.segmentEndTs);
+        (void)applyChatIdentityContinuityRound_(
+            hit,
+            nlohmann::json::object(),
+            identityDecisionNowIso,
+            /*allowTemporalObservations=*/false,
+            chatTemporalState.state,
+            chatTemporalState.visualState,
+            "agent",
+            "analyzeVideosWithOpenAISequentialIdentityChat_");
+
+        persistIdentityState();
+        ++executedRounds;
+        result.allHits.push_back(hit);
+
+        if (hit.hasMatch) {
+            result.visibleHits.push_back(std::move(hit));
+        }
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "analyzeVideosWithOpenAISequentialIdentityChat_: completed rounds=" +
+            std::to_string(executedRounds) + "/" + std::to_string(orderedIndices.size()) +
+            " visible_hits=" + std::to_string(result.visibleHits.size()) +
+            " all_hits=" + std::to_string(result.allHits.size()) +
+            " planned_samples=" + std::to_string(result.plannedSampleCount) +
+            " processed_samples=" + std::to_string(result.processedSampleCount) +
+            " failure_reason=" + trimAscii(result.failureReason) +
+            " aborted=" + std::string(result.aborted ? "true" : "false"));
 
     return result;
 }

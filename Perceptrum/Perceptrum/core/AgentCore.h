@@ -34,6 +34,18 @@ struct EncodedVideoSegment {
     // -1 = not triggered; otherwise the id of the step to start
     int startConditionStepId = -1;
 
+    // Uploaded-video analysis manifest. When enabled, sampling must obey these
+    // exact chunk boundaries instead of inferring duration/fps from the file.
+    bool uploadAnalysisSegment = false;
+    int uploadChunkIndex = -1;
+    int uploadChunkCount = 0;
+    int uploadPlannedSampleStart = 0;
+    int uploadPlannedSampleCount = 0;
+    int uploadPlannedTotalSamples = 0;
+    int uploadPlannedFps = 0;
+    double uploadStartSeconds = 0.0;
+    double uploadDurationSeconds = 0.0;
+
 };
 
 // Multi-camera IMAGE input for Gemini group inference (Job Steps)
@@ -121,6 +133,10 @@ struct VideoHit {
     nlohmann::json matchedEntityIds = nlohmann::json::array();
     nlohmann::json identityCards = nlohmann::json::array();
     std::string primaryIdentityCardId;
+    bool analysisFailed = false;
+    std::string analysisFailureReason;
+    int plannedFrameCount = 0;
+    int extractedFrameCount = 0;
 
 };
 
@@ -749,6 +765,7 @@ private:
 
     struct ChatTemporalVideoAnalysisResult {
         std::vector<VideoHit> visibleHits;
+        std::vector<VideoHit> allHits;
         int promptTokens = 0;
         int outputTokens = 0;
         int totalTokens = 0;
@@ -757,6 +774,9 @@ private:
         bool temporalReport = false;
         nlohmann::json temporalOperatorResults = nlohmann::json::array();
         std::string temporalSummary;
+        int plannedSampleCount = 0;
+        int processedSampleCount = 0;
+        std::string failureReason;
         bool aborted = false;
     };
 
@@ -765,6 +785,20 @@ private:
         const nlohmann::json& routerResult) const;
 
     ChatTemporalVideoAnalysisResult analyzeVideosWithOpenAISequentialTemporalChat_(
+        const std::vector<EncodedVideoSegment>& videos,
+        const nlohmann::json& routerResult,
+        const std::string& userQuestionBase,
+        const std::string& uploadedImageBase64,
+        const std::string& openAiModelName,
+        const std::string& openAiApiKey,
+        int modelInputFps,
+        int runningResolution,
+        int chatSessionId,
+        ChatTemporalState& chatTemporalState,
+        bool requestCoreChatPriority = false,
+        const std::function<bool()>& shouldAbort = {});
+
+    ChatTemporalVideoAnalysisResult analyzeVideosWithOpenAISequentialIdentityChat_(
         const std::vector<EncodedVideoSegment>& videos,
         const nlohmann::json& routerResult,
         const std::string& userQuestionBase,

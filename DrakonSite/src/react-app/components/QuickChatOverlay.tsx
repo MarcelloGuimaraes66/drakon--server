@@ -4,6 +4,7 @@ import { useQuickChat } from "@/react-app/hooks/useQuickChat";
 import { usePerceptrumChatSession } from "@/react-app/hooks/usePerceptrumChatSession";
 import ChatInput from "@/react-app/components/ChatInput";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import UploadedVideoAttachment from "@/react-app/components/UploadedVideoAttachment";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
 import ChatCameraBatchEditCard from "@/react-app/components/ChatCameraBatchEditCard";
@@ -26,7 +27,7 @@ import MessageCopyButton from "@/react-app/components/MessageCopyButton";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import Toast from "@/react-app/components/Toast";
-import { ChatMessage, ChatSession } from "@/shared/types";
+import { ChatMessage, ChatSession, type UploadedVideoAttachment as UploadedVideoAttachmentData } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
 import {
   X,
@@ -58,6 +59,7 @@ import {
   buildCameraAgentDraftForEditor,
   extractIdentityCardsFromMessage,
   extractHitMediaFromMessage,
+  extractUploadedVideoAttachmentFromMessage,
   formatMessageContent,
 } from "@/react-app/utils/chatUtils";
 import { CHAT_ASSISTANT_BADGE_CLASS } from "@/react-app/lib/chatAssistantStyles";
@@ -113,12 +115,7 @@ export default function QuickChatOverlay() {
   const [input, setInput] = useState("");
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
-  const [uploadedVideo, setUploadedVideo] = useState<{
-    id: number;
-    publicUrl: string;
-    originalName: string;
-    sizeBytes: number;
-  } | null>(null);
+  const [uploadedVideo, setUploadedVideo] = useState<UploadedVideoAttachmentData | null>(null);
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
   const [chatEditModalCamera, setChatEditModalCamera] = useState<CameraEditorCamera | null>(null);
   const [isChatEditModalOpen, setIsChatEditModalOpen] = useState(false);
@@ -157,10 +154,31 @@ export default function QuickChatOverlay() {
         ? "Desktop agent connection looks stale. Check whether the EXE is still connected."
         : null;
 
-  const resetQuickChatDraft = () => {
+  const clearDraftVideo = async ({ preserveUpload = false }: { preserveUpload?: boolean } = {}) => {
+    const currentVideo = uploadedVideo;
+    setUploadedVideo(null);
+
+    if (preserveUpload || !currentVideo?.id) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/video-uploads/${currentVideo.id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!response.ok && response.status !== 404 && response.status !== 409) {
+        console.warn("[QUICK CHAT] Failed to clean up draft video upload:", response.status);
+      }
+    } catch (error) {
+      console.warn("[QUICK CHAT] Failed to clean up draft video upload:", error);
+    }
+  };
+
+  const resetQuickChatDraft = ({ preserveVideoUpload = false }: { preserveVideoUpload?: boolean } = {}) => {
     setInput("");
     setUploadedImage(null);
-    setUploadedVideo(null);
+    void clearDraftVideo({ preserveUpload: preserveVideoUpload });
     shouldAutoScrollRef.current = true;
     clearError();
     clearWarning();
@@ -496,15 +514,14 @@ export default function QuickChatOverlay() {
 
     const userMessage = input;
     const imageBase64 = uploadedImage;
-    const videoId = uploadedVideo?.id;
-    setInput("");
-    setUploadedImage(null);
-    setUploadedVideo(null);
+    const draftVideo = uploadedVideo;
+    const videoId = uploadedVideo?.id ?? null;
+    resetQuickChatDraft({ preserveVideoUpload: true });
 
     // Enable auto-scroll when user sends a message
     shouldAutoScrollRef.current = true;
 
-    await sendMessage({
+    const sendSucceeded = await sendMessage({
       sessionIdOverride: targetSessionId,
       content: userMessage,
       uploadedImageBase64: imageBase64,
@@ -513,6 +530,15 @@ export default function QuickChatOverlay() {
       modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
       runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
     });
+
+    if (!sendSucceeded) {
+      setInput(userMessage);
+      setUploadedImage(imageBase64);
+      if (draftVideo) {
+        setUploadedVideo(draftVideo);
+      }
+      return;
+    }
     void fetchSessions(targetSessionId);
   };
 
@@ -546,6 +572,8 @@ export default function QuickChatOverlay() {
     if (message.role === "user") {
       const userMsg = message as any;
       const formattedUserContent = formatMessageContent(message.content);
+      const uploadedVideoAttachment = extractUploadedVideoAttachmentFromMessage(message);
+      const hasUserText = formattedUserContent.trim().length > 0;
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
           <div className="flex min-w-0 flex-1 justify-end">
@@ -558,17 +586,24 @@ export default function QuickChatOverlay() {
                     className="mb-3 max-h-32 rounded-2xl shadow-md"
                   />
                 )}
-                <p
-                  className="text-sm leading-relaxed whitespace-pre-wrap break-words"
-                  style={{ overflowWrap: "anywhere" }}
-                >
-                  {formattedUserContent}
-                </p>
+                {uploadedVideoAttachment ? (
+                  <UploadedVideoAttachment attachment={uploadedVideoAttachment} mode="message" />
+                ) : null}
+                {hasUserText ? (
+                  <p
+                    className="text-sm leading-relaxed whitespace-pre-wrap break-words"
+                    style={{ overflowWrap: "anywhere" }}
+                  >
+                    {formattedUserContent}
+                  </p>
+                ) : null}
               </div>
-              <MessageCopyButton
-                text={formattedUserContent}
-                className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
-              />
+              {hasUserText ? (
+                <MessageCopyButton
+                  text={formattedUserContent}
+                  className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
+                />
+              ) : null}
             </div>
           </div>
           <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500">
@@ -944,7 +979,7 @@ export default function QuickChatOverlay() {
             onImageRemove={() => setUploadedImage(null)}
             uploadedVideo={uploadedVideo}
             onVideoUpload={setUploadedVideo}
-            onVideoRemove={() => setUploadedVideo(null)}
+            onVideoRemove={() => void clearDraftVideo()}
           />
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
             <span>{`${brand.quickChatName} can make mistakes. Verify important details when needed.`}</span>

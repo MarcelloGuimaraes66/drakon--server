@@ -1,4 +1,4 @@
-import { ChatMessage } from "@/shared/types";
+import { ChatMessage, type UploadedVideoAttachment } from "@/shared/types";
 import type { CameraImportApplyResult, CameraImportPreview } from "@/shared/cameraImport";
 import type { CameraBatchEditApplyResult, CameraBatchEditPreview } from "@/shared/cameraBatchEdit";
 import type { CameraDiscoverySummary } from "@/shared/cameraDiscovery";
@@ -274,6 +274,108 @@ function parseMessageCameraSelectionJson(message: ChatMessage): Record<string, u
   }
 
   return parsed as Record<string, unknown>;
+}
+
+function readOptionalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function readOptionalNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function readOptionalPositiveInteger(value: unknown): number | null {
+  const parsed = readOptionalNumber(value);
+  if (parsed === null) return null;
+  const rounded = Math.round(parsed);
+  return rounded > 0 ? rounded : null;
+}
+
+function deriveFallbackVideoName(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const decoded = decodeURIComponent(url.split("/").pop() || "").trim();
+    return decoded || null;
+  } catch {
+    return null;
+  }
+}
+
+export function extractUploadedVideoAttachmentFromMessage(
+  message: ChatMessage,
+): UploadedVideoAttachment | null {
+  const parsed = parseMessageCameraSelectionJson(message);
+  if (!parsed) {
+    return null;
+  }
+
+  const id = readOptionalPositiveInteger(parsed.uploaded_video_id ?? parsed.uploadedVideoId);
+  const publicUrl =
+    readOptionalString(parsed.uploaded_video_url ?? parsed.uploadedVideoUrl) ??
+    readOptionalString(parsed.public_url ?? parsed.publicUrl);
+  const originalName =
+    readOptionalString(parsed.uploaded_video_original_name ?? parsed.uploadedVideoOriginalName) ??
+    readOptionalString(parsed.original_name ?? parsed.originalName) ??
+    deriveFallbackVideoName(publicUrl);
+  const sizeBytes =
+    readOptionalNumber(parsed.uploaded_video_size_bytes ?? parsed.uploadedVideoSizeBytes) ??
+    readOptionalNumber(parsed.size_bytes ?? parsed.sizeBytes);
+  const thumbnailFilename =
+    readOptionalString(parsed.uploaded_video_thumbnail_filename ?? parsed.uploadedVideoThumbnailFilename) ??
+    readOptionalString(parsed.thumbnail_filename ?? parsed.thumbnailFilename);
+  const thumbnailUrl =
+    readOptionalString(parsed.uploaded_video_thumbnail_url ?? parsed.uploadedVideoThumbnailUrl) ??
+    readOptionalString(parsed.thumbnail_url ?? parsed.thumbnailUrl) ??
+    (thumbnailFilename ? `/api/thumbnails/${encodeURIComponent(thumbnailFilename)}` : null);
+  const thumbnailWidth =
+    readOptionalPositiveInteger(parsed.uploaded_video_thumbnail_width ?? parsed.uploadedVideoThumbnailWidth) ??
+    readOptionalPositiveInteger(parsed.thumbnail_width ?? parsed.thumbnailWidth);
+  const thumbnailHeight =
+    readOptionalPositiveInteger(parsed.uploaded_video_thumbnail_height ?? parsed.uploadedVideoThumbnailHeight) ??
+    readOptionalPositiveInteger(parsed.thumbnail_height ?? parsed.thumbnailHeight);
+  const durationSeconds =
+    readOptionalNumber(parsed.uploaded_video_duration_seconds ?? parsed.uploadedVideoDurationSeconds) ??
+    readOptionalNumber(parsed.duration_seconds ?? parsed.durationSeconds);
+  const previewFrameSeconds =
+    readOptionalNumber(parsed.uploaded_video_preview_frame_seconds ?? parsed.uploadedVideoPreviewFrameSeconds) ??
+    readOptionalNumber(parsed.preview_frame_seconds ?? parsed.previewFrameSeconds);
+  const mimeType =
+    readOptionalString(parsed.uploaded_video_mime_type ?? parsed.uploadedVideoMimeType) ??
+    readOptionalString(parsed.mime_type ?? parsed.mimeType);
+
+  if (
+    !id &&
+    !publicUrl &&
+    !originalName &&
+    !thumbnailUrl &&
+    sizeBytes === null &&
+    durationSeconds === null
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    publicUrl,
+    originalName,
+    sizeBytes,
+    mimeType,
+    thumbnailUrl,
+    thumbnailFilename,
+    thumbnailWidth,
+    thumbnailHeight,
+    durationSeconds,
+    previewFrameSeconds,
+  };
 }
 
 function identityCardDedupeKey(card: Record<string, unknown>, fallbackIndex: number): string {

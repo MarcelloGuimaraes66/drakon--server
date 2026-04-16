@@ -5,6 +5,7 @@ import Layout from "@/react-app/components/Layout";
 import ChatInput from "@/react-app/components/ChatInput";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import AssistantMessage from "@/react-app/components/AssistantMessage";
+import UploadedVideoAttachment from "@/react-app/components/UploadedVideoAttachment";
 import ChatCameraRegistrationCard from "@/react-app/components/ChatCameraRegistrationCard";
 import ChatCameraBatchRegistrationCard from "@/react-app/components/ChatCameraBatchRegistrationCard";
 import ChatCameraBatchEditCard from "@/react-app/components/ChatCameraBatchEditCard";
@@ -33,9 +34,9 @@ import {
   usePerceptrumChatSession,
 } from "@/react-app/hooks/usePerceptrumChatSession";
 import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
-import { ChatMessage, ChatSession } from "@/shared/types";
+import { ChatMessage, ChatSession, type UploadedVideoAttachment as UploadedVideoAttachmentData } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
-import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2, Video } from "lucide-react";
+import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2 } from "lucide-react";
 import {
   type CameraAgentFormRequestMessageMetadata,
   type CameraEditFormRequestMessageMetadata,
@@ -52,6 +53,7 @@ import {
   extractCameraRegistrationDraftFromMessage,
   extractJobCreationResultFromMessage,
   extractReportDocumentFromMessage,
+  extractUploadedVideoAttachmentFromMessage,
   applyCameraEditDraftToCamera,
   buildCameraAgentDraftForEditor,
   extractChatProgressFromMessage,
@@ -106,17 +108,7 @@ export default function Chat() {
   const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
-  const [uploadedVideo, setUploadedVideo] = useState<{
-    id: number;
-    publicUrl: string;
-    originalName: string;
-    sizeBytes: number;
-  } | null>(null);
-  const [videoUploadsCache, setVideoUploadsCache] = useState<Map<number, {
-    originalName: string;
-    sizeBytes: number;
-    publicUrl: string;
-  }>>(new Map());
+  const [uploadedVideo, setUploadedVideo] = useState<UploadedVideoAttachmentData | null>(null);
   const [modelTier, setModelTier] = useState<ChatModelTier>(DEFAULT_CHAT_MODEL_TIER);
   const [toast, setToast] = useState<{
     message: string;
@@ -182,6 +174,27 @@ export default function Chat() {
       : pendingExecutionState.kind === "stale"
         ? "Desktop agent connection looks stale. Make sure the EXE is open and still connected."
         : null;
+
+  const clearDraftVideo = async ({ preserveUpload = false }: { preserveUpload?: boolean } = {}) => {
+    const currentVideo = uploadedVideo;
+    setUploadedVideo(null);
+
+    if (preserveUpload || !currentVideo?.id) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/video-uploads/${currentVideo.id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!response.ok && response.status !== 404 && response.status !== 409) {
+        console.warn("[CHAT] Failed to clean up draft video upload:", response.status);
+      }
+    } catch (error) {
+      console.warn("[CHAT] Failed to clean up draft video upload:", error);
+    }
+  };
 
   const openChatEditForm = async (
     cameraId: number,
@@ -494,7 +507,7 @@ export default function Chat() {
   const handleNewChat = () => {
     setInput("");
     setUploadedImage(null);
-    setUploadedVideo(null);
+    void clearDraftVideo();
     setMessages([]);
     setActiveSessionId(null);
     setShouldAutoScroll(true);
@@ -591,26 +604,15 @@ export default function Chat() {
 
     const userMessage = input;
     const imageBase64 = uploadedImage;
-    const videoId = uploadedVideo?.id;
-
-    if (uploadedVideo) {
-      setVideoUploadsCache((prev) => {
-        const newCache = new Map(prev);
-        newCache.set(uploadedVideo.id, {
-          originalName: uploadedVideo.originalName,
-          sizeBytes: uploadedVideo.sizeBytes,
-          publicUrl: uploadedVideo.publicUrl,
-        });
-        return newCache;
-      });
-    }
+    const draftVideo = uploadedVideo;
+    const videoId = uploadedVideo?.id ?? null;
 
     setInput("");
     setUploadedImage(null);
-    setUploadedVideo(null);
+    void clearDraftVideo({ preserveUpload: true });
     setShouldAutoScroll(true);
 
-    await sendMessage({
+    const sendSucceeded = await sendMessage({
       sessionIdOverride: targetSessionId,
       content: userMessage,
       uploadedImageBase64: imageBase64,
@@ -619,6 +621,15 @@ export default function Chat() {
       modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
       runningResolution: modelTier === "core" ? DEFAULT_CHAT_CORE_RUNNING_RESOLUTION : null,
     });
+
+    if (!sendSucceeded) {
+      setInput(userMessage);
+      setUploadedImage(imageBase64);
+      if (draftVideo) {
+        setUploadedVideo(draftVideo);
+      }
+      return;
+    }
 
     await fetchSessions({ preferredSessionId: targetSessionId });
   };
@@ -639,12 +650,6 @@ export default function Chat() {
     if (diffDays < 7) return `${diffDays}d ago`;
 
     return date.toLocaleDateString();
-  };
-
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
   const handleModelSelect = (tier: ChatModelTier) => {
@@ -716,47 +721,8 @@ export default function Chat() {
     if (message.role === "user") {
       const userMsg = message as any;
       const formattedUserContent = formatMessageContent(message.content);
-      let videoMetadata: { uploaded_video_id?: number; uploaded_video_url?: string } | null = null;
-      try {
-        if (userMsg.camera_selection_json) {
-          const parsed = JSON.parse(userMsg.camera_selection_json);
-          if (parsed.uploaded_video_id || parsed.uploaded_video_url) {
-            videoMetadata = parsed;
-          }
-        }
-      } catch {
-      }
-
-      let videoFileName = "Video file";
-      let videoFileSize: number | null = null;
-      let videoUrl: string | null = null;
-
-      if (videoMetadata) {
-        videoUrl = videoMetadata.uploaded_video_url || null;
-
-        if (videoMetadata.uploaded_video_id) {
-          const cached = videoUploadsCache.get(videoMetadata.uploaded_video_id);
-          if (cached) {
-            videoFileName = cached.originalName;
-            videoFileSize = cached.sizeBytes;
-            videoUrl = cached.publicUrl;
-          }
-        }
-
-        if (videoUrl && videoFileName === "Video file") {
-          try {
-            const urlPath = videoUrl.split("/").pop();
-            if (urlPath) {
-              const decodedPath = decodeURIComponent(urlPath);
-              const match = decodedPath.match(/\.(mp4|webm|mov)$/i);
-              if (match) {
-                videoFileName = `Video${match[0]}`;
-              }
-            }
-          } catch {
-          }
-        }
-      }
+      const uploadedVideoAttachment = extractUploadedVideoAttachmentFromMessage(message);
+      const hasUserText = formattedUserContent.trim().length > 0;
 
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
@@ -770,34 +736,24 @@ export default function Chat() {
                     className="mb-3 max-h-40 rounded-2xl shadow-md"
                   />
                 )}
-                {videoUrl && (
-                  <a
-                    href={videoUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="mb-3 flex cursor-pointer items-center gap-3 rounded-2xl border border-white/15 bg-white/10 px-3 py-2 transition-colors hover:bg-white/20"
-                    onClick={(event) => event.stopPropagation()}
+                {uploadedVideoAttachment ? (
+                  <UploadedVideoAttachment attachment={uploadedVideoAttachment} mode="message" />
+                ) : null}
+                {hasUserText ? (
+                  <p
+                    className="break-words whitespace-pre-wrap text-sm leading-relaxed"
+                    style={{ overflowWrap: "anywhere" }}
                   >
-                    <Video className="h-5 w-5 flex-shrink-0" />
-                    <div className="min-w-0 flex-1 text-left">
-                      <p className="truncate text-sm font-medium">{videoFileName}</p>
-                      {videoFileSize && (
-                        <p className="text-xs opacity-75">{formatFileSize(videoFileSize)}</p>
-                      )}
-                    </div>
-                  </a>
-                )}
-                <p
-                  className="break-words whitespace-pre-wrap text-sm leading-relaxed"
-                  style={{ overflowWrap: "anywhere" }}
-                >
-                  {formattedUserContent}
-                </p>
+                    {formattedUserContent}
+                  </p>
+                ) : null}
               </div>
-              <MessageCopyButton
-                text={formattedUserContent}
-                className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
-              />
+              {hasUserText ? (
+                <MessageCopyButton
+                  text={formattedUserContent}
+                  className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
+                />
+              ) : null}
             </div>
           </div>
           <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500">
@@ -1234,7 +1190,7 @@ export default function Chat() {
                   onImageRemove={() => setUploadedImage(null)}
                   uploadedVideo={uploadedVideo}
                   onVideoUpload={setUploadedVideo}
-                  onVideoRemove={() => setUploadedVideo(null)}
+                  onVideoRemove={() => void clearDraftVideo()}
                 />
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-xs text-gray-500">
                   <span>{`${brand.chatName} can make mistakes. Consider verifying important details.`}</span>

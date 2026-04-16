@@ -436,13 +436,14 @@ async function collectLocalStorageKeys(
 
   const uploadRows = await queryAll(
     db,
-    `SELECT storage_key
+    `SELECT storage_key, thumbnail_filename
        FROM video_uploads
       WHERE user_id = ?`,
     [appUserId]
   );
   for (const row of uploadRows) {
     addUniqueStorageKey(storageKeys, row.storage_key);
+    addUniqueStorageKey(storageKeys, row.thumbnail_filename, "thumbs");
   }
 
   const chatHitRows = await queryAll(
