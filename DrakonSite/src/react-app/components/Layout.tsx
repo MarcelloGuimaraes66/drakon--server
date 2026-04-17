@@ -14,6 +14,7 @@ import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { useTheme } from "@/react-app/hooks/useTheme";
+import type { OnboardingTutorialKind } from "@/react-app/lib/onboarding";
 import { brand, getBrandStorageKey, getBrandWindowEventName } from "@/shared/brand";
 import {
   Activity,
@@ -29,6 +30,7 @@ import {
   Bell,
   Briefcase,
   Bot,
+  ChevronDown,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
@@ -89,6 +91,25 @@ function getSidebarSectionLabels(language: string) {
 function formatSidebarBadgeCount(count?: number) {
   if (!count || count < 1) return null;
   return count > 99 ? "99+" : String(count);
+}
+
+function getStandaloneAgentTutorialCameraId(
+  cameras: Array<{ id?: unknown; name?: unknown }>
+): number | null {
+  const availableCameras = cameras
+    .map((camera) => ({
+      id: typeof camera.id === "number" && Number.isInteger(camera.id) && camera.id > 0
+        ? camera.id
+        : null,
+      name: typeof camera.name === "string" ? camera.name.trim().toLowerCase() : "",
+    }))
+    .filter((camera): camera is { id: number; name: string } => camera.id !== null);
+
+  return (
+    availableCameras.find((camera) => camera.name.includes("tutorial"))?.id ??
+    availableCameras[0]?.id ??
+    null
+  );
 }
 
 type ApiKeyPromptStatus = {
@@ -160,6 +181,7 @@ export default function Layout({ children }: LayoutProps) {
   const [isSystemActivityOpen, setIsSystemActivityOpen] = useState(false);
   const [showOpenAiKeyPrompt, setShowOpenAiKeyPrompt] = useState(false);
   const [showZAiKeyPrompt, setShowZAiKeyPrompt] = useState(false);
+  const [isTutorialMenuOpen, setIsTutorialMenuOpen] = useState(false);
   const [sidebarHoverHint, setSidebarHoverHint] = useState<SidebarHoverHint | null>(null);
   const previousPathnameRef = useRef("");
   const collapseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -168,6 +190,7 @@ export default function Layout({ children }: LayoutProps) {
   const sidebarHoverHintTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousUnreadCountRef = useRef(0);
   const notificationsContainerRef = useRef<HTMLDivElement>(null);
+  const tutorialMenuRef = useRef<HTMLDivElement>(null);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
   const isSidebarCollapsed = isDesktop && (isSidebarCollapsedDesktop || isChatAutoCollapsedDesktop);
   const currentBrandId = brand.id.toLowerCase();
@@ -244,6 +267,7 @@ export default function Layout({ children }: LayoutProps) {
   useEffect(() => {
     setIsSidebarOpen(false);
     setSidebarHoverHint(null);
+    setIsTutorialMenuOpen(false);
   }, [location.pathname]);
 
   useEffect(() => {
@@ -360,6 +384,31 @@ export default function Layout({ children }: LayoutProps) {
       document.removeEventListener("keydown", handleEscape);
     };
   }, [isNotificationsOpen]);
+
+  useEffect(() => {
+    if (!isTutorialMenuOpen) return;
+
+    const closeTutorialMenu = () => setIsTutorialMenuOpen(false);
+    const handlePointerDown = (event: PointerEvent) => {
+      if (tutorialMenuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+
+      closeTutorialMenu();
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeTutorialMenu();
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [isTutorialMenuOpen]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -759,6 +808,43 @@ export default function Layout({ children }: LayoutProps) {
     onboardingStatus === "never_started"
       ? t("tutorial.entry.getStarted")
       : t("tutorial.entry.tutorial");
+  const standaloneAgentTutorialCameraId = getStandaloneAgentTutorialCameraId(cameras);
+  const tutorialMenuItems: Array<{
+    kind: OnboardingTutorialKind;
+    label: string;
+    description: string;
+  }> = [
+    {
+      kind: "intro",
+      label: t("tutorial.entry.menu.intro.label"),
+      description: t("tutorial.entry.menu.intro.description"),
+    },
+    {
+      kind: "api-key",
+      label: t("tutorial.entry.menu.apiKey.label"),
+      description: t("tutorial.entry.menu.apiKey.description"),
+    },
+    {
+      kind: "camera",
+      label: t("tutorial.entry.menu.camera.label"),
+      description: t("tutorial.entry.menu.camera.description"),
+    },
+    {
+      kind: "agent",
+      label: t("tutorial.entry.menu.agent.label"),
+      description: standaloneAgentTutorialCameraId
+        ? t("tutorial.entry.menu.agent.description")
+        : t("tutorial.entry.menu.agent.noCameraDescription"),
+    },
+  ];
+
+  const handleTutorialMenuSelect = (kind: OnboardingTutorialKind) => {
+    setIsTutorialMenuOpen(false);
+    startTutorial(
+      kind,
+      kind === "agent" ? { cameraId: standaloneAgentTutorialCameraId } : undefined
+    );
+  };
 
   return (
     <div className="h-screen bg-gray-950 flex overflow-hidden">
@@ -1126,15 +1212,53 @@ export default function Layout({ children }: LayoutProps) {
               <span className="hidden sm:inline">System Activity</span>
             </button>
 
-            <button
-              type="button"
-              onClick={startTutorial}
-              className="inline-flex items-center gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-1.5 text-sm font-medium text-blue-100 transition-colors hover:border-blue-400/45 hover:bg-blue-500/15 hover:text-white"
-              aria-label={t("tutorial.entry.openAria")}
-            >
-              <Sparkles className="h-4 w-4 text-blue-200" />
-              <span className="hidden sm:inline">{tutorialButtonLabel}</span>
-            </button>
+            <div ref={tutorialMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setIsTutorialMenuOpen((open) => !open)}
+                className="inline-flex items-center gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-1.5 text-sm font-medium text-blue-100 transition-colors hover:border-blue-400/45 hover:bg-blue-500/15 hover:text-white"
+                aria-haspopup="menu"
+                aria-expanded={isTutorialMenuOpen}
+                aria-label={t("tutorial.entry.openAria")}
+              >
+                <Sparkles className="h-4 w-4 text-blue-200" />
+                <span className="hidden sm:inline">{tutorialButtonLabel}</span>
+                <ChevronDown
+                  className={`h-3.5 w-3.5 text-blue-200 transition-transform ${
+                    isTutorialMenuOpen ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+
+              {isTutorialMenuOpen ? (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-full z-50 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-blue-400/20 bg-slate-950/96 p-1.5 shadow-2xl shadow-blue-950/50 backdrop-blur-xl"
+                >
+                  {tutorialMenuItems.map((item) => (
+                    <button
+                      key={item.kind}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => handleTutorialMenuSelect(item.kind)}
+                      className="group flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left transition-colors hover:bg-blue-500/10"
+                    >
+                      <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06] text-blue-100 transition-colors group-hover:border-blue-300/35 group-hover:bg-blue-500/15">
+                        <Sparkles className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-semibold text-slate-100">
+                          {item.label}
+                        </span>
+                        <span className="mt-1 block text-xs leading-5 text-slate-400">
+                          {item.description}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
 
             <LanguageSelector />
             

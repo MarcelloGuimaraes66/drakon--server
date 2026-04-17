@@ -15,6 +15,7 @@ import {
   type OnboardingProviderKind,
   type OnboardingStepId,
   type OnboardingStatus,
+  type OnboardingTutorialKind,
   readOnboardingState,
   writeOnboardingState,
 } from "@/react-app/lib/onboarding";
@@ -26,6 +27,7 @@ type OnboardingContextValue = {
   isHydrated: boolean;
   isOpen: boolean;
   status: OnboardingStatus;
+  tutorialKind: OnboardingTutorialKind;
   currentStepId: OnboardingStepId | null;
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
@@ -33,7 +35,10 @@ type OnboardingContextValue = {
   tutorialProceedWithoutWebcam: boolean;
   providerStatus: ProviderStatusMap;
   inlineMessage: string;
-  startTutorial: () => void;
+  startTutorial: (
+    kind?: OnboardingTutorialKind,
+    options?: { cameraId?: number | null }
+  ) => void;
   closeTutorial: () => void;
   finishTutorial: () => void;
   completeCameraTutorial: (cameraId?: number | null) => void;
@@ -85,6 +90,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const [isHydrated, setIsHydrated] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [status, setStatus] = useState<OnboardingStatus>("never_started");
+  const [tutorialKind, setTutorialKind] = useState<OnboardingTutorialKind>("intro");
   const [currentStepId, setCurrentStepId] = useState<OnboardingStepId | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<OnboardingProviderKind | null>(null);
   const [tutorialCameraId, setTutorialCameraId] = useState<number | null>(null);
@@ -108,6 +114,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
 
     const persisted = readOnboardingState(onboardingUserId);
     setStatus(persisted.status);
+    setTutorialKind(persisted.tutorialKind);
     setCurrentStepId(persisted.currentStepId);
     setSelectedProvider(persisted.selectedProvider);
     setTutorialCameraId(persisted.tutorialCameraId);
@@ -130,6 +137,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     writeOnboardingState({
       version: 1,
       status,
+      tutorialKind,
       currentStepId,
       selectedProvider,
       tutorialCameraId,
@@ -144,6 +152,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     onboardingUserId,
     selectedProvider,
     status,
+    tutorialKind,
     tutorialAgentId,
     tutorialCameraId,
     tutorialProceedWithoutWebcam,
@@ -197,11 +206,11 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     }
 
     const timeoutId = window.setTimeout(() => {
-      moveToStep("camera-placeholder");
+      moveToStep(tutorialKind === "api-key" ? "complete" : "camera-placeholder");
     }, 420);
 
     return () => window.clearTimeout(timeoutId);
-  }, [currentStepId, isOpen, moveToStep, providerStatus, selectedProvider]);
+  }, [currentStepId, isOpen, moveToStep, providerStatus, selectedProvider, tutorialKind]);
 
   const refreshProviderStatus = useCallback(async (): Promise<ProviderStatusMap> => {
     const readHasKey = async (url: string): Promise<boolean | null> => {
@@ -249,18 +258,39 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const startTutorial = useCallback(() => {
+  const startTutorial = useCallback((
+    kind: OnboardingTutorialKind = "intro",
+    options: { cameraId?: number | null } = {}
+  ) => {
+    const cameraId = normalizeCameraId(options.cameraId);
+    setTutorialKind(kind);
     setSelectedProvider(null);
-    setTutorialCameraId(null);
+    setTutorialCameraId(kind === "agent" ? cameraId : null);
     setTutorialAgentId(null);
     setTutorialProceedWithoutWebcam(false);
-    moveToStep("welcome");
+
+    switch (kind) {
+      case "api-key":
+        moveToStep("settings-zai-card");
+        return;
+      case "camera":
+        moveToStep("camera-placeholder");
+        return;
+      case "agent":
+        moveToStep(cameraId ? "agent-intro" : "agent-camera-required");
+        return;
+      case "intro":
+      default:
+        moveToStep("welcome");
+        return;
+    }
   }, [moveToStep]);
 
   const closeTutorial = useCallback(() => {
     setInlineMessage("");
     setIsOpen(false);
     setCurrentStepId(null);
+    setTutorialKind("intro");
     setSelectedProvider(null);
     setTutorialCameraId(null);
     setTutorialAgentId(null);
@@ -272,6 +302,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setInlineMessage("");
     setIsOpen(false);
     setCurrentStepId(null);
+    setTutorialKind("intro");
     setSelectedProvider(null);
     setTutorialCameraId(null);
     setTutorialAgentId(null);
@@ -283,8 +314,8 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setInlineMessage("");
     setTutorialCameraId((current) => normalizeCameraId(cameraId) ?? current);
     setTutorialAgentId(null);
-    moveToStep("agent-intro");
-  }, [moveToStep]);
+    moveToStep(tutorialKind === "camera" ? "complete" : "agent-intro");
+  }, [moveToStep, tutorialKind]);
 
   const completeAgentTutorial = useCallback((agentId?: number | null) => {
     setInlineMessage("");
@@ -302,13 +333,13 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       setInlineMessage("");
       const nextStatus = await refreshProviderStatus();
       if (nextStatus[provider]) {
-        moveToStep("camera-placeholder");
+        moveToStep(tutorialKind === "api-key" ? "complete" : "camera-placeholder");
         return;
       }
 
       moveToStep("provider-open");
     },
-    [moveToStep, refreshProviderStatus]
+    [moveToStep, refreshProviderStatus, tutorialKind]
   );
 
   const next = useCallback(async () => {
@@ -338,7 +369,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
 
         const nextStatus = await refreshProviderStatus();
         if (nextStatus[selectedProvider]) {
-          moveToStep("camera-placeholder");
+          moveToStep(tutorialKind === "api-key" ? "complete" : "camera-placeholder");
           return;
         }
 
@@ -406,16 +437,30 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       case "complete":
         finishTutorial();
         return;
+      case "agent-camera-required":
+        startTutorial("camera");
+        return;
       default:
         return;
     }
-  }, [currentStepId, finishTutorial, moveToStep, refreshProviderStatus, selectedProvider]);
+  }, [
+    currentStepId,
+    finishTutorial,
+    moveToStep,
+    refreshProviderStatus,
+    selectedProvider,
+    startTutorial,
+    tutorialKind,
+  ]);
 
   const back = useCallback(() => {
     setInlineMessage("");
 
     switch (currentStepId) {
       case "settings-zai-card":
+        if (tutorialKind === "api-key") {
+          return;
+        }
         moveToStep("welcome");
         return;
       case "settings-openai-card":
@@ -434,6 +479,9 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
         moveToStep("provider-input");
         return;
       case "camera-placeholder":
+        if (tutorialKind === "camera") {
+          return;
+        }
         moveToStep("settings-provider-choice");
         return;
       case "camera-scan-network":
@@ -461,6 +509,9 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
         moveToStep("camera-webcam-form");
         return;
       case "agent-intro":
+        if (tutorialKind === "agent") {
+          return;
+        }
         moveToStep("camera-webcam-save");
         return;
       case "agent-create":
@@ -499,7 +550,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       default:
         return;
     }
-  }, [currentStepId, moveToStep]);
+  }, [currentStepId, moveToStep, tutorialKind]);
 
   const clearInlineMessage = useCallback(() => {
     setInlineMessage("");
@@ -510,6 +561,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       isHydrated,
       isOpen,
       status,
+      tutorialKind,
       currentStepId,
       selectedProvider,
       tutorialCameraId,
@@ -549,6 +601,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       startTutorial,
       status,
       syncProviderStatus,
+      tutorialKind,
       tutorialAgentId,
       tutorialCameraId,
       tutorialProceedWithoutWebcam,

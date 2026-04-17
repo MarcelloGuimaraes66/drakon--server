@@ -4,6 +4,9 @@ import { useTranslation } from "react-i18next";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
 import CameraDirectoryControls from "@/react-app/components/CameraDirectoryControls";
 import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
+import CameraRecordingPlayerOverlay, {
+  type CameraRecordingPlayerCamera,
+} from "@/react-app/components/CameraRecordingPlayerOverlay";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
@@ -39,6 +42,7 @@ import {
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
 import {
+  Archive,
   Camera,
   Plus,
   Play,
@@ -133,7 +137,7 @@ function applyAIAgentsDirectoryState(
 }
 
 function AIAgentsContent() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -156,6 +160,8 @@ function AIAgentsContent() {
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
+  const [recordingCamera, setRecordingCamera] =
+    useState<CameraRecordingPlayerCamera | null>(null);
   const [editingCamera, setEditingCamera] = useState<CameraEditorCamera | null>(null);
   const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
@@ -216,6 +222,9 @@ function AIAgentsContent() {
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
   );
+  const recordingHistoryLabel = i18n.language?.startsWith("pt")
+    ? "Arquivo"
+    : "Archive";
 
   useEffect(() => {
     if (!isOnboardingOpen || onboardingStepId !== "ai-agents-camera-start") {
@@ -429,6 +438,33 @@ function AIAgentsContent() {
     dashboardSummaryStore.refresh();
   };
 
+  const openRecordingPlayer = (camera: CameraType) => {
+    setRecordingCamera({
+      id: camera.id,
+      name: String(camera.name || "").trim() || `Camera ${camera.id}`,
+      description:
+        typeof (camera as any).description === "string"
+          ? String((camera as any).description).trim()
+          : null,
+      thumbnail_url:
+        typeof camera.thumbnail_url === "string" ? camera.thumbnail_url : null,
+      is_service_running:
+        typeof camera.is_service_running === "number"
+          ? camera.is_service_running
+          : null,
+      is_online:
+        typeof camera.is_online === "number" ? camera.is_online : null,
+      store_frames:
+        typeof (camera as any).store_frames === "number"
+          ? (camera as any).store_frames
+          : null,
+      retention_days:
+        typeof (camera as any).retention_days === "number"
+          ? (camera as any).retention_days
+          : null,
+    });
+  };
+
   const renderCameraActions = (
     camera: CameraType,
     mode: "default" | "overlay" = "default"
@@ -498,6 +534,19 @@ function AIAgentsContent() {
           )}
         </button>
 
+        <button
+          type="button"
+          onClick={() => openRecordingPlayer(camera)}
+          className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
+            isOverlay
+              ? "min-h-[40px] rounded-xl border border-cyan-400/20 bg-cyan-500/16 px-3 py-2 text-cyan-100 backdrop-blur-sm hover:bg-cyan-500/24"
+              : "min-h-[44px] rounded-lg bg-cyan-500/10 px-3 py-2.5 text-cyan-300 hover:bg-cyan-500/18 md:min-h-0 md:py-2"
+          }`}
+        >
+          <Archive className="w-4 h-4" />
+          {recordingHistoryLabel}
+        </button>
+
         <Link
           to={{
             pathname: `/algorithms/${camera.id}`,
@@ -506,8 +555,8 @@ function AIAgentsContent() {
           state={{ returnSource: AI_AGENTS_RETURN_SOURCE }}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
             isOverlay
-              ? "col-span-2 min-h-[40px] rounded-xl border border-blue-400/20 bg-blue-500/20 px-3 py-2 text-blue-100 backdrop-blur-sm hover:bg-blue-500/30"
-              : "min-h-[44px] rounded-lg bg-blue-500/10 px-3 py-2.5 text-blue-400 hover:bg-blue-500/20 md:col-span-2 md:min-h-0 md:py-2"
+              ? "min-h-[40px] rounded-xl border border-blue-400/20 bg-blue-500/20 px-3 py-2 text-blue-100 backdrop-blur-sm hover:bg-blue-500/30"
+              : "min-h-[44px] rounded-lg bg-blue-500/10 px-3 py-2.5 text-blue-400 hover:bg-blue-500/20 md:min-h-0 md:py-2"
           }`}
         >
           <Cpu className="w-4 h-4" />
@@ -796,6 +845,12 @@ function AIAgentsContent() {
         isOpen={isImportOpen}
         onClose={() => setIsImportOpen(false)}
         onImported={handleImportSaved}
+      />
+
+      <CameraRecordingPlayerOverlay
+        isOpen={recordingCamera !== null}
+        camera={recordingCamera}
+        onClose={() => setRecordingCamera(null)}
       />
 
       {/* Camera event toasts */}

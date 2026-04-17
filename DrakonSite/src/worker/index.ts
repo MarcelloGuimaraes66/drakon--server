@@ -27,6 +27,12 @@ import {
   runJobSchedulerTick,
 } from "./jobScheduler";
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
+import {
+  buildCameraRecordingSegments,
+  buildCameraRecordingSummary,
+  resolveCameraRecordingStreamTarget,
+  type CameraRecordingCameraState,
+} from "./cameraRecordings";
 import { brand } from "@/shared/brand";
 import {
   formatAiApiErrorDisplay,
@@ -10878,15 +10884,15 @@ function normalizeChatModelFps(value: unknown, tier: ChatModelTier): number {
   const fallback = getChatModelDefaultFps(tier);
   if (typeof value === "number" && Number.isFinite(value)) {
     const rounded = Math.round(value);
-    return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, rounded));
+    return Math.min(MAX_CHAT_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, rounded));
   }
   if (typeof value === "string" && value.trim()) {
     const parsed = Number.parseInt(value.trim(), 10);
     if (Number.isFinite(parsed)) {
-      return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
+      return Math.min(MAX_CHAT_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
     }
   }
-  return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, fallback));
+  return Math.min(MAX_CHAT_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, fallback));
 }
 
 function stripTemporalEngineDiagnosticsFromChatAnswer(value: string): string {
@@ -12091,6 +12097,48 @@ const CHAT_IDENTITY_PERSON_DISCARDED_CUES = [
   "calçado",
 ];
 
+const CHAT_IDENTITY_VEHICLE_PRIMARY_CUES = [
+  "plate",
+  "placa",
+  "dent",
+  "scratch",
+  "scrape",
+  "rack",
+  "roof rack",
+  "headlight",
+  "taillight",
+  "tail light",
+  "bumper",
+  "grille",
+  "sticker",
+  "decal",
+];
+
+const CHAT_IDENTITY_VEHICLE_SECONDARY_CUES = [
+  "vehicle",
+  "car",
+  "sedan",
+  "suv",
+  "truck",
+  "pickup",
+  "van",
+  "bus",
+  "motorcycle",
+  "motorbike",
+  "hatchback",
+  "coupe",
+  "wagon",
+  "four-door",
+  "four door",
+  "two-door",
+  "two door",
+  "wheel",
+  "tire",
+  "chrome",
+  "tinted",
+  "mirror",
+];
+
 const CHAT_IDENTITY_GENERIC_OBJECT_CUES = [
   "box",
   "package",
@@ -12153,9 +12201,13 @@ function classifyChatIdentityTraitPriority(entityTypeInput: unknown, value: unkn
     entityType.includes("plate");
 
   if (vehicleLike) {
-    return chatIdentityTextHasCue(text, ["plate", "placa", "dent", "scratch", "rack", "headlight", "taillight"])
-      ? 3
-      : 0;
+    if (chatIdentityTextHasCue(text, CHAT_IDENTITY_VEHICLE_PRIMARY_CUES)) {
+      return 3;
+    }
+    if (chatIdentityTextHasCue(text, CHAT_IDENTITY_VEHICLE_SECONDARY_CUES)) {
+      return 2;
+    }
+    return 0;
   }
 
   if (personLike) {
@@ -12234,6 +12286,39 @@ function sanitizeChatIdentityTraitArray(
     .map((item) => item.value);
 }
 
+function preserveChatIdentityTraitArray(values: unknown[], maxItems = 8): string[] {
+  const seen = new Set<string>();
+  const preserved: string[] = [];
+
+  values.forEach((value) => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    value.forEach((item) => {
+      if (typeof item !== "string") {
+        return;
+      }
+      const trimmed = normalizeText(item).slice(0, 160);
+      if (!trimmed) {
+        return;
+      }
+      const dedupeKey = foldChatRecallText(trimmed);
+      if (
+        !dedupeKey ||
+        seen.has(dedupeKey) ||
+        isChatIdentitySceneLikeText(trimmed) ||
+        isChatIdentityPoseLikeText(trimmed)
+      ) {
+        return;
+      }
+      seen.add(dedupeKey);
+      preserved.push(trimmed);
+    });
+  });
+
+  return preserved.slice(0, Math.max(0, Math.floor(maxItems)));
+}
+
 function splitChatIdentityTraitCandidatesFromText(value: unknown, maxItems = 8): string[] {
   const normalized = normalizeText(value)
     .replace(/^identity signature\s*:\s*/i, "")
@@ -12254,21 +12339,53 @@ function splitChatIdentityTraitCandidatesFromText(value: unknown, maxItems = 8):
   return [normalized.slice(0, 160)];
 }
 
-function sanitizeChatIdentityDescriptionForContext(
+function buildChatIdentityDescriptionFromTraits(signatureTraits: string[], maxItems = 4): string {
+  return signatureTraits.slice(0, Math.max(0, Math.floor(maxItems))).join("; ").slice(0, 400);
+}
+
+function chatIdentityDescriptionHasUsefulSignal(
   value: unknown,
-  signatureTraits: string[]
-): string {
-  const curatedFromTraits = signatureTraits.slice(0, 4).join("; ").slice(0, 400);
-  if (curatedFromTraits) {
-    return curatedFromTraits;
-  }
+  entityTypeInput: unknown
+): boolean {
   const description = normalizeText(value).slice(0, 400);
   if (!description) {
-    return "";
+    return false;
   }
-  return isChatIdentitySceneLikeText(description) || isChatIdentityPoseLikeText(description)
-    ? ""
-    : description;
+
+  const candidates = Array.from(
+    new Set([
+      description,
+      ...description
+        .split(/[\r\n,;|]+/)
+        .map((item) => normalizeText(item).slice(0, 160))
+        .filter(Boolean),
+    ])
+  );
+
+  return candidates.some((candidate) => classifyChatIdentityTraitPriority(entityTypeInput, candidate) > 0);
+}
+
+function sanitizeChatIdentityDescriptionForContext(
+  value: unknown,
+  signatureTraits: string[],
+  entityTypeInput?: unknown
+): string {
+  const curatedFromTraits = buildChatIdentityDescriptionFromTraits(signatureTraits, 4);
+  const description = normalizeText(value).slice(0, 400);
+  if (description) {
+    const looksSceneLike = isChatIdentitySceneLikeText(description);
+    const looksPoseLike = isChatIdentityPoseLikeText(description);
+    const hasUsefulSignal = chatIdentityDescriptionHasUsefulSignal(description, entityTypeInput);
+    if ((!looksSceneLike && !looksPoseLike) || hasUsefulSignal) {
+      const descriptionKey = foldChatRecallText(description);
+      const curatedKey = foldChatRecallText(curatedFromTraits);
+      if (descriptionKey && curatedKey && descriptionKey === curatedKey) {
+        return curatedFromTraits;
+      }
+      return description;
+    }
+  }
+  return curatedFromTraits;
 }
 
 function sanitizeChatIdentityContextTraitArray(value: unknown, maxItems = 4): string[] {
@@ -12303,6 +12420,77 @@ function sanitizeChatIdentityContextTraitArray(value: unknown, maxItems = 4): st
   ).slice(0, Math.max(0, Math.floor(maxItems)));
 }
 
+function normalizeChatIdentityCardIdForContext(cardId: unknown, entityId: unknown): string {
+  const normalizedCardId = normalizeText(cardId).slice(0, 160);
+  if (normalizedCardId) {
+    if (normalizedCardId.startsWith("identity_card:")) {
+      return normalizedCardId;
+    }
+    const normalizedEntityId = normalizeText(entityId).slice(0, 120);
+    if (normalizedEntityId && normalizedCardId === normalizedEntityId) {
+      return `identity_card:${normalizedEntityId}`.slice(0, 160);
+    }
+    return normalizedCardId;
+  }
+
+  const normalizedEntityId = normalizeText(entityId).slice(0, 120);
+  return normalizedEntityId ? `identity_card:${normalizedEntityId}`.slice(0, 160) : "";
+}
+
+function sanitizeChatIdentityFeatureCandidatesForContext(
+  value: unknown,
+  entityTypeInput: unknown,
+  maxItems = 8
+): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const accepted: Array<{ priority: number; candidate: Record<string, unknown>; order: number }> = [];
+  let order = 0;
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const text = normalizeText(candidate.text).slice(0, 160);
+    if (!text) {
+      continue;
+    }
+    const priority = classifyChatIdentityTraitPriority(entityTypeInput, text);
+    if (priority <= 0) {
+      continue;
+    }
+    const category = normalizeText(candidate.category).slice(0, 80);
+    const relationToTarget = normalizeText(candidate.relation_to_target).slice(0, 80);
+    const dedupeKey = `${foldChatRecallText(text)}|${category.toLowerCase()}|${relationToTarget.toLowerCase()}`;
+    if (!dedupeKey || seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+
+    const normalized: Record<string, unknown> = { text };
+    if (category) normalized.category = category;
+    if (relationToTarget) normalized.relation_to_target = relationToTarget;
+    if (typeof candidate.confidence === "number" && Number.isFinite(candidate.confidence)) {
+      normalized.confidence = candidate.confidence;
+    }
+
+    accepted.push({ priority, candidate: normalized, order: order++ });
+  }
+
+  return accepted
+    .sort((a, b) => {
+      if (b.priority !== a.priority) {
+        return b.priority - a.priority;
+      }
+      return a.order - b.order;
+    })
+    .slice(0, Math.max(0, Math.floor(maxItems)))
+    .map((entry) => entry.candidate);
+}
+
 function normalizeChatStringArrayForContext(
   value: unknown,
   maxItems = 8,
@@ -12328,7 +12516,26 @@ function sanitizeChatExternalUrlForContext(value: unknown, maxChars = 500): stri
   return text.slice(0, maxChars);
 }
 
-function sanitizeChatIdentityPortraitSnapshot(value: unknown): Record<string, unknown> | null {
+type ChatIdentityCardSnapshotOptions = {
+  includeInlineImageData?: boolean;
+  maxInlineImageChars?: number;
+};
+
+function sanitizeChatInlineImageDataUrlForContext(
+  value: unknown,
+  maxChars = 120_000
+): string {
+  const text = normalizeText(value);
+  if (!text) return "";
+  if (!parseDataUrl(text)) return "";
+  if (text.length > maxChars) return "";
+  return text;
+}
+
+function sanitizeChatIdentityPortraitSnapshot(
+  value: unknown,
+  options: ChatIdentityCardSnapshotOptions = {}
+): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
@@ -12341,10 +12548,13 @@ function sanitizeChatIdentityPortraitSnapshot(value: unknown): Record<string, un
   const cameraId = clampInteger(source.camera_id);
   const cameraName = normalizeText(source.camera_name).slice(0, 120);
   const zone = normalizeText(source.zone).slice(0, 120);
-  const imageUrl = sanitizeChatExternalUrlForContext(
-    source.image_url ?? source.image_data_url ?? "",
-    600
-  );
+  const imageUrl = sanitizeChatExternalUrlForContext(source.image_url, 600);
+  const imageDataUrl = options.includeInlineImageData
+    ? sanitizeChatInlineImageDataUrlForContext(
+        source.image_data_url ?? source.image_url ?? "",
+        options.maxInlineImageChars ?? 120_000
+      )
+    : "";
 
   if (assetId) snapshot.asset_id = assetId;
   if (portraitKind) snapshot.portrait_kind = portraitKind;
@@ -12353,6 +12563,7 @@ function sanitizeChatIdentityPortraitSnapshot(value: unknown): Record<string, un
   if (cameraName) snapshot.camera_name = cameraName;
   if (zone) snapshot.zone = zone;
   if (imageUrl) snapshot.image_url = imageUrl;
+  if (imageDataUrl) snapshot.image_data_url = imageDataUrl;
 
   return Object.keys(snapshot).length > 0 ? snapshot : null;
 }
@@ -12384,49 +12595,69 @@ function sanitizeChatResolvedIdentitySnapshot(value: unknown): Record<string, un
   return Object.keys(snapshot).length > 0 ? snapshot : null;
 }
 
-function sanitizeChatIdentityCardSnapshot(value: unknown): Record<string, unknown> | null {
+function sanitizeChatIdentityCardSnapshot(
+  value: unknown,
+  options: ChatIdentityCardSnapshotOptions = {}
+): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
 
   const source = value as Record<string, unknown>;
   const snapshot: Record<string, unknown> = {};
-  const cardId = normalizeText(source.card_id).slice(0, 160);
+  const cardId = normalizeChatIdentityCardIdForContext(source.card_id, source.entity_id);
   const entityId = normalizeText(source.entity_id).slice(0, 120);
   const entityType = normalizeText(source.entity_type).slice(0, 64);
   const normalizedEntityType = normalizeChatIdentityEntityType(entityType);
   const displayName = normalizeText(source.display_name).slice(0, 160);
   const knownName = normalizeText(source.known_name).slice(0, 160);
-  const explicitSignatureTraits = sanitizeChatIdentityTraitArray(
-    [source.identity_signature_traits, source.key_traits, source.stable_attributes],
+  const identityFeatureCandidates = sanitizeChatIdentityFeatureCandidatesForContext(
+    source.identity_feature_candidates,
     normalizedEntityType,
     8
   );
-  const signatureTraits =
-    explicitSignatureTraits.length > 0
-      ? explicitSignatureTraits
-      : sanitizeChatIdentityTraitArray(
-          [
-            splitChatIdentityTraitCandidatesFromText(source.identity_signature_summary, 8),
-            splitChatIdentityTraitCandidatesFromText(source.description, 8),
-          ],
-          normalizedEntityType,
-          8
-        );
+  const explicitSignatureTraits = preserveChatIdentityTraitArray(
+    [source.identity_signature_traits, source.key_traits, source.stable_attributes],
+    8
+  );
+  const fallbackSignatureTraits = sanitizeChatIdentityTraitArray(
+    [
+      identityFeatureCandidates.map((candidate) => normalizeText(candidate.text).slice(0, 160)),
+      splitChatIdentityTraitCandidatesFromText(source.identity_signature_summary, 8),
+      splitChatIdentityTraitCandidatesFromText(source.description, 8),
+    ],
+    normalizedEntityType,
+    8
+  );
+  const signatureTraits = preserveChatIdentityTraitArray([explicitSignatureTraits, fallbackSignatureTraits], 8);
   const description = sanitizeChatIdentityDescriptionForContext(
     source.description,
-    signatureTraits
+    signatureTraits,
+    normalizedEntityType
   ).slice(0, 400);
   const signatureSummary = normalizeText(source.identity_signature_summary).slice(0, 400);
   const portraitUrl = sanitizeChatExternalUrlForContext(source.portrait_url, 600);
+  const inlinePortraitDataUrl = options.includeInlineImageData
+    ? sanitizeChatInlineImageDataUrlForContext(
+        source.portrait_url,
+        options.maxInlineImageChars ?? 120_000
+      )
+    : "";
   const aliases = normalizeChatStringArrayForContext(source.aliases, 8, 120);
   const contextTraits = sanitizeChatIdentityContextTraitArray(source.identity_context_traits, 4);
+  const observedContextTraits = normalizeChatStringArrayForContext(
+    source.identity_observed_context_traits,
+    8,
+    160
+  );
   const referenceImageUrls = normalizeChatStringArrayForContext(source.reference_image_urls, 6, 500)
     .map((item) => sanitizeChatExternalUrlForContext(item, 500))
     .filter(Boolean);
-  const primaryPortrait = sanitizeChatIdentityPortraitSnapshot(source.primary_portrait);
-  const contextPortrait = sanitizeChatIdentityPortraitSnapshot(source.context_portrait);
+  const primaryPortrait = sanitizeChatIdentityPortraitSnapshot(source.primary_portrait, options);
+  const contextPortrait = sanitizeChatIdentityPortraitSnapshot(source.context_portrait, options);
   const resolvedIdentity = sanitizeChatResolvedIdentitySnapshot(source.resolved_identity);
+  const sourceEventId = normalizeText(source.source_event_id ?? source.sourceEventId).slice(0, 160);
+  const sourceType = normalizeText(source.source_type ?? source.sourceType).slice(0, 80);
   const lastSeen =
     source.last_seen && typeof source.last_seen === "object" && !Array.isArray(source.last_seen)
       ? (() => {
@@ -12457,13 +12688,22 @@ function sanitizeChatIdentityCardSnapshot(value: unknown): Record<string, unknow
   if (signatureSummary) snapshot.identity_signature_summary = signatureSummary;
   if (aliases.length > 0) snapshot.aliases = aliases;
   if (signatureTraits.length > 0) snapshot.identity_signature_traits = signatureTraits;
+  if (identityFeatureCandidates.length > 0) {
+    snapshot.identity_feature_candidates = identityFeatureCandidates;
+  }
   if (contextTraits.length > 0) snapshot.identity_context_traits = contextTraits;
+  if (observedContextTraits.length > 0) {
+    snapshot.identity_observed_context_traits = observedContextTraits;
+  }
   if (referenceImageUrls.length > 0) snapshot.reference_image_urls = referenceImageUrls;
   if (resolvedIdentity) snapshot.resolved_identity = resolvedIdentity;
   if (primaryPortrait) snapshot.primary_portrait = primaryPortrait;
   if (contextPortrait) snapshot.context_portrait = contextPortrait;
   if (portraitUrl) snapshot.portrait_url = portraitUrl;
+  else if (inlinePortraitDataUrl) snapshot.portrait_url = inlinePortraitDataUrl;
   if (lastSeen) snapshot.last_seen = lastSeen;
+  if (sourceEventId) snapshot.source_event_id = sourceEventId;
+  if (sourceType) snapshot.source_type = sourceType;
   if (typeof source.face_available === "boolean") {
     snapshot.face_available = source.face_available;
   }
@@ -12489,6 +12729,9 @@ function sanitizeChatLastPositiveHitSummary(value: unknown): Record<string, unkn
   const eventTimestampUtcIso = normalizeText(source.event_timestamp_utc_iso).slice(0, 64);
   const eventTimestampLocalIso = normalizeText(source.event_timestamp_local_iso).slice(0, 64);
   const primaryIdentityCardId = normalizeText(source.primary_identity_card_id).slice(0, 160);
+  const sourceEventId = normalizeText(source.source_event_id).slice(0, 160);
+  const sourceType = normalizeText(source.source_type).slice(0, 80);
+  const sourceEventRefs = normalizeChatStringArrayForContext(source.source_event_refs, 12, 160);
   const matchedEntityIds = normalizeChatStringArrayForContext(source.matched_entity_ids, 8, 120);
   const detectionTimeInVideo = normalizeChatStringArrayForContext(
     source.detection_time_in_video,
@@ -12502,7 +12745,7 @@ function sanitizeChatLastPositiveHitSummary(value: unknown): Record<string, unkn
     ? source.identity_cards
         .map((item) => sanitizeChatIdentityCardSnapshot(item))
         .filter((item): item is Record<string, unknown> => !!item)
-        .slice(0, 3)
+        .slice(0, 12)
     : [];
 
   if (
@@ -12532,6 +12775,9 @@ function sanitizeChatLastPositiveHitSummary(value: unknown): Record<string, unkn
   if (detectionTimeInVideo.length > 0) {
     summary.detection_time_in_video = detectionTimeInVideo;
   }
+  if (sourceEventId) summary.source_event_id = sourceEventId;
+  if (sourceType) summary.source_type = sourceType;
+  if (sourceEventRefs.length > 0) summary.source_event_refs = sourceEventRefs;
   if (matchedEntityIds.length > 0) summary.matched_entity_ids = matchedEntityIds;
   if (primaryIdentityCardId) summary.primary_identity_card_id = primaryIdentityCardId;
   if (displayName) summary.display_name = displayName;
@@ -12548,15 +12794,27 @@ function buildChatLastPositiveHitSummary(input: {
   camera_names?: unknown;
   all_cameras?: unknown;
   time_window_minutes_before_now?: unknown;
+  source_event_id?: unknown;
+  source_type?: unknown;
   vision_hits?: unknown;
   identity_cards?: unknown;
 }): Record<string, unknown> | null {
   const allCards = Array.isArray(input.identity_cards) ? input.identity_cards : [];
   const cardsById = new Map<string, Record<string, unknown>>();
   const cardsByEntityId = new Map<string, Record<string, unknown>>();
+  const allUniqueCards: Record<string, unknown>[] = [];
+  const seenAllCardKeys = new Set<string>();
   for (const rawCard of allCards) {
     const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
     if (!snapshot) continue;
+    const snapshotKey =
+      normalizeText(snapshot.card_id).slice(0, 160) ||
+      normalizeText(snapshot.entity_id).slice(0, 120) ||
+      JSON.stringify(snapshot);
+    if (snapshotKey && !seenAllCardKeys.has(snapshotKey)) {
+      seenAllCardKeys.add(snapshotKey);
+      allUniqueCards.push(snapshot);
+    }
     const cardId = normalizeText(snapshot.card_id);
     const entityId = normalizeText(snapshot.entity_id);
     if (cardId && !cardsById.has(cardId)) {
@@ -12566,6 +12824,70 @@ function buildChatLastPositiveHitSummary(input: {
       cardsByEntityId.set(entityId, snapshot);
     }
   }
+
+  const buildSummary = (params: {
+    cards: Record<string, unknown>[];
+    primaryIdentityCardId?: unknown;
+    matchedEntityIds?: string[];
+    camera_id?: unknown;
+    camera_name?: unknown;
+    segment_start_ts?: unknown;
+    segment_end_ts?: unknown;
+    event_timestamp_utc_iso?: unknown;
+    event_timestamp_local_iso?: unknown;
+    detection_time_in_video?: unknown;
+    source_event_id?: unknown;
+    source_type?: unknown;
+  }): Record<string, unknown> | null => {
+    const primaryIdentityCardId = normalizeText(params.primaryIdentityCardId).slice(0, 160);
+    const matchedEntityIds = Array.isArray(params.matchedEntityIds)
+      ? params.matchedEntityIds.filter((item) => typeof item === "string" && item.trim())
+      : [];
+    if (params.cards.length === 0 && matchedEntityIds.length === 0 && !primaryIdentityCardId) {
+      return null;
+    }
+
+    const primaryCard =
+      (primaryIdentityCardId &&
+        params.cards.find((card) => normalizeText(card.card_id) === primaryIdentityCardId)) ||
+      params.cards[0] ||
+      null;
+    const displayName = normalizeText(primaryCard?.display_name ?? "").slice(0, 160);
+    const portraitUrl = sanitizeChatExternalUrlForContext(primaryCard?.portrait_url ?? "", 600);
+    const effectiveMatchedEntityIds =
+      matchedEntityIds.length > 0
+        ? matchedEntityIds
+        : params.cards
+            .map((card) => normalizeText(card.entity_id).slice(0, 120))
+            .filter(Boolean)
+            .slice(0, 8);
+
+    return sanitizeChatLastPositiveHitSummary({
+      query: input.query,
+      camera_ids: input.camera_ids,
+      camera_names: input.camera_names,
+      all_cameras: input.all_cameras,
+      time_window_minutes_before_now: input.time_window_minutes_before_now,
+      camera_id: params.camera_id,
+      camera_name: params.camera_name,
+      segment_start_ts: params.segment_start_ts,
+      segment_end_ts: params.segment_end_ts,
+      event_timestamp_utc_iso: params.event_timestamp_utc_iso,
+      event_timestamp_local_iso: params.event_timestamp_local_iso,
+      detection_time_in_video: params.detection_time_in_video,
+      source_event_id: params.source_event_id ?? input.source_event_id,
+      source_type: params.source_type ?? input.source_type,
+      source_event_refs: [
+        normalizeText(params.source_event_id ?? input.source_event_id).slice(0, 160),
+      ].filter(Boolean),
+      matched_entity_ids: effectiveMatchedEntityIds,
+      primary_identity_card_id: primaryIdentityCardId,
+      display_name: displayName,
+      portrait_url: portraitUrl,
+      identity_cards: params.cards,
+      updated_at: new Date().toISOString(),
+    });
+  };
 
   const visionHits = Array.isArray(input.vision_hits) ? input.vision_hits : [];
   for (const rawHit of visionHits) {
@@ -12601,25 +12923,16 @@ function buildChatLastPositiveHitSummary(input: {
     for (const entityId of matchedEntityIds) {
       pushCard(cardsByEntityId.get(entityId) || null);
     }
-
-    if (hitCards.length === 0 && matchedEntityIds.length === 0 && !primaryIdentityCardId) {
-      continue;
+    if (hitCards.length === 0) {
+      for (const card of allUniqueCards) {
+        pushCard(card);
+      }
     }
 
-    const primaryCard =
-      (primaryIdentityCardId &&
-        hitCards.find((card) => normalizeText(card.card_id) === primaryIdentityCardId)) ||
-      hitCards[0] ||
-      null;
-    const displayName = normalizeText(primaryCard?.display_name ?? "").slice(0, 160);
-    const portraitUrl = sanitizeChatExternalUrlForContext(primaryCard?.portrait_url ?? "", 600);
-
-    return sanitizeChatLastPositiveHitSummary({
-      query: input.query,
-      camera_ids: input.camera_ids,
-      camera_names: input.camera_names,
-      all_cameras: input.all_cameras,
-      time_window_minutes_before_now: input.time_window_minutes_before_now,
+    const summary = buildSummary({
+      cards: hitCards,
+      primaryIdentityCardId,
+      matchedEntityIds,
       camera_id: hit.camera_id,
       camera_name: hit.camera_name,
       segment_start_ts: hit.segment_start_ts,
@@ -12627,16 +12940,17 @@ function buildChatLastPositiveHitSummary(input: {
       event_timestamp_utc_iso: hit.event_timestamp_utc_iso,
       event_timestamp_local_iso: hit.event_timestamp_local_iso,
       detection_time_in_video: hit.detection_time_in_video,
-      matched_entity_ids: matchedEntityIds,
-      primary_identity_card_id: primaryIdentityCardId,
-      display_name: displayName,
-      portrait_url: portraitUrl,
-      identity_cards: hitCards,
-      updated_at: new Date().toISOString(),
+      source_event_id: hit.source_event_id,
+      source_type: hit.source_type,
     });
+    if (summary) {
+      return summary;
+    }
   }
 
-  return null;
+  return buildSummary({
+    cards: allUniqueCards,
+  });
 }
 
 function buildChatIdentityCardSnapshotFromOperationalRow(
@@ -12653,11 +12967,16 @@ function buildChatIdentityCardSnapshotFromOperationalRow(
       : {};
   const snapshotSource: Record<string, unknown> = { ...cardSource };
 
-  const cardId = normalizeText(snapshotSource.card_id ?? source.identity_card_id).slice(0, 160);
+  const cardId = normalizeChatIdentityCardIdForContext(
+    snapshotSource.card_id ?? source.identity_card_id,
+    snapshotSource.entity_id
+  );
   const displayName = normalizeText(snapshotSource.display_name ?? source.display_name).slice(0, 160);
   const createdAt = normalizeText(source.created_at).slice(0, 64);
   const cameraId = clampInteger(source.camera_id);
   const cameraName = normalizeText(source.camera_name).slice(0, 120);
+  const sourceEventId = normalizeText(source.source_event_id).slice(0, 160);
+  const sourceType = normalizeText(source.source_type).slice(0, 80);
   const cropUrl = sanitizeChatExternalUrlForContext(
     source.crop_url ??
       source.portrait_url ??
@@ -12699,6 +13018,8 @@ function buildChatIdentityCardSnapshotFromOperationalRow(
 
   if (cardId) snapshotSource.card_id = cardId;
   if (displayName) snapshotSource.display_name = displayName;
+  if (sourceEventId) snapshotSource.source_event_id = sourceEventId;
+  if (sourceType) snapshotSource.source_type = sourceType;
   if (rowResolvedIdentity || cardResolvedIdentity) {
     snapshotSource.resolved_identity = {
       ...(rowResolvedIdentity || {}),
@@ -12782,6 +13103,8 @@ function buildChatIdentityCardMessageMetadataFromOperationalExecution(
   let jobRunId = "";
   let stepRunId = "";
   let agentRunId = "";
+  let sourceEventId = "";
+  let sourceType = "";
 
   for (const rawRow of rawIdentityCardRows) {
     if (!rawRow || typeof rawRow !== "object" || Array.isArray(rawRow)) {
@@ -12841,6 +13164,12 @@ function buildChatIdentityCardMessageMetadataFromOperationalExecution(
     if (!agentRunId) {
       agentRunId = normalizeText(row.agent_run_id).slice(0, 160);
     }
+    if (!sourceEventId) {
+      sourceEventId = normalizeText(row.source_event_id).slice(0, 160);
+    }
+    if (!sourceType) {
+      sourceType = normalizeText(row.source_type).slice(0, 80);
+    }
   }
 
   if (identityCards.length === 0) {
@@ -12860,6 +13189,8 @@ function buildChatIdentityCardMessageMetadataFromOperationalExecution(
   if (jobRunId) metadata.job_run_id = jobRunId;
   if (stepRunId) metadata.step_run_id = stepRunId;
   if (agentRunId) metadata.agent_run_id = agentRunId;
+  if (sourceEventId) metadata.source_event_id = sourceEventId;
+  if (sourceType) metadata.source_type = sourceType;
   return metadata;
 }
 
@@ -13944,6 +14275,57 @@ function safeChatContextCameraSelection(value: unknown) {
   }
 }
 
+type UploadedVideoSourceContext = {
+  uploadedVideoId: number | null;
+  uploadedVideoUrl: string | null;
+  sourceEventId: string | null;
+  sourceType: "uploaded_video";
+};
+
+async function loadLatestUploadedVideoSourceContext(params: {
+  db: D1Database;
+  userId: string;
+  sessionId: number;
+}): Promise<UploadedVideoSourceContext | null> {
+  const row = await params.db
+    .prepare(
+      `SELECT id, camera_selection_json
+       FROM chat_messages
+       WHERE user_id = ?
+         AND session_id = ?
+         AND role = 'user'
+         AND json_extract(COALESCE(camera_selection_json, '{}'), '$.uploaded_video_id') IS NOT NULL
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .bind(params.userId, params.sessionId)
+    .first();
+
+  if (!row) {
+    return null;
+  }
+
+  const cameraSelection = parseCommandJsonColumn((row as any).camera_selection_json);
+  const uploadedVideoIdRaw = Number((cameraSelection as any)?.uploaded_video_id || 0);
+  const uploadedVideoId =
+    Number.isInteger(uploadedVideoIdRaw) && uploadedVideoIdRaw > 0 ? uploadedVideoIdRaw : null;
+  const uploadedVideoUrl =
+    typeof (cameraSelection as any)?.uploaded_video_url === "string" &&
+    String((cameraSelection as any).uploaded_video_url).trim()
+      ? String((cameraSelection as any).uploaded_video_url).trim()
+      : null;
+  const sourceEventId = uploadedVideoId
+    ? `uploaded_video:${uploadedVideoId}`
+    : `uploaded_video_message:${Number((row as any)?.id || 0)}`;
+
+  return {
+    uploadedVideoId,
+    uploadedVideoUrl,
+    sourceEventId,
+    sourceType: "uploaded_video",
+  };
+}
+
 type ChatModelRuntimeConfig = {
   apiKey: string;
   defaultFps: number;
@@ -14287,6 +14669,33 @@ async function sha256Base64Url(input: string): Promise<string> {
   const encoded = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest("SHA-256", encoded);
   return base64UrlEncodeBytes(new Uint8Array(digest));
+}
+
+async function buildConditionalJsonResponse(
+  c: any,
+  etagPrefix: string,
+  payload: unknown
+) {
+  const etag = `"${etagPrefix}-${await sha256Base64Url(JSON.stringify(payload))}"`;
+  const ifNoneMatch = c.req.header("if-none-match");
+  const cacheControl = "private, no-cache, max-age=0, must-revalidate";
+
+  if (ifNoneMatch === etag) {
+    return c.body(null, {
+      status: 304,
+      headers: {
+        etag,
+        "cache-control": cacheControl,
+      },
+    });
+  }
+
+  return c.json(payload, {
+    headers: {
+      etag,
+      "cache-control": cacheControl,
+    },
+  });
 }
 
 function setSessionCookie(c: any, name: string, value: string, maxAgeSeconds: number) {
@@ -23962,6 +24371,136 @@ app.get("/api/reports/:id/evidence", anyAuthMiddleware, async (c) => {
   return c.body(object.body, { headers });
 });
 
+// Camera recordings (local disk)
+app.get("/api/camera-recordings/*", anyAuthMiddleware, async (c) => {
+  const forceDownload = c.req.query("download") === "1";
+  let scopedPath = c.req.path.replace(/^\/api\/camera-recordings\//, "");
+  if (!scopedPath) {
+    return c.json({ error: "Invalid path" }, 400);
+  }
+
+  try {
+    scopedPath = decodeURIComponent(scopedPath);
+  } catch {
+    // Keep original if decode fails.
+  }
+
+  if (
+    !scopedPath ||
+    scopedPath.includes("..") ||
+    scopedPath.startsWith("/") ||
+    scopedPath.startsWith("\\")
+  ) {
+    return c.json({ error: "Invalid path" }, 400);
+  }
+
+  const target = await resolveCameraRecordingStreamTarget(c.env, scopedPath);
+  if (!target) {
+    return c.json({ error: "Not found" }, 404);
+  }
+
+  const cameraPathMatch = target.relativePath.match(/^cam_(\d+)(?:\/|$)/i);
+  const cameraIdFromPath = cameraPathMatch
+    ? Number.parseInt(cameraPathMatch[1], 10)
+    : 0;
+  if (!Number.isInteger(cameraIdFromPath) || cameraIdFromPath <= 0) {
+    return c.json({ error: "Invalid camera path" }, 400);
+  }
+
+  const user = c.get("user")!;
+  const ownedCamera = await c.env.DB.prepare(
+    "SELECT 1 FROM cameras WHERE id = ? AND user_id = ? LIMIT 1"
+  )
+    .bind(cameraIdFromPath, user.id)
+    .first();
+
+  if (!ownedCamera) {
+    return c.json({ error: "Not found" }, 404);
+  }
+
+  const totalSize = Number(target.stat.size || 0);
+  const rangeHeader = c.req.header("range");
+  const filename = String(target.pathMod.basename(target.fullPath) || "recording.mp4").replace(
+    /["\r\n]/g,
+    "_"
+  );
+
+  if (rangeHeader && /^bytes=/i.test(rangeHeader) && totalSize > 0) {
+    const rawRange = rangeHeader.replace(/^bytes=/i, "");
+    const [startRaw, endRaw] = rawRange.split("-");
+
+    let start = 0;
+    let end = totalSize - 1;
+
+    if (startRaw === "" && endRaw) {
+      const suffixLength = Number.parseInt(endRaw, 10);
+      if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+        return c.body(null, {
+          status: 416,
+          headers: {
+            "content-range": `bytes */${totalSize}`,
+          },
+        });
+      }
+      start = Math.max(0, totalSize - suffixLength);
+    } else {
+      start = Number.parseInt(startRaw || "0", 10);
+      end = endRaw ? Number.parseInt(endRaw, 10) : totalSize - 1;
+    }
+
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 0 ||
+      end < start ||
+      start >= totalSize
+    ) {
+      return c.body(null, {
+        status: 416,
+        headers: {
+          "content-range": `bytes */${totalSize}`,
+        },
+      });
+    }
+
+    const safeEnd = Math.min(end, totalSize - 1);
+    const contentLength = safeEnd - start + 1;
+    const partialStream = target.fs.createReadStream(target.fullPath, {
+      start,
+      end: safeEnd,
+    });
+
+    const headers = new Headers();
+    headers.set("accept-ranges", "bytes");
+    headers.set("cache-control", "no-cache");
+    headers.set("content-type", "video/mp4");
+    headers.set("content-length", String(contentLength));
+    headers.set("content-range", `bytes ${start}-${safeEnd}/${totalSize}`);
+    if (forceDownload) {
+      headers.set("content-disposition", `attachment; filename="${filename}"`);
+    }
+
+    return c.body(partialStream as any, {
+      status: 206,
+      headers,
+    });
+  }
+
+  const stream = target.fs.createReadStream(target.fullPath);
+  const headers = new Headers();
+  headers.set("accept-ranges", "bytes");
+  headers.set("cache-control", "no-cache");
+  headers.set("content-type", "video/mp4");
+  if (totalSize > 0) {
+    headers.set("content-length", String(totalSize));
+  }
+  if (forceDownload) {
+    headers.set("content-disposition", `attachment; filename="${filename}"`);
+  }
+
+  return c.body(stream as any, { headers });
+});
+
 // Job alert clips (local disk)
 app.get("/api/job-clips/*", anyAuthMiddleware, async (c) => {
   const forceDownload = c.req.query("download") === "1";
@@ -27144,6 +27683,70 @@ app.get("/api/cameras/:id", anyAuthMiddleware, async (c) => {
   return c.json(camera);
 });
 
+app.get("/api/cameras/:cameraId/recordings/summary", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
+
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return c.json({ error: "Invalid camera id" }, 400);
+  }
+
+  const cameraState = await loadOwnedCameraRecordingState(c, user.id, cameraId);
+  if (!cameraState) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+
+  const url = new URL(c.req.url);
+  const payload = await buildCameraRecordingSummary({
+    env: c.env,
+    camera: cameraState,
+    query: {
+      zoom: url.searchParams.get("zoom"),
+      from: url.searchParams.get("from"),
+      to: url.searchParams.get("to"),
+      focusAt: url.searchParams.get("focus_at"),
+      timezone: url.searchParams.get("timezone"),
+    },
+  });
+
+  return await buildConditionalJsonResponse(
+    c,
+    `camera-recordings-summary-${cameraId}`,
+    payload
+  );
+});
+
+app.get("/api/cameras/:cameraId/recordings/segments", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
+
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return c.json({ error: "Invalid camera id" }, 400);
+  }
+
+  const cameraState = await loadOwnedCameraRecordingState(c, user.id, cameraId);
+  if (!cameraState) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+
+  const url = new URL(c.req.url);
+  const payload = await buildCameraRecordingSegments({
+    env: c.env,
+    camera: cameraState,
+    query: {
+      from: url.searchParams.get("from"),
+      to: url.searchParams.get("to"),
+      focusAt: url.searchParams.get("focus_at"),
+    },
+  });
+
+  return await buildConditionalJsonResponse(
+    c,
+    `camera-recordings-segments-${cameraId}`,
+    payload
+  );
+});
+
 app.post("/api/cameras/:cameraId/refresh-thumbnail", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const cameraId = parseInt(c.req.param("cameraId"), 10);
@@ -29089,7 +29692,10 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     return c.json({ error: "Invalid input_type. Allowed values: video, image" }, 400);
   }
   const inputType = requestedInputType || "video";
-  const videoPackagingMode = normalizeVideoPackagingMode(body.video_packaging_mode);
+  const videoPackagingMode =
+    body.video_packaging_mode === undefined
+      ? "frame_sequence"
+      : normalizeVideoPackagingMode(body.video_packaging_mode, "frame_sequence");
   const requestedInferenceModel = body.inference_model === undefined
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
@@ -37338,6 +37944,40 @@ function normalizeCameraDirectCaptureOnMotion(
   return fallback;
 }
 
+async function loadOwnedCameraRecordingState(
+  c: any,
+  userId: string,
+  cameraId: number
+): Promise<CameraRecordingCameraState | null> {
+  const camera = await c.env.DB.prepare(
+    `SELECT id,
+            store_frames,
+            retention_days,
+            is_service_running,
+            is_online
+       FROM cameras
+      WHERE id = ? AND user_id = ?`
+  )
+    .bind(cameraId, userId)
+    .first();
+
+  if (!camera) {
+    return null;
+  }
+
+  return {
+    cameraId,
+    storeFramesEnabled: normalizeDbBoolean((camera as any).store_frames, false),
+    isServiceRunning: normalizeDbBoolean((camera as any).is_service_running, false),
+    isOnline: normalizeDbBoolean((camera as any).is_online, false),
+    retentionDays:
+      Number.isInteger(Number((camera as any).retention_days)) &&
+      Number((camera as any).retention_days) > 0
+        ? Number((camera as any).retention_days)
+        : null,
+  };
+}
+
 function semanticIntentFamilyFromPreferredSkill(value: unknown): SemanticIntentFamily | null {
   const skill = normalizeReportText(value, 80).toLowerCase();
   if (skill === "read_state") return "read_operational";
@@ -38296,13 +38936,14 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
           ? `event:${Number(input.eventDbId)}`
           : "")
     ).slice(0, 160) || null;
-  const fallbackIdentityCardId = normalizeText(
+  const fallbackIdentityCardId = normalizeChatIdentityCardIdForContext(
     details.primary_identity_card_id ??
       details.primaryIdentityCardId ??
       details.identity_card_id ??
       details.identityCardId ??
-      input.correlationIds.identityCardId
-  ).slice(0, 160);
+      input.correlationIds.identityCardId,
+    details.entity_id ?? details.entityId
+  );
   if (rawIdentityCards.length === 0 && fallbackIdentityCardId) {
     const fallbackEntityId = fallbackIdentityCardId.startsWith("identity_card:")
       ? fallbackIdentityCardId.slice("identity_card:".length)
@@ -38323,18 +38964,32 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
       details.known_name ??
         details.knownName
     ).slice(0, 160);
-    const fallbackTraits = sanitizeChatIdentityTraitArray(
+    const fallbackFeatureCandidates = sanitizeChatIdentityFeatureCandidatesForContext(
+      details.identity_feature_candidates,
+      normalizedFallbackEntityType,
+      8
+    );
+    const fallbackExplicitTraits = preserveChatIdentityTraitArray(
+      [details.identity_signature_traits, details.key_traits, details.stable_attributes],
+      8
+    );
+    const fallbackHeuristicTraits = sanitizeChatIdentityTraitArray(
       [
-        details.identity_signature_traits,
-        details.key_traits,
-        details.stable_attributes,
+        fallbackFeatureCandidates.map((candidate) => normalizeText(candidate.text).slice(0, 160)),
+        splitChatIdentityTraitCandidatesFromText(details.identity_signature_summary, 8),
+        splitChatIdentityTraitCandidatesFromText(details.description, 8),
       ],
       normalizedFallbackEntityType,
       8
     );
+    const fallbackTraits = preserveChatIdentityTraitArray(
+      [fallbackExplicitTraits, fallbackHeuristicTraits],
+      8
+    );
     const fallbackDescription = sanitizeChatIdentityDescriptionForContext(
       details.description,
-      fallbackTraits
+      fallbackTraits,
+      normalizedFallbackEntityType
     ).slice(0, 400);
     const fallbackSignatureSummary = normalizeText(
       details.identity_signature_summary
@@ -38343,6 +38998,11 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
     const fallbackContextTraits = sanitizeChatIdentityContextTraitArray(
       details.identity_context_traits,
       4
+    );
+    const fallbackObservedContextTraits = normalizeChatStringArrayForContext(
+      details.identity_observed_context_traits,
+      8,
+      160
     );
     const fallbackReferenceImageUrls = normalizeChatStringArrayForContext(
       details.reference_image_urls,
@@ -38368,8 +39028,14 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
     if (fallbackDescription) fallbackCard.description = fallbackDescription;
     if (fallbackSignatureSummary) fallbackCard.identity_signature_summary = fallbackSignatureSummary;
     if (fallbackTraits.length > 0) fallbackCard.identity_signature_traits = fallbackTraits;
+    if (fallbackFeatureCandidates.length > 0) {
+      fallbackCard.identity_feature_candidates = fallbackFeatureCandidates;
+    }
     if (fallbackAliases.length > 0) fallbackCard.aliases = fallbackAliases;
     if (fallbackContextTraits.length > 0) fallbackCard.identity_context_traits = fallbackContextTraits;
+    if (fallbackObservedContextTraits.length > 0) {
+      fallbackCard.identity_observed_context_traits = fallbackObservedContextTraits;
+    }
     if (fallbackReferenceImageUrls.length > 0) {
       fallbackCard.reference_image_urls = fallbackReferenceImageUrls;
     }
@@ -38404,14 +39070,15 @@ function buildOperationalIdentityCardOccurrenceDrafts(input: {
         rawCard && typeof rawCard === "object" && !Array.isArray(rawCard)
           ? (rawCard as Record<string, unknown>)
           : {};
-      const explicitIdentityCardId = normalizeText(
+      const explicitIdentityCardId = normalizeChatIdentityCardIdForContext(
         rawCardRecord.identity_card_id ??
           rawCardRecord.card_id ??
           rawCardRecord.entity_id ??
           details.primary_identity_card_id ??
           details.primaryIdentityCardId ??
-          input.correlationIds.identityCardId
-      ).slice(0, 160);
+          input.correlationIds.identityCardId,
+        rawCardRecord.entity_id ?? details.entity_id ?? details.entityId
+      );
       const shouldMergeTopLevelDetails =
         rawIdentityCards.length === 1 &&
         (!fallbackIdentityCardId ||
@@ -48166,11 +48833,28 @@ app.post("/api/agent/chat-response", async (c) => {
 
     console.log("[CHAT RESPONSE] Session verified:", chat_session_id);
 
-    const sourceEventId = normalizeText(
+    const explicitSourceEventId = normalizeText(
       body.source_event_id ??
         message_metadata?.source_event_id ??
         message_metadata?.sourceEventId
     ).slice(0, 160) || null;
+    const uploadedVideoSourceContext = explicitSourceEventId
+      ? null
+      : await loadLatestUploadedVideoSourceContext({
+          db: c.env.DB,
+          userId: String(userId),
+          sessionId: chat_session_id,
+        });
+    const sourceEventId =
+      explicitSourceEventId || uploadedVideoSourceContext?.sourceEventId || null;
+    const sourceType =
+      normalizeText(
+        body.source_type ??
+          message_metadata?.source_type ??
+          message_metadata?.sourceType
+      ).slice(0, 80) ||
+      uploadedVideoSourceContext?.sourceType ||
+      "chat_response";
     const jobRunId = normalizeText(
       body.job_run_id ??
         message_metadata?.job_run_id ??
@@ -48205,6 +48889,15 @@ app.post("/api/agent/chat-response", async (c) => {
         return snapshot;
       })
       .filter((item: Record<string, unknown> | null): item is Record<string, unknown> => !!item);
+    const sanitizedMessageIdentityCards = identity_cards
+      .map((rawCard: unknown) => {
+        const snapshot = sanitizeChatIdentityCardSnapshot(rawCard, {
+          includeInlineImageData: true,
+        });
+        if (!snapshot) return null;
+        return snapshot;
+      })
+      .filter((item: Record<string, unknown> | null): item is Record<string, unknown> => !!item);
     const identityCardOccurrenceDrafts = identity_cards
       .map((rawCard: unknown): IdentityCardOccurrenceDraft | null => {
         const snapshot = sanitizeChatIdentityCardSnapshot(rawCard);
@@ -48212,18 +48905,19 @@ app.post("/api/agent/chat-response", async (c) => {
         const explicitOccurrenceId = normalizeText(
           (rawCard as any)?.occurrence_id ?? (rawCard as any)?.id
         ).slice(0, 160);
-        const explicitIdentityCardId = normalizeText(
+        const explicitIdentityCardId = normalizeChatIdentityCardIdForContext(
           (rawCard as any)?.identity_card_id ??
             (rawCard as any)?.card_id ??
-            (rawCard as any)?.entity_id
-        ).slice(0, 160);
+            (rawCard as any)?.entity_id,
+          snapshot.entity_id
+        );
         return {
           occurrenceId: explicitOccurrenceId || null,
           identityCardId: explicitIdentityCardId || null,
           chatSessionId: chat_session_id,
           commandId,
           card: snapshot,
-          sourceType: "chat_response",
+          sourceType,
           sourceEventId,
           jobRunId,
           stepRunId,
@@ -48246,8 +48940,9 @@ app.post("/api/agent/chat-response", async (c) => {
       (Array.isArray(camera_ids) && camera_ids.length > 0) ||
       vision_hits.length > 0 ||
       (Array.isArray(hit_images) && hit_images.length > 0) ||
-      sanitizedIdentityCards.length > 0 ||
-      !!message_metadata;
+      sanitizedMessageIdentityCards.length > 0 ||
+      !!message_metadata ||
+      !!uploadedVideoSourceContext;
 
     const cameraSelectionPayload: Record<string, unknown> = {};
     if (Array.isArray(camera_ids) && camera_ids.length > 0) {
@@ -48268,11 +48963,26 @@ app.post("/api/agent/chat-response", async (c) => {
     if (Array.isArray(hit_images) && hit_images.length > 0) {
       cameraSelectionPayload.hit_images = hit_images;
     }
-    if (sanitizedIdentityCards.length > 0) {
-      cameraSelectionPayload.identity_cards = sanitizedIdentityCards;
+    if (sanitizedMessageIdentityCards.length > 0) {
+      cameraSelectionPayload.identity_cards = sanitizedMessageIdentityCards;
     }
     if (message_metadata) {
       Object.assign(cameraSelectionPayload, message_metadata);
+    }
+    if (sourceEventId) {
+      cameraSelectionPayload.source_event_id = sourceEventId;
+    }
+    if (sourceType) {
+      cameraSelectionPayload.source_type = sourceType;
+    }
+    if (uploadedVideoSourceContext?.uploadedVideoId) {
+      cameraSelectionPayload.uploaded_video_id = uploadedVideoSourceContext.uploadedVideoId;
+    }
+    if (uploadedVideoSourceContext?.uploadedVideoUrl) {
+      cameraSelectionPayload.uploaded_video_url = uploadedVideoSourceContext.uploadedVideoUrl;
+    }
+    if (sanitizedMessageIdentityCards.length > 0) {
+      cameraSelectionPayload.identity_cards = sanitizedMessageIdentityCards;
     }
 
     const cameraSelectionJson = hasStructuredSelectionPayload
@@ -48295,6 +49005,8 @@ app.post("/api/agent/chat-response", async (c) => {
       camera_names,
       all_cameras,
       time_window_minutes_before_now,
+      source_event_id: sourceEventId,
+      source_type: sourceType,
       vision_hits,
       identity_cards: sanitizedIdentityCards,
     });
@@ -55795,7 +56507,8 @@ const FIXED_JOB_STEP_RUN_EVERY_SECONDS: JobStepRunEverySeconds = 60;
 type JobStepRunningResolution = 640 | 1024;
 const DEFAULT_CORE_RUNNING_RESOLUTION: JobStepRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
+const MAX_CHAT_VIDEO_MODEL_FPS = 5;
+const MAX_AGENT_VIDEO_MODEL_FPS = 10;
 const MIN_JOB_STEP_TIMEOUT_SECONDS = 120;
 type JobStepPriorityLevel = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
 
@@ -55947,7 +56660,7 @@ const normalizeJobStepModelFps = (
     return null;
   };
   const parsed = parseFps(value) ?? parseFps(fallback) ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
-  return Math.min(MAX_ULTRA_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
+  return Math.min(MAX_AGENT_VIDEO_MODEL_FPS, Math.max(DEFAULT_ULTRA_VIDEO_MODEL_FPS, parsed));
 };
 
 const parseJobStepRunningResolution = (
@@ -56825,6 +57538,15 @@ type HubTaskSnapshot = {
   tags?: string[];
 };
 
+function readHubSnapshotField(
+  row: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string
+): unknown {
+  const snakeValue = row[snakeKey];
+  return snakeValue !== undefined ? snakeValue : row[camelKey];
+}
+
 const HUB_SYNC_STATE_PREFIX = "public_catalog";
 
 function getHubSyncStateKey(itemType: HubItemType | null): string {
@@ -57589,44 +58311,244 @@ function extractHubPipelinesSnapshot(
 function normalizeHubAgentSnapshot(value: unknown): HubAgentSnapshot | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  const promptTemplate = normalizeText(row.prompt_template);
-  const alertCondition = normalizeText(row.alert_condition);
+  const promptTemplate = normalizeText(
+    readHubSnapshotField(row, "prompt_template", "promptTemplate")
+  );
+  const alertCondition = normalizeText(
+    readHubSnapshotField(row, "alert_condition", "alertCondition")
+  );
   if (!promptTemplate || !alertCondition) return null;
+  const inputTypeValue = readHubSnapshotField(row, "input_type", "inputType");
+  const inferenceModelValue = readHubSnapshotField(row, "inference_model", "inferenceModel");
+  const analysisRegionsValue = readHubSnapshotField(row, "analysis_regions", "analysisRegions");
   return {
     type: "agent",
-    display_name: normalizeText(row.display_name) || "Hub Agent",
-    summary: normalizeText(row.summary) || "",
-    agent_key: normalizeText(row.agent_key) || "custom_template",
-    is_enabled: normalizeJobStepOnlyCaptureOnMotion(row.is_enabled, false),
-    input_type: normalizeJobStepInputType(row.input_type) || "video",
-    video_packaging_mode: normalizeVideoPackagingMode(row.video_packaging_mode),
+    display_name: normalizeText(readHubSnapshotField(row, "display_name", "displayName")) || "Hub Agent",
+    summary: normalizeText(readHubSnapshotField(row, "summary", "summary")) || "",
+    agent_key: normalizeText(readHubSnapshotField(row, "agent_key", "agentKey")) || "custom_template",
+    is_enabled: normalizeJobStepOnlyCaptureOnMotion(
+      readHubSnapshotField(row, "is_enabled", "isEnabled"),
+      false
+    ),
+    input_type: normalizeJobStepInputType(inputTypeValue) || "video",
+    video_packaging_mode: normalizeVideoPackagingMode(
+      readHubSnapshotField(row, "video_packaging_mode", "videoPackagingMode")
+    ),
     inference_model:
-      normalizeJobStepInferenceModel(row.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL,
+      normalizeJobStepInferenceModel(inferenceModelValue) || FIXED_JOB_STEP_INFERENCE_MODEL,
     model_fps: normalizeJobStepModelFps(
-      row.model_fps,
-      normalizeJobStepInferenceModel(row.inference_model) || FIXED_JOB_STEP_INFERENCE_MODEL,
-      normalizeJobStepInputType(row.input_type) || "video"
+      readHubSnapshotField(row, "model_fps", "modelFps"),
+      normalizeJobStepInferenceModel(inferenceModelValue) || FIXED_JOB_STEP_INFERENCE_MODEL,
+      normalizeJobStepInputType(inputTypeValue) || "video"
     ),
     run_every: normalizeJobStepRunEverySeconds(
-      row.run_every,
+      readHubSnapshotField(row, "run_every", "runEvery"),
       FIXED_JOB_STEP_RUN_EVERY_SECONDS
     ),
     running_resolution: normalizeJobStepRunningResolution(
-      row.running_resolution,
+      readHubSnapshotField(row, "running_resolution", "runningResolution"),
       DEFAULT_CORE_RUNNING_RESOLUTION
     ),
     only_capture_on_motion: normalizeJobStepOnlyCaptureOnMotion(
-      row.only_capture_on_motion,
+      readHubSnapshotField(row, "only_capture_on_motion", "onlyCaptureOnMotion"),
       true
     ),
-    use_temporal_context: normalizeJobStepUseTemporalContext(row.use_temporal_context, true),
+    use_temporal_context: normalizeJobStepUseTemporalContext(
+      readHubSnapshotField(row, "use_temporal_context", "useTemporalContext"),
+      true
+    ),
     prompt_template: promptTemplate,
     alert_condition: alertCondition,
-    negative_condition: normalizeOptionalPromptText(row.negative_condition),
-    face_target_ids: normalizeFaceTargetIdsInput(row.face_target_ids) || [],
-    analysis_regions: Array.isArray(row.analysis_regions) ? row.analysis_regions : [],
-    tags: normalizeHubTagsInput(row.tags),
+    negative_condition: normalizeOptionalPromptText(
+      readHubSnapshotField(row, "negative_condition", "negativeCondition")
+    ),
+    face_target_ids:
+      normalizeFaceTargetIdsInput(readHubSnapshotField(row, "face_target_ids", "faceTargetIds")) || [],
+    analysis_regions: Array.isArray(analysisRegionsValue) ? analysisRegionsValue : [],
+    tags: normalizeHubTagsInput(readHubSnapshotField(row, "tags", "tags")),
   };
+}
+
+type NormalizedHubTaskStepAgentEntry = {
+  camera_slot_key: string | null;
+  agent_snapshot: HubAgentSnapshot;
+};
+
+function normalizeHubTaskStepAgentEntries(rawStep: unknown): NormalizedHubTaskStepAgentEntry[] {
+  if (!rawStep || typeof rawStep !== "object" || Array.isArray(rawStep)) return [];
+  const step = rawStep as Record<string, unknown>;
+  const rawAgents = Array.isArray(step.agents) ? step.agents : [];
+  const normalizedAgents = rawAgents
+    .map((rawAgent): NormalizedHubTaskStepAgentEntry | null => {
+      if (!rawAgent || typeof rawAgent !== "object" || Array.isArray(rawAgent)) return null;
+      const row = rawAgent as Record<string, unknown>;
+      const agentSnapshot = normalizeHubAgentSnapshot(
+        readHubSnapshotField(row, "agent_snapshot", "agentSnapshot")
+      );
+      if (!agentSnapshot) return null;
+      return {
+        camera_slot_key:
+          normalizeText(readHubSnapshotField(row, "camera_slot_key", "cameraSlotKey")) || null,
+        agent_snapshot: agentSnapshot,
+      };
+    })
+    .filter(Boolean) as NormalizedHubTaskStepAgentEntry[];
+
+  const rawGroups = Array.isArray(step.inference_groups)
+    ? step.inference_groups
+    : Array.isArray(step.inferenceGroups)
+    ? step.inferenceGroups
+    : [];
+  if (rawGroups.length === 0 || normalizedAgents.length === 0) {
+    return normalizedAgents;
+  }
+
+  const buildEntryKey = (cameraSlotKey: string | null, agentKey: string): string =>
+    `${cameraSlotKey || "__default__"}::${agentKey}`;
+  const mergedEntries = new Map<string, NormalizedHubTaskStepAgentEntry>();
+
+  for (const entry of normalizedAgents) {
+    mergedEntries.set(buildEntryKey(entry.camera_slot_key, entry.agent_snapshot.agent_key), entry);
+  }
+
+  for (const rawGroup of rawGroups) {
+    if (!rawGroup || typeof rawGroup !== "object" || Array.isArray(rawGroup)) continue;
+    const group = rawGroup as Record<string, unknown>;
+    const agentKey = normalizeText(readHubSnapshotField(group, "agent_key", "agentKey"));
+    const targetSlotKeysRaw = readHubSnapshotField(group, "target_slot_keys", "targetSlotKeys");
+    const targetSlotKeys = Array.from(
+      new Set(
+        (Array.isArray(targetSlotKeysRaw) ? targetSlotKeysRaw : [])
+          .map((slotKey: unknown) => normalizeText(slotKey))
+          .filter(Boolean)
+      )
+    );
+    if (!agentKey || targetSlotKeys.length === 0) continue;
+
+    const matchingEntries = normalizedAgents.filter(
+      (entry) => entry.agent_snapshot.agent_key === agentKey
+    );
+    if (matchingEntries.length === 0) continue;
+
+    const matchingEntriesBySlotKey = new Map<string, NormalizedHubTaskStepAgentEntry>();
+    for (const entry of matchingEntries) {
+      if (entry.camera_slot_key) {
+        matchingEntriesBySlotKey.set(entry.camera_slot_key, entry);
+      }
+    }
+
+    const sourceTargetSlotKey =
+      normalizeText(readHubSnapshotField(group, "source_target_slot_key", "sourceTargetSlotKey")) ||
+      null;
+    const defaultEntry =
+      matchingEntries.find((entry) => entry.camera_slot_key === null) || matchingEntries[0];
+    const sourceEntry =
+      (sourceTargetSlotKey
+        ? matchingEntriesBySlotKey.get(sourceTargetSlotKey) || null
+        : null) ||
+      targetSlotKeys
+        .map((slotKey) => matchingEntriesBySlotKey.get(slotKey) || null)
+        .find(Boolean) ||
+      defaultEntry;
+    if (!sourceEntry) continue;
+
+    for (const targetSlotKey of targetSlotKeys) {
+      const baseEntry = matchingEntriesBySlotKey.get(targetSlotKey) || sourceEntry;
+      const baseSnapshot = baseEntry.agent_snapshot;
+      const baseRunEvery = normalizeJobStepRunEverySeconds(
+        baseSnapshot.run_every,
+        FIXED_JOB_STEP_RUN_EVERY_SECONDS
+      );
+      const baseRunningResolution = normalizeJobStepRunningResolution(
+        baseSnapshot.running_resolution,
+        DEFAULT_CORE_RUNNING_RESOLUTION
+      );
+      const requestedInputType =
+        normalizeJobStepInputType(readHubSnapshotField(group, "input_type", "inputType")) ||
+        baseSnapshot.input_type;
+      const requestedInferenceModel =
+        normalizeJobStepInferenceModel(
+          readHubSnapshotField(group, "inference_model", "inferenceModel")
+        ) ||
+        normalizeJobStepInferenceModel(baseSnapshot.inference_model) ||
+        FIXED_JOB_STEP_INFERENCE_MODEL;
+      const requestedRunEvery = normalizeJobStepRunEverySeconds(
+        readHubSnapshotField(group, "run_every", "runEvery"),
+        baseRunEvery
+      );
+      const requestedRunningResolution = normalizeJobStepRunningResolution(
+        readHubSnapshotField(group, "running_resolution", "runningResolution"),
+        baseRunningResolution
+      );
+      const requestedModelFps = normalizeJobStepModelFps(
+        readHubSnapshotField(group, "model_fps", "modelFps"),
+        requestedInferenceModel,
+        requestedInputType
+      );
+      const executionSettings = applyInferenceExecutionConstraints(
+        requestedInputType,
+        requestedInferenceModel,
+        requestedRunEvery,
+        requestedInferenceModel === "core" ? requestedRunningResolution : null,
+        requestedModelFps
+      );
+      const videoPackagingModeValue = readHubSnapshotField(
+        group,
+        "video_packaging_mode",
+        "videoPackagingMode"
+      );
+      const resolvedVideoPackagingMode =
+        videoPackagingModeValue === undefined ||
+        videoPackagingModeValue === null ||
+        normalizeText(videoPackagingModeValue) === ""
+          ? normalizeVideoPackagingMode(baseSnapshot.video_packaging_mode)
+          : normalizeVideoPackagingMode(
+              videoPackagingModeValue,
+              normalizeVideoPackagingMode(baseSnapshot.video_packaging_mode)
+            );
+      const onlyCaptureOnMotionValue = readHubSnapshotField(
+        group,
+        "only_capture_on_motion",
+        "onlyCaptureOnMotion"
+      );
+      const resolvedOnlyCaptureOnMotion =
+        onlyCaptureOnMotionValue === undefined
+          ? normalizeJobStepOnlyCaptureOnMotion(baseSnapshot.only_capture_on_motion, true)
+          : normalizeJobStepOnlyCaptureOnMotion(
+              onlyCaptureOnMotionValue,
+              normalizeJobStepOnlyCaptureOnMotion(baseSnapshot.only_capture_on_motion, true)
+            );
+      const mergedSnapshot = normalizeHubAgentSnapshot({
+        ...baseSnapshot,
+        agent_key: agentKey,
+        input_type: executionSettings.inputType,
+        video_packaging_mode: resolvedVideoPackagingMode,
+        inference_model: executionSettings.inferenceModel,
+        model_fps: executionSettings.modelFps,
+        run_every: executionSettings.runEvery,
+        running_resolution: executionSettings.runningResolution,
+        only_capture_on_motion: resolvedOnlyCaptureOnMotion,
+        prompt_template:
+          normalizeText(readHubSnapshotField(group, "prompt_template", "promptTemplate")) ||
+          baseSnapshot.prompt_template,
+        alert_condition:
+          normalizeText(readHubSnapshotField(group, "alert_condition", "alertCondition")) ||
+          baseSnapshot.alert_condition,
+        negative_condition:
+          normalizeOptionalPromptText(
+            readHubSnapshotField(group, "negative_condition", "negativeCondition")
+          ) ?? baseSnapshot.negative_condition,
+      });
+      if (!mergedSnapshot) continue;
+
+      mergedEntries.set(buildEntryKey(targetSlotKey, agentKey), {
+        camera_slot_key: targetSlotKey,
+        agent_snapshot: mergedSnapshot,
+      });
+    }
+  }
+
+  return Array.from(mergedEntries.values());
 }
 
 function isGeneratedCustomAgentName(value: unknown): boolean {
@@ -58365,7 +59287,7 @@ async function buildHubTaskSnapshotFromJob(
 
     const pipelines = extractHubPipelinesSnapshot(step, stepKeyById, targetSlotKeyByTargetId);
 
-    return {
+    const stepSnapshot = {
       step_key: stepKey,
       step_order: Number(step?.step_order || 1),
       name: normalizeText(step?.name) || stepKey,
@@ -58413,6 +59335,10 @@ async function buildHubTaskSnapshotFromJob(
         })
         .filter(Boolean),
       inference_groups: inferenceGroups,
+    };
+    return {
+      ...stepSnapshot,
+      agents: normalizeHubTaskStepAgentEntries(stepSnapshot),
     };
   });
 
@@ -59421,12 +60347,11 @@ async function installHubTaskIntoRuntime(
     const stepKey = normalizeText((rawStep as any)?.step_key);
     const stepId = stepIdByKey.get(stepKey);
     if (!stepId) continue;
-    const agents = Array.isArray((rawStep as any)?.agents) ? (rawStep as any).agents : [];
+    const agents = normalizeHubTaskStepAgentEntries(rawStep);
     for (const rawAgent of agents) {
-      const slotKey = normalizeText((rawAgent as any)?.camera_slot_key) || null;
+      const slotKey = rawAgent.camera_slot_key || null;
       const cameraId = slotKey ? targetCameraRefBySlotKey.get(slotKey) || null : null;
-      const agentSnapshot = normalizeHubAgentSnapshot((rawAgent as any)?.agent_snapshot);
-      if (!agentSnapshot) continue;
+      const agentSnapshot = rawAgent.agent_snapshot;
       await upsertStepAgentFromHubSnapshot(db, userId, stepId, cameraId, agentSnapshot, hubItemId, versionId);
     }
   }
@@ -61353,7 +62278,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   }
   const requestedVideoPackagingMode = body.video_packaging_mode === undefined
     ? null
-    : normalizeVideoPackagingMode(body.video_packaging_mode);
+    : normalizeVideoPackagingMode(body.video_packaging_mode, "frame_sequence");
   const requestedInferenceModel = body.inference_model === undefined
     ? null
     : normalizeJobStepInferenceModel(body.inference_model);
@@ -61667,7 +62592,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
     await c.env.DB.prepare(
       `UPDATE job_step_agents
-       SET agent_key = ?, priority_level = ?, input_type = ?, video_packaging_mode = ?, inference_model = ?, model_fps = ?, run_every = ?, running_resolution = ?, only_capture_on_motion = ?, use_temporal_context = ?, prompt_template = ?, params = ?, input_schema = ?, alert_condition = ?, analysis_regions = ?, temporal_plan_json = ?, temporal_plan_hash = ?, temporal_plan_version = ?, temporal_compiled_at = ?, temporal_compile_model = ?, temporal_explain_json = ?, updated_at = ?
+       SET agent_key = ?, priority_level = ?, input_type = ?, video_packaging_mode = ?, inference_model = ?, model_fps = ?, run_every = ?, running_resolution = ?, only_capture_on_motion = ?, use_temporal_context = ?, prompt_template = ?, params = ?, input_schema = ?, alert_condition = ?, negative_condition = ?, analysis_regions = ?, temporal_plan_json = ?, temporal_plan_hash = ?, temporal_plan_version = ?, temporal_compiled_at = ?, temporal_compile_model = ?, temporal_explain_json = ?, updated_at = ?
        WHERE id = ?`
     )
       .bind(
@@ -61685,6 +62610,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
         storedParams,
         body.input_schema || null,
         normalizedPromptParts.alert_condition,
+        normalizedPromptParts.negative_condition,
         analysisRegionsToStore,
         temporalPlanJson,
         temporalPlanHash,
@@ -61802,7 +62728,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 
   const inputType = requestedInputType || "video";
   const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
-  const videoPackagingMode = requestedVideoPackagingMode || "mosaic_2x2";
+  const videoPackagingMode = requestedVideoPackagingMode || "frame_sequence";
   const runEvery = requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
   const modelFps = requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
   const runningResolution = requestedRunningResolution ?? null;
@@ -61903,8 +62829,8 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   }
 
   const result = await c.env.DB.prepare(
-    `INSERT INTO job_step_agents (step_id, camera_id, agent_key, priority_level, input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, use_temporal_context, prompt_template, params, input_schema, alert_condition, analysis_regions, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    `INSERT INTO job_step_agents (step_id, camera_id, agent_key, priority_level, input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, use_temporal_context, prompt_template, params, input_schema, alert_condition, negative_condition, analysis_regions, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   )
     .bind(
       stepId,
@@ -61923,6 +62849,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       storedParams,
       body.input_schema || null,
       normalizedPromptParts.alert_condition,
+      normalizedPromptParts.negative_condition,
       insertAnalysisRegionsJson,
       now,
       now

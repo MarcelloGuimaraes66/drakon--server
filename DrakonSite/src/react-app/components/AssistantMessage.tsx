@@ -329,12 +329,16 @@ export default function AssistantMessage({
   onRevealComplete,
 }: AssistantMessageProps) {
   const markdown = formatAssistantMessageContent(content);
+  const hasCopyableText = markdown.trim().length > 0;
   const suppressCameraFooter = shouldSuppressAssistantCameraFooter(content);
   const isChatPageVariant = variant === "chat-page";
   const contentWidthClasses = compact ? "max-w-[34rem]" : "max-w-[68ch]";
+  const bubbleWrapperClasses = compact
+    ? "w-fit max-w-[82%]"
+    : "w-full max-w-full md:max-w-[50rem] xl:max-w-[54rem]";
   const bubbleClasses = compact
-    ? "max-w-[82%] px-4 py-3"
-    : "w-full max-w-full px-5 py-4 md:max-w-[50rem] md:px-7 md:py-5 xl:max-w-[54rem]";
+    ? "px-4 py-3"
+    : "w-full px-5 py-4 md:px-7 md:py-5";
 
   return (
     <div className={`flex items-start justify-start ${compact ? "gap-3" : "gap-4"}`}>
@@ -351,7 +355,7 @@ export default function AssistantMessage({
       </div>
 
       <div className="min-w-0 flex-1">
-        <div className="group relative min-w-0">
+        <div className={`group flex min-w-0 flex-col ${bubbleWrapperClasses}`}>
           <div
             className={[
               bubbleClasses,
@@ -386,10 +390,11 @@ export default function AssistantMessage({
               ) : null}
             </div>
           </div>
-          <MessageCopyButton
-            text={markdown}
-            className={compact ? "absolute left-2 top-[calc(100%+0.375rem)] z-20" : "absolute left-3 top-[calc(100%+0.375rem)] z-20"}
-          />
+          {hasCopyableText ? (
+            <div className={compact ? "mt-1 flex justify-end pr-2" : "mt-1.5 flex justify-end pr-3"}>
+              <MessageCopyButton text={markdown} />
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

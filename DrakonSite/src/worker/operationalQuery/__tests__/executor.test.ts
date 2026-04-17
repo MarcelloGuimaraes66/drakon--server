@@ -35,6 +35,7 @@ function makePlan(): ResolvedOperationalPlan {
         include_crop: true,
         include_media: false,
         identity_refs: [],
+        source_event_refs: [],
       },
       analysis: {
         group_by: [],
@@ -132,7 +133,11 @@ test("composeOperationalExecutionResult renders a rich text identity card withou
           card_id: "identity_card:qualified_person_10",
           entity_id: "qualified_person_10",
           display_name: "qualified_person_10",
-          identity_signature_summary: "Identity signature: short vermelho",
+          identity_signature_summary: "Identity signature: medium build",
+          identity_feature_candidates: [
+            { text: "light skin tone", category: "physical_trait" },
+            { text: "short dark hair", category: "physical_trait" },
+          ],
           identity_context_traits: ["saindo pela porta A"],
           last_seen: {
             timestamp_utc_iso: "2026-04-14T00:48:07",
@@ -150,7 +155,7 @@ test("composeOperationalExecutionResult renders a rich text identity card withou
   assert.equal(result.ok, true);
   assert.match(result.draft_answer, /## Identity cards persistidos/);
   assert.match(result.draft_answer, /### 1\. qualified_person_10 -> Pessoa conhecida/);
-  assert.match(result.draft_answer, /- Caracteristicas: short vermelho/);
+  assert.match(result.draft_answer, /- Caracteristicas: medium build; light skin tone; short dark hair/);
   assert.match(result.draft_answer, /- Crop: nao/);
   assert.match(result.draft_answer, /- Zona: porta_a/);
 });

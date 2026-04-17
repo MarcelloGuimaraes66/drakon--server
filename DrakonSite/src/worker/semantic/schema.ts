@@ -33,6 +33,7 @@ export type SemanticConversationMemory = {
   active_task_type: string | null;
   last_camera_name: string | null;
   last_video_scope: Record<string, unknown> | null;
+  last_positive_hit: Record<string, unknown> | null;
   last_semantic_plan: Record<string, unknown> | null;
   carry_forward_requested: boolean;
   recent_turns: Array<{

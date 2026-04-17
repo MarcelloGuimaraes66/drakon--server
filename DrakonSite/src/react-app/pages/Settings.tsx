@@ -893,7 +893,7 @@ export default function Settings() {
               </div>
               <button
                 type="button"
-                onClick={startTutorial}
+                onClick={() => startTutorial("intro")}
                 className="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-blue-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-400"
               >
                 {tutorialButtonLabel}

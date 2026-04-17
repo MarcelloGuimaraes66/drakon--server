@@ -57,6 +57,81 @@ namespace
         });
     }
 
+    bool IsCleanSessionField(std::string const& value)
+    {
+        if (value.empty())
+        {
+            return false;
+        }
+
+        return std::none_of(value.begin(), value.end(), [](unsigned char ch)
+        {
+            return ch < 0x20 || ch == 0x7F;
+        });
+    }
+
+    std::wstring RemoveEnvironmentTerminatorBytes(std::wstring value)
+    {
+        auto const terminator = value.find(L'\0');
+        if (terminator != std::wstring::npos)
+        {
+            value.resize(terminator);
+        }
+
+        return value;
+    }
+
+    void QuarantineInvalidProtectedLocalText(std::filesystem::path const& path)
+    {
+        if (!DrakonDesktop::platform::ProtectedLocalTextNeedsQuarantine(path))
+        {
+            return;
+        }
+
+        std::error_code errorCode;
+        for (int attempt = 0; attempt < 100; ++attempt)
+        {
+            auto backupPath = path;
+            backupPath += attempt == 0
+                ? ".invalid.bak"
+                : ".invalid." + std::to_string(attempt) + ".bak";
+
+            if (std::filesystem::exists(backupPath, errorCode))
+            {
+                continue;
+            }
+
+            errorCode.clear();
+            std::filesystem::rename(path, backupPath, errorCode);
+            if (!errorCode)
+            {
+                AppendBootstrapTrace(
+                    "runtime: quarantined invalid local session file " +
+                    path.filename().string());
+                return;
+            }
+        }
+
+        errorCode.clear();
+        std::filesystem::remove(path, errorCode);
+        AppendBootstrapTrace(
+            "runtime: removed invalid local session file " +
+            path.filename().string());
+    }
+
+    void SanitizeProvisionedSessionFiles(std::filesystem::path const& serviceSessionDirectory)
+    {
+        for (auto const& name : {
+            "exe_token.txt",
+            "client_id.txt",
+            "exe_id.txt",
+            "paired_timezone.txt",
+        })
+        {
+            QuarantineInvalidProtectedLocalText(serviceSessionDirectory / name);
+        }
+    }
+
 }
 
 namespace DrakonDesktop::platform
@@ -100,6 +175,17 @@ namespace DrakonDesktop::platform
         std::string const& exeId,
         std::optional<std::string> const& timezoneIana)
     {
+        if (!IsCleanSessionField(exeToken) ||
+            !IsCleanSessionField(clientId) ||
+            !IsCleanSessionField(exeId) ||
+            (timezoneIana.has_value() && !timezoneIana->empty() && !IsCleanSessionField(*timezoneIana)))
+        {
+            std::lock_guard lock(m_statusMutex);
+            m_status.lastError = "Invalid local session payload.";
+            m_status.summary = "servico cpp refused an invalid local session payload.";
+            return m_status;
+        }
+
         m_pendingProvisionedSession = ProvisionedSessionSnapshot{
             exeToken,
             clientId,
@@ -147,6 +233,7 @@ namespace DrakonDesktop::platform
         }
 
         std::filesystem::create_directories(config.serviceSessionDirectory);
+        SanitizeProvisionedSessionFiles(config.serviceSessionDirectory);
         PersistBaseUrlFiles();
 
         if (!std::filesystem::exists(config.executablePath))
@@ -325,6 +412,7 @@ namespace DrakonDesktop::platform
         auto const exeTokenPath = config.serviceSessionDirectory / "exe_token.txt";
         auto const clientIdPath = config.serviceSessionDirectory / "client_id.txt";
         auto const exeIdPath = config.serviceSessionDirectory / "exe_id.txt";
+        SanitizeProvisionedSessionFiles(config.serviceSessionDirectory);
         auto const exeToken = ReadProtectedLocalText(exeTokenPath).value_or(std::string{});
         auto const clientId = ReadProtectedLocalText(clientIdPath).value_or(std::string{});
         auto const exeId = ReadProtectedLocalText(exeIdPath).value_or(std::string{});
@@ -389,7 +477,7 @@ namespace DrakonDesktop::platform
 
         for (auto const& [key, value] : overrides)
         {
-            variables[key] = value;
+            variables[key] = RemoveEnvironmentTerminatorBytes(value);
         }
 
         std::wstring block;

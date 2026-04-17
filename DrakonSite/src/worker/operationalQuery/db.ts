@@ -88,6 +88,33 @@ function normalizeStringArray(value: unknown, maxItems = 12): string[] {
   return out;
 }
 
+function normalizeIdentityFeatureCandidateArray(value: unknown, maxItems = 12): JsonRecord[] {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const out: JsonRecord[] = [];
+  for (const entry of source) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as JsonRecord;
+    const text = normalizePlannerText(record.text, 240);
+    if (!text) continue;
+    const category = normalizePlannerText(record.category, 80);
+    const relationToTarget = normalizePlannerText(record.relation_to_target, 80);
+    const dedupeKey = `${text.toLowerCase()}|${category.toLowerCase()}|${relationToTarget.toLowerCase()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const normalized: JsonRecord = { text };
+    if (category) normalized.category = category;
+    if (relationToTarget) normalized.relation_to_target = relationToTarget;
+    if (typeof record.confidence === "number" && Number.isFinite(record.confidence)) {
+      normalized.confidence = record.confidence;
+    }
+    out.push(normalized);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
 function mergeJsonRecords(primary: JsonRecord | null, fallback: JsonRecord | null): JsonRecord | null {
   if (!primary && !fallback) return null;
   if (!primary) return fallback ? { ...fallback } : null;
@@ -126,6 +153,14 @@ function mergeJsonRecords(primary: JsonRecord | null, fallback: JsonRecord | nul
     }
   }
 
+  const mergedFeatureCandidates = normalizeIdentityFeatureCandidateArray([
+    ...normalizeIdentityFeatureCandidateArray(primary.identity_feature_candidates),
+    ...normalizeIdentityFeatureCandidateArray(fallback.identity_feature_candidates),
+  ]);
+  if (mergedFeatureCandidates.length > 0) {
+    merged.identity_feature_candidates = mergedFeatureCandidates;
+  }
+
   return merged;
 }
 
@@ -139,6 +174,7 @@ function computeIdentityCardRichness(row: Record<string, unknown>): number {
     ...normalizeStringArray(card?.stable_attributes),
   ]);
   const contextTraits = normalizeStringArray(card?.identity_context_traits, 6);
+  const featureCandidates = normalizeIdentityFeatureCandidateArray(card?.identity_feature_candidates, 8);
   let score = 0;
   if (normalizePlannerText(row.crop_url, 260)) score += 5;
   if (normalizePlannerText(row.portrait_kind, 80)) score += 2;
@@ -150,6 +186,7 @@ function computeIdentityCardRichness(row: Record<string, unknown>): number {
   if (normalizePlannerText(card?.portrait_url, 260)) score += 2;
   if (normalizePlannerText(parseJsonRecord(card?.last_seen)?.zone, 120)) score += 1;
   if (contextTraits.length > 0) score += contextTraits.length;
+  if (featureCandidates.length > 0) score += featureCandidates.length * 3;
   if (resolvedIdentity) score += 4;
   if (normalizePlannerText(resolvedIdentity?.target_name, 160)) score += 2;
   if (normalizePlannerText(resolvedIdentity?.target_description, 400)) score += 2;
@@ -177,16 +214,57 @@ function queryPrefersLatestIdentityCard(query: string): boolean {
   ]);
 }
 
+function rowsHaveCompatibleIdentityCardProvenance(
+  anchor: Record<string, unknown>,
+  candidate: Record<string, unknown>
+): boolean {
+  const anchorSourceEventId = normalizePlannerText(anchor.source_event_id, 160);
+  const candidateSourceEventId = normalizePlannerText(candidate.source_event_id, 160);
+  if (anchorSourceEventId || candidateSourceEventId) {
+    return !!anchorSourceEventId && anchorSourceEventId === candidateSourceEventId;
+  }
+
+  const anchorChatSessionId = Number(anchor.chat_session_id || 0) || 0;
+  const candidateChatSessionId = Number(candidate.chat_session_id || 0) || 0;
+  if (anchorChatSessionId > 0 || candidateChatSessionId > 0) {
+    return anchorChatSessionId > 0 && anchorChatSessionId === candidateChatSessionId;
+  }
+
+  const anchorSourceType = normalizePlannerText(anchor.source_type, 80);
+  const candidateSourceType = normalizePlannerText(candidate.source_type, 80);
+  if (anchorSourceType && candidateSourceType && anchorSourceType !== candidateSourceType) {
+    return false;
+  }
+
+  for (const field of ["job_run_id", "step_run_id", "agent_run_id"]) {
+    const anchorValue = normalizePlannerText(anchor[field], 160);
+    const candidateValue = normalizePlannerText(candidate[field], 160);
+    if (anchorValue || candidateValue) {
+      return !!anchorValue && anchorValue === candidateValue;
+    }
+  }
+
+  const anchorCameraId = Number(anchor.camera_id || 0) || 0;
+  const candidateCameraId = Number(candidate.camera_id || 0) || 0;
+  if (anchorCameraId > 0 || candidateCameraId > 0) {
+    return anchorCameraId > 0 && anchorCameraId === candidateCameraId;
+  }
+
+  return true;
+}
+
 function mergeIdentityCardRows(rows: Array<Record<string, unknown>>): Record<string, unknown> {
   if (rows.length === 0) return {};
   const recentRows = sortRowsByIsoDesc(rows, "created_at");
-  const richestRows = [...rows].sort((left, right) => {
+  const anchorRow = recentRows[0];
+  const compatibleRows = rows.filter((row) => rowsHaveCompatibleIdentityCardProvenance(anchorRow, row));
+  const richestRows = [...compatibleRows].sort((left, right) => {
     const scoreDelta = computeIdentityCardRichness(right) - computeIdentityCardRichness(left);
     if (scoreDelta !== 0) return scoreDelta;
     return (reportPickIso(right.created_at) || "").localeCompare(reportPickIso(left.created_at) || "");
   });
 
-  const merged = { ...recentRows[0] };
+  const merged = { ...anchorRow };
   let mergedCard = parseJsonRecord(merged.card_json);
   let mergedResolvedIdentity = parseJsonRecord(merged.resolved_identity_json);
 
@@ -305,7 +383,11 @@ function clonePlan(plan: ResolvedOperationalPlan): ResolvedOperationalPlan {
         agent_runs: [...plan.intent.scope.agent_runs],
       },
       time: { ...plan.intent.time },
-      filters: { ...plan.intent.filters, identity_refs: [...plan.intent.filters.identity_refs] },
+      filters: {
+        ...plan.intent.filters,
+        identity_refs: [...plan.intent.filters.identity_refs],
+        source_event_refs: [...plan.intent.filters.source_event_refs],
+      },
       analysis: {
         ...plan.intent.analysis,
         group_by: [...plan.intent.analysis.group_by],
@@ -927,6 +1009,10 @@ async function queryIdentityCardsDb(params: {
     "identity_card_id",
     params.plan.intent.filters.identity_refs || []
   );
+  const sourceEventFilter = buildTextInClause(
+    "source_event_id",
+    params.plan.intent.filters.source_event_refs || []
+  );
 
   const relationFragments: string[] = [];
   const relationBindings: Array<string | number> = [];
@@ -987,6 +1073,7 @@ async function queryIdentityCardsDb(params: {
     `SELECT
        occurrence_id,
        identity_card_id,
+       chat_session_id,
        camera_id,
        camera_name,
        source_type,
@@ -1006,7 +1093,7 @@ async function queryIdentityCardsDb(params: {
      FROM identity_card_occurrences
      WHERE user_id = ?
        AND created_at >= ?
-       AND created_at <= ?${cameraFilter.clause}${jobRunFilter.clause}${stepRunFilter.clause}${agentRunFilter.clause}${identityFilter.clause}${relationClause}
+       AND created_at <= ?${cameraFilter.clause}${jobRunFilter.clause}${stepRunFilter.clause}${agentRunFilter.clause}${identityFilter.clause}${sourceEventFilter.clause}${relationClause}
      ORDER BY created_at DESC
      LIMIT ${candidateLimit}`,
     [
@@ -1018,6 +1105,7 @@ async function queryIdentityCardsDb(params: {
       ...stepRunFilter.params,
       ...agentRunFilter.params,
       ...identityFilter.params,
+      ...sourceEventFilter.params,
       ...relationBindings,
     ]
   );
@@ -1025,6 +1113,7 @@ async function queryIdentityCardsDb(params: {
   const mappedRows = rows.map((row) => ({
     occurrence_id: normalizePlannerText(row.occurrence_id, 160),
     identity_card_id: normalizePlannerText(row.identity_card_id, 160),
+    chat_session_id: Number(row.chat_session_id || 0) || null,
     camera_id: Number(row.camera_id || 0) || null,
     camera_name: normalizePlannerText(row.camera_name, 120) || null,
     source_type: normalizePlannerText(row.source_type, 80) || null,

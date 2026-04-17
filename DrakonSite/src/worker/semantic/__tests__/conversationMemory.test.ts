@@ -34,6 +34,7 @@ function makeContext(query = ""): OperationalPlannerContext {
     chat_discussion: {
       task_state: {
         session_entities: {
+          last_positive_hit: null,
           last_semantic_plan: {
             scope: {
               jobs: [22],
@@ -83,6 +84,7 @@ function makeOperationalPlan(): ResolvedOperationalPlan {
         include_crop: true,
         include_media: false,
         identity_refs: [],
+        source_event_refs: [],
       },
       analysis: {
         group_by: [],
@@ -146,6 +148,62 @@ test("applyConversationMemoryToOperationalPlan reuses prior scope", () => {
   assert.deepEqual(applied.intent.scope.job_runs, ["run-1"]);
 });
 
+test("applyConversationMemoryToOperationalPlan scopes identity refs to the last analyzed video", () => {
+  const query = "me traga os id cards do video analisado";
+  const context = makeContext(query);
+  (
+    (
+      context.chat_discussion as Record<string, unknown>
+    ).task_state as Record<string, unknown>
+  ).session_entities = {
+    ...((
+      (
+        context.chat_discussion as Record<string, unknown>
+      ).task_state as Record<string, unknown>
+    ).session_entities as Record<string, unknown>),
+    last_positive_hit: {
+      camera_id: 77,
+      source_event_id: "uploaded_video:91",
+      primary_identity_card_id: "identity_card:vehicle_1",
+      identity_cards: [
+        {
+          card_id: "identity_card:vehicle_1",
+          entity_id: "vehicle_1",
+          display_name: "vehicle_1",
+          source_event_id: "uploaded_video:91",
+        },
+        {
+          card_id: "identity_card:person_1",
+          entity_id: "person_1",
+          display_name: "person_1",
+          source_event_id: "uploaded_video:91",
+        },
+        {
+          card_id: "identity_card:person_2",
+          entity_id: "person_2",
+          display_name: "person_2",
+          source_event_id: "uploaded_video:91",
+        },
+      ],
+    },
+  };
+
+  const memory = resolveConversationMemory(context, query);
+  const applied = applyConversationMemoryToOperationalPlan({
+    plan: makeOperationalPlan(),
+    memory,
+    query,
+  });
+
+  assert.deepEqual(applied.intent.filters.identity_refs, [
+    "identity_card:vehicle_1",
+    "identity_card:person_1",
+    "identity_card:person_2",
+  ]);
+  assert.deepEqual(applied.intent.filters.source_event_refs, ["uploaded_video:91"]);
+  assert.deepEqual(applied.intent.scope.cameras, [77]);
+});
+
 test("buildSemanticPlanMemoryPatch stores first-step scope", () => {
   const plan: SemanticPlan = {
     version: 1,
@@ -164,6 +222,7 @@ test("buildSemanticPlanMemoryPatch stores first-step scope", () => {
       active_task_type: null,
       last_camera_name: null,
       last_video_scope: null,
+      last_positive_hit: null,
       last_semantic_plan: null,
       carry_forward_requested: false,
       recent_turns: [],

@@ -15,6 +15,9 @@ declare global {
     STRIPE_CHAT_PAYG_PRICE_ID: string;
     R2_PUBLIC_BASE_URL?: string;
     LOCAL_MEDIA_BASE_DIR?: string;
+    APP_SERVICE_SESSION_DIR?: string;
+    STORAGE_ROOT?: string;
+    CAMERA_RECORDINGS_BASE_DIR?: string;
     APP_ALLOWED_ORIGINS?: string;
     USD_TO_BRL?: string;
     SCHEDULER_TICK_SECRET?: string;

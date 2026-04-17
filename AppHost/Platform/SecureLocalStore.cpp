@@ -27,6 +27,22 @@ namespace
         return value;
     }
 
+    std::optional<std::string> NormalizePlainText(std::string value)
+    {
+        if (value.find('\0') != std::string::npos)
+        {
+            return std::nullopt;
+        }
+
+        value = TrimAscii(std::move(value));
+        if (value.empty())
+        {
+            return std::nullopt;
+        }
+
+        return value;
+    }
+
     bool LooksLikeBase64(std::string const& value)
     {
         bool seenPadding = false;
@@ -53,6 +69,13 @@ namespace
         }
 
         return !value.empty();
+    }
+
+    bool LooksLikeProtectedBlob(std::string const& value)
+    {
+        return value.size() >= 32 &&
+            value.rfind("AQAAANCM", 0) == 0 &&
+            LooksLikeBase64(value);
     }
 
     std::string FileEntropy(std::filesystem::path const& path)
@@ -242,10 +265,10 @@ namespace DrakonDesktop::platform
         auto decrypted = UnprotectText(*raw, path);
         if (decrypted.has_value())
         {
-            return *decrypted;
+            return NormalizePlainText(*decrypted);
         }
 
-        return *raw;
+        return NormalizePlainText(*raw);
     }
 
     std::optional<std::string> ReadProtectedLocalTextStrict(std::filesystem::path const& path)
@@ -256,12 +279,50 @@ namespace DrakonDesktop::platform
             return std::nullopt;
         }
 
-        return UnprotectText(*raw, path);
+        auto decrypted = UnprotectText(*raw, path);
+        if (!decrypted.has_value())
+        {
+            return std::nullopt;
+        }
+
+        return NormalizePlainText(*decrypted);
+    }
+
+    bool ProtectedLocalTextNeedsQuarantine(std::filesystem::path const& path)
+    {
+        auto const raw = ReadRawFile(path);
+        if (!raw.has_value())
+        {
+            return false;
+        }
+        if (raw->empty())
+        {
+            return true;
+        }
+
+        auto decrypted = UnprotectText(*raw, path);
+        if (decrypted.has_value())
+        {
+            return !NormalizePlainText(*decrypted).has_value();
+        }
+
+        if (LooksLikeProtectedBlob(*raw))
+        {
+            return true;
+        }
+
+        return !NormalizePlainText(*raw).has_value();
     }
 
     bool WriteProtectedLocalText(std::filesystem::path const& path, std::string_view value)
     {
-        auto const encrypted = ProtectText(value, path);
+        auto const normalized = NormalizePlainText(std::string(value));
+        if (!normalized.has_value())
+        {
+            return false;
+        }
+
+        auto const encrypted = ProtectText(*normalized, path);
         if (!encrypted.has_value())
         {
             return false;

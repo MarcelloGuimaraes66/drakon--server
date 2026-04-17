@@ -1,11 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
-import { Camera, FileUp, Pencil, Play, Plus, Square, Trash2, Wifi } from "lucide-react";
+import {
+  Archive,
+  Camera,
+  FileUp,
+  Pencil,
+  Play,
+  Plus,
+  Square,
+  Trash2,
+  Wifi,
+} from "lucide-react";
 import CameraStartAttentionToast from "@/react-app/components/CameraStartAttentionToast";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
 import CameraDirectoryControls from "@/react-app/components/CameraDirectoryControls";
 import CameraDiscoveryModal from "@/react-app/components/CameraDiscoveryModal";
+import CameraRecordingPlayerOverlay, {
+  type CameraRecordingPlayerCamera,
+} from "@/react-app/components/CameraRecordingPlayerOverlay";
+import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import Layout from "@/react-app/components/Layout";
 import CameraEditorModal, {
   type CameraEditorCamera,
@@ -83,14 +97,18 @@ function findSavedCameraId(
 }
 
 function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContentProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const billingEnabled = brand.features.billingEnabled;
   const [searchParams, setSearchParams] = useSearchParams();
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
+  const [recordingCamera, setRecordingCamera] =
+    useState<CameraRecordingPlayerCamera | null>(null);
   const [editorCamera, setEditorCamera] = useState<CameraEditorCamera | null>(null);
   const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<CameraType | null>(null);
+  const [isDeletingCamera, setIsDeletingCamera] = useState(false);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
@@ -122,6 +140,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
   );
+  const recordingHistoryLabel = i18n.language?.startsWith("pt")
+    ? "Arquivo"
+    : "Archive";
 
   useEffect(() => {
     const editId = searchParams.get("edit");
@@ -224,6 +245,31 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     setSearchParams(nextParams);
   };
 
+  const openRecordingPlayer = (camera: CameraType) => {
+    setRecordingCamera({
+      id: camera.id,
+      name: String(camera.name || "").trim() || `Camera ${camera.id}`,
+      description:
+        typeof camera.description === "string"
+          ? String(camera.description).trim()
+          : null,
+      thumbnail_url:
+        typeof camera.thumbnail_url === "string" ? camera.thumbnail_url : null,
+      is_service_running:
+        typeof camera.is_service_running === "number"
+          ? camera.is_service_running
+          : null,
+      is_online:
+        typeof camera.is_online === "number" ? camera.is_online : null,
+      store_frames:
+        typeof camera.store_frames === "number" ? camera.store_frames : null,
+      retention_days:
+        typeof camera.retention_days === "number"
+          ? camera.retention_days
+          : null,
+    });
+  };
+
   const closeEditor = useCallback(() => {
     onboardingOwnedEditorRef.current = false;
     setIsEditorOpen(false);
@@ -313,12 +359,31 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     refreshDashboardSummary();
   };
 
-  const handleDelete = async (cameraId: number) => {
-    if (!confirm("Are you sure you want to delete this camera?")) {
+  const requestDeleteCamera = (camera: CameraType) => {
+    if (isDeletingCamera) {
       return;
     }
 
+    setDeleteCandidate(camera);
+  };
+
+  const closeDeleteDialog = () => {
+    if (isDeletingCamera) {
+      return;
+    }
+
+    setDeleteCandidate(null);
+  };
+
+  const handleDelete = async () => {
+    if (!deleteCandidate || isDeletingCamera) {
+      return;
+    }
+
+    const cameraId = deleteCandidate.id;
+
     try {
+      setIsDeletingCamera(true);
       const response = await fetch(`/api/cameras/${cameraId}`, {
         method: "DELETE",
         credentials: "include",
@@ -335,8 +400,12 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
       if (editorCamera?.id === cameraId) {
         closeEditor();
       }
+
+      setDeleteCandidate(null);
     } catch (error) {
       console.error("Failed to delete camera:", error);
+    } finally {
+      setIsDeletingCamera(false);
     }
   };
 
@@ -436,9 +505,33 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
       : t("cameraDirectory.noOfflineCamerasDesc", {
           defaultValue: "Stopped cameras stay here until they are started again.",
         });
+  const deleteCandidateName =
+    deleteCandidate && typeof deleteCandidate.name === "string" && deleteCandidate.name.trim().length > 0
+      ? deleteCandidate.name.trim()
+      : deleteCandidate
+        ? `Camera #${deleteCandidate.id}`
+        : t("cameras.thisCamera", { defaultValue: "this camera" });
 
   return (
     <>
+      <ConfirmDialog
+        isOpen={deleteCandidate !== null}
+        title={t("cameras.deleteCameraTitle", { defaultValue: "Delete camera" })}
+        message={t("cameras.deleteCameraMessage", {
+          defaultValue: `Are you sure you want to delete "${deleteCandidateName}"? This action cannot be undone.`,
+          cameraName: deleteCandidateName,
+        })}
+        confirmLabel={
+          isDeletingCamera
+            ? t("cameras.deleting", { defaultValue: "Deleting..." })
+            : t("cameras.delete", { defaultValue: "Delete" })
+        }
+        cancelLabel={t("cameras.cancel", { defaultValue: "Cancel" })}
+        onConfirm={handleDelete}
+        onCancel={closeDeleteDialog}
+        variant="danger"
+      />
+
       <div className="max-w-7xl">
         <div className="mb-6 md:mb-8">
           <div>
@@ -593,6 +686,15 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                           )}
                         </button>
                         <button
+                          type="button"
+                          onClick={() => openRecordingPlayer(camera)}
+                          title={recordingHistoryLabel}
+                          aria-label={recordingHistoryLabel}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-cyan-300 transition-colors hover:bg-cyan-500/10"
+                        >
+                          <Archive className="h-4 w-4" />
+                        </button>
+                        <button
                           onClick={() => openEditModal(camera)}
                           title={t("dashboard.edit")}
                           aria-label={t("dashboard.edit")}
@@ -601,7 +703,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                           <Pencil className="h-4 w-4" />
                         </button>
                         <button
-                          onClick={() => handleDelete(camera.id)}
+                          onClick={() => requestDeleteCamera(camera)}
                           title={t("cameras.delete")}
                           aria-label={t("cameras.delete")}
                           className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-red-400 transition-colors hover:bg-red-500/10"
@@ -652,6 +754,12 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
         isOpen={isImportOpen}
         onClose={() => setIsImportOpen(false)}
         onImported={handleImportSaved}
+      />
+
+      <CameraRecordingPlayerOverlay
+        isOpen={recordingCamera !== null}
+        camera={recordingCamera}
+        onClose={() => setRecordingCamera(null)}
       />
 
       <CameraEventToast toasts={toasts} onDismiss={dismissToast} />

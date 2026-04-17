@@ -561,7 +561,8 @@ export default function Algorithms() {
               String(row?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video",
             video_packaging_mode: (() => {
               const mode = String(row?.video_packaging_mode || "").trim().toLowerCase();
-              return mode === "frame_sequence" ||
+              if (
+                mode === "frame_sequence" ||
                 mode === "frame-sequence" ||
                 mode === "full_frame" ||
                 mode === "full-frame" ||
@@ -569,15 +570,31 @@ export default function Algorithms() {
                 mode === "high_resolution" ||
                 mode === "high-resolution" ||
                 mode === "high resolution"
-                ? "frame_sequence"
-                : mode === "mosaic_2x2" ||
-                    mode === "mosaic-2x2" ||
-                    mode === "2x2" ||
-                    mode === "standard_resolution" ||
-                    mode === "standard-resolution" ||
-                    mode === "standard resolution"
-                  ? "mosaic_2x2"
-                  : "mosaic_3x3";
+              ) {
+                return "frame_sequence";
+              }
+              if (
+                mode === "mosaic_2x2" ||
+                mode === "mosaic-2x2" ||
+                mode === "2x2" ||
+                mode === "standard_resolution" ||
+                mode === "standard-resolution" ||
+                mode === "standard resolution"
+              ) {
+                return "mosaic_2x2";
+              }
+              if (
+                mode === "mosaic" ||
+                mode === "mosaic_3x3" ||
+                mode === "mosaic-3x3" ||
+                mode === "3x3" ||
+                mode === "compact_resolution" ||
+                mode === "compact-resolution" ||
+                mode === "compact resolution"
+              ) {
+                return "mosaic_3x3";
+              }
+              return "frame_sequence";
             })(),
             inference_model: (() => {
               const model = String(row?.inference_model || "").trim().toLowerCase();

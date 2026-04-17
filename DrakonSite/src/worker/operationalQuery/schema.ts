@@ -98,6 +98,7 @@ export type OperationalIntent = {
     include_crop: boolean;
     include_media: boolean;
     identity_refs: string[];
+    source_event_refs: string[];
   };
   analysis: {
     group_by: string[];

@@ -123,6 +123,7 @@ export default function Chat() {
   const [isHeaderGhostedWhileScrolling, setIsHeaderGhostedWhileScrolling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const sessionRailRef = useRef<HTMLDivElement>(null);
   const headerGhostTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const emptyCamerasRef = useRef<any[]>([]);
   const previousMessageCountRef = useRef(0);
@@ -263,6 +264,39 @@ export default function Chat() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (deletingSessionId === null) {
+      return;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        return;
+      }
+
+      if (sessionRailRef.current?.contains(target)) {
+        return;
+      }
+
+      setDeletingSessionId(null);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setDeletingSessionId(null);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [deletingSessionId]);
 
   useEffect(() => {
     shouldAutoScrollRef.current = shouldAutoScroll;
@@ -510,6 +544,7 @@ export default function Chat() {
     void clearDraftVideo();
     setMessages([]);
     setActiveSessionId(null);
+    setDeletingSessionId(null);
     setShouldAutoScroll(true);
     previousMessageCountRef.current = 0;
 
@@ -524,10 +559,12 @@ export default function Chat() {
   const handleSelectSession = (sessionId: number) => {
     setMessages([]);
     setActiveSessionId(sessionId);
+    setDeletingSessionId(null);
     navigate(`/chat?session=${sessionId}`);
   };
 
   const handleStartEdit = (session: ChatSession) => {
+    setDeletingSessionId(null);
     setEditingSessionId(session.id);
     setEditingTitle(session.title);
   };
@@ -557,11 +594,10 @@ export default function Chat() {
     setEditingTitle("");
   };
 
-  const handleDeleteSession = async () => {
-    if (!deletingSessionId) return;
+  const handleDeleteSession = async (sessionId: number) => {
+    if (!sessionId) return;
 
     try {
-      const sessionId = deletingSessionId;
       const response = await fetch(`/api/chat/sessions/${sessionId}`, {
         method: "DELETE",
       });
@@ -585,9 +621,12 @@ export default function Chat() {
       }
     } catch (deleteError) {
       console.error("Failed to delete session:", deleteError);
-      alert("Failed to delete chat. Please try again.");
+      setToast({
+        message: "Failed to delete chat. Please try again.",
+        type: "error",
+      });
     } finally {
-      setDeletingSessionId(null);
+      setDeletingSessionId((currentSessionId) => (currentSessionId === sessionId ? null : currentSessionId));
     }
   };
 
@@ -727,7 +766,7 @@ export default function Chat() {
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
           <div className="flex min-w-0 flex-1 justify-end">
-            <div className="group relative w-full max-w-full min-w-0 md:max-w-[42rem]">
+            <div className="group flex w-full max-w-full min-w-0 flex-col md:max-w-[42rem]">
               <div className="w-full min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)] md:px-5">
                 {userMsg.uploaded_image_base64 && (
                   <img
@@ -749,10 +788,12 @@ export default function Chat() {
                 ) : null}
               </div>
               {hasUserText ? (
-                <MessageCopyButton
-                  text={formattedUserContent}
-                  className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
-                />
+                <div className="mt-1.5 flex justify-end pr-2">
+                  <MessageCopyButton
+                    text={formattedUserContent}
+                    className="border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
+                  />
+                </div>
               ) : null}
             </div>
           </div>
@@ -872,7 +913,10 @@ export default function Chat() {
   return (
     <Layout>
       <div className="flex h-[calc(100vh-10rem)] gap-5 md:h-[calc(100vh-8rem)]">
-        <div className="hidden md:flex w-[18.75rem] flex-col overflow-hidden rounded-[28px] border border-white/[0.06] bg-gradient-to-b from-[#171a22]/96 via-[#13161d]/98 to-[#101216] shadow-[0_30px_120px_-55px_rgba(0,0,0,0.96)] backdrop-blur-xl">
+        <div
+          ref={sessionRailRef}
+          className="hidden md:flex w-[18.75rem] flex-col overflow-hidden rounded-[28px] border border-white/[0.06] bg-gradient-to-b from-[#171a22]/96 via-[#13161d]/98 to-[#101216] shadow-[0_30px_120px_-55px_rgba(0,0,0,0.96)] backdrop-blur-xl"
+        >
           <div className="border-b border-white/[0.06] p-4">
             <button
               onClick={handleNewChat}
@@ -905,84 +949,119 @@ export default function Chat() {
                 </div>
               )}
 
-              {sessions.map((session) => (
-                <div
-                  key={session.id}
-                  onClick={() => !editingSessionId && handleSelectSession(session.id)}
-                  className={`group relative cursor-pointer rounded-[20px] px-4 py-3 transition-all ${
-                    activeSessionId === session.id
-                      ? "border border-blue-400/20 bg-blue-500/12 shadow-[0_20px_50px_-35px_rgba(74,149,255,0.95)]"
-                      : "border border-transparent hover:border-white/[0.06] hover:bg-white/[0.04]"
-                  }`}
-                >
-                  {editingSessionId === session.id ? (
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        value={editingTitle}
-                        onChange={(e) => setEditingTitle(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
+              {sessions.map((session) => {
+                const isPendingDelete = deletingSessionId === session.id;
+
+                return (
+                  <div
+                    key={session.id}
+                    onClick={() => {
+                      if (editingSessionId) {
+                        return;
+                      }
+
+                      if (isPendingDelete) {
+                        setDeletingSessionId(null);
+                        return;
+                      }
+
+                      handleSelectSession(session.id);
+                    }}
+                    className={`group relative cursor-pointer rounded-[20px] px-4 py-3 transition-all ${
+                      activeSessionId === session.id
+                        ? "border border-blue-400/20 bg-blue-500/12 shadow-[0_20px_50px_-35px_rgba(74,149,255,0.95)]"
+                        : "border border-transparent hover:border-white/[0.06] hover:bg-white/[0.04]"
+                    }`}
+                  >
+                    {editingSessionId === session.id ? (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={editingTitle}
+                          onChange={(e) => setEditingTitle(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              handleSaveEdit(session.id);
+                            } else if (e.key === "Escape") {
+                              handleCancelEdit();
+                            }
+                          }}
+                          className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          autoFocus
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
                             handleSaveEdit(session.id);
-                          } else if (e.key === "Escape") {
+                          }}
+                          className="p-1 text-green-400 hover:text-green-300"
+                        >
+                          <Check className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
                             handleCancelEdit();
-                          }
-                        }}
-                        className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        autoFocus
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleSaveEdit(session.id);
-                        }}
-                        className="p-1 text-green-400 hover:text-green-300"
-                      >
-                        <Check className="h-4 w-4" />
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleCancelEdit();
-                        }}
-                        className="p-1 text-red-400 hover:text-red-300"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="mb-1 flex items-start justify-between gap-2">
-                        <h3 className="flex-1 truncate text-sm font-medium text-gray-100">
-                          {session.title}
-                        </h3>
-                        <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleStartEdit(session);
-                            }}
-                            className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-gray-200"
-                          >
-                            <Edit2 className="h-3 w-3" />
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setDeletingSessionId(session.id);
-                            }}
-                            className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-red-400"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                          </button>
-                        </div>
+                          }}
+                          className="p-1 text-red-400 hover:text-red-300"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
                       </div>
-                      <p className="text-xs text-gray-500">{formatTime(session.updated_at)}</p>
-                    </>
-                  )}
-                </div>
-              ))}
+                    ) : (
+                      <>
+                        <div className="mb-1 flex items-start justify-between gap-2">
+                          <h3 className="flex-1 truncate text-sm font-medium text-gray-100">
+                            {session.title}
+                          </h3>
+                          <div
+                            className={`flex min-h-7 items-center justify-end gap-1 transition-opacity ${
+                              isPendingDelete
+                                ? "opacity-100"
+                                : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+                            }`}
+                          >
+                            {!isPendingDelete ? (
+                              <>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleStartEdit(session);
+                                  }}
+                                  className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-gray-200"
+                                >
+                                  <Edit2 className="h-3 w-3" />
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setDeletingSessionId(session.id);
+                                  }}
+                                  className="rounded-md p-1 text-gray-500 hover:bg-white/[0.05] hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleDeleteSession(session.id);
+                                }}
+                                className="inline-flex h-7 items-center rounded-full border border-red-400/20 bg-red-500/12 px-3 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/18 hover:text-red-200"
+                              >
+                                Confirm
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <p className="text-xs text-gray-500">{formatTime(session.updated_at)}</p>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1252,31 +1331,6 @@ export default function Chat() {
           });
         }}
       />
-
-      {deletingSessionId !== null && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-gray-800 bg-gray-900 p-6 shadow-2xl">
-            <h3 className="mb-3 text-lg font-semibold text-gray-100">Delete Chat</h3>
-            <p className="mb-6 text-sm text-gray-400">
-              Are you sure you want to delete this chat? This action cannot be undone and all messages will be permanently removed.
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setDeletingSessionId(null)}
-                className="flex-1 rounded-lg bg-gray-800 px-4 py-2 text-sm font-medium text-gray-300 transition-colors hover:bg-gray-700"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDeleteSession}
-                className="flex-1 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700"
-              >
-                Delete Chat
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
       <CameraEventToast toasts={cameraEventToasts} onDismiss={dismissCameraEventToast} />

@@ -161,6 +161,7 @@ export function buildOperationalPlan(params: {
       include_crop: includeCrop,
       include_media: includeMedia,
       identity_refs: [],
+      source_event_refs: [],
     },
     analysis: {
       group_by: [],
@@ -199,6 +200,7 @@ export function buildOperationalPlan(params: {
       include_crop: includeCrop,
       include_media: includeMedia,
       identity_refs: [],
+      source_event_refs: [],
     },
     analysis: {
       group_by: task === "aggregate" ? ["time"] : [],

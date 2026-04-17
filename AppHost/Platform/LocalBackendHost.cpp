@@ -103,6 +103,17 @@ namespace
         return value;
     }
 
+    std::wstring RemoveEnvironmentTerminatorBytes(std::wstring value)
+    {
+        auto const terminator = value.find(L'\0');
+        if (terminator != std::wstring::npos)
+        {
+            value.resize(terminator);
+        }
+
+        return value;
+    }
+
     std::wstring ReadLogTail(std::filesystem::path const& logPath, size_t maxBytes = 4096)
     {
         std::ifstream stream(logPath, std::ios::binary);
@@ -383,7 +394,7 @@ namespace DrakonDesktop::platform
             return false;
         }
 
-        auto const provisionedExeId = ReadProtectedLocalText(config.serviceSessionDirectory / "exe_id.txt").value_or(std::string{});
+        auto const provisionedExeId = ReadProtectedLocalTextStrict(config.serviceSessionDirectory / "exe_id.txt").value_or(std::string{});
 
         SECURITY_ATTRIBUTES securityAttributes{};
         securityAttributes.nLength = sizeof(securityAttributes);
@@ -527,7 +538,7 @@ namespace DrakonDesktop::platform
 
         for (auto const& [key, value] : overrides)
         {
-            variables[key] = value;
+            variables[key] = RemoveEnvironmentTerminatorBytes(value);
         }
 
         std::wstring block;

@@ -577,7 +577,7 @@ export default function QuickChatOverlay() {
       return (
         <div key={message.id} className="flex justify-end gap-4 animate-slide-up">
           <div className="flex min-w-0 flex-1 justify-end">
-            <div className="group relative max-w-[85%] min-w-0">
+            <div className="group flex max-w-[85%] min-w-0 flex-col">
               <div className="min-w-0 overflow-hidden rounded-[26px] border border-blue-300/10 bg-gradient-to-br from-blue-500/90 via-blue-500/82 to-cyan-500/78 px-4 py-3 text-white shadow-[0_24px_60px_-30px_rgba(74,149,255,0.8)]">
                 {userMsg.uploaded_image_base64 && (
                   <img
@@ -599,10 +599,12 @@ export default function QuickChatOverlay() {
                 ) : null}
               </div>
               {hasUserText ? (
-                <MessageCopyButton
-                  text={formattedUserContent}
-                  className="absolute right-2 top-[calc(100%+0.375rem)] z-20 border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
-                />
+                <div className="mt-1 flex justify-end pr-2">
+                  <MessageCopyButton
+                    text={formattedUserContent}
+                    className="border-white/10 bg-white/[0.08] text-white/80 hover:bg-white/[0.14]"
+                  />
+                </div>
               ) : null}
             </div>
           </div>

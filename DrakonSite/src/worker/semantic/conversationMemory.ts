@@ -54,6 +54,134 @@ function queryIncludesAny(query: string, needles: readonly string[]): boolean {
   });
 }
 
+function queryReferencesLastAnalyzedVideo(queryInput: string): boolean {
+  return queryIncludesAny(queryInput, [
+    "video analisado",
+    "video que voce analisou",
+    "video que vc analisou",
+    "video anterior",
+    "ultimo video",
+    "mesmo video",
+    "mesmo clip",
+    "clip analisado",
+    "clip anterior",
+    "last video",
+    "same video",
+    "same clip",
+    "analyzed video",
+    "analyzed clip",
+    "previous video",
+    "previous clip",
+  ]);
+}
+
+function queryRequestsSameTrackedIdentities(queryInput: string): boolean {
+  return queryIncludesAny(queryInput, [
+    "same people",
+    "same person",
+    "same objects",
+    "same object",
+    "same entities",
+    "same identities",
+    "objects of interest",
+    "mesmas pessoas",
+    "mesma pessoa",
+    "mesmos objetos",
+    "mesmo objeto",
+    "mesmas entidades",
+    "mesmas identidades",
+    "objetos de interesse",
+  ]);
+}
+
+function normalizeIdentityCardRef(value: unknown): string {
+  const normalized = normalizePlannerText(value, 160);
+  if (!normalized) {
+    return "";
+  }
+  return normalized.startsWith("identity_card:")
+    ? normalized
+    : `identity_card:${normalized}`;
+}
+
+function extractLastPositiveHitIdentityRefs(lastPositiveHit: Record<string, unknown> | null): string[] {
+  if (!lastPositiveHit) {
+    return [];
+  }
+
+  const refs = new Set<string>();
+  const primaryIdentityCardId = normalizeIdentityCardRef(lastPositiveHit.primary_identity_card_id);
+  if (primaryIdentityCardId) {
+    refs.add(primaryIdentityCardId);
+  }
+
+  for (const rawCard of asArray(lastPositiveHit.identity_cards)) {
+    const card = asRecord(rawCard);
+    if (!card) {
+      continue;
+    }
+    const cardId = normalizeIdentityCardRef(card.card_id);
+    const entityId = normalizeIdentityCardRef(card.entity_id);
+    if (cardId) {
+      refs.add(cardId);
+    } else if (entityId) {
+      refs.add(entityId);
+    }
+  }
+
+  for (const entityId of toStringList(lastPositiveHit.matched_entity_ids)) {
+    const normalizedEntityId = normalizeIdentityCardRef(entityId);
+    if (!normalizedEntityId) {
+      continue;
+    }
+    refs.add(normalizedEntityId);
+  }
+
+  return Array.from(refs).slice(0, 24);
+}
+
+function extractLastPositiveHitSourceEventRefs(
+  lastPositiveHit: Record<string, unknown> | null
+): string[] {
+  if (!lastPositiveHit) {
+    return [];
+  }
+
+  const refs = new Set<string>();
+  const pushRef = (value: unknown) => {
+    const normalized = normalizePlannerText(value, 160);
+    if (normalized) {
+      refs.add(normalized);
+    }
+  };
+
+  pushRef(lastPositiveHit.source_event_id);
+  for (const value of toStringList(lastPositiveHit.source_event_refs)) {
+    pushRef(value);
+  }
+
+  for (const rawCard of asArray(lastPositiveHit.identity_cards)) {
+    const card = asRecord(rawCard);
+    if (!card) {
+      continue;
+    }
+    pushRef(card.source_event_id);
+  }
+
+  return Array.from(refs).slice(0, 12);
+}
+
+function extractLastPositiveHitCameraIds(lastPositiveHit: Record<string, unknown> | null): number[] {
+  if (!lastPositiveHit) {
+    return [];
+  }
+
+  return toNumberList([
+    ...toNumberList(lastPositiveHit.camera_ids),
+    lastPositiveHit.camera_id,
+  ]);
+}
+
 export function resolveConversationMemory(
   context: OperationalPlannerContext,
   queryInput: string
@@ -80,6 +208,7 @@ export function resolveConversationMemory(
       null,
     last_camera_name: normalizePlannerText(sessionEntities?.last_camera_name, 160) || null,
     last_video_scope: asRecord(sessionEntities?.last_video_scope),
+    last_positive_hit: asRecord(sessionEntities?.last_positive_hit),
     last_semantic_plan: asRecord(sessionEntities?.last_semantic_plan),
     carry_forward_requested: queryIncludesAny(queryInput, [
       "this",
@@ -264,6 +393,38 @@ export function applyConversationMemoryToOperationalPlan(params: {
     ])
   ) {
     plan.intent.scope.cameras = toNumberList(params.memory.last_video_scope.camera_ids);
+  }
+
+  const shouldReuseLastPositiveHit =
+    plan.intent.subject.entity === "identity_occurrence" &&
+    !!params.memory.last_positive_hit &&
+    (
+      queryReferencesLastAnalyzedVideo(params.query) ||
+      (params.memory.carry_forward_requested &&
+        queryRequestsSameTrackedIdentities(params.query))
+    );
+
+  if (shouldReuseLastPositiveHit) {
+    const sourceEventRefs = extractLastPositiveHitSourceEventRefs(params.memory.last_positive_hit);
+    if (sourceEventRefs.length > 0) {
+      plan.intent.filters.source_event_refs = sourceEventRefs;
+      plan.confidence = Math.min(0.99, plan.confidence + 0.08);
+      plan.resolved.is_specific = true;
+    }
+
+    const identityRefs = extractLastPositiveHitIdentityRefs(params.memory.last_positive_hit);
+    if (identityRefs.length > 0) {
+      plan.intent.filters.identity_refs = identityRefs;
+      plan.confidence = Math.min(0.99, plan.confidence + 0.06);
+      plan.resolved.is_specific = true;
+    }
+
+    if (plan.intent.scope.cameras.length === 0) {
+      const lastHitCameraIds = extractLastPositiveHitCameraIds(params.memory.last_positive_hit);
+      if (lastHitCameraIds.length > 0) {
+        plan.intent.scope.cameras = lastHitCameraIds;
+      }
+    }
   }
 
   return plan;

@@ -1805,7 +1805,8 @@ static std::string normalizeVideoPackagingMode_(std::string s) {
         s == "standard_resolution" || s == "standard-resolution" || s == "standard resolution") {
         return "mosaic_2x2";
     }
-    return "mosaic_3x3";
+    // Deprecated: 3x3 mosaics compress temporal/detail evidence too aggressively.
+    return "frame_sequence";
 }
 
 static bool hasUsableFaceTargets_(const std::vector<JobFaceTarget>& faceTargets) {

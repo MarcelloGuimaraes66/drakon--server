@@ -202,6 +202,48 @@ const IDENTITY_PERSON_DISCARDED_CUES = [
   "calcado",
 ];
 
+const IDENTITY_VEHICLE_PRIMARY_CUES = [
+  "plate",
+  "placa",
+  "dent",
+  "scratch",
+  "scrape",
+  "rack",
+  "roof rack",
+  "headlight",
+  "taillight",
+  "tail light",
+  "bumper",
+  "grille",
+  "sticker",
+  "decal",
+];
+
+const IDENTITY_VEHICLE_SECONDARY_CUES = [
+  "vehicle",
+  "car",
+  "sedan",
+  "suv",
+  "truck",
+  "pickup",
+  "van",
+  "bus",
+  "motorcycle",
+  "motorbike",
+  "hatchback",
+  "coupe",
+  "wagon",
+  "four-door",
+  "four door",
+  "two-door",
+  "two door",
+  "wheel",
+  "tire",
+  "chrome",
+  "tinted",
+  "mirror",
+];
+
 function foldIdentityCardText(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) {
     return "";
@@ -258,9 +300,13 @@ function classifyIdentityTraitPriority(entityTypeInput: unknown, value: unknown)
     entityType.includes("plate");
 
   if (vehicleLike) {
-    return identityTextHasCue(text, ["plate", "placa", "dent", "scratch", "rack", "headlight", "taillight"])
-      ? 3
-      : 0;
+    if (identityTextHasCue(text, IDENTITY_VEHICLE_PRIMARY_CUES)) {
+      return 3;
+    }
+    if (identityTextHasCue(text, IDENTITY_VEHICLE_SECONDARY_CUES)) {
+      return 2;
+    }
+    return 0;
   }
 
   if (personLike) {
@@ -282,18 +328,53 @@ function classifyIdentityTraitPriority(entityTypeInput: unknown, value: unknown)
   return identityTextHasCue(text, ["box", "package", "bottle", "cup", "phone", "bag", "backpack", "caixa", "pacote", "garrafa", "copo", "celular", "bolsa", "mochila"]) ? 2 : 0;
 }
 
+function preserveIdentityTraitsForDisplay(values: unknown[], maxItems = 8): string[] {
+  const seen = new Set<string>();
+  const preserved: string[] = [];
+  for (const value of values) {
+    for (const item of normalizeStringArray(value, 12)) {
+      const dedupeKey = foldIdentityCardText(item);
+      if (
+        !dedupeKey ||
+        seen.has(dedupeKey) ||
+        isIdentitySceneLikeText(item) ||
+        isIdentityPoseLikeText(item)
+      ) {
+        continue;
+      }
+      seen.add(dedupeKey);
+      preserved.push(item);
+      if (preserved.length >= maxItems) {
+        return preserved;
+      }
+    }
+  }
+  return preserved;
+}
+
 function sanitizeIdentityTraitsForDisplay(card: ChatIdentityCardMetadata, maxItems = 8): string[] {
   const entityType = normalizeIdentityEntityType(card.entity_type);
+  const explicitTraits = preserveIdentityTraitsForDisplay(
+    [card.identity_signature_traits, card.key_traits, card.stable_attributes],
+    12
+  );
   const seen = new Set<string>();
   const accepted: Array<{ priority: number; value: string; order: number }> = [];
   let order = 0;
   for (const value of [
-    ...normalizeStringArray(card.identity_signature_traits, 12),
-    ...normalizeStringArray(card.key_traits, 12),
-    ...normalizeStringArray(card.stable_attributes, 12),
+    ...(Array.isArray(card.identity_feature_candidates)
+      ? card.identity_feature_candidates
+          .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+          .filter((item) => isAllowedFeatureCandidateForDisplay(card, item))
+          .map((item) => (typeof item.text === "string" ? item.text.trim() : ""))
+          .filter(Boolean)
+      : []),
   ]) {
     const dedupeKey = foldIdentityCardText(value);
     if (!dedupeKey || seen.has(dedupeKey)) {
+      continue;
+    }
+    if (explicitTraits.some((item) => foldIdentityCardText(item) === dedupeKey)) {
       continue;
     }
     const priority = classifyIdentityTraitPriority(entityType, value);
@@ -303,7 +384,7 @@ function sanitizeIdentityTraitsForDisplay(card: ChatIdentityCardMetadata, maxIte
     seen.add(dedupeKey);
     accepted.push({ priority, value, order: order++ });
   }
-  return accepted
+  return [...explicitTraits, ...accepted
     .sort((a, b) => {
       if (b.priority !== a.priority) {
         return b.priority - a.priority;
@@ -311,12 +392,56 @@ function sanitizeIdentityTraitsForDisplay(card: ChatIdentityCardMetadata, maxIte
       return a.order - b.order;
     })
     .slice(0, maxItems)
-    .map((item) => item.value);
+    .map((item) => item.value)].slice(0, maxItems);
+}
+
+function descriptionHasIdentitySignal(card: ChatIdentityCardMetadata, value: string): boolean {
+  const description = value.trim();
+  if (!description) {
+    return false;
+  }
+
+  const parts = Array.from(
+    new Set([
+      description,
+      ...description
+        .split(/[\r\n,;|]+/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ])
+  );
+
+  const entityType = normalizeIdentityEntityType(card.entity_type);
+  const personLike =
+    entityType.includes("person") ||
+    entityType.includes("people") ||
+    entityType.includes("human") ||
+    entityType.includes("man") ||
+    entityType.includes("woman");
+
+  return parts.some((part) => {
+    const text = foldIdentityCardText(part);
+    if (!text) {
+      return false;
+    }
+    if (personLike) {
+      return (
+        identityTextHasCue(text, IDENTITY_PERSON_INTRINSIC_CUES) ||
+        identityTextHasCue(text, IDENTITY_PERSON_SECONDARY_CUES)
+      );
+    }
+    return classifyIdentityTraitPriority(card.entity_type, part) > 0;
+  });
 }
 
 function sanitizeIdentityDescriptionForDisplay(card: ChatIdentityCardMetadata, value: unknown): string {
   const description = typeof value === "string" ? value.trim() : "";
-  if (!description || isIdentitySceneLikeText(description) || isIdentityPoseLikeText(description)) {
+  if (!description) {
+    return "";
+  }
+  const looksSceneLike = isIdentitySceneLikeText(description);
+  const looksPoseLike = isIdentityPoseLikeText(description);
+  if ((looksSceneLike || looksPoseLike) && !descriptionHasIdentitySignal(card, description)) {
     return "";
   }
   const signatureKey = sanitizeIdentityTraitsForDisplay(card, 4).join("; ").toLowerCase();
@@ -554,6 +679,20 @@ function collectTraitBadges(card: ChatIdentityCardMetadata): string[] {
   return sanitizeIdentityTraitsForDisplay(card, 8);
 }
 
+function collectObservedContextTraits(card: ChatIdentityCardMetadata): string[] {
+  return normalizeStringArray(card.identity_observed_context_traits, 8);
+}
+
+function collectVisibilityNotes(card: ChatIdentityCardMetadata): string[] {
+  const observedKeys = new Set(
+    collectObservedContextTraits(card).map((item) => foldIdentityCardText(item))
+  );
+  return normalizeStringArray(card.identity_context_traits, 4).filter((item) => {
+    const key = foldIdentityCardText(item);
+    return !!key && !observedKeys.has(key);
+  });
+}
+
 function collectFeatureHighlights(card: ChatIdentityCardMetadata): string[] {
   const seen = new Set<string>();
   const highlights: string[] = [];
@@ -703,6 +842,8 @@ export default function ChatIdentityCardsPanel({ cards, busy = false, onUpdateId
           const entityTypeLabel = formatEntityType(card.entity_type, isPt);
           const traitBadges = collectTraitBadges(card);
           const featureHighlights = collectFeatureHighlights(card);
+          const observedContextTraits = collectObservedContextTraits(card);
+          const visibilityNotes = collectVisibilityNotes(card);
           const lastSeen = card.last_seen && typeof card.last_seen === "object" ? card.last_seen : undefined;
           const lastSeenTime = formatLastSeenTimestamp(lastSeen?.timestamp_utc_iso, locale);
           const lastSeenCamera =
@@ -827,6 +968,42 @@ export default function ChatIdentityCardsPanel({ cards, busy = false, onUpdateId
                             className="rounded-full border border-cyan-300/15 bg-cyan-400/10 px-2.5 py-1 text-[11px] text-cyan-50"
                           >
                             {feature}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {observedContextTraits.length > 0 ? (
+                    <div className="mt-4">
+                      <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-amber-200/80">
+                        {isPt ? "Contexto observado" : "Observed context"}
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {observedContextTraits.map((trait) => (
+                          <span
+                            key={trait}
+                            className="rounded-full border border-amber-300/20 bg-amber-300/10 px-2.5 py-1 text-[11px] text-amber-50"
+                          >
+                            {trait}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {visibilityNotes.length > 0 ? (
+                    <div className="mt-4">
+                      <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-gray-500">
+                        {isPt ? "Notas de visibilidade" : "Visibility notes"}
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {visibilityNotes.map((trait) => (
+                          <span
+                            key={trait}
+                            className="rounded-full border border-white/[0.08] bg-black/15 px-2.5 py-1 text-[11px] text-gray-300"
+                          >
+                            {trait}
                           </span>
                         ))}
                       </div>

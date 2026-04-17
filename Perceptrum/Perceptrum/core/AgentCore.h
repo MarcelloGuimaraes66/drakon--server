@@ -43,6 +43,7 @@ struct EncodedVideoSegment {
     int uploadPlannedSampleCount = 0;
     int uploadPlannedTotalSamples = 0;
     int uploadPlannedFps = 0;
+    double uploadPlannedSamplingFps = 0.0;
     double uploadStartSeconds = 0.0;
     double uploadDurationSeconds = 0.0;
 

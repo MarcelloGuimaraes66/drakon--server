@@ -808,6 +808,8 @@ static int normalizeAlgorithmModelFps_(
 
 static std::string trimAscii(const std::string& input);
 
+static constexpr const char* kPreferredChatVideoPackagingMode_ = "high_resolution";
+
 static std::string normalizeVideoPackagingMode_(const std::string& value)
 {
     const std::string normalized = lowerAsciiCopy_(trimAscii(value));
@@ -839,9 +841,10 @@ static std::string normalizeVideoPackagingMode_(const std::string& value)
         normalized == "compact-resolution" ||
         normalized == "compact resolution")
     {
-        return "mosaic_3x3";
+        // Deprecated: 3x3 mosaics compress temporal/detail evidence too aggressively.
+        return "frame_sequence";
     }
-    return "mosaic_3x3";
+    return "frame_sequence";
 }
 
 
@@ -5063,7 +5066,11 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
         ac.inputType = lowerLocal(jsonStringOr(a, "input_type", "video"));
         if (ac.inputType.empty()) ac.inputType = "video";
         ac.videoPackagingMode = normalizeVideoPackagingMode_(
-            jsonStringOr(a, "video_packaging_mode", jsonStringOr(a, "videoPackagingMode", "mosaic"))
+            jsonStringOr(
+                a,
+                "video_packaging_mode",
+                jsonStringOr(a, "videoPackagingMode", kPreferredChatVideoPackagingMode_)
+            )
         );
         ac.inferenceModel = lowerLocal(jsonStringOr(a, "inference_model", "ultra"));
         if (ac.inferenceModel.empty()) ac.inferenceModel = "ultra";
@@ -6661,7 +6668,7 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
             jsonStringOr(
                 algo,
                 "video_packaging_mode",
-                jsonStringOr(algo, "videoPackagingMode", "mosaic")
+                jsonStringOr(algo, "videoPackagingMode", kPreferredChatVideoPackagingMode_)
             )
         );
         ac.inferenceModel = lowerLocal(jsonStringOr(algo, "inference_model", "ultra"));
@@ -9895,6 +9902,7 @@ static constexpr int kPromptVideoMosaicWidth_ = 1920;
 static constexpr int kPromptVideoMosaicHeight_ = 1080;
 
 struct PromptVideoMosaicProfile_ {
+    // Legacy defaults retained only for explicit deprecated 3x3 profile construction.
     const char* videoPackagingMode = "mosaic_3x3";
     const char* layoutId = "openai_video_mosaic_3x3_v1";
     int columns = 3;
@@ -9910,6 +9918,8 @@ static constexpr PromptVideoMosaicProfile_ kPromptVideoMosaicProfile2x2_ = {
     4
 };
 
+// Deprecated legacy profile. Keep only for backward compatibility with stored
+// configs and historical log decoding; chat video search/upload no longer use it.
 static constexpr PromptVideoMosaicProfile_ kPromptVideoMosaicProfile3x3_ = {
     "mosaic_3x3",
     "openai_video_mosaic_3x3_v1",
@@ -12057,7 +12067,21 @@ static std::string readIdentityPortraitKind_(const nlohmann::json& node)
 {
     if (!node.is_object()) return std::string();
     if (node.contains("kind") && node["kind"].is_string()) {
-        return lowerAsciiCopy_(trimAscii(node["kind"].get<std::string>()));
+        const std::string normalized =
+            lowerAsciiCopy_(trimAscii(node["kind"].get<std::string>()));
+        if (normalized == "face") return "face";
+        if (normalized == "full_object" ||
+            normalized == "full-object" ||
+            normalized == "full object" ||
+            normalized == "context" ||
+            normalized == "context_fallback" ||
+            normalized == "context-fallback" ||
+            normalized == "full_body" ||
+            normalized == "full-body" ||
+            normalized == "body")
+        {
+            return "full_object";
+        }
     }
     return std::string();
 }
@@ -12083,6 +12107,69 @@ static std::string readIdentityPatchStringField_(
         if (!value.empty()) return value;
     }
     return std::string();
+}
+
+enum class PortraitCoordinateSpace_ {
+    MosaicCell,
+    FrameFull
+};
+
+static PortraitCoordinateSpace_ resolvePortraitCoordinateSpace_(
+    const std::string& videoPackagingMode)
+{
+    return normalizeVideoPackagingMode_(videoPackagingMode) == "frame_sequence"
+        ? PortraitCoordinateSpace_::FrameFull
+        : PortraitCoordinateSpace_::MosaicCell;
+}
+
+static const char* portraitCoordinateSpaceName_(
+    PortraitCoordinateSpace_ space)
+{
+    return space == PortraitCoordinateSpace_::FrameFull ? "frame_full" : "mosaic_cell";
+}
+
+static std::vector<std::string> preferredPortraitPrimaryBBoxKeys_(
+    PortraitCoordinateSpace_ coordinateSpace)
+{
+    if (coordinateSpace == PortraitCoordinateSpace_::FrameFull) {
+        return {
+            "bbox_norm_in_frame",
+            "target_bbox_norm_in_frame",
+            "portrait_bbox_norm_in_frame",
+            "bbox_norm_in_cell",
+            "target_bbox_norm_in_cell",
+            "portrait_bbox_norm_in_cell"
+        };
+    }
+    return {
+        "bbox_norm_in_cell",
+        "target_bbox_norm_in_cell",
+        "portrait_bbox_norm_in_cell",
+        "bbox_norm_in_frame",
+        "target_bbox_norm_in_frame",
+        "portrait_bbox_norm_in_frame"
+    };
+}
+
+static std::vector<std::string> preferredPortraitContextBBoxKeys_(
+    PortraitCoordinateSpace_ coordinateSpace)
+{
+    if (coordinateSpace == PortraitCoordinateSpace_::FrameFull) {
+        return {
+            "context_bbox_norm_in_frame",
+            "body_bbox_norm_in_frame",
+            "context_bbox_norm_in_cell",
+            "context_bbox",
+            "body_bbox_norm_in_cell"
+        };
+    }
+    return {
+        "context_bbox_norm_in_cell",
+        "context_bbox",
+        "body_bbox_norm_in_cell",
+        "context_bbox_norm_in_frame",
+        "body_bbox_norm_in_frame"
+    };
 }
 
 static bool computePromptVideoCellPlacement_(
@@ -12166,6 +12253,237 @@ static bool computeSourceCropRectFromCellBBox_(
     return outCropRect.width > 0 && outCropRect.height > 0;
 }
 
+static bool computeSourceCropRectFromFrameBBox_(
+    const cv::Size& sourceSize,
+    const IdentityPortraitBBox_& bboxNormInFrame,
+    double paddingPct,
+    cv::Rect& outCropRect)
+{
+    outCropRect = cv::Rect();
+    if (sourceSize.width <= 0 || sourceSize.height <= 0) {
+        return false;
+    }
+
+    int x1 = (std::max)(0, static_cast<int>(std::floor(
+        bboxNormInFrame.x * static_cast<double>(sourceSize.width))));
+    int y1 = (std::max)(0, static_cast<int>(std::floor(
+        bboxNormInFrame.y * static_cast<double>(sourceSize.height))));
+    int x2 = (std::min)(sourceSize.width, static_cast<int>(std::ceil(
+        (bboxNormInFrame.x + bboxNormInFrame.w) * static_cast<double>(sourceSize.width))));
+    int y2 = (std::min)(sourceSize.height, static_cast<int>(std::ceil(
+        (bboxNormInFrame.y + bboxNormInFrame.h) * static_cast<double>(sourceSize.height))));
+    if (x2 <= x1 || y2 <= y1) return false;
+
+    const int width = x2 - x1;
+    const int height = y2 - y1;
+    const double safePaddingPct = (std::max)(0.0, (std::min)(0.40, paddingPct));
+    const int padX = static_cast<int>(std::llround(static_cast<double>(width) * safePaddingPct));
+    const int padY = static_cast<int>(std::llround(static_cast<double>(height) * safePaddingPct));
+
+    x1 = (std::max)(0, x1 - padX);
+    y1 = (std::max)(0, y1 - padY);
+    x2 = (std::min)(sourceSize.width, x2 + padX);
+    y2 = (std::min)(sourceSize.height, y2 + padY);
+    if (x2 <= x1 || y2 <= y1) return false;
+
+    outCropRect = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+    return outCropRect.width > 0 && outCropRect.height > 0;
+}
+
+static bool computePromptPortraitSourceRect_(
+    const cv::Size& sourceSize,
+    const IdentityPortraitBBox_& bboxNorm,
+    const std::string& videoPackagingMode,
+    double paddingPct,
+    cv::Rect& outCropRect)
+{
+    const std::string normalizedVideoPackagingMode =
+        normalizeVideoPackagingMode_(videoPackagingMode);
+    if (normalizedVideoPackagingMode == "frame_sequence") {
+        return computeSourceCropRectFromFrameBBox_(
+            sourceSize,
+            bboxNorm,
+            paddingPct,
+            outCropRect);
+    }
+
+    const PromptVideoMosaicProfile_& profile =
+        getPromptVideoMosaicProfile_(normalizedVideoPackagingMode);
+    const PromptVideoMosaicLayout_ layout = getPromptVideoMosaicLayout_(profile);
+    return computeSourceCropRectFromCellBBox_(
+        sourceSize,
+        layout.cellWidth,
+        layout.cellHeight,
+        bboxNorm,
+        paddingPct,
+        outCropRect);
+}
+
+static bool validatePortraitSourceRect_(
+    const cv::Rect& sourceRect,
+    const cv::Size& frameSize,
+    const std::string& portraitKind,
+    std::string& outReason)
+{
+    outReason.clear();
+    if (sourceRect.width <= 0 || sourceRect.height <= 0) {
+        outReason = "empty_rect";
+        return false;
+    }
+    if (frameSize.width <= 0 || frameSize.height <= 0) {
+        outReason = "invalid_frame";
+        return false;
+    }
+
+    const int minDim = (std::min)(sourceRect.width, sourceRect.height);
+    const double aspect =
+        static_cast<double>(sourceRect.width) / static_cast<double>((std::max)(1, sourceRect.height));
+    const double frameArea =
+        static_cast<double>(frameSize.width) * static_cast<double>(frameSize.height);
+    const double areaFraction =
+        frameArea > 0.0
+            ? (static_cast<double>(sourceRect.width) * static_cast<double>(sourceRect.height)) / frameArea
+            : 0.0;
+
+    if (portraitKind == "face") {
+        if (minDim < 40) {
+            outReason = "face_too_small";
+            return false;
+        }
+        if (aspect < 0.45 || aspect > 1.80) {
+            outReason = "face_bad_aspect";
+            return false;
+        }
+        if (areaFraction > 0.45) {
+            outReason = "face_too_large";
+            return false;
+        }
+        return true;
+    }
+
+    if (minDim < 48) {
+        outReason = "context_too_small";
+        return false;
+    }
+    if (aspect < 0.15 || aspect > 6.0) {
+        outReason = "context_bad_aspect";
+        return false;
+    }
+    return true;
+}
+
+static bool portraitKindAllowedAsPrimaryForEntityType_(
+    const std::string& rawEntityType,
+    const std::string& rawPortraitKind);
+
+static bool buildPortraitDataUrlFromSourceRect_(
+    const cv::Mat& decodedFrame,
+    const cv::Rect& sourceRect,
+    double paddingPct,
+    int minDimension,
+    std::string& outImageDataUrl,
+    nlohmann::json& outMeta);
+
+static void runPortraitPipelineRegressionSelfCheckOnce_()
+{
+    static const bool kRanPortraitPipelineRegressionSelfCheck_ = []() {
+        std::vector<std::string> failures;
+
+        auto expectRect = [&](const cv::Size& frameSize,
+                              const IdentityPortraitBBox_& bbox,
+                              const cv::Rect& expected,
+                              const std::string& label) {
+            cv::Rect rect;
+            if (!computeSourceCropRectFromFrameBBox_(frameSize, bbox, 0.0, rect) ||
+                rect != expected)
+            {
+                failures.push_back(label);
+            }
+        };
+
+        expectRect(
+            cv::Size(1920, 1080),
+            IdentityPortraitBBox_{ 0.25, 0.25, 0.50, 0.50 },
+            cv::Rect(480, 270, 960, 540),
+            "frame_16x9_center_bbox");
+        expectRect(
+            cv::Size(1600, 1200),
+            IdentityPortraitBBox_{ 0.25, 0.25, 0.50, 0.50 },
+            cv::Rect(400, 300, 800, 600),
+            "frame_4x3_center_bbox");
+        expectRect(
+            cv::Size(1080, 1920),
+            IdentityPortraitBBox_{ 0.10, 0.20, 0.30, 0.20 },
+            cv::Rect(108, 384, 324, 384),
+            "frame_portrait_bbox");
+
+        cv::Rect mosaicRect;
+        if (!computePromptPortraitSourceRect_(
+                cv::Size(1920, 1080),
+                IdentityPortraitBBox_{ 0.0, 0.0, 1.0, 1.0 },
+                "mosaic_2x2",
+                0.0,
+                mosaicRect) ||
+            mosaicRect.width <= 0 ||
+            mosaicRect.height <= 0)
+        {
+            failures.push_back("mosaic_2x2_bbox");
+        }
+
+        if (resolvePortraitCoordinateSpace_("high_resolution") != PortraitCoordinateSpace_::FrameFull) {
+            failures.push_back("high_resolution_coordinate_space");
+        }
+        if (resolvePortraitCoordinateSpace_("mosaic_2x2") != PortraitCoordinateSpace_::MosaicCell) {
+            failures.push_back("mosaic_coordinate_space");
+        }
+        if (!portraitKindAllowedAsPrimaryForEntityType_("person", "face")) {
+            failures.push_back("person_face_primary_policy");
+        }
+        if (portraitKindAllowedAsPrimaryForEntityType_("person", "full_object")) {
+            failures.push_back("person_context_primary_policy");
+        }
+        if (!portraitKindAllowedAsPrimaryForEntityType_("vehicle", "full_object")) {
+            failures.push_back("vehicle_full_object_primary_policy");
+        }
+
+        std::string validationReason;
+        if (!validatePortraitSourceRect_(
+                cv::Rect(100, 100, 96, 112),
+                cv::Size(1920, 1080),
+                "face",
+                validationReason))
+        {
+            failures.push_back("face_validation_accept");
+        }
+        if (validatePortraitSourceRect_(
+                cv::Rect(0, 0, 20, 200),
+                cv::Size(1920, 1080),
+                "face",
+                validationReason))
+        {
+            failures.push_back("face_validation_reject");
+        }
+
+        std::ostringstream logLine;
+        logLine << "portrait_pipeline_regression_self_check: "
+                << (failures.empty() ? "passed" : "failed")
+                << " cases=";
+        if (failures.empty()) {
+            logLine << "none";
+        }
+        else {
+            for (size_t i = 0; i < failures.size(); ++i) {
+                if (i > 0) logLine << ",";
+                logLine << failures[i];
+            }
+        }
+        Logger::instance().logDebug("agent", logLine.str());
+        return true;
+    }();
+
+    (void)kRanPortraitPipelineRegressionSelfCheck_;
+}
+
 static bool buildPortraitDataUrlFromPromptFrame_(
     const PromptVideoFrame& matchedFrame,
     const IdentityPortraitBBox_& bboxNormInCell,
@@ -12183,46 +12501,35 @@ static bool buildPortraitDataUrlFromPromptFrame_(
         return false;
     }
 
-    const PromptVideoMosaicProfile_& profile =
-        getPromptVideoMosaicProfile_(normalizeVideoPackagingMode_(videoPackagingMode));
-    const PromptVideoMosaicLayout_ layout = getPromptVideoMosaicLayout_(profile);
-
     cv::Rect cropRect;
-    if (!computeSourceCropRectFromCellBBox_(
+    if (!computePromptPortraitSourceRect_(
             decodedFrame.size(),
-            layout.cellWidth,
-            layout.cellHeight,
             bboxNormInCell,
+            videoPackagingMode,
             paddingPct,
             cropRect))
     {
         return false;
     }
 
-    if (cropRect.width < minDimension || cropRect.height < minDimension) {
+    if (!buildPortraitDataUrlFromSourceRect_(
+            decodedFrame,
+            cropRect,
+            0.0,
+            minDimension,
+            outImageDataUrl,
+            outMeta))
+    {
         return false;
     }
 
-    cv::Mat cropped = decodedFrame(cropRect).clone();
-    if (cropped.empty()) return false;
-    if (!encodeJpegDataUrlForPromptEnhance(cropped, outImageDataUrl) || outImageDataUrl.empty()) {
-        return false;
-    }
-
-    outMeta["crop_width"] = cropRect.width;
-    outMeta["crop_height"] = cropRect.height;
-    outMeta["frame_width"] = decodedFrame.cols;
-    outMeta["frame_height"] = decodedFrame.rows;
-    outMeta["crop_rect"] = {
-        { "x", cropRect.x },
-        { "y", cropRect.y },
-        { "w", cropRect.width },
-        { "h", cropRect.height }
-    };
+    outMeta["coordinate_space"] =
+        portraitCoordinateSpaceName_(resolvePortraitCoordinateSpace_(videoPackagingMode));
+    outMeta["video_packaging_mode"] = normalizeVideoPackagingMode_(videoPackagingMode);
     return true;
 }
 
-static void appendIdentityPortraitCandidate_(
+static bool appendIdentityPortraitCandidate_(
     VideoHit& hit,
     const nlohmann::json& patch,
     const PromptVideoFrame& matchedFrame,
@@ -12230,25 +12537,60 @@ static void appendIdentityPortraitCandidate_(
     const std::string& cardRole,
     const std::string& portraitKind,
     const IdentityPortraitBBox_& bboxNormInCell,
-    double confidence)
+    double confidence,
+    const char* bboxSource = nullptr,
+    std::string* outStatus = nullptr)
 {
-    if (cardRole.empty() || portraitKind.empty()) return;
+    if (outStatus != nullptr) outStatus->clear();
+    if (cardRole.empty() || portraitKind.empty()) {
+        if (outStatus != nullptr) *outStatus = "missing_role_or_kind";
+        return false;
+    }
 
-    std::string imageDataUrl;
-    nlohmann::json cropMeta = nlohmann::json::object();
+    cv::Mat decodedFrame;
+    if (!decodePromptVideoFrameToMat_(matchedFrame.jpegBase64, decodedFrame) || decodedFrame.empty()) {
+        if (outStatus != nullptr) *outStatus = "decode_failed";
+        return false;
+    }
+
     const bool facePortrait = portraitKind == "face";
     const double paddingPct = facePortrait ? 0.18 : 0.10;
     const int minDimension = facePortrait ? 40 : 48;
-    if (!buildPortraitDataUrlFromPromptFrame_(
-            matchedFrame,
+    cv::Rect sourceRect;
+    if (!computePromptPortraitSourceRect_(
+            decodedFrame.size(),
             bboxNormInCell,
             videoPackagingMode,
             paddingPct,
+            sourceRect))
+    {
+        if (outStatus != nullptr) *outStatus = "source_rect_unresolved";
+        return false;
+    }
+
+    std::string validationReason;
+    if (!validatePortraitSourceRect_(
+            sourceRect,
+            decodedFrame.size(),
+            portraitKind,
+            validationReason))
+    {
+        if (outStatus != nullptr) *outStatus = validationReason;
+        return false;
+    }
+
+    std::string imageDataUrl;
+    nlohmann::json cropMeta = nlohmann::json::object();
+    if (!buildPortraitDataUrlFromSourceRect_(
+            decodedFrame,
+            sourceRect,
+            0.0,
             minDimension,
             imageDataUrl,
             cropMeta))
     {
-        return;
+        if (outStatus != nullptr) *outStatus = "crop_build_failed";
+        return false;
     }
 
     nlohmann::json candidate = nlohmann::json::object();
@@ -12304,12 +12646,21 @@ static void appendIdentityPortraitCandidate_(
             candidate["timestamp_utc_iso"] = candidate["last_seen_ts_utc"];
         }
     }
-    candidate["bbox_norm_in_cell"] = {
+    const PortraitCoordinateSpace_ coordinateSpace =
+        resolvePortraitCoordinateSpace_(videoPackagingMode);
+    const nlohmann::json bboxJson = {
         { "x", bboxNormInCell.x },
         { "y", bboxNormInCell.y },
         { "w", bboxNormInCell.w },
         { "h", bboxNormInCell.h }
     };
+    candidate["coordinate_space"] = portraitCoordinateSpaceName_(coordinateSpace);
+    if (coordinateSpace == PortraitCoordinateSpace_::FrameFull) {
+        candidate["bbox_norm_in_frame"] = bboxJson;
+    }
+    else {
+        candidate["bbox_norm_in_cell"] = bboxJson;
+    }
     for (const char* key : {
              "description",
              "short_description",
@@ -12321,6 +12672,7 @@ static void appendIdentityPortraitCandidate_(
              "stable_attributes",
              "key_traits",
              "identity_signature_traits",
+             "identity_feature_candidates",
              "identity_context_traits",
              "reference_image_urls",
              "known_name",
@@ -12329,22 +12681,38 @@ static void appendIdentityPortraitCandidate_(
         if (key == nullptr || !patch.contains(key)) continue;
         candidate[key] = patch[key];
     }
+    cropMeta["coordinate_space"] = candidate["coordinate_space"];
+    cropMeta["video_packaging_mode"] = normalizeVideoPackagingMode_(videoPackagingMode);
+    cropMeta["crop_origin"] = "llm_explicit_bbox";
+    if (bboxSource != nullptr && trimAscii(bboxSource).size() > 0) {
+        cropMeta["bbox_source"] = bboxSource;
+    }
+    cropMeta["validation_status"] = "accepted";
     if (!cropMeta.empty()) candidate["crop_meta"] = cropMeta;
 
     hit.identityPortraitCandidates.push_back(std::move(candidate));
+    if (outStatus != nullptr) *outStatus = "accepted";
+    return true;
 }
 
 static void appendIdentityPortraitCandidatesFromPatch_(
     VideoHit& hit,
     const nlohmann::json& patch,
     const std::vector<PromptVideoFrame>* frameCatalog,
-    const std::string& videoPackagingMode)
+    const std::string& videoPackagingMode,
+    const std::string& logStreamId = std::string(),
+    const std::string& scopeTag = std::string())
 {
     if (!patch.is_object() || frameCatalog == nullptr) return;
 
     const PromptVideoFrame* matchedFrame =
         findPromptVideoFrameForNode_(patch, frameCatalog, videoPackagingMode);
     if (matchedFrame == nullptr || trimAscii(matchedFrame->jpegBase64).empty()) return;
+
+    const std::string normalizedVideoPackagingMode =
+        normalizeVideoPackagingMode_(videoPackagingMode);
+    const PortraitCoordinateSpace_ coordinateSpace =
+        resolvePortraitCoordinateSpace_(normalizedVideoPackagingMode);
 
     const std::string rawEntityType =
         lowerAsciiCopy_(readIdentityPatchStringField_(patch, { "entity_type", "entity_key" }));
@@ -12353,29 +12721,44 @@ static void appendIdentityPortraitCandidatesFromPatch_(
         rawEntityType == "people" ||
         rawEntityType == "pessoa" ||
         rawEntityType == "human";
+    const std::string entityLogToken =
+        trimAscii(readIdentityPatchStringField_(patch, { "entity_id", "entity_key", "entity_type" }));
 
     const nlohmann::json* portraitCropNode = nullptr;
     if (patch.contains("portrait_crop") && patch["portrait_crop"].is_object()) {
         portraitCropNode = &patch["portrait_crop"];
     }
 
+    std::vector<std::string> portraitOutcomes;
+    auto rememberOutcome = [&](const std::string& value) {
+        const std::string trimmed = trimAscii(value);
+        if (!trimmed.empty()) portraitOutcomes.push_back(trimmed);
+    };
+
     IdentityPortraitBBox_ primaryBBox;
+    bool hasPrimaryBBox = false;
     std::string primaryKind;
     double primaryConfidence = 0.75;
     if (portraitCropNode != nullptr) {
         primaryKind = readIdentityPortraitKind_(*portraitCropNode);
-        if (primaryKind.empty()) primaryKind = isPerson ? "face" : "full_object";
-        if (parseIdentityPortraitBBox_(*portraitCropNode, primaryBBox) ||
+        if (!primaryKind.empty() &&
             tryGetPortraitBBoxNode_(
                 *portraitCropNode,
-                { "bbox_norm_in_cell", "target_bbox_norm_in_cell", "portrait_bbox_norm_in_cell" },
+                preferredPortraitPrimaryBBoxKeys_(coordinateSpace),
                 primaryBBox))
         {
+            hasPrimaryBBox = true;
             primaryConfidence = readIdentityPortraitConfidence_(*portraitCropNode, primaryConfidence);
         }
-        else {
-            primaryKind.clear();
+        else if (!primaryKind.empty()) {
+            rememberOutcome("llm_primary_bbox=missing");
         }
+    }
+    else {
+        rememberOutcome("portrait_crop=omitted");
+    }
+    if (portraitCropNode != nullptr && primaryKind.empty()) {
+        rememberOutcome("portrait_kind=missing_or_invalid");
     }
 
     IdentityPortraitBBox_ contextBBox;
@@ -12383,76 +12766,100 @@ static void appendIdentityPortraitCandidatesFromPatch_(
     if (portraitCropNode != nullptr) {
         hasContextBBox = tryGetPortraitBBoxNode_(
             *portraitCropNode,
-            { "context_bbox_norm_in_cell", "context_bbox", "body_bbox_norm_in_cell" },
+            preferredPortraitContextBBoxKeys_(coordinateSpace),
             contextBBox);
     }
     if (!hasContextBBox) {
         hasContextBBox = tryGetPortraitBBoxNode_(
             patch,
-            { "context_bbox_norm_in_cell", "body_bbox_norm_in_cell" },
+            preferredPortraitContextBBoxKeys_(coordinateSpace),
             contextBBox);
     }
 
     if (isPerson) {
-        if (primaryKind == "face") {
-            appendIdentityPortraitCandidate_(
+        bool acceptedPrimaryFace = false;
+        if (primaryKind == "face" && hasPrimaryBBox) {
+            std::string primaryFaceStatus;
+            acceptedPrimaryFace = appendIdentityPortraitCandidate_(
                 hit,
                 patch,
                 *matchedFrame,
-                videoPackagingMode,
+                normalizedVideoPackagingMode,
                 "primary",
                 "face",
                 primaryBBox,
-                primaryConfidence);
+                primaryConfidence,
+                "portrait_crop_primary",
+                &primaryFaceStatus);
+            rememberOutcome("llm_face=" + (primaryFaceStatus.empty() ? std::string("unknown") : primaryFaceStatus));
         }
-        else if (!primaryKind.empty()) {
-            appendIdentityPortraitCandidate_(
-                hit,
-                patch,
-                *matchedFrame,
-                videoPackagingMode,
-                "primary",
-                "context_fallback",
-                primaryBBox,
-                primaryConfidence);
-        }
-
-        if (hasContextBBox) {
-            appendIdentityPortraitCandidate_(
-                hit,
-                patch,
-                *matchedFrame,
-                videoPackagingMode,
-                hit.identityPortraitCandidates.empty() ? "primary" : "context",
-                hit.identityPortraitCandidates.empty() ? "context_fallback" : "full_object",
-                contextBBox,
-                portraitCropNode != nullptr
-                    ? readIdentityPortraitConfidence_(*portraitCropNode, 0.70)
-                    : 0.70);
+        if (!acceptedPrimaryFace) {
+            if (hasContextBBox) {
+                rememberOutcome("person_context_bbox_ignored_without_explicit_face");
+            }
+            else if (!primaryKind.empty() && primaryKind != "face" && hasPrimaryBBox) {
+                rememberOutcome("person_non_face_portrait_ignored");
+            }
+            rememberOutcome("primary_face=unavailable");
         }
     }
     else {
-        IdentityPortraitBBox_ chosenBBox;
-        bool hasChosenBBox = false;
-        if (!primaryKind.empty()) {
-            chosenBBox = primaryBBox;
-            hasChosenBBox = true;
-        }
-        else if (hasContextBBox) {
-            chosenBBox = contextBBox;
-            hasChosenBBox = true;
-        }
-        if (hasChosenBBox) {
+        if (!primaryKind.empty() && hasPrimaryBBox) {
+            std::string objectPrimaryStatus;
             appendIdentityPortraitCandidate_(
                 hit,
                 patch,
                 *matchedFrame,
-                videoPackagingMode,
+                normalizedVideoPackagingMode,
                 "primary",
                 "full_object",
-                chosenBBox,
-                primaryConfidence);
+                primaryBBox,
+                primaryConfidence,
+                "portrait_crop_primary",
+                &objectPrimaryStatus);
+            rememberOutcome("object_primary=" +
+                (objectPrimaryStatus.empty() ? std::string("unknown") : objectPrimaryStatus));
         }
+        else if (hasContextBBox) {
+            std::string objectContextStatus;
+            appendIdentityPortraitCandidate_(
+                hit,
+                patch,
+                *matchedFrame,
+                normalizedVideoPackagingMode,
+                "primary",
+                "full_object",
+                contextBBox,
+                portraitCropNode != nullptr
+                    ? readIdentityPortraitConfidence_(*portraitCropNode, 0.70)
+                    : 0.70,
+                "context_bbox",
+                &objectContextStatus);
+            rememberOutcome("object_context=" +
+                (objectContextStatus.empty() ? std::string("unknown") : objectContextStatus));
+        }
+    }
+
+    if (!logStreamId.empty() && !scopeTag.empty()) {
+        std::ostringstream summary;
+        summary << scopeTag
+                << ": portrait pipeline entity="
+                << (entityLogToken.empty() ? std::string("unknown") : entityLogToken)
+                << " entity_type="
+                << (rawEntityType.empty() ? std::string("unknown") : rawEntityType)
+                << " packaging_mode=" << normalizedVideoPackagingMode
+                << " coordinate_space=" << portraitCoordinateSpaceName_(coordinateSpace)
+                << " outcomes=";
+        if (portraitOutcomes.empty()) {
+            summary << "none";
+        }
+        else {
+            for (size_t i = 0; i < portraitOutcomes.size(); ++i) {
+                if (i > 0) summary << ",";
+                summary << portraitOutcomes[i];
+            }
+        }
+        Logger::instance().logDebug(logStreamId, summary.str());
     }
 }
 
@@ -12549,6 +12956,111 @@ static std::string latestKnownEntitySeenTs_(
         return temporal::identityMemoryLastSeenTs(*identityMemoryRow);
     }
     return std::string();
+}
+
+static nlohmann::json buildIdentityPatchDebugSummary_(const nlohmann::json& item)
+{
+    nlohmann::json summary = nlohmann::json::object();
+    if (!item.is_object()) {
+        summary["node_kind"] = item.type_name();
+        return summary;
+    }
+
+    const auto putStringField = [&](const char* key, const std::string& value) {
+        const std::string trimmed = trimAscii(value);
+        if (!trimmed.empty()) summary[key] = trimmed;
+    };
+    const auto putCountField = [&](const char* key, const char* fieldName) {
+        if (item.contains(fieldName) && item[fieldName].is_array()) {
+            summary[key] = item[fieldName].size();
+        }
+    };
+
+    putStringField("entity_id", item.value("entity_id", item.value("id", std::string())));
+    putStringField("entity_key", item.value("entity_key", std::string()));
+    putStringField("entity_type", item.value("entity_type", std::string()));
+    putStringField("decision", item.value("decision", std::string()));
+    putStringField("event", item.value("event", item.value("evidence_event", std::string())));
+    putStringField("status", item.value("status", item.value("state", std::string())));
+    putStringField(
+        "timestamp_utc",
+        item.value("ts_utc", item.value("timestamp", item.value("time", std::string()))));
+    putStringField("last_seen_ts_utc", item.value("last_seen_ts_utc", std::string()));
+    putStringField("timestamp_name", item.value("timestamp_name", std::string()));
+    putStringField(
+        "frame_timestamp_in_segment",
+        item.value("frame_timestamp_in_segment", std::string()));
+    putStringField("evidence_key", item.value("temporal_evidence_key", std::string()));
+
+    if (item.contains("frame_index") && item["frame_index"].is_number_integer()) {
+        summary["frame_index"] = item["frame_index"].get<int>();
+    }
+    summary["positive_entity"] = temporalIdentityPatchCarriesPositiveEntity_(item);
+
+    putCountField("updated_traits_count", "updated_traits");
+    putCountField("identity_signature_traits_count", "identity_signature_traits");
+    putCountField("identity_feature_candidates_count", "identity_feature_candidates");
+
+    if (item.contains("portrait_crop") && item["portrait_crop"].is_object()) {
+        summary["has_portrait_crop"] = true;
+        putStringField("portrait_kind", item["portrait_crop"].value("kind", std::string()));
+    }
+    else {
+        summary["has_portrait_crop"] = false;
+    }
+
+    return summary;
+}
+
+static void logIdentityPatchCheckpoint_(
+    const std::string& logStreamId,
+    const std::string& scopeTag,
+    const std::string& checkpoint,
+    const nlohmann::json& identityPatch)
+{
+    if (logStreamId.empty() || scopeTag.empty()) return;
+
+    nlohmann::json payload = nlohmann::json::array();
+    if (identityPatch.is_array()) {
+        for (const auto& item : identityPatch) {
+            payload.push_back(buildIdentityPatchDebugSummary_(item));
+        }
+    }
+    Logger::instance().logDebug(
+        logStreamId,
+        scopeTag + ": " + checkpoint + " identity_patch=" + payload.dump());
+}
+
+static void logIdentityPatchTraceCheckpoint_(
+    const std::string& logStreamId,
+    const std::string& scopeTag,
+    const std::string& checkpoint,
+    const nlohmann::json& traceItems)
+{
+    if (logStreamId.empty() || scopeTag.empty()) return;
+
+    Logger::instance().logDebug(
+        logStreamId,
+        scopeTag + ": " + checkpoint + " identity_patch_trace=" +
+            (traceItems.is_array() ? traceItems.dump() : std::string("[]")));
+}
+
+static void logResolvedIdentityPatchEntityIdsCheckpoint_(
+    const std::string& logStreamId,
+    const std::string& scopeTag,
+    const std::string& checkpoint,
+    const std::vector<std::string>& entityIds)
+{
+    if (logStreamId.empty() || scopeTag.empty()) return;
+
+    nlohmann::json payload = nlohmann::json::array();
+    for (const auto& entityId : entityIds) {
+        const std::string trimmed = trimAscii(entityId);
+        if (!trimmed.empty()) payload.push_back(trimmed);
+    }
+    Logger::instance().logDebug(
+        logStreamId,
+        scopeTag + ": " + checkpoint + " resolved_entity_ids=" + payload.dump());
 }
 
 static bool hitHasPositiveIdentityPatch_(const VideoHit& hit)
@@ -12667,141 +13179,6 @@ static bool buildPortraitDataUrlFromSourceRect_(
     return true;
 }
 
-static cv::Rect deriveFaceRectFromBodyRect_(
-    const cv::Rect& bodyRect,
-    const cv::Size& frameSize)
-{
-    if (bodyRect.width <= 0 || bodyRect.height <= 0) return cv::Rect();
-    cv::Rect faceRect(
-        bodyRect.x + static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.22)),
-        bodyRect.y + static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.05)),
-        static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.56)),
-        static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.34)));
-    return faceRect & cv::Rect(0, 0, frameSize.width, frameSize.height);
-}
-
-static cv::Rect deriveHeuristicPersonFaceRect_(
-    const cv::Size& frameSize)
-{
-    if (frameSize.width <= 0 || frameSize.height <= 0) return cv::Rect();
-    cv::Rect faceRect(
-        static_cast<int>(std::llround(static_cast<double>(frameSize.width) * 0.24)),
-        static_cast<int>(std::llround(static_cast<double>(frameSize.height) * 0.08)),
-        static_cast<int>(std::llround(static_cast<double>(frameSize.width) * 0.52)),
-        static_cast<int>(std::llround(static_cast<double>(frameSize.height) * 0.48)));
-    return faceRect & cv::Rect(0, 0, frameSize.width, frameSize.height);
-}
-
-static cv::Rect deriveFallbackContextRectForEntityType_(
-    const std::string& rawEntityType,
-    const cv::Size& frameSize,
-    const cv::Rect& bodyRect)
-{
-    if (frameSize.width <= 0 || frameSize.height <= 0) return cv::Rect();
-    const std::string entityType = normalizeFallbackEntityType_(rawEntityType);
-    if (entityType == "person" && bodyRect.width > 0 && bodyRect.height > 0) {
-        cv::Rect expanded(
-            bodyRect.x - static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.10)),
-            bodyRect.y - static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.08)),
-            bodyRect.width + static_cast<int>(std::llround(static_cast<double>(bodyRect.width) * 0.20)),
-            bodyRect.height + static_cast<int>(std::llround(static_cast<double>(bodyRect.height) * 0.18)));
-        return expanded & cv::Rect(0, 0, frameSize.width, frameSize.height);
-    }
-    return cv::Rect(0, 0, frameSize.width, frameSize.height);
-}
-
-static void appendSyntheticIdentityPortraitCandidateFromSourceRect_(
-    VideoHit& hit,
-    const nlohmann::json& seed,
-    const PromptVideoFrame& matchedFrame,
-    const cv::Mat& decodedFrame,
-    const cv::Rect& sourceRect,
-    const std::string& cardRole,
-    const std::string& portraitKind,
-    double confidence,
-    const std::string& fallbackReason)
-{
-    if (sourceRect.width <= 0 || sourceRect.height <= 0) return;
-    if (cardRole.empty() || portraitKind.empty()) return;
-
-    std::string imageDataUrl;
-    nlohmann::json cropMeta = nlohmann::json::object();
-    cropMeta["fallback_reason"] = fallbackReason;
-    cropMeta["synthetic_crop"] = true;
-
-    const bool facePortrait = portraitKind == "face";
-    const double paddingPct = facePortrait ? 0.18 : 0.10;
-    const int minDimension = facePortrait ? 40 : 48;
-    nlohmann::json imageMeta = nlohmann::json::object();
-    if (!buildPortraitDataUrlFromSourceRect_(
-            decodedFrame,
-            sourceRect,
-            paddingPct,
-            minDimension,
-            imageDataUrl,
-            imageMeta))
-    {
-        return;
-    }
-    for (auto it = imageMeta.begin(); it != imageMeta.end(); ++it) {
-        cropMeta[it.key()] = it.value();
-    }
-
-    nlohmann::json candidate = nlohmann::json::object();
-    const std::string candidateEntityId =
-        trimAscii(seed.value("candidate_entity_id", std::string()));
-    const std::string fallbackEntityId =
-        trimAscii(seed.value("entity_id", std::string()));
-    const std::string candidateEntityHint =
-        trimAscii(seed.value("candidate_entity_hint", std::string()));
-    const std::string fallbackEntityHint =
-        trimAscii(seed.value("entity_key", std::string()));
-    const std::string candidateEntityType =
-        trimAscii(seed.value("entity_type", std::string()));
-    if (!candidateEntityId.empty()) candidate["candidate_entity_id"] = candidateEntityId;
-    else if (!fallbackEntityId.empty()) candidate["candidate_entity_id"] = fallbackEntityId;
-    if (!candidateEntityHint.empty()) candidate["candidate_entity_hint"] = candidateEntityHint;
-    else if (!fallbackEntityHint.empty()) candidate["candidate_entity_hint"] = fallbackEntityHint;
-    if (!candidateEntityHint.empty()) candidate["entity_key"] = candidateEntityHint;
-    else if (!fallbackEntityHint.empty()) candidate["entity_key"] = fallbackEntityHint;
-    if (!candidateEntityType.empty()) candidate["entity_type"] = candidateEntityType;
-    if (seed.contains("description")) candidate["description"] = seed["description"];
-    if (seed.contains("short_description")) candidate["short_description"] = seed["short_description"];
-    if (seed.contains("identity_signature_traits")) {
-        candidate["identity_signature_traits"] = seed["identity_signature_traits"];
-    }
-    if (seed.contains("identity_feature_candidates")) {
-        candidate["identity_feature_candidates"] = seed["identity_feature_candidates"];
-    }
-    candidate["card_role"] = cardRole;
-    candidate["portrait_kind"] = portraitKind;
-    candidate["confidence"] = (std::max)(0.0, (std::min)(1.0, confidence));
-    candidate["image_data_url"] = imageDataUrl;
-    candidate["camera_id"] = hit.cameraId;
-    if (!hit.cameraName.empty()) candidate["camera_name"] = hit.cameraName;
-    if (matchedFrame.frameIndex >= 0) candidate["frame_index"] = matchedFrame.frameIndex;
-    if (!matchedFrame.frameTimestampInSegment.empty()) {
-        candidate["frame_timestamp_in_segment"] = matchedFrame.frameTimestampInSegment;
-    }
-    if (!matchedFrame.timestampName.empty()) {
-        candidate["timestamp_name"] = matchedFrame.timestampName;
-    }
-    if (matchedFrame.hasAbsoluteTimestamp) {
-        candidate["timestamp_utc_iso"] = formatTimePointToIsoUtcZ_(matchedFrame.absoluteTimestamp);
-    }
-    if (seed.contains("timestamp_utc_iso")) candidate["timestamp_utc_iso"] = seed["timestamp_utc_iso"];
-    if (seed.contains("last_seen_ts_utc")) candidate["last_seen_ts_utc"] = seed["last_seen_ts_utc"];
-    candidate["bbox_norm_in_cell"] = {
-        { "x", decodedFrame.cols > 0 ? static_cast<double>(sourceRect.x) / static_cast<double>(decodedFrame.cols) : 0.0 },
-        { "y", decodedFrame.rows > 0 ? static_cast<double>(sourceRect.y) / static_cast<double>(decodedFrame.rows) : 0.0 },
-        { "w", decodedFrame.cols > 0 ? static_cast<double>(sourceRect.width) / static_cast<double>(decodedFrame.cols) : 1.0 },
-        { "h", decodedFrame.rows > 0 ? static_cast<double>(sourceRect.height) / static_cast<double>(decodedFrame.rows) : 1.0 }
-    };
-    candidate["crop_meta"] = std::move(cropMeta);
-
-    hit.identityPortraitCandidates.push_back(std::move(candidate));
-}
-
 static void normalizeTemporalPayloadForVideo_(
     VideoHit& hit,
     const std::string& sourceFilePath,
@@ -12811,6 +13188,7 @@ static void normalizeTemporalPayloadForVideo_(
     const std::vector<PromptVideoFrame>* frameCatalog = nullptr,
     const std::string& videoPackagingMode = std::string())
 {
+    runPortraitPipelineRegressionSelfCheckOnce_();
     hit.temporalEvidenceCandidates.clear();
     hit.identityPortraitCandidates = nlohmann::json::array();
     const std::string normalizedVideoPackagingMode =
@@ -13061,7 +13439,9 @@ static void normalizeTemporalPayloadForVideo_(
                 hit,
                 item,
                 frameCatalog,
-                normalizedVideoPackagingMode);
+                normalizedVideoPackagingMode,
+                logStreamId,
+                scopeTag);
         }
     }
 
@@ -13147,6 +13527,12 @@ static void normalizeTemporalPayloadForVideo_(
                 (hit.eventTimestampName.empty() ? std::string("unknown") : hit.eventTimestampName)
         );
     }
+
+    logIdentityPatchCheckpoint_(
+        logStreamId,
+        scopeTag,
+        "post_temporal_video_normalize",
+        hit.identityPatch);
 
     compactContinuousTemporalEvidenceCandidatesForVideo_(hit, logStreamId, scopeTag);
 }
@@ -13325,6 +13711,18 @@ static std::string canonicalizeEntityTypeForCard_(const std::string& rawType)
     return normalized;
 }
 
+static bool portraitKindAllowedAsPrimaryForEntityType_(
+    const std::string& rawEntityType,
+    const std::string& rawPortraitKind)
+{
+    const std::string entityType = canonicalizeEntityTypeForCard_(rawEntityType);
+    const std::string portraitKind = lowerAsciiCopy_(trimAscii(rawPortraitKind));
+    if (entityType == "person") {
+        return portraitKind == "face";
+    }
+    return !portraitKind.empty();
+}
+
 static bool shouldReplaceStoredPortrait_(
     const nlohmann::json* currentAsset,
     const nlohmann::json& candidateAsset,
@@ -13361,6 +13759,10 @@ static bool portraitAssetIsGoodEnough_(const nlohmann::json& asset)
     if (imageDataUrl.empty()) return false;
 
     const std::string kind = lowerAsciiCopy_(trimAscii(asset.value("portrait_kind", "")));
+    const std::string entityType =
+        canonicalizeEntityTypeForCard_(trimAscii(asset.value("entity_type", "")));
+    const bool primaryRole =
+        lowerAsciiCopy_(trimAscii(asset.value("card_role", "primary"))) != "context";
     const double confidence = asset.value("confidence", 0.0);
     int cropWidth = 0;
     int cropHeight = 0;
@@ -13369,6 +13771,12 @@ static bool portraitAssetIsGoodEnough_(const nlohmann::json& asset)
         cropHeight = asset["crop_meta"].value("crop_height", 0);
     }
     const int minDim = (std::min)(cropWidth, cropHeight);
+
+    if (primaryRole &&
+        !portraitKindAllowedAsPrimaryForEntityType_(entityType, kind))
+    {
+        return false;
+    }
 
     if (kind == "face") {
         return confidence >= 0.78 && minDim >= 64;
@@ -13488,6 +13896,7 @@ static void seedIdentityMemoryFromPortraitCandidate_(
              "stable_attributes",
              "key_traits",
              "identity_signature_traits",
+             "identity_feature_candidates",
              "identity_context_traits",
              "reference_image_urls",
              "known_name",
@@ -13667,6 +14076,16 @@ static nlohmann::json buildChatIdentityCardForEntity_(
     appendUniqueTrimmedStringsToJsonArray_(
         stableTraitSources,
         identityMemoryRow != nullptr
+            ? temporal::extractStableTraitsFromNode(*identityMemoryRow, entityType)
+            : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(
+        stableTraitSources,
+        entityState != nullptr
+            ? temporal::extractStableTraitsFromNode(*entityState, entityType)
+            : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(
+        stableTraitSources,
+        identityMemoryRow != nullptr
             ? (*identityMemoryRow).value("stable_attributes", nlohmann::json::array())
             : nlohmann::json::array());
     appendUniqueTrimmedStringsToJsonArray_(
@@ -13701,6 +14120,16 @@ static nlohmann::json buildChatIdentityCardForEntity_(
     appendUniqueTrimmedStringsToJsonArray_(
         rawContextTraits,
         identityMemoryRow != nullptr
+            ? temporal::extractContextTraitsFromNode(*identityMemoryRow, entityType)
+            : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(
+        rawContextTraits,
+        entityState != nullptr
+            ? temporal::extractContextTraitsFromNode(*entityState, entityType)
+            : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(
+        rawContextTraits,
+        identityMemoryRow != nullptr
             ? (*identityMemoryRow).value("identity_context_traits", nlohmann::json::array())
             : nlohmann::json::array());
     appendUniqueTrimmedStringsToJsonArray_(
@@ -13717,6 +14146,18 @@ static nlohmann::json buildChatIdentityCardForEntity_(
         rawContextTraits,
         entityState != nullptr
             ? (*entityState).value("latest_context_traits", nlohmann::json::array())
+            : nlohmann::json::array());
+
+    nlohmann::json observedContextTraits = nlohmann::json::array();
+    appendUniqueTrimmedStringsToJsonArray_(
+        observedContextTraits,
+        identityMemoryRow != nullptr
+            ? (*identityMemoryRow).value("identity_observed_context_traits", nlohmann::json::array())
+            : nlohmann::json::array());
+    appendUniqueTrimmedStringsToJsonArray_(
+        observedContextTraits,
+        entityState != nullptr
+            ? (*entityState).value("identity_observed_context_traits", nlohmann::json::array())
             : nlohmann::json::array());
 
     nlohmann::json signatureTraits =
@@ -13738,9 +14179,15 @@ static nlohmann::json buildChatIdentityCardForEntity_(
             rawContextTraits,
             rawContextTraits);
     if (!contextTraits.empty()) card["identity_context_traits"] = contextTraits;
+    if (!observedContextTraits.empty()) {
+        card["identity_observed_context_traits"] = observedContextTraits;
+    }
 
     const std::string rawDescription =
-        selectCardStringField_(identityMemoryRow, entityState, { "description" });
+        selectCardStringField_(identityMemoryRow, entityState, {
+            "description",
+            "identity_signature_summary"
+        });
     const std::string description =
         temporal::curateIdentityDescription(entityType, rawDescription, signatureTraits);
     if (!description.empty()) card["description"] = description;
@@ -14617,6 +15064,12 @@ static nlohmann::json applyChatIdentityContinuityRound_(
         return nlohmann::json::array();
     }
 
+    logIdentityPatchCheckpoint_(
+        logStreamId,
+        scopeTag,
+        "before_apply_round",
+        identityPatchForApply);
+
     temporal::applyRound(
         temporalState,
         envelopeForApply,
@@ -14632,6 +15085,8 @@ static nlohmann::json applyChatIdentityContinuityRound_(
 
     const nlohmann::json candidateDecisions =
         temporal::extractLastRoundCandidateDecisions(temporalState);
+    const nlohmann::json identityPatchTrace =
+        temporal::extractLastRoundIdentityPatchTrace(temporalState);
     if (!logStreamId.empty() &&
         !scopeTag.empty() &&
         candidateDecisions.is_array() &&
@@ -14641,6 +15096,11 @@ static nlohmann::json applyChatIdentityContinuityRound_(
             logStreamId,
             scopeTag + ": candidate decisions=" + candidateDecisions.dump());
     }
+    logIdentityPatchTraceCheckpoint_(
+        logStreamId,
+        scopeTag,
+        "after_apply_round",
+        identityPatchTrace);
 
     std::vector<std::string> roundResolvedEntityIds;
     std::unordered_set<std::string> seenRoundEntityIds;
@@ -14648,6 +15108,11 @@ static nlohmann::json applyChatIdentityContinuityRound_(
         candidateDecisions,
         roundResolvedEntityIds,
         seenRoundEntityIds);
+    logResolvedIdentityPatchEntityIdsCheckpoint_(
+        logStreamId,
+        scopeTag,
+        "post_candidate_decisions",
+        roundResolvedEntityIds);
 
     if (hit.identityPortraitCandidates.is_array()) {
         for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
@@ -14665,6 +15130,12 @@ static nlohmann::json applyChatIdentityContinuityRound_(
             roundResolvedEntityIds.push_back(resolvedEntityId);
         }
     }
+
+    logResolvedIdentityPatchEntityIdsCheckpoint_(
+        logStreamId,
+        scopeTag,
+        "post_portrait_promotion",
+        roundResolvedEntityIds);
 
     if (!roundResolvedEntityIds.empty()) {
         hit.matchedEntityIds = nlohmann::json::array();
@@ -15883,22 +16354,106 @@ static bool probeUploadedVideoStatsWithFfmpeg_(
         return false;
     }
 
-    const std::string command =
-        "\"" + ffmpegPath.string() + "\" -hide_banner -i \"" + videoPath + "\" 2>&1";
     logProbe("running ffmpeg metadata probe path=" + videoPath +
              " ffmpeg=" + ffmpegPath.string());
-    FILE* pipe = _popen(command.c_str(), "r");
-    if (pipe == nullptr) {
-        logProbe("failed to start ffmpeg metadata probe via _popen");
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
+        logProbe("CreatePipe failed error=" + std::to_string(GetLastError()));
+        return false;
+    }
+    if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+        logProbe("SetHandleInformation failed error=" + std::to_string(GetLastError()));
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        return false;
+    }
+
+    HANDLE nullInput = CreateFileW(
+        L"NUL",
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (nullInput == INVALID_HANDLE_VALUE) {
+        logProbe("CreateFileW(NUL) failed error=" + std::to_string(GetLastError()));
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        return false;
+    }
+
+    const std::wstring ffmpegW = utf8ToWide(ffmpegPath.string());
+    const std::wstring inW = utf8ToWide(videoPath);
+    std::wstring cmdLine =
+        L"\"" + ffmpegW + L"\""
+        L" -hide_banner -i \"" + inW + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdInput = nullInput;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back(L'\0');
+
+    const BOOL ok = CreateProcessW(
+        nullptr,
+        cmdBuf.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+
+    CloseHandle(writePipe);
+    writePipe = nullptr;
+    CloseHandle(nullInput);
+    nullInput = nullptr;
+
+    if (!ok) {
+        logProbe("CreateProcessW(ffmpeg probe) failed error=" + std::to_string(GetLastError()));
+        CloseHandle(readPipe);
         return false;
     }
 
     std::string output;
-    char buffer[512];
-    while (std::fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
-        output += buffer;
+    char buffer[4096];
+    for (;;) {
+        DWORD bytesRead = 0;
+        const BOOL readOk = ReadFile(
+            readPipe,
+            buffer,
+            static_cast<DWORD>(sizeof(buffer)),
+            &bytesRead,
+            nullptr);
+        if (!readOk || bytesRead == 0) {
+            break;
+        }
+        output.append(buffer, buffer + bytesRead);
     }
-    const int closeCode = _pclose(pipe);
+    CloseHandle(readPipe);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    const int closeCode = static_cast<int>(exitCode);
 
     if (output.empty()) {
         logProbe("ffmpeg probe produced empty output close_code=" + std::to_string(closeCode));
@@ -16338,14 +16893,22 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
                 " source_frame_count=" + std::to_string(sourceFrameCount));
     }
 
-    int effectiveFps = clampRequestedModelFps_(requestedModelFps);
+    double effectiveSamplingFps = 0.0;
     if (sourceFps > 0.0) {
-        const int roundedSourceFps = (std::max)(1, static_cast<int>(sourceFps + 0.5));
-        effectiveFps = (std::min)(effectiveFps, roundedSourceFps);
+        effectiveSamplingFps = (std::min)(5.0, sourceFps);
     }
-    if (effectiveFps < 1) {
-        effectiveFps = 1;
+    else if (sourceFrameCount > 0 && durationSec > 0.0) {
+        effectiveSamplingFps =
+            (std::min)(5.0, static_cast<double>(sourceFrameCount) / durationSec);
     }
+    else {
+        effectiveSamplingFps = static_cast<double>(clampRequestedModelFps_(requestedModelFps));
+    }
+    if (effectiveSamplingFps < 1.0) {
+        effectiveSamplingFps = 1.0;
+    }
+    const int effectiveFps =
+        (std::max)(1, static_cast<int>(std::llround(effectiveSamplingFps)));
     if (durationSec <= 0.0) {
         setFailure("invalid uploaded video duration after probe");
         return out;
@@ -16354,12 +16917,12 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
     int totalSamples = 0;
     if (sourceFps > 0.0 &&
         sourceFrameCount > 0 &&
-        sourceFps <= static_cast<double>(effectiveFps) + 0.001)
+        sourceFps <= 5.0 + 0.001)
     {
         totalSamples = sourceFrameCount;
     }
     else {
-        totalSamples = static_cast<int>(durationSec * static_cast<double>(effectiveFps) + 1e-6);
+        totalSamples = static_cast<int>(durationSec * effectiveSamplingFps + 1e-6);
     }
     if (totalSamples < 1) {
         totalSamples = 1;
@@ -16400,6 +16963,7 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
         seg.uploadPlannedSampleCount = chunkSampleCount;
         seg.uploadPlannedTotalSamples = totalSamples;
         seg.uploadPlannedFps = effectiveFps;
+        seg.uploadPlannedSamplingFps = effectiveSamplingFps;
         seg.uploadStartSeconds = chunkStartSec;
         seg.uploadDurationSeconds = chunkDurationSec;
     };
@@ -16407,14 +16971,15 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
     if (!logStreamId.empty()) {
         Logger::instance().logDebug(
             logStreamId,
-            "buildEncodedVideosFromUploadedMp4_: duration_s=" + std::to_string(durationSec) +
+                "buildEncodedVideosFromUploadedMp4_: duration_s=" + std::to_string(durationSec) +
                 " source_fps=" + std::to_string(sourceFps) +
                 " source_frame_count=" + std::to_string(sourceFrameCount) +
                 " requested_fps=" + std::to_string(requestedModelFps) +
-                " effective_fps=" + std::to_string(effectiveFps) +
+                " effective_prompt_fps=" + std::to_string(effectiveFps) +
+                " effective_sampling_fps=" + std::to_string(effectiveSamplingFps) +
                 " total_samples=" + std::to_string(totalSamples) +
                 " chunk_count=" + std::to_string(chunkCount));
-    }
+        }
 
     if (chunkCount <= 1) {
         EncodedVideoSegment seg;
@@ -16451,9 +17016,9 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
         }
 
         const double chunkStartSec =
-            static_cast<double>(sampleStart) / static_cast<double>(effectiveFps);
+            static_cast<double>(sampleStart) / effectiveSamplingFps;
         const double nominalChunkDurationSec =
-            static_cast<double>(sampleCount) / static_cast<double>(effectiveFps);
+            static_cast<double>(sampleCount) / effectiveSamplingFps;
         const double chunkEndSec =
             durationSec > 0.0
                 ? (std::min)(durationSec, chunkStartSec + nominalChunkDurationSec)
@@ -16507,6 +17072,7 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromUploadedMp4_(
     for (const auto& seg : out) {
         if (!seg.uploadAnalysisSegment ||
             seg.uploadPlannedFps != effectiveFps ||
+            seg.uploadPlannedSamplingFps <= 0.0 ||
             seg.uploadPlannedSampleCount <= 0)
         {
             for (const auto& rawPath : createdChunkPaths) {
@@ -22379,6 +22945,96 @@ namespace {
         return std::string();
     }
 
+    static std::string detectHairColorCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kHairColorCues[] = {
+            { "cabelo verde", "green" },
+            { "green hair", "green" },
+            { "cabelo vermelho", "red" },
+            { "red hair", "red" },
+            { "cabelo ruivo", "red" },
+            { "ruivo", "red" },
+            { "cabelo azul", "blue" },
+            { "blue hair", "blue" },
+            { "cabelo preto", "black" },
+            { "black hair", "black" },
+            { "cabelo branco", "white" },
+            { "white hair", "white" },
+            { "cabelo grisalho", "gray" },
+            { "gray hair", "gray" },
+            { "grey hair", "gray" },
+            { "cabelo cinza", "gray" },
+            { "cabelo castanho", "brown" },
+            { "brown hair", "brown" },
+            { "cabelo loiro", "blond" },
+            { "blond hair", "blond" },
+            { "blonde hair", "blond" }
+        };
+
+        for (const auto& item : kHairColorCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
+    static std::string detectSkinToneCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kSkinToneCues[] = {
+            { "pele clara", "light skin tone" },
+            { "pele branca", "light skin tone" },
+            { "light skin", "light skin tone" },
+            { "fair skin", "light skin tone" },
+            { "pele escura", "dark skin tone" },
+            { "pele negra", "dark skin tone" },
+            { "dark skin", "dark skin tone" },
+            { "pele morena", "brown skin tone" },
+            { "brown skin", "brown skin tone" },
+            { "medium skin", "medium skin tone" },
+            { "medium skin tone", "medium skin tone" },
+            { "olive skin", "medium skin tone" },
+            { "pele oliva", "medium skin tone" }
+        };
+
+        for (const auto& item : kSkinToneCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
+    static std::string detectBodyBuildCueForIdentityText_(const std::string& normalizedText)
+    {
+        static const std::pair<const char*, const char*> kBuildCues[] = {
+            { "porte fisico mediano", "medium build" },
+            { "porte físico mediano", "medium build" },
+            { "porte medio", "medium build" },
+            { "porte médio", "medium build" },
+            { "porte mediano", "medium build" },
+            { "average build", "medium build" },
+            { "medium build", "medium build" },
+            { "regular build", "medium build" },
+            { "slim build", "slim build" },
+            { "magro", "slim build" },
+            { "slim", "slim build" },
+            { "thin", "slim build" },
+            { "heavy build", "heavy build" },
+            { "heavyset", "heavy build" },
+            { "stocky", "heavy build" },
+            { "corpulento", "heavy build" },
+            { "gordo", "heavy build" }
+        };
+
+        for (const auto& item : kBuildCues) {
+            if (normalizedText.find(item.first) != std::string::npos) {
+                return item.second;
+            }
+        }
+        return std::string();
+    }
+
     static std::string detectPersonTraitCueForIdentityText_(const std::string& normalizedText)
     {
         static const std::pair<const char*, const char*> kTraitCues[] = {
@@ -22449,6 +23105,9 @@ namespace {
 
         const std::string entityType = normalizeFallbackEntityType_(rawEntityType);
         const std::string colorCue = detectColorCueForIdentityText_(normalizedText);
+        const std::string hairColorCue = detectHairColorCueForIdentityText_(normalizedText);
+        const std::string skinToneCue = detectSkinToneCueForIdentityText_(normalizedText);
+        const std::string bodyBuildCue = detectBodyBuildCueForIdentityText_(normalizedText);
 
         auto hasCue = [&](std::initializer_list<const char*> cues) {
             for (const char* cue : cues) {
@@ -22475,17 +23134,40 @@ namespace {
         };
 
         if (entityType == "person") {
-            if (hasCue({ "pele clara", "pele branca", "light skin", "fair skin" })) {
-                appendIdentityCue("light skin tone", "physical_trait", "intrinsic_body");
-            }
-            if (hasCue({ "pele escura", "pele negra", "dark skin", "brown skin" })) {
-                appendIdentityCue("dark skin tone", "physical_trait", "intrinsic_body");
+            if (!skinToneCue.empty()) {
+                appendIdentityCue(skinToneCue, "physical_trait", "intrinsic_body");
             }
             if (hasCue({ "cabelo curto", "short hair" })) {
                 appendIdentityCue("short hair", "physical_trait", "intrinsic_body");
             }
+            if (hasCue({
+                    "cabelo raspado",
+                    "cabelos raspados",
+                    "raspado",
+                    "raspados",
+                    "buzz cut",
+                    "shaved head",
+                    "very short hair",
+                    "cabelo muito curto",
+                    "muito curtos"
+                }))
+            {
+                appendIdentityCue("very short hair", "physical_trait", "intrinsic_body");
+            }
             if (hasCue({ "cabelo comprido", "cabelo longo", "long hair" })) {
                 appendIdentityCue("long hair", "physical_trait", "intrinsic_body");
+            }
+            if (hasCue({
+                    "cabelo preso",
+                    "cabelos presos",
+                    "hair tied back",
+                    "tied back hair",
+                    "tied-back hair",
+                    "ponytail",
+                    "rabo de cavalo"
+                }))
+            {
+                appendIdentityCue("hair tied back", "physical_trait", "intrinsic_body");
             }
             if (hasCue({ "cabelo cacheado", "curly hair" })) {
                 appendIdentityCue("curly hair", "physical_trait", "intrinsic_body");
@@ -22499,8 +23181,8 @@ namespace {
             if (hasCue({ "cabelo crespo", "coily hair" })) {
                 appendIdentityCue("coily hair", "physical_trait", "intrinsic_body");
             }
-            if (!colorCue.empty() && hasCue({ "cabelo", "hair" })) {
-                appendIdentityCue(colorCue + " hair", "physical_trait", "intrinsic_body");
+            if (!hairColorCue.empty() && hasCue({ "cabelo", "hair" })) {
+                appendIdentityCue(hairColorCue + " hair", "physical_trait", "intrinsic_body");
             }
             if (hasCue({ "barba baixa", "barba curta", "barba por fazer", "stubble", "short beard", "light beard" })) {
                 appendIdentityCue("short beard", "physical_trait", "intrinsic_body");
@@ -22511,7 +23193,7 @@ namespace {
             if (hasCue({ "bigode", "mustache", "moustache" })) {
                 appendIdentityCue("mustache", "physical_trait", "intrinsic_body");
             }
-            if (hasCue({ "careca", "bald" })) {
+            if (hasCue({ "careca", "calvo", "bald" })) {
                 appendIdentityCue("bald", "physical_trait", "intrinsic_body");
             }
             if (hasCue({ "tatuagem", "tattoo" })) {
@@ -22520,11 +23202,8 @@ namespace {
             if (hasCue({ "cicatriz", "scar" })) {
                 appendIdentityCue("scar", "body_marking", "intrinsic_body");
             }
-            if (hasCue({ "magro", "slim", "thin" })) {
-                appendIdentityCue("slim build", "physical_trait", "intrinsic_body");
-            }
-            if (hasCue({ "gordo", "heavy", "stocky", "corpulento" })) {
-                appendIdentityCue("heavy build", "physical_trait", "intrinsic_body");
+            if (!bodyBuildCue.empty()) {
+                appendIdentityCue(bodyBuildCue, "physical_trait", "intrinsic_body");
             }
             if (hasCue({ "oculos", "glasses" })) {
                 appendIdentityCue("glasses", "accessory", "worn_on_target");
@@ -22569,12 +23248,6 @@ namespace {
                     "accessory",
                     "carried_by_target");
             }
-            if ((!outSignatureTraits.is_array() || outSignatureTraits.empty()) && !colorCue.empty()) {
-                appendIdentityCue(
-                    colorCue + " clothing",
-                    "clothing",
-                    "worn_on_target");
-            }
         }
         else if (entityType == "vehicle") {
             if (!colorCue.empty()) {
@@ -22606,6 +23279,205 @@ namespace {
                     "object_detail",
                     "intrinsic_body");
             }
+        }
+    }
+
+    static std::string selectIdentityPatchFallbackText_(
+        const nlohmann::json& patch)
+    {
+        if (!patch.is_object()) return std::string();
+        const std::string description =
+            trimAscii(patch.value("description", std::string()));
+        if (!description.empty()) return description;
+        const std::string shortDescription =
+            trimAscii(patch.value("short_description", std::string()));
+        if (!shortDescription.empty()) return shortDescription;
+        return trimAscii(patch.value("identity_signature_summary", std::string()));
+    }
+
+    static void normalizeIdentityPatchItemForMemory_(
+        nlohmann::json& item)
+    {
+        if (!item.is_object()) return;
+
+        const std::string entityType =
+            normalizeFallbackEntityType_(item.value("entity_type", std::string()));
+        const nlohmann::json explicitSignatureTraits =
+            item.contains("identity_signature_traits")
+                ? temporal::parseTraitsValue(item["identity_signature_traits"])
+                : nlohmann::json::array();
+        nlohmann::json signatureTraits =
+            explicitSignatureTraits;
+        nlohmann::json featureCandidates =
+            item.contains("identity_feature_candidates")
+                ? item["identity_feature_candidates"]
+                : nlohmann::json::array();
+        featureCandidates =
+            temporal::filterIdentityFeatureCandidatesForMemory(entityType, featureCandidates);
+
+        const nlohmann::json stableTraits =
+            temporal::extractStableTraitsFromNode(item, entityType);
+        const nlohmann::json contextTraits =
+            temporal::extractContextTraitsFromNode(item, entityType);
+        signatureTraits =
+            temporal::curateIdentitySignatureTraits(
+                entityType,
+                stableTraits,
+                contextTraits,
+                signatureTraits);
+        appendUniqueIdentityFeatureCandidatesToJsonArray_(
+            featureCandidates,
+            buildManualIdentityFeatureCandidatesFromTraits_(signatureTraits));
+        featureCandidates =
+            temporal::filterIdentityFeatureCandidatesForMemory(entityType, featureCandidates);
+
+        const bool explicitTraitsAlreadyRich =
+            entityType == "person" &&
+            explicitSignatureTraits.is_array() &&
+            explicitSignatureTraits.size() >= 2 &&
+            signatureTraits.is_array() &&
+            signatureTraits.size() >= 2;
+
+        const bool needsPersonReinforcement =
+            entityType == "person" &&
+            !explicitTraitsAlreadyRich &&
+            (
+                !signatureTraits.is_array() ||
+                signatureTraits.size() < 3 ||
+                !featureCandidates.is_array() ||
+                featureCandidates.size() < 3
+            );
+
+        if ((!signatureTraits.is_array() || signatureTraits.empty()) ||
+            (!featureCandidates.is_array() || featureCandidates.empty()) ||
+            needsPersonReinforcement)
+        {
+            const std::string fallbackText = selectIdentityPatchFallbackText_(item);
+            nlohmann::json fallbackTraits = nlohmann::json::array();
+            nlohmann::json fallbackFeatureCandidates = nlohmann::json::array();
+            buildFallbackIdentityAttributesFromText_(
+                fallbackText,
+                entityType,
+                fallbackTraits,
+                fallbackFeatureCandidates);
+            appendUniqueTrimmedStringsToJsonArray_(signatureTraits, fallbackTraits);
+            appendUniqueIdentityFeatureCandidatesToJsonArray_(
+                featureCandidates,
+                fallbackFeatureCandidates);
+            featureCandidates =
+                temporal::filterIdentityFeatureCandidatesForMemory(entityType, featureCandidates);
+            signatureTraits =
+                temporal::curateIdentitySignatureTraits(
+                    entityType,
+                    stableTraits,
+                    contextTraits,
+                    signatureTraits);
+        }
+
+        if (signatureTraits.is_array() && !signatureTraits.empty()) {
+            item["identity_signature_traits"] = signatureTraits;
+        }
+        else {
+            item.erase("identity_signature_traits");
+        }
+
+        if (featureCandidates.is_array() && !featureCandidates.empty()) {
+            item["identity_feature_candidates"] = featureCandidates;
+        }
+        else {
+            item.erase("identity_feature_candidates");
+        }
+    }
+
+    static void normalizeIdentityPatchArrayForMemory_(
+        nlohmann::json& identityPatch,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string())
+    {
+        if (!identityPatch.is_array()) return;
+
+        int enrichedItems = 0;
+        for (auto& item : identityPatch) {
+            if (!item.is_object()) continue;
+            const std::size_t beforeCount =
+                item.contains("identity_signature_traits") &&
+                item["identity_signature_traits"].is_array()
+                    ? item["identity_signature_traits"].size()
+                    : 0;
+            normalizeIdentityPatchItemForMemory_(item);
+            const std::size_t afterCount =
+                item.contains("identity_signature_traits") &&
+                item["identity_signature_traits"].is_array()
+                    ? item["identity_signature_traits"].size()
+                    : 0;
+            if (afterCount > beforeCount) {
+                ++enrichedItems;
+            }
+        }
+
+        if (enrichedItems > 0 &&
+            !logStreamId.empty() &&
+            !scopeTag.empty())
+        {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag + ": normalized identity_patch traits enriched_items=" +
+                    std::to_string(enrichedItems));
+        }
+    }
+
+    static void mergeFallbackIdentityTraitsIntoPositivePatch_(
+        VideoHit& hit,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string())
+    {
+        if (!hit.identityPatch.is_array() || hit.identityPatch.empty()) return;
+
+        const nlohmann::json fallbackPatch =
+            buildFallbackIdentityPatchForPositiveHit_(hit, nlohmann::json::object(), true);
+        if (!fallbackPatch.is_object() || fallbackPatch.empty()) return;
+
+        bool mergedAny = false;
+        for (auto& item : hit.identityPatch) {
+            if (!item.is_object() || !temporalIdentityPatchCarriesPositiveEntity_(item)) continue;
+
+            const bool missingSignatureTraits =
+                !item.contains("identity_signature_traits") ||
+                !item["identity_signature_traits"].is_array() ||
+                item["identity_signature_traits"].empty();
+            const bool missingFeatureCandidates =
+                !item.contains("identity_feature_candidates") ||
+                !item["identity_feature_candidates"].is_array() ||
+                item["identity_feature_candidates"].empty();
+
+            if (missingSignatureTraits &&
+                fallbackPatch.contains("identity_signature_traits") &&
+                fallbackPatch["identity_signature_traits"].is_array() &&
+                !fallbackPatch["identity_signature_traits"].empty())
+            {
+                item["identity_signature_traits"] = fallbackPatch["identity_signature_traits"];
+                mergedAny = true;
+            }
+            if (missingFeatureCandidates &&
+                fallbackPatch.contains("identity_feature_candidates") &&
+                fallbackPatch["identity_feature_candidates"].is_array() &&
+                !fallbackPatch["identity_feature_candidates"].empty())
+            {
+                item["identity_feature_candidates"] = fallbackPatch["identity_feature_candidates"];
+                mergedAny = true;
+            }
+
+            normalizeIdentityPatchItemForMemory_(item);
+            break;
+        }
+
+        if (mergedAny &&
+            !logStreamId.empty() &&
+            !scopeTag.empty())
+        {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag + ": merged fallback identity traits into positive identity_patch");
         }
     }
 
@@ -22901,127 +23773,13 @@ namespace {
             return;
         }
 
-        if (representativeFrame == nullptr || trimAscii(representativeFrame->jpegBase64).empty()) return;
-
-        cv::Mat decodedFrame;
-        if (!decodePromptVideoFrameToMat_(representativeFrame->jpegBase64, decodedFrame) || decodedFrame.empty()) {
-            return;
-        }
-
-        nlohmann::json seed = nlohmann::json::object();
-        if (!descriptor.entityId.empty()) seed["candidate_entity_id"] = descriptor.entityId;
-        if (!descriptor.entityHint.empty()) seed["candidate_entity_hint"] = descriptor.entityHint;
-        if (!descriptor.entityHint.empty()) seed["entity_key"] = descriptor.entityHint;
-        if (!descriptor.entityType.empty()) seed["entity_type"] = descriptor.entityType;
-        if (!trimAscii(hit.answer).empty()) seed["description"] = trimAscii(hit.answer);
-        if (!representativeFrame->frameTimestampInSegment.empty()) {
-            seed["frame_timestamp_in_segment"] = representativeFrame->frameTimestampInSegment;
-        }
-        if (!representativeFrame->timestampName.empty()) {
-            seed["timestamp_name"] = representativeFrame->timestampName;
-        }
-        if (representativeFrame->frameIndex >= 0) {
-            seed["frame_index"] = representativeFrame->frameIndex;
-        }
-        if (!trimAscii(hit.eventTimestampUtcIso).empty()) {
-            seed["timestamp_utc_iso"] = hit.eventTimestampUtcIso;
-            seed["last_seen_ts_utc"] = hit.eventTimestampUtcIso;
-        }
-        else if (representativeFrame->hasAbsoluteTimestamp) {
-            const std::string tsUtc = formatTimePointToIsoUtcZ_(representativeFrame->absoluteTimestamp);
-            if (!tsUtc.empty()) {
-                seed["timestamp_utc_iso"] = tsUtc;
-                seed["last_seen_ts_utc"] = tsUtc;
-            }
-        }
-
-        nlohmann::json signatureTraits = nlohmann::json::array();
-        nlohmann::json featureCandidates = nlohmann::json::array();
-        buildFallbackIdentityAttributesFromText_(
-            focusText,
-            descriptor.entityType,
-            signatureTraits,
-            featureCandidates);
-        if (!signatureTraits.empty()) {
-            seed["identity_signature_traits"] = signatureTraits;
-        }
-        if (!featureCandidates.empty()) {
-            seed["identity_feature_candidates"] = featureCandidates;
-        }
-
-        const std::string entityType =
-            normalizeFallbackEntityType_(descriptor.entityType);
-        cv::Rect bodyRect;
-        const bool detectedBody = false;
-        if (entityType == "person") {
-            const cv::Rect faceRect = deriveHeuristicPersonFaceRect_(decodedFrame.size());
-            if (faceRect.width > 0 && faceRect.height > 0) {
-                appendSyntheticIdentityPortraitCandidateFromSourceRect_(
-                    hit,
-                    seed,
-                    *representativeFrame,
-                    decodedFrame,
-                    faceRect,
-                    "primary",
-                    "face",
-                    0.44,
-                    "person_face_heuristic");
-            }
-
-            const cv::Rect contextRect =
-                deriveFallbackContextRectForEntityType_(
-                    entityType,
-                    decodedFrame.size(),
-                    bodyRect);
-            if (contextRect.width > 0 && contextRect.height > 0) {
-                appendSyntheticIdentityPortraitCandidateFromSourceRect_(
-                    hit,
-                    seed,
-                    *representativeFrame,
-                    decodedFrame,
-                    contextRect,
-                    hit.identityPortraitCandidates.empty() ? "primary" : "context",
-                    hit.identityPortraitCandidates.empty() ? "context_fallback" : "full_object",
-                    0.50,
-                    "person_full_frame_context");
-            }
-        }
-        else {
-            const cv::Rect objectRect =
-                deriveFallbackContextRectForEntityType_(
-                    entityType,
-                    decodedFrame.size(),
-                    cv::Rect());
-            appendSyntheticIdentityPortraitCandidateFromSourceRect_(
-                hit,
-                seed,
-                *representativeFrame,
-                decodedFrame,
-                objectRect,
-                "primary",
-                "full_object",
-                0.50,
-                "object_full_frame_fallback");
-        }
-
-        if (hit.identityPortraitCandidates.is_array()) {
-            for (auto& portraitCandidate : hit.identityPortraitCandidates) {
-                enrichPortraitCandidate(portraitCandidate);
-            }
-        }
-
-        if (!logStreamId.empty() &&
-            !scopeTag.empty() &&
-            hit.identityPortraitCandidates.is_array() &&
-            !hit.identityPortraitCandidates.empty())
-        {
+        if (!logStreamId.empty() && !scopeTag.empty()) {
             Logger::instance().logDebug(
                 logStreamId,
                 scopeTag +
-                    ": synthesized fallback identity portrait candidates count=" +
-                    std::to_string(static_cast<unsigned long long>(hit.identityPortraitCandidates.size())) +
+                    ": no explicit LLM portrait bbox available; synthetic portrait fallback disabled" +
                     " entity_hint=" + descriptor.entityHint +
-                    " entity_type=" + entityType);
+                    " entity_type=" + normalizeFallbackEntityType_(descriptor.entityType));
         }
     }
 
@@ -23183,6 +23941,15 @@ namespace {
             }
             if (source.contains("scene_brief") && source["scene_brief"].is_string()) {
                 target["scene_brief"] = source["scene_brief"];
+            }
+            if (source.contains("portrait_crop") && source["portrait_crop"].is_object()) {
+                target["portrait_crop"] = source["portrait_crop"];
+            }
+            if (source.contains("context_bbox_norm_in_cell") && source["context_bbox_norm_in_cell"].is_object()) {
+                target["context_bbox_norm_in_cell"] = source["context_bbox_norm_in_cell"];
+            }
+            if (source.contains("context_bbox_norm_in_frame") && source["context_bbox_norm_in_frame"].is_object()) {
+                target["context_bbox_norm_in_frame"] = source["context_bbox_norm_in_frame"];
             }
             if (source.contains("reference_image_urls") && source["reference_image_urls"].is_array()) {
                 target["reference_image_urls"] = source["reference_image_urls"];
@@ -23517,6 +24284,17 @@ namespace {
 
         hit.alertRegionIds = parseAlertRegionIdsFromJson_(compatNode);
         parseTemporalFieldsFromJson_(compatNode, hit);
+        logIdentityPatchCheckpoint_(
+            logStreamId,
+            scopeTag,
+            "post_parse_temporal_fields_raw",
+            hit.identityPatch);
+        normalizeIdentityPatchArrayForMemory_(hit.identityPatch, logStreamId, scopeTag);
+        logIdentityPatchCheckpoint_(
+            logStreamId,
+            scopeTag,
+            "post_parse_normalized_for_memory",
+            hit.identityPatch);
         hit.crossCameraWatchlistMatches = parseCrossCameraWatchlistMatchesFromJson_(compatNode);
 
         const std::size_t rawCrossCameraMatchCount =
@@ -23561,6 +24339,11 @@ namespace {
         }
 
         applyStructuredVisionCompatCaps_(hit);
+        logIdentityPatchCheckpoint_(
+            logStreamId,
+            scopeTag,
+            "post_parse_compat_caps",
+            hit.identityPatch);
     }
 
     static bool hitHasStructuredMatch_(const VideoHit& hit)
@@ -23866,6 +24649,7 @@ namespace {
         bool temporalAlertMayUsePriorState = false;
         bool includeDetectionTimeInVideo = false;
         bool requireDetectionTimeInVideo = false;
+        bool fullUploadedVideoSegment = false;
     };
 
     static bool usesDirectChatIdentityContinuity_(
@@ -23874,6 +24658,18 @@ namespace {
         return options.modality == OpenAIVisionModality_::Video &&
             options.directChatFlow &&
             !options.useTemporalDeltaContract;
+    }
+
+    static bool usesIdentityMemory_(
+        const OpenAIVisionPromptOptions_& options)
+    {
+        return options.hasTemporal || usesDirectChatIdentityContinuity_(options);
+    }
+
+    static bool requiresIdentitySignatureTraits_(
+        const OpenAIVisionPromptOptions_& options)
+    {
+        return usesIdentityMemory_(options);
     }
 
     struct OpenAIVisionRequestBuild_ {
@@ -23901,7 +24697,7 @@ namespace {
         std::size_t dynamicPromptBytes = 0;
     };
 
-    static constexpr const char* kOpenAIVisionPromptRevision_ = "vision-cache-v4";
+    static constexpr const char* kOpenAIVisionPromptRevision_ = "vision-cache-v5";
 
     static std::string hashString64Hex_(const std::string& value)
     {
@@ -24315,6 +25111,20 @@ namespace {
         return nlohmann::json{ { "type", nlohmann::json::array({ "number", "null" }) } };
     }
 
+    static nlohmann::json makeNullableStringEnumSchema_(
+        std::initializer_list<const char*> values)
+    {
+        nlohmann::json enumValues = nlohmann::json::array();
+        for (const char* value : values) {
+            if (value && *value) enumValues.push_back(std::string(value));
+        }
+        enumValues.push_back(nullptr);
+        return nlohmann::json{
+            { "type", nlohmann::json::array({ "string", "null" }) },
+            { "enum", std::move(enumValues) }
+        };
+    }
+
     static nlohmann::json makeNullableStringArraySchema_(int maxItems)
     {
         nlohmann::json schema = {
@@ -24324,6 +25134,21 @@ namespace {
             }}
         };
         if (maxItems > 0) schema["maxItems"] = maxItems;
+        return schema;
+    }
+
+    static nlohmann::json makeStringArraySchema_(
+        int maxItems,
+        int minItems = 0)
+    {
+        nlohmann::json schema = {
+            { "type", "array" },
+            { "items", {
+                { "type", "string" }
+            }}
+        };
+        if (maxItems > 0) schema["maxItems"] = maxItems;
+        if (minItems > 0) schema["minItems"] = minItems;
         return schema;
     }
 
@@ -24384,23 +25209,29 @@ namespace {
     static nlohmann::json makePortraitCropSchema_()
     {
         return makeNullableObjectSchema_(nlohmann::json{
-            { "kind", makeNullableStringSchema_() },
+            { "kind", makeNullableStringEnumSchema_({ "face", "full_object" }) },
             { "confidence", makeNullableNumberSchema_() },
-            { "bbox_norm_in_cell", makeNormalizedBboxSchema_() }
+            { "bbox_norm_in_cell", makeNormalizedBboxSchema_() },
+            { "bbox_norm_in_frame", makeNormalizedBboxSchema_() }
         });
     }
 
     static nlohmann::json makeNullableObjectArraySchemaWithItemProperties_(
         nlohmann::json itemProperties,
-        int maxItems)
+        int maxItems,
+        nlohmann::json itemRequired = nlohmann::json::array())
     {
+        nlohmann::json itemSchema = {
+            { "type", "object" },
+            { "additionalProperties", false },
+            { "properties", std::move(itemProperties) }
+        };
+        if (itemRequired.is_array() && !itemRequired.empty()) {
+            itemSchema["required"] = std::move(itemRequired);
+        }
         nlohmann::json schema = {
             { "type", nlohmann::json::array({ "array", "null" }) },
-            { "items", {
-                { "type", "object" },
-                { "additionalProperties", false },
-                { "properties", std::move(itemProperties) }
-            }}
+            { "items", std::move(itemSchema) }
         };
         if (maxItems > 0) schema["maxItems"] = maxItems;
         return schema;
@@ -24423,8 +25254,14 @@ namespace {
         const std::string& cacheVariant)
     {
         const bool allowIdentityPatch =
-            options.hasTemporal || usesDirectChatIdentityContinuity_(options);
+            usesIdentityMemory_(options);
+        const bool requireIdentitySignatureTraits =
+            requiresIdentitySignatureTraits_(options);
         if (options.useTemporalDeltaContract) {
+            const nlohmann::json identityUpdateRequired =
+                requireIdentitySignatureTraits
+                    ? nlohmann::json::array({ "identity_signature_traits" })
+                    : nlohmann::json::array();
             nlohmann::json properties = {
                 { "answer", makeNullableStringSchema_() },
                 { "local_alert_update", makeNullableObjectSchema_(nlohmann::json{
@@ -24440,18 +25277,27 @@ namespace {
                         { "entity_id", makeNullableStringSchema_() },
                         { "entity_key", makeNullableStringSchema_() },
                         { "entity_type", makeNullableStringSchema_() },
-                        { "decision", makeNullableStringSchema_() },
+                        { "decision",
+                            makeNullableStringEnumSchema_(
+                                { "match_existing", "new_entity", "unknown" }) },
                         { "confidence", makeNullableNumberSchema_() },
                         { "short_description", makeNullableStringSchema_() },
                         { "identity_feature_candidates", makeIdentityFeatureCandidateArraySchema_() },
-                        { "identity_signature_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "identity_signature_traits",
+                            requireIdentitySignatureTraits
+                                ? makeStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_), 1)
+                                : makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "identity_context_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityContextTraitItems_)) },
                         { "scene_brief", makeNullableStringSchema_() },
+                        { "portrait_crop", makePortraitCropSchema_() },
+                        { "context_bbox_norm_in_cell", makeNormalizedBboxSchema_() },
+                        { "context_bbox_norm_in_frame", makeNormalizedBboxSchema_() },
                         { "reference_image_urls", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxReferenceImageUrls_)) },
                         { "frame_ref", makeFrameRefSchema_() }
                     },
-                    static_cast<int>(kStructuredVisionMaxIdentityPatchItems_)) },
+                    static_cast<int>(kStructuredVisionMaxIdentityPatchItems_),
+                    identityUpdateRequired) },
                 { "visibility_updates", makeNullableObjectArraySchemaWithItemProperties_(
                     nlohmann::json{
                         { "entity_id", makeNullableStringSchema_() },
@@ -24534,26 +25380,37 @@ namespace {
         });
 
         if (allowIdentityPatch) {
+            const nlohmann::json identityPatchRequired =
+                requireIdentitySignatureTraits
+                    ? nlohmann::json::array({ "identity_signature_traits" })
+                    : nlohmann::json::array();
             properties["identity_patch"] =
                 makeNullableObjectArraySchemaWithItemProperties_(
                     nlohmann::json{
                         { "entity_id", makeNullableStringSchema_() },
                         { "entity_key", makeNullableStringSchema_() },
                         { "entity_type", makeNullableStringSchema_() },
-                        { "decision", makeNullableStringSchema_() },
+                        { "decision",
+                            makeNullableStringEnumSchema_(
+                                { "match_existing", "new_entity", "unknown" }) },
                         { "confidence", makeNullableNumberSchema_() },
                         { "description", makeNullableStringSchema_() },
                         { "short_description", makeNullableStringSchema_() },
                         { "identity_feature_candidates", makeIdentityFeatureCandidateArraySchema_() },
-                        { "identity_signature_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
+                        { "identity_signature_traits",
+                            requireIdentitySignatureTraits
+                                ? makeStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_), 1)
+                                : makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "updated_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityTraitItems_)) },
                         { "identity_context_traits", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxIdentityContextTraitItems_)) },
                         { "portrait_crop", makePortraitCropSchema_() },
                         { "context_bbox_norm_in_cell", makeNormalizedBboxSchema_() },
+                        { "context_bbox_norm_in_frame", makeNormalizedBboxSchema_() },
                         { "reference_image_urls", makeNullableStringArraySchema_(static_cast<int>(kStructuredVisionMaxReferenceImageUrls_)) },
                         { "frame_ref", makeFrameRefSchema_() }
                     },
-                    static_cast<int>(kStructuredVisionMaxIdentityPatchItems_));
+                    static_cast<int>(kStructuredVisionMaxIdentityPatchItems_),
+                    identityPatchRequired);
             required.push_back("identity_patch");
         }
         if (options.hasTemporal) {
@@ -24659,7 +25516,7 @@ namespace {
 
     static std::string buildOpenAIVideoMosaicRuntimeText_(
         const PromptVideoMosaicBundle_& bundle,
-        int modelInputFps)
+        double modelInputFps)
     {
         const nlohmann::json runtime = {
             { "layout_id", bundle.layoutId },
@@ -24684,6 +25541,19 @@ namespace {
     {
         if (!options.useTemporalDeltaContract) return std::string();
 
+        const bool usesVideoCellCoordinates =
+            options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics;
+        const char* localizationSurface =
+            usesVideoCellCoordinates ? "current mosaic cell" : "current frame";
+        const char* portraitBboxField =
+            usesVideoCellCoordinates ? "bbox_norm_in_cell" : "bbox_norm_in_frame";
+        const char* contextBboxField =
+            usesVideoCellCoordinates ? "context_bbox_norm_in_cell" : "context_bbox_norm_in_frame";
+        const char* bboxNormalizationText =
+            usesVideoCellCoordinates
+                ? "normalized to the current cell (0..1)"
+                : "normalized to the full frame (0..1)";
+
         std::ostringstream prompt;
         prompt << "TEMPORAL DELTA OUTPUT CONTRACT:\n";
         prompt << "- Return only updates discovered in the current batch.\n";
@@ -24694,6 +25564,7 @@ namespace {
         prompt << "- local_alert_update is optional. Emit it only when the current batch itself provides local alert evidence. Do not emit a false alert update.\n";
         prompt << "- start_condition_update is optional. Emit it only when the current batch clearly satisfies the start condition.\n";
         prompt << "- identity_updates are optional overall, but for each tracked entity or shared cross-camera target that is visibly present in the current batch, emit one compact identity_updates item with entity_id when known and only the minimum fields needed for continuity in this batch.\n";
+        prompt << "- Every emitted identity_updates item must include non-empty identity_signature_traits.\n";
         prompt << "- short_description is optional and delta-only. Emit it only for a newly seen entity or when the current batch materially changes the concise summary relative to prior description or recent memory.\n";
         prompt << "- identity_feature_candidates is an optional delta-only structured identity field when enough detail is visible for reidentification.\n";
         prompt << "- Emit identity_feature_candidates only when the current batch introduces a strong new target-centric cue, clearly corrects or contradicts prior identity memory, or establishes identity for a newly seen entity.\n";
@@ -24705,9 +25576,21 @@ namespace {
         prompt << "- Only target-attached relations belong in identity_signature_traits. Nearby detached objects, background, scene layout, pose, and activity must stay out of the identity signature.\n";
         prompt << "- When possible, also emit identity_signature_traits as the primary language-agnostic identity field for cross-camera reidentification. Fill it with strong target-centric physical identity cues only.\n";
         prompt << "- If a visible tracked entity or shared hunt target has enough appearance detail for reidentification, do not omit identity_signature_traits just because the identity looks unchanged from prior rounds. Repeat the explicit identity cues that remain visually supported.\n";
-        prompt << "- For a visible person, prioritize identity_signature_traits first around intrinsic physical cues such as visible skin tone, hair color/style/length, beard or mustache, tattoos, scars, body build, baldness, or other stable facial/body markers. Treat glasses or jewelry as secondary target-attached cues. Use clothing, bags, and carried objects only as fallback identity cues when stronger intrinsic traits are not clearly visible.\n";
-        prompt << "- For a clearly visible person supporting a hit or answer, treat visible skin tone and facial hair as mandatory identity cues when they are visually supportable. Do not substitute room, furniture, computer, or activity details for missing hair information.\n";
-        prompt << "- If hair is hidden by cap, hat, hood, or other headwear, say that briefly in identity_context_traits and keep identity_signature_traits focused on the visible face and body cues.\n";
+        prompt << "- When multiple distinct visible entities materially interact in the current batch, emit separate identity_updates items instead of collapsing them into one entity.\n";
+                prompt << "- For a visible person, prioritize identity_signature_traits first around intrinsic physical cues such as visible skin tone, hair color/style/length or baldness, body build, beard or mustache, tattoos, scars, or other stable facial/body markers. Treat glasses or jewelry as secondary target-attached cues. Use clothing, bags, and carried objects only as fallback identity cues when stronger intrinsic traits are not clearly visible.\n";
+                prompt << "- For a clearly visible person supporting a hit or answer, treat visible skin tone, hair appearance or baldness, and body build as mandatory identity categories when they are visually supportable. Facial hair is an additional high-value cue, but do not substitute room, furniture, computer, or activity details for missing hair/build information.\n";
+                prompt << "- If hair is hidden by cap, hat, hood, or other headwear, say that briefly in identity_context_traits and keep identity_signature_traits focused on the visible face and body cues instead of inventing hair color.\n";
+        prompt << "- For the first clearly visible positive tracked target in this batch, include portrait_crop or "
+               << contextBboxField
+               << " whenever localization is feasible so backend memory can preserve an identity card.\n";
+        prompt << "- When a visible entity is clearly localizable in the " << localizationSurface
+               << ", portrait_crop should include kind, confidence, and "
+               << portraitBboxField << " where " << portraitBboxField << " is " << bboxNormalizationText << ".\n";
+        prompt << "- For entity_type=person, portrait_crop.kind must be face when a face is visible and localizable. If a reliable face crop is not available, omit portrait_crop and provide only "
+               << contextBboxField << " for body/context evidence.\n";
+        prompt << "- For non-person entities, use portrait_crop.kind=full_object and make "
+               << portraitBboxField << " cover the visible target whenever the object is localizable.\n";
+        prompt << "- Never emit portrait_crop for a tiny, blurred, heavily occluded, or uncertain target.\n";
         prompt << "- For a visible vehicle, prioritize identity_signature_traits such as make, model, color, body style, plate or visible plate fragments, stickers, dents, scratches, broken lights, rack, or other distinctive body details.\n";
         prompt << "- identity_context_traits is optional, delta-only, and should contain only a few brief non-identity cues for current-round continuity. Emit it only when the current batch adds or changes continuity context. Keep it short and do not use it as a substitute for identity_signature_traits.\n";
         prompt << "- scene_brief is optional and should be a very short scene hint only when useful for continuity. Keep it to a few words.\n";
@@ -24743,11 +25626,21 @@ namespace {
         prompt << "- All JSON field names must remain in English.\n";
         if (options.useTemporalDeltaContract) {
             prompt << "- `answer` is optional in this automated temporal delta contract.\n";
-            prompt << "- When you do emit `answer`, write it in the same language as the task text and keep it to one short sentence.\n";
+            if (options.fullUploadedVideoSegment) {
+                prompt << "- When you do emit `answer`, write it in the same language as the task text and summarize the main sequence of the full uploaded video in 2-5 short factual sentences.\n";
+            }
+            else {
+                prompt << "- When you do emit `answer`, write it in the same language as the task text and keep it to one short sentence.\n";
+            }
         }
         else {
             prompt << "- Write `answer` in the same language as the task text.\n";
-            prompt << "- Keep `answer` concise; prefer one short sentence unless the task explicitly needs more detail.\n";
+            if (options.fullUploadedVideoSegment) {
+                prompt << "- Because this request covers a full uploaded video segment, summarize the main sequence in 2-5 short factual sentences when needed.\n";
+            }
+            else {
+                prompt << "- Keep `answer` concise; prefer one short sentence unless the task explicitly needs more detail.\n";
+            }
         }
         prompt << "- Be conservative: when uncertain, prefer null/empty optional fields and keep booleans false.\n";
         if (options.modality == OpenAIVisionModality_::Video) {
@@ -24806,6 +25699,17 @@ namespace {
     {
         const bool directChatIdentityContinuity =
             usesDirectChatIdentityContinuity_(options);
+        const bool usesVideoCellCoordinates = options.useVideoMosaics;
+        const char* localizationSurface =
+            usesVideoCellCoordinates ? "current mosaic cell" : "current frame";
+        const char* portraitBboxField =
+            usesVideoCellCoordinates ? "bbox_norm_in_cell" : "bbox_norm_in_frame";
+        const char* contextBboxField =
+            usesVideoCellCoordinates ? "context_bbox_norm_in_cell" : "context_bbox_norm_in_frame";
+        const char* bboxNormalizationText =
+            usesVideoCellCoordinates
+                ? "normalized to the current cell (0..1)"
+                : "normalized to the full frame (0..1)";
         std::ostringstream prompt;
         if (options.jobMode) {
             prompt << "JOB STEP MODE (AUTOMATION):\n";
@@ -24830,8 +25734,14 @@ namespace {
         }
 
         prompt << "IMPORTANT CONTEXT RULE:\n";
-        prompt << "- The analyzed segment is only PART of the full requested time window.\n";
-        prompt << "- Never imply that the answer covers the entire requested window.\n";
+        if (options.fullUploadedVideoSegment) {
+            prompt << "- This analyzed segment covers the FULL uploaded video for this request.\n";
+            prompt << "- Summarize the main sequence across the full uploaded video instead of focusing on only the first visible moment.\n";
+        }
+        else {
+            prompt << "- The analyzed segment is only PART of the full requested time window.\n";
+            prompt << "- Never imply that the answer covers the entire requested window.\n";
+        }
         if (options.hasTemporal) {
             prompt << "- Use current frames for new observations in this batch.\n";
             prompt << "- Use temporal context for identity continuity and cumulative interpretation only when explicitly allowed.\n\n";
@@ -24914,10 +25824,21 @@ namespace {
                 prompt << "- Do not repeat the same event just because later frames still show continuity of the same action.\n";
                 prompt << "- When later frames only confirm continuity, use continuation=true and counts_as_new_event=false inside that event update.\n";
                 prompt << "- When temporal context lets you match a visible entity to prior state, still emit a minimal identity update with the current appearance snapshot even when the identity decision itself did not change; keep short_description, updated_traits, and identity_context_traits omitted unless they add new current-batch information.\n";
+                prompt << "- Every emitted identity_updates item must include non-empty identity_signature_traits with durable target-centric identity cues.\n";
+                prompt << "- When multiple distinct visible entities materially interact in the current batch, emit separate identity_updates items instead of collapsing them into one entity.\n";
+                prompt << "- When an event update and an identity update refer to the same visible entity, keep entity_id and entity_key consistent across both arrays.\n";
+                prompt << "- When a visible target is clearly localizable in the " << localizationSurface << ", include portrait_crop or " << contextBboxField << " inside identity_updates whenever backend identity memory would benefit from preserving a card.\n";
+                prompt << "- portrait_crop should be an object with kind, confidence, and " << portraitBboxField << " where " << portraitBboxField << " has x,y,w,h " << bboxNormalizationText << ".\n";
+                prompt << "- For entity_type=person, portrait_crop.kind must be face when a face is visible and localizable; otherwise omit portrait_crop and provide only " << contextBboxField << " for body/context evidence.\n";
+                prompt << "- For non-person entities, use portrait_crop.kind=full_object and make " << portraitBboxField << " cover the whole visible target whenever the object is localizable.\n";
+                prompt << "- Never invent a crop for a tiny, blurred, occluded, or uncertain target.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
                 prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+                prompt << "- Every emitted identity_patch item must include non-empty identity_signature_traits with durable target-centric identity cues.\n";
+                prompt << "- When multiple distinct visible entities materially interact in the current batch, emit separate identity_patch items instead of collapsing them into one entity.\n";
+                prompt << "- When an observation and an identity_patch refer to the same visible entity, keep entity_id and entity_key consistent across both arrays.\n";
                 if (options.directChatFlow) {
                     prompt << "- If this batch contains a newly seen entity that directly satisfies the user's positive search target or answer, emit one identity_patch item for that entity so later rounds can refer to the same target.\n";
                     prompt << "- In temporal chat video search, use identity_patch to seed continuity for the first clearly visible positive target even when that entity was not already in prior memory.\n";
@@ -24925,16 +25846,19 @@ namespace {
                 prompt << "- Do not repeat the same event in observations just because later frames still show the entity in the middle of that same action.\n";
                 prompt << "- If you need to mention that later frame, keep the same observation as continuity using continuation=true and counts_as_new_event=false.\n";
                 prompt << "- When temporal context lets you match a visible entity to prior state, prefer including decision and confidence in identity_patch.\n";
+                prompt << "- When you include identity_patch.decision, use only the exact values match_existing, new_entity, or unknown; never invent synonyms.\n";
+                prompt << "- For a clearly visible person, include at least three intrinsic physical identity cues when visually supportable, prioritizing one skin tone cue, one hair or baldness cue, and one body build cue before clothing or scene detail.\n";
+                prompt << "- Never use room, furniture, doors, walls, layout, pose, or activity as identity_signature_traits.\n";
                 prompt << "- portrait_crop is not required for every round, but for the first clearly visible positive tracked target in this chat it should be present whenever the target is localizable enough for backend memory.\n";
                 if (options.directChatFlow) {
-                    prompt << "- When the first relevant positive target in temporal chat is visible, do not leave identity_patch empty, and include portrait_crop or context_bbox_norm_in_cell whenever localization is feasible so backend memory can preserve an identity card for later recall.\n";
+                    prompt << "- When the first relevant positive target in temporal chat is visible, do not leave identity_patch empty, and include portrait_crop or " << contextBboxField << " whenever localization is feasible so backend memory can preserve an identity card for later recall.\n";
                 }
                 prompt << "- If the same tracked entity is already known from prior rounds, omit portrait_crop unless this batch provides a materially clearer crop than before.\n";
                 prompt << "- Never emit portrait_crop just to repeat an already adequate portrait for the same tracked entity.\n";
-                prompt << "- When a visible entity is clearly localizable in the current mosaic cell, include portrait_crop inside identity_patch instead of omitting it.\n";
-                prompt << "- portrait_crop should be an object with kind, confidence, and bbox_norm_in_cell where bbox_norm_in_cell has x,y,w,h normalized to the current cell (0..1).\n";
-                prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; if the face is not clearly localizable, still provide context_bbox_norm_in_cell for a body/context crop.\n";
-                prompt << "- For non-person entities, use portrait_crop.kind=full_object and make bbox_norm_in_cell cover the whole visible target whenever the object is localizable.\n";
+                prompt << "- When a visible entity is clearly localizable in the " << localizationSurface << ", include portrait_crop inside identity_patch instead of omitting it.\n";
+                prompt << "- portrait_crop should be an object with kind, confidence, and " << portraitBboxField << " where " << portraitBboxField << " has x,y,w,h " << bboxNormalizationText << ".\n";
+                prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; if the face is not clearly localizable, omit portrait_crop and provide " << contextBboxField << " for a body/context crop.\n";
+                prompt << "- For non-person entities, use portrait_crop.kind=full_object and make " << portraitBboxField << " cover the whole visible target whenever the object is localizable.\n";
                 prompt << "- Never invent a crop for a tiny, blurred, occluded, or uncertain target.\n";
             }
         }
@@ -24944,17 +25868,18 @@ namespace {
             prompt << "- identity_patch must contain JSON objects only.\n";
             prompt << "- Do not emit absent/not_visible continuity patches in this mode.\n";
             prompt << "- When possible, include frame_ref for the representative evidence frame of that visible target.\n";
-            prompt << "- When a visible positive target supports the answer, prefer including identity_signature_traits with 2-8 durable target-centric cues so the chat identity card can preserve those characteristics.\n";
-            prompt << "- For a clearly visible person that supports the answer, include at least two intrinsic physical identity cues when visually supportable, prioritizing skin tone and facial hair before clothing or room details.\n";
-            prompt << "- If hair is hidden by cap, hat, hood, or other headwear, note that occlusion briefly in identity_context_traits instead of replacing the missing hair detail with background, pose, or activity.\n";
+            prompt << "- Every emitted identity_patch item must include non-empty identity_signature_traits with 2-8 durable target-centric cues so the chat identity card can preserve those characteristics.\n";
+                prompt << "- For a clearly visible person that supports the answer, include at least three intrinsic physical identity cues when visually supportable, prioritizing one skin tone cue, one hair or baldness cue, and one body build cue before clothing or room details.\n";
+                prompt << "- If hair is hidden by cap, hat, hood, or other headwear, note that occlusion briefly in identity_context_traits instead of replacing the missing hair detail with background, pose, or activity.\n";
             prompt << "- Never use doors, windows, walls, furniture, computers, room layout, pose, or activity as identity_signature_traits, identity_feature_candidates, key_traits, or stable_attributes.\n";
+            prompt << "- If multiple distinct visible entities materially interact in this clip, emit separate identity_patch items for each relevant visible entity instead of collapsing them into one patch.\n";
             prompt << "- portrait_crop is not required for every round, but it should be included whenever that visible positive target is localizable enough for backend memory.\n";
             prompt << "- If the same tracked entity already has an adequate portrait in prior chat memory, omit portrait_crop unless this batch provides a materially clearer crop than before.\n";
             prompt << "- Never emit portrait_crop just to repeat an already adequate portrait for the same tracked entity.\n";
-            prompt << "- When a visible entity is clearly localizable in the current mosaic cell and it directly supports the answer, include portrait_crop or context_bbox_norm_in_cell inside identity_patch so backend memory can preserve an identity card.\n";
-            prompt << "- portrait_crop should be an object with kind, confidence, and bbox_norm_in_cell where bbox_norm_in_cell has x,y,w,h normalized to the current cell (0..1).\n";
-            prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; otherwise still provide context_bbox_norm_in_cell for a body/context crop.\n";
-            prompt << "- For non-person entities, use portrait_crop.kind=full_object and make bbox_norm_in_cell cover the whole visible target whenever the object is localizable.\n";
+            prompt << "- When a visible entity is clearly localizable in the " << localizationSurface << " and it directly supports the answer, include portrait_crop or " << contextBboxField << " inside identity_patch so backend memory can preserve an identity card.\n";
+            prompt << "- portrait_crop should be an object with kind, confidence, and " << portraitBboxField << " where " << portraitBboxField << " has x,y,w,h " << bboxNormalizationText << ".\n";
+            prompt << "- For entity_type=person, if the face is visible and localizable, portrait_crop.kind=face should be used; otherwise provide only " << contextBboxField << " for a body/context crop.\n";
+            prompt << "- For non-person entities, use portrait_crop.kind=full_object and make " << portraitBboxField << " cover the whole visible target whenever the object is localizable.\n";
             prompt << "- Never invent a crop for a tiny, blurred, occluded, or uncertain target.\n";
         }
         if (options.hasFaceReferences) {
@@ -24987,7 +25912,7 @@ namespace {
         const VisionPromptSections_& sections,
         const std::string& segmentStartForPrompt,
         const std::string& segmentEndForPrompt,
-        int modelInputFps,
+        double modelInputFps,
         const PromptVideoMosaicBundle_* mosaicBundle)
     {
         std::ostringstream prompt;
@@ -25086,10 +26011,12 @@ namespace {
             if (options.useTemporalDeltaContract) {
                 prompt << "- identity_updates, visibility_updates, event_updates, watchlist_updates, and unknown_reasons must contain JSON objects only.\n";
                 prompt << "- If a tracked entity is visible, do not let visibility_updates replace identity_updates; emit a compact identity snapshot for continuity and add visibility_updates only when the visibility state itself changed or otherwise materially matters.\n";
+                prompt << "- Every emitted identity_updates item must include non-empty identity_signature_traits with durable target-centric identity cues.\n";
             }
             else {
                 prompt << "- identity_patch and observations must contain JSON objects only.\n";
                 prompt << "- If a tracked entity is visible, do not leave identity_patch empty.\n";
+                prompt << "- Every emitted identity_patch item must include non-empty identity_signature_traits with durable target-centric identity cues.\n";
             }
         }
         if (options.hasFaceReferences) {
@@ -25133,7 +26060,15 @@ namespace {
         const OpenAIVisionPromptOptions_& options)
     {
         const bool allowIdentityPatch =
-            options.hasTemporal || usesDirectChatIdentityContinuity_(options);
+            usesIdentityMemory_(options);
+        const bool requireIdentitySignatureTraits =
+            requiresIdentitySignatureTraits_(options);
+        const bool usesVideoCellCoordinates =
+            options.modality == OpenAIVisionModality_::Video && options.useVideoMosaics;
+        const char* portraitBboxField =
+            usesVideoCellCoordinates ? "bbox_norm_in_cell" : "bbox_norm_in_frame";
+        const char* contextBboxField =
+            usesVideoCellCoordinates ? "context_bbox_norm_in_cell" : "context_bbox_norm_in_frame";
         std::ostringstream prompt;
         if (options.useTemporalDeltaContract) {
             prompt << "RESPONSE FORMAT (RAW JSON ONLY, TEMPORAL DELTA CONTRACT):\n";
@@ -25144,7 +26079,11 @@ namespace {
             prompt << "- identity_updates: optional array (max " <<
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
             prompt << "- identity_updates[*].short_description: optional delta-only string; emit only for a newly seen entity or a material summary change, otherwise omit\n";
-            prompt << "- identity_updates[*].identity_signature_traits: optional array of strong physical identity cues (max " <<
+            prompt << "- identity_updates[*].identity_signature_traits: " <<
+                (requireIdentitySignatureTraits
+                    ? "required non-empty array"
+                    : "optional array")
+                << " of strong physical identity cues (max " <<
                 kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
             prompt << "- identity_updates[*].identity_feature_candidates: optional delta-only array (max " <<
                 kStructuredVisionMaxIdentityFeatureCandidates_ << " items); emit it only for new, corrective, or contradictory structured identity cues, or for a newly seen entity. Omit it when merely restating prior identity memory. Each item should include text, category, and relation_to_target.\n";
@@ -25153,6 +26092,8 @@ namespace {
             prompt << "- identity_updates[*].identity_context_traits: optional delta-only array of brief continuity or context cues (max " <<
                 kStructuredVisionMaxIdentityContextTraitItems_ << " items); omit when unchanged from recent memory\n";
             prompt << "- identity_updates[*].scene_brief: optional very short scene hint string; omit when not useful\n";
+            prompt << "- identity_updates[*].portrait_crop: optional object with kind, confidence, and " << portraitBboxField << "\n";
+            prompt << "- identity_updates[*]." << contextBboxField << ": optional normalized body/context bbox object with x,y,w,h\n";
             prompt << "- visibility_updates: optional delta-only array (max " <<
                 kStructuredVisionMaxObservationItems_ << " items); emit only for visibility changes, absence, uncertainty, or when visibility needs explicit clarification\n";
             prompt << "- event_updates: optional array (max " <<
@@ -25187,9 +26128,13 @@ namespace {
             prompt << "- identity_patch: array or null (max " <<
                 kStructuredVisionMaxIdentityPatchItems_ << " items)\n";
             prompt << "- identity_patch[*].entity_id/entity_key/entity_type: optional identifiers for the visible target\n";
-            prompt << "- identity_patch[*].decision/confidence: optional continuity fields when identity is positively supported\n";
+            prompt << "- identity_patch[*].decision/confidence: optional continuity fields when identity is positively supported; if decision is present, use only match_existing, new_entity, or unknown\n";
             prompt << "- identity_patch[*].description or short_description: optional short target-centric summary; never use room or activity prose here\n";
-            prompt << "- identity_patch[*].identity_signature_traits: optional array of durable physical identity cues (max " <<
+            prompt << "- identity_patch[*].identity_signature_traits: " <<
+                (requireIdentitySignatureTraits
+                    ? "required non-empty array"
+                    : "optional array")
+                << " of durable physical identity cues (max " <<
                 kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
             prompt << "- identity_patch[*].identity_feature_candidates: optional structured target-centric cues (max " <<
                 kStructuredVisionMaxIdentityFeatureCandidates_ << " items); each item should include text, category, and relation_to_target\n";
@@ -25197,8 +26142,8 @@ namespace {
                 kStructuredVisionMaxIdentityTraitItems_ << " items)\n";
             prompt << "- identity_patch[*].identity_context_traits: optional brief visibility or continuity cues (max " <<
                 kStructuredVisionMaxIdentityContextTraitItems_ << " items)\n";
-            prompt << "- identity_patch[*].portrait_crop: optional object with kind, confidence, and bbox_norm_in_cell\n";
-            prompt << "- identity_patch[*].context_bbox_norm_in_cell: optional normalized target context bbox object with x,y,w,h\n";
+            prompt << "- identity_patch[*].portrait_crop: optional object with kind, confidence, and " << portraitBboxField << "\n";
+            prompt << "- identity_patch[*]." << contextBboxField << ": optional normalized target context bbox object with x,y,w,h\n";
             prompt << "- identity_patch[*].frame_ref: optional representative evidence frame object\n";
         }
         if (options.hasTemporal) {
@@ -25234,13 +26179,19 @@ namespace {
             prompt << "- In direct chat identity continuity mode, if a clearly visible positive target directly supports the answer or clearly matches prior memory, emit one identity_patch item for that target and do not leave identity_patch empty.\n";
             prompt << "- When detection_time_in_video is emitted, identity_patch must refer to that same positive target so chat memory can attach the identity card to the hit.\n";
             prompt << "- Do not emit absent/not_visible continuity patches in this mode.\n";
-            prompt << "- Prefer including identity_signature_traits for that target so the chat identity card can surface the main characteristics.\n";
-            prompt << "- For a clearly visible person in this mode, include at least two durable physical identity cues when visually supportable, prioritizing visible skin tone and facial hair before clothing or room detail.\n";
-            prompt << "- If hair is occluded by headwear, mention the occlusion briefly in identity_context_traits instead of replacing it with background, room, or activity detail.\n";
+            prompt << "- identity_patch must include non-empty identity_signature_traits for that target so the chat identity card can surface the main characteristics.\n";
+            prompt << "- For a clearly visible person in this mode, include at least three durable physical identity cues when visually supportable, prioritizing one skin tone cue, one hair or baldness cue, and one body build cue before clothing or room detail.\n";
+            prompt << "- Even when portrait_crop is omitted or face localization is not possible, still emit identity_signature_traits plus identity_feature_candidates for every visible person or object of interest.\n";
+            prompt << "- If hair is occluded by headwear, mention the occlusion briefly in identity_context_traits instead of replacing it with background, room, or activity detail, and never infer hair color from clothing color.\n";
             prompt << "- Do not place doors, windows, walls, furniture, computers, room layout, pose, or activity inside identity_patch[*].identity_signature_traits or identity_patch[*].identity_feature_candidates.\n";
-            prompt << "- When a visible target is clearly localizable, include portrait_crop with kind, confidence, and bbox_norm_in_cell, plus context_bbox_norm_in_cell when helpful.\n";
+            prompt << "- When a visible target is clearly localizable, include portrait_crop with kind, confidence, and " << portraitBboxField << ", plus " << contextBboxField << " when helpful.\n";
         }
-        prompt << "- Keep answer short and factual.\n";
+        if (options.fullUploadedVideoSegment) {
+            prompt << "- Because this segment covers the full uploaded video, answer in 2-5 short factual sentences that summarize the main sequence chronologically when helpful.\n";
+        }
+        else {
+            prompt << "- Keep answer short and factual.\n";
+        }
         prompt << "- No markdown, no code fences, no extra keys.\n";
         return prompt.str();
     }
@@ -25414,14 +26365,15 @@ namespace {
         const std::string& startConditionText,
         const std::string& segmentStartForPrompt,
         const std::string& segmentEndForPrompt,
-        int modelInputFps,
+        double modelInputFps,
         const std::vector<PromptVideoFrame>& frames,
         const std::vector<FaceReferenceImage>& effectiveFaceReferences,
         const std::vector<NegativeReferenceImage>& effectiveNegativeReferences,
         const std::string& uploadedImageBase64,
         const std::string& videoPackagingMode,
         bool jobMode,
-        bool cameraStyleFlow)
+        bool cameraStyleFlow,
+        const EncodedVideoSegment* videoSegment = nullptr)
     {
         OpenAIVisionRequestBuild_ build;
         build.videoPackagingModeForLog = normalizeVideoPackagingMode_(videoPackagingMode);
@@ -25452,6 +26404,12 @@ namespace {
         options.includeDetectionTimeInVideo = !options.useTemporalDeltaContract;
         options.requireDetectionTimeInVideo =
             options.includeDetectionTimeInVideo && options.directChatFlow;
+        options.fullUploadedVideoSegment =
+            videoSegment != nullptr &&
+            videoSegment->uploadAnalysisSegment &&
+            videoSegment->uploadChunkCount <= 1 &&
+            videoSegment->uploadPlannedSampleCount > 0 &&
+            videoSegment->uploadPlannedSampleCount == videoSegment->uploadPlannedTotalSamples;
 
         const std::string staticSystemText = buildOpenAIVisionSystemText_(
             options,
@@ -26236,7 +27194,8 @@ namespace {
             manifestSegment != nullptr &&
             manifestSegment->uploadAnalysisSegment &&
             manifestSegment->uploadPlannedSampleCount > 0 &&
-            manifestSegment->uploadPlannedFps > 0;
+            (manifestSegment->uploadPlannedSamplingFps > 0.0 ||
+             manifestSegment->uploadPlannedFps > 0);
 
         auto normalizeFps = [](int fps) -> int {
             return clampRequestedModelFps_(fps);
@@ -26271,9 +27230,13 @@ namespace {
         }
 
         if (useUploadManifest && durationSec <= 0.0) {
+            const double manifestSamplingFps =
+                manifestSegment->uploadPlannedSamplingFps > 0.0
+                    ? manifestSegment->uploadPlannedSamplingFps
+                    : static_cast<double>((std::max)(1, manifestSegment->uploadPlannedFps));
             durationSec =
                 static_cast<double>(manifestSegment->uploadPlannedSampleCount) /
-                static_cast<double>((std::max)(1, manifestSegment->uploadPlannedFps));
+                manifestSamplingFps;
         }
 
         int clipNominalSeconds = 0;
@@ -26413,7 +27376,10 @@ namespace {
 
         std::vector<double> sampleSeconds;
         if (useUploadManifest) {
-            const int effectiveFps = (std::max)(1, manifestSegment->uploadPlannedFps);
+            const double effectiveFps =
+                manifestSegment->uploadPlannedSamplingFps > 0.0
+                    ? manifestSegment->uploadPlannedSamplingFps
+                    : static_cast<double>((std::max)(1, manifestSegment->uploadPlannedFps));
             const int sampleCount = manifestSegment->uploadPlannedSampleCount;
             if (sampleCount > maxFrames) {
                 if (outFailureReason) {
@@ -26431,7 +27397,7 @@ namespace {
             }
             sampleSeconds.reserve(sampleCount);
             for (int i = 0; i < sampleCount; ++i) {
-                sampleSeconds.push_back(static_cast<double>(i) / static_cast<double>(effectiveFps));
+                sampleSeconds.push_back(static_cast<double>(i) / effectiveFps);
             }
         }
         else if (useZAiCoreModel) {
@@ -28503,6 +29469,12 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         );
         hit.segmentStartTs = segmentStartForPrompt;
         hit.segmentEndTs = segmentEndForPrompt;
+        const double promptSampledFps =
+            segment.uploadAnalysisSegment
+                ? (segment.uploadPlannedSamplingFps > 0.0
+                    ? segment.uploadPlannedSamplingFps
+                    : static_cast<double>((std::max)(1, segment.uploadPlannedFps)))
+                : static_cast<double>(modelInputFps);
 
         OpenAIVisionRequestBuild_ requestBuild = buildOpenAIVideoRequest_(
             modelName,
@@ -28511,14 +29483,15 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
             startConditionText,
             segmentStartForPrompt,
             segmentEndForPrompt,
-            modelInputFps,
+            promptSampledFps,
             frames,
             effectiveFaceReferences,
             effectiveNegativeReferences,
             uploadedImageBase64,
             videoPackagingMode,
             /*jobMode*/ false,
-            cameraStyleFlow
+            cameraStyleFlow,
+            &segment
         );
         logOpenAIVisionPromptBuild_(
             camLogId,
@@ -28790,6 +29763,10 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                 videoPackagingMode,
                 camLogId,
                 "callOpenAIVisionVideoSegment_");
+            mergeFallbackIdentityTraitsIntoPositivePatch_(
+                hit,
+                camLogId,
+                "callOpenAIVisionVideoSegment_");
             if (!hit.hasMatch &&
                 answerSupportsPositiveChatIdentityFallback_(hit.answer) &&
                 ((!hit.detectionTimeInVideo.empty()) ||
@@ -28977,6 +29954,12 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
         );
         hit.segmentStartTs = segmentStartForPrompt;
         hit.segmentEndTs = segmentEndForPrompt;
+        const double promptSampledFps =
+            segment.uploadAnalysisSegment
+                ? (segment.uploadPlannedSamplingFps > 0.0
+                    ? segment.uploadPlannedSamplingFps
+                    : static_cast<double>((std::max)(1, segment.uploadPlannedFps)))
+                : static_cast<double>(modelInputFps);
 
         OpenAIVisionRequestBuild_ requestBuild = buildOpenAIVideoRequest_(
             modelName,
@@ -28985,14 +29968,15 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             startConditionText,
             segmentStartForPrompt,
             segmentEndForPrompt,
-            modelInputFps,
+            promptSampledFps,
             frames,
             effectiveFaceReferences,
             effectiveNegativeReferences,
             /*uploadedImageBase64*/ std::string(),
             videoPackagingMode,
             /*jobMode*/ true,
-            /*cameraStyleFlow*/ true
+            /*cameraStyleFlow*/ true,
+            &segment
         );
         logOpenAIVisionPromptBuild_(
             camLogId,
@@ -33344,9 +34328,10 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
                 value == "compact_resolution" ||
                 value == "compact-resolution" ||
                 value == "compact resolution") {
-                return std::string("mosaic_3x3");
+                // Deprecated: 3x3 mosaics underperform for detail-heavy chat video analysis.
+                return std::string("frame_sequence");
             }
-            return std::string("mosaic_2x2");
+            return std::string("frame_sequence");
         };
 
         auto normalizeInferenceModel = [](std::string value) {
@@ -33723,7 +34708,8 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
         prompt << "- Prefer precise, testable alert and negative conditions.\n";
         prompt << "- Choose stable defaults when the user did not specify execution settings.\n";
         prompt << "- Valid input_type values: video, image.\n";
-        prompt << "- Valid video_packaging_mode values: mosaic_2x2, mosaic_3x3, frame_sequence.\n";
+        prompt << "- Valid video_packaging_mode values: mosaic_2x2, frame_sequence.\n";
+        prompt << "- Do not choose mosaic_3x3; it is deprecated because it weakens temporal/detail fidelity.\n";
         prompt << "- Valid inference_model values: ultra, ultra_plus, light, core, legacy, pro.\n";
         prompt << "- model_fps must be 1-5 when input_type=video; use 1 otherwise.\n";
         prompt << "- run_every should normally be 10 or 60 seconds.\n";
@@ -33742,7 +34728,7 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
         prompt << "  \"alert_condition\": \"...\",\n";
         prompt << "  \"negative_condition\": \"...\",\n";
         prompt << "  \"input_type\": \"video\",\n";
-        prompt << "  \"video_packaging_mode\": \"mosaic_2x2\",\n";
+        prompt << "  \"video_packaging_mode\": \"frame_sequence\",\n";
         prompt << "  \"inference_model\": \"ultra\",\n";
         prompt << "  \"model_fps\": 1,\n";
         prompt << "  \"run_every\": 60,\n";
@@ -34671,7 +35657,7 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
                     modelInputFps,
                     /*expectedWindowSeconds*/ 0,
                     runningResolution,
-                    std::string("mosaic"),
+                    std::string(kPreferredChatVideoPackagingMode_),
                     batchPrompt,
                     batchOutput,
                     batchTotal,
@@ -34956,7 +35942,7 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
             modelInputFps,
             /*expectedWindowSeconds*/ 0,
             runningResolution,
-            std::string("mosaic"),
+            std::string(kPreferredChatVideoPackagingMode_),
             batchPrompt,
             batchOutput,
             batchTotal,
@@ -35133,7 +36119,7 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
             modelInputFps,
             /*expectedWindowSeconds*/ 0,
             runningResolution,
-            std::string("mosaic"),
+            std::string(kPreferredChatVideoPackagingMode_),
             batchPrompt,
             batchOutput,
             batchTotal,

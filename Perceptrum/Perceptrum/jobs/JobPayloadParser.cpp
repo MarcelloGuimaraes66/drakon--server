@@ -151,7 +151,8 @@ static std::string normalizeVideoPackagingModeValue(std::string v) {
         v == "standard_resolution" || v == "standard-resolution" || v == "standard resolution") {
         return "mosaic_2x2";
     }
-    return "mosaic_3x3";
+    // Deprecated: 3x3 mosaics compress temporal/detail evidence too aggressively.
+    return "frame_sequence";
 }
 
 static int normalizeRunningResolutionValue(int raw, int fallback = 640) {
@@ -873,7 +874,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                         safeString(
                             ig,
                             "video_packaging_mode",
-                            safeString(ig, "videoPackagingMode", "mosaic")
+                            safeString(ig, "videoPackagingMode", "high_resolution")
                         )
                     );
 
@@ -1038,7 +1039,7 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                     safeString(
                         a,
                         "video_packaging_mode",
-                        safeString(a, "videoPackagingMode", "mosaic")
+                        safeString(a, "videoPackagingMode", "high_resolution")
                     )
                 );
                 ag.inference_model = normalizeInferenceModelName(

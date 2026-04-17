@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cwctype>
 #include <nlohmann/json.hpp>
 #include <shellapi.h>
+#include <utility>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -47,6 +49,14 @@ namespace winrt::DrakonDesktop::implementation
   }
 
   let lastTheme = "";
+
+  function cleanSessionValue(value) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (!text || /[\u0000-\u001f\u007f]/.test(text)) {
+      return "";
+    }
+    return text;
+  }
 
   function reportTheme() {
     if (!window.chrome || !window.chrome.webview) {
@@ -123,22 +133,17 @@ namespace winrt::DrakonDesktop::implementation
       }
 
       const payload = await response.json();
-      if (
-        payload &&
-        typeof payload.client_id === "string" &&
-        payload.client_id.trim() &&
-        typeof payload.exe_id === "string" &&
-        payload.exe_id.trim() &&
-        typeof payload.exe_token === "string" &&
-        payload.exe_token.trim()
-      ) {
+      const clientId = cleanSessionValue(payload && payload.client_id);
+      const exeId = cleanSessionValue(payload && payload.exe_id);
+      const exeToken = cleanSessionValue(payload && payload.exe_token);
+      if (clientId && exeId && exeToken) {
         window.chrome.webview.postMessage({
           type: "resident-runtime-session",
-          client_id: payload.client_id.trim(),
-          exe_id: payload.exe_id.trim(),
-          exe_token: payload.exe_token.trim(),
+          client_id: clientId,
+          exe_id: exeId,
+          exe_token: exeToken,
           timezone_iana:
-            typeof payload.timezone_iana === "string" ? payload.timezone_iana : ""
+            cleanSessionValue(payload && payload.timezone_iana)
         });
       }
     } catch {
@@ -230,6 +235,42 @@ namespace winrt::DrakonDesktop::implementation
                 return static_cast<wchar_t>(std::towlower(ch));
             });
             return value;
+        }
+
+        std::string TrimAsciiCopy(std::string value)
+        {
+            auto isSpace = [](unsigned char ch)
+            {
+                return std::isspace(ch) != 0;
+            };
+
+            while (!value.empty() && isSpace(static_cast<unsigned char>(value.front())))
+            {
+                value.erase(value.begin());
+            }
+
+            while (!value.empty() && isSpace(static_cast<unsigned char>(value.back())))
+            {
+                value.pop_back();
+            }
+
+            return value;
+        }
+
+        std::string CleanBridgeSessionValue(std::string value)
+        {
+            value = TrimAsciiCopy(std::move(value));
+            if (value.empty())
+            {
+                return {};
+            }
+
+            auto const hasControlByte = std::any_of(value.begin(), value.end(), [](unsigned char ch)
+            {
+                return ch < 0x20 || ch == 0x7F;
+            });
+
+            return hasControlByte ? std::string{} : value;
         }
 
         std::wstring BuildOrigin(Windows::Foundation::Uri const& uri)
@@ -720,12 +761,13 @@ namespace winrt::DrakonDesktop::implementation
             return;
         }
 
-        auto const clientId = payload.value("client_id", std::string{});
-        auto const exeId = payload.value("exe_id", std::string{});
-        auto const exeToken = payload.value("exe_token", std::string{});
-        auto const timezoneIana = payload.value("timezone_iana", std::string{});
+        auto const clientId = CleanBridgeSessionValue(payload.value("client_id", std::string{}));
+        auto const exeId = CleanBridgeSessionValue(payload.value("exe_id", std::string{}));
+        auto const exeToken = CleanBridgeSessionValue(payload.value("exe_token", std::string{}));
+        auto const timezoneIana = CleanBridgeSessionValue(payload.value("timezone_iana", std::string{}));
         if (clientId.empty() || exeId.empty() || exeToken.empty())
         {
+            AppendBootstrapTrace("site-host: ignored invalid resident runtime session payload");
             return;
         }
 

@@ -248,6 +248,22 @@ function truncateText(value: string | null, maxLen: number): string | null {
   return value.length > maxLen ? value.slice(0, maxLen) : value;
 }
 
+function normalizeIdentityCardId(value: string | null, entityId?: unknown): string | null {
+  const normalized = truncateText(readNonEmptyString(value), 160);
+  if (normalized) {
+    if (normalized.startsWith("identity_card:")) {
+      return normalized;
+    }
+    const normalizedEntityId = truncateText(readNonEmptyString(entityId), 120);
+    if (normalizedEntityId && normalized === normalizedEntityId) {
+      return truncateText(`identity_card:${normalizedEntityId}`, 160);
+    }
+    return normalized;
+  }
+  const normalizedEntityId = truncateText(readNonEmptyString(entityId), 120);
+  return normalizedEntityId ? truncateText(`identity_card:${normalizedEntityId}`, 160) : null;
+}
+
 function sanitizePathSegment(value: unknown, fallback = "na"): string {
   const raw = String(value ?? fallback).trim();
   const normalized = raw || fallback;
@@ -1983,10 +1999,9 @@ export async function persistIdentityCardOccurrences(
     const resolvedIdentity = asRecord(card.resolved_identity);
     const lastSeen = asRecord(card.last_seen);
     const identityCardId =
-      truncateText(
-        draft.identityCardId ||
-          readNonEmptyString(card.card_id, card.entity_id),
-        160
+      normalizeIdentityCardId(
+        draft.identityCardId || readNonEmptyString(card.card_id, card.entity_id),
+        card.entity_id
       ) || buildDeterministicId("identity", draft.chatSessionId, index, nowIso);
     const occurrenceId =
       truncateText(draft.occurrenceId || null, 160) ||

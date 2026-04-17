@@ -20,6 +20,7 @@ import {
   ONBOARDING_TARGETS,
   type OnboardingProviderKind,
   type OnboardingStepId,
+  type OnboardingTutorialKind,
 } from "@/react-app/lib/onboarding";
 import { brand } from "@/shared/brand";
 
@@ -117,6 +118,7 @@ function getPreviewCardIcon(icon: TutorialPreviewCard["icon"]) {
 
 function getStepView(
   stepId: OnboardingStepId | null,
+  tutorialKind: OnboardingTutorialKind,
   provider: OnboardingProviderKind | null,
   tutorialProceedWithoutWebcam: boolean,
   inlineMessage: string,
@@ -173,7 +175,7 @@ function getStepView(
         stageLabel: t("tutorial.common.stageOfTotal", { current: 1, total: 3 }),
         stageProgress: t("tutorial.common.progressOfTotal", { current: 1, total: 6 }),
         primaryLabel: t("tutorial.common.continue"),
-        showBack: true,
+        showBack: tutorialKind !== "api-key",
         panelMaxWidth: 540,
         accentClassName: "from-cyan-500/20 to-sky-500/10 border-cyan-400/35 text-cyan-100",
       };
@@ -249,7 +251,7 @@ function getStepView(
         stageLabel: t("tutorial.common.stageOfTotal", { current: 2, total: 3 }),
         stageProgress: t("tutorial.common.progressOfTotal", { current: 1, total: 9 }),
         primaryLabel: t("tutorial.common.continue"),
-        showBack: true,
+        showBack: tutorialKind !== "camera",
         centered: true,
         panelMaxWidth: 560,
         accentClassName: "from-emerald-500/18 to-cyan-500/10 border-emerald-400/35 text-emerald-100",
@@ -346,7 +348,7 @@ function getStepView(
         stageLabel: t("tutorial.common.stageOfTotal", { current: 3, total: 3 }),
         stageProgress: t("tutorial.common.progressOfTotal", { current: 1, total: 11 }),
         primaryLabel: t("tutorial.agentIntro.primary"),
-        showBack: true,
+        showBack: tutorialKind !== "agent",
         centered: true,
         panelMaxWidth: 560,
         accentClassName: "from-fuchsia-500/18 to-indigo-500/10 border-fuchsia-400/35 text-fuchsia-100",
@@ -409,6 +411,10 @@ function getStepView(
       return {
         title: t("tutorial.agentPolygons.title"),
         description: t("tutorial.agentPolygons.description"),
+        bullets: [
+          t("tutorial.agentPolygons.bullet1"),
+          t("tutorial.agentPolygons.bullet2"),
+        ],
         stageLabel: t("tutorial.common.stageOfTotal", { current: 3, total: 3 }),
         stageProgress: t("tutorial.common.progressOfTotal", { current: 7, total: 11 }),
         primaryLabel: t("tutorial.common.continue"),
@@ -459,7 +465,67 @@ function getStepView(
         showBack: true,
         accentClassName: "from-emerald-500/18 to-cyan-500/10 border-emerald-400/35 text-emerald-100",
       };
+    case "agent-camera-required":
+      return {
+        title: t("tutorial.agentCameraRequired.title"),
+        description: t("tutorial.agentCameraRequired.description"),
+        bullets: [
+          t("tutorial.agentCameraRequired.bullet1"),
+          t("tutorial.agentCameraRequired.bullet2"),
+        ],
+        primaryLabel: t("tutorial.agentCameraRequired.primary"),
+        centered: true,
+        panelMaxWidth: 560,
+        accentClassName: "from-amber-500/18 to-orange-500/10 border-amber-400/35 text-amber-100",
+      };
     case "complete":
+      if (tutorialKind === "api-key") {
+        return {
+          title: t("tutorial.complete.apiKey.title"),
+          description: t("tutorial.complete.apiKey.description"),
+          bullets: [
+            t("tutorial.complete.apiKey.bullet1"),
+            t("tutorial.complete.apiKey.bullet2"),
+          ],
+          primaryLabel: t("tutorial.complete.primary"),
+          centered: true,
+          panelMaxWidth: 520,
+          accentClassName: "from-cyan-500/20 to-blue-500/10 border-cyan-400/35 text-cyan-100",
+        };
+      }
+
+      if (tutorialKind === "camera") {
+        return {
+          title: t("tutorial.complete.camera.title"),
+          description: t("tutorial.complete.camera.description"),
+          bullets: [
+            t("tutorial.complete.camera.bullet1"),
+            t("tutorial.complete.camera.bullet2"),
+          ],
+          primaryLabel: t("tutorial.complete.primary"),
+          centered: true,
+          panelMaxWidth: 520,
+          accentClassName: "from-emerald-500/20 to-blue-500/10 border-emerald-400/35 text-emerald-100",
+        };
+      }
+
+      if (tutorialKind === "agent") {
+        return {
+          title: t("tutorial.complete.agent.title"),
+          description: t("tutorial.complete.agent.description"),
+          bullets: [
+            t("tutorial.complete.agent.bullet1"),
+            t("tutorial.complete.agent.bullet2"),
+          ],
+          primaryLabel: t("tutorial.complete.primary"),
+          centered: true,
+          panelMaxWidth: 520,
+          accentClassName: "from-fuchsia-500/20 to-blue-500/10 border-fuchsia-400/35 text-fuchsia-100",
+          illustration: "thumbs-up-detection",
+          illustrationCaption: t("tutorial.complete.visualCaption"),
+        };
+      }
+
       return {
         title: t("tutorial.complete.title"),
         description: tutorialProceedWithoutWebcam
@@ -489,6 +555,7 @@ export default function TutorialOverlay() {
   const {
     isHydrated,
     isOpen,
+    tutorialKind,
     currentStepId,
     selectedProvider,
     providerStatus,
@@ -516,6 +583,7 @@ export default function TutorialOverlay() {
     () =>
       getStepView(
         currentStepId,
+        tutorialKind,
         selectedProvider,
         tutorialProceedWithoutWebcam,
         inlineMessage,
@@ -528,6 +596,7 @@ export default function TutorialOverlay() {
       inlineMessage,
       selectedProvider,
       t,
+      tutorialKind,
       tutorialProceedWithoutWebcam,
     ]
   );
@@ -774,8 +843,12 @@ export default function TutorialOverlay() {
     clearInlineMessage();
 
     if (currentStepId === "welcome") {
-      startTutorial();
       await next();
+      return;
+    }
+
+    if (currentStepId === "agent-camera-required") {
+      startTutorial("camera");
       return;
     }
 

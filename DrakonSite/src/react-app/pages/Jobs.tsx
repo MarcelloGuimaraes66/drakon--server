@@ -1,4 +1,12 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+  type ChangeEvent,
+  type KeyboardEventHandler,
+} from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
@@ -224,7 +232,8 @@ function AutoGrowingTextarea({
 
 const parsePromptTemplate = (
   template: string,
-  fallbackAlertCondition?: string | null
+  fallbackAlertCondition?: string | null,
+  fallbackNegativeCondition?: string | null
 ): PromptEditorFields => {
   const raw = String(template || "");
   const lower = raw.toLowerCase();
@@ -243,7 +252,7 @@ const parsePromptTemplate = (
     return {
       prompt_template: raw,
       alert_condition: String(fallbackAlertCondition || "").trim(),
-      negative_condition: "",
+      negative_condition: String(fallbackNegativeCondition || "").trim(),
     };
   }
 
@@ -267,6 +276,9 @@ const parsePromptTemplate = (
 
   if (!parsed.alert_condition && fallbackAlertCondition) {
     parsed.alert_condition = String(fallbackAlertCondition).trim();
+  }
+  if (!parsed.negative_condition && fallbackNegativeCondition) {
+    parsed.negative_condition = String(fallbackNegativeCondition).trim();
   }
 
   return parsed;
@@ -1006,9 +1018,9 @@ type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
-const MAX_ULTRA_VIDEO_MODEL_FPS = 5;
+const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
 const MIN_STEP_TIMEOUT_SECONDS = 120;
-const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "mosaic_2x2";
+const DEFAULT_AGENT_VIDEO_PACKAGING_MODE: AgentVideoPackagingMode = "frame_sequence";
 
 const isAssignedTarget = (target: Pick<Target, "camera_id"> | null | undefined): boolean => {
   const cameraId = Number(target?.camera_id);
@@ -1205,8 +1217,16 @@ const normalizeAgentVideoPackagingMode = (
 const getAgentVideoPackagingModeLabel = (mode: AgentVideoPackagingMode): string => {
   if (mode === "frame_sequence") return "High Resolution";
   if (mode === "mosaic_2x2") return "Standard Resolution";
-  return "Compact Resolution";
+  return "Legacy Packaging";
 };
+
+const isSelectableAgentVideoPackagingMode = (
+  mode: AgentVideoPackagingMode
+): mode is Exclude<AgentVideoPackagingMode, "mosaic_3x3"> =>
+  mode === "frame_sequence" || mode === "mosaic_2x2";
+
+const getAgentVideoPackagingSelectValue = (mode: AgentVideoPackagingMode): AgentVideoPackagingMode | "" =>
+  isSelectableAgentVideoPackagingMode(mode) ? mode : "";
 
 const supportsAdjustableAgentVideoFps = (inferenceModel: AgentInferenceModel): boolean =>
   inferenceModel === "ultra" || inferenceModel === "ultra_plus" || inferenceModel === "light";
@@ -1374,6 +1394,66 @@ const parseNonNegativeIntegerInput = (value: string): number => {
   return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
 };
 
+type StepTimeoutPartInputProps = {
+  value: number;
+  unit: "h" | "m";
+  onChange: (value: number) => void;
+  onKeyDown?: KeyboardEventHandler<HTMLInputElement>;
+  min?: number;
+  max?: number;
+  compact?: boolean;
+};
+
+function StepTimeoutPartInput({
+  value,
+  unit,
+  onChange,
+  onKeyDown,
+  min = 0,
+  max,
+  compact = false,
+}: StepTimeoutPartInputProps) {
+  const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const parsed = parseNonNegativeIntegerInput(event.target.value);
+    const minBound = Math.max(0, Math.floor(min));
+    const normalized =
+      typeof max === "number" && Number.isFinite(max)
+        ? Math.min(Math.floor(max), Math.max(minBound, parsed))
+        : Math.max(minBound, parsed);
+    onChange(normalized);
+  };
+
+  return (
+    <div
+      className={`flex items-center gap-1.5 border text-gray-200 transition-colors focus-within:border-blue-500 ${
+        compact
+          ? "w-[4.5rem] rounded border-gray-700 bg-gray-900 px-2 py-1"
+          : "w-full rounded-xl border-gray-800 bg-gray-950/80 px-3 py-2.5"
+      }`}
+    >
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        autoComplete="off"
+        enterKeyHint="done"
+        value={value}
+        onChange={handleChange}
+        onKeyDown={onKeyDown}
+        className={`min-w-0 flex-1 border-0 bg-transparent p-0 text-gray-100 tabular-nums focus:outline-none ${
+          compact ? "text-[11px]" : "text-sm"
+        }`}
+        aria-label={unit === "h" ? "Hours" : "Minutes"}
+      />
+      <span
+        className={`shrink-0 select-none text-gray-500 ${compact ? "text-[10px]" : "text-[11px]"}`}
+      >
+        {unit}
+      </span>
+    </div>
+  );
+}
+
 const getJobsViewModeFromParams = (params: URLSearchParams): JobsViewMode => {
   const raw = params.get("view");
   if (raw === "create" || raw === "steps") return raw;
@@ -1402,6 +1482,7 @@ interface Agent {
   summary?: string | null;
   prompt_template: string;
   alert_condition?: string | null;
+  negative_condition?: string | null;
   params: string;
   input_schema: string;
   is_active: number;
@@ -3401,49 +3482,33 @@ export default function JobsPage() {
                           Max time to run step
                         </label>
                         <div className="grid grid-cols-2 gap-2">
-                          <div className="relative">
-                            <input
-                              type="number"
-                              value={newStepTimeoutParts.hours}
-                              onChange={(e) => {
-                                const hours = parseNonNegativeIntegerInput(e.target.value);
-                                setNewStep({
-                                  ...newStep,
-                                  timeout_seconds: hourMinutePartsToTimeoutSeconds(
-                                    hours,
-                                    newStepTimeoutParts.minutes
-                                  ),
-                                });
-                              }}
-                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
-                              min="0"
-                            />
-                            <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
-                              h
-                            </span>
-                          </div>
-                          <div className="relative">
-                            <input
-                              type="number"
-                              value={newStepTimeoutParts.minutes}
-                              onChange={(e) => {
-                                const minutes = Math.min(59, parseNonNegativeIntegerInput(e.target.value));
-                                setNewStep({
-                                  ...newStep,
-                                  timeout_seconds: hourMinutePartsToTimeoutSeconds(
-                                    newStepTimeoutParts.hours,
-                                    minutes
-                                  ),
-                                });
-                              }}
-                              className="w-full rounded-xl border border-gray-800 bg-gray-950/80 px-3 py-2.5 pr-8 text-sm text-gray-100 focus:border-blue-500 focus:outline-none"
-                              min="0"
-                              max="59"
-                            />
-                            <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">
-                              m
-                            </span>
-                          </div>
+                          <StepTimeoutPartInput
+                            value={newStepTimeoutParts.hours}
+                            unit="h"
+                            onChange={(hours) =>
+                              setNewStep({
+                                ...newStep,
+                                timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                                  hours,
+                                  newStepTimeoutParts.minutes
+                                ),
+                              })
+                            }
+                          />
+                          <StepTimeoutPartInput
+                            value={newStepTimeoutParts.minutes}
+                            unit="m"
+                            max={59}
+                            onChange={(minutes) =>
+                              setNewStep({
+                                ...newStep,
+                                timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                                  newStepTimeoutParts.hours,
+                                  minutes
+                                ),
+                              })
+                            }
+                          />
                         </div>
                         {selectedJobMaxTimeoutSeconds !== null && (
                           <p className="mt-1.5 text-[11px] text-blue-100/60">
@@ -3887,49 +3952,33 @@ export default function JobsPage() {
                       Max time to run step (hours/minutes)
                     </label>
                     <div className="grid grid-cols-2 gap-2">
-                      <div className="relative">
-                        <input
-                          type="number"
-                          value={newStepTimeoutParts.hours}
-                          onChange={(e) => {
-                            const hours = parseNonNegativeIntegerInput(e.target.value);
-                            setNewStep({
-                              ...newStep,
-                              timeout_seconds: hourMinutePartsToTimeoutSeconds(
-                                hours,
-                                newStepTimeoutParts.minutes
-                              ),
-                            });
-                          }}
-                          className="w-full px-3 py-2 pr-8 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
-                          min="0"
-                        />
-                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400">
-                          h
-                        </span>
-                      </div>
-                      <div className="relative">
-                        <input
-                          type="number"
-                          value={newStepTimeoutParts.minutes}
-                          onChange={(e) => {
-                            const minutes = Math.min(59, parseNonNegativeIntegerInput(e.target.value));
-                            setNewStep({
-                              ...newStep,
-                              timeout_seconds: hourMinutePartsToTimeoutSeconds(
-                                newStepTimeoutParts.hours,
-                                minutes
-                              ),
-                            });
-                          }}
-                          className="w-full px-3 py-2 pr-8 bg-gray-700 border border-gray-600 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500"
-                          min="0"
-                          max="59"
-                        />
-                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400">
-                          m
-                        </span>
-                      </div>
+                      <StepTimeoutPartInput
+                        value={newStepTimeoutParts.hours}
+                        unit="h"
+                        onChange={(hours) =>
+                          setNewStep({
+                            ...newStep,
+                            timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                              hours,
+                              newStepTimeoutParts.minutes
+                            ),
+                          })
+                        }
+                      />
+                      <StepTimeoutPartInput
+                        value={newStepTimeoutParts.minutes}
+                        unit="m"
+                        max={59}
+                        onChange={(minutes) =>
+                          setNewStep({
+                            ...newStep,
+                            timeout_seconds: hourMinutePartsToTimeoutSeconds(
+                              newStepTimeoutParts.hours,
+                              minutes
+                            ),
+                          })
+                        }
+                      />
                     </div>
                     {selectedJobMaxTimeoutSeconds !== null && (
                       <p className="mt-1 text-[11px] text-gray-500">
@@ -5469,7 +5518,11 @@ function StepCard({
 
   const normalizeAgentFromApiRow = (agent: any): Agent => {
     const paramsObject = parseAgentParamsObject(agent?.params);
-    const split = parsePromptTemplate(agent?.prompt_template || "", agent?.alert_condition);
+    const split = parsePromptTemplate(
+      agent?.prompt_template || "",
+      agent?.alert_condition,
+      agent?.negative_condition
+    );
     const faceTargetIds: number[] = Array.isArray(agent?.face_target_ids)
       ? Array.from(
           new Set(
@@ -6102,11 +6155,14 @@ function StepCard({
     negative_condition: String(fields.negative_condition || "").trim(),
   });
 
-  const buildPromptPayload = (fields: PromptEditorFields): { prompt_template: string; alert_condition: string } => {
+  const buildPromptPayload = (
+    fields: PromptEditorFields
+  ): { prompt_template: string; alert_condition: string; negative_condition: string } => {
     const normalized = normalizePromptEditorFields(fields);
     return {
       prompt_template: buildPromptTemplate(normalized),
       alert_condition: normalized.alert_condition,
+      negative_condition: normalized.negative_condition,
     };
   };
 
@@ -6137,6 +6193,7 @@ function StepCard({
     promptPayload: {
       prompt_template: string;
       alert_condition: string;
+      negative_condition: string;
     };
     analysisRegions: AnalysisRegion[];
     inputType?: TargetInputType | null;
@@ -6155,6 +6212,7 @@ function StepCard({
       agent_key: source.stored_agent_key || source.agent_key,
       prompt_template: promptPayload.prompt_template,
       alert_condition: promptPayload.alert_condition,
+      negative_condition: promptPayload.negative_condition,
       camera_id: cameraId,
       params: JSON.stringify({
         ...sourceParams,
@@ -6199,16 +6257,30 @@ function StepCard({
   };
 
   const getPromptFieldsFromAgent = (
-    agent: Pick<Agent, "prompt_template" | "alert_condition">
-  ): PromptEditorFields => parsePromptTemplate(agent.prompt_template || "", agent.alert_condition);
+    agent: Pick<Agent, "prompt_template" | "alert_condition" | "negative_condition">
+  ): PromptEditorFields =>
+    parsePromptTemplate(
+      agent.prompt_template || "",
+      agent.alert_condition,
+      agent.negative_condition
+    );
 
   const getAnalysisRegionsFromAgent = (
     agent: Pick<
       Agent,
-      "analysis_regions" | "prompt_template" | "alert_condition" | "face_target_ids" | "negative_reference_images"
+      | "analysis_regions"
+      | "prompt_template"
+      | "alert_condition"
+      | "negative_condition"
+      | "face_target_ids"
+      | "negative_reference_images"
     >
   ): AnalysisRegion[] => {
-    const promptFields = parsePromptTemplate(agent.prompt_template || "", agent.alert_condition);
+    const promptFields = parsePromptTemplate(
+      agent.prompt_template || "",
+      agent.alert_condition,
+      agent.negative_condition
+    );
     const faceTargetIds = Array.isArray(agent.face_target_ids)
       ? Array.from(
           new Set(
@@ -7923,7 +7995,8 @@ function StepCard({
     if (targetAgent) {
       const split = parsePromptTemplate(
         targetAgent.prompt_template || "",
-        targetAgent.alert_condition
+        targetAgent.alert_condition,
+        targetAgent.negative_condition
       );
       const normalizedNegativeReferenceImages = Array.isArray(targetAgent.negative_reference_images)
         ? targetAgent.negative_reference_images
@@ -8953,65 +9026,47 @@ function StepCard({
       <Clock className="h-4 w-4" />
       {isEditingTimeout ? (
         <div className="flex items-center gap-1.5">
-          <div className="relative">
-            <input
-              type="number"
-              value={editTimeoutParts.hours}
-              onChange={(e) =>
-                setEditTimeoutSeconds(
-                  hourMinutePartsToTimeoutSeconds(
-                    parseNonNegativeIntegerInput(e.target.value),
-                    editTimeoutParts.minutes
-                  )
-                )
+          <StepTimeoutPartInput
+            value={editTimeoutParts.hours}
+            unit="h"
+            compact
+            onChange={(hours) =>
+              setEditTimeoutSeconds(
+                hourMinutePartsToTimeoutSeconds(hours, editTimeoutParts.minutes)
+              )
+            }
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleSaveStepSettings();
               }
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleSaveStepSettings();
-                }
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  resetEditingTimeout();
-                }
-              }}
-              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-blue-500 focus:outline-none"
-              min="0"
-            />
-            <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
-              h
-            </span>
-          </div>
-          <div className="relative">
-            <input
-              type="number"
-              value={editTimeoutParts.minutes}
-              onChange={(e) =>
-                setEditTimeoutSeconds(
-                  hourMinutePartsToTimeoutSeconds(
-                    editTimeoutParts.hours,
-                    Math.min(59, parseNonNegativeIntegerInput(e.target.value))
-                  )
-                )
+              if (e.key === "Escape") {
+                e.preventDefault();
+                resetEditingTimeout();
               }
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleSaveStepSettings();
-                }
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  resetEditingTimeout();
-                }
-              }}
-              className="w-12 rounded border border-gray-700 bg-gray-900 px-2 py-1 pr-4 text-[11px] text-gray-200 focus:border-blue-500 focus:outline-none"
-              min="0"
-              max="59"
-            />
-            <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
-              m
-            </span>
-          </div>
+            }}
+          />
+          <StepTimeoutPartInput
+            value={editTimeoutParts.minutes}
+            unit="m"
+            compact
+            max={59}
+            onChange={(minutes) =>
+              setEditTimeoutSeconds(
+                hourMinutePartsToTimeoutSeconds(editTimeoutParts.hours, minutes)
+              )
+            }
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleSaveStepSettings();
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                resetEditingTimeout();
+              }
+            }}
+          />
           <button
             onClick={handleSaveStepSettings}
             className="text-blue-400 hover:text-blue-300"
@@ -10032,8 +10087,8 @@ function StepCard({
                                   Video packaging
                                 </label>
                                 <select
-                                  value={normalizeAgentVideoPackagingMode(
-                                    agentForm.video_packaging_mode
+                                  value={getAgentVideoPackagingSelectValue(
+                                    normalizeAgentVideoPackagingMode(agentForm.video_packaging_mode)
                                   )}
                                   onChange={(e) =>
                                     setAgentForm((prev) => ({
@@ -10045,20 +10100,33 @@ function StepCard({
                                   }
                                   className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
                                 >
+                                  {!isSelectableAgentVideoPackagingMode(
+                                    normalizeAgentVideoPackagingMode(agentForm.video_packaging_mode)
+                                  ) ? (
+                                    <option value="" disabled>
+                                      Legacy Packaging Mode
+                                    </option>
+                                  ) : null}
                                   <option value="frame_sequence">
                                     {getAgentVideoPackagingModeLabel("frame_sequence")}
                                   </option>
                                   <option value="mosaic_2x2">
                                     {getAgentVideoPackagingModeLabel("mosaic_2x2")}
                                   </option>
-                                  <option value="mosaic_3x3">
-                                    {getAgentVideoPackagingModeLabel("mosaic_3x3")}
-                                  </option>
                                 </select>
                                 <p className="text-xs text-gray-400">
-                                  Standard Resolution uses a 2x2 mosaic. Compact Resolution uses a
-                                  3x3 mosaic and sends fewer image inputs than High Resolution.
+                                  Standard Resolution uses a 2x2 mosaic and sends fewer image inputs
+                                  than High Resolution.
                                 </p>
+                                {!isSelectableAgentVideoPackagingMode(
+                                  normalizeAgentVideoPackagingMode(agentForm.video_packaging_mode)
+                                ) ? (
+                                  <p className="text-xs text-amber-400">
+                                    This agent is using a legacy packaging mode that is no longer
+                                    available here. Choose High Resolution or Standard Resolution to
+                                    replace it.
+                                  </p>
+                                ) : null}
                               </div>
                             ) : null}
                             {supportsAdjustableAgentVideoFps(

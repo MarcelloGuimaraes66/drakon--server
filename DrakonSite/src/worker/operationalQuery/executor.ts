@@ -52,6 +52,23 @@ function normalizeTextArray(value: unknown, maxItems = 8): string[] {
   return out;
 }
 
+function normalizeIdentityFeatureCandidateTexts(value: unknown, maxItems = 8): string[] {
+  const source = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of source) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const text = normalizeText((entry as JsonRecord).text, 160);
+    if (!text) continue;
+    const dedupeKey = text.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(text);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
 function normalizeIdentitySummary(value: unknown): string {
   const text = normalizeText(value, 320);
   if (!text) return "";
@@ -84,22 +101,33 @@ function extractIdentityTraitLines(card: JsonRecord | null): string[] {
     ...normalizeTextArray(card.key_traits, 12),
     ...normalizeTextArray(card.stable_attributes, 12),
   ], 12);
-  if (explicitTraits.length > 0) {
-    return explicitTraits.slice(0, 6);
-  }
-
+  const featureCandidateTraits = normalizeIdentityFeatureCandidateTexts(
+    card.identity_feature_candidates,
+    12
+  );
   const summary = normalizeIdentitySummary(card.identity_signature_summary);
-  if (summary) {
-    return summary
-      .split(/[;,|]/)
-      .map((entry) => normalizeText(entry, 120))
-      .filter(Boolean)
-      .slice(0, 6);
+  const summaryTraits = summary
+    ? summary
+        .split(/[;,|]/)
+        .map((entry) => normalizeText(entry, 120))
+        .filter(Boolean)
+    : [];
+  const description = normalizeText(card.description, 280);
+  const descriptionTraits =
+    description && !isAggregateIdentityDescription(description) ? [description] : [];
+  const mergedTraits = normalizeTextArray(
+    [...explicitTraits, ...summaryTraits, ...featureCandidateTraits, ...descriptionTraits],
+    12
+  );
+  if (mergedTraits.length > 0) {
+    return mergedTraits.slice(0, 6);
   }
 
-  const description = normalizeText(card.description, 280);
-  if (description && !isAggregateIdentityDescription(description)) {
-    return [description];
+  if (summary) {
+    return summaryTraits.slice(0, 6);
+  }
+  if (featureCandidateTraits.length > 0) {
+    return featureCandidateTraits.slice(0, 6);
   }
   return [];
 }

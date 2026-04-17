@@ -363,14 +363,17 @@ inline bool traitLooksLikePersonIntrinsicPhysicalCue(const std::string& rawTrait
             s,
             {
                 "skin tone", "light skin", "dark skin", "fair skin", "brown skin",
-                "pele", "tom de pele", "cabelo", "hair", "beard", "mustache",
+                "brown skin tone", "medium skin", "medium skin tone", "olive skin",
+                "pele", "tom de pele", "pele morena", "pele oliva", "cabelo", "hair", "beard", "mustache",
                 "moustache", "barba", "bigode", "tattoo", "tatuagem",
                 "scar", "cicatriz", "bald", "careca", "calvo",
                 "body build", "build", "body type", "porte fisico", "porte físico",
-                "slim", "thin", "heavyset", "stocky", "magro", "gordo",
+                "porte medio", "porte médio", "porte mediano", "average build",
+                "medium build", "regular build", "slim", "thin", "heavyset", "stocky", "magro", "gordo",
                 "coily hair", "curly hair", "wavy hair", "straight hair",
                 "cacheado", "ondulado", "crespo", "liso",
                 "short hair", "long hair", "cabelo curto", "cabelo longo",
+                "very short hair", "buzz cut", "shaved head", "raspado",
                 "stubble", "facial hair", "por fazer", "barba curta",
                 "barba baixa", "short beard", "light beard",
                 "jawline", "nose", "eyebrow", "sobrancelha", "nariz"
@@ -388,6 +391,67 @@ inline bool traitLooksLikePersonIntrinsicPhysicalCue(const std::string& rawTrait
             "build", "slim", "thin", "heavyset", "stocky", "magro",
             "gordo", "cacheado", "ondulado", "crespo", "liso",
             "stubble", "nose", "eyebrow", "sobrancelha", "nariz"
+        });
+}
+
+inline bool traitLooksLikePersonSkinToneCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    return containsAnySubstring(
+        s,
+        {
+            "skin tone", "light skin", "dark skin", "fair skin", "brown skin",
+            "brown skin tone", "medium skin", "medium skin tone", "olive skin",
+            "pele", "tom de pele", "pele morena", "pele oliva"
+        });
+}
+
+inline bool traitLooksLikePersonHairCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    return containsAnySubstring(
+        s,
+        {
+            "cabelo", "hair", "bald", "careca", "calvo",
+            "short hair", "long hair", "curly hair", "straight hair",
+            "wavy hair", "coily hair", "cabelo curto", "cabelo longo",
+            "cacheado", "ondulado", "crespo", "liso",
+            "very short hair", "buzz cut", "shaved head", "raspado"
+        });
+}
+
+inline bool traitLooksLikePersonBodyBuildCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    return containsAnySubstring(
+        s,
+        {
+            "body build", "body type", "medium build", "average build",
+            "regular build", "heavy build", "slim build", "build",
+            "porte fisico", "porte físico", "porte medio", "porte médio",
+            "porte mediano", "slim", "thin", "heavyset", "stocky",
+            "magro", "gordo", "corpulento"
+        });
+}
+
+inline bool traitLooksLikePersonFacialHairCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    return containsAnySubstring(
+        s,
+        {
+            "beard", "mustache", "moustache", "facial hair",
+            "stubble", "barba", "bigode", "por fazer"
+        });
+}
+
+inline bool traitLooksLikePersonBodyMarkingCue(const std::string& rawTrait) {
+    const std::string s = lower(trim(rawTrait));
+    if (s.empty()) return false;
+    return containsAnySubstring(
+        s,
+        {
+            "tattoo", "tatuagem", "scar", "cicatriz"
         });
 }
 
@@ -584,6 +648,43 @@ inline json curateIdentitySignatureTraits(
         appendMatchingTraitsByPriority(existingTraits, 1);
         appendMatchingTraitsByPriority(stableTraits, 1);
         appendMatchingTraitsByPriority(contextTraits, 1);
+    }
+    if (entityTypeSuggestsPersonIdentity(rawEntityType) && curated.is_array() && !curated.empty()) {
+        json ordered = json::array();
+
+        auto appendFirstMatchingTrait = [&](const json& source, auto&& matcher, int minPriority) -> bool {
+            const json parsed = parseTraitsValue(source);
+            if (!parsed.is_array()) return false;
+            for (const auto& item : parsed) {
+                if (!item.is_string()) continue;
+                const std::string trait = trim(item.get<std::string>());
+                if (trait.empty()) continue;
+                if (classifyIdentityTraitPriority(rawEntityType, trait) < minPriority) continue;
+                if (!matcher(trait)) continue;
+                appendUniqueStringsToArray(ordered, trait);
+                return true;
+            }
+            return false;
+        };
+
+        auto appendPreferredBucket = [&](auto&& matcher, int minPriority = 2) {
+            if (appendFirstMatchingTrait(curated, matcher, minPriority)) return;
+            if (appendFirstMatchingTrait(existingTraits, matcher, minPriority)) return;
+            if (appendFirstMatchingTrait(stableTraits, matcher, minPriority)) return;
+            (void)appendFirstMatchingTrait(contextTraits, matcher, minPriority);
+        };
+
+        appendPreferredBucket(traitLooksLikePersonSkinToneCue, 2);
+        appendPreferredBucket(traitLooksLikePersonHairCue, 2);
+        appendPreferredBucket(traitLooksLikePersonBodyBuildCue, 2);
+        appendPreferredBucket(traitLooksLikePersonFacialHairCue, 2);
+        appendPreferredBucket(traitLooksLikePersonBodyMarkingCue, 2);
+
+        for (const auto& item : curated) {
+            if (!item.is_string()) continue;
+            appendUniqueStringsToArray(ordered, trim(item.get<std::string>()));
+        }
+        curated = std::move(ordered);
     }
     if (curated.size() > 8) {
         curated.erase(curated.begin() + 8, curated.end());
@@ -3027,12 +3128,6 @@ inline json extractStableTraitsFromNode(
     const json& node,
     const std::string& rawEntityType = std::string()) {
     if (!node.is_object()) return json::array();
-    const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
-    const json structuredIdentityTraits =
-        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredCandidates, rawEntityType);
-    if (structuredIdentityTraits.is_array() && !structuredIdentityTraits.empty()) {
-        return structuredIdentityTraits;
-    }
     json out = json::array();
     if (node.contains("identity_signature_traits")) {
         appendUniqueTraitsToArray(out, node["identity_signature_traits"]);
@@ -3045,6 +3140,12 @@ inline json extractStableTraitsFromNode(
     }
     if (node.contains("traits")) {
         appendUniqueTraitsToArray(out, node["traits"]);
+    }
+    const json structuredCandidates = extractIdentityFeatureCandidatesFromNode(node);
+    const json structuredIdentityTraits =
+        deriveIdentitySignatureTraitsFromFeatureCandidates(structuredCandidates, rawEntityType);
+    if (structuredIdentityTraits.is_array() && !structuredIdentityTraits.empty()) {
+        appendUniqueStringsToArray(out, structuredIdentityTraits);
     }
     return out;
 }
@@ -3957,6 +4058,7 @@ inline json defaultState() {
             { "last_report_ts_utc", "" },
             { "last_round_evidence_keys", json::array() },
             { "last_round_candidate_decisions", json::array() },
+            { "last_round_identity_patch_trace", json::array() },
             { "first_round_start_ts_utc", "" },
             { "last_round_start_ts_utc", "" },
             { "last_round_end_ts_utc", "" },
@@ -3981,6 +4083,11 @@ inline void ensureState(json& st) {
         !st["meta"]["last_round_candidate_decisions"].is_array())
     {
         st["meta"]["last_round_candidate_decisions"] = json::array();
+    }
+    if (!st["meta"].contains("last_round_identity_patch_trace") ||
+        !st["meta"]["last_round_identity_patch_trace"].is_array())
+    {
+        st["meta"]["last_round_identity_patch_trace"] = json::array();
     }
     if (!st["meta"].contains("first_round_start_ts_utc") || !st["meta"]["first_round_start_ts_utc"].is_string()) {
         st["meta"]["first_round_start_ts_utc"] = "";
@@ -4059,6 +4166,18 @@ inline json extractLastRoundCandidateDecisions(const json& st) {
         return json::array();
     }
     return st["meta"]["last_round_candidate_decisions"];
+}
+
+inline json extractLastRoundIdentityPatchTrace(const json& st) {
+    if (!st.is_object() ||
+        !st.contains("meta") ||
+        !st["meta"].is_object() ||
+        !st["meta"].contains("last_round_identity_patch_trace") ||
+        !st["meta"]["last_round_identity_patch_trace"].is_array())
+    {
+        return json::array();
+    }
+    return st["meta"]["last_round_identity_patch_trace"];
 }
 
 inline json extractTemporalEvidenceRef(const json& node) {
@@ -4269,6 +4388,16 @@ inline std::string sanitizeToken(const std::string& value, const std::string& fa
     while (!out.empty() && out.front() == '_') out.erase(out.begin());
     while (!out.empty() && out.back() == '_') out.pop_back();
     return out.empty() ? fallback : out;
+}
+
+inline bool tokenHasNumericSuffix(const std::string& value) {
+    const std::string token = sanitizeToken(value, "");
+    const auto pos = token.find_last_of('_');
+    if (pos == std::string::npos || pos == 0 || pos + 1 >= token.size()) return false;
+    for (std::size_t i = pos + 1; i < token.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(token[i]))) return false;
+    }
+    return true;
 }
 
 inline std::string normalizeEventName(const std::string& rawEvent) {
@@ -5533,8 +5662,6 @@ inline void upsertIdentityMemory(
         deriveIdentitySignatureTraitsFromFeatureCandidates(
             structuredIdentityFeatureCandidates,
             entityTypeHint);
-    const json derivedIdentityContextTraits =
-        deriveIdentityContextTraitsFromFeatureCandidates(rawIdentityFeatureCandidates);
     const json stableTraits = extractStableTraitsFromNode(patch, entityTypeHint);
     const json contextTraits = extractContextTraitsFromNode(patch, entityTypeHint);
     const json explicitIdentitySignatureTraitsRaw =
@@ -5545,23 +5672,27 @@ inline void upsertIdentityMemory(
         patch.contains("identity_context_traits")
             ? parseTraitsValue(patch["identity_context_traits"])
             : json::array();
+    const json explicitIdentityObservedContextTraitsRaw =
+        patch.contains("identity_observed_context_traits")
+            ? parseTraitsValue(patch["identity_observed_context_traits"])
+            : explicitIdentityContextTraitsRaw;
+    const bool hasExplicitIdentitySignature =
+        explicitIdentitySignatureTraitsRaw.is_array() &&
+        !explicitIdentitySignatureTraitsRaw.empty();
     const json explicitIdentitySignatureTraits =
         curateIdentitySignatureTraits(
             entityTypeHint,
             stableTraits,
             contextTraits,
-            (derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty())
-                ? derivedIdentitySignatureTraits
-                : explicitIdentitySignatureTraitsRaw);
+            explicitIdentitySignatureTraitsRaw);
     const json explicitIdentityContextTraits =
         curateIdentityContextTraits(
             entityTypeHint,
             stableTraits,
             contextTraits,
-            (derivedIdentityContextTraits.is_array() && !derivedIdentityContextTraits.empty())
-                ? derivedIdentityContextTraits
-                : explicitIdentityContextTraitsRaw);
+            explicitIdentityContextTraitsRaw);
     const bool hasStructuredIdentitySignature =
+        !hasExplicitIdentitySignature &&
         derivedIdentitySignatureTraits.is_array() && !derivedIdentitySignatureTraits.empty();
     auto signatureSourceIsStructured = [&](const json& node) -> bool {
         if (!node.is_object()) return false;
@@ -5573,11 +5704,11 @@ inline void upsertIdentityMemory(
         entityState != nullptr && signatureSourceIsStructured(*entityState);
     auto updateIdentitySignatureSource = [&](json& node) {
         if (!node.is_object()) return;
-        if (hasStructuredIdentitySignature) {
-            node["identity_signature_source"] = "structured_candidates";
-        }
-        else if (explicitIdentitySignatureTraitsRaw.is_array() && !explicitIdentitySignatureTraitsRaw.empty()) {
+        if (hasExplicitIdentitySignature) {
             node["identity_signature_source"] = "explicit_traits";
+        }
+        else if (hasStructuredIdentitySignature) {
+            node["identity_signature_source"] = "structured_candidates";
         }
     };
 
@@ -5626,6 +5757,36 @@ inline void upsertIdentityMemory(
     }
     mem.erase("scene_brief");
     if (entityState) entityState->erase("scene_brief");
+
+    json mergedIdentityObservedContextTraits = json::array();
+    appendUniqueStringsToArray(
+        mergedIdentityObservedContextTraits,
+        explicitIdentityObservedContextTraitsRaw);
+    if (mem.contains("identity_observed_context_traits")) {
+        appendUniqueStringsToArray(
+            mergedIdentityObservedContextTraits,
+            mem["identity_observed_context_traits"]);
+    }
+    if (entityState && entityState->contains("identity_observed_context_traits")) {
+        appendUniqueStringsToArray(
+            mergedIdentityObservedContextTraits,
+            (*entityState)["identity_observed_context_traits"]);
+    }
+    if (mergedIdentityObservedContextTraits.size() > 8) {
+        mergedIdentityObservedContextTraits.erase(
+            mergedIdentityObservedContextTraits.begin() + 8,
+            mergedIdentityObservedContextTraits.end());
+    }
+    if (!mergedIdentityObservedContextTraits.empty()) {
+        mem["identity_observed_context_traits"] = mergedIdentityObservedContextTraits;
+        if (entityState) {
+            (*entityState)["identity_observed_context_traits"] =
+                mergedIdentityObservedContextTraits;
+        }
+    } else {
+        mem.erase("identity_observed_context_traits");
+        if (entityState) entityState->erase("identity_observed_context_traits");
+    }
 
     auto mergeIdentityFeatureCandidates = [&](json target, const json& source) {
         if (!target.is_array()) target = json::array();
@@ -5940,6 +6101,7 @@ inline void applyRound(json& st,
     ensureState(st);
     st["meta"]["last_round_evidence_keys"] = json::array();
     st["meta"]["last_round_candidate_decisions"] = json::array();
+    st["meta"]["last_round_identity_patch_trace"] = json::array();
     st["meta"]["last_round_identity_memory_fallbacks"] = json::array();
     std::string nowTs = decisionAnchorUtc(nowIsoUtc, segmentEndTsRaw);
     if (nowTs.empty()) nowTs = decisionAnchorUtc(nowIso());
@@ -6101,6 +6263,7 @@ inline void applyRound(json& st,
     auto resolveEntityIdFromHint = [&](const std::string& hintRaw) -> std::string {
         const std::string hint = sanitizeToken(hintRaw.empty() ? defaultEntityKey : hintRaw, "entity");
         std::string selected = selectExistingEntityIdFromHint(hint);
+        if (selected.empty() && tokenHasNumericSuffix(hint)) selected = hint;
         if (selected.empty()) selected = allocateEntityId(st, hint);
         roundEntityByHint[hint] = selected;
         return selected;
@@ -6110,7 +6273,6 @@ inline void applyRound(json& st,
         if (rawHint.empty()) return std::string();
         return selectExistingEntityIdFromHint(sanitizeToken(rawHint, "entity"));
     };
-
     std::unordered_map<std::string, std::string> roundLastPresentTs;
     std::unordered_map<std::string, std::string> roundLastLeftTs;
     std::unordered_set<std::string> roundHasEntered;
@@ -6321,6 +6483,114 @@ inline void applyRound(json& st,
             candidate.frameTimestampInSegment = trim(strField(patchEvidenceRef, "frame_timestamp_in_segment"));
         }
         return candidate;
+    };
+
+    auto recordIdentityPatchTrace = [&](const json& patch,
+                                        const std::string& checkpoint,
+                                        const std::string& normalizedDecision = std::string(),
+                                        const std::string& resolvedEntityId = std::string(),
+                                        const std::string& detail = std::string()) {
+        if (!patch.is_object()) return;
+
+        json entry = json::object();
+        const std::string checkpointToken = trim(checkpoint);
+        if (!checkpointToken.empty()) entry["checkpoint"] = checkpointToken;
+
+        const std::string patchEntityId = trim(structuredEntityIdField(patch));
+        const std::string patchEntityHint = trim(structuredEntityHintField(patch));
+        const std::string patchEntityType = trim(strField(patch, "entity_type"));
+        const std::string decisionRaw = lower(structuredDecisionField(patch));
+        const std::string eventName = extractStructuredEvidenceEventName(patch);
+        const std::string statusToken =
+            normalizeEvidenceToken(strField(patch, "status", strField(patch, "state")));
+        const json evidenceRef = extractTemporalEvidenceRef(patch);
+
+        if (!patchEntityId.empty()) entry["patch_entity_id"] = patchEntityId;
+        if (!patchEntityHint.empty()) entry["patch_entity_hint"] = patchEntityHint;
+        if (!patchEntityType.empty()) entry["patch_entity_type"] = patchEntityType;
+        if (!decisionRaw.empty()) entry["decision_raw"] = decisionRaw;
+        if (!normalizedDecision.empty()) entry["decision_normalized"] = trim(normalizedDecision);
+        if (!eventName.empty()) entry["event"] = eventName;
+        if (!statusToken.empty()) entry["status_token"] = statusToken;
+        if (!resolvedEntityId.empty()) entry["resolved_entity_id"] = trim(resolvedEntityId);
+
+        entry["absence_by_node"] = nodeRepresentsSyntheticAbsence(patch);
+        entry["absence_by_event"] = isAbsenceEventName(eventName);
+        entry["absence_by_status"] = observationStatusSuggestsNegative(statusToken);
+
+        const std::string evidenceKey = trim(strField(
+            evidenceRef,
+            "temporal_evidence_key",
+            strField(patch, "temporal_evidence_key")));
+        if (!evidenceKey.empty()) entry["evidence_key"] = evidenceKey;
+
+        int frameIndex = intField(evidenceRef, "frame_index", intField(patch, "frame_index", -1));
+        if (frameIndex < 0 &&
+            patch.contains("frame_ref") &&
+            patch["frame_ref"].is_object())
+        {
+            frameIndex = intField(patch["frame_ref"], "frame_index", -1);
+        }
+        if (frameIndex >= 0) entry["frame_index"] = frameIndex;
+
+        std::string timestampName = trim(strField(
+            evidenceRef,
+            "timestamp_name",
+            strField(patch, "timestamp_name")));
+        if (timestampName.empty() &&
+            patch.contains("frame_ref") &&
+            patch["frame_ref"].is_object())
+        {
+            timestampName = trim(strField(patch["frame_ref"], "timestamp_name"));
+        }
+        if (!timestampName.empty()) entry["timestamp_name"] = timestampName;
+
+        std::string frameTimestampInSegment = trim(strField(
+            evidenceRef,
+            "frame_timestamp_in_segment",
+            strField(patch, "frame_timestamp_in_segment")));
+        if (frameTimestampInSegment.empty() &&
+            patch.contains("frame_ref") &&
+            patch["frame_ref"].is_object())
+        {
+            frameTimestampInSegment =
+                trim(strField(patch["frame_ref"], "frame_timestamp_in_segment"));
+        }
+        if (!frameTimestampInSegment.empty()) {
+            entry["frame_timestamp_in_segment"] = frameTimestampInSegment;
+        }
+
+        const std::string patchTs =
+            trim(strField(patch, "ts_utc", strField(patch, "timestamp", strField(patch, "time"))));
+        if (!patchTs.empty()) entry["timestamp_utc"] = patchTs;
+
+        const json traits = extractTraitsFromNode(patch);
+        if (traits.is_array()) entry["traits_count"] = static_cast<int>(traits.size());
+        if (patch.contains("identity_signature_traits") &&
+            patch["identity_signature_traits"].is_array())
+        {
+            entry["identity_signature_traits_count"] =
+                static_cast<int>(patch["identity_signature_traits"].size());
+        }
+        if (patch.contains("identity_feature_candidates") &&
+            patch["identity_feature_candidates"].is_array())
+        {
+            entry["identity_feature_candidates_count"] =
+                static_cast<int>(patch["identity_feature_candidates"].size());
+        }
+        if (patch.contains("portrait_crop") && patch["portrait_crop"].is_object()) {
+            entry["has_portrait_crop"] = true;
+            const std::string portraitKind = trim(strField(patch["portrait_crop"], "kind"));
+            if (!portraitKind.empty()) entry["portrait_kind"] = portraitKind;
+        }
+        else {
+            entry["has_portrait_crop"] = false;
+        }
+
+        const std::string detailToken = trim(detail);
+        if (!detailToken.empty()) entry["detail"] = detailToken;
+
+        st["meta"]["last_round_identity_patch_trace"].push_back(std::move(entry));
     };
 
     auto tryUpsertIdentityMemoryFromWeakPatch = [&](const json& patch,
@@ -6597,10 +6867,32 @@ inline void applyRound(json& st,
             const std::string patchTs =
                 strField(p, "ts_utc", strField(p, "timestamp", strField(p, "time")));
             const json patchEvidenceRef = extractTemporalEvidenceRef(p);
+            recordIdentityPatchTrace(
+                p,
+                "loop_start",
+                std::string(),
+                std::string(),
+                "entered identityPatch loop");
             if (nodeRepresentsSyntheticAbsence(p) ||
                 isAbsenceEventName(extractStructuredEvidenceEventName(p)) ||
                 observationStatusSuggestsNegative(strField(p, "status", strField(p, "state"))))
             {
+                std::string absenceDetail;
+                if (nodeRepresentsSyntheticAbsence(p)) absenceDetail += "node_synthetic_absence";
+                if (isAbsenceEventName(extractStructuredEvidenceEventName(p))) {
+                    if (!absenceDetail.empty()) absenceDetail += ",";
+                    absenceDetail += "event_absence";
+                }
+                if (observationStatusSuggestsNegative(strField(p, "status", strField(p, "state")))) {
+                    if (!absenceDetail.empty()) absenceDetail += ",";
+                    absenceDetail += "status_negative";
+                }
+                recordIdentityPatchTrace(
+                    p,
+                    "branch_absence",
+                    std::string(),
+                    std::string(),
+                    absenceDetail.empty() ? std::string("absence branch triggered") : absenceDetail);
                 commitExplicitEntityAbsence(
                     patchEntityId,
                     patchEntityHint,
@@ -6645,6 +6937,14 @@ inline void applyRound(json& st,
                     patchEntityType,
                     patchZone,
                     patchTs);
+                recordIdentityPatchTrace(
+                    p,
+                    "branch_unknown",
+                    decision,
+                    weakResolvedEntityId,
+                    weakResolvedEntityId.empty()
+                        ? std::string("unknown decision without weak identity memory upsert")
+                        : std::string("unknown decision accepted via weak identity memory upsert"));
                 if (!weakResolvedEntityId.empty()) {
                     recordLastRoundCandidateDecision(
                         st,
@@ -6665,8 +6965,16 @@ inline void applyRound(json& st,
             std::string entityId = trim(strField(p, "entity_id", strField(p, "id")));
             const std::string entityHint = patchEntityHint;
             if (decision == "new_entity") {
-                const std::string prefix = entityHint.empty() ? inferEntityPrefix(p, plan) : entityHint;
-                entityId = allocateEntityId(st, prefix);
+                const std::string explicitEntityId = sanitizeToken(entityId, "");
+                if (!explicitEntityId.empty() &&
+                    (entityExists(explicitEntityId) || tokenHasNumericSuffix(explicitEntityId)))
+                {
+                    entityId = explicitEntityId;
+                }
+                else {
+                    const std::string prefix = entityHint.empty() ? inferEntityPrefix(p, plan) : entityHint;
+                    entityId = allocateEntityId(st, prefix);
+                }
             }
             else {
                 if (entityId.empty()) {
@@ -6680,6 +6988,12 @@ inline void applyRound(json& st,
                 }
             }
             if (entityId.empty()) {
+                recordIdentityPatchTrace(
+                    p,
+                    "branch_missing_entity",
+                    decision,
+                    std::string(),
+                    "resolved entity_id empty after decision normalization");
                 recordLastRoundCandidateDecision(
                     st,
                     makeIdentityPatchDecisionCandidate(
@@ -6700,6 +7014,14 @@ inline void applyRound(json& st,
             roundTouchedEntityIds.insert(entityId);
             roundPositiveEntityIds.insert(entityId);
             upsertIdentityMemory(st, entityId, p, nowTs, zone);
+            recordIdentityPatchTrace(
+                p,
+                "branch_accepted",
+                decision,
+                entityId,
+                decision == "new_entity"
+                    ? std::string("identity_patch accepted as new entity")
+                    : std::string("identity_patch accepted as existing entity"));
             recordLastRoundCandidateDecision(
                 st,
                 makeIdentityPatchDecisionCandidate(

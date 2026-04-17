@@ -68,11 +68,14 @@ export interface ChatIdentityCardMetadata {
   key_traits?: string[];
   identity_signature_traits?: string[];
   identity_context_traits?: string[];
+  identity_observed_context_traits?: string[];
   identity_signature_summary?: string;
   identity_feature_candidates?: ChatIdentityFeatureCandidate[];
   reference_image_urls?: string[];
   portrait_url?: string;
   face_available?: boolean;
+  source_event_id?: string;
+  source_type?: string;
   primary_portrait?: ChatIdentityCardPortrait;
   context_portrait?: ChatIdentityCardPortrait;
   last_seen?: ChatIdentityCardLastSeen;

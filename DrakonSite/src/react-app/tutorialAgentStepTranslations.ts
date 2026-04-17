@@ -43,9 +43,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "This button analyzes your current prompt together with the latest streamed camera image to build a more detailed prompt suggestion that better matches your intent and helps reduce false positives.",
-    "tutorial.agentPolygons.title": "Optional polygons for focused regions",
+    "tutorial.agentPolygons.title": "Preview zoom and optional polygons",
     "tutorial.agentPolygons.description":
-      "You can draw named polygons over the image to split the scene into specific analysis areas. The agent can then watch only those regions instead of the full frame all the time.",
+      "Before drawing polygons, you can zoom in on the camera image with a mousepad gesture, the mouse wheel, or the on-screen bar. Use this when you need a closer, more precise view for focused analysis.",
+    "tutorial.agentPolygons.bullet1":
+      "Zoom in or out with the mousepad gesture, mouse wheel, or the on-screen bar.",
+    "tutorial.agentPolygons.bullet2":
+      "After framing the detail you care about, draw named polygons so the agent watches only that area.",
     "tutorial.agentExecution.title": "Run every, resolution, and FPS",
     "tutorial.agentExecution.description":
       "For this tutorial we keep High Resolution and 1 FPS. When Ultra is available, Run every stays at 10 seconds. With only Core, the app keeps Core's fixed 60-second cadence.",
@@ -126,9 +130,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Este boton analiza tu prompt actual junto con la ultima imagen transmitida por la camara para construir una sugerencia mas detallada, reforzar tu intencion y reducir falsos positivos.",
-    "tutorial.agentPolygons.title": "Poligonos opcionales para regiones enfocadas",
+    "tutorial.agentPolygons.title": "Zoom del preview y poligonos opcionales",
     "tutorial.agentPolygons.description":
-      "Puedes dibujar poligonos con nombre sobre la imagen para separar distintas zonas de analisis. Asi el agente puede mirar solo esas regiones y no todo el frame todo el tiempo.",
+      "Antes de dibujar poligonos, puedes acercar la imagen de la camara con el gesto del mousepad, el scroll del mouse o la barra en pantalla. Usa esto cuando necesites una vista mas cercana y precisa para un analisis enfocado.",
+    "tutorial.agentPolygons.bullet1":
+      "Haz zoom in o zoom out con el mousepad, el scroll del mouse o la barra en pantalla.",
+    "tutorial.agentPolygons.bullet2":
+      "Cuando ya tengas encuadrado el detalle importante, dibuja poligonos con nombre para que el agente mire solo esa zona.",
     "tutorial.agentExecution.title": "Run every, resolution y FPS",
     "tutorial.agentExecution.description":
       "En este tutorial dejamos High Resolution y 1 FPS. Cuando Ultra esta disponible, Run every queda en 10 segundos. Con solo Core, la app mantiene la cadencia fija de 60 segundos de Core.",
@@ -209,9 +217,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Esse botao analisa o prompt atual junto com a imagem streamada mais recente da camera para montar uma sugestao mais detalhada, reforcar sua intencao e reduzir falsos positivos.",
-    "tutorial.agentPolygons.title": "Poligonos opcionais para areas focadas",
+    "tutorial.agentPolygons.title": "Zoom do preview e poligonos opcionais",
     "tutorial.agentPolygons.description":
-      "Voce pode desenhar poligonos nomeados sobre a imagem para separar diferentes areas de analise. Assim o agente pode observar so essas regioes, em vez do frame inteiro o tempo todo.",
+      "Antes de desenhar poligonos, voce pode dar zoom in na imagem da camera com o gesto do mousepad, o scroll do mouse ou a barra na tela. Use isso quando precisar de uma visao mais proxima e precisa para uma analise focada.",
+    "tutorial.agentPolygons.bullet1":
+      "Faca zoom in ou zoom out com o mousepad, o scroll do mouse ou a barra na tela.",
+    "tutorial.agentPolygons.bullet2":
+      "Quando o detalhe importante estiver enquadrado, desenhe poligonos nomeados para que o agente observe so aquela area.",
     "tutorial.agentExecution.title": "Run every, resolution e FPS",
     "tutorial.agentExecution.description":
       "Neste tutorial deixamos High Resolution e FPS 1. Quando Ultra esta disponivel, Run every fica em 10 segundos. Com apenas Core, o app mantem a cadencia fixa de 60 segundos do Core.",
@@ -292,9 +304,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "Ce bouton analyse votre prompt actuel avec la derniere image transmise par la camera pour produire une suggestion plus detaillee, mieux aligner l intention et reduire les faux positifs.",
-    "tutorial.agentPolygons.title": "Polygones optionnels pour des zones ciblees",
+    "tutorial.agentPolygons.title": "Zoom de l apercu et polygones optionnels",
     "tutorial.agentPolygons.description":
-      "Vous pouvez dessiner des polygones nommes sur l image pour separer differentes zones d analyse. L agent peut ainsi observer uniquement ces regions au lieu de tout le frame en permanence.",
+      "Avant de dessiner des polygones, vous pouvez zoomer sur l image de la camera avec le geste du pave tactile, la molette de la souris ou la barre a l ecran. Utilisez cela quand vous avez besoin d une vue plus proche et plus precise pour une analyse ciblee.",
+    "tutorial.agentPolygons.bullet1":
+      "Zoomez ou dezoomez avec le pave tactile, la molette de la souris ou la barre a l ecran.",
+    "tutorial.agentPolygons.bullet2":
+      "Une fois le detail important bien cadre, dessinez des polygones nommes pour que l agent observe seulement cette zone.",
     "tutorial.agentExecution.title": "Run every, resolution et FPS",
     "tutorial.agentExecution.description":
       "Dans ce tutoriel, nous gardons High Resolution et 1 FPS. Quand Ultra est disponible, Run every reste a 10 secondes. Avec seulement Core, l app conserve la cadence fixe de 60 secondes de Core.",
@@ -369,9 +385,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "这个按钮会分析你当前的 prompt 和摄像头最新传输画面，生成更详细的建议，以更贴近你的意图并减少误报。",
-    "tutorial.agentPolygons.title": "可选多边形聚焦区域",
+    "tutorial.agentPolygons.title": "预览缩放和可选多边形区域",
     "tutorial.agentPolygons.description":
-      "你可以在图像上绘制带名称的多边形，把画面拆分成不同的分析区域。这样 agent 就可以只关注这些区域，而不必一直分析整个画面。",
+      "在绘制多边形之前，你现在可以通过触控板手势、鼠标滚轮或屏幕上的滑条对摄像头图像进行缩放。在需要更近、更精确的聚焦分析时先这样做。",
+    "tutorial.agentPolygons.bullet1":
+      "使用触控板手势、鼠标滚轮或屏幕滑条进行放大和缩小。",
+    "tutorial.agentPolygons.bullet2":
+      "当重要细节已经框定后，再绘制带名称的多边形，让 agent 只关注那个区域。",
     "tutorial.agentExecution.title": "Run every、resolution 和 FPS",
     "tutorial.agentExecution.description":
       "本教程保持 High Resolution 和 1 FPS。Ultra 可用时，Run every 保持 10 秒；如果只有 Core，应用会保持 Core 固定的 60 秒频率。",
@@ -430,9 +450,13 @@ export const tutorialAgentStepTranslations: Record<string, Record<string, string
     "tutorial.agentEnhance.title": "Enhance Prompt with AI",
     "tutorial.agentEnhance.description":
       "هذا الزر يحلل الـ prompt الحالي مع آخر صورة متدفقة من الكاميرا ليبني اقتراحاً أكثر تفصيلاً، ويعزز نيتك، ويقلل الإيجابيات الكاذبة.",
-    "tutorial.agentPolygons.title": "مضلعات اختيارية لمناطق مركزة",
+    "tutorial.agentPolygons.title": "تكبير المعاينة ومضلعات اختيارية",
     "tutorial.agentPolygons.description":
-      "يمكنك رسم مضلعات مسماة فوق الصورة لتقسيم المشهد إلى مناطق تحليل مختلفة. وهكذا يستطيع الـ agent مراقبة تلك المناطق فقط بدلا من الإطار كله بشكل مستمر.",
+      "قبل رسم المضلعات، يمكنك الآن عمل zoom in لصورة الكاميرا عبر حركة لوحة اللمس او عجلة الماوس او الشريط الظاهر على الشاشة. استخدم ذلك عندما تحتاج الى رؤية اقرب وادق لتحليل مركز.",
+    "tutorial.agentPolygons.bullet1":
+      "قم بعمل zoom in او zoom out عبر لوحة اللمس او عجلة الماوس او الشريط على الشاشة.",
+    "tutorial.agentPolygons.bullet2":
+      "بعد ضبط التفاصيل المهمة داخل الاطار، ارسم مضلعات مسماة لكي يراقب الـ agent تلك المنطقة فقط.",
     "tutorial.agentExecution.title": "Run every و resolution و FPS",
     "tutorial.agentExecution.description":
       "في هذا الشرح نبقي على High Resolution و 1 FPS. عندما يكون Ultra متاحاً يبقى Run every على 10 ثوانٍ. ومع وجود Core فقط يحافظ التطبيق على cadence الثابتة البالغة 60 ثانية.",

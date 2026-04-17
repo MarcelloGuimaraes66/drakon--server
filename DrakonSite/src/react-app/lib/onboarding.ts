@@ -2,6 +2,8 @@ import { brand } from "@/shared/brand";
 
 export type OnboardingProviderKind = "zai" | "openai";
 
+export type OnboardingTutorialKind = "intro" | "api-key" | "camera" | "agent";
+
 export type OnboardingStepId =
   | "welcome"
   | "settings-zai-card"
@@ -30,6 +32,7 @@ export type OnboardingStepId =
   | "agent-save"
   | "agent-toggle"
   | "ai-agents-camera-start"
+  | "agent-camera-required"
   | "complete";
 
 export type OnboardingStatus =
@@ -100,6 +103,7 @@ export const ONBOARDING_TARGETS = {
 export type PersistedOnboardingState = {
   version: number;
   status: OnboardingStatus;
+  tutorialKind: OnboardingTutorialKind;
   currentStepId: OnboardingStepId | null;
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
@@ -112,6 +116,7 @@ const ONBOARDING_STORAGE_VERSION = 1;
 const DEFAULT_PERSISTED_STATE: PersistedOnboardingState = {
   version: ONBOARDING_STORAGE_VERSION,
   status: "never_started",
+  tutorialKind: "intro",
   currentStepId: null,
   selectedProvider: null,
   tutorialCameraId: null,
@@ -157,6 +162,7 @@ function isValidStepId(value: unknown): value is OnboardingStepId {
     value === "agent-save" ||
     value === "agent-toggle" ||
     value === "ai-agents-camera-start" ||
+    value === "agent-camera-required" ||
     value === "complete"
   );
 }
@@ -172,6 +178,10 @@ function isValidStatus(value: unknown): value is OnboardingStatus {
 
 function isValidProvider(value: unknown): value is OnboardingProviderKind {
   return value === "zai" || value === "openai";
+}
+
+function isValidTutorialKind(value: unknown): value is OnboardingTutorialKind {
+  return value === "intro" || value === "api-key" || value === "camera" || value === "agent";
 }
 
 function normalizePersistedStepId(value: unknown): OnboardingStepId | null {
@@ -224,6 +234,9 @@ export function readOnboardingState(userId?: string | null): PersistedOnboarding
     return {
       version: ONBOARDING_STORAGE_VERSION,
       status: isValidStatus(parsed.status) ? parsed.status : DEFAULT_PERSISTED_STATE.status,
+      tutorialKind: isValidTutorialKind(parsed.tutorialKind)
+        ? parsed.tutorialKind
+        : DEFAULT_PERSISTED_STATE.tutorialKind,
       currentStepId: normalizePersistedStepId(parsed.currentStepId),
       selectedProvider: isValidProvider(parsed.selectedProvider) ? parsed.selectedProvider : null,
       tutorialCameraId: normalizePersistedCameraId(parsed.tutorialCameraId),

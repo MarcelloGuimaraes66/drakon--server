@@ -10,6 +10,7 @@ function makeMemory(): SemanticConversationMemory {
     active_task_type: null,
     last_camera_name: null,
     last_video_scope: null,
+    last_positive_hit: null,
     last_semantic_plan: null,
     carry_forward_requested: false,
     recent_turns: [],
@@ -47,6 +48,7 @@ function makeOperationalPlan(): ResolvedOperationalPlan {
         include_crop: true,
         include_media: false,
         identity_refs: [],
+        source_event_refs: [],
       },
       analysis: {
         group_by: [],
