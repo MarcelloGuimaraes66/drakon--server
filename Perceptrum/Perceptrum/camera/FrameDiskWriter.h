@@ -130,6 +130,12 @@ private:
         int height{ 0 };
         bool opened{ false };
         std::int64_t frameCount{ 0 };
+        std::chrono::steady_clock::time_point clipStartAt{};
+        std::chrono::steady_clock::time_point nextSampleAt{};
+        std::chrono::system_clock::time_point clipStartWallTime{};
+        bool timelineInitialized{ false };
+        cv::Mat heldFrame;
+        bool hasHeldFrame{ false };
 
 #ifdef _WIN32
         struct MfEncoder;        // defined in .cpp
@@ -183,21 +189,34 @@ private:
     bool hasLastVideoFrameWriteTp10_{ false };
     bool hasLastVideoFrameWriteTp60_{ false };
     TimeParts getTimeParts_() const;
+    TimeParts getTimePartsForSystemTime_(
+        const std::chrono::system_clock::time_point& tp) const;
     std::string ensureBaseDirAndMakePrefix_(const TimeParts& tp) const;
+    void clearSegmentTimeline_(SegmentWriter& writer);
 
     // writer helpers
     void openWriterIfNeeded_(SegmentWriter& w,
         const std::string& path,
         const cv::Size& size,
-        double fps);
+        double fps,
+        std::chrono::steady_clock::time_point clipStartAt,
+        std::chrono::system_clock::time_point clipStartWallTime);
     void closeWriter_(SegmentWriter& w);
     void writeFrame_(SegmentWriter& w, const cv::Mat& frame);
     void recordWriteTelemetry_(std::uint64_t bytesWritten, std::uint64_t latencyUs);
 
 
     // rotation helpers
-    void rotate10s_(const cv::Size& size, const TimeParts& tp);
-    void rotate60s_(const cv::Size& size, const TimeParts& tp);
+    void rotate10s_(
+        const cv::Size& size,
+        const TimeParts& tp,
+        std::chrono::steady_clock::time_point clipStartAt,
+        std::chrono::system_clock::time_point clipStartWallTime);
+    void rotate60s_(
+        const cv::Size& size,
+        const TimeParts& tp,
+        std::chrono::steady_clock::time_point clipStartAt,
+        std::chrono::system_clock::time_point clipStartWallTime);
 
     // finalize clip filename to include end timestamp
     void finalizeLastClipName_(
@@ -220,7 +239,8 @@ private:
         TimeParts& lastWriteTp,
         bool& hasLastWriteTp,
         const std::vector<JobsCopyTarget>& jobsTargets,
-        bool shouldCopyInferenceVideo);
+        bool shouldCopyInferenceVideo,
+        const TimeParts* forcedEndTp = nullptr);
 
     // merge helpers (re-encode from existing short clips)
     bool mergeTenSecondClipsInto60_(const cv::Size& size);

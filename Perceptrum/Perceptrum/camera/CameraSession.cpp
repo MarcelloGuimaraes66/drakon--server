@@ -414,6 +414,59 @@ static bool parseSegmentTsFromClipPathForInference_(
     return true;
 }
 
+static bool parseCompactLocalTimestampToTimePointForInference_(
+    const std::string& compactLocalTs,
+    std::chrono::system_clock::time_point& outTp)
+{
+    outTp = {};
+    if (compactLocalTs.size() != 15 || compactLocalTs[8] != '_') {
+        return false;
+    }
+
+    std::tm tmLocal{};
+    try {
+        tmLocal.tm_year = std::stoi(compactLocalTs.substr(0, 4)) - 1900;
+        tmLocal.tm_mon = std::stoi(compactLocalTs.substr(4, 2)) - 1;
+        tmLocal.tm_mday = std::stoi(compactLocalTs.substr(6, 2));
+        tmLocal.tm_hour = std::stoi(compactLocalTs.substr(9, 2));
+        tmLocal.tm_min = std::stoi(compactLocalTs.substr(11, 2));
+        tmLocal.tm_sec = std::stoi(compactLocalTs.substr(13, 2));
+        tmLocal.tm_isdst = -1;
+    }
+    catch (...) {
+        return false;
+    }
+
+    const std::time_t tt = std::mktime(&tmLocal);
+    if (tt == static_cast<std::time_t>(-1)) {
+        return false;
+    }
+
+    outTp = std::chrono::system_clock::from_time_t(tt);
+    return true;
+}
+
+static int deriveActualWindowSecondsForInferenceClip_(
+    const std::string& startTs,
+    const std::string& endTs,
+    int fallbackSeconds)
+{
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    if (!parseCompactLocalTimestampToTimePointForInference_(startTs, startTp) ||
+        !parseCompactLocalTimestampToTimePointForInference_(endTs, endTp) ||
+        endTp <= startTp)
+    {
+        return fallbackSeconds > 0 ? fallbackSeconds : 0;
+    }
+
+    const auto diffSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(endTp - startTp).count();
+    return diffSeconds > 0
+        ? static_cast<int>(diffSeconds)
+        : (fallbackSeconds > 0 ? fallbackSeconds : 0);
+}
+
 static bool convertCompactLocalTimestampToUtcIsoForInference_(
     const std::string& compactLocalTs,
     std::string& outUtcIso)
@@ -1733,7 +1786,8 @@ std::string httpPostJsonGemini(
     const std::string& api_key,
     const std::string& modelName,
     const json& bodyJson,
-    const std::function<void()>& onFirstRetry)
+    const std::function<void()>& onFirstRetry,
+    long requestTimeoutSecOverride)
 {
     const std::string url =
         "https://generativelanguage.googleapis.com/v1beta/models/" +
@@ -1754,10 +1808,19 @@ std::string httpPostJsonGemini(
         }
         };
 
+    long connectTimeoutSec = 30L;
+    long requestTimeoutSec = 90L;
+    int maxAttempts = 3;
+    if (requestTimeoutSecOverride > 0L) {
+        requestTimeoutSec = (std::max)(1L, (std::min)(requestTimeoutSec, requestTimeoutSecOverride));
+        connectTimeoutSec = (std::max)(1L, (std::min)(30L, requestTimeoutSec));
+        maxAttempts = 1;
+    }
+
     bool notified = false;
     std::string lastErr;
 
-    for (int attempt = 1; attempt <= 3; ++attempt) {
+    for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
         CURL* curl = curl_easy_init();
         if (!curl) throw std::runtime_error("curl_easy_init failed");
 
@@ -1776,8 +1839,8 @@ std::string httpPostJsonGemini(
 
         // Keep these bounded so threads never hang forever.
         // Vision-video requests can be slow, but we still need an upper bound.
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connectTimeoutSec);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, requestTimeoutSec);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
         CURLcode res = curl_easy_perform(curl);
@@ -1791,7 +1854,7 @@ std::string httpPostJsonGemini(
 
         lastErr = std::string("curl_easy_perform() failed: ") + curl_easy_strerror(res);
 
-        if (attempt < 3 && isTransient(res)) {
+        if (attempt < maxAttempts && isTransient(res)) {
             if (!notified && onFirstRetry) {
                 notified = true;
                 try { onFirstRetry(); }
@@ -1811,7 +1874,7 @@ std::string httpPostJsonGemini(
 
 // Backward-compatible overload
 std::string httpPostJsonGemini(const std::string& api_key, const std::string& modelName, const json& bodyJson) {
-    return httpPostJsonGemini(api_key, modelName, bodyJson, nullptr);
+    return httpPostJsonGemini(api_key, modelName, bodyJson, nullptr, 0L);
 }
 
 static std::string httpPostJsonOpenAIForDescription(
@@ -4573,7 +4636,11 @@ static std::optional<AdaptiveInferenceBatch_> acquireAdaptiveInferenceBatchForCa
     if (clipCount <= 1) {
         AdaptiveInferenceBatch_ batch;
         batch.clipPath = pending.front().path.string();
-        batch.windowSeconds = 10;
+        batch.windowSeconds = deriveActualWindowSecondsForInferenceClip_(
+            pending.front().startTs,
+            pending.front().endTs,
+            10
+        );
         batch.sourceCount = 1;
         return batch;
     }
@@ -4586,13 +4653,21 @@ static std::optional<AdaptiveInferenceBatch_> acquireAdaptiveInferenceBatchForCa
 
     const PendingInferenceClip_& first = pending.front();
     const PendingInferenceClip_& last = pending[static_cast<size_t>(clipCount - 1)];
-    const int windowSeconds = clipCount * 10;
+    const int windowSeconds = deriveActualWindowSecondsForInferenceClip_(
+        first.startTs,
+        last.endTs,
+        clipCount * 10
+    );
 
     fs::path assembledDir = getInferenceTempDirForCameraId(cameraId) / "_assembled";
     std::error_code dirEc;
     fs::create_directories(assembledDir, dirEc);
     if (dirEc) {
-        return AdaptiveInferenceBatch_{ first.path.string(), 10, 1 };
+        return AdaptiveInferenceBatch_{
+            first.path.string(),
+            deriveActualWindowSecondsForInferenceClip_(first.startTs, first.endTs, 10),
+            1
+        };
     }
 
     fs::path assembledPath =
@@ -4602,7 +4677,11 @@ static std::optional<AdaptiveInferenceBatch_> acquireAdaptiveInferenceBatchForCa
          "_" + std::to_string(windowSeconds) + "s.mp4");
 
     if (!concatVideoClipsWithFfmpeg_(selectedPaths, assembledPath, cameraId)) {
-        return AdaptiveInferenceBatch_{ first.path.string(), 10, 1 };
+        return AdaptiveInferenceBatch_{
+            first.path.string(),
+            deriveActualWindowSecondsForInferenceClip_(first.startTs, first.endTs, 10),
+            1
+        };
     }
 
     for (const auto& srcPath : selectedPaths) {

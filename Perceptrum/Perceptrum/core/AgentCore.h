@@ -547,7 +547,8 @@ private:
         bool requestChatPriority = false,
         const std::function<bool()>& shouldAbort = {},
         const std::string& waitScope = "",
-        const std::string& cameraLogId = "");
+        const std::string& cameraLogId = "",
+        long requestTimeoutSecOverride = 0L);
     std::string postOpenAIResponsesWithCoreLease_(
         const std::string& apiKey,
         const nlohmann::json& chatCompletionsBodyJson,
@@ -555,7 +556,8 @@ private:
         bool requestChatPriority = false,
         const std::function<bool()>& shouldAbort = {},
         const std::string& waitScope = "",
-        const std::string& cameraLogId = "");
+        const std::string& cameraLogId = "",
+        long requestTimeoutSecOverride = 0L);
 
     long long timeOffsetSeconds_ = 0;
 
@@ -652,7 +654,8 @@ private:
         const std::string& geminiApiKey,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens);
+        int& outTotalTokens,
+        int requestTimeoutSeconds = 0);
     
     VideoHit callGeminiVisionImageJOB_(
         int cameraId,
@@ -668,7 +671,8 @@ private:
         const std::string& snapshotTsUtcIso,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens
+        int& outTotalTokens,
+        int requestTimeoutSeconds = 0
     );
 
     VideoHit callGeminiVisionImageGroupJOB_(
@@ -700,7 +704,8 @@ private:
         const std::string& videoPackagingMode,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens);
+        int& outTotalTokens,
+        int requestTimeoutSeconds = 0);
 
     VideoHit callOpenAIVisionImageJOB_(
         int cameraId,
@@ -715,7 +720,8 @@ private:
         const std::string& snapshotTsUtcIso,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens
+        int& outTotalTokens,
+        int requestTimeoutSeconds = 0
     );
 
     VideoHit callOpenAIVisionImageGroupJOB_(

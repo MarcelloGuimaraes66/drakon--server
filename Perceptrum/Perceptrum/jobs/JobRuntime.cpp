@@ -82,6 +82,11 @@ static bool extractBoundaryFrameToMatFromMp4_(
     std::string* outErr);
 
 namespace {
+    constexpr int kTimeoutDrainGraceSeconds_ = 45;
+    constexpr int kTimeoutDrainIdleWaitSeconds_ = 2;
+    constexpr int kNormalInferenceRequestTimeoutCapSeconds_ = 45;
+    constexpr int kTimeoutDrainInferenceRequestTimeoutCapSeconds_ = 30;
+
     static ErrorLogContext makeJobErrorContext_(
         const std::string& flow,
         const std::string& functionName,
@@ -3794,6 +3799,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             run.startedAt = std::chrono::steady_clock::now();
             run.deadline = run.startedAt + std::chrono::seconds(effectiveTimeoutSeconds);
             run.cancel = false;
+            run.timeoutRequested = false;
             run.injectedInput.clear(); // pipeline input is resolved per target camera (non-blocking)
 
             // Ensure target cameras are started using the enriched start_camera_payloads map
@@ -5110,6 +5116,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         const bool useRunEverySchedulerGate = true;
                         int successfulInferenceCount = 0;
                         std::string lastCompletedOutput;
+                        bool observedTemporalReportDue = false;
                         postAgentRunEvent(
                             "job_agent_started",
                             "Job agent started.",
@@ -5118,6 +5125,96 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 {"status_reason", "started"}
                             }
                         );
+                        auto inferenceOutputHasTemporalReportDue = [&](const std::string& rawOutput) -> bool {
+                            if (rawOutput.empty() || !isLikelyJson_(rawOutput)) {
+                                return false;
+                            }
+                            try {
+                                const json parsed = json::parse(rawOutput);
+                                return parsed.is_object() &&
+                                    parsed.contains("temporal_report_due") &&
+                                    parsed["temporal_report_due"].is_boolean() &&
+                                    parsed["temporal_report_due"].get<bool>();
+                            }
+                            catch (...) {
+                                return false;
+                            }
+                        };
+                        auto persistCompletedOutput = [&](const std::string& completedOutput, bool countSuccessful) {
+                            if (completedOutput.empty()) {
+                                return;
+                            }
+                            if (countSuccessful) {
+                                successfulInferenceCount += 1;
+                            }
+                            lastCompletedOutput = completedOutput;
+
+                            {
+                                std::lock_guard<std::mutex> lk(job->outputsMu);
+                                StepOutput& so = job->outputs[step.id];
+                                so.last_output_by_camera[cameraId] = completedOutput;
+                                so.history_by_camera[cameraId].push_back(completedOutput);
+                                so.aggregated_output = completedOutput;
+                            }
+
+                            maybeFireAlerts_(job->payload, step, cameraId, *agent, completedOutput);
+
+                            try {
+                                if (isLikelyJson_(completedOutput)) {
+                                    json j = json::parse(completedOutput);
+                                    const std::string cp = j.value("clip_path", "");
+                                    if (!cp.empty() &&
+                                        cp.size() >= std::string(".processing").size() &&
+                                        cp.rfind(".processing") == cp.size() - std::string(".processing").size())
+                                    {
+                                        std::error_code ec;
+                                        fs::remove(fs::path(cp), ec);
+                                    }
+
+                                    if (j.contains("temp_clip_cleanup_paths") && j["temp_clip_cleanup_paths"].is_array()) {
+                                        for (const auto& item : j["temp_clip_cleanup_paths"]) {
+                                            if (!item.is_string()) continue;
+                                            const std::string tmpPath = item.get<std::string>();
+                                            if (tmpPath.empty()) continue;
+                                            std::error_code tmpEc;
+                                            fs::remove(fs::path(tmpPath), tmpEc);
+                                        }
+                                    }
+                                }
+                            }
+                            catch (...) {
+                                // ignore
+                            }
+
+                            try {
+                                if (isLikelyJson_(completedOutput)) {
+                                    json j = json::parse(completedOutput);
+                                    if (j.contains("start_condition_step_id") && j["start_condition_step_id"].is_number_integer()) {
+                                        int sidToStart = j["start_condition_step_id"].get<int>();
+                                        std::lock_guard<std::mutex> lk2(job->triggeredMu);
+                                        job->triggeredStartStepIds.insert(sidToStart);
+                                    }
+                                }
+                            }
+                            catch (...) {}
+
+                            if (inferenceOutputHasTemporalReportDue(completedOutput)) {
+                                observedTemporalReportDue = true;
+                            }
+                        };
+                        auto computeRequestTimeoutSeconds = [&](const std::chrono::steady_clock::time_point& budgetDeadline,
+                                                                int maxTimeoutSeconds) -> int {
+                            const int safeMaxTimeoutSeconds = (std::max)(1, maxTimeoutSeconds);
+                            const auto nowForBudget = std::chrono::steady_clock::now();
+                            if (budgetDeadline <= nowForBudget) {
+                                return 1;
+                            }
+                            const auto remainingMs =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(budgetDeadline - nowForBudget).count();
+                            const int remainingSeconds =
+                                (std::max)(1, static_cast<int>((remainingMs + 999) / 1000));
+                            return (std::clamp)(remainingSeconds, 1, safeMaxTimeoutSeconds);
+                        };
                         bool runDuePending = !isImageAgentInput;
                         while (!job->cancel && !run.cancel && std::chrono::steady_clock::now() < run.deadline) {
                             const auto nowTick = std::chrono::steady_clock::now();
@@ -5136,117 +5233,187 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 }
                             }
 
-                        bool readyVideoInputForPendingRun = false;
-                        if (!isImageAgentInput && runDuePending) {
-                            readyVideoInputForPendingRun =
-                                peekReadyJobVideoInputForStepCamera_(jobId, step.id, cameraId, *agent).has_value();
-                            if (!readyVideoInputForPendingRun) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                            bool readyVideoInputForPendingRun = false;
+                            if (!isImageAgentInput && runDuePending) {
+                                readyVideoInputForPendingRun =
+                                    peekReadyJobVideoInputForStepCamera_(jobId, step.id, cameraId, *agent).has_value();
+                                if (!readyVideoInputForPendingRun) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                    continue;
+                                }
+                            }
+
+                            const std::string startConditionText = buildStartConditionText();
+                            std::string out = runAgentInferenceOnCamera_(
+                                jobId,
+                                step.id,
+                                cameraId,
+                                *agent,
+                                resolvePipelineInputsForCamera_(job, step, cameraId, stepsById),
+                                /*alertConditionText*/ agent->alert_condition_text,
+                                /*startConditionText*/ startConditionText,
+                                /*modelTier*/ modelTier,
+                                /*jobRunId*/ job->payload.job_run_id,
+                                /*stepRunId*/ step.step_run_id,
+                                /*agentRunId*/ agent->agent_run_id,
+                                computeRequestTimeoutSeconds(
+                                    run.deadline,
+                                    kNormalInferenceRequestTimeoutCapSeconds_
+                                ),
+                                job->cancel
+                            );
+
+                            if (out.empty()) {
+                                // No fresh clip/inference in this cycle.
+                                // Keep previous output cached; do not overwrite with empty string.
+                                if (!isImageAgentInput && runDuePending && readyVideoInputForPendingRun) {
+                                    lastRunAt = nowTick;
+                                    runDuePending = false;
+                                }
+                                if (isImageAgentInput) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                }
+                                else {
+                                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                                }
                                 continue;
                             }
-                        }
 
-                        const std::string startConditionText = buildStartConditionText();
-                        std::string out = runAgentInferenceOnCamera_(
-                            jobId,
-                            step.id,
-                            cameraId,
-                            *agent,
-                            resolvePipelineInputsForCamera_(job, step, cameraId, stepsById),
-                            /*alertConditionText*/ agent->alert_condition_text,
-                            /*startConditionText*/ startConditionText,
-                            /*modelTier*/ modelTier,
-                            /*jobRunId*/ job->payload.job_run_id,
-                            /*stepRunId*/ step.step_run_id,
-                            /*agentRunId*/ agent->agent_run_id,
-                            /*timeoutSeconds*/ 15,
-                            job->cancel
-                        );
-
-                        if (out.empty()) {
-                            // No fresh clip/inference in this cycle.
-                            // Keep previous output cached; do not overwrite with empty string.
-                            if (!isImageAgentInput && runDuePending && readyVideoInputForPendingRun) {
-                                lastRunAt = nowTick;
-                                runDuePending = false;
-                            }
-                            if (isImageAgentInput) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                            }
-                            else {
-                                std::this_thread::sleep_for(std::chrono::seconds(1));
-                            }
-                            continue;
-                        }
-
-                        // Record successful cycles after a real inference window was handled.
-                        lastRunAt = nowTick;
-                        runDuePending = false;
-                        successfulInferenceCount += 1;
-                        lastCompletedOutput = out;
-
-                        {
-                            std::lock_guard<std::mutex> lk(job->outputsMu);
-                            StepOutput& so = job->outputs[step.id];
-                            so.last_output_by_camera[cameraId] = out;
-                            so.history_by_camera[cameraId].push_back(out);
-                            if (!out.empty()) so.aggregated_output = out;
-                        }
-
-                        //maybeFireAlerts_(job->payload, step, cameraId, out);
-
-                        maybeFireAlerts_(job->payload, step, cameraId, *agent, out);
-
-
-
-                        // Cleanup the JOBS ".processing" clip AFTER alerts had a chance to copy it.
-                        try {
-                            if (!out.empty() && isLikelyJson_(out)) {
-                                json j = json::parse(out);
-                                const std::string cp = j.value("clip_path", "");
-                                if (!cp.empty() &&
-                                    cp.size() >= std::string(".processing").size() &&
-                                    cp.rfind(".processing") == cp.size() - std::string(".processing").size())
-                                {
-                                    std::error_code ec;
-                                    fs::remove(fs::path(cp), ec);
-                                }
-
-                                if (j.contains("temp_clip_cleanup_paths") && j["temp_clip_cleanup_paths"].is_array()) {
-                                    for (const auto& item : j["temp_clip_cleanup_paths"]) {
-                                        if (!item.is_string()) continue;
-                                        const std::string tmpPath = item.get<std::string>();
-                                        if (tmpPath.empty()) continue;
-                                        std::error_code tmpEc;
-                                        fs::remove(fs::path(tmpPath), tmpEc);
-                                    }
-                                }
-                            }
-                        }
-                        catch (...) {
-                            // ignore
-                        }
-
-
-                        // If Gemini signaled a downstream custom step to start, record it.
-                        try {
-                            if (isLikelyJson_(out)) {
-                                json j = json::parse(out);
-                                if (j.contains("start_condition_step_id") && j["start_condition_step_id"].is_number_integer()) {
-                                    int sidToStart = j["start_condition_step_id"].get<int>();
-                                    std::lock_guard<std::mutex> lk2(job->triggeredMu);
-                                    job->triggeredStartStepIds.insert(sidToStart);
-                                }
-                            }
-                        } catch (...) {}
+                            // Record successful cycles after a real inference window was handled.
+                            lastRunAt = nowTick;
+                            runDuePending = false;
+                            persistCompletedOutput(out, true);
 
                             std::this_thread::sleep_for(std::chrono::seconds(1));
+                        }
+
+                        const bool deadlineReachedWithoutCancel =
+                            !job->cancel &&
+                            !run.cancel &&
+                            std::chrono::steady_clock::now() >= run.deadline;
+                        if (deadlineReachedWithoutCancel && !run.timeoutRequested.load()) {
+                            for (int waitAttempt = 0;
+                                 waitAttempt < 10 &&
+                                 !job->cancel &&
+                                 !run.cancel &&
+                                 !run.timeoutRequested.load();
+                                 ++waitAttempt)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            }
+                        }
+                        if (deadlineReachedWithoutCancel &&
+                            run.timeoutRequested.load() &&
+                            !job->cancel &&
+                            !run.cancel &&
+                            !isImageAgentInput &&
+                            !observedTemporalReportDue)
+                        {
+                            const auto timeoutDrainDeadline =
+                                std::chrono::steady_clock::now() +
+                                std::chrono::seconds(kTimeoutDrainGraceSeconds_);
+                            auto noReadyClipWaitDeadline =
+                                (std::min)(
+                                    timeoutDrainDeadline,
+                                    std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
+                                );
+                            Logger::instance().logDebug(
+                                "job",
+                                "runAgentInferenceOnCamera_: timeout drain started job_id=" +
+                                std::to_string(jobId) +
+                                " step_id=" + std::to_string(step.id) +
+                                " camera_id=" + std::to_string(cameraId) +
+                                " grace_seconds=" + std::to_string(kTimeoutDrainGraceSeconds_)
+                            );
+                            while (!job->cancel &&
+                                   !run.cancel &&
+                                   !observedTemporalReportDue &&
+                                   std::chrono::steady_clock::now() < timeoutDrainDeadline)
+                            {
+                                const auto pendingReady =
+                                    peekReadyJobVideoInputForStepCamera_(jobId, step.id, cameraId, *agent);
+                                if (!pendingReady.has_value()) {
+                                    if (std::chrono::steady_clock::now() >= noReadyClipWaitDeadline) {
+                                        break;
+                                    }
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                    continue;
+                                }
+
+                                const std::string drainStartConditionText = buildStartConditionText();
+                                std::string drainOut = runAgentInferenceOnCamera_(
+                                    jobId,
+                                    step.id,
+                                    cameraId,
+                                    *agent,
+                                    resolvePipelineInputsForCamera_(job, step, cameraId, stepsById),
+                                    /*alertConditionText*/ agent->alert_condition_text,
+                                    /*startConditionText*/ drainStartConditionText,
+                                    /*modelTier*/ modelTier,
+                                    /*jobRunId*/ job->payload.job_run_id,
+                                    /*stepRunId*/ step.step_run_id,
+                                    /*agentRunId*/ agent->agent_run_id,
+                                    computeRequestTimeoutSeconds(
+                                        timeoutDrainDeadline,
+                                        kTimeoutDrainInferenceRequestTimeoutCapSeconds_
+                                    ),
+                                    job->cancel
+                                );
+                                if (drainOut.empty()) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                                    continue;
+                                }
+
+                                noReadyClipWaitDeadline =
+                                    (std::min)(
+                                        timeoutDrainDeadline,
+                                        std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
+                                    );
+                                persistCompletedOutput(drainOut, true);
+                            }
+                            Logger::instance().logDebug(
+                                "job",
+                                "runAgentInferenceOnCamera_: timeout drain finished job_id=" +
+                                std::to_string(jobId) +
+                                " step_id=" + std::to_string(step.id) +
+                                " camera_id=" + std::to_string(cameraId) +
+                                " temporal_report_due=" +
+                                std::string(observedTemporalReportDue ? "true" : "false")
+                            );
+                        }
+                        if (deadlineReachedWithoutCancel && !observedTemporalReportDue) {
+                            const std::string timeoutTemporalOutput =
+                                maybeEmitFinalTemporalReportOnTimeout_(
+                                    jobId,
+                                    step.id,
+                                    cameraId,
+                                    *agent,
+                                    agent->alert_condition_text,
+                                    job->payload.job_run_id,
+                                    step.step_run_id,
+                                    agent->agent_run_id
+                                );
+                            if (!timeoutTemporalOutput.empty()) {
+                                lastCompletedOutput = timeoutTemporalOutput;
+                                {
+                                    std::lock_guard<std::mutex> lk(job->outputsMu);
+                                    StepOutput& so = job->outputs[step.id];
+                                    so.last_output_by_camera[cameraId] = timeoutTemporalOutput;
+                                    so.history_by_camera[cameraId].push_back(timeoutTemporalOutput);
+                                    so.aggregated_output = timeoutTemporalOutput;
+                                }
+                                observedTemporalReportDue = true;
+                            }
                         }
 
                         json completionDetails = {
                             {"status_reason",
                              job->cancel ? "job_cancelled"
-                                         : (run.cancel ? "step_cancelled" : "deadline_reached")},
+                                         : (run.timeoutRequested.load()
+                                                ? "deadline_reached"
+                                                : (run.cancel ? "step_cancelled" : "deadline_reached"))},
                             {"successful_iterations", successfulInferenceCount}
                         };
                         if (!lastCompletedOutput.empty()) {
@@ -5428,21 +5595,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             }
         };
 
-        auto finalizeStep = [&](JobInstance::StepRun& run, const char* reason) {
+        auto freezeStepCaptureAndCamera = [&](JobInstance::StepRun& run) {
             auto& step = run.def;
-            run.cancel = true;
-            for (auto& t : run.workers) {
-                if (t.joinable()) t.join();
-            }
-            run.workers.clear();
-
-            /*
-            if (owner_) {
-                for (const auto& tgt : step.targets) {
-                    owner_->jobsCaptureRelease(tgt.camera_id, job->payload.job.id, step.id);
-                }
-            }
-            */
 
             if (owner_) {
                 for (const auto& tgt : step.targets) {
@@ -5453,9 +5607,6 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                 }
             }
 
-            // Important: a step can finish (typically by timeout) while its target cameras
-            // are still running capture/recording. If no other RUNNING step currently
-            // uses a given camera, we should stop it for this job.
             if (owner_) {
                 for (const auto& tgt : step.targets) {
                     const int camId = tgt.camera_id;
@@ -5478,7 +5629,27 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     }
                 }
             }
+        };
 
+        auto finalizeStep = [&](JobInstance::StepRun& run, const char* reason) {
+            auto& step = run.def;
+            const bool timeoutReason = (std::string(reason) == "timeout");
+            if (timeoutReason) {
+                run.timeoutRequested = true;
+                freezeStepCaptureAndCamera(run);
+            }
+            else {
+                run.cancel = true;
+            }
+
+            for (auto& t : run.workers) {
+                if (t.joinable()) t.join();
+            }
+            run.workers.clear();
+
+            if (!timeoutReason) {
+                freezeStepCaptureAndCamera(run);
+            }
 
             if (run.state == JobInstance::StepState::Running) {
                 run.state = JobInstance::StepState::Completed;
@@ -6302,6 +6473,142 @@ void JobRuntime::postStepEvent_(const std::string& eventType, const JobDefSnapsh
     postJobEvent_(eventType, job, d);
 }
 
+std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
+    int jobId,
+    int stepId,
+    int cameraId,
+    const JobAgentDef& agent,
+    const std::string& alertConditionText,
+    const std::string& jobRunId,
+    const std::string& stepRunId,
+    const std::string& agentRunId)
+{
+    if (!owner_) return "";
+
+    const std::string temporalPromptCore = trimCopyRuntime_(agent.prompt_template);
+    const std::string temporalPromptHash =
+        temporal::computePromptRevisionHash(temporalPromptCore, alertConditionText);
+    const std::string temporalSlotKey =
+        "job:" + std::to_string(jobId) +
+        "|step:" + std::to_string(stepId) +
+        "|cam:" + std::to_string(cameraId) +
+        "|agent:" + std::to_string(agent.id > 0 ? agent.id : 0);
+
+    TemporalRuntimeSlot temporalSlot;
+    bool haveTemporalSlot = false;
+    {
+        std::lock_guard<std::mutex> lock(temporalMu_);
+        auto it = temporalBySlot_.find(temporalSlotKey);
+        if (it != temporalBySlot_.end()) {
+            temporalSlot = it->second;
+            haveTemporalSlot = true;
+        }
+    }
+    if (!haveTemporalSlot || !temporal::planUsable(temporalSlot.planEnvelope) || !temporalSlot.state.is_object()) {
+        return "";
+    }
+    if (!temporalSlot.visualState.is_object()) {
+        temporalSlot.visualState = json::object();
+    }
+
+    const bool slotPlanMatchesCurrentPrompt =
+        (!temporalSlot.promptHash.empty() && temporalSlot.promptHash == temporalPromptHash) ||
+        temporal::planMatchesPromptRevision(
+            temporalSlot.planEnvelope,
+            temporalPromptCore,
+            alertConditionText
+        );
+    if (!slotPlanMatchesCurrentPrompt) {
+        return "";
+    }
+
+    const std::string nowIsoUtc = temporal::nowIso();
+    const temporal::EvalResult eval = temporal::evaluate(
+        temporalSlot.state,
+        temporalSlot.planEnvelope,
+        nowIsoUtc
+    );
+
+    temporalSlot.touchedAt = std::chrono::steady_clock::now();
+    temporalSlot.promptHash = temporalPromptHash;
+    {
+        std::lock_guard<std::mutex> lock(temporalMu_);
+        temporalBySlot_[temporalSlotKey] = temporalSlot;
+    }
+
+    if (!eval.report) {
+        return "";
+    }
+
+    const json identityCards =
+        owner_->collectOperationalIdentityCards(temporalSlot.state, temporalSlot.visualState);
+    std::string primaryIdentityCardId;
+    if (identityCards.is_array() &&
+        !identityCards.empty() &&
+        identityCards[0].is_object() &&
+        identityCards[0].contains("card_id") &&
+        identityCards[0]["card_id"].is_string())
+    {
+        primaryIdentityCardId =
+            trimCopyRuntime_(identityCards[0]["card_id"].get<std::string>());
+    }
+
+    json reportDetails = {
+        { "job_id", jobId },
+        { "step_id", stepId },
+        { "camera_id", cameraId },
+        { "agent_id", agent.id },
+        { "operator_results", eval.operatorResults },
+        { "answer", eval.summary },
+        { "decision_source", "temporal_engine" },
+        { "llm_alert_condition", false },
+        { "final_alert_condition", eval.alert },
+        { "temporal_decision_summary", eval.summary },
+        { "status_reason", "deadline_reached" },
+        { "trigger_source", "step_timeout_flush" }
+    };
+    if (!jobRunId.empty()) {
+        reportDetails["job_run_id"] = jobRunId;
+    }
+    if (!stepRunId.empty()) {
+        reportDetails["step_run_id"] = stepRunId;
+    }
+    if (!agentRunId.empty()) {
+        reportDetails["agent_run_id"] = agentRunId;
+    }
+    if (!primaryIdentityCardId.empty()) {
+        reportDetails["primary_identity_card_id"] = primaryIdentityCardId;
+    }
+    if (identityCards.is_array() && !identityCards.empty()) {
+        reportDetails["identity_cards"] = identityCards;
+    }
+
+    owner_->postAgentEvent(
+        "temporal_report",
+        std::optional<int>(cameraId),
+        "",
+        "",
+        reportDetails
+    );
+
+    json out = {
+        { "answer", eval.summary },
+        { "decision_source", "temporal_engine" },
+        { "temporal_operator_results", eval.operatorResults },
+        { "temporal_report_due", true },
+        { "temporal_decision_summary", eval.summary },
+        { "alert_condition", eval.alert },
+        { "llm_alert_condition", false },
+        { "final_alert_condition", eval.alert }
+    };
+    if (!primaryIdentityCardId.empty()) {
+        out["primary_identity_card_id"] = primaryIdentityCardId;
+    }
+    if (identityCards.is_array() && !identityCards.empty()) {
+        out["identity_cards"] = identityCards;
+    }
+    return out.dump();
+}
 
 
 std::string JobRuntime::runAgentInferenceOnCamera_(
@@ -6320,7 +6627,6 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     std::atomic<bool>& cancel
 ) {
     if (cancel) return "";
-    (void)timeoutSeconds;
 
     // Normalize input_type (defensive)
     std::string it = agent.input_type;
@@ -8134,7 +8440,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 tsUtcIso,
                 promptTokens,
                 outputTokens,
-                totalTokens
+                totalTokens,
+                timeoutSeconds
             );
         }
         else {
@@ -8152,7 +8459,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 tsUtcIso,
                 promptTokens,
                 outputTokens,
-                totalTokens
+                totalTokens,
+                timeoutSeconds
             );
         }
 
@@ -8970,7 +9278,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             normalizeVideoPackagingMode_(agent.video_packaging_mode),
             promptTokens,
             outputTokens,
-            totalTokens
+            totalTokens,
+            timeoutSeconds
         );
     }
     else {
@@ -8986,7 +9295,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             /*geminiApiKey*/ modelApiKey,
             promptTokens,
             outputTokens,
-            totalTokens
+            totalTokens,
+            timeoutSeconds
         );
     }
 
@@ -9857,6 +10167,39 @@ static bool parseLocalClipTimePoint_(
     return true;
 }
 
+static bool parseCompactLocalClipTimePoint_(
+    const std::string& compactTs,
+    std::chrono::system_clock::time_point& outTp)
+{
+    if (compactTs.size() != 15 || compactTs[8] != '_') return false;
+    return parseLocalClipTimePoint_(
+        compactTs.substr(0, 8),
+        compactTs.substr(9, 6),
+        outTp
+    );
+}
+
+static int deriveActualWindowSecondsFromCompactClipRange_(
+    const std::string& startCompact,
+    const std::string& endCompact,
+    int fallbackSeconds)
+{
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point endTp;
+    if (!parseCompactLocalClipTimePoint_(startCompact, startTp) ||
+        !parseCompactLocalClipTimePoint_(endCompact, endTp) ||
+        endTp <= startTp)
+    {
+        return fallbackSeconds > 0 ? fallbackSeconds : 0;
+    }
+
+    const auto diffSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(endTp - startTp).count();
+    return diffSeconds > 0
+        ? static_cast<int>(diffSeconds)
+        : (fallbackSeconds > 0 ? fallbackSeconds : 0);
+}
+
 static std::string formatPrettyLocalTimePoint_(
     const std::chrono::system_clock::time_point& tp)
 {
@@ -9950,12 +10293,10 @@ static bool parseClipSpanFromPath_(
     const double tsDurationSeconds =
         std::chrono::duration_cast<std::chrono::milliseconds>(endTp - startTp).count() / 1000.0;
     double contentDurationSeconds = tsDurationSeconds;
-    if (nominalSeconds > 0) {
-        // Clip suffix (_10s/_60s/_300s) is the most stable signal for media content duration.
-        contentDurationSeconds = static_cast<double>(nominalSeconds);
-    }
     if (contentDurationSeconds <= 0.0) {
-        contentDurationSeconds = 1.0;
+        contentDurationSeconds = nominalSeconds > 0
+            ? static_cast<double>(nominalSeconds)
+            : 1.0;
     }
 
     outSpan.path = clipPath;
@@ -10481,7 +10822,11 @@ static VideoWindowAssemblyResult claimSinglePendingJobsClip_(
         result.clipPath = processingPath.string();
         result.windowStartPretty = clip.startPretty;
         result.windowEndPretty = clip.endPretty;
-        result.windowSeconds = 10;
+        result.windowSeconds = deriveActualWindowSecondsFromCompactClipRange_(
+            clip.startCompact,
+            clip.endCompact,
+            10
+        );
         return result;
     }
     catch (...) {
@@ -10522,7 +10867,11 @@ static VideoWindowAssemblyResult assembleAdaptivePendingJobsWindow_(
 
     const PendingJobClip_& first = pending.front();
     const PendingJobClip_& last = pending[static_cast<size_t>(clipCount - 1)];
-    const int windowSeconds = clipCount * 10;
+    const int windowSeconds = deriveActualWindowSecondsFromCompactClipRange_(
+        first.startCompact,
+        last.endCompact,
+        clipCount * 10
+    );
     if (first.startCompact.size() != 15 || last.endCompact.size() != 15) {
         return claimSinglePendingJobsClip_(jobId, stepId, cameraId, pending.front());
     }

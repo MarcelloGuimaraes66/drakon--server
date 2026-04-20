@@ -1142,10 +1142,13 @@ int FrameDiskWriter::probeClipFps_(const std::string& path) {
 }
 
 FrameDiskWriter::TimeParts FrameDiskWriter::getTimeParts_() const {
+    return getTimePartsForSystemTime_(std::chrono::system_clock::now());
+}
+
+FrameDiskWriter::TimeParts FrameDiskWriter::getTimePartsForSystemTime_(
+    const std::chrono::system_clock::time_point& tp) const {
     using namespace std::chrono;
-    // local Windows time, no manual offset
-    auto nowSys = system_clock::now();
-    auto ms = duration_cast<milliseconds>(nowSys.time_since_epoch());
+    auto ms = duration_cast<milliseconds>(tp.time_since_epoch());
     std::time_t tt = static_cast<std::time_t>(ms.count() / 1000);
     int msPart = static_cast<int>(ms.count() % 1000);
 
@@ -1156,6 +1159,15 @@ FrameDiskWriter::TimeParts FrameDiskWriter::getTimeParts_() const {
     localtime_r(&tt, &tmLocal);
 #endif
     return { tmLocal, msPart };
+}
+
+void FrameDiskWriter::clearSegmentTimeline_(SegmentWriter& writer) {
+    writer.clipStartAt = Clock::time_point{};
+    writer.nextSampleAt = Clock::time_point{};
+    writer.clipStartWallTime = std::chrono::system_clock::time_point{};
+    writer.timelineInitialized = false;
+    writer.heldFrame.release();
+    writer.hasHeldFrame = false;
 }
 
 
@@ -1206,7 +1218,9 @@ void FrameDiskWriter::openWriterIfNeeded_(
     SegmentWriter& w,
     const std::string& path,
     const cv::Size& size,
-    double fps)
+    double fps,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime)
 {
     if (w.isOpened()) return;
 
@@ -1219,6 +1233,10 @@ void FrameDiskWriter::openWriterIfNeeded_(
         w.height = size.height;
         w.fps = static_cast<double>(normalizeClipFps_(fps));
         w.frameCount = 0;
+        w.clipStartAt = clipStartAt;
+        w.nextSampleAt = clipStartAt;
+        w.clipStartWallTime = clipStartWallTime;
+        w.timelineInitialized = true;
 
         safeLogDebug(cameraId_, "FrameDiskWriter: opening MF writer at " + path);
 
@@ -1343,6 +1361,8 @@ void FrameDiskWriter::openWriterIfNeeded_(
     (void)w;
     (void)path;
     (void)size;
+    (void)clipStartAt;
+    (void)clipStartWallTime;
     safeLogDebug(cameraId_, "FrameDiskWriter: Media Foundation writer not available on this platform");
 #endif
 }
@@ -1753,24 +1773,46 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
 
 // --- short-clip rotation (10s) ---
 
-void FrameDiskWriter::rotate10s_(const cv::Size& size, const TimeParts& tp) {
+void FrameDiskWriter::rotate10s_(
+    const cv::Size& size,
+    const TimeParts& tp,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime) {
     if (!capture10Enabled_) return;
     if (!writer10_.isOpened()) {
         std::string prefix = ensureBaseDirAndMakePrefix_(tp);
         std::string path = prefix + "_10s.mp4";
-        openWriterIfNeeded_(writer10_, path, size, static_cast<double>(capture10Fps_));
+        openWriterIfNeeded_(
+            writer10_,
+            path,
+            size,
+            static_cast<double>(capture10Fps_),
+            clipStartAt,
+            clipStartWallTime
+        );
         if (writer10_.isOpened()) {
             tenSecondPaths_.push_back(path);
         }
     }
 }
 
-void FrameDiskWriter::rotate60s_(const cv::Size& size, const TimeParts& tp) {
+void FrameDiskWriter::rotate60s_(
+    const cv::Size& size,
+    const TimeParts& tp,
+    std::chrono::steady_clock::time_point clipStartAt,
+    std::chrono::system_clock::time_point clipStartWallTime) {
     if (!capture60Enabled_) return;
     if (!writer60_.isOpened()) {
         std::string prefix = ensureBaseDirAndMakePrefix_(tp);
         std::string path = prefix + "_60s.mp4";
-        openWriterIfNeeded_(writer60_, path, size, static_cast<double>(capture60Fps_));
+        openWriterIfNeeded_(
+            writer60_,
+            path,
+            size,
+            static_cast<double>(capture60Fps_),
+            clipStartAt,
+            clipStartWallTime
+        );
         if (writer60_.isOpened()) {
             sixtySecondPaths_.push_back(path);
         }
@@ -2211,14 +2253,18 @@ void FrameDiskWriter::discardOpenClip_(
     TimeParts& lastWriteTp,
     bool& hasLastWriteTp)
 {
-    if (!writer.isOpened()) return;
-
     const std::string danglingPath = writer.path;
-    closeWriter_(writer);
+    if (writer.isOpened()) {
+        closeWriter_(writer);
+    } else {
+        writer.frameCount = 0;
+    }
     framesInClip = 0;
     lastWriteAt = Clock::time_point{};
     lastWriteTp = TimeParts{};
     hasLastWriteTp = false;
+    clearSegmentTimeline_(writer);
+    writer.path.clear();
 
     if (!danglingPath.empty()) {
         auto it = std::find(clipPaths.begin(), clipPaths.end(), danglingPath);
@@ -2247,7 +2293,8 @@ bool FrameDiskWriter::finalizeOpenClip_(
     TimeParts& lastWriteTp,
     bool& hasLastWriteTp,
     const std::vector<JobsCopyTarget>& jobsTargets,
-    bool shouldCopyInferenceVideo)
+    bool shouldCopyInferenceVideo,
+    const TimeParts* forcedEndTp)
 {
     if (!writer.isOpened()) {
         return false;
@@ -2258,7 +2305,10 @@ bool FrameDiskWriter::finalizeOpenClip_(
         return false;
     }
 
-    const TimeParts endTp = hasLastWriteTp ? lastWriteTp : getTimeParts_();
+    const TimeParts endTp =
+        forcedEndTp
+            ? *forcedEndTp
+            : (hasLastWriteTp ? lastWriteTp : getTimeParts_());
     closeWriter_(writer);
     framesInClip = 0;
     lastWriteAt = Clock::time_point{};
@@ -2767,45 +2817,137 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
 
         lastSavedAt = now;
         lastSaved_ = now;
+        const auto nowWall = std::chrono::system_clock::now();
+        const auto sampleIntervalNs =
+            (std::max)(1LL, 1000000000LL / static_cast<long long>(clipFps));
+        const auto sampleInterval = std::chrono::nanoseconds(sampleIntervalNs);
+        const std::int64_t targetSamples =
+            (std::max)(1LL, static_cast<long long>(clipFps) * static_cast<long long>(clipSeconds));
 
-        if (clipSeconds >= 60) {
-            rotate60s_(sz, tp);
-        }
-        else {
-            rotate10s_(sz, tp);
+        if (!writer.timelineInitialized) {
+            writer.clipStartAt = now;
+            writer.nextSampleAt = now;
+            writer.clipStartWallTime = nowWall;
+            writer.timelineInitialized = true;
         }
 
-        if (!writer.isOpened()) {
-            Logger::instance().logDebug(
-                cameraId_,
-                "save: failed to open writer for " + std::to_string(clipSeconds) + "s profile"
+        auto ensureWriterForCurrentTimeline = [&]() -> bool {
+            if (!writer.timelineInitialized) {
+                return false;
+            }
+            if (writer.isOpened()) {
+                return true;
+            }
+
+            const TimeParts clipStartTp =
+                getTimePartsForSystemTime_(writer.clipStartWallTime);
+            if (clipSeconds >= 60) {
+                rotate60s_(sz, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+            }
+            else {
+                rotate10s_(sz, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+            }
+
+            if (!writer.isOpened()) {
+                Logger::instance().logDebug(
+                    cameraId_,
+                    "save: failed to open writer for " + std::to_string(clipSeconds) + "s profile"
+                );
+                return false;
+            }
+            return true;
+        };
+
+        auto finalizeCompletedTimelineClip = [&]() {
+            const auto clipEndWallTime =
+                writer.clipStartWallTime + std::chrono::seconds(clipSeconds);
+            const TimeParts forcedEndTp =
+                getTimePartsForSystemTime_(clipEndWallTime);
+            finalizeOpenClip_(
+                writer,
+                clipSeconds,
+                framesInClip,
+                clipPaths,
+                lastWriteAt,
+                lastWriteTp,
+                hasLastWriteTp,
+                jobsTargets,
+                shouldCopyInferenceVideo,
+                &forcedEndTp
             );
-            return;
+            writer.clipStartAt += std::chrono::seconds(clipSeconds);
+            writer.nextSampleAt = writer.clipStartAt;
+            writer.clipStartWallTime = clipEndWallTime;
+            writer.timelineInitialized = true;
+        };
+
+        auto writeDueSamplesUntil = [&](const cv::Mat& sampleFrame, bool includeCurrentBoundary) {
+            if (!writer.timelineInitialized || sampleFrame.empty()) {
+                return;
+            }
+
+            while (writer.timelineInitialized) {
+                const auto clipEndAt = writer.clipStartAt + std::chrono::seconds(clipSeconds);
+                bool wroteAnySampleThisPass = false;
+
+                while (writer.frameCount < targetSamples &&
+                       writer.nextSampleAt < clipEndAt &&
+                       (writer.nextSampleAt < now ||
+                        (includeCurrentBoundary && writer.nextSampleAt <= now)))
+                {
+                    if (!ensureWriterForCurrentTimeline()) {
+                        return;
+                    }
+
+                    const auto frameCountBeforeWrite = writer.frameCount;
+                    writeFrame_(writer, sampleFrame);
+                    if (writer.frameCount == frameCountBeforeWrite) {
+                        discardOpenClip_(
+                            writer,
+                            framesInClip,
+                            clipPaths,
+                            lastWriteAt,
+                            lastWriteTp,
+                            hasLastWriteTp
+                        );
+                        return;
+                    }
+
+                    wroteAnySampleThisPass = true;
+                    framesInClip = static_cast<int>(writer.frameCount);
+                    const auto sampleOffset = writer.nextSampleAt - writer.clipStartAt;
+                    const auto sampleWallTime =
+                        writer.clipStartWallTime +
+                        std::chrono::duration_cast<std::chrono::system_clock::duration>(sampleOffset);
+                    lastWriteTp = getTimePartsForSystemTime_(sampleWallTime);
+                    hasLastWriteTp = true;
+                    writer.nextSampleAt += sampleInterval;
+                }
+
+                if (writer.frameCount >= targetSamples) {
+                    finalizeCompletedTimelineClip();
+                    continue;
+                }
+
+                if (!wroteAnySampleThisPass) {
+                    break;
+                }
+            }
+        };
+
+        if (writer.hasHeldFrame) {
+            writeDueSamplesUntil(writer.heldFrame, false);
         }
 
-        writeFrame_(writer, frame);
-        ++framesInClip;
-        lastWriteAt = now;
-        lastWriteTp = tp;
-        hasLastWriteTp = true;
+        writer.heldFrame = frame.clone();
+        writer.hasHeldFrame = !writer.heldFrame.empty();
+        writeDueSamplesUntil(writer.heldFrame, true);
 
-        int framesPerClip = static_cast<int>(static_cast<double>(clipFps) * static_cast<double>(clipSeconds) + 0.5);
-        if (framesPerClip < 1) framesPerClip = 1;
-        if (framesInClip < framesPerClip) {
-            return;
+        if (writer.hasHeldFrame) {
+            lastWriteAt = now;
+            lastWriteTp = tp;
+            hasLastWriteTp = true;
         }
-
-        finalizeOpenClip_(
-            writer,
-            clipSeconds,
-            framesInClip,
-            clipPaths,
-            lastWriteAt,
-            lastWriteTp,
-            hasLastWriteTp,
-            jobsTargets,
-            shouldCopyInferenceVideo
-        );
     };
 
     writeProfileIfDue(
@@ -2874,7 +3016,7 @@ void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThresho
                                   std::chrono::steady_clock::time_point& lastWriteAt,
                                   TimeParts& lastWriteTp,
                                   bool& hasLastWriteTp) {
-        if (!writer.isOpened()) return;
+        if (!writer.timelineInitialized && !writer.isOpened()) return;
 
         if (!hasLastWriteTp || lastWriteAt.time_since_epoch().count() == 0) {
             discardOpenClip_(writer, framesInClip, clipPaths, lastWriteAt, lastWriteTp, hasLastWriteTp);
@@ -2895,17 +3037,25 @@ void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThresho
             )
         );
 
-        finalizeOpenClip_(
-            writer,
-            clipSeconds,
-            framesInClip,
-            clipPaths,
-            lastWriteAt,
-            lastWriteTp,
-            hasLastWriteTp,
-            jobsTargets,
-            shouldCopyInferenceVideo
-        );
+        if (writer.isOpened()) {
+            finalizeOpenClip_(
+                writer,
+                clipSeconds,
+                framesInClip,
+                clipPaths,
+                lastWriteAt,
+                lastWriteTp,
+                hasLastWriteTp,
+                jobsTargets,
+                shouldCopyInferenceVideo
+            );
+        } else {
+            framesInClip = 0;
+            lastWriteAt = Clock::time_point{};
+            lastWriteTp = TimeParts{};
+            hasLastWriteTp = false;
+        }
+        clearSegmentTimeline_(writer);
     };
 
     flushProfileIfIdle(

@@ -69,6 +69,7 @@ private:
             std::chrono::steady_clock::time_point startedAt;
             std::chrono::steady_clock::time_point deadline;
             std::atomic<bool> cancel{ false };
+            std::atomic<bool> timeoutRequested{ false };
             std::vector<std::thread> workers; // one per target camera
             std::string injectedInput;
         };
@@ -123,6 +124,15 @@ private:
         const std::string& modelTier, const std::string& jobRunId,
         const std::string& stepRunId, const std::string& agentRunId,
         int timeoutSeconds, std::atomic<bool>& cancel);
+    std::string maybeEmitFinalTemporalReportOnTimeout_(
+        int jobId,
+        int stepId,
+        int cameraId,
+        const JobAgentDef& agent,
+        const std::string& alertConditionText,
+        const std::string& jobRunId,
+        const std::string& stepRunId,
+        const std::string& agentRunId);
     //void maybeFireAlerts_(const JobStartPayload& payload, const JobStepDef& step, int cameraId, const std::string& inferenceOutput);
 
     void maybeFireAlerts_(

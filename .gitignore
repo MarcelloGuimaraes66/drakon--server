@@ -46,6 +46,17 @@ tmp_billing_frames/
 tmp_video_analysis/
 tmp_zoom_review/
 tmp_zoom_review_132025/
+tmp_cam127_events/
+tmp_cam127_events_tail/
+tmp_cam127_hog/
+tmp_cam127_samples/
+tmp_cam127_events_sheet.jpg
+tmp_cam127_events_tail_sheet.jpg
+tmp_cam127_yolo_test.jpg
+cam127_gate_count.json
+analyze_cam127_gate.py
+.claude/
+models/
 
 # AppHost generated and packaged outputs
 AppHost/dist/

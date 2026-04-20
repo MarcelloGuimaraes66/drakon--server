@@ -883,7 +883,8 @@ std::string httpPostJsonGemini(
     const std::string& api_key,
     const std::string& modelName,
     const nlohmann::json& bodyJson,
-    const std::function<void()>& onFirstRetry);
+    const std::function<void()>& onFirstRetry,
+    long requestTimeoutSecOverride = 0L);
 
 
 
@@ -1158,6 +1159,7 @@ struct ClipInfo {
     std::string startTs;   // "YYYYMMDD_HHMMSS"
     std::string endTs;     // "YYYYMMDD_HHMMSS"
     int nominalSeconds;    // 10, 60, 300 (parsed from filename if possible)
+    double actualDurationSeconds = 0.0;
 
     int cameraId = -1;          
     std::string cameraName;     
@@ -2069,6 +2071,19 @@ static double deriveDurationSecondsFromSegmentBounds_(
     return diffSeconds > 0 ? static_cast<double>(diffSeconds) : 0.0;
 }
 
+static int deriveRoundedSegmentDurationSeconds_(
+    const std::string& segmentStartTs,
+    const std::string& segmentEndTs,
+    int fallbackSeconds)
+{
+    const double rangeSeconds =
+        deriveDurationSecondsFromSegmentBounds_(segmentStartTs, segmentEndTs);
+    if (rangeSeconds > 0.0) {
+        return (std::max)(1, static_cast<int>(std::lround(rangeSeconds)));
+    }
+    return fallbackSeconds > 0 ? fallbackSeconds : 0;
+}
+
 static void clampSegmentRangeToAnalyzedWindow_(
     std::string& segmentStartTs,
     std::string& segmentEndTs,
@@ -2322,6 +2337,8 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
             ci.startTs = clipStartTs;
             ci.endTs = clipEndTs;
             ci.nominalSeconds = nominalSeconds;
+            ci.actualDurationSeconds =
+                deriveDurationSecondsFromSegmentBounds_(clipStartTs, clipEndTs);
             ci.cameraId = camId;
 
             auto itName = camNameById.find(camId);
@@ -2421,7 +2438,15 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
         int currentGroupSeconds = 0;
 
         for (const ClipInfo* ci : chosen) {
-            int clipSeconds = ci->nominalSeconds > 0 ? ci->nominalSeconds : 10;
+            int clipSeconds =
+                deriveRoundedSegmentDurationSeconds_(
+                    ci->startTs,
+                    ci->endTs,
+                    ci->nominalSeconds > 0 ? ci->nominalSeconds : 10
+                );
+            if (clipSeconds <= 0) {
+                clipSeconds = 10;
+            }
 
             if (!currentGroup.empty() &&
                 currentGroupSeconds + clipSeconds > safeMaxSegmentSeconds)
@@ -18806,6 +18831,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             clipInfo.startTs = parsedStartTs;
             clipInfo.endTs = parsedEndTs;
             clipInfo.nominalSeconds = nominalSeconds;
+            clipInfo.actualDurationSeconds =
+                deriveDurationSecondsFromSegmentBounds_(parsedStartTs, parsedEndTs);
             clipInfo.cameraId = cameraId;
             clipInfo.cameraName = cameraName;
 
@@ -21356,7 +21383,8 @@ namespace {
         const std::string& apiKey,
         const nlohmann::json& bodyJson,
         const std::function<void()>& onFirstRetry,
-        const std::string& cameraLogId = "")
+        const std::string& cameraLogId = "",
+        long requestTimeoutSecOverride = 0L)
     {
         const std::string modelName = bodyJson.value("model", std::string());
         auto isZAiCoreModelLocal = [](std::string m) {
@@ -21404,6 +21432,12 @@ namespace {
 
             // Avoid excessive stalls when one long request already timed out.
             maxAttempts = 2;
+        }
+        long connectTimeoutSec = 30L;
+        if (requestTimeoutSecOverride > 0L) {
+            requestTimeoutSec = (std::max)(1L, (std::min)(requestTimeoutSec, requestTimeoutSecOverride));
+            connectTimeoutSec = (std::max)(1L, (std::min)(30L, requestTimeoutSec));
+            maxAttempts = 1;
         }
 
         const std::string url = useZAiCore
@@ -21454,7 +21488,7 @@ namespace {
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
             // Keep bounded and similar to Gemini path.
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connectTimeoutSec);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, requestTimeoutSec);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
@@ -21560,7 +21594,8 @@ namespace {
         const std::string& apiKey,
         const nlohmann::json& chatCompletionsBodyJson,
         const std::function<void()>& onFirstRetry,
-        const std::string& cameraLogId = "")
+        const std::string& cameraLogId = "",
+        long requestTimeoutSecOverride = 0L)
     {
         const nlohmann::json bodyJson =
             convertOpenAIChatCompletionsBodyToResponsesBody_(chatCompletionsBodyJson);
@@ -21593,6 +21628,12 @@ namespace {
             else requestTimeoutSec = 180L;
             maxAttempts = 2;
         }
+        long connectTimeoutSec = 30L;
+        if (requestTimeoutSecOverride > 0L) {
+            requestTimeoutSec = (std::max)(1L, (std::min)(requestTimeoutSec, requestTimeoutSecOverride));
+            connectTimeoutSec = (std::max)(1L, (std::min)(30L, requestTimeoutSec));
+            maxAttempts = 1;
+        }
 
         const std::string url = "https://api.openai.com/v1/responses";
         const std::string providerLabel = "OpenAI";
@@ -21619,7 +21660,7 @@ namespace {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connectTimeoutSec);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, requestTimeoutSec);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
@@ -27958,7 +27999,8 @@ VideoHit AgentCore::callGeminiVisionVideoSegmentJOB_(
     const std::string& geminiApiKey,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens)
+    int& outTotalTokens,
+    int requestTimeoutSeconds)
 {
     VideoHit hit;
     hit.segmentStartTs = segment.startTs;
@@ -27987,6 +28029,22 @@ VideoHit AgentCore::callGeminiVisionVideoSegmentJOB_(
     const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
         buildEffectiveNegativeReferences_(negativeReferences);
     const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     // 1) Build parts
     //nlohmann::json parts = nlohmann::json::array();
@@ -28263,11 +28321,21 @@ VideoHit AgentCore::callGeminiVisionVideoSegmentJOB_(
         //}
         std::string rawResp;
         try {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callGeminiVisionVideoSegmentJOB_: request budget exhausted before HTTP call"
+                );
+                return hit;
+            }
             rawResp = httpPostJsonGemini(
                 apiKey,
                 modelName,
                 body,
-                []() { MaybeNotifyFirstRetry(); }
+                []() { MaybeNotifyFirstRetry(); },
+                remainingRequestTimeoutSeconds()
             );
         }
         catch (const std::exception& e) {
@@ -28469,7 +28537,8 @@ VideoHit AgentCore::callGeminiVisionImageJOB_(
     const std::string& snapshotTsUtcIso,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens)
+    int& outTotalTokens,
+    int requestTimeoutSeconds)
 {
     VideoHit hit;
     outPromptTokens = outOutputTokens = outTotalTokens = 0;
@@ -28485,6 +28554,22 @@ VideoHit AgentCore::callGeminiVisionImageJOB_(
     const std::vector<NegativeReferenceImage> effectiveNegativeReferences =
         buildEffectiveNegativeReferences_(negativeReferences);
     const bool hasNegativeReferences = !effectiveNegativeReferences.empty();
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     try {
         nlohmann::json parts = nlohmann::json::array();
@@ -28739,11 +28824,21 @@ VideoHit AgentCore::callGeminiVisionImageJOB_(
 
         std::string rawResp;
         try {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callGeminiVisionImageJOB_: request budget exhausted before HTTP call"
+                );
+                return hit;
+            }
             rawResp = httpPostJsonGemini(
                 apiKey,
                 modelName,
                 body,
-                []() { MaybeNotifyFirstRetry(); }
+                []() { MaybeNotifyFirstRetry(); },
+                remainingRequestTimeoutSeconds()
             );
         }
         catch (const std::exception& e) {
@@ -29279,7 +29374,8 @@ std::string AgentCore::postOpenAIChatCompletionsWithCoreLease_(
     bool requestChatPriority,
     const std::function<bool()>& shouldAbort,
     const std::string& waitScope,
-    const std::string& cameraLogId)
+    const std::string& cameraLogId,
+    long requestTimeoutSecOverride)
 {
     auto lease = acquireCoreModelExecutionLease_(
         bodyJson.value("model", std::string()),
@@ -29288,7 +29384,13 @@ std::string AgentCore::postOpenAIChatCompletionsWithCoreLease_(
         waitScope,
         cameraLogId
     );
-    return httpPostJsonOpenAI(apiKey, bodyJson, onFirstRetry, cameraLogId);
+    return httpPostJsonOpenAI(
+        apiKey,
+        bodyJson,
+        onFirstRetry,
+        cameraLogId,
+        requestTimeoutSecOverride
+    );
 }
 
 std::string AgentCore::postOpenAIResponsesWithCoreLease_(
@@ -29298,7 +29400,8 @@ std::string AgentCore::postOpenAIResponsesWithCoreLease_(
     bool requestChatPriority,
     const std::function<bool()>& shouldAbort,
     const std::string& waitScope,
-    const std::string& cameraLogId)
+    const std::string& cameraLogId,
+    long requestTimeoutSecOverride)
 {
     auto lease = acquireCoreModelExecutionLease_(
         chatCompletionsBodyJson.value("model", std::string()),
@@ -29307,7 +29410,13 @@ std::string AgentCore::postOpenAIResponsesWithCoreLease_(
         waitScope,
         cameraLogId
     );
-    return httpPostJsonOpenAIResponses(apiKey, chatCompletionsBodyJson, onFirstRetry, cameraLogId);
+    return httpPostJsonOpenAIResponses(
+        apiKey,
+        chatCompletionsBodyJson,
+        onFirstRetry,
+        cameraLogId,
+        requestTimeoutSecOverride
+    );
 }
 
 VideoHit AgentCore::callOpenAIVisionVideoSegment_(
@@ -29834,7 +29943,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
     const std::string& videoPackagingMode,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens)
+    int& outTotalTokens,
+    int requestTimeoutSeconds)
 {
     VideoHit hit;
     hit.cameraId = segment.cameraId;
@@ -29902,6 +30012,23 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
             std::to_string(effectiveFaceReferences.size()) + " reference image(s)"
         );
     }
+
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     try {
         std::string videoPath = segment.sourceFilePath;
@@ -29995,9 +30122,27 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
         std::string rawResp;
         OpenAITextObjectResponse_ parsedResponse;
         auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionVideoSegmentJOB_: request budget exhausted before attempt=" +
+                    std::to_string(attemptNo)
+                );
+                return false;
+            }
             nlohmann::json reqBody = body;
             applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
             const auto coreRequestStart = std::chrono::steady_clock::now();
+            std::function<bool()> shouldAbortWait;
+            long requestTimeoutOverrideSec = 0L;
+            if (requestTimeoutSeconds > 0) {
+                shouldAbortWait = [requestBudgetDeadline]() {
+                    return std::chrono::steady_clock::now() >= requestBudgetDeadline;
+                };
+                requestTimeoutOverrideSec = remainingRequestTimeoutSeconds();
+            }
 
             try {
                 if (useResponsesTransport) {
@@ -30006,9 +30151,10 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         false,
-                        {},
+                        shouldAbortWait,
                         "background_video_segment_job",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
                 else {
@@ -30017,9 +30163,10 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         false,
-                        {},
+                        shouldAbortWait,
                         "background_video_segment_job",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
             }
@@ -30052,7 +30199,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegmentJOB_(
                         { "attempt", attemptNo },
                         { "segment_start_ts", segmentStartForPrompt },
                         { "segment_end_ts", segmentEndForPrompt },
-                        { "expected_window_seconds", expectedWindowSeconds }
+                        { "expected_window_seconds", expectedWindowSeconds },
+                        { "request_timeout_seconds", requestTimeoutSeconds }
                     }
                 );
                 return false;
@@ -30301,9 +30449,14 @@ VideoHit AgentCore::runCameraCustomVideoInference(
     const int safeRunningResolution = (runningResolution == 1024) ? 1024 : 640;
     int safeWindow = expectedWindowSeconds <= 0 ? 60 : expectedWindowSeconds;
 
-    // For direct camera inference, prefer the actual clip nominal duration from filename
-    // (e.g., 10s clip should not request a 60s frame window).
-    if (!segment.sourceFilePath.empty()) {
+    // Prefer the real segment span so adaptive windows no longer collapse
+    // back to their nominal bucket size.
+    const int segmentRangeSeconds =
+        deriveRoundedSegmentDurationSeconds_(segment.startTs, segment.endTs, 0);
+    if (segmentRangeSeconds > 0) {
+        safeWindow = segmentRangeSeconds;
+    }
+    else if (!segment.sourceFilePath.empty()) {
         try {
             std::string clipCameraId;
             std::string clipStartTs;
@@ -30316,8 +30469,15 @@ VideoHit AgentCore::runCameraCustomVideoInference(
                 clipStartTs,
                 clipEndTs,
                 clipNominalSeconds
-            ) && clipNominalSeconds > 0) {
-                safeWindow = clipNominalSeconds;
+            )) {
+                const int clipRangeSeconds =
+                    deriveRoundedSegmentDurationSeconds_(clipStartTs, clipEndTs, 0);
+                if (clipRangeSeconds > 0) {
+                    safeWindow = clipRangeSeconds;
+                }
+                else if (clipNominalSeconds > 0) {
+                    safeWindow = clipNominalSeconds;
+                }
             }
         }
         catch (...) {
@@ -31029,7 +31189,8 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
     const std::string& snapshotTsUtcIso,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens
+    int& outTotalTokens,
+    int requestTimeoutSeconds
 )
 {
     VideoHit hit;
@@ -31052,6 +31213,22 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
     const VisionPromptSections_ promptSections = parseVisionPromptSections_(userQuestion);
     const std::vector<std::string> fallbackFaceTargetNames =
         collectTargetNamesFromFaceReferences_(effectiveFaceReferences);
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     try {
         const std::string modelName = openAiModelName.empty() ? "gpt-5-mini" : openAiModelName;
@@ -31085,9 +31262,27 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
         OpenAITextObjectResponse_ parsedResponse;
 
         auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionImageJOB_: request budget exhausted before attempt=" +
+                    std::to_string(attemptNo)
+                );
+                return false;
+            }
             nlohmann::json reqBody = body;
             applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
             const auto coreRequestStart = std::chrono::steady_clock::now();
+            std::function<bool()> shouldAbortWait;
+            long requestTimeoutOverrideSec = 0L;
+            if (requestTimeoutSeconds > 0) {
+                shouldAbortWait = [requestBudgetDeadline]() {
+                    return std::chrono::steady_clock::now() >= requestBudgetDeadline;
+                };
+                requestTimeoutOverrideSec = remainingRequestTimeoutSeconds();
+            }
 
             try {
                 if (useResponsesTransport) {
@@ -31096,9 +31291,10 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         false,
-                        {},
+                        shouldAbortWait,
                         "background_image_job",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
                 else {
@@ -31107,9 +31303,10 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         false,
-                        {},
+                        shouldAbortWait,
                         "background_image_job",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
             }
@@ -31139,7 +31336,8 @@ VideoHit AgentCore::callOpenAIVisionImageJOB_(
                     e.what(),
                     nlohmann::json{
                         { "attempt", attemptNo },
-                        { "snapshot_ts_utc_iso", snapshotTsUtcIso }
+                        { "snapshot_ts_utc_iso", snapshotTsUtcIso },
+                        { "request_timeout_seconds", requestTimeoutSeconds }
                     }
                 );
                 return false;

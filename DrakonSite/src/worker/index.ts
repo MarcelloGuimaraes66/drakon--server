@@ -49480,7 +49480,7 @@ app.post("/api/agent/events", async (c) => {
     Number.isInteger(parsedCameraId) && Number(parsedCameraId) > 0
       ? Number(parsedCameraId)
       : null;
-  const eventType = body.event_type ?? "agent_event";
+  let eventType = body.event_type ?? "agent_event";
   let message = body.message ?? "";
   let details = body.details || null;
   const now = new Date().toISOString();
@@ -49584,6 +49584,87 @@ app.post("/api/agent/events", async (c) => {
     }
     return null;
   };
+
+  const readOperationalString = (...values: unknown[]): string => {
+    for (const value of values) {
+      if (typeof value !== "string") continue;
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    return "";
+  };
+
+  const readOperationalPositiveInt = (...values: unknown[]): number | null => {
+    for (const value of values) {
+      const numeric = typeof value === "number" ? value : Number(value);
+      if (Number.isInteger(numeric) && numeric > 0) {
+        return Number(numeric);
+      }
+    }
+    return null;
+  };
+
+  if (eventType === "temporal_report") {
+    const jobDetails =
+      detailsObject.job && typeof detailsObject.job === "object" && !Array.isArray(detailsObject.job)
+        ? (detailsObject.job as Record<string, unknown>)
+        : null;
+    const sourceType = readOperationalString(
+      detailsObject.source_type,
+      detailsObject.sourceType
+    ).toLowerCase();
+    const source = readOperationalString(detailsObject.source).toLowerCase();
+    const hasJobTemporalContext =
+      !!readOperationalString(body.job_run_id, body.step_run_id) ||
+      readOperationalPositiveInt(
+        detailsObject.job_id,
+        detailsObject.jobId,
+        jobDetails?.id,
+      ) !== null ||
+      readOperationalPositiveInt(
+        detailsObject.step_id,
+        detailsObject.stepId,
+        detailsObject.step_order,
+        detailsObject.stepOrder,
+      ) !== null ||
+      source === "job" ||
+      sourceType === "job_step" ||
+      sourceType === "job_step_agent";
+    const hasCameraTemporalContext =
+      sourceType === "camera_algorithm" ||
+      readOperationalPositiveInt(
+        detailsObject.camera_algorithm_id,
+        detailsObject.cameraAlgorithmId,
+        detailsObject.algorithm_id,
+        detailsObject.algorithmId,
+      ) !== null ||
+      (!hasJobTemporalContext &&
+        !!readOperationalString(
+          body.camera_session_id,
+          detailsObject.camera_session_id,
+          detailsObject.cameraSessionId,
+        ));
+    const temporalVisibleEventType = hasJobTemporalContext
+      ? "job_alert_triggered"
+      : hasCameraTemporalContext
+      ? "ai_detection"
+      : "";
+    detailsObject.original_event_type = "temporal_report";
+    if (temporalVisibleEventType) {
+      detailsObject.temporal_visible_event_type = temporalVisibleEventType;
+      eventType = temporalVisibleEventType;
+      if (!readOperationalString(message)) {
+        message =
+          readOperationalString(
+            detailsObject.answer,
+            detailsObject.temporal_decision_summary,
+            detailsObject.temporalDecisionSummary,
+            detailsObject.summary_label,
+            detailsObject.summaryLabel,
+          ) || message;
+      }
+    }
+  }
 
   if (eventType === "job_token_usage") {
     const tokenDetails = details && typeof details === "object" ? details : {};
