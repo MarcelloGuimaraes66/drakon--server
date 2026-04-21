@@ -162,19 +162,35 @@ namespace winrt::DrakonDesktop::implementation
 })();
 )JS";
 
+        std::wstring DefaultDashboardUrl()
+        {
+            auto base = ::DrakonDesktop::platform::RuntimeConfig().uiBaseUrl;
+            if (base.empty())
+            {
+                base = L"http://127.0.0.1:4000";
+            }
+
+            if (!base.ends_with(L"/"))
+            {
+                base += L'/';
+            }
+
+            return base + L"dashboard";
+        }
+
         std::wstring ResolveUiUrl()
         {
             wchar_t buffer[2048]{};
             auto const written = GetEnvironmentVariableW(kUiUrlEnvVar, buffer, static_cast<DWORD>(std::size(buffer)));
             if (written == 0 || written >= std::size(buffer))
             {
-                return L"http://127.0.0.1:4000/dashboard";
+                return DefaultDashboardUrl();
             }
 
             std::wstring base(buffer, written);
             if (base.empty())
             {
-                return L"http://127.0.0.1:4000/dashboard";
+                return DefaultDashboardUrl();
             }
 
             if (base.ends_with(L"/dashboard") || base.ends_with(L"/login"))

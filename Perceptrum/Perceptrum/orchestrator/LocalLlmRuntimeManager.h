@@ -1,9 +1,9 @@
 #pragma once
 
+#include "../platform/platform_process.h"
+
 #include <mutex>
 #include <string>
-
-#include <windows.h>
 
 namespace chatv2 {
 
@@ -39,7 +39,7 @@ private:
     void loadConfig_();
     std::string defaultBaseUrl_() const;
     bool isHealthy_(const std::string& baseUrl) const;
-    bool isManagedProcessRunning_() const;
+    bool isManagedProcessRunning_();
     bool launchManagedProcess_();
     bool waitForHealthy_(int timeoutMs);
     void terminateManagedProcess_();
@@ -47,7 +47,7 @@ private:
 
     mutable std::mutex mutex_;
     Config config_;
-    PROCESS_INFORMATION processInfo_{};
+    perceptrum::platform::ProcessHandle processHandle_{};
     bool processActive_ = false;
     bool usingManagedProcess_ = false;
     std::string resolvedBaseUrl_;

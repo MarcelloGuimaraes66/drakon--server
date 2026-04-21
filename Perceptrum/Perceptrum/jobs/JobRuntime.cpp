@@ -3,7 +3,9 @@
 #include "JobPayloadParser.h"
 
 #include "../core/AgentCore.h"      // adjust include paths to your tree
+#include "../core/AnalysisRegionGeometry.h"
 #include "../core/TemporalEngine.h"
+#include "../core/VideoPolygonOverlayRenderer.h"
 #include "../camera/CameraSession.h"
 #include "../comm/TelegramNotifier.h"
 #include "../generated/Branding.h"
@@ -75,6 +77,16 @@ static bool cropVideoClipByFrameWindowWithFfmpeg_(
     const JobFrameWindowNorm& frameWindow,
     fs::path& outClipPath,
     std::string* outErr);
+static bool cutMp4SegmentWithFfmpeg_(
+    const fs::path& srcPath,
+    const fs::path& dstPath,
+    double offsetSeconds,
+    double durationSeconds,
+    std::string* outErr);
+static bool parseCoverageTimePoint_(
+    const std::string& rawIsoUtc,
+    std::chrono::system_clock::time_point& out);
+static std::string trimCopyRuntime_(std::string s);
 static bool extractBoundaryFrameToMatFromMp4_(
     const fs::path& srcMp4Path,
     bool useLastMoment,
@@ -82,10 +94,10 @@ static bool extractBoundaryFrameToMatFromMp4_(
     std::string* outErr);
 
 namespace {
-    constexpr int kTimeoutDrainGraceSeconds_ = 45;
+    constexpr int kTimeoutDrainGraceSeconds_ = 60;
     constexpr int kTimeoutDrainIdleWaitSeconds_ = 2;
-    constexpr int kNormalInferenceRequestTimeoutCapSeconds_ = 45;
-    constexpr int kTimeoutDrainInferenceRequestTimeoutCapSeconds_ = 30;
+    constexpr int kNormalInferenceRequestTimeoutCapSeconds_ = 60;
+    constexpr int kTimeoutDrainInferenceRequestTimeoutCapSeconds_ = 60;
 
     static ErrorLogContext makeJobErrorContext_(
         const std::string& flow,
@@ -129,6 +141,32 @@ namespace {
             sourceId,
             makeJobErrorContext_(flow, functionName, operation, context)
         );
+    }
+
+    static std::string buildJobTemporalReportScopeKey_(
+        int jobId,
+        int stepId,
+        int cameraId,
+        int agentId,
+        const std::string& jobRunId,
+        const std::string& stepRunId,
+        const std::string& agentRunId)
+    {
+        std::ostringstream oss;
+        oss << "job=" << jobId
+            << "|step=" << stepId
+            << "|camera=" << cameraId
+            << "|agent=" << agentId;
+        if (!jobRunId.empty()) {
+            oss << "|job_run_id=" << jobRunId;
+        }
+        if (!stepRunId.empty()) {
+            oss << "|step_run_id=" << stepRunId;
+        }
+        if (!agentRunId.empty()) {
+            oss << "|agent_run_id=" << agentRunId;
+        }
+        return oss.str();
     }
 
     struct JobTokenUsageTask {
@@ -1351,6 +1389,108 @@ static bool parseClipEndTsUtcIsoFromPath_(
     return compactLocalClipTokenToUtcIso_(endDate, endTime, outTsUtcIso);
 }
 
+static bool clipStartsBeforeCoverageCutoff_(
+    const fs::path& clipPath,
+    const std::string& coverageCutoffUtcIso)
+{
+    const std::string normalizedCutoff =
+        temporal::normalizeFlexibleTs(trimCopyRuntime_(coverageCutoffUtcIso));
+    if (normalizedCutoff.empty()) {
+        return true;
+    }
+
+    std::string clipStartUtc;
+    std::string clipEndUtc;
+    if (!parseClipRangeUtcIsoFromPath_(clipPath, clipStartUtc, clipEndUtc)) {
+        return true;
+    }
+
+    const std::string normalizedStart = temporal::normalizeFlexibleTs(clipStartUtc);
+    if (normalizedStart.empty()) {
+        return true;
+    }
+    return normalizedStart < normalizedCutoff;
+}
+
+static bool trimClipToCoverageCutoff_(
+    int jobId,
+    int stepId,
+    int cameraId,
+    const fs::path& srcClipPath,
+    const std::string& srcStartUtcIso,
+    const std::string& srcEndUtcIso,
+    const std::string& coverageCutoffUtcIso,
+    fs::path& outTrimmedPath,
+    std::string& outEffectiveStartUtcIso,
+    std::string& outEffectiveEndUtcIso,
+    std::string* outErr)
+{
+    outTrimmedPath.clear();
+    outEffectiveStartUtcIso = temporal::normalizeFlexibleTs(srcStartUtcIso);
+    outEffectiveEndUtcIso = temporal::normalizeFlexibleTs(srcEndUtcIso);
+
+    const std::string normalizedCutoff =
+        temporal::normalizeFlexibleTs(trimCopyRuntime_(coverageCutoffUtcIso));
+    if (normalizedCutoff.empty() ||
+        outEffectiveStartUtcIso.empty() ||
+        outEffectiveEndUtcIso.empty())
+    {
+        return true;
+    }
+    if (outEffectiveEndUtcIso <= normalizedCutoff) {
+        return true;
+    }
+    if (outEffectiveStartUtcIso >= normalizedCutoff) {
+        if (outErr) {
+            *outErr = "clip starts at or after coverage cutoff";
+        }
+        return false;
+    }
+
+    std::chrono::system_clock::time_point startTp;
+    std::chrono::system_clock::time_point cutoffTp;
+    if (!parseCoverageTimePoint_(outEffectiveStartUtcIso, startTp) ||
+        !parseCoverageTimePoint_(normalizedCutoff, cutoffTp) ||
+        cutoffTp <= startTp)
+    {
+        if (outErr) {
+            *outErr = "invalid trim range";
+        }
+        return false;
+    }
+
+    const double durationSeconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cutoffTp - startTp
+    ).count() / 1000.0;
+    if (durationSeconds <= 0.0) {
+        if (outErr) {
+            *outErr = "non-positive trim duration";
+        }
+        return false;
+    }
+
+    const std::string safeCutoff = normalizedCutoff;
+    std::string trimmedStem = "coverage_trim_" + std::to_string(jobId) +
+        "_" + std::to_string(stepId) +
+        "_" + std::to_string(cameraId) +
+        "_" + std::to_string(std::hash<std::string>{}(srcClipPath.string() + safeCutoff));
+    fs::path trimmedPath =
+        getJobsTempDirForJobStepCamera(jobId, stepId, std::to_string(cameraId)) /
+        (trimmedStem + ".mp4");
+
+    std::string trimErr;
+    if (!cutMp4SegmentWithFfmpeg_(srcClipPath, trimmedPath, 0.0, durationSeconds, &trimErr)) {
+        if (outErr) {
+            *outErr = trimErr;
+        }
+        return false;
+    }
+
+    outTrimmedPath = trimmedPath;
+    outEffectiveEndUtcIso = normalizedCutoff;
+    return true;
+}
+
 static bool hasProcessingSuffix_(const fs::path& clipPath)
 {
     const std::string name = clipPath.filename().string();
@@ -1790,6 +1930,48 @@ static int normalizeRunEverySeconds_(int seconds) {
     return (seconds <= 10) ? 10 : 60;
 }
 
+static bool parseCoverageTimePoint_(const std::string& rawIsoUtc, std::chrono::system_clock::time_point& out) {
+    return temporal::parseFlexibleTs(rawIsoUtc, out);
+}
+
+static std::string formatCoverageIsoUtc_(const std::chrono::system_clock::time_point& tp) {
+    return temporal::formatIsoUtcNoSuffix(tp);
+}
+
+static bool hasUsableInferenceResult_(const VideoHit& hit, int promptTokens, int outputTokens, int totalTokens) {
+    if (hit.analysisFailed) {
+        return false;
+    }
+    if (promptTokens > 0 || outputTokens > 0 || totalTokens > 0) {
+        return true;
+    }
+    if (!trimCopyRuntime_(hit.answer).empty()) {
+        return true;
+    }
+    if (hit.hasMatch || hit.alertCondition || hit.faceIdMatch) {
+        return true;
+    }
+    if (hit.startConditionStepId >= 0) {
+        return true;
+    }
+    if (!hit.alertRegionIds.empty()) {
+        return true;
+    }
+    if (hit.temporalPayloadPresent) {
+        return true;
+    }
+    if (hit.identityPatch.is_array() && !hit.identityPatch.empty()) {
+        return true;
+    }
+    if (hit.observations.is_array() && !hit.observations.empty()) {
+        return true;
+    }
+    if (!hit.temporalEvidenceCandidates.empty()) {
+        return true;
+    }
+    return false;
+}
+
 static std::string trimCopyRuntime_(std::string s) {
     auto isSpace = [](unsigned char ch) { return std::isspace(ch); };
     while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
@@ -1944,125 +2126,121 @@ static std::vector<JobAnalysisRegion> collectEnabledAnalysisRegionsForAgent_(con
     return out;
 }
 
+static analysisregion::FrameWindowNorm toSharedFrameWindow_(const JobFrameWindowNorm& frameWindow)
+{
+    analysisregion::FrameWindowNorm out;
+    out.enabled = frameWindow.enabled;
+    out.x = frameWindow.x;
+    out.y = frameWindow.y;
+    out.width = frameWindow.width;
+    out.height = frameWindow.height;
+    return out;
+}
+
+static JobFrameWindowNorm fromSharedFrameWindow_(const analysisregion::FrameWindowNorm& frameWindow)
+{
+    JobFrameWindowNorm out;
+    out.enabled = frameWindow.enabled;
+    out.x = frameWindow.x;
+    out.y = frameWindow.y;
+    out.width = frameWindow.width;
+    out.height = frameWindow.height;
+    return out;
+}
+
+static std::vector<analysisregion::PointNorm> toSharedPolygon_(
+    const std::vector<JobPolygonPoint>& polygon)
+{
+    std::vector<analysisregion::PointNorm> out;
+    out.reserve(polygon.size());
+    for (const auto& point : polygon) {
+        out.push_back(analysisregion::PointNorm{ point.x, point.y });
+    }
+    return out;
+}
+
+static std::vector<JobPolygonPoint> fromSharedPolygon_(
+    const std::vector<analysisregion::PointNorm>& polygon)
+{
+    std::vector<JobPolygonPoint> out;
+    out.reserve(polygon.size());
+    for (const auto& point : polygon) {
+        out.push_back(JobPolygonPoint{ point.x, point.y });
+    }
+    return out;
+}
+
+static analysisregion::RegionSpec toSharedRegionSpec_(const JobAnalysisRegion& region)
+{
+    analysisregion::RegionSpec out;
+    out.regionId = region.region_id;
+    out.label = region.label;
+    out.enabled = region.enabled;
+    out.fullFrame = region.full_frame;
+    out.polygonNorm = toSharedPolygon_(region.polygon_norm);
+    out.drawRefWidth = region.draw_ref_width;
+    out.drawRefHeight = region.draw_ref_height;
+    out.contextPaddingPct = region.context_padding_pct;
+    out.frameWindowNorm = toSharedFrameWindow_(region.frame_window_norm);
+    return out;
+}
+
+static std::vector<analysisregion::RegionSpec> toSharedRegionSpecs_(
+    const std::vector<JobAnalysisRegion>& regions)
+{
+    std::vector<analysisregion::RegionSpec> out;
+    out.reserve(regions.size());
+    for (const auto& region : regions) {
+        out.push_back(toSharedRegionSpec_(region));
+    }
+    return out;
+}
+
+static JobAnalysisRegion applySharedRegionSpecToJobRegion_(
+    const JobAnalysisRegion& source,
+    const analysisregion::RegionSpec& shared)
+{
+    JobAnalysisRegion out = source;
+    out.region_id = shared.regionId;
+    out.label = shared.label;
+    out.enabled = shared.enabled;
+    out.full_frame = shared.fullFrame;
+    out.polygon_norm = fromSharedPolygon_(shared.polygonNorm);
+    out.draw_ref_width = shared.drawRefWidth;
+    out.draw_ref_height = shared.drawRefHeight;
+    out.context_padding_pct = shared.contextPaddingPct;
+    out.frame_window_norm = fromSharedFrameWindow_(shared.frameWindowNorm);
+    return out;
+}
+
 static bool isFrameWindowActive_(const JobFrameWindowNorm& frameWindow)
 {
-    return frameWindow.enabled &&
-        frameWindow.width > 1e-6 &&
-        frameWindow.height > 1e-6 &&
-        (frameWindow.x > 1e-6 ||
-         frameWindow.y > 1e-6 ||
-         frameWindow.width < (1.0 - 1e-6) ||
-         frameWindow.height < (1.0 - 1e-6));
+    return analysisregion::IsFrameWindowActive(toSharedFrameWindow_(frameWindow));
 }
 
 static JobFrameWindowNorm resolveFrameWindowFromRegions_(
     const std::vector<JobAnalysisRegion>& regions)
 {
-    for (const auto& region : regions) {
-        if (isFrameWindowActive_(region.frame_window_norm)) {
-            return region.frame_window_norm;
-        }
-    }
-    return JobFrameWindowNorm{};
+    return fromSharedFrameWindow_(
+        analysisregion::ResolveFrameWindow(toSharedRegionSpecs_(regions)));
 }
 
 static JobAnalysisRegion buildFrameWindowCropRegion_(
     const JobFrameWindowNorm& frameWindow)
 {
-    JobAnalysisRegion region;
-    region.region_id = "frame-window";
-    region.label = "Frame window";
-    region.enabled = true;
-    region.full_frame = false;
-    const double x1 = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
-    const double y1 = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
-    const double x2 = (std::max)(x1, (std::min)(1.0, frameWindow.x + frameWindow.width));
-    const double y2 = (std::max)(y1, (std::min)(1.0, frameWindow.y + frameWindow.height));
-    region.polygon_norm = {
-        JobPolygonPoint{ x1, y1 },
-        JobPolygonPoint{ x2, y1 },
-        JobPolygonPoint{ x2, y2 },
-        JobPolygonPoint{ x1, y2 }
-    };
-    return region;
+    return applySharedRegionSpecToJobRegion_(
+        JobAnalysisRegion{},
+        analysisregion::BuildFrameWindowCropRegion(toSharedFrameWindow_(frameWindow)));
 }
 
 static std::vector<JobPolygonPoint> clipPolygonToFrameWindow_(
     const std::vector<JobPolygonPoint>& polygon,
     const JobFrameWindowNorm& frameWindow)
 {
-    using Point = JobPolygonPoint;
-    if (!isFrameWindowActive_(frameWindow) || polygon.size() < 3) {
-        return polygon;
-    }
-
-    const double minX = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
-    const double minY = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
-    const double maxX = (std::max)(minX, (std::min)(1.0, frameWindow.x + frameWindow.width));
-    const double maxY = (std::max)(minY, (std::min)(1.0, frameWindow.y + frameWindow.height));
-
-    auto intersectAtX = [](const Point& a, const Point& b, double x) -> Point {
-        const double dx = b.x - a.x;
-        if (std::abs(dx) <= 1e-9) {
-            return Point{ x, a.y };
-        }
-        const double t = (x - a.x) / dx;
-        return Point{ x, a.y + ((b.y - a.y) * t) };
-    };
-    auto intersectAtY = [](const Point& a, const Point& b, double y) -> Point {
-        const double dy = b.y - a.y;
-        if (std::abs(dy) <= 1e-9) {
-            return Point{ a.x, y };
-        }
-        const double t = (y - a.y) / dy;
-        return Point{ a.x + ((b.x - a.x) * t), y };
-    };
-    auto clipEdge = [](const std::vector<Point>& input, const auto& inside, const auto& intersect) {
-        std::vector<Point> output;
-        if (input.empty()) return output;
-        output.reserve(input.size() + 4);
-
-        Point prev = input.back();
-        bool prevInside = inside(prev);
-        for (const auto& curr : input) {
-            const bool currInside = inside(curr);
-            if (currInside) {
-                if (!prevInside) {
-                    output.push_back(intersect(prev, curr));
-                }
-                output.push_back(curr);
-            }
-            else if (prevInside) {
-                output.push_back(intersect(prev, curr));
-            }
-            prev = curr;
-            prevInside = currInside;
-        }
-        return output;
-    };
-
-    std::vector<Point> clipped = polygon;
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.x >= minX; },
-        [&](const Point& a, const Point& b) { return intersectAtX(a, b, minX); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.x <= maxX; },
-        [&](const Point& a, const Point& b) { return intersectAtX(a, b, maxX); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.y >= minY; },
-        [&](const Point& a, const Point& b) { return intersectAtY(a, b, minY); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.y <= maxY; },
-        [&](const Point& a, const Point& b) { return intersectAtY(a, b, maxY); }
-    );
-    return clipped;
+    return fromSharedPolygon_(
+        analysisregion::ClipPolygonToFrameWindow(
+            toSharedPolygon_(polygon),
+            toSharedFrameWindow_(frameWindow)));
 }
 
 static std::vector<JobAnalysisRegion> remapRegionsToFrameWindow_(
@@ -2071,26 +2249,43 @@ static std::vector<JobAnalysisRegion> remapRegionsToFrameWindow_(
 {
     if (!isFrameWindowActive_(frameWindow)) return regions;
 
-    std::vector<JobAnalysisRegion> out;
-    out.reserve(regions.size());
-    const double invWidth = frameWindow.width > 1e-6 ? (1.0 / frameWindow.width) : 1.0;
-    const double invHeight = frameWindow.height > 1e-6 ? (1.0 / frameWindow.height) : 1.0;
+    const std::vector<analysisregion::RegionSpec> remapped =
+        analysisregion::RemapRegionsToFrameWindow(
+            toSharedRegionSpecs_(regions),
+            toSharedFrameWindow_(frameWindow));
 
-    for (const auto& region : regions) {
-        JobAnalysisRegion next = region;
-        next.frame_window_norm = JobFrameWindowNorm{};
-        if (!next.full_frame && !next.polygon_norm.empty()) {
-            auto clippedPolygon = clipPolygonToFrameWindow_(next.polygon_norm, frameWindow);
-            if (clippedPolygon.size() < 3) {
-                continue;
-            }
-            for (auto& point : clippedPolygon) {
-                point.x = (std::max)(0.0, (std::min)(1.0, (point.x - frameWindow.x) * invWidth));
-                point.y = (std::max)(0.0, (std::min)(1.0, (point.y - frameWindow.y) * invHeight));
-            }
-            next.polygon_norm = std::move(clippedPolygon);
+    std::unordered_map<std::string, analysisregion::RegionSpec> remappedById;
+    remappedById.reserve(remapped.size());
+    std::vector<analysisregion::RegionSpec> unnamedRegions;
+    unnamedRegions.reserve(remapped.size());
+    for (const auto& region : remapped) {
+        if (!region.regionId.empty()) {
+            remappedById[region.regionId] = region;
         }
-        out.push_back(std::move(next));
+        else {
+            unnamedRegions.push_back(region);
+        }
+    }
+
+    std::vector<JobAnalysisRegion> out;
+    out.reserve(remapped.size());
+    std::size_t unnamedIndex = 0;
+    for (const auto& region : regions) {
+        const analysisregion::RegionSpec* shared = nullptr;
+        if (!region.region_id.empty()) {
+            auto it = remappedById.find(region.region_id);
+            if (it != remappedById.end()) {
+                shared = &it->second;
+            }
+        }
+        else if (unnamedIndex < unnamedRegions.size()) {
+            shared = &unnamedRegions[unnamedIndex++];
+        }
+
+        if (!shared) {
+            continue;
+        }
+        out.push_back(applySharedRegionSpecToJobRegion_(region, *shared));
     }
     return out;
 }
@@ -2099,56 +2294,14 @@ static std::vector<cv::Point> regionPolygonToPixels_(
     const JobAnalysisRegion& region,
     const cv::Size& size)
 {
-    std::vector<cv::Point> polygon;
-    if (size.width <= 0 || size.height <= 0) return polygon;
-    polygon.reserve(region.polygon_norm.size());
-    for (const auto& p : region.polygon_norm) {
-        const double xNorm = std::min(1.0, std::max(0.0, p.x));
-        const double yNorm = std::min(1.0, std::max(0.0, p.y));
-        int x = (int)std::llround(xNorm * (double)(size.width - 1));
-        int y = (int)std::llround(yNorm * (double)(size.height - 1));
-        x = std::min(std::max(0, x), size.width - 1);
-        y = std::min(std::max(0, y), size.height - 1);
-        polygon.emplace_back(x, y);
-    }
-    return polygon;
+    return analysisregion::RegionPolygonToPixels(toSharedRegionSpec_(region), size);
 }
 
 static cv::Rect computeRegionCropRect_(
     const JobAnalysisRegion& region,
     const cv::Size& imageSize)
 {
-    if (imageSize.width <= 1 || imageSize.height <= 1) {
-        return cv::Rect();
-    }
-    if (region.full_frame || region.polygon_norm.size() < 3) {
-        return cv::Rect(0, 0, imageSize.width, imageSize.height);
-    }
-
-    const auto polygon = regionPolygonToPixels_(region, imageSize);
-    if (polygon.size() < 3) {
-        return cv::Rect(0, 0, imageSize.width, imageSize.height);
-    }
-
-    cv::Rect rect = cv::boundingRect(polygon);
-    if (rect.width <= 0 || rect.height <= 0) {
-        return cv::Rect(0, 0, imageSize.width, imageSize.height);
-    }
-
-    const double pct = std::min(0.4, std::max(0.0, region.context_padding_pct));
-    const int padX = (int)std::llround((double)rect.width * pct);
-    const int padY = (int)std::llround((double)rect.height * pct);
-
-    int x1 = std::max(0, rect.x - padX);
-    int y1 = std::max(0, rect.y - padY);
-    int x2 = std::min(imageSize.width, rect.x + rect.width + padX);
-    int y2 = std::min(imageSize.height, rect.y + rect.height + padY);
-
-    if (x2 <= x1 || y2 <= y1) {
-        return cv::Rect(0, 0, imageSize.width, imageSize.height);
-    }
-
-    return cv::Rect(x1, y1, x2 - x1, y2 - y1);
+    return analysisregion::ComputeRegionCropRect(toSharedRegionSpec_(region), imageSize);
 }
 
 static bool cropJpegDataUrlByRegion_(
@@ -2598,17 +2751,7 @@ static bool detectMotionInAnyRegionFromClip_(
 
 static cv::Scalar regionOverlayColorByIndex_(std::size_t index)
 {
-    static const cv::Scalar kPalette[] = {
-        cv::Scalar(255, 99, 71),    // tomato
-        cv::Scalar(60, 179, 113),   // mediumseagreen
-        cv::Scalar(30, 144, 255),   // dodgerblue
-        cv::Scalar(238, 130, 238),  // violet
-        cv::Scalar(255, 215, 0),    // gold
-        cv::Scalar(255, 140, 0),    // darkorange
-        cv::Scalar(0, 206, 209),    // darkturquoise
-        cv::Scalar(220, 20, 60)     // crimson
-    };
-    return kPalette[index % (sizeof(kPalette) / sizeof(kPalette[0]))];
+    return analysisregion::OverlayColorForIndex(index);
 }
 
 static int drawAnalysisRegionOverlaysOnFrame_(
@@ -2616,89 +2759,10 @@ static int drawAnalysisRegionOverlaysOnFrame_(
     const std::vector<JobAnalysisRegion>& regions,
     std::vector<std::string>* outDrawnRegionIds = nullptr)
 {
-    if (outDrawnRegionIds) outDrawnRegionIds->clear();
-    if (frame.empty()) return 0;
-
-    const std::vector<JobAnalysisRegion> polygonRegions = collectPolygonOnlyRegions_(regions);
-    if (polygonRegions.empty()) return 0;
-
-    cv::Mat overlay = frame.clone();
-    int drawnCount = 0;
-    for (std::size_t i = 0; i < polygonRegions.size(); ++i) {
-        const auto& region = polygonRegions[i];
-        const auto polygon = regionPolygonToPixels_(region, frame.size());
-        if (polygon.size() < 3) continue;
-        const cv::Scalar color = regionOverlayColorByIndex_(i);
-        std::vector<std::vector<cv::Point>> polygons{ polygon };
-        cv::fillPoly(overlay, polygons, color, cv::LINE_AA);
-        drawnCount++;
-        if (outDrawnRegionIds && !region.region_id.empty()) {
-            outDrawnRegionIds->push_back(region.region_id);
-        }
-    }
-
-    if (drawnCount <= 0) return 0;
-
-    cv::addWeighted(overlay, 0.20, frame, 0.80, 0.0, frame);
-
-    for (std::size_t i = 0; i < polygonRegions.size(); ++i) {
-        const auto& region = polygonRegions[i];
-        const auto polygon = regionPolygonToPixels_(region, frame.size());
-        if (polygon.size() < 3) continue;
-
-        const cv::Scalar color = regionOverlayColorByIndex_(i);
-        std::vector<std::vector<cv::Point>> polygons{ polygon };
-        cv::polylines(frame, polygons, true, color, 2, cv::LINE_AA);
-
-        std::string label = trimCopyRuntime_(region.label);
-        if (label.empty()) label = trimCopyRuntime_(region.region_id);
-        if (label.empty()) label = "ROI";
-
-        int baseline = 0;
-        const double fontScale = 0.50;
-        const int thickness = 1;
-        const int pad = 4;
-        const cv::Size textSize = cv::getTextSize(
-            label,
-            cv::FONT_HERSHEY_SIMPLEX,
-            fontScale,
-            thickness,
-            &baseline
-        );
-
-        cv::Point anchor = polygon.front();
-        int boxW = textSize.width + pad * 2;
-        int boxH = textSize.height + baseline + pad * 2;
-        int x = std::max(0, std::min(anchor.x, frame.cols - boxW));
-        int yTop = anchor.y - boxH - 3;
-        if (yTop < 0) {
-            yTop = std::min(std::max(0, anchor.y + 3), frame.rows - boxH);
-        }
-        if (yTop < 0) yTop = 0;
-        if (x < 0) x = 0;
-        if (x + boxW > frame.cols) boxW = frame.cols - x;
-        if (yTop + boxH > frame.rows) boxH = frame.rows - yTop;
-        if (boxW <= 0 || boxH <= 0) continue;
-
-        cv::Rect box(x, yTop, boxW, boxH);
-        cv::rectangle(frame, box, color, cv::FILLED);
-        const cv::Point textOrg(
-            x + pad,
-            yTop + boxH - baseline - pad
-        );
-        cv::putText(
-            frame,
-            label,
-            textOrg,
-            cv::FONT_HERSHEY_SIMPLEX,
-            fontScale,
-            cv::Scalar(15, 15, 15),
-            thickness,
-            cv::LINE_AA
-        );
-    }
-
-    return drawnCount;
+    return analysisregion::DrawRegionsOnFrame(
+        frame,
+        toSharedRegionSpecs_(regions),
+        outDrawnRegionIds);
 }
 
 static bool annotateJpegDataUrlWithRegions_(
@@ -2757,97 +2821,12 @@ static bool annotateVideoClipWithRegions_(
     std::vector<std::string>* outDrawnRegionIds = nullptr,
     std::string* outErr = nullptr)
 {
-    outClipPath.clear();
-    if (outDrawnRegionIds) outDrawnRegionIds->clear();
-
-    const std::vector<JobAnalysisRegion> polygonRegions = collectPolygonOnlyRegions_(regions);
-    if (polygonRegions.empty()) {
-        outClipPath = srcClipPath;
-        return true;
-    }
-
-    ensureOpenCvVideoIoThreadReady_();
-
-    cv::VideoCapture cap;
-    TempOpenCvClipPathGuard_ tempOpenPathGuard;
-    if (!openVideoCaptureForClipPath_(srcClipPath, cap, tempOpenPathGuard.path, outErr)) {
-        return false;
-    }
-
-    cv::Mat frame;
-    if (!cap.read(frame) || frame.empty()) {
-        if (outErr) *outErr = "failed reading first frame";
-        return false;
-    }
-
-    const cv::Size frameSize = frame.size();
-    if (frameSize.width <= 0 || frameSize.height <= 0) {
-        if (outErr) *outErr = "invalid frame size";
-        return false;
-    }
-
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (!std::isfinite(fps) || fps <= 0.0) {
-        fps = 10.0;
-    }
-
-    fs::path dstClipPath = srcClipPath;
-    dstClipPath += ".roi_overlay.mp4";
-
-    cv::VideoWriter writer;
-    const std::vector<int> fourccCandidates = {
-        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
-        cv::VideoWriter::fourcc('m', 'p', '4', 'v')
-    };
-    for (const int fourcc : fourccCandidates) {
-        if (writer.open(dstClipPath.string(), fourcc, fps, frameSize, true)) {
-            break;
-        }
-    }
-    if (!writer.isOpened()) {
-        if (outErr) *outErr = "cv::VideoWriter failed to open output clip";
-        return false;
-    }
-
-    bool wroteAny = false;
-    auto writeFrameWithOverlay = [&](cv::Mat& srcFrame) {
-        if (srcFrame.empty()) return;
-        cv::Mat drawFrame = srcFrame.clone();
-        drawAnalysisRegionOverlaysOnFrame_(drawFrame, polygonRegions, nullptr);
-        writer.write(drawFrame);
-        wroteAny = true;
-    };
-
-    writeFrameWithOverlay(frame);
-    while (cap.read(frame)) {
-        writeFrameWithOverlay(frame);
-    }
-
-    writer.release();
-    cap.release();
-
-    if (!wroteAny) {
-        std::error_code ec;
-        fs::remove(dstClipPath, ec);
-        if (outErr) *outErr = "no frames written to annotated clip";
-        return false;
-    }
-
-    if (outDrawnRegionIds) {
-        outDrawnRegionIds->reserve(polygonRegions.size());
-        for (const auto& region : polygonRegions) {
-            if (!region.region_id.empty()) {
-                outDrawnRegionIds->push_back(region.region_id);
-            }
-        }
-    }
-
-    if (!waitForReadableClipPath_(dstClipPath, outErr)) {
-        return false;
-    }
-
-    outClipPath = std::move(dstClipPath);
-    return true;
+    return analysisregion::AnnotateVideoClipWithOverlay(
+        srcClipPath,
+        toSharedRegionSpecs_(regions),
+        outClipPath,
+        outDrawnRegionIds,
+        outErr);
 }
 
 static std::vector<std::string> parseFaceIdTargetNamesFromJsonNode_(
@@ -3390,7 +3369,8 @@ static int normalizedRunEverySecondsForJobAgent_(const JobAgentDef& agent)
 static std::optional<std::string> getNextReadyCurrentDayStoredSixtySecondClipPathForJobStepCamera_(
     int jobId,
     int stepId,
-    int cameraId)
+    int cameraId,
+    const std::string& coverageCutoffUtcIso = std::string())
 {
     std::time_t tt = std::time(nullptr);
     std::tm tmLocal{};
@@ -3465,6 +3445,9 @@ static std::optional<std::string> getNextReadyCurrentDayStoredSixtySecondClipPat
         if (hasCursor && clipKey <= lastConsumedKey) {
             continue;
         }
+        if (!clipStartsBeforeCoverageCutoff_(entry.path(), coverageCutoffUtcIso)) {
+            continue;
+        }
 
         if (!found) {
             found = true;
@@ -3496,7 +3479,8 @@ static std::optional<std::string> peekReadyJobVideoInputForStepCamera_(
     int jobId,
     int stepId,
     int cameraId,
-    const JobAgentDef& agent)
+    const JobAgentDef& agent,
+    const std::string& coverageCutoffUtcIso = std::string())
 {
     std::string inputType = agent.input_type;
     std::transform(inputType.begin(), inputType.end(), inputType.begin(),
@@ -3510,12 +3494,16 @@ static std::optional<std::string> peekReadyJobVideoInputForStepCamera_(
         return getNextReadyCurrentDayStoredSixtySecondClipPathForJobStepCamera_(
             jobId,
             stepId,
-            cameraId
+            cameraId,
+            coverageCutoffUtcIso
         );
     }
 
     auto clipOpt = getNextReadyJobsClipForCamera_(jobId, stepId, cameraId);
     if (!clipOpt.has_value()) {
+        return std::nullopt;
+    }
+    if (!clipStartsBeforeCoverageCutoff_(fs::path(*clipOpt), coverageCutoffUtcIso)) {
         return std::nullopt;
     }
 
@@ -3536,8 +3524,11 @@ struct VideoWindowAssemblyResult {
     VideoWindowAssemblyStatus status = VideoWindowAssemblyStatus::Failed;
     std::string clipPath;
     std::vector<std::string> cleanupPaths;
+    std::string consumedClipKey;
     std::string windowStartPretty;
     std::string windowEndPretty;
+    std::string windowStartUtc;
+    std::string windowEndUtc;
     int windowSeconds = 0;
     std::string error;
 };
@@ -3545,7 +3536,8 @@ struct VideoWindowAssemblyResult {
 static VideoWindowAssemblyResult assembleAdaptivePendingJobsWindow_(
     int jobId,
     int stepId,
-    int cameraId);
+    int cameraId,
+    const std::string& coverageCutoffUtcIso = std::string());
 
 static VideoWindowAssemblyResult assembleLegacyVideoWindowForRunEvery_(
     int jobId,
@@ -3790,6 +3782,856 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
         job->jobStartedAt = std::chrono::steady_clock::now();
         constexpr int kMinStepTimeoutSeconds = 120;
+        const int maxStepOrder = [&]() -> int {
+            int maxOrder = 0;
+            for (const auto& step : steps) {
+                maxOrder = (std::max)(maxOrder, step.step_order);
+            }
+            return maxOrder;
+        }();
+
+        auto parseOptionalCoverageTimePoint =
+            [&](const std::string& rawIsoUtc)
+            -> std::optional<std::chrono::system_clock::time_point>
+        {
+            std::chrono::system_clock::time_point parsed{};
+            if (!parseCoverageTimePoint_(rawIsoUtc, parsed)) {
+                return std::nullopt;
+            }
+            return parsed;
+        };
+
+        auto completionPhaseToString =
+            [&](JobInstance::StepRun::CompletionPhase phase) -> std::string
+        {
+            switch (phase) {
+            case JobInstance::StepRun::CompletionPhase::Idle:
+                return "idle";
+            case JobInstance::StepRun::CompletionPhase::Capturing:
+                return "capturing";
+            case JobInstance::StepRun::CompletionPhase::DrainingToTarget:
+                return "draining_to_analysis_target";
+            case JobInstance::StepRun::CompletionPhase::Finalizing:
+                return "finalizing";
+            case JobInstance::StepRun::CompletionPhase::Completed:
+                return "completed";
+            default:
+                return "unknown";
+            }
+        };
+
+        auto stepHasTemporalPlan = [&](const JobStepDef& step) -> bool {
+            for (const auto& agent : step.agents) {
+                if (temporal::planUsable(agent.temporal_plan_envelope)) {
+                    return true;
+                }
+            }
+            for (const auto& group : step.inference_groups) {
+                if (temporal::planUsable(group.temporal_plan_envelope)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto shouldUseAnalysisDrivenCompletion = [&](const JobStepDef& step) -> bool {
+            const std::string completionMode =
+                toLowerCopy(trimCopyRuntime_(step.analysis_completion_mode));
+            if (completionMode == "legacy_deadline") {
+                return false;
+            }
+            if (completionMode == "drain_to_analysis_target") {
+                return true;
+            }
+            if (!step.analysis_target_end_utc.empty()) {
+                return true;
+            }
+            if (!job->payload.execution_target_end_utc.empty() &&
+                step.step_order >= maxStepOrder)
+            {
+                return true;
+            }
+            return stepHasTemporalPlan(step);
+        };
+
+        auto resolveAnalysisTargetForStep =
+            [&](const JobStepDef& step,
+                const std::chrono::system_clock::time_point& startedAtSystemUtc,
+                int effectiveTimeoutSeconds)
+            -> std::pair<std::chrono::system_clock::time_point, std::string>
+        {
+            std::chrono::system_clock::time_point targetEndUtc =
+                startedAtSystemUtc + std::chrono::seconds(effectiveTimeoutSeconds);
+            std::string targetSource = "step_timeout";
+
+            if (const auto explicitTarget =
+                    parseOptionalCoverageTimePoint(step.analysis_target_end_utc);
+                explicitTarget.has_value())
+            {
+                targetEndUtc = *explicitTarget;
+                targetSource = "step_analysis_target";
+            }
+            else if (step.step_order >= maxStepOrder) {
+                if (const auto executionTarget =
+                        parseOptionalCoverageTimePoint(job->payload.execution_target_end_utc);
+                    executionTarget.has_value())
+                {
+                    targetEndUtc = *executionTarget;
+                    targetSource = "execution_target_end";
+                }
+            }
+
+            return { targetEndUtc, targetSource };
+        };
+
+        auto resolveAnalysisHardStopSeconds =
+            [&](const JobStepDef& step, int effectiveTimeoutSeconds) -> int
+        {
+            if (step.analysis_hard_stop_seconds > 0) {
+                return (std::max)(kTimeoutDrainGraceSeconds_, step.analysis_hard_stop_seconds);
+            }
+            return (std::max)(kTimeoutDrainGraceSeconds_, effectiveTimeoutSeconds);
+        };
+
+        auto resolveEarliestFirstDueForEnvelope =
+            [&](const json& envelope,
+                const std::chrono::system_clock::time_point& analysisAnchorUtc)
+            -> std::optional<std::chrono::system_clock::time_point>
+        {
+            if (!temporal::planUsable(envelope)) {
+                return std::nullopt;
+            }
+
+            const json plan = temporal::effectivePlan(envelope);
+            if (!plan.is_object() || !plan.contains("operators") || !plan["operators"].is_array()) {
+                return std::nullopt;
+            }
+
+            const std::string anchorIso = formatCoverageIsoUtc_(analysisAnchorUtc);
+            std::optional<std::chrono::system_clock::time_point> earliest;
+            for (const auto& op : plan["operators"]) {
+                if (!op.is_object()) continue;
+                if (toLowerCopy(trimCopyRuntime_(op.value("type", std::string()))) !=
+                    "analyze_events_at_interval")
+                {
+                    continue;
+                }
+
+                json params = op.value("params", json::object());
+                if (!params.is_object()) continue;
+                json schedule = params.value("schedule", json::object());
+                if (!schedule.is_object()) continue;
+
+                const std::string anchorMode =
+                    temporal::normalizeAnalyzeIntervalAnchorModeToken(
+                        temporal::strField(schedule, "anchor_mode", "monitoring_start"));
+                std::optional<std::chrono::system_clock::time_point> candidate;
+
+                if (anchorMode == "monitoring_start") {
+                    const int intervalSeconds = temporal::intField(schedule, "interval_seconds", 0);
+                    if (intervalSeconds > 0) {
+                        candidate = analysisAnchorUtc + std::chrono::seconds(intervalSeconds);
+                    }
+                }
+                else if (anchorMode == "fixed_time_local") {
+                    const std::string timeLocal =
+                        trimCopyRuntime_(temporal::strField(schedule, "time_local"));
+                    if (timeLocal.empty()) continue;
+                    std::string scheduledTargetTs;
+                    if (!temporal::computeFixedLocalCheckpointUtc(
+                            anchorIso,
+                            trimCopyRuntime_(temporal::strField(schedule, "date_local")),
+                            timeLocal,
+                            trimCopyRuntime_(temporal::strField(schedule, "timezone")),
+                            scheduledTargetTs))
+                    {
+                        continue;
+                    }
+
+                    std::chrono::system_clock::time_point scheduledTp{};
+                    if (parseCoverageTimePoint_(scheduledTargetTs, scheduledTp)) {
+                        candidate = scheduledTp;
+                    }
+                }
+
+                if (!candidate.has_value()) continue;
+                if (!earliest.has_value() || *candidate < *earliest) {
+                    earliest = *candidate;
+                }
+            }
+
+            return earliest;
+        };
+
+        auto resolveEarliestFirstDueForStep =
+            [&](const JobStepDef& step,
+                const std::chrono::system_clock::time_point& analysisAnchorUtc)
+            -> std::optional<std::chrono::system_clock::time_point>
+        {
+            std::optional<std::chrono::system_clock::time_point> earliest;
+            for (const auto& agent : step.agents) {
+                const auto candidate =
+                    resolveEarliestFirstDueForEnvelope(agent.temporal_plan_envelope, analysisAnchorUtc);
+                if (!candidate.has_value()) continue;
+                if (!earliest.has_value() || *candidate < *earliest) {
+                    earliest = *candidate;
+                }
+            }
+            for (const auto& group : step.inference_groups) {
+                const auto candidate =
+                    resolveEarliestFirstDueForEnvelope(group.temporal_plan_envelope, analysisAnchorUtc);
+                if (!candidate.has_value()) continue;
+                if (!earliest.has_value() || *candidate < *earliest) {
+                    earliest = *candidate;
+                }
+            }
+            return earliest;
+        };
+
+        auto applyAnalysisTargetLocked =
+            [&](JobInstance::StepRun& run,
+                const std::chrono::system_clock::time_point& analysisTargetEndUtc,
+                const std::string& analysisTargetSource,
+                bool resolvedFromAnchor,
+                bool clampedToFirstDue,
+                const std::string& earliestFirstDueUtcIso)
+        {
+            const int hardStopExtensionSeconds =
+                run.configuredAnalysisHardStopSeconds > 0
+                    ? run.configuredAnalysisHardStopSeconds
+                    : kTimeoutDrainGraceSeconds_;
+            const long long captureBudgetSeconds = (std::max)(
+                0LL,
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    analysisTargetEndUtc - run.startedAtSystemUtc).count());
+
+            run.captureDeadline = run.startedAt + std::chrono::seconds(captureBudgetSeconds);
+            run.deadline = run.captureDeadline;
+            run.captureDeadlineUtc = analysisTargetEndUtc;
+            run.requiredCompletionEndUtc = analysisTargetEndUtc;
+            run.analysisTargetEndUtc = analysisTargetEndUtc;
+            run.hardStopDeadline =
+                run.captureDeadline + std::chrono::seconds(hardStopExtensionSeconds);
+            run.hardStopDeadlineUtc =
+                run.captureDeadlineUtc + std::chrono::seconds(hardStopExtensionSeconds);
+            run.captureDeadlineUtcIso = formatCoverageIsoUtc_(run.captureDeadlineUtc);
+            run.hardStopDeadlineUtcIso = formatCoverageIsoUtc_(run.hardStopDeadlineUtc);
+            run.requiredCompletionEndUtcIso = formatCoverageIsoUtc_(run.requiredCompletionEndUtc);
+            run.analysisTargetEndUtcIso = formatCoverageIsoUtc_(run.analysisTargetEndUtc);
+            run.analysisTargetSource = analysisTargetSource;
+            run.analysisTargetResolvedFromAnchor = resolvedFromAnchor;
+            run.analysisTargetPendingAnchor = run.analysisDriven && !resolvedFromAnchor;
+            run.analysisTargetClampedToFirstDue = clampedToFirstDue;
+            run.earliestFirstDueUtcIso = earliestFirstDueUtcIso;
+
+            for (auto& [cameraId, coverage] : run.coverageByCamera) {
+                (void)cameraId;
+                if (!coverage.enabled) continue;
+                coverage.targetEndUtc = run.requiredCompletionEndUtc;
+                coverage.targetEndUtcIso = run.requiredCompletionEndUtcIso;
+                coverage.tracker.setCutoff(
+                    std::optional<std::chrono::system_clock::time_point>(coverage.targetEndUtc)
+                );
+            }
+        };
+
+        struct RunTimingSnapshot_ {
+            std::chrono::steady_clock::time_point captureDeadline;
+            std::chrono::steady_clock::time_point hardStopDeadline;
+            std::string requiredCompletionEndUtcIso;
+            bool analysisTargetPendingAnchor = false;
+            bool analysisTargetResolvedFromAnchor = false;
+        };
+
+        auto snapshotRunTiming = [&](JobInstance::StepRun& run) -> RunTimingSnapshot_ {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            return RunTimingSnapshot_{
+                run.captureDeadline,
+                run.hardStopDeadline,
+                run.requiredCompletionEndUtcIso,
+                run.analysisTargetPendingAnchor,
+                run.analysisTargetResolvedFromAnchor
+            };
+        };
+
+        auto captureWindowOpen = [&](JobInstance::StepRun& run) -> bool {
+            const auto now = std::chrono::steady_clock::now();
+            const RunTimingSnapshot_ timing = snapshotRunTiming(run);
+            if (run.analysisDriven &&
+                timing.analysisTargetPendingAnchor &&
+                !timing.analysisTargetResolvedFromAnchor)
+            {
+                return now < timing.hardStopDeadline;
+            }
+            return now < timing.captureDeadline;
+        };
+
+        auto captureDeadlineReached = [&](JobInstance::StepRun& run) -> bool {
+            const RunTimingSnapshot_ timing = snapshotRunTiming(run);
+            const auto now = std::chrono::steady_clock::now();
+            if (run.analysisDriven &&
+                timing.analysisTargetPendingAnchor &&
+                !timing.analysisTargetResolvedFromAnchor)
+            {
+                return now >= timing.hardStopDeadline;
+            }
+            return now >= timing.captureDeadline;
+        };
+
+        auto currentCaptureBudgetDeadline =
+            [&](JobInstance::StepRun& run) -> std::chrono::steady_clock::time_point
+        {
+            const RunTimingSnapshot_ timing = snapshotRunTiming(run);
+            if (run.analysisDriven &&
+                timing.analysisTargetPendingAnchor &&
+                !timing.analysisTargetResolvedFromAnchor)
+            {
+                return timing.hardStopDeadline;
+            }
+            return timing.captureDeadline;
+        };
+
+        auto refreshCameraCoverageLocked = [&](JobInstance::StepRun::CameraCoverageRun& coverage) {
+            const contentcoverage::CoverageSnapshot snapshot =
+                coverage.tracker.snapshotFromAnchor(coverage.anchorUtc);
+            coverage.coveredUntilUtcIso =
+                snapshot.hasCoveredUntil ? formatCoverageIsoUtc_(snapshot.coveredUntil) : std::string();
+            coverage.latestCapturedUtcIso =
+                snapshot.hasLatestCaptured ? formatCoverageIsoUtc_(snapshot.latestCaptured) : std::string();
+            coverage.firstGapStartUtcIso =
+                snapshot.hasFirstGapStart ? formatCoverageIsoUtc_(snapshot.firstGapStart) : std::string();
+            if (snapshot.hasCoveredUntil && snapshot.coveredUntil >= coverage.targetEndUtc) {
+                coverage.complete = true;
+                coverage.coverageGapSeconds = 0;
+            }
+            else {
+                coverage.complete = false;
+                const std::chrono::system_clock::time_point coveredUntil =
+                    snapshot.hasCoveredUntil ? snapshot.coveredUntil : coverage.anchorUtc;
+                coverage.coverageGapSeconds = std::max<long long>(
+                    0,
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        coverage.targetEndUtc - coveredUntil).count()
+                );
+            }
+        };
+
+        auto refreshCameraAnalysisLocked =
+            [&](JobInstance::StepRun& run, JobInstance::StepRun::CameraCoverageRun& coverage) {
+            if (coverage.hasAnalysisAnchor) {
+                coverage.analysisAnchorUtcIso = formatCoverageIsoUtc_(coverage.analysisAnchorUtc);
+            }
+            else {
+                coverage.analysisAnchorUtcIso.clear();
+            }
+
+            if (coverage.hasAnalysisFrontier) {
+                coverage.analysisFrontierUtcIso = formatCoverageIsoUtc_(coverage.analysisFrontierUtc);
+            }
+            else {
+                coverage.analysisFrontierUtcIso.clear();
+            }
+
+            const std::chrono::system_clock::time_point analysisTargetEndUtc =
+                run.analysisTargetEndUtc.time_since_epoch().count() != 0
+                    ? run.analysisTargetEndUtc
+                    : run.requiredCompletionEndUtc;
+            const std::chrono::system_clock::time_point lagBaseUtc =
+                coverage.hasAnalysisFrontier
+                    ? coverage.analysisFrontierUtc
+                    : (coverage.hasAnalysisAnchor
+                           ? coverage.analysisAnchorUtc
+                           : run.startedAtSystemUtc);
+            coverage.analysisLagSeconds = (std::max)(
+                0LL,
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    analysisTargetEndUtc - lagBaseUtc).count());
+            coverage.analysisComplete =
+                coverage.hasAnalysisFrontier &&
+                coverage.analysisFrontierUtc >= analysisTargetEndUtc;
+
+            const bool terminalTimeoutPhase =
+                run.timeoutRequested.load() &&
+                (run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::Finalizing ||
+                 run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::Completed ||
+                 std::chrono::steady_clock::now() >= run.hardStopDeadline);
+            const bool contentGapBeforeTarget =
+                !coverage.analysisComplete &&
+                (coverage.latestCapturedUtcIso.empty() ||
+                 (!run.analysisTargetEndUtcIso.empty() &&
+                  coverage.latestCapturedUtcIso < run.analysisTargetEndUtcIso));
+
+            if (run.cancel.load()) {
+                coverage.analysisStatus = "step_cancelled";
+            }
+            else if (coverage.analysisComplete) {
+                coverage.analysisStatus = "analysis_target_reached";
+            }
+            else if (!run.analysisDriven) {
+                coverage.analysisStatus = "legacy_deadline";
+            }
+            else if (terminalTimeoutPhase) {
+                coverage.analysisStatus =
+                    contentGapBeforeTarget ? "content_gap_before_target"
+                                           : "analysis_backlog_timeout";
+            }
+            else if (run.timeoutRequested.load() ||
+                     run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::DrainingToTarget)
+            {
+                coverage.analysisStatus = "draining_to_analysis_target";
+            }
+            else if (coverage.hasAnalysisFrontier || coverage.hasAnalysisAnchor) {
+                coverage.analysisStatus = "analysis_in_progress";
+            }
+            else {
+                coverage.analysisStatus = "waiting_for_analysis";
+            }
+        };
+
+        auto buildCameraCoverageJson = [&](JobInstance::StepRun& run, int cameraId) -> json {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return json{
+                    {"coverage_required", false},
+                    {"coverage_complete", true},
+                    {"coverage_status", "not_applicable"},
+                    {"analysis_driven", run.analysisDriven},
+                    {"analysis_completion_mode", run.analysisCompletionMode},
+                    {"analysis_complete", true},
+                    {"analysis_status", "not_applicable"},
+                    {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                    {"analysis_target_source", run.analysisTargetSource},
+                    {"capture_deadline_utc", run.captureDeadlineUtcIso},
+                    {"hard_stop_deadline_utc", run.hardStopDeadlineUtcIso},
+                    {"step_phase", completionPhaseToString(run.completionPhase.load())}
+                };
+            }
+
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+            const auto& coverage = it->second;
+            return json{
+                {"coverage_required", true},
+                {"coverage_complete", coverage.complete},
+                {"coverage_status", coverage.complete ? "complete" : "coverage_incomplete"},
+                {"coverage_anchor_utc", coverage.anchorUtcIso},
+                {"required_completion_end_utc", coverage.targetEndUtcIso},
+                {"covered_until_utc", coverage.coveredUntilUtcIso},
+                {"latest_captured_utc", coverage.latestCapturedUtcIso},
+                {"first_gap_start_utc", coverage.firstGapStartUtcIso},
+                {"coverage_gap_seconds", coverage.coverageGapSeconds},
+                {"analysis_driven", run.analysisDriven},
+                {"analysis_completion_mode", run.analysisCompletionMode},
+                {"analysis_complete", coverage.analysisComplete},
+                {"analysis_status", coverage.analysisStatus},
+                {"analysis_anchor_utc", coverage.analysisAnchorUtcIso},
+                {"analysis_frontier_utc", coverage.analysisFrontierUtcIso},
+                {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                {"analysis_target_source", run.analysisTargetSource},
+                {"analysis_lag_seconds", coverage.analysisLagSeconds},
+                {"capture_deadline_utc", run.captureDeadlineUtcIso},
+                {"hard_stop_deadline_utc", run.hardStopDeadlineUtcIso},
+                {"step_phase", completionPhaseToString(run.completionPhase.load())}
+            };
+        };
+
+        auto isCameraCoverageComplete = [&](JobInstance::StepRun& run, int cameraId) -> bool {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return true;
+            }
+            refreshCameraCoverageLocked(it->second);
+            return it->second.complete;
+        };
+
+        auto isCameraAnalysisComplete = [&](JobInstance::StepRun& run, int cameraId) -> bool {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return true;
+            }
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+            return it->second.analysisComplete;
+        };
+
+        auto observeLatestCapturedForCamera = [&](JobInstance::StepRun& run,
+                                                  int cameraId,
+                                                  const std::string& latestCapturedEndUtc) {
+            std::chrono::system_clock::time_point endTp;
+            if (!parseCoverageTimePoint_(latestCapturedEndUtc, endTp)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return;
+            }
+            it->second.tracker.observeCapturedEnd(endTp);
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+        };
+
+        auto observeSuccessfulCoverageSpanForCamera = [&](JobInstance::StepRun& run,
+                                                          int cameraId,
+                                                          const std::string& segmentStartUtc,
+                                                          const std::string& segmentEndUtc) {
+            std::chrono::system_clock::time_point startTp;
+            std::chrono::system_clock::time_point endTp;
+            if (!parseCoverageTimePoint_(segmentStartUtc, startTp) ||
+                !parseCoverageTimePoint_(segmentEndUtc, endTp) ||
+                endTp <= startTp)
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return;
+            }
+            it->second.tracker.observeCapturedEnd(endTp);
+            it->second.tracker.addSuccessfulSpan(startTp, endTp);
+            bool analysisAnchorUpdated = false;
+            if (!it->second.hasAnalysisAnchor || startTp < it->second.analysisAnchorUtc) {
+                it->second.analysisAnchorUtc = startTp;
+                it->second.hasAnalysisAnchor = true;
+                analysisAnchorUpdated = true;
+            }
+            if (!it->second.hasAnalysisFrontier || endTp > it->second.analysisFrontierUtc) {
+                it->second.analysisFrontierUtc = endTp;
+                it->second.hasAnalysisFrontier = true;
+            }
+            if (run.analysisDriven &&
+                run.analysisTargetPendingAnchor &&
+                run.configuredAnalysisDurationSeconds > 0 &&
+                analysisAnchorUpdated)
+            {
+                std::chrono::system_clock::time_point nextAnalysisTargetEndUtc =
+                    it->second.analysisAnchorUtc +
+                    std::chrono::seconds(run.configuredAnalysisDurationSeconds);
+                bool clampedToFirstDue = false;
+                std::string earliestFirstDueUtcIso;
+                if (const auto earliestFirstDue =
+                        resolveEarliestFirstDueForStep(run.def, it->second.analysisAnchorUtc);
+                    earliestFirstDue.has_value())
+                {
+                    earliestFirstDueUtcIso = formatCoverageIsoUtc_(*earliestFirstDue);
+                    if (*earliestFirstDue > nextAnalysisTargetEndUtc) {
+                        nextAnalysisTargetEndUtc = *earliestFirstDue;
+                        clampedToFirstDue = true;
+                    }
+                }
+
+                applyAnalysisTargetLocked(
+                    run,
+                    nextAnalysisTargetEndUtc,
+                    clampedToFirstDue
+                        ? "step_timeout_from_analysis_anchor_clamped_to_first_due"
+                        : "step_timeout_from_analysis_anchor",
+                    true,
+                    clampedToFirstDue,
+                    earliestFirstDueUtcIso
+                );
+                for (auto& [otherCameraId, coverage] : run.coverageByCamera) {
+                    (void)otherCameraId;
+                    if (!coverage.enabled) continue;
+                    refreshCameraCoverageLocked(coverage);
+                    refreshCameraAnalysisLocked(run, coverage);
+                }
+            }
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+        };
+
+        auto buildStepCoverageSummary = [&](JobInstance::StepRun& run) -> json {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            if (!run.coverageDriven || run.coverageByCamera.empty()) {
+                return json{
+                    {"coverage_required", false},
+                    {"coverage_complete", true},
+                    {"coverage_status", "not_applicable"}
+                };
+            }
+
+            bool allComplete = true;
+            bool haveCoveredUntil = false;
+            bool haveLatestCaptured = false;
+            bool haveFirstGap = false;
+            std::string minCoveredUntilUtc;
+            std::string maxLatestCapturedUtc;
+            std::string firstGapStartUtc;
+            long long maxGapSeconds = 0;
+            json perCamera = json::object();
+            for (auto& [cameraId, coverage] : run.coverageByCamera) {
+                if (!coverage.enabled) {
+                    continue;
+                }
+                refreshCameraCoverageLocked(coverage);
+                allComplete = allComplete && coverage.complete;
+                if (!coverage.coveredUntilUtcIso.empty() &&
+                    (!haveCoveredUntil || coverage.coveredUntilUtcIso < minCoveredUntilUtc))
+                {
+                    minCoveredUntilUtc = coverage.coveredUntilUtcIso;
+                    haveCoveredUntil = true;
+                }
+                if (!coverage.latestCapturedUtcIso.empty() &&
+                    (!haveLatestCaptured || coverage.latestCapturedUtcIso > maxLatestCapturedUtc))
+                {
+                    maxLatestCapturedUtc = coverage.latestCapturedUtcIso;
+                    haveLatestCaptured = true;
+                }
+                if (!coverage.firstGapStartUtcIso.empty() &&
+                    (!haveFirstGap || coverage.firstGapStartUtcIso < firstGapStartUtc))
+                {
+                    firstGapStartUtc = coverage.firstGapStartUtcIso;
+                    haveFirstGap = true;
+                }
+                maxGapSeconds = std::max(maxGapSeconds, coverage.coverageGapSeconds);
+                perCamera[std::to_string(cameraId)] = json{
+                    {"coverage_required", true},
+                    {"coverage_complete", coverage.complete},
+                    {"coverage_status", coverage.complete ? "complete" : "coverage_incomplete"},
+                    {"coverage_anchor_utc", coverage.anchorUtcIso},
+                    {"required_completion_end_utc", coverage.targetEndUtcIso},
+                    {"covered_until_utc", coverage.coveredUntilUtcIso},
+                    {"latest_captured_utc", coverage.latestCapturedUtcIso},
+                    {"first_gap_start_utc", coverage.firstGapStartUtcIso},
+                    {"coverage_gap_seconds", coverage.coverageGapSeconds}
+                };
+            }
+
+            return json{
+                {"coverage_required", true},
+                {"coverage_complete", allComplete},
+                {"coverage_status", allComplete ? "complete" : "coverage_incomplete"},
+                {"required_completion_end_utc", run.requiredCompletionEndUtcIso},
+                {"covered_until_utc", haveCoveredUntil ? json(minCoveredUntilUtc) : json(nullptr)},
+                {"latest_captured_utc", haveLatestCaptured ? json(maxLatestCapturedUtc) : json(nullptr)},
+                {"first_gap_start_utc", haveFirstGap ? json(firstGapStartUtc) : json(nullptr)},
+                {"coverage_gap_seconds", maxGapSeconds},
+                {"coverage_by_camera", perCamera}
+            };
+        };
+
+        auto buildStepAnalysisSummary = [&](JobInstance::StepRun& run) -> json {
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            if (run.coverageByCamera.empty()) {
+                return json{
+                    {"analysis_driven", run.analysisDriven},
+                    {"analysis_completion_mode", run.analysisCompletionMode},
+                    {"analysis_complete", true},
+                    {"analysis_status", "not_applicable"},
+                    {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                    {"analysis_target_source", run.analysisTargetSource},
+                    {"analysis_lag_seconds", 0},
+                    {"capture_deadline_utc", run.captureDeadlineUtcIso},
+                    {"hard_stop_deadline_utc", run.hardStopDeadlineUtcIso},
+                    {"step_phase", completionPhaseToString(run.completionPhase.load())}
+                };
+            }
+
+            bool anyEnabled = false;
+            bool allComplete = true;
+            bool haveFrontier = false;
+            bool haveAnchor = false;
+            bool sawGap = false;
+            bool sawBacklog = false;
+            bool sawDraining = false;
+            bool sawProgress = false;
+            bool sawWaiting = false;
+            std::string minFrontierUtc;
+            std::string minAnchorUtc;
+            long long maxLagSeconds = 0;
+            json perCamera = json::object();
+
+            for (auto& [cameraId, coverage] : run.coverageByCamera) {
+                if (!coverage.enabled) {
+                    continue;
+                }
+                anyEnabled = true;
+                refreshCameraCoverageLocked(coverage);
+                refreshCameraAnalysisLocked(run, coverage);
+                allComplete = allComplete && coverage.analysisComplete;
+                if (!coverage.analysisFrontierUtcIso.empty() &&
+                    (!haveFrontier || coverage.analysisFrontierUtcIso < minFrontierUtc))
+                {
+                    minFrontierUtc = coverage.analysisFrontierUtcIso;
+                    haveFrontier = true;
+                }
+                if (!coverage.analysisAnchorUtcIso.empty() &&
+                    (!haveAnchor || coverage.analysisAnchorUtcIso < minAnchorUtc))
+                {
+                    minAnchorUtc = coverage.analysisAnchorUtcIso;
+                    haveAnchor = true;
+                }
+                maxLagSeconds = (std::max)(maxLagSeconds, coverage.analysisLagSeconds);
+                sawGap = sawGap || coverage.analysisStatus == "content_gap_before_target";
+                sawBacklog = sawBacklog || coverage.analysisStatus == "analysis_backlog_timeout";
+                sawDraining = sawDraining || coverage.analysisStatus == "draining_to_analysis_target";
+                sawProgress = sawProgress || coverage.analysisStatus == "analysis_in_progress";
+                sawWaiting = sawWaiting || coverage.analysisStatus == "waiting_for_analysis";
+                perCamera[std::to_string(cameraId)] = json{
+                    {"analysis_complete", coverage.analysisComplete},
+                    {"analysis_status", coverage.analysisStatus},
+                    {"analysis_anchor_utc", coverage.analysisAnchorUtcIso},
+                    {"analysis_frontier_utc", coverage.analysisFrontierUtcIso},
+                    {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                    {"analysis_lag_seconds", coverage.analysisLagSeconds}
+                };
+            }
+
+            std::string overallStatus = "not_applicable";
+            if (anyEnabled) {
+                if (allComplete) {
+                    overallStatus = "analysis_target_reached";
+                }
+                else if (!run.analysisDriven) {
+                    overallStatus = "legacy_deadline";
+                }
+                else if (sawGap) {
+                    overallStatus = "content_gap_before_target";
+                }
+                else if (sawBacklog) {
+                    overallStatus = "analysis_backlog_timeout";
+                }
+                else if (sawDraining) {
+                    overallStatus = "draining_to_analysis_target";
+                }
+                else if (sawProgress) {
+                    overallStatus = "analysis_in_progress";
+                }
+                else if (sawWaiting) {
+                    overallStatus = "waiting_for_analysis";
+                }
+                else {
+                    overallStatus = "analysis_incomplete";
+                }
+            }
+
+            return json{
+                {"analysis_driven", run.analysisDriven},
+                {"analysis_completion_mode", run.analysisCompletionMode},
+                {"analysis_complete", anyEnabled ? allComplete : true},
+                {"analysis_status", overallStatus},
+                {"analysis_anchor_utc", haveAnchor ? json(minAnchorUtc) : json(nullptr)},
+                {"analysis_frontier_utc", haveFrontier ? json(minFrontierUtc) : json(nullptr)},
+                {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                {"analysis_target_source", run.analysisTargetSource},
+                {"analysis_lag_seconds", maxLagSeconds},
+                {"capture_deadline_utc", run.captureDeadlineUtcIso},
+                {"hard_stop_deadline_utc", run.hardStopDeadlineUtcIso},
+                {"step_phase", completionPhaseToString(run.completionPhase.load())},
+                {"analysis_by_camera", perCamera}
+            };
+        };
+
+        auto buildJobCoverageSummary = [&]() -> json {
+            bool anyCoverageRequired = false;
+            bool allComplete = true;
+            long long maxGapSeconds = 0;
+            json perStep = json::object();
+            json incompleteSteps = json::array();
+
+            for (auto& [stepId, stepRun] : job->stepRuns) {
+                json stepCoverage = buildStepCoverageSummary(stepRun);
+                perStep[std::to_string(stepId)] = stepCoverage;
+
+                const bool stepCoverageRequired =
+                    stepCoverage.value("coverage_required", false);
+                if (!stepCoverageRequired) {
+                    continue;
+                }
+
+                anyCoverageRequired = true;
+                const bool stepCoverageComplete =
+                    stepCoverage.value("coverage_complete", true);
+                allComplete = allComplete && stepCoverageComplete;
+                maxGapSeconds = std::max(
+                    maxGapSeconds,
+                    stepCoverage.value("coverage_gap_seconds", 0LL)
+                );
+
+                if (!stepCoverageComplete) {
+                    incompleteSteps.push_back(json{
+                        {"step_id", stepId},
+                        {"step_order", stepRun.def.step_order},
+                        {"coverage_status",
+                         stepCoverage.value("coverage_status",
+                                            std::string("coverage_incomplete"))}
+                    });
+                }
+            }
+
+            json out = {
+                {"coverage_required", anyCoverageRequired},
+                {"coverage_complete", anyCoverageRequired ? allComplete : true},
+                {"coverage_status",
+                 anyCoverageRequired
+                     ? (allComplete ? "complete" : "coverage_incomplete")
+                     : "not_applicable"},
+                {"coverage_gap_seconds", maxGapSeconds},
+                {"coverage_by_step", perStep}
+            };
+            if (!incompleteSteps.empty()) {
+                out["coverage_incomplete_steps"] = incompleteSteps;
+            }
+            return out;
+        };
+
+        auto buildJobAnalysisSummary = [&]() -> json {
+            bool anyAnalysisDriven = false;
+            bool allComplete = true;
+            long long maxLagSeconds = 0;
+            json perStep = json::object();
+            json incompleteSteps = json::array();
+
+            for (auto& [stepId, stepRun] : job->stepRuns) {
+                json stepAnalysis = buildStepAnalysisSummary(stepRun);
+                perStep[std::to_string(stepId)] = stepAnalysis;
+
+                const bool stepAnalysisDriven =
+                    stepAnalysis.value("analysis_driven", false);
+                if (!stepAnalysisDriven) {
+                    continue;
+                }
+
+                anyAnalysisDriven = true;
+                const bool stepAnalysisComplete =
+                    stepAnalysis.value("analysis_complete", true);
+                allComplete = allComplete && stepAnalysisComplete;
+                maxLagSeconds = (std::max)(
+                    maxLagSeconds,
+                    stepAnalysis.value("analysis_lag_seconds", 0LL)
+                );
+
+                if (!stepAnalysisComplete) {
+                    incompleteSteps.push_back(json{
+                        {"step_id", stepId},
+                        {"step_order", stepRun.def.step_order},
+                        {"analysis_status",
+                         stepAnalysis.value("analysis_status",
+                                            std::string("analysis_incomplete"))}
+                    });
+                }
+            }
+
+            json out = {
+                {"analysis_driven", anyAnalysisDriven},
+                {"analysis_complete", anyAnalysisDriven ? allComplete : true},
+                {"analysis_status",
+                 anyAnalysisDriven
+                     ? (allComplete ? "analysis_target_reached" : "analysis_incomplete")
+                     : "not_applicable"},
+                {"analysis_lag_seconds", maxLagSeconds},
+                {"analysis_by_step", perStep}
+            };
+            if (!incompleteSteps.empty()) {
+                out["analysis_incomplete_steps"] = incompleteSteps;
+            }
+            return out;
+        };
 
         auto startStep = [&](JobInstance::StepRun& run) {
             auto& step = run.def;
@@ -3797,10 +4639,114 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
             run.state = JobInstance::StepState::Running;
             run.startedAt = std::chrono::steady_clock::now();
-            run.deadline = run.startedAt + std::chrono::seconds(effectiveTimeoutSeconds);
+            run.startedAtSystemUtc = std::chrono::system_clock::now();
+            const bool analysisDriven = shouldUseAnalysisDrivenCompletion(step);
+            std::chrono::system_clock::time_point analysisTargetEndUtc =
+                run.startedAtSystemUtc + std::chrono::seconds(effectiveTimeoutSeconds);
+            std::string analysisTargetSource = "step_timeout";
+            if (analysisDriven) {
+                std::tie(analysisTargetEndUtc, analysisTargetSource) =
+                    resolveAnalysisTargetForStep(
+                        step,
+                        run.startedAtSystemUtc,
+                        effectiveTimeoutSeconds
+                    );
+            }
+            const bool analysisTargetPendingAnchor =
+                analysisDriven && analysisTargetSource == "step_timeout";
+            const int hardStopExtensionSeconds =
+                analysisDriven
+                    ? resolveAnalysisHardStopSeconds(step, effectiveTimeoutSeconds)
+                    : kTimeoutDrainGraceSeconds_;
+            const long long captureBudgetSeconds = (std::max)(
+                0LL,
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    analysisTargetEndUtc - run.startedAtSystemUtc).count());
+            run.captureDeadline = run.startedAt + std::chrono::seconds(captureBudgetSeconds);
+            run.deadline = run.captureDeadline;
+            run.captureDeadlineUtc = analysisTargetEndUtc;
+            run.requiredCompletionEndUtc = analysisTargetEndUtc;
+            run.analysisTargetEndUtc = analysisTargetEndUtc;
+            run.hardStopDeadline =
+                run.captureDeadline + std::chrono::seconds(hardStopExtensionSeconds);
+            run.hardStopDeadlineUtc =
+                run.captureDeadlineUtc + std::chrono::seconds(hardStopExtensionSeconds);
             run.cancel = false;
             run.timeoutRequested = false;
             run.injectedInput.clear(); // pipeline input is resolved per target camera (non-blocking)
+            run.coverageDriven = false;
+            run.coverageIncomplete = false;
+            run.analysisDriven = analysisDriven;
+            run.configuredAnalysisDurationSeconds = effectiveTimeoutSeconds;
+            run.configuredAnalysisHardStopSeconds = hardStopExtensionSeconds;
+            run.analysisTargetPendingAnchor = analysisTargetPendingAnchor;
+            run.analysisTargetResolvedFromAnchor = !analysisTargetPendingAnchor;
+            run.analysisTargetClampedToFirstDue = false;
+            run.earliestFirstDueUtcIso.clear();
+            run.completionPhase.store(JobInstance::StepRun::CompletionPhase::Capturing);
+            run.startedAtSystemUtcIso = formatCoverageIsoUtc_(run.startedAtSystemUtc);
+            run.captureDeadlineUtcIso = formatCoverageIsoUtc_(run.captureDeadlineUtc);
+            run.hardStopDeadlineUtcIso = formatCoverageIsoUtc_(run.hardStopDeadlineUtc);
+            run.requiredCompletionEndUtcIso = formatCoverageIsoUtc_(run.requiredCompletionEndUtc);
+            run.analysisTargetEndUtcIso = formatCoverageIsoUtc_(run.analysisTargetEndUtc);
+            run.analysisTargetSource =
+                analysisTargetPendingAnchor
+                    ? std::string("step_timeout_pending_analysis_anchor")
+                    : analysisTargetSource;
+            run.analysisCompletionMode =
+                analysisDriven ? std::string("drain_to_analysis_target")
+                               : std::string("legacy_deadline");
+            if (!step.analysis_completion_mode.empty()) {
+                run.analysisCompletionMode = trimCopyRuntime_(step.analysis_completion_mode);
+            }
+            {
+                std::lock_guard<std::mutex> coverageLock(run.coverageMu);
+                run.coverageByCamera.clear();
+                for (const auto& tgt : step.targets) {
+                    const JobAgentDef* selectedAgent = selectAgentForCamera_(step, tgt.camera_id);
+                    if (!selectedAgent) {
+                        continue;
+                    }
+                    std::string inputType = toLowerCopy(selectedAgent->input_type);
+                    if (inputType == "image") {
+                        continue;
+                    }
+                    auto& coverage = run.coverageByCamera[tgt.camera_id];
+                    coverage.enabled = true;
+                    coverage.anchorUtc = run.startedAtSystemUtc;
+                    coverage.targetEndUtc = run.requiredCompletionEndUtc;
+                    coverage.anchorUtcIso = run.startedAtSystemUtcIso;
+                    coverage.targetEndUtcIso = run.requiredCompletionEndUtcIso;
+                    coverage.coveredUntilUtcIso.clear();
+                    coverage.latestCapturedUtcIso.clear();
+                    coverage.firstGapStartUtcIso.clear();
+                    coverage.coverageGapSeconds = (std::max)(
+                        0LL,
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            run.requiredCompletionEndUtc - run.startedAtSystemUtc).count());
+                    coverage.complete = false;
+                    coverage.hasAnalysisAnchor = false;
+                    coverage.analysisAnchorUtc = std::chrono::system_clock::time_point{};
+                    coverage.hasAnalysisFrontier = false;
+                    coverage.analysisFrontierUtc = std::chrono::system_clock::time_point{};
+                    coverage.analysisAnchorUtcIso.clear();
+                    coverage.analysisFrontierUtcIso.clear();
+                    coverage.analysisLagSeconds = (std::max)(
+                        0LL,
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            run.analysisTargetEndUtc - run.startedAtSystemUtc).count());
+                    coverage.analysisComplete = false;
+                    coverage.analysisStatus =
+                        run.analysisDriven ? "waiting_for_analysis" : "legacy_deadline";
+                    coverage.tracker.clear();
+                    coverage.tracker.setCutoff(
+                        std::optional<std::chrono::system_clock::time_point>(
+                            coverage.targetEndUtc
+                        )
+                    );
+                    run.coverageDriven = true;
+                }
+            }
 
             // Ensure target cameras are started using the enriched start_camera_payloads map
             if (owner_) {
@@ -3841,7 +4787,13 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             postStepEvent_("job_step_started", J, step, json{
                 {"job_run_id", job->payload.job_run_id},
                 {"timeout_seconds", effectiveTimeoutSeconds},
-                {"targets", (int)step.targets.size()}
+                {"targets", (int)step.targets.size()},
+                {"analysis_driven", run.analysisDriven},
+                {"analysis_completion_mode", run.analysisCompletionMode},
+                {"analysis_target_end_utc", run.analysisTargetEndUtcIso},
+                {"analysis_target_source", run.analysisTargetSource},
+                {"capture_deadline_utc", run.captureDeadlineUtcIso},
+                {"hard_stop_deadline_utc", run.hardStopDeadlineUtcIso}
             });
 
 
@@ -3903,7 +4855,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             // VIDEO group can be added next (multi-mp4 inline_data).
             // ------------------------------------------------------------
             for (const auto& pg : plannedGroups) {
-                run.workers.emplace_back([this, job, &run, &step, &stepsById, pg]() {
+                run.workers.emplace_back([this, job, &run, &step, &stepsById, &captureWindowOpen, pg]() {
                     try {
                         const int jobId = job->payload.job.id;
 
@@ -3980,7 +4932,9 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     const bool useRunEverySchedulerGate = true;
                     const bool stampRunTickBeforeInference = !isImageGroup;
 
-                        while (!job->cancel && !run.cancel && std::chrono::steady_clock::now() < run.deadline) {
+                        while (!job->cancel &&
+                               !run.cancel &&
+                               captureWindowOpen(run)) {
                             const auto nowTick = std::chrono::steady_clock::now();
                             if (useRunEverySchedulerGate &&
                                 lastRunAt != std::chrono::steady_clock::time_point::min()) {
@@ -4999,7 +5953,22 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
 
             for (const auto& tgt : legacyTargets) {
-                run.workers.emplace_back([this, job, &run, &step, &stepsById, tgt]() {
+                run.workers.emplace_back([this,
+                                          job,
+                                          &run,
+                                          &step,
+                                          &stepsById,
+                                          &snapshotRunTiming,
+                                          &captureWindowOpen,
+                                          &captureDeadlineReached,
+                                          &currentCaptureBudgetDeadline,
+                                          &buildCameraCoverageJson,
+                                          &observeLatestCapturedForCamera,
+                                          &observeSuccessfulCoverageSpanForCamera,
+                                          &isCameraCoverageComplete,
+                                          &isCameraAnalysisComplete,
+                                          &completionPhaseToString,
+                                          tgt]() {
                     const int cameraId = tgt.camera_id;
                     const JobAgentDef* agent = nullptr;
                     try {
@@ -5066,7 +6035,14 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             details["model"] = modelName;
                             details["input_type"] = agent->input_type;
                             details["priority_level"] = agent->priority_level;
-                            details["timeout_seconds"] = 15;
+                            details["timeout_seconds"] = step.timeout_seconds;
+                            details["analysis_driven"] = run.analysisDriven;
+                            details["analysis_completion_mode"] = run.analysisCompletionMode;
+                            details["analysis_target_end_utc"] = run.analysisTargetEndUtcIso;
+                            details["analysis_target_source"] = run.analysisTargetSource;
+                            details["capture_deadline_utc"] = run.captureDeadlineUtcIso;
+                            details["hard_stop_deadline_utc"] = run.hardStopDeadlineUtcIso;
+                            details["step_phase"] = completionPhaseToString(run.completionPhase.load());
                             if (!job->payload.job_run_id.empty()) {
                                 details["job_run_id"] = job->payload.job_run_id;
                             }
@@ -5116,7 +6092,16 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         const bool useRunEverySchedulerGate = true;
                         int successfulInferenceCount = 0;
                         std::string lastCompletedOutput;
-                        bool observedTemporalReportDue = false;
+                        bool observedTemporalReportDelivered = false;
+                        const json initialCameraCoverageDetails = buildCameraCoverageJson(run, cameraId);
+                        const bool coverageRequiredForCamera =
+                            initialCameraCoverageDetails.value("coverage_required", false);
+                        auto currentCoverageCutoffUtcIso = [&]() -> std::string {
+                            if (!coverageRequiredForCamera) {
+                                return std::string();
+                            }
+                            return snapshotRunTiming(run).requiredCompletionEndUtcIso;
+                        };
                         postAgentRunEvent(
                             "job_agent_started",
                             "Job agent started.",
@@ -5125,16 +6110,16 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 {"status_reason", "started"}
                             }
                         );
-                        auto inferenceOutputHasTemporalReportDue = [&](const std::string& rawOutput) -> bool {
+                        auto inferenceOutputHasTemporalReportDelivered = [&](const std::string& rawOutput) -> bool {
                             if (rawOutput.empty() || !isLikelyJson_(rawOutput)) {
                                 return false;
                             }
                             try {
                                 const json parsed = json::parse(rawOutput);
                                 return parsed.is_object() &&
-                                    parsed.contains("temporal_report_due") &&
-                                    parsed["temporal_report_due"].is_boolean() &&
-                                    parsed["temporal_report_due"].get<bool>();
+                                    parsed.contains("temporal_report_delivered") &&
+                                    parsed["temporal_report_delivered"].is_boolean() &&
+                                    parsed["temporal_report_delivered"].get<bool>();
                             }
                             catch (...) {
                                 return false;
@@ -5198,8 +6183,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             }
                             catch (...) {}
 
-                            if (inferenceOutputHasTemporalReportDue(completedOutput)) {
-                                observedTemporalReportDue = true;
+                            if (inferenceOutputHasTemporalReportDelivered(completedOutput)) {
+                                observedTemporalReportDelivered = true;
                             }
                         };
                         auto computeRequestTimeoutSeconds = [&](const std::chrono::steady_clock::time_point& budgetDeadline,
@@ -5216,7 +6201,9 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             return (std::clamp)(remainingSeconds, 1, safeMaxTimeoutSeconds);
                         };
                         bool runDuePending = !isImageAgentInput;
-                        while (!job->cancel && !run.cancel && std::chrono::steady_clock::now() < run.deadline) {
+                        while (!job->cancel &&
+                               !run.cancel &&
+                               captureWindowOpen(run)) {
                             const auto nowTick = std::chrono::steady_clock::now();
                             if (useRunEverySchedulerGate && !runDuePending) {
                                 if (lastRunAt == std::chrono::steady_clock::time_point::min()) {
@@ -5236,7 +6223,13 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             bool readyVideoInputForPendingRun = false;
                             if (!isImageAgentInput && runDuePending) {
                                 readyVideoInputForPendingRun =
-                                    peekReadyJobVideoInputForStepCamera_(jobId, step.id, cameraId, *agent).has_value();
+                                    peekReadyJobVideoInputForStepCamera_(
+                                        jobId,
+                                        step.id,
+                                        cameraId,
+                                        *agent,
+                                        currentCoverageCutoffUtcIso()
+                                    ).has_value();
                                 if (!readyVideoInputForPendingRun) {
                                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                                     continue;
@@ -5244,6 +6237,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             }
 
                             const std::string startConditionText = buildStartConditionText();
+                            JobInstance::InferenceMediaInfo mediaInfo;
                             std::string out = runAgentInferenceOnCamera_(
                                 jobId,
                                 step.id,
@@ -5257,19 +6251,18 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 /*stepRunId*/ step.step_run_id,
                                 /*agentRunId*/ agent->agent_run_id,
                                 computeRequestTimeoutSeconds(
-                                    run.deadline,
+                                    currentCaptureBudgetDeadline(run),
                                     kNormalInferenceRequestTimeoutCapSeconds_
                                 ),
-                                job->cancel
+                                job->cancel,
+                                currentCoverageCutoffUtcIso(),
+                                &mediaInfo
                             );
+                            if (!mediaInfo.latestCapturedEndUtc.empty()) {
+                                observeLatestCapturedForCamera(run, cameraId, mediaInfo.latestCapturedEndUtc);
+                            }
 
                             if (out.empty()) {
-                                // No fresh clip/inference in this cycle.
-                                // Keep previous output cached; do not overwrite with empty string.
-                                if (!isImageAgentInput && runDuePending && readyVideoInputForPendingRun) {
-                                    lastRunAt = nowTick;
-                                    runDuePending = false;
-                                }
                                 if (isImageAgentInput) {
                                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                                 }
@@ -5283,6 +6276,24 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             lastRunAt = nowTick;
                             runDuePending = false;
                             persistCompletedOutput(out, true);
+                            if (!mediaInfo.consumptionKey.empty()) {
+                                markClipConsumedForJobStepCamera_(
+                                    jobId,
+                                    step.id,
+                                    cameraId,
+                                    mediaInfo.consumptionKey
+                                );
+                            }
+                            if (!mediaInfo.processedSegmentStartUtc.empty() &&
+                                !mediaInfo.processedSegmentEndUtc.empty())
+                            {
+                                observeSuccessfulCoverageSpanForCamera(
+                                    run,
+                                    cameraId,
+                                    mediaInfo.processedSegmentStartUtc,
+                                    mediaInfo.processedSegmentEndUtc
+                                );
+                            }
 
                             std::this_thread::sleep_for(std::chrono::seconds(1));
                         }
@@ -5290,7 +6301,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         const bool deadlineReachedWithoutCancel =
                             !job->cancel &&
                             !run.cancel &&
-                            std::chrono::steady_clock::now() >= run.deadline;
+                            captureDeadlineReached(run);
                         if (deadlineReachedWithoutCancel && !run.timeoutRequested.load()) {
                             for (int waitAttempt = 0;
                                  waitAttempt < 10 &&
@@ -5306,17 +6317,21 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             run.timeoutRequested.load() &&
                             !job->cancel &&
                             !run.cancel &&
-                            !isImageAgentInput &&
-                            !observedTemporalReportDue)
+                            !isImageAgentInput)
                         {
+                            const bool useAnalysisDrivenDrain = run.analysisDriven;
                             const auto timeoutDrainDeadline =
-                                std::chrono::steady_clock::now() +
-                                std::chrono::seconds(kTimeoutDrainGraceSeconds_);
+                                useAnalysisDrivenDrain
+                                    ? run.hardStopDeadline
+                                    : (std::min)(
+                                          run.hardStopDeadline,
+                                          std::chrono::steady_clock::now() +
+                                              std::chrono::seconds(kTimeoutDrainGraceSeconds_));
                             auto noReadyClipWaitDeadline =
                                 (std::min)(
                                     timeoutDrainDeadline,
                                     std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
+                                        std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
                                 );
                             Logger::instance().logDebug(
                                 "job",
@@ -5324,15 +6339,30 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 std::to_string(jobId) +
                                 " step_id=" + std::to_string(step.id) +
                                 " camera_id=" + std::to_string(cameraId) +
-                                " grace_seconds=" + std::to_string(kTimeoutDrainGraceSeconds_)
+                                " grace_seconds=" +
+                                std::to_string((std::max)(
+                                    0LL,
+                                    std::chrono::duration_cast<std::chrono::seconds>(
+                                        timeoutDrainDeadline - std::chrono::steady_clock::now()).count()))
                             );
                             while (!job->cancel &&
                                    !run.cancel &&
-                                   !observedTemporalReportDue &&
                                    std::chrono::steady_clock::now() < timeoutDrainDeadline)
                             {
+                                if (useAnalysisDrivenDrain
+                                        ? isCameraAnalysisComplete(run, cameraId)
+                                        : isCameraCoverageComplete(run, cameraId))
+                                {
+                                    break;
+                                }
                                 const auto pendingReady =
-                                    peekReadyJobVideoInputForStepCamera_(jobId, step.id, cameraId, *agent);
+                                    peekReadyJobVideoInputForStepCamera_(
+                                        jobId,
+                                        step.id,
+                                        cameraId,
+                                        *agent,
+                                        currentCoverageCutoffUtcIso()
+                                    );
                                 if (!pendingReady.has_value()) {
                                     if (std::chrono::steady_clock::now() >= noReadyClipWaitDeadline) {
                                         break;
@@ -5342,6 +6372,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 }
 
                                 const std::string drainStartConditionText = buildStartConditionText();
+                                JobInstance::InferenceMediaInfo drainMediaInfo;
                                 std::string drainOut = runAgentInferenceOnCamera_(
                                     jobId,
                                     step.id,
@@ -5358,8 +6389,13 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                         timeoutDrainDeadline,
                                         kTimeoutDrainInferenceRequestTimeoutCapSeconds_
                                     ),
-                                    job->cancel
+                                    job->cancel,
+                                    currentCoverageCutoffUtcIso(),
+                                    &drainMediaInfo
                                 );
+                                if (!drainMediaInfo.latestCapturedEndUtc.empty()) {
+                                    observeLatestCapturedForCamera(run, cameraId, drainMediaInfo.latestCapturedEndUtc);
+                                }
                                 if (drainOut.empty()) {
                                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                                     continue;
@@ -5372,18 +6408,53 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                         std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
                                     );
                                 persistCompletedOutput(drainOut, true);
+                                if (!drainMediaInfo.consumptionKey.empty()) {
+                                    markClipConsumedForJobStepCamera_(
+                                        jobId,
+                                        step.id,
+                                        cameraId,
+                                        drainMediaInfo.consumptionKey
+                                    );
+                                }
+                                if (!drainMediaInfo.processedSegmentStartUtc.empty() &&
+                                    !drainMediaInfo.processedSegmentEndUtc.empty())
+                                {
+                                    observeSuccessfulCoverageSpanForCamera(
+                                        run,
+                                        cameraId,
+                                        drainMediaInfo.processedSegmentStartUtc,
+                                        drainMediaInfo.processedSegmentEndUtc
+                                    );
+                                }
                             }
+                            const json drainedCoverageDetails = buildCameraCoverageJson(run, cameraId);
                             Logger::instance().logDebug(
                                 "job",
                                 "runAgentInferenceOnCamera_: timeout drain finished job_id=" +
                                 std::to_string(jobId) +
                                 " step_id=" + std::to_string(step.id) +
                                 " camera_id=" + std::to_string(cameraId) +
-                                " temporal_report_due=" +
-                                std::string(observedTemporalReportDue ? "true" : "false")
+                                " coverage_status=" +
+                                drainedCoverageDetails.value("coverage_status", std::string("not_applicable")) +
+                                " analysis_status=" +
+                                drainedCoverageDetails.value("analysis_status", std::string("not_applicable")) +
+                                " covered_until_utc=" +
+                                drainedCoverageDetails.value("covered_until_utc", std::string()) +
+                                " analysis_frontier_utc=" +
+                                drainedCoverageDetails.value("analysis_frontier_utc", std::string()) +
+                                " temporal_report_delivered=" +
+                                std::string(observedTemporalReportDelivered ? "true" : "false")
                             );
                         }
-                        if (deadlineReachedWithoutCancel && !observedTemporalReportDue) {
+                        const json finalCameraCoverageDetails = buildCameraCoverageJson(run, cameraId);
+                        const std::string finalCoverageNowUtc =
+                            finalCameraCoverageDetails.value("analysis_frontier_utc", std::string()).empty()
+                                ? finalCameraCoverageDetails.value("covered_until_utc", std::string())
+                                : finalCameraCoverageDetails.value("analysis_frontier_utc", std::string());
+                        if (deadlineReachedWithoutCancel &&
+                            !observedTemporalReportDelivered &&
+                            !finalCoverageNowUtc.empty())
+                        {
                             const std::string timeoutTemporalOutput =
                                 maybeEmitFinalTemporalReportOnTimeout_(
                                     jobId,
@@ -5393,7 +6464,9 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                     agent->alert_condition_text,
                                     job->payload.job_run_id,
                                     step.step_run_id,
-                                    agent->agent_run_id
+                                    agent->agent_run_id,
+                                    finalCoverageNowUtc,
+                                    &finalCameraCoverageDetails
                                 );
                             if (!timeoutTemporalOutput.empty()) {
                                 lastCompletedOutput = timeoutTemporalOutput;
@@ -5404,15 +6477,36 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                     so.history_by_camera[cameraId].push_back(timeoutTemporalOutput);
                                     so.aggregated_output = timeoutTemporalOutput;
                                 }
-                                observedTemporalReportDue = true;
+                                if (inferenceOutputHasTemporalReportDelivered(timeoutTemporalOutput)) {
+                                    observedTemporalReportDelivered = true;
+                                }
                             }
                         }
 
+                        const json completionCoverageDetails = buildCameraCoverageJson(run, cameraId);
+                        const bool completionAnalysisDriven =
+                            completionCoverageDetails.value("analysis_driven", false);
+                        const bool completionAnalysisComplete =
+                            completionCoverageDetails.value("analysis_complete", true);
+                        const std::string completionAnalysisStatus =
+                            completionCoverageDetails.value(
+                                "analysis_status",
+                                std::string("legacy_deadline"));
+                        const bool completionCoverageIncomplete =
+                            run.timeoutRequested.load() &&
+                            completionCoverageDetails.value("coverage_required", false) &&
+                            !completionCoverageDetails.value("coverage_complete", true);
                         json completionDetails = {
                             {"status_reason",
                              job->cancel ? "job_cancelled"
                                          : (run.timeoutRequested.load()
-                                                ? "deadline_reached"
+                                                ? (completionAnalysisDriven
+                                                       ? (completionAnalysisComplete
+                                                              ? "analysis_target_reached"
+                                                              : completionAnalysisStatus)
+                                                       : (completionCoverageIncomplete
+                                                              ? "coverage_incomplete"
+                                                              : "deadline_reached"))
                                                 : (run.cancel ? "step_cancelled" : "deadline_reached"))},
                             {"successful_iterations", successfulInferenceCount}
                         };
@@ -5455,6 +6549,12 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             else {
                                 completionDetails["output_data"] = lastCompletedOutput;
                             }
+                        }
+                        for (auto it = completionCoverageDetails.begin();
+                             it != completionCoverageDetails.end();
+                             ++it)
+                        {
+                            completionDetails[it.key()] = it.value();
                         }
                         postAgentRunEvent(
                             "job_agent_completed",
@@ -5636,10 +6736,12 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             const bool timeoutReason = (std::string(reason) == "timeout");
             if (timeoutReason) {
                 run.timeoutRequested = true;
+                run.completionPhase.store(JobInstance::StepRun::CompletionPhase::DrainingToTarget);
                 freezeStepCaptureAndCamera(run);
             }
             else {
                 run.cancel = true;
+                run.completionPhase.store(JobInstance::StepRun::CompletionPhase::Finalizing);
             }
 
             for (auto& t : run.workers) {
@@ -5652,13 +6754,44 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             }
 
             if (run.state == JobInstance::StepState::Running) {
-                run.state = JobInstance::StepState::Completed;
-                postStepEvent_("job_step_completed", J, step, json{
+                run.completionPhase.store(JobInstance::StepRun::CompletionPhase::Finalizing);
+                json stepCoverage = buildStepCoverageSummary(run);
+                json stepAnalysis = buildStepAnalysisSummary(run);
+                const bool coverageIncomplete =
+                    timeoutReason &&
+                    stepCoverage.value("coverage_required", false) &&
+                    !stepCoverage.value("coverage_complete", true);
+                run.coverageIncomplete = coverageIncomplete;
+                const bool analysisDriven =
+                    stepAnalysis.value("analysis_driven", false);
+                const bool analysisComplete =
+                    stepAnalysis.value("analysis_complete", true);
+                const std::string analysisStatus =
+                    stepAnalysis.value("analysis_status", std::string("legacy_deadline"));
+                const std::string finalStatusReason =
+                    timeoutReason
+                        ? (analysisDriven
+                               ? (analysisComplete ? "analysis_target_reached" : analysisStatus)
+                               : (coverageIncomplete ? "coverage_incomplete" : std::string(reason)))
+                        : std::string(reason);
+
+                json stepCompletedDetails = {
                     {"job_run_id", job->payload.job_run_id},
                     {"step_id", step.id},
                     {"step_order", step.step_order},
-                    {"reason", reason}
-                });
+                    {"reason", finalStatusReason},
+                    {"status_reason", finalStatusReason}
+                };
+                for (auto it = stepCoverage.begin(); it != stepCoverage.end(); ++it) {
+                    stepCompletedDetails[it.key()] = it.value();
+                }
+                for (auto it = stepAnalysis.begin(); it != stepAnalysis.end(); ++it) {
+                    stepCompletedDetails[it.key()] = it.value();
+                }
+
+                run.completionPhase.store(JobInstance::StepRun::CompletionPhase::Completed);
+                run.state = JobInstance::StepState::Completed;
+                postStepEvent_("job_step_completed", J, step, std::move(stepCompletedDetails));
             }
         };
 
@@ -5743,10 +6876,12 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                 }
             }
 
-            // Finalize running steps that hit timeout
+            // Finalize running steps that hit the capture deadline. For
+            // analysis-driven steps, finalizeStep() blocks until drain-to-target
+            // completes or the hard stop is reached.
             for (auto& [sid, run] : job->stepRuns) {
                 if (run.state == JobInstance::StepState::Running &&
-                    std::chrono::steady_clock::now() >= run.deadline) {
+                    captureDeadlineReached(run)) {
                     finalizeStep(run, "timeout");
                 }
             }
@@ -5836,11 +6971,20 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             return;
         }
 
-        postJobEvent_("job_completed", J, json{
+        json jobCompletedDetails = {
             {"job_id", J.id},
             {"job_name", J.name},
             {"job_run_id", job->payload.job_run_id}
-        });
+        };
+        json jobCoverageSummary = buildJobCoverageSummary();
+        json jobAnalysisSummary = buildJobAnalysisSummary();
+        for (auto it = jobCoverageSummary.begin(); it != jobCoverageSummary.end(); ++it) {
+            jobCompletedDetails[it.key()] = it.value();
+        }
+        for (auto it = jobAnalysisSummary.begin(); it != jobAnalysisSummary.end(); ++it) {
+            jobCompletedDetails[it.key()] = it.value();
+        }
+        postJobEvent_("job_completed", J, std::move(jobCompletedDetails));
         finalizeJobRuntimeState();
     }
     catch (const std::exception& e) {
@@ -6481,13 +7625,21 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
     const std::string& alertConditionText,
     const std::string& jobRunId,
     const std::string& stepRunId,
-    const std::string& agentRunId)
+    const std::string& agentRunId,
+    const std::string& evaluationNowIsoUtc,
+    const json* coverageDetails)
 {
     if (!owner_) return "";
 
     const std::string temporalPromptCore = trimCopyRuntime_(agent.prompt_template);
     const std::string temporalPromptHash =
-        temporal::computePromptRevisionHash(temporalPromptCore, alertConditionText);
+        temporal::computePromptRevisionHash(
+            temporalPromptCore,
+            alertConditionText,
+            agent.negative_condition_text,
+            agent.input_type,
+            "pt-BR",
+            true);
     const std::string temporalSlotKey =
         "job:" + std::to_string(jobId) +
         "|step:" + std::to_string(stepId) +
@@ -6516,13 +7668,19 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
         temporal::planMatchesPromptRevision(
             temporalSlot.planEnvelope,
             temporalPromptCore,
-            alertConditionText
+            alertConditionText,
+            agent.negative_condition_text,
+            agent.input_type,
+            "pt-BR",
+            true
         );
     if (!slotPlanMatchesCurrentPrompt) {
         return "";
     }
 
-    const std::string nowIsoUtc = temporal::nowIso();
+    const std::string nowIsoUtc = temporal::decisionAnchorUtc(
+        evaluationNowIsoUtc.empty() ? temporal::nowIso() : evaluationNowIsoUtc
+    );
     const temporal::EvalResult eval = temporal::evaluate(
         temporalSlot.state,
         temporalSlot.planEnvelope,
@@ -6564,8 +7722,17 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
         { "llm_alert_condition", false },
         { "final_alert_condition", eval.alert },
         { "temporal_decision_summary", eval.summary },
-        { "status_reason", "deadline_reached" },
-        { "trigger_source", "step_timeout_flush" }
+        { "status_reason",
+          (coverageDetails && coverageDetails->is_object())
+              ? coverageDetails->value(
+                    "analysis_status",
+                    coverageDetails->value("coverage_status", std::string("deadline_reached")))
+              : std::string("deadline_reached") },
+        { "trigger_source",
+          (coverageDetails && coverageDetails->is_object() &&
+           !coverageDetails->value("analysis_frontier_utc", std::string()).empty())
+              ? "step_timeout_flush_analysis_frontier"
+              : "step_timeout_flush" }
     };
     if (!jobRunId.empty()) {
         reportDetails["job_run_id"] = jobRunId;
@@ -6582,20 +7749,74 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
     if (identityCards.is_array() && !identityCards.empty()) {
         reportDetails["identity_cards"] = identityCards;
     }
+    if (coverageDetails && coverageDetails->is_object()) {
+        for (auto it = coverageDetails->begin(); it != coverageDetails->end(); ++it) {
+            reportDetails[it.key()] = it.value();
+        }
+    }
+    const std::string temporalScopeKey = buildJobTemporalReportScopeKey_(
+        jobId,
+        stepId,
+        cameraId,
+        agent.id,
+        jobRunId,
+        stepRunId,
+        agentRunId);
+    if (eval.reportDeliveryMarkers.is_array() && !eval.reportDeliveryMarkers.empty()) {
+        const std::string externalEventId =
+            temporal::buildTemporalReportExternalEventId(
+                temporalScopeKey,
+                eval.reportDeliveryMarkers);
+        reportDetails["external_event_id"] = externalEventId;
+        reportDetails["event_id"] = externalEventId;
+    }
 
-    owner_->postAgentEvent(
-        "temporal_report",
-        std::optional<int>(cameraId),
-        "",
-        "",
-        reportDetails
-    );
+    const AgentCore::AgentEventPostResult reportPostResult =
+        owner_->postAgentEventWithResult(
+            "temporal_report",
+            std::optional<int>(cameraId),
+            "",
+            "",
+            reportDetails
+        );
+    const bool temporalReportDelivered = reportPostResult.ok;
+    if (temporalReportDelivered) {
+        temporal::acknowledgeDeliveredReportMarkers(
+            temporalSlot.state,
+            eval.reportDeliveryMarkers,
+            nowIsoUtc);
+        temporalSlot.touchedAt = std::chrono::steady_clock::now();
+        temporalSlot.promptHash = temporalPromptHash;
+        {
+            std::lock_guard<std::mutex> lock(temporalMu_);
+            temporalBySlot_[temporalSlotKey] = temporalSlot;
+        }
+    } else {
+        Logger::instance().logError(
+            cameraId > 0 ? std::to_string(cameraId) : "job",
+            "failed to post temporal report during timeout flush",
+            makeJobErrorContext_(
+                "job_step",
+                "JobRuntime::maybeEmitFinalTemporalReportOnTimeout_",
+                "post_temporal_report",
+                {
+                    { "job_id", jobId },
+                    { "step_id", stepId },
+                    { "camera_id", cameraId },
+                    { "agent_id", agent.id },
+                    { "http_code", reportPostResult.httpCode },
+                    { "response", reportPostResult.response }
+                }
+            )
+        );
+    }
 
     json out = {
         { "answer", eval.summary },
         { "decision_source", "temporal_engine" },
         { "temporal_operator_results", eval.operatorResults },
         { "temporal_report_due", true },
+        { "temporal_report_delivered", temporalReportDelivered },
         { "temporal_decision_summary", eval.summary },
         { "alert_condition", eval.alert },
         { "llm_alert_condition", false },
@@ -6606,6 +7827,11 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
     }
     if (identityCards.is_array() && !identityCards.empty()) {
         out["identity_cards"] = identityCards;
+    }
+    if (coverageDetails && coverageDetails->is_object()) {
+        for (auto it = coverageDetails->begin(); it != coverageDetails->end(); ++it) {
+            out[it.key()] = it.value();
+        }
     }
     return out.dump();
 }
@@ -6624,9 +7850,14 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     const std::string& stepRunId,
     const std::string& agentRunId,
     int timeoutSeconds,
-    std::atomic<bool>& cancel
+    std::atomic<bool>& cancel,
+    const std::string& coverageCutoffUtcIso,
+    JobInstance::InferenceMediaInfo* outMediaInfo
 ) {
     if (cancel) return "";
+    if (outMediaInfo) {
+        *outMediaInfo = JobInstance::InferenceMediaInfo{};
+    }
 
     // Normalize input_type (defensive)
     std::string it = agent.input_type;
@@ -6653,7 +7884,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     const std::string temporalLanguage = "pt-BR";
     const std::string temporalPromptCore = trimCopyRuntime_(agent.prompt_template);
     const std::string temporalPromptHash =
-        temporal::computePromptRevisionHash(temporalPromptCore, alertConditionText);
+        temporal::computePromptRevisionHash(
+            temporalPromptCore,
+            alertConditionText,
+            agent.negative_condition_text,
+            agent.input_type,
+            temporalLanguage,
+            true);
     const std::string temporalSlotKey =
         "job:" + std::to_string(jobId) +
         "|step:" + std::to_string(stepId) +
@@ -6667,7 +7904,11 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             temporal::planMatchesPromptRevision(
                 agent.temporal_plan_envelope,
                 temporalPromptCore,
-                alertConditionText
+                alertConditionText,
+                agent.negative_condition_text,
+                agent.input_type,
+                temporalLanguage,
+                true
             );
         std::lock_guard<std::mutex> lock(temporalMu_);
         auto it = temporalBySlot_.find(temporalSlotKey);
@@ -6680,7 +7921,11 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
              temporal::planMatchesPromptRevision(
                  slot.planEnvelope,
                  temporalPromptCore,
-                 alertConditionText
+                 alertConditionText,
+                 agent.negative_condition_text,
+                 agent.input_type,
+                 temporalLanguage,
+                 true
              ));
         if (!slotPlanMatchesCurrentPrompt) {
             slot.planEnvelope = payloadPlanMatchesCurrentPrompt
@@ -6703,6 +7948,39 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         TemporalRuntimeSlot persisted = slot;
         persisted.promptHash = temporalPromptHash;
         temporalBySlot_[temporalSlotKey] = std::move(persisted);
+    };
+    const std::string temporalReportScopeKey = buildJobTemporalReportScopeKey_(
+        jobId,
+        stepId,
+        cameraId,
+        agent.id,
+        jobRunId,
+        stepRunId,
+        agentRunId);
+    auto attachTemporalReportDeliveryIds = [&](json& reportDetails,
+                                               const json& reportDeliveryMarkers) {
+        if (!reportDeliveryMarkers.is_array() || reportDeliveryMarkers.empty()) {
+            return;
+        }
+        const std::string externalEventId =
+            temporal::buildTemporalReportExternalEventId(
+                temporalReportScopeKey,
+                reportDeliveryMarkers);
+        reportDetails["external_event_id"] = externalEventId;
+        if (!reportDetails.contains("event_id") ||
+            !reportDetails["event_id"].is_string() ||
+            trimCopyRuntime_(reportDetails["event_id"].get<std::string>()).empty())
+        {
+            reportDetails["event_id"] = externalEventId;
+        }
+    };
+    auto acknowledgeTemporalReportDelivery = [&](TemporalRuntimeSlot& slot,
+                                                 const json& reportDeliveryMarkers,
+                                                 const std::string& deliveredAtUtc = std::string()) {
+        temporal::acknowledgeDeliveredReportMarkers(slot.state, reportDeliveryMarkers, deliveredAtUtc);
+        slot.touchedAt = std::chrono::steady_clock::now();
+        slot.promptHash = temporalPromptHash;
+        saveTemporalSlot(slot);
     };
     TemporalRuntimeSlot preparedTemporalSlot = loadTemporalSlot();
     bool temporalPlanPrepared = temporal::planUsable(preparedTemporalSlot.planEnvelope);
@@ -8121,18 +9399,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         std::string clipPath;
         bool clipBackedSource = false;
         std::string croppedClipPathForMotion;
-
-        struct ProcessingClipGuard {
-            std::string path;
-            bool disarm = false;
-            ~ProcessingClipGuard() {
-                if (disarm) return;
-                if (path.size() < std::string(".processing").size()) return;
-                if (path.rfind(".processing") != path.size() - std::string(".processing").size()) return;
-                std::error_code ec;
-                fs::remove(fs::path(path), ec);
-            }
-        } clipGuard;
+        std::string selectedImageKey;
         struct TempClipGuard {
             std::string* pathPtr = nullptr;
             ~TempClipGuard() {
@@ -8152,7 +9419,11 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (isNewerClipForJobStepCamera_(jobId, stepId, cameraId, imageKey)) {
                 std::string imageErr;
                 if (encodeImageFileAsJpegDataUrl_(imagePath, jpegB64, &imageErr) && !jpegB64.empty()) {
-                    markClipConsumedForJobStepCamera_(jobId, stepId, cameraId, imageKey);
+                    selectedImageKey = imageKey;
+                    if (outMediaInfo) {
+                        outMediaInfo->hadInput = true;
+                        outMediaInfo->consumptionKey = imageKey;
+                    }
                 }
                 else {
                     Logger::instance().logDebug(
@@ -8173,18 +9444,11 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (!isNewerClipForJobStepCamera_(jobId, stepId, cameraId, clipKey)) {
                 return "";
             }
-
-            // Claim clip exclusively for this worker to prevent reprocessing.
-            std::error_code renEc;
-            fs::path pth = fs::path(clipPath);
-            fs::path processing = pth;
-            processing += ".processing";
-            fs::rename(pth, processing, renEc);
-            if (renEc) return "";
-            clipPath = processing.string();
             clipBackedSource = true;
-            clipGuard.path = clipPath;
-            markClipConsumedForJobStepCamera_(jobId, stepId, cameraId, clipKey);
+            if (outMediaInfo) {
+                outMediaInfo->hadInput = true;
+                outMediaInfo->consumptionKey = clipKey;
+            }
 
             std::string extractErr;
             if (!extractLastFrameJpegDataUrlFromMp4_(fs::path(clipPath), jpegB64, &extractErr) || jpegB64.empty()) {
@@ -8196,6 +9460,10 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 return "";
             }
             parseClipEndTsUtcIsoFromPath_(fs::path(clipPath), tsUtcIso);
+            if (outMediaInfo) {
+                outMediaInfo->latestCapturedEndUtc = tsUtcIso;
+                outMediaInfo->processedSegmentEndUtc = tsUtcIso;
+            }
         }
 
         if (hasFrameWindow) {
@@ -8471,25 +9739,21 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             hit.alertCondition = hit.faceIdMatch;
             hit.answer = buildFaceIdOnlyShortAnswer_(hit.faceIdMatch, hit.faceIdTargetNames);
         }
+        if (!hasUsableInferenceResult_(hit, promptTokens, outputTokens, totalTokens)) {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: image inference produced no usable provider result cameraId=" +
+                std::to_string(cameraId)
+            );
+            return "";
+        }
 
         const bool firstPassAlertCondition = hit.alertCondition;
         const bool llmAlertCondition = hit.alertCondition;
         std::string decisionSource = "llm";
         std::string temporalDecisionSummary;
-        const std::vector<std::string> preValidatedAlertRegionIds =
-            sanitizeAlertRegionIds_(hit.alertRegionIds, allowedAlertRegionLabelById, nullptr);
-        const bool firstPassPolygonAlertSignal =
-            !polygonRegions.empty() && !preValidatedAlertRegionIds.empty();
+        json temporalReportDeliveryMarkers = json::array();
         AlertValidationMeta_ validatorMeta;
-        if (!firstPassAlertCondition && firstPassPolygonAlertSignal && !temporalPlanActive) {
-            Logger::instance().logDebug(
-                "job",
-                "runAgentInferenceOnCamera_: promoting first-pass alert due polygon alert_region_ids cameraId=" +
-                std::to_string(cameraId) + " roi_count=" +
-                std::to_string(preValidatedAlertRegionIds.size())
-            );
-            hit.alertCondition = true;
-        }
 
         const LocalAlertNormalization_ normalizedLocalAlert =
             normalizeConflictingLocalAlert_(hit.alertCondition, alertConditionText, hit);
@@ -8535,6 +9799,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 temporal::shouldFallbackToLocalAlert(eval, localAlertSignal);
             temporalOperatorResults = eval.operatorResults;
             temporalReport = eval.report;
+            temporalReportDeliveryMarkers = eval.reportDeliveryMarkers;
             hit.alertCondition = eval.alert;
             decisionSource = "temporal_engine";
             temporalDecisionSummary = eval.summary;
@@ -8811,14 +10076,19 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         out["output_tokens"] = sumOutputTokens;
         out["total_tokens"] = sumTotalTokens;
         out["clip_path"] = clipPath;
+        if (!tsUtcIso.empty()) {
+            out["segment_end_utc"] = tsUtcIso;
+        }
         out["region_results"] = regionResults;
         out["alert_region_ids"] = alertRegionIds;
         out["alert_region_names"] = alertRegionNames;
         out["motion_trigger_region_ids"] = motionRegionIds;
         out["motion_trigger_region_names"] = motionRegionNames;
+        bool temporalReportDelivered = false;
         if (includeTemporalDiagnostics) {
             out["temporal_operator_results"] = temporalOperatorResults;
             out["temporal_report_due"] = temporalReport;
+            out["temporal_report_delivered"] = false;
             if (!temporalDecisionSummary.empty()) {
                 out["temporal_decision_summary"] = temporalDecisionSummary;
             }
@@ -8877,16 +10147,45 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
                 reportDetails["identity_cards"] = hit.identityCards;
             }
-            owner_->postAgentEvent(
-                "temporal_report",
-                std::optional<int>(cameraId),
-                "",
-                "",
-                reportDetails
-            );
+            attachTemporalReportDeliveryIds(reportDetails, temporalReportDeliveryMarkers);
+            const AgentCore::AgentEventPostResult reportPostResult =
+                owner_->postAgentEventWithResult(
+                    "temporal_report",
+                    std::optional<int>(cameraId),
+                    "",
+                    "",
+                    reportDetails
+                );
+            temporalReportDelivered = reportPostResult.ok;
+            if (temporalReportDelivered) {
+                acknowledgeTemporalReportDelivery(
+                    temporalSlot,
+                    temporalReportDeliveryMarkers,
+                    nowIsoForInference);
+            } else {
+                Logger::instance().logError(
+                    std::to_string(cameraId),
+                    "failed to post temporal report for job image inference",
+                    makeJobErrorContext_(
+                        "job_step",
+                        "JobRuntime::runAgentInferenceOnCamera_",
+                        "post_temporal_report_image",
+                        {
+                            { "job_id", jobId },
+                            { "step_id", stepId },
+                            { "camera_id", cameraId },
+                            { "agent_id", agent.id },
+                            { "http_code", reportPostResult.httpCode },
+                            { "response", reportPostResult.response }
+                        }
+                    )
+                );
+            }
+            if (includeTemporalDiagnostics) {
+                out["temporal_report_delivered"] = temporalReportDelivered;
+            }
         }
 
-        clipGuard.disarm = true;
         return out.dump();
     }
 
@@ -8895,16 +10194,34 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     // -------------------------------
     const int normalizedRunEverySeconds = normalizedRunEverySecondsForJobAgent_(agent);
     std::vector<std::string> tempClipCleanupPaths;
+    struct TempPathsCleanupGuard {
+        std::vector<std::string>* paths = nullptr;
+        bool disarm = false;
+        ~TempPathsCleanupGuard() {
+            if (disarm || !paths) return;
+            for (const auto& rawPath : *paths) {
+                if (rawPath.empty()) continue;
+                std::error_code ec;
+                fs::remove(fs::path(rawPath), ec);
+            }
+        }
+    } tempClipCleanupGuard{ &tempClipCleanupPaths };
     std::string assembledWindowStartPretty;
     std::string assembledWindowEndPretty;
     std::string assembledWindowStartUtc;
     std::string assembledWindowEndUtc;
     int expectedWindowSecondsForOpenAI = normalizedRunEverySeconds;
+    std::string consumptionKey;
 
     std::string clipPath;
     if (normalizedRunEverySeconds == 60) {
         auto storedSixtySecondClipPath =
-            getNextReadyCurrentDayStoredSixtySecondClipPathForJobStepCamera_(jobId, stepId, cameraId);
+            getNextReadyCurrentDayStoredSixtySecondClipPathForJobStepCamera_(
+                jobId,
+                stepId,
+                cameraId,
+                coverageCutoffUtcIso
+            );
         if (!storedSixtySecondClipPath.has_value()) {
             Logger::instance().logDebug(
                 "job",
@@ -8942,7 +10259,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         );
 
         expectedWindowSecondsForOpenAI = normalizedRunEverySeconds;
-        markClipConsumedForJobStepCamera_(jobId, stepId, cameraId, clipKey);
+        consumptionKey = clipKey;
         Logger::instance().logDebug(
             "job",
             "runAgentInferenceOnCamera_: using finalized current-day 60s clip run_every=" +
@@ -8960,7 +10277,12 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
 
     if (clipPath.empty()) {
         const VideoWindowAssemblyResult adaptiveWindow =
-            assembleAdaptivePendingJobsWindow_(jobId, stepId, cameraId);
+            assembleAdaptivePendingJobsWindow_(
+                jobId,
+                stepId,
+                cameraId,
+                coverageCutoffUtcIso
+            );
         if (adaptiveWindow.status == VideoWindowAssemblyStatus::NoNewWindow) {
             return "";
         }
@@ -8975,15 +10297,57 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
 
         clipPath = adaptiveWindow.clipPath;
         tempClipCleanupPaths = adaptiveWindow.cleanupPaths;
+        consumptionKey = adaptiveWindow.consumedClipKey;
         assembledWindowStartPretty = adaptiveWindow.windowStartPretty;
         assembledWindowEndPretty = adaptiveWindow.windowEndPretty;
+        assembledWindowStartUtc = adaptiveWindow.windowStartUtc;
+        assembledWindowEndUtc = adaptiveWindow.windowEndUtc;
         expectedWindowSecondsForOpenAI =
             adaptiveWindow.windowSeconds > 0 ? adaptiveWindow.windowSeconds : 10;
-        (void)parseClipRangeUtcIsoFromPath_(
-            fs::path(clipPath),
-            assembledWindowStartUtc,
-            assembledWindowEndUtc
-        );
+    }
+
+    if (outMediaInfo && !clipPath.empty()) {
+        outMediaInfo->hadInput = true;
+        outMediaInfo->coverageRelevant = true;
+        outMediaInfo->consumptionKey = consumptionKey;
+        outMediaInfo->latestCapturedEndUtc = assembledWindowEndUtc;
+    }
+
+    {
+        fs::path trimmedClipPath;
+        std::string trimErr;
+        std::string effectiveStartUtc = assembledWindowStartUtc;
+        std::string effectiveEndUtc = assembledWindowEndUtc;
+        if (!trimClipToCoverageCutoff_(
+                jobId,
+                stepId,
+                cameraId,
+                fs::path(clipPath),
+                assembledWindowStartUtc,
+                assembledWindowEndUtc,
+                coverageCutoffUtcIso,
+                trimmedClipPath,
+                effectiveStartUtc,
+                effectiveEndUtc,
+                &trimErr))
+        {
+            Logger::instance().logDebug(
+                "job",
+                "runAgentInferenceOnCamera_: coverage trim skipped clip for video inference cameraId=" +
+                std::to_string(cameraId) + " err=" + trimErr
+            );
+            return "";
+        }
+        if (!trimmedClipPath.empty()) {
+            clipPath = trimmedClipPath.string();
+            tempClipCleanupPaths.push_back(clipPath);
+        }
+        assembledWindowStartUtc = effectiveStartUtc;
+        assembledWindowEndUtc = effectiveEndUtc;
+        if (outMediaInfo) {
+            outMediaInfo->processedSegmentStartUtc = assembledWindowStartUtc;
+            outMediaInfo->processedSegmentEndUtc = assembledWindowEndUtc;
+        }
     }
 
     const std::vector<JobAnalysisRegion> activeRegions =
@@ -9175,6 +10539,14 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         seg.startTs = assembledWindowStartUtc;
         seg.endTs = assembledWindowEndUtc;
     }
+    if (outMediaInfo) {
+        if (outMediaInfo->processedSegmentStartUtc.empty()) {
+            outMediaInfo->processedSegmentStartUtc = seg.startTs;
+        }
+        if (outMediaInfo->processedSegmentEndUtc.empty()) {
+            outMediaInfo->processedSegmentEndUtc = seg.endTs;
+        }
+    }
 
 
     json regionResults = json::array();
@@ -9307,25 +10679,21 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         hit.alertCondition = hit.faceIdMatch;
         hit.answer = buildFaceIdOnlyShortAnswer_(hit.faceIdMatch, hit.faceIdTargetNames);
     }
+    if (!hasUsableInferenceResult_(hit, promptTokens, outputTokens, totalTokens)) {
+        Logger::instance().logDebug(
+            "job",
+            "runAgentInferenceOnCamera_: video inference produced no usable provider result cameraId=" +
+            std::to_string(cameraId)
+        );
+        return "";
+    }
 
     const bool firstPassAlertCondition = hit.alertCondition;
     const bool llmAlertCondition = hit.alertCondition;
     std::string decisionSource = "llm";
     std::string temporalDecisionSummary;
-    const std::vector<std::string> preValidatedAlertRegionIds =
-        sanitizeAlertRegionIds_(hit.alertRegionIds, allowedAlertRegionLabelById, nullptr);
-    const bool firstPassPolygonAlertSignal =
-        !polygonRegions.empty() && !preValidatedAlertRegionIds.empty();
+    json temporalReportDeliveryMarkers = json::array();
     AlertValidationMeta_ validatorMeta;
-    if (!firstPassAlertCondition && firstPassPolygonAlertSignal && !temporalPlanActive) {
-        Logger::instance().logDebug(
-            "job",
-            "runAgentInferenceOnCamera_: promoting first-pass alert due polygon alert_region_ids (video) cameraId=" +
-            std::to_string(cameraId) + " roi_count=" +
-            std::to_string(preValidatedAlertRegionIds.size())
-        );
-        hit.alertCondition = true;
-    }
 
     const LocalAlertNormalization_ normalizedLocalAlert =
         normalizeConflictingLocalAlert_(hit.alertCondition, alertConditionText, hit);
@@ -9371,6 +10739,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             temporal::shouldFallbackToLocalAlert(eval, localAlertSignal);
         temporalOperatorResults = eval.operatorResults;
         temporalReport = eval.report;
+        temporalReportDeliveryMarkers = eval.reportDeliveryMarkers;
         hit.alertCondition = eval.alert;
         decisionSource = "temporal_engine";
         temporalDecisionSummary = eval.summary;
@@ -9643,6 +11012,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     out["output_tokens"] = sumOutputTokens;
     out["total_tokens"] = sumTotalTokens;
     out["clip_path"] = clipPath;
+    out["segment_start_utc"] = seg.startTs;
+    out["segment_end_utc"] = seg.endTs;
     out["region_results"] = regionResults;
     out["alert_region_ids"] = alertRegionIds;
     out["alert_region_names"] = alertRegionNames;
@@ -9671,6 +11042,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         out["window_end"] = assembledWindowEndPretty;
     }
 
+    bool temporalReportDelivered = false;
     if (temporalPlanActive && temporalReport && owner_) {
         const json reportIdentityCards =
             owner_->collectOperationalIdentityCards(temporalSlot.state, temporalSlot.visualState);
@@ -9715,15 +11087,47 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
             reportDetails["identity_cards"] = hit.identityCards;
         }
-        owner_->postAgentEvent(
-            "temporal_report",
-            std::optional<int>(cameraId),
-            "",
-            "",
-            reportDetails
-        );
+        attachTemporalReportDeliveryIds(reportDetails, temporalReportDeliveryMarkers);
+        const AgentCore::AgentEventPostResult reportPostResult =
+            owner_->postAgentEventWithResult(
+                "temporal_report",
+                std::optional<int>(cameraId),
+                "",
+                "",
+                reportDetails
+            );
+        temporalReportDelivered = reportPostResult.ok;
+        if (temporalReportDelivered) {
+            acknowledgeTemporalReportDelivery(
+                temporalSlot,
+                temporalReportDeliveryMarkers,
+                temporalDecisionNowIso);
+        } else {
+            Logger::instance().logError(
+                std::to_string(cameraId),
+                "failed to post temporal report for job video inference",
+                makeJobErrorContext_(
+                    "job_step",
+                    "JobRuntime::runAgentInferenceOnCamera_",
+                    "post_temporal_report_video",
+                    {
+                        { "job_id", jobId },
+                        { "step_id", stepId },
+                        { "camera_id", cameraId },
+                        { "agent_id", agent.id },
+                        { "http_code", reportPostResult.httpCode },
+                        { "response", reportPostResult.response }
+                    }
+                )
+            );
+        }
     }
 
+    if (includeTemporalDiagnostics) {
+        out["temporal_report_delivered"] = temporalReportDelivered;
+    }
+
+    tempClipCleanupGuard.disarm = true;
     return out.dump();
 }
 
@@ -10695,13 +12099,16 @@ struct PendingJobClip_ {
     std::string endCompact;
     std::string startPretty;
     std::string endPretty;
+    std::string startUtcIso;
+    std::string endUtcIso;
     fs::file_time_type lastWrite{};
 };
 
 static std::vector<PendingJobClip_> collectPendingJobsClipsForCamera_(
     int jobId,
     int stepId,
-    int cameraId)
+    int cameraId,
+    const std::string& coverageCutoffUtcIso = std::string())
 {
     std::vector<PendingJobClip_> pending;
     try {
@@ -10757,6 +12164,10 @@ static std::vector<PendingJobClip_> collectPendingJobsClipsForCamera_(
             {
                 continue;
             }
+            (void)parseClipRangeUtcIsoFromPath_(entry.path(), clip.startUtcIso, clip.endUtcIso);
+            if (!clipStartsBeforeCoverageCutoff_(entry.path(), coverageCutoffUtcIso)) {
+                continue;
+            }
 
             clip.lastWrite = entry.last_write_time(ec);
             if (ec) break;
@@ -10807,21 +12218,13 @@ static VideoWindowAssemblyResult claimSinglePendingJobsClip_(
     result.status = VideoWindowAssemblyStatus::Failed;
 
     try {
-        fs::path processingPath = clip.path;
-        processingPath += ".processing";
-
-        std::error_code ec;
-        fs::rename(clip.path, processingPath, ec);
-        if (ec) {
-            result.error = "failed to claim clip for processing";
-            return result;
-        }
-
-        markClipConsumedForJobStepCamera_(jobId, stepId, cameraId, clip.clipKey);
         result.status = VideoWindowAssemblyStatus::Assembled;
-        result.clipPath = processingPath.string();
+        result.clipPath = clip.path.string();
+        result.consumedClipKey = clip.clipKey;
         result.windowStartPretty = clip.startPretty;
         result.windowEndPretty = clip.endPretty;
+        result.windowStartUtc = clip.startUtcIso;
+        result.windowEndUtc = clip.endUtcIso;
         result.windowSeconds = deriveActualWindowSecondsFromCompactClipRange_(
             clip.startCompact,
             clip.endCompact,
@@ -10838,13 +12241,14 @@ static VideoWindowAssemblyResult claimSinglePendingJobsClip_(
 static VideoWindowAssemblyResult assembleAdaptivePendingJobsWindow_(
     int jobId,
     int stepId,
-    int cameraId)
+    int cameraId,
+    const std::string& coverageCutoffUtcIso)
 {
     VideoWindowAssemblyResult result;
     result.status = VideoWindowAssemblyStatus::Failed;
 
     const std::vector<PendingJobClip_> pending =
-        collectPendingJobsClipsForCamera_(jobId, stepId, cameraId);
+        collectPendingJobsClipsForCamera_(jobId, stepId, cameraId, coverageCutoffUtcIso);
     if (pending.empty()) {
         result.status = VideoWindowAssemblyStatus::NoNewWindow;
         result.error = "no clip available yet";
@@ -10891,17 +12295,14 @@ static VideoWindowAssemblyResult assembleAdaptivePendingJobsWindow_(
         return claimSinglePendingJobsClip_(jobId, stepId, cameraId, pending.front());
     }
 
-    for (const auto& srcPath : segmentPaths) {
-        std::error_code rmEc;
-        fs::remove(srcPath, rmEc);
-    }
-
-    markClipConsumedForJobStepCamera_(jobId, stepId, cameraId, last.clipKey);
     result.status = VideoWindowAssemblyStatus::Assembled;
     result.clipPath = assembledPath.string();
     result.cleanupPaths.push_back(assembledPath.string());
+    result.consumedClipKey = last.clipKey;
     result.windowStartPretty = first.startPretty;
     result.windowEndPretty = last.endPretty;
+    result.windowStartUtc = first.startUtcIso;
+    result.windowEndUtc = last.endUtcIso;
     result.windowSeconds = windowSeconds;
     return result;
 }

@@ -775,6 +775,21 @@ const normalizeAgentUseTemporalContext = (value: unknown): boolean => {
   return true;
 };
 
+const normalizeAgentSummaryLocked = (value: unknown): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+  }
+  return false;
+};
+
 const JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED = brand.id === "drakon";
 const DEFAULT_AGENT_USE_TEMPORAL_CONTEXT = true;
 
@@ -6200,25 +6215,38 @@ function StepCard({
   }) => {
     const inferenceModel = normalizeAgentInferenceModel(source.inference_model);
     const sourceParams = parseAgentParamsObject(source.params ?? "{}");
+    const summaryLocked = normalizeAgentSummaryLocked(sourceParams.summary_locked);
     const displayName =
       (typeof source.display_name === "string" ? source.display_name.trim() : "") ||
       (typeof sourceParams.display_name === "string" ? sourceParams.display_name.trim() : "") ||
       String(source.agent_key || "").trim();
     const summary =
-      (typeof source.summary === "string" ? source.summary.trim() : "") ||
-      (typeof sourceParams.summary === "string" ? sourceParams.summary.trim() : "") ||
-      String(promptPayload.alert_condition || "").trim();
+      summaryLocked
+        ? (typeof sourceParams.summary === "string" ? sourceParams.summary.trim() : "") ||
+          (typeof source.summary === "string" ? source.summary.trim() : "") ||
+          String(promptPayload.alert_condition || "").trim()
+        : String(promptPayload.alert_condition || "").trim();
+    const paramsPayload: Record<string, unknown> = {
+      ...sourceParams,
+      display_name: displayName,
+    };
+    if (summary) {
+      paramsPayload.summary = summary;
+    } else {
+      delete paramsPayload.summary;
+    }
+    if (summaryLocked) {
+      paramsPayload.summary_locked = true;
+    } else {
+      delete paramsPayload.summary_locked;
+    }
     const body: Record<string, unknown> = {
       agent_key: source.stored_agent_key || source.agent_key,
       prompt_template: promptPayload.prompt_template,
       alert_condition: promptPayload.alert_condition,
       negative_condition: promptPayload.negative_condition,
       camera_id: cameraId,
-      params: JSON.stringify({
-        ...sourceParams,
-        display_name: displayName,
-        summary,
-      }),
+      params: JSON.stringify(paramsPayload),
       input_schema: source.input_schema ?? "{}",
       priority_level: source.priority_level || "MEDIUM",
       inference_model: inferenceModel,

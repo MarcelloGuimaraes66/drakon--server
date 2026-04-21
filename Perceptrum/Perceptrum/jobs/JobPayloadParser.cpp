@@ -677,6 +677,12 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
         out.trigger.triggered_at_utc = safeString(p["trigger"], "triggered_at_utc");
     }
 
+    out.execution_target_end_utc = safeString(
+        p,
+        "execution_target_end_utc",
+        safeString(p, "executionTargetEndUtc", "")
+    );
+
     if (p.contains("all_camera_ids") && p["all_camera_ids"].is_array()) {
         for (auto& c : p["all_camera_ids"]) {
             if (c.is_number_integer()) out.all_camera_ids.push_back(c.get<int>());
@@ -718,6 +724,19 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
             step.step_order = st.value("step_order", 0);
             step.name = safeString(st, "name");
             step.timeout_seconds = st.value("timeout_seconds", 0);
+            step.analysis_completion_mode = safeString(
+                st,
+                "analysis_completion_mode",
+                safeString(st, "analysisCompletionMode", "")
+            );
+            step.analysis_target_end_utc = safeString(
+                st,
+                "analysis_target_end_utc",
+                safeString(st, "analysisTargetEndUtc", "")
+            );
+            step.analysis_hard_stop_seconds =
+                optInt(st, "analysis_hard_stop_seconds").value_or(
+                    optInt(st, "analysisHardStopSeconds").value_or(0));
             step.input_from_step_id = optInt(st, "input_from_step_id");
             step.input_inject_key = safeString(st, "input_inject_key", "");
             step.on_missing_input = safeString(st, "on_missing_input", "skip");

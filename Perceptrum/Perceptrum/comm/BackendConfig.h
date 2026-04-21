@@ -57,13 +57,15 @@ inline std::string LoadBaseUrlFromFile() {
 // Order of precedence:
 // 1) active brand env var
 // 2) legacy brand env var
-// 3) active brand base-url file
-// 4) legacy brand base-url file
-// 3) default to localhost
+// 3) APP_BASE_URL env var injected by the desktop host
+// 4) active brand base-url file
+// 5) legacy brand base-url file
+// 6) default to localhost
 inline std::string GetPerceptrumBaseUrl() {
     const char* envCandidates[] = {
         AppBrand::kBaseUrlEnvVarName,
         AppBrand::kLegacyBaseUrlEnvVarName,
+        "APP_BASE_URL",
     };
 
     for (const char* candidate : envCandidates) {

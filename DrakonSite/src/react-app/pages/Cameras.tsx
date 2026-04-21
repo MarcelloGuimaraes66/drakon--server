@@ -619,6 +619,7 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                 {filteredCameras.map((camera) => {
                   const connectionState = getCameraConnectionState(camera);
                   const isRunning = isCameraServiceRunning(camera);
+                  const isAuthLost = connectionState === "auth_lost";
                   const isReconnecting = connectionState === "reconnecting";
                   const isOnline = connectionState === "online";
 
@@ -650,6 +651,8 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                         className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
                           isOnline
                             ? "bg-green-500/10 text-green-400"
+                            : isAuthLost
+                            ? "bg-rose-500/10 text-rose-300"
                             : isReconnecting
                             ? "bg-amber-500/10 text-amber-300"
                             : "bg-red-500/10 text-red-400"
@@ -658,6 +661,8 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                           <Wifi className="w-3 h-3" />
                           {isOnline
                             ? t("dashboard.online")
+                            : isAuthLost
+                            ? "Pairing/Auth lost"
                             : isReconnecting
                             ? "Reconnecting"
                             : t("dashboard.offline")}

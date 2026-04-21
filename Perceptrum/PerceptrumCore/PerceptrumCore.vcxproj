@@ -99,8 +99,10 @@
     <ClInclude Include="..\Perceptrum\comm\TelegramNotifier.h" />
     <ClInclude Include="..\Perceptrum\comm\TelegramSettings.h" />
     <ClInclude Include="..\Perceptrum\core\AgentCore.h" />
+    <ClInclude Include="..\Perceptrum\core\AnalysisRegionGeometry.h" />
     <ClInclude Include="..\Perceptrum\core\Localization.h" />
     <ClInclude Include="..\Perceptrum\core\TemporalEngine.h" />
+    <ClInclude Include="..\Perceptrum\core\VideoPolygonOverlayRenderer.h" />
     <ClInclude Include="..\Perceptrum\jobs\JobPayloadParser.h" />
     <ClInclude Include="..\Perceptrum\jobs\JobRuntime.h" />
     <ClInclude Include="..\Perceptrum\jobs\JobTypes.h" />
@@ -134,6 +136,10 @@
     <ClInclude Include="..\Perceptrum\orchestrator\skills\shared\AgentAuthoringShared.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\shared\JobBlueprintShared.h" />
     <ClInclude Include="..\Perceptrum\orchestrator\skills\VideoSearchSkill.h" />
+    <ClInclude Include="..\Perceptrum\platform\platform_common.h" />
+    <ClInclude Include="..\Perceptrum\platform\platform_process.h" />
+    <ClInclude Include="..\Perceptrum\platform\platform_secure_store.h" />
+    <ClInclude Include="..\Perceptrum\platform\platform_shutdown.h" />
     <ClInclude Include="..\Perceptrum\runtime\BrandingRuntime.h" />
     <ClInclude Include="..\Perceptrum\runtime\HeadlessService.h" />
   </ItemGroup>
@@ -148,6 +154,7 @@
     <ClCompile Include="..\Perceptrum\comm\TelegramNotifier.cpp" />
     <ClCompile Include="..\Perceptrum\comm\TelegramNotifierSendVideo.cpp" />
     <ClCompile Include="..\Perceptrum\core\AgentCore.cpp" />
+    <ClCompile Include="..\Perceptrum\core\AnalysisRegionGeometry.cpp" />
     <ClCompile Include="..\Perceptrum\jobs\JobPayloadParser.cpp" />
     <ClCompile Include="..\Perceptrum\jobs\JobRuntime.cpp" />
     <ClCompile Include="..\Perceptrum\logging\Logging.cpp" />
@@ -179,6 +186,11 @@
     <ClCompile Include="..\Perceptrum\orchestrator\skills\shared\AgentAuthoringShared.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\shared\JobBlueprintShared.cpp" />
     <ClCompile Include="..\Perceptrum\orchestrator\skills\VideoSearchSkill.cpp" />
+    <ClCompile Include="..\Perceptrum\platform\platform_common.cpp" />
+    <ClCompile Include="..\Perceptrum\platform\platform_process.cpp" />
+    <ClCompile Include="..\Perceptrum\platform\platform_secure_store.cpp" />
+    <ClCompile Include="..\Perceptrum\platform\platform_shutdown.cpp" />
+    <ClCompile Include="..\Perceptrum\core\VideoPolygonOverlayRenderer.cpp" />
     <ClCompile Include="..\Perceptrum\runtime\BrandingRuntime.cpp" />
     <ClCompile Include="..\Perceptrum\runtime\HeadlessService.cpp" />
   </ItemGroup>

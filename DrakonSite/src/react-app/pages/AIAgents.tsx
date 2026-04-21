@@ -661,6 +661,7 @@ function AIAgentsContent() {
             const connectionState = getCameraConnectionState(camera);
             const isRunning = isCameraServiceRunning(camera);
             const isOnline = isCameraOnline(camera);
+            const isAuthLost = connectionState === "auth_lost";
             const isReconnecting = connectionState === "reconnecting";
             const showInlineActionsForTutorial =
               isOnboardingOpen &&
@@ -708,7 +709,14 @@ function AIAgentsContent() {
                 )}
 
                 {/* Status badge */}
-                {isReconnecting ? (
+                {isAuthLost ? (
+                  <div className="absolute top-3 right-3 z-20 flex items-center gap-2 rounded-full bg-gray-900/90 px-3 py-1.5 backdrop-blur-sm">
+                    <AlertCircle className="h-4 w-4 text-rose-300" />
+                    <span className="text-xs font-medium text-rose-300">
+                      Pairing/Auth lost
+                    </span>
+                  </div>
+                ) : isReconnecting ? (
                   <div className="absolute top-3 right-3 z-20 flex items-center gap-2 bg-gray-900/90 backdrop-blur-sm px-3 py-1.5 rounded-full">
                     <AlertCircle className="w-4 h-4 text-amber-300" />
                     <span className="text-xs font-medium text-amber-300">
@@ -728,7 +736,7 @@ function AIAgentsContent() {
                 {isRunning ? (
                   <div
                     className={`absolute top-3 left-3 z-20 backdrop-blur-sm p-2 rounded-full ${
-                      isOnline ? "bg-blue-500/90" : "bg-amber-500/90"
+                      isOnline ? "bg-blue-500/90" : isAuthLost ? "bg-rose-500/90" : "bg-amber-500/90"
                     }`}
                   >
                     <Play className="w-4 h-4 text-white fill-white" />
@@ -750,6 +758,8 @@ function AIAgentsContent() {
                   className={`text-xs font-medium mb-3 ${
                     isOnline
                       ? "text-green-400"
+                      : isAuthLost
+                      ? "text-rose-300"
                       : isReconnecting
                       ? "text-amber-300"
                       : "text-red-400"
@@ -757,6 +767,8 @@ function AIAgentsContent() {
                 >
                   {isOnline
                     ? t("dashboard.online")
+                    : isAuthLost
+                    ? "Pairing/Auth lost"
                     : isReconnecting
                     ? "Reconnecting"
                     : t("dashboard.offline")}

@@ -78,6 +78,27 @@ function normalizeCameraId(value: unknown): number | null {
   return null;
 }
 
+function normalizeHydratedOnboardingState(
+  persisted: ReturnType<typeof readOnboardingState>
+): ReturnType<typeof readOnboardingState> {
+  if (persisted.status !== "in_progress") {
+    return persisted;
+  }
+
+  // The guided tutorial should auto-open only once. If the app is relaunched
+  // mid-flow, keep it available for manual reopen but do not force-resume it.
+  return {
+    version: persisted.version,
+    status: "dismissed",
+    tutorialKind: "intro",
+    currentStepId: null,
+    selectedProvider: null,
+    tutorialCameraId: null,
+    tutorialAgentId: null,
+    tutorialProceedWithoutWebcam: false,
+  };
+}
+
 export function OnboardingProvider({ children }: { children: ReactNode }) {
   const { user, isPending: isAuthPending } = useAuth();
   const navigate = useNavigate();
@@ -112,7 +133,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    const persisted = readOnboardingState(onboardingUserId);
+    const persisted = normalizeHydratedOnboardingState(readOnboardingState(onboardingUserId));
     setStatus(persisted.status);
     setTutorialKind(persisted.tutorialKind);
     setCurrentStepId(persisted.currentStepId);

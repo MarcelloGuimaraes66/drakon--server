@@ -1,6 +1,7 @@
 // JobRuntime.h
 #pragma once
 #include "JobTypes.h"
+#include "../core/ContentCoverageTracker.h"
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -24,6 +25,15 @@ public:
 
 private:
     struct JobInstance {
+        struct InferenceMediaInfo {
+            bool hadInput = false;
+            bool coverageRelevant = false;
+            std::string consumptionKey;
+            std::string latestCapturedEndUtc;
+            std::string processedSegmentStartUtc;
+            std::string processedSegmentEndUtc;
+        };
+
         JobStartPayload payload;
         std::thread worker;
         std::atomic<bool> cancel{ false };
@@ -64,14 +74,64 @@ private:
         // step state
         enum class StepState { Pending, Running, Completed, Skipped, Failed };
         struct StepRun {
+            enum class CompletionPhase { Idle, Capturing, DrainingToTarget, Finalizing, Completed };
+            struct CameraCoverageRun {
+                bool enabled = false;
+                std::chrono::system_clock::time_point anchorUtc{};
+                std::chrono::system_clock::time_point targetEndUtc{};
+                std::string anchorUtcIso;
+                std::string targetEndUtcIso;
+                std::string coveredUntilUtcIso;
+                std::string latestCapturedUtcIso;
+                std::string firstGapStartUtcIso;
+                long long coverageGapSeconds = 0;
+                bool complete = false;
+                bool hasAnalysisAnchor = false;
+                std::chrono::system_clock::time_point analysisAnchorUtc{};
+                bool hasAnalysisFrontier = false;
+                std::chrono::system_clock::time_point analysisFrontierUtc{};
+                std::string analysisAnchorUtcIso;
+                std::string analysisFrontierUtcIso;
+                long long analysisLagSeconds = 0;
+                bool analysisComplete = false;
+                std::string analysisStatus = "not_applicable";
+                contentcoverage::Tracker tracker;
+            };
+
             JobStepDef def;
             StepState state = StepState::Pending;
             std::chrono::steady_clock::time_point startedAt;
+            std::chrono::steady_clock::time_point captureDeadline;
             std::chrono::steady_clock::time_point deadline;
+            std::chrono::steady_clock::time_point hardStopDeadline;
+            std::chrono::system_clock::time_point startedAtSystemUtc;
+            std::chrono::system_clock::time_point captureDeadlineUtc;
+            std::chrono::system_clock::time_point hardStopDeadlineUtc;
+            std::chrono::system_clock::time_point requiredCompletionEndUtc;
+            std::chrono::system_clock::time_point analysisTargetEndUtc;
+            int configuredAnalysisDurationSeconds = 0;
+            int configuredAnalysisHardStopSeconds = 0;
             std::atomic<bool> cancel{ false };
             std::atomic<bool> timeoutRequested{ false };
             std::vector<std::thread> workers; // one per target camera
             std::string injectedInput;
+            bool coverageDriven = false;
+            bool coverageIncomplete = false;
+            bool analysisDriven = false;
+            bool analysisTargetPendingAnchor = false;
+            bool analysisTargetResolvedFromAnchor = false;
+            bool analysisTargetClampedToFirstDue = false;
+            std::atomic<CompletionPhase> completionPhase{ CompletionPhase::Idle };
+            std::string startedAtSystemUtcIso;
+            std::string captureDeadlineUtcIso;
+            std::string hardStopDeadlineUtcIso;
+            std::string requiredCompletionEndUtcIso;
+            std::string analysisTargetEndUtcIso;
+            std::string earliestFirstDueUtcIso;
+            std::string analysisTargetSource = "step_timeout";
+            std::string analysisCompletionMode = "legacy_deadline";
+            std::mutex coverageMu;
+            std::unordered_map<int, CameraCoverageRun> coverageByCamera;
         };
         std::unordered_map<int, StepRun> stepRuns; // step_id -> runtime
     };
@@ -123,7 +183,9 @@ private:
         const std::string& alertConditionText, const std::string& startConditionText,
         const std::string& modelTier, const std::string& jobRunId,
         const std::string& stepRunId, const std::string& agentRunId,
-        int timeoutSeconds, std::atomic<bool>& cancel);
+        int timeoutSeconds, std::atomic<bool>& cancel,
+        const std::string& coverageCutoffUtcIso = std::string(),
+        JobInstance::InferenceMediaInfo* outMediaInfo = nullptr);
     std::string maybeEmitFinalTemporalReportOnTimeout_(
         int jobId,
         int stepId,
@@ -132,7 +194,9 @@ private:
         const std::string& alertConditionText,
         const std::string& jobRunId,
         const std::string& stepRunId,
-        const std::string& agentRunId);
+        const std::string& agentRunId,
+        const std::string& evaluationNowIsoUtc,
+        const json* coverageDetails = nullptr);
     //void maybeFireAlerts_(const JobStartPayload& payload, const JobStepDef& step, int cameraId, const std::string& inferenceOutput);
 
     void maybeFireAlerts_(

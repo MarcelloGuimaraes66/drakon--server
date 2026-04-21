@@ -95,6 +95,13 @@
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <VcpkgInstalledDir>C:\dev\vcpkg</VcpkgInstalledDir>
   </PropertyGroup>
+  <PropertyGroup>
+    <PostgreSqlRoot Condition="'$(PostgreSqlRoot)'==''">C:\Program Files\PostgreSQL\17\</PostgreSqlRoot>
+    <VcpkgLibraryRoot Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(VcpkgInstalledDir)\installed\x64-windows\debug\lib\</VcpkgLibraryRoot>
+    <VcpkgLibraryRoot Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(VcpkgInstalledDir)\installed\x64-windows\lib\</VcpkgLibraryRoot>
+    <CurlImportLibrary Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">libcurl-d.lib</CurlImportLibrary>
+    <CurlImportLibrary Condition="'$(Configuration)|$(Platform)'=='Release|x64'">libcurl.lib</CurlImportLibrary>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -146,8 +153,8 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world4110.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110d.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -167,8 +174,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\libs\opencv-4.11.0\build\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world4110.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4110.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -188,9 +195,11 @@
     <ClInclude Include="comm\PgClient.h" />
     <ClInclude Include="comm\TelegramNotifier.h" />
     <ClInclude Include="comm\TelegramSettings.h" />
+    <ClInclude Include="core\AnalysisRegionGeometry.h" />
     <ClInclude Include="core\AgentCore.h" />
     <ClInclude Include="core\Localization.h" />
     <ClInclude Include="core\TemporalEngine.h" />
+    <ClInclude Include="core\VideoPolygonOverlayRenderer.h" />
     <ClInclude Include="framework.h" />
     <ClInclude Include="jobs\JobPayloadParser.h" />
     <ClInclude Include="jobs\JobRuntime.h" />
@@ -225,6 +234,10 @@
     <ClInclude Include="orchestrator\skills\shared\AgentAuthoringShared.h" />
     <ClInclude Include="orchestrator\skills\shared\JobBlueprintShared.h" />
     <ClInclude Include="orchestrator\skills\VideoSearchSkill.h" />
+    <ClInclude Include="platform\platform_common.h" />
+    <ClInclude Include="platform\platform_process.h" />
+    <ClInclude Include="platform\platform_secure_store.h" />
+    <ClInclude Include="platform\platform_shutdown.h" />
     <ClInclude Include="runtime\BrandingRuntime.h" />
     <ClInclude Include="Perceptrum.h" />
     <ClInclude Include="Resource.h" />
@@ -242,7 +255,9 @@
     <ClCompile Include="comm\SecureLocalStore.cpp" />
     <ClCompile Include="comm\TelegramNotifier.cpp" />
     <ClCompile Include="comm\TelegramNotifierSendVideo.cpp" />
+    <ClCompile Include="core\AnalysisRegionGeometry.cpp" />
     <ClCompile Include="core\AgentCore.cpp" />
+    <ClCompile Include="core\VideoPolygonOverlayRenderer.cpp" />
     <ClCompile Include="jobs\JobPayloadParser.cpp" />
     <ClCompile Include="jobs\JobRuntime.cpp" />
     <ClCompile Include="logging\Logging.cpp" />
@@ -274,6 +289,10 @@
     <ClCompile Include="orchestrator\skills\shared\AgentAuthoringShared.cpp" />
     <ClCompile Include="orchestrator\skills\shared\JobBlueprintShared.cpp" />
     <ClCompile Include="orchestrator\skills\VideoSearchSkill.cpp" />
+    <ClCompile Include="platform\platform_common.cpp" />
+    <ClCompile Include="platform\platform_process.cpp" />
+    <ClCompile Include="platform\platform_secure_store.cpp" />
+    <ClCompile Include="platform\platform_shutdown.cpp" />
     <ClCompile Include="runtime\BrandingRuntime.cpp" />
     <ClCompile Include="Perceptrum.cpp" />
   </ItemGroup>

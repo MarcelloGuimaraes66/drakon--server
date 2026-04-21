@@ -18,6 +18,8 @@ export interface Camera {
   last_thumbnail_update?: string | null;
   is_service_running?: number;
   is_online?: number;
+  connection_issue_kind?: string | null;
+  connection_issue_reason?: string | null;
   [key: string]: any; // Allow other camera properties
 }
 
@@ -149,6 +151,31 @@ export interface DashboardPayload {
       camera_name: string | null;
     }>;
   }>>;
+  desktopRuntime?: {
+    pairing?: {
+      status?: "connected" | "not_connected";
+      effective_status?: "connected" | "stale" | "not_connected";
+      chat_effective_status?: "connected" | "stale" | "not_connected";
+      is_available_for_chat?: boolean;
+      is_heartbeat_fresh?: boolean;
+      client_id?: string | null;
+      exe_id?: string | null;
+      paired_at?: string | null;
+      last_seen_at?: string | null;
+      last_seen_age_seconds?: number | null;
+    };
+    process?: {
+      client_id?: string | null;
+      exe_id?: string | null;
+      active_cameras?: number | null;
+      unique_streams?: number | null;
+      sample_age_ms?: number | null;
+      sampled_at?: string | null;
+      updated_at?: string | null;
+    } | null;
+    camera_connection_issue_kind?: string | null;
+    camera_connection_issue_reason?: string | null;
+  };
   etagHints?: {
     camerasUpdatedAtMax: number;
     camerasCount: number;

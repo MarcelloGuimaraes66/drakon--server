@@ -1,7 +1,5 @@
 #include "HeadlessService.h"
 
-#include <windows.h>
-
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -11,12 +9,18 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "../comm/BackendConfig.h"
 #include "../comm/PairingClient.h"
 #include "../core/AgentCore.h"
 #include "../logging/Logging.h"
+#include "../platform/platform_shutdown.h"
 
 namespace {
+#ifdef _WIN32
 LONG WINAPI TopLevelExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {
     const DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
     Logger::instance().logDebug(
@@ -29,25 +33,19 @@ LONG WINAPI TopLevelExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {
         }(code));
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-HANDLE OpenShutdownEvent(const std::wstring& name) {
-    if (name.empty()) {
-        return nullptr;
-    }
-
-    return OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
-}
+#endif
 }
 
 namespace PerceptrumCore {
 int RunHeadlessService(const HeadlessServiceOptions& options) {
+#ifdef _WIN32
     SetUnhandledExceptionFilter(TopLevelExceptionFilter);
+#endif
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
     Logger::instance().logDebug("agent", "HeadlessService: starting");
 
-    HANDLE shutdownEvent = OpenShutdownEvent(options.shutdownEventName);
-    std::unique_ptr<void, decltype(&CloseHandle)> shutdownGuard(shutdownEvent, &CloseHandle);
+    perceptrum::platform::ShutdownSignal shutdownSignal(options.shutdownEventName);
 
     std::unique_ptr<AgentCore> agent;
     std::string currentBaseUrl;
@@ -56,13 +54,8 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
     bool waitingForPairingLogged = false;
 
     while (true) {
-        if (shutdownEvent != nullptr) {
-            const DWORD waitResult = WaitForSingleObject(shutdownEvent, 1000);
-            if (waitResult == WAIT_OBJECT_0) {
-                break;
-            }
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        if (shutdownSignal.WaitFor(std::chrono::milliseconds(1000))) {
+            break;
         }
 
         const std::string baseUrl = GetPerceptrumBaseUrl();

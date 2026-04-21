@@ -2,11 +2,19 @@
 #include "AppRuntimeConfig.h"
 
 #include <Windows.h>
+#include <iphlpapi.h>
 #include <shellapi.h>
 
 #include <mutex>
+#include <random>
+#include <unordered_set>
+#include <vector>
+
+#include <platform/platform_common.h>
 
 #include "generated\\Branding.h"
+
+#pragma comment(lib, "Iphlpapi.lib")
 
 namespace
 {
@@ -15,21 +23,7 @@ namespace
 
     std::wstring Utf8ToWide(std::string const& value)
     {
-        if (value.empty())
-        {
-            return {};
-        }
-
-        auto const required = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
-        if (required <= 0)
-        {
-            return std::wstring(value.begin(), value.end());
-        }
-
-        std::wstring wide(static_cast<size_t>(required), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wide.data(), required);
-        wide.resize(static_cast<size_t>(required) - 1);
-        return wide;
+        return perceptrum::platform::Utf8ToWide(value);
     }
 
     std::wstring TrimCopy(std::wstring value)
@@ -66,26 +60,12 @@ namespace
 
     std::filesystem::path SearchExecutablePath(wchar_t const* executableName)
     {
-        wchar_t buffer[MAX_PATH]{};
-        auto const written = SearchPathW(nullptr, executableName, nullptr, static_cast<DWORD>(std::size(buffer)), buffer, nullptr);
-        if (written == 0 || written >= std::size(buffer))
-        {
-            return std::filesystem::path(executableName);
-        }
-
-        return std::filesystem::path(buffer);
+        return perceptrum::platform::SearchExecutableInPath(std::filesystem::path(executableName));
     }
 
     std::filesystem::path ResolveExecutablePath()
     {
-        wchar_t buffer[MAX_PATH]{};
-        auto const written = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
-        if (written == 0)
-        {
-            return {};
-        }
-
-        return std::filesystem::path(buffer);
+        return perceptrum::platform::GetExecutablePath();
     }
 
     std::filesystem::path FirstExistingPath(std::initializer_list<std::filesystem::path> candidates)
@@ -111,13 +91,111 @@ namespace
         return {};
     }
 
-    void ParseCommandLine(DrakonDesktop::platform::AppRuntimeConfig& config)
+    bool TryParsePortValue(std::wstring const& value, std::uint16_t& port)
     {
+        auto const trimmed = TrimCopy(value);
+        if (trimmed.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            auto const parsed = std::stoul(trimmed);
+            if (parsed == 0 || parsed > 65535UL)
+            {
+                return false;
+            }
+
+            port = static_cast<std::uint16_t>(parsed);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    std::uint16_t NetworkPortToHostPort(DWORD portValue)
+    {
+        auto const networkPort = static_cast<std::uint16_t>(portValue & 0xFFFF);
+        return static_cast<std::uint16_t>((networkPort >> 8) | (networkPort << 8));
+    }
+
+    std::unordered_set<std::uint16_t> ReadOccupiedTcpPorts()
+    {
+        std::unordered_set<std::uint16_t> ports;
+        DWORD tableBytes = 0;
+        auto status = GetTcpTable(nullptr, &tableBytes, FALSE);
+        if (status != ERROR_INSUFFICIENT_BUFFER || tableBytes == 0)
+        {
+            return ports;
+        }
+
+        std::vector<unsigned char> buffer(tableBytes);
+        auto* table = reinterpret_cast<PMIB_TCPTABLE>(buffer.data());
+        status = GetTcpTable(table, &tableBytes, FALSE);
+        if (status != NO_ERROR)
+        {
+            return ports;
+        }
+
+        for (DWORD index = 0; index < table->dwNumEntries; ++index)
+        {
+            auto const port = NetworkPortToHostPort(table->table[index].dwLocalPort);
+            if (port != 0)
+            {
+                ports.insert(port);
+            }
+        }
+
+        return ports;
+    }
+
+    std::uint16_t ChooseDesktopBackendPort()
+    {
+        auto const occupiedPorts = ReadOccupiedTcpPorts();
+        constexpr std::uint16_t kDynamicPortStart = 49152;
+        constexpr std::uint16_t kDynamicPortEnd = 65535;
+
+        std::random_device randomDevice;
+        auto seed = static_cast<std::uint32_t>(GetCurrentProcessId() ^ GetTickCount());
+        for (int index = 0; index < 4; ++index)
+        {
+            seed ^= static_cast<std::uint32_t>(randomDevice()) << (index % 2 == 0 ? 0 : 1);
+        }
+
+        std::mt19937 generator(seed);
+        std::uniform_int_distribution<std::uint32_t> distribution(kDynamicPortStart, kDynamicPortEnd);
+        for (int attempt = 0; attempt < 64; ++attempt)
+        {
+            auto const candidate = static_cast<std::uint16_t>(distribution(generator));
+            if (occupiedPorts.find(candidate) == occupiedPorts.end())
+            {
+                return candidate;
+            }
+        }
+
+        for (std::uint32_t candidate = kDynamicPortStart; candidate <= kDynamicPortEnd; ++candidate)
+        {
+            auto const narrowedCandidate = static_cast<std::uint16_t>(candidate);
+            if (occupiedPorts.find(narrowedCandidate) == occupiedPorts.end())
+            {
+                return narrowedCandidate;
+            }
+        }
+
+        return 4000;
+    }
+
+    bool ParseCommandLine(DrakonDesktop::platform::AppRuntimeConfig& config)
+    {
+        bool portExplicitlyConfigured = false;
         int argc = 0;
         auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         if (!argv)
         {
-            return;
+            return false;
         }
 
         std::unique_ptr<wchar_t*, decltype(&LocalFree)> argvGuard(argv, &LocalFree);
@@ -129,26 +207,18 @@ namespace
             if (token == L"--port" && index + 1 < argc)
             {
                 value = argv[++index];
-                try
+                if (TryParsePortValue(value, config.port))
                 {
-                    config.port = static_cast<std::uint16_t>(std::stoi(value));
-                }
-                catch (...)
-                {
-                    config.port = 4000;
+                    portExplicitlyConfigured = true;
                 }
                 continue;
             }
 
             if (!(value = ExtractArgValue(token, L"port")).empty())
             {
-                try
+                if (TryParsePortValue(value, config.port))
                 {
-                    config.port = static_cast<std::uint16_t>(std::stoi(value));
-                }
-                catch (...)
-                {
-                    config.port = 4000;
+                    portExplicitlyConfigured = true;
                 }
                 continue;
             }
@@ -178,6 +248,8 @@ namespace
                 continue;
             }
         }
+
+        return portExplicitlyConfigured;
     }
 
     std::filesystem::path ResolveLocalAppDataRoot()
@@ -208,7 +280,12 @@ namespace
         config.trayIconGuidValid =
             CLSIDFromString(AppBrand::kTrayIconGuidW, &config.trayIconGuid) == NOERROR;
 
-        ParseCommandLine(config);
+        auto const portExplicitlyConfigured = ParseCommandLine(config);
+        if (!portExplicitlyConfigured && !config.internalServiceMode)
+        {
+            // Use a random high port by default so the local desktop backend does not keep colliding on :4000.
+            config.port = ChooseDesktopBackendPort();
+        }
 
         auto const envWorkspaceRoot = ReadEnvValue(L"DRAKON_WORKSPACE_ROOT");
         config.workspaceRoot = FirstExistingPath({

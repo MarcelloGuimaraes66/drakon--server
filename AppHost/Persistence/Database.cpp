@@ -1,7 +1,6 @@
 #include "pch.h"
 #include "Database.h"
 
-#include <windows.h>
 #include <winsqlite/winsqlite3.h>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -15,6 +14,8 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <platform/platform_common.h>
+
 using json = nlohmann::json;
 
 namespace
@@ -25,6 +26,8 @@ namespace
     {
         std::string brandId{ "drakon" };
         std::string dataRootWindows;
+        std::string dataRootMacOS;
+        std::string dataRootLinux;
     };
 
     std::string TrimAscii(std::string value)
@@ -52,16 +55,7 @@ namespace
 
     std::string ReadEnvVar(char const* name)
     {
-        char* buffer = nullptr;
-        size_t length = 0;
-        if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr)
-        {
-            return {};
-        }
-
-        std::string value(buffer);
-        free(buffer);
-        return TrimAscii(std::move(value));
+        return perceptrum::platform::ReadEnvVar(name);
     }
 
     std::string ReadTextFileTrimmed(std::filesystem::path const& path)
@@ -79,20 +73,20 @@ namespace
 
     std::string WideToUtf8(std::wstring const& value)
     {
-        if (value.empty())
-        {
-            return {};
-        }
+        return perceptrum::platform::WideToUtf8(value);
+    }
 
-        auto const size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-        if (size <= 0)
-        {
-            return {};
-        }
-
-        std::string result(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
-        return result;
+    std::string ResolveBrandDataRoot(BrandConfigData const& data)
+    {
+#ifdef _WIN32
+        return data.dataRootWindows;
+#elif defined(__APPLE__)
+        return data.dataRootMacOS;
+#elif defined(__linux__)
+        return data.dataRootLinux;
+#else
+        return {};
+#endif
     }
 
     std::string EscapeConninfoValue(std::string value)
@@ -216,6 +210,8 @@ namespace
                     if (brands.contains(data.brandId) && brands[data.brandId].is_object())
                     {
                         data.dataRootWindows = TrimAscii(brands[data.brandId].value("dataRootWindows", std::string{}));
+                        data.dataRootMacOS = TrimAscii(brands[data.brandId].value("dataRootMacOS", std::string{}));
+                        data.dataRootLinux = TrimAscii(brands[data.brandId].value("dataRootLinux", std::string{}));
                     }
                 }
             }
@@ -940,9 +936,19 @@ namespace DrakonDesktop::persistence
         {
             config.sqlitePath = std::filesystem::path(sqliteOverride);
         }
-        else if (config.brandId == "perceptrum" && !brandData.dataRootWindows.empty())
+        else if (config.brandId == "perceptrum")
         {
-            config.sqlitePath = std::filesystem::path(brandData.dataRootWindows) / "local-site" / (config.brandId + "_site.sqlite");
+            const std::string brandDataRoot = ResolveBrandDataRoot(brandData);
+            if (!brandDataRoot.empty())
+            {
+                config.sqlitePath = perceptrum::platform::ExpandUserPath(std::filesystem::path(brandDataRoot))
+                    / "local-site"
+                    / (config.brandId + "_site.sqlite");
+            }
+            else
+            {
+                config.sqlitePath = config.workspaceRoot / "DrakonSite" / "storage" / "sqlite" / "local-site" / (config.brandId + "_site.sqlite");
+            }
         }
         else
         {

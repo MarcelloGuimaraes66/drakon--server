@@ -413,6 +413,7 @@ private:
     void handleAgentDesignCommand_(int commandId, const nlohmann::json& payload);
     void handleRefreshThumbnailCommand_(int commandId, const nlohmann::json& payload);
     void handleCameraImportPreviewCommand_(int commandId, const nlohmann::json& payload);
+    void handleTemporalRecompileCommand_(int commandId, const nlohmann::json& payload);
     void handleProbeWebcamsCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindStartCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindCancelCommand_(int commandId, const nlohmann::json& payload);
@@ -617,7 +618,8 @@ private:
         const std::string& geminiApiKey,
         int& outPromptTokens,
         int& outOutputTokens,
-        int& outTotalTokens);
+        int& outTotalTokens,
+        int requestTimeoutSeconds = 0);
 
     VideoHit callOpenAIVisionVideoSegment_(
         const EncodedVideoSegment& segment,
@@ -637,7 +639,8 @@ private:
         int& outOutputTokens,
         int& outTotalTokens,
         bool requestCoreChatPriority = false,
-        const std::function<bool()>& shouldAbort = {});
+        const std::function<bool()>& shouldAbort = {},
+        int requestTimeoutSeconds = 0);
 
 
 

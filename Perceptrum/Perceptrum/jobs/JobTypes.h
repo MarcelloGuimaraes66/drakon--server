@@ -149,6 +149,12 @@ struct JobStepDef {
     std::string name;
 
     int timeout_seconds = 0;
+    // "legacy_deadline" | "drain_to_analysis_target"
+    std::string analysis_completion_mode;
+    // Optional explicit semantic end for analyzed content (ISO UTC).
+    std::string analysis_target_end_utc;
+    // Optional extra drain budget after capture stops.
+    int analysis_hard_stop_seconds = 0;
 
     std::optional<int> input_from_step_id;
     std::string input_inject_key;
@@ -239,6 +245,8 @@ struct JobTriggerSnapshot {
 struct JobStartPayload {
     int version = 1;
     std::string job_run_id;
+    // Optional global semantic end for the overall execution (ISO UTC).
+    std::string execution_target_end_utc;
     JobDefSnapshot job;
     JobTriggerSnapshot trigger;
     std::vector<JobStepDef> steps;

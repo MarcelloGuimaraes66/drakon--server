@@ -51,6 +51,8 @@ struct AlgorithmConfig {
         bool enabled = true;
         bool fullFrame = true;
         std::vector<AnalysisRegionPoint> polygonNorm;
+        int drawRefWidth = 1920;
+        int drawRefHeight = 1080;
         FrameWindowNorm frameWindowNorm;
     };
 

@@ -8,13 +8,11 @@
 #include "SecureLocalStore.h"
 
 #include <ctime>
-#include <cstdlib>
-#include <cstdio>
-#include <iomanip>
-#include <sstream>
-#include <unordered_map>
 #include <algorithm>
 #include <cctype>
+
+#include "../platform/platform_common.h"
+#include "../platform/platform_secure_store.h"
 
 using json = nlohmann::json;
 
@@ -35,95 +33,12 @@ static std::string TrimAscii(const std::string& input) {
     return input.substr(start, end - start);
 }
 
-static std::string ReadEnvVarLocal(const char* name) {
-    char* buf = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
-        return "";
-    }
-
-    std::string out(buf);
-    free(buf);
-    return out;
-}
-
 static bool LooksLikeProtectedBlob(const std::string& input) {
-    const std::string value = TrimAscii(input);
-    if (value.size() < 32 || value.rfind("AQAAANCM", 0) != 0) {
-        return false;
-    }
-
-    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-        return std::isalnum(ch) || ch == '+' || ch == '/' || ch == '=';
-    });
-}
-
-static std::string DetectWindowsTimezoneKeyViaTzutil() {
-    std::string output;
-#if defined(_WIN32)
-    FILE* pipe = _popen("tzutil /g", "r");
-    if (!pipe) return "";
-
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        output += buffer;
-    }
-    _pclose(pipe);
-#endif
-    return TrimAscii(output);
-}
-
-static std::string MapWindowsTimezoneToIana(const std::string& windowsKey) {
-    if (windowsKey.empty()) return "";
-
-    static const std::unordered_map<std::string, std::string> kMap = {
-        { "E. South America Standard Time", "America/Sao_Paulo" },
-        { "Bahia Standard Time", "America/Bahia" },
-        { "SA Eastern Standard Time", "America/Manaus" },
-        { "SA Western Standard Time", "America/Manaus" },
-        { "Central Brazilian Standard Time", "America/Cuiaba" },
-    };
-
-    const auto it = kMap.find(windowsKey);
-    if (it != kMap.end()) {
-        return it->second;
-    }
-    return "";
-}
-
-static std::string DetectUtcOffsetTimezone() {
-    std::time_t now = std::time(nullptr);
-    std::tm localTm{};
-    std::tm utcTm{};
-    localtime_s(&localTm, &now);
-    gmtime_s(&utcTm, &now);
-
-    // mktime interprets tm as local time. Using UTC tm here yields local offset.
-    std::time_t localEpoch = std::mktime(&localTm);
-    std::time_t utcAsLocalEpoch = std::mktime(&utcTm);
-    long offsetSeconds = static_cast<long>(std::difftime(localEpoch, utcAsLocalEpoch));
-
-    const char sign = offsetSeconds >= 0 ? '+' : '-';
-    const long absSeconds = std::labs(offsetSeconds);
-    const int hours = static_cast<int>(absSeconds / 3600);
-    const int minutes = static_cast<int>((absSeconds % 3600) / 60);
-
-    std::ostringstream out;
-    out << "UTC" << sign << hours;
-    if (minutes > 0) {
-        out << ":" << std::setw(2) << std::setfill('0') << minutes;
-    }
-    return out.str();
+    return perceptrum::platform::IsWindowsProtectedBlob(TrimAscii(input));
 }
 
 static std::string DetectMachineTimezoneForPairing() {
-    const std::string windowsKey = DetectWindowsTimezoneKeyViaTzutil();
-    const std::string iana = MapWindowsTimezoneToIana(windowsKey);
-    if (!iana.empty()) {
-        return iana;
-    }
-
-    return DetectUtcOffsetTimezone();
+    return perceptrum::platform::DetectLocalTimezoneIana();
 }
 
 static constexpr const char* kPairedTimezoneFilename = "paired_timezone.txt";
@@ -142,10 +57,14 @@ PairingClient::PairingClient(const std::string& baseUrl)
 
 // simple loadSavedToken implementation (use what you already have if it's different)
 bool PairingClient::loadSavedToken(std::string& exeTokenOut, std::string& clientIdOut) {
-    const std::string provisionedExeToken = TrimAscii(ReadEnvVarLocal(kProvisionedExeTokenEnv));
-    const std::string provisionedClientId = TrimAscii(ReadEnvVarLocal(kProvisionedClientIdEnv));
-    const std::string provisionedExeId = TrimAscii(ReadEnvVarLocal(kProvisionedExeIdEnv));
-    const std::string provisionedTimezone = TrimAscii(ReadEnvVarLocal(kProvisionedTimezoneEnv));
+    const std::string provisionedExeToken =
+        TrimAscii(perceptrum::platform::ReadEnvVar(kProvisionedExeTokenEnv));
+    const std::string provisionedClientId =
+        TrimAscii(perceptrum::platform::ReadEnvVar(kProvisionedClientIdEnv));
+    const std::string provisionedExeId =
+        TrimAscii(perceptrum::platform::ReadEnvVar(kProvisionedExeIdEnv));
+    const std::string provisionedTimezone =
+        TrimAscii(perceptrum::platform::ReadEnvVar(kProvisionedTimezoneEnv));
     if (!provisionedExeToken.empty() && !provisionedClientId.empty()) {
         if (LooksLikeProtectedBlob(provisionedExeToken) || LooksLikeProtectedBlob(provisionedClientId)) {
             Logger::instance().logDebug(

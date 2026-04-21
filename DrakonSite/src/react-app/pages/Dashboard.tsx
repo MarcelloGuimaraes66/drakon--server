@@ -1630,6 +1630,7 @@ function DashboardContent() {
                       const isStoppingCamera = stoppingCameras.has(camera.id);
                       const connectionState = getCameraConnectionState(camera);
                       const isOnline = connectionState === "online";
+                      const isAuthLost = connectionState === "auth_lost";
                       const isReconnecting = connectionState === "reconnecting";
 
                       return (
@@ -1659,6 +1660,8 @@ function DashboardContent() {
                                     className={`px-2 py-0.5 text-xs rounded-full ${
                                       isOnline
                                         ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                                        : isAuthLost
+                                        ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
                                         : isReconnecting
                                         ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                                         : "bg-red-500/20 text-red-400 border border-red-500/30"
@@ -1666,6 +1669,8 @@ function DashboardContent() {
                                   >
                                     {isOnline
                                       ? t("dashboard.online")
+                                      : isAuthLost
+                                      ? "Pairing/Auth lost"
                                       : isReconnecting
                                       ? "Reconnecting"
                                       : t("dashboard.offline")}
@@ -2609,6 +2614,7 @@ function DashboardContent() {
                 const connectionState = getCameraConnectionState(camera);
                 const isRunning = isCameraServiceRunning(camera);
                 const isOnline = connectionState === "online";
+                const isAuthLost = connectionState === "auth_lost";
                 const isReconnecting = connectionState === "reconnecting";
 
                 return (
@@ -2625,6 +2631,8 @@ function DashboardContent() {
                               className={`px-2 py-0.5 text-xs rounded-full ${
                                 isOnline
                                   ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                                  : isAuthLost
+                                  ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
                                   : isReconnecting
                                   ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                                   : "bg-red-500/20 text-red-400 border border-red-500/30"
@@ -2632,6 +2640,8 @@ function DashboardContent() {
                             >
                               {isOnline
                                 ? t("dashboard.online")
+                                : isAuthLost
+                                ? "Pairing/Auth lost"
                                 : isReconnecting
                                 ? "Reconnecting"
                                 : t("dashboard.offline")}

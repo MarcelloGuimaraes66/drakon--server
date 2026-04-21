@@ -1142,10 +1142,19 @@ inline std::string computePromptHash(
 
 inline std::string computePromptRevisionHash(
     const std::string& promptCore,
-    const std::string& alertCondition)
+    const std::string& alertCondition,
+    const std::string& negativeCondition = std::string(),
+    const std::string& inputType = std::string(),
+    const std::string& language = std::string(),
+    bool useTemporalContext = true)
 {
     std::ostringstream oss;
-    oss << trim(promptCore) << "\n---\n" << trim(alertCondition);
+    oss << trim(promptCore) << "\n---\n"
+        << trim(alertCondition) << "\n---\n"
+        << trim(negativeCondition) << "\n---\n"
+        << lower(trim(inputType)) << "\n---\n"
+        << lower(trim(language)) << "\n---\n"
+        << (useTemporalContext ? "1" : "0");
     return std::string("fnv1a64_") + u64hex(fnv1a64(oss.str()));
 }
 
@@ -1157,6 +1166,72 @@ inline bool promptCoreAndAlertMatch(
 {
     return trim(lhsPromptCore) == trim(rhsPromptCore) &&
            trim(lhsAlertCondition) == trim(rhsAlertCondition);
+}
+
+inline bool promptFingerprintMatches(
+    const json& fingerprint,
+    const std::string& promptCore,
+    const std::string& alertCondition,
+    const std::string& negativeCondition = std::string(),
+    const std::string& inputType = std::string(),
+    const std::string& language = std::string(),
+    const std::optional<bool>& useTemporalContext = std::nullopt)
+{
+    if (!fingerprint.is_object()) return false;
+
+    if (trim(strField(fingerprint, "prompt_core", std::string())) != trim(promptCore)) {
+        return false;
+    }
+    if (trim(strField(fingerprint, "alert_condition", std::string())) != trim(alertCondition)) {
+        return false;
+    }
+
+    const bool compareNegativeCondition =
+        fingerprint.contains("negative_condition") || !trim(negativeCondition).empty();
+    if (compareNegativeCondition &&
+        trim(strField(fingerprint, "negative_condition", std::string())) != trim(negativeCondition))
+    {
+        return false;
+    }
+
+    const bool compareInputType =
+        fingerprint.contains("input_type") || !trim(inputType).empty();
+    if (compareInputType &&
+        lower(trim(strField(fingerprint, "input_type", std::string()))) != lower(trim(inputType)))
+    {
+        return false;
+    }
+
+    const bool compareLanguage =
+        fingerprint.contains("language") || !trim(language).empty();
+    if (compareLanguage &&
+        lower(trim(strField(fingerprint, "language", std::string()))) != lower(trim(language)))
+    {
+        return false;
+    }
+
+    if (useTemporalContext.has_value()) {
+        bool actualUseTemporalContext = true;
+        if (fingerprint.contains("use_temporal_context")) {
+            const json& raw = fingerprint["use_temporal_context"];
+            if (raw.is_boolean()) {
+                actualUseTemporalContext = raw.get<bool>();
+            }
+            else if (raw.is_number_integer()) {
+                actualUseTemporalContext = raw.get<int>() != 0;
+            }
+            else if (raw.is_string()) {
+                const std::string normalized = lower(trim(raw.get<std::string>()));
+                actualUseTemporalContext =
+                    !(normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off");
+            }
+        }
+        if (actualUseTemporalContext != *useTemporalContext) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 inline bool parseIso(const std::string& raw, std::chrono::system_clock::time_point& out) {
@@ -2751,7 +2826,11 @@ inline json effectivePlan(const json& envelope) {
 inline bool planMatchesPromptRevision(
     const json& envelope,
     const std::string& promptCore,
-    const std::string& alertCondition)
+    const std::string& alertCondition,
+    const std::string& negativeCondition = std::string(),
+    const std::string& inputType = std::string(),
+    const std::string& language = std::string(),
+    const std::optional<bool>& useTemporalContext = std::nullopt)
 {
     json fp = json::object();
     if (envelope.is_object() &&
@@ -2764,11 +2843,14 @@ inline bool planMatchesPromptRevision(
         if (!plan.is_object()) return false;
         fp = plan.value("prompt_fingerprint", json::object());
     }
-    return promptCoreAndAlertMatch(
-        strField(fp, "prompt_core"),
-        strField(fp, "alert_condition"),
+    return promptFingerprintMatches(
+        fp,
         promptCore,
-        alertCondition
+        alertCondition,
+        negativeCondition,
+        inputType,
+        language,
+        useTemporalContext
     );
 }
 
@@ -2777,14 +2859,16 @@ inline json makePromptFingerprint(
     const std::string& alertCondition,
     const std::string& negativeCondition,
     const std::string& inputType,
-    const std::string& language)
+    const std::string& language,
+    bool useTemporalContext = true)
 {
     return json{
         { "prompt_core", promptCore },
         { "alert_condition", alertCondition },
         { "negative_condition", negativeCondition },
         { "input_type", inputType },
-        { "language", language }
+        { "language", language },
+        { "use_temporal_context", useTemporalContext }
     };
 }
 
@@ -3719,6 +3803,8 @@ You are TemporalPlanCompiler v1.
 - operators MUST use the field name "type" exactly, never "operator_type".
 - Use "operator_id" for operator identifier; do not use "operator_key" in plan_json.
 - If user intent needs unsupported operator, set compile_status="unsupported".
+- Before declaring a request unsupported, first check whether the scene semantics can be represented as one or more custom atomic events in event_catalog plus an existing temporal operator over those events.
+- If the temporal need is windowing, checkpointing, accumulation, delayed reporting or alerting, and the scene logic is still visually observable, prefer inventing a precise atomic event name in event_catalog and then using count_events_in_window or analyze_events_at_interval over that event.
 - Treat INPUT_JSON.operator_selection_hints as semantic guidance and multilingual cues. They are hints, not deterministic rules.
 
 2) Operator dictionary (semantic + params + example)
@@ -3768,6 +3854,7 @@ You are TemporalPlanCompiler v1.
     once after 30 minutes -> schedule={mode:"once", anchor_mode:"monitoring_start", interval_seconds:1800}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
     every 10 minutes on the last 10 minutes -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"bucket", window_seconds:600}
     every 10 minutes with accumulated partials over a 30-minute horizon -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:600}, analysis={window_mode:"cumulative_from_anchor", window_seconds:1800}
+    every 2 minutes report total valid_traversal_porta_f_corredor_para_camera in the last 2 minutes -> schedule={mode:"recurring", anchor_mode:"monitoring_start", interval_seconds:120}, source={event:"valid_traversal_porta_f_corredor_para_camera", entity:"person", zone:"porta_f"}, analysis={kind:"count_occurrences", window_mode:"bucket", window_seconds:120}
     once at 16:30 local -> schedule={mode:"once", anchor_mode:"fixed_time_local", time_local:"16:30", timezone:INPUT_JSON.execution_context.fixed_time_timezone_hint}
     once on 2026-09-15 at 16:30 local -> schedule={mode:"once", anchor_mode:"fixed_time_local", date_local:"2026-09-15", time_local:"16:30", timezone:INPUT_JSON.execution_context.fixed_time_timezone_hint}
   forbidden_aliases:
@@ -3786,6 +3873,7 @@ You are TemporalPlanCompiler v1.
 - If the user wants confirmed-event analysis at a fixed local time or a fixed local date+time, use analyze_events_at_interval, not schedule_at_time.
 - Use schedule_at_time only for pure scheduling or reminder semantics without confirmed-event analysis.
 - For analyze_events_at_interval, infer checkpoint behavior semantically from the whole multilingual request, not by copying literal words. Use canonical enum values only.
+- analyze_events_at_interval does NOT need the operator itself to encode all scene geometry. If the scene request is "count qualified traversals / qualified exits / directional crossings and only report after X minutes", define an atomic custom event for the qualified traversal and let analyze_events_at_interval aggregate that event history.
 - If the request means a single elapsed checkpoint, emit schedule.mode="once". If it means repeated checkpoints, emit schedule.mode="recurring".
 - If the request gives only a local clock time, emit schedule.anchor_mode="fixed_time_local", normalize time_local to HH:MM, and omit date_local.
 - If the request gives a specific local calendar date and time, emit schedule.anchor_mode="fixed_time_local", normalize date_local to YYYY-MM-DD, and normalize time_local to HH:MM.
@@ -3800,9 +3888,12 @@ You are TemporalPlanCompiler v1.
 - Never return objects inside event_catalog.
 - If event metadata is useful, put it in entities, operators or plan_explain_json, not in event_catalog.
 - Do not create vague events (example: strange_behavior) unless explicitly requested.
+- It is valid to invent precise custom atomic events when the request describes a visually observable qualified scene event, for example qualified_exit_porta_a, valid_traversal_porta_f_corredor_para_camera, or loitering_started_front_gate.
+- Custom event names are preferred over requesting a brand-new operator when the scene logic is specific but still observable from vision.
 - Use entered_zone and left_zone only as events/runtime-variable inputs, never as operator.type.
 - For entry/exit alerts, prefer seen_n_times_in_window_by_entity over event entered_zone/left_zone.
 - analyze_events_at_interval is event-centric: it analyzes confirmed events already stored by the temporal engine, not arbitrary scene state snapshots.
+- Instructions such as "without precise identity", "short memory only", "occlusion tolerant", or "count each completed traversal" do not by themselves require a new operator. They can often be handled by defining a custom observable event, choosing track_identity=false when appropriate, and then counting event occurrences.
 
 4) Runtime variables rules
 - Create only variables needed by operators/output_policy.
@@ -8373,6 +8464,7 @@ struct EvalResult {
     bool hasUnknownOperatorResults = false;
     bool hasActionableAlertOperator = false;
     json operatorResults = json::array();
+    json reportDeliveryMarkers = json::array();
     std::string summary;
 };
 
@@ -8386,6 +8478,133 @@ inline std::string describeLocalAlertFallback(const EvalResult& eval) {
         return "Temporal engine returned only unknown operator results; preserved local alert_condition=true.";
     }
     return "Temporal engine provided no actionable alert operator; preserved local alert_condition=true.";
+}
+
+inline json buildReportDeliveryMarker(const std::string& operatorId,
+                                      const std::string& dueTsUtc,
+                                      const std::string& evaluatedTsUtc,
+                                      bool finalizeOnDelivery) {
+    const std::string normalizedDueTs = normalizeFlexibleTs(dueTsUtc);
+    if (normalizedDueTs.empty()) return json::object();
+
+    json marker = json::object();
+    const std::string trimmedOperatorId = trim(operatorId);
+    if (!trimmedOperatorId.empty()) {
+        marker["operator_id"] = trimmedOperatorId;
+    }
+    marker["due_ts_utc"] = normalizedDueTs;
+
+    const std::string normalizedEvaluatedTs = normalizeFlexibleTs(evaluatedTsUtc);
+    if (!normalizedEvaluatedTs.empty()) {
+        marker["evaluated_ts_utc"] = normalizedEvaluatedTs;
+    }
+    if (finalizeOnDelivery) {
+        marker["finalize_on_delivery"] = true;
+    }
+    return marker;
+}
+
+inline std::string buildReportDeliveryMarkerIdentity(const json& marker) {
+    if (!marker.is_object()) return "";
+    const std::string operatorId = trim(strField(marker, "operator_id"));
+    const std::string dueTsUtc = normalizeFlexibleTs(strField(marker, "due_ts_utc"));
+    if (operatorId.empty() || dueTsUtc.empty()) return "";
+
+    const bool finalizeOnDelivery =
+        marker.contains("finalize_on_delivery") &&
+        marker["finalize_on_delivery"].is_boolean() &&
+        marker["finalize_on_delivery"].get<bool>();
+
+    return operatorId + "|" + dueTsUtc + "|" + (finalizeOnDelivery ? "1" : "0");
+}
+
+inline std::string buildReportDeliveryMarkerFingerprint(const json& markers) {
+    if (!markers.is_array() || markers.empty()) {
+        return "none";
+    }
+
+    std::vector<std::string> identities;
+    identities.reserve(markers.size());
+    for (const auto& marker : markers) {
+        const std::string identity = buildReportDeliveryMarkerIdentity(marker);
+        if (!identity.empty()) {
+            identities.push_back(identity);
+        }
+    }
+    if (identities.empty()) {
+        return "none";
+    }
+
+    std::sort(identities.begin(), identities.end());
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < identities.size(); ++i) {
+        if (i > 0) oss << "\n";
+        oss << identities[i];
+    }
+    return std::string("fnv1a64_") + u64hex(fnv1a64(oss.str()));
+}
+
+inline std::string buildTemporalReportExternalEventId(const std::string& scopeKey,
+                                                      const json& markers) {
+    std::ostringstream oss;
+    oss << trim(scopeKey) << "\n---\n" << buildReportDeliveryMarkerFingerprint(markers);
+    return std::string("temporal_report_") + u64hex(fnv1a64(oss.str()));
+}
+
+inline void acknowledgeDeliveredReportMarkers(json& st,
+                                              const json& markers,
+                                              const std::string& deliveredAtUtc = std::string()) {
+    if (!markers.is_array() || markers.empty()) return;
+
+    ensureState(st);
+    json& operatorState = st["meta"]["operator_state"];
+    if (!operatorState.is_object()) {
+        operatorState = json::object();
+    }
+
+    const std::string ackTsUtc = normalizeFlexibleTs(deliveredAtUtc);
+
+    for (const auto& marker : markers) {
+        if (!marker.is_object()) continue;
+
+        const std::string operatorId = trim(strField(marker, "operator_id"));
+        const std::string dueTsUtc = normalizeFlexibleTs(strField(marker, "due_ts_utc"));
+        if (operatorId.empty() || dueTsUtc.empty()) continue;
+
+        json& opState = operatorState[operatorId];
+        if (!opState.is_object()) {
+            opState = json::object();
+        }
+
+        const std::string lastDeliveredDueTs =
+            normalizeFlexibleTs(strField(opState, "last_delivered_due_ts_utc"));
+        const std::string lastLegacyEmittedDueTs =
+            normalizeFlexibleTs(strField(opState, "last_emitted_due_ts_utc"));
+        const std::string existingDueTs =
+            !lastDeliveredDueTs.empty() ? lastDeliveredDueTs : lastLegacyEmittedDueTs;
+        if (!existingDueTs.empty() && dueTsUtc < existingDueTs) {
+            continue;
+        }
+
+        opState["last_delivered_due_ts_utc"] = dueTsUtc;
+        opState["last_emitted_due_ts_utc"] = dueTsUtc;
+
+        const std::string evaluatedTsUtc =
+            normalizeFlexibleTs(strField(marker, "evaluated_ts_utc"));
+        if (!evaluatedTsUtc.empty()) {
+            opState["last_evaluated_ts_utc"] = evaluatedTsUtc;
+        }
+        if (!ackTsUtc.empty()) {
+            opState["last_delivery_ack_ts_utc"] = ackTsUtc;
+        }
+
+        if (marker.contains("finalize_on_delivery") &&
+            marker["finalize_on_delivery"].is_boolean() &&
+            marker["finalize_on_delivery"].get<bool>())
+        {
+            opState["finalized"] = true;
+        }
+    }
 }
 
 inline long long countEvents(const json& st,
@@ -9501,11 +9720,15 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         result["checkpoint_due"] = false;
                     }
                     else {
-                        const std::string lastEmittedDueTs = trim(strField(opState, "last_emitted_due_ts_utc"));
+                        const std::string lastDeliveredDueTs = trim(
+                            strField(
+                                opState,
+                                "last_delivered_due_ts_utc",
+                                trim(strField(opState, "last_emitted_due_ts_utc"))));
                         std::vector<std::string> dueTimes;
                         if (scheduleMode == "once") {
                             if (firstDueTs <= normalizedNowTs &&
-                                (lastEmittedDueTs.empty() || firstDueTs > lastEmittedDueTs))
+                                (lastDeliveredDueTs.empty() || firstDueTs > lastDeliveredDueTs))
                             {
                                 dueTimes.push_back(firstDueTs);
                             }
@@ -9514,7 +9737,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                             int guard = 0;
                             while (!dueTs.empty() && dueTs <= normalizedNowTs && guard < 4096) {
                                 if ((horizonEndTs.empty() || dueTs <= horizonEndTs) &&
-                                    (lastEmittedDueTs.empty() || dueTs > lastEmittedDueTs))
+                                    (lastDeliveredDueTs.empty() || dueTs > lastDeliveredDueTs))
                                 {
                                     dueTimes.push_back(dueTs);
                                 }
@@ -9526,7 +9749,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                             }
                             if (!horizonEndTs.empty() &&
                                 horizonEndTs <= normalizedNowTs &&
-                                (lastEmittedDueTs.empty() || horizonEndTs > lastEmittedDueTs))
+                                (lastDeliveredDueTs.empty() || horizonEndTs > lastDeliveredDueTs))
                             {
                                 if (dueTimes.empty() || dueTimes.back() < horizonEndTs) {
                                     dueTimes.push_back(horizonEndTs);
@@ -9626,6 +9849,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                                 result["checkpoints"] = checkpoints;
                                 if (latestCheckpoint.is_object() && !latestCheckpoint.empty()) {
                                     result["latest_checkpoint"] = latestCheckpoint;
+                                    result["latest_due_ts_utc"] = latestDueTs;
                                     if (latestCheckpoint.contains("analysis_value")) {
                                         result["current_value"] = latestCheckpoint["analysis_value"];
                                     }
@@ -9638,13 +9862,29 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                                     }
                                 }
 
-                                opState["last_emitted_due_ts_utc"] = latestDueTs;
+                                const bool finalizeOnDelivery =
+                                    scheduleMode == "once" ||
+                                    (!horizonEndTs.empty() && latestDueTs >= horizonEndTs);
                                 opState["last_evaluated_ts_utc"] = normalizedNowTs;
-                                if (scheduleMode == "once" ||
-                                    (!horizonEndTs.empty() && latestDueTs >= horizonEndTs))
-                                {
-                                    opState["finalized"] = true;
-                                    result["finalized"] = true;
+                                if (shouldReport) {
+                                    const json deliveryMarker = buildReportDeliveryMarker(
+                                        opStateKey,
+                                        latestDueTs,
+                                        normalizedNowTs,
+                                        finalizeOnDelivery);
+                                    if (deliveryMarker.is_object() && !deliveryMarker.empty()) {
+                                        r.reportDeliveryMarkers.push_back(deliveryMarker);
+                                    }
+                                    if (finalizeOnDelivery) {
+                                        result["finalize_on_delivery"] = true;
+                                    }
+                                }
+                                else {
+                                    opState["last_emitted_due_ts_utc"] = latestDueTs;
+                                    if (finalizeOnDelivery) {
+                                        opState["finalized"] = true;
+                                        result["finalized"] = true;
+                                    }
                                 }
 
                                 if (shouldReport) r.report = true;

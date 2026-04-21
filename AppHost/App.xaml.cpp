@@ -342,6 +342,7 @@ namespace winrt::DrakonDesktop::implementation
         {
             SetCurrentProcessExplicitAppUserModelID(runtimeConfig.appUserModelId.c_str());
         }
+        SetEnvironmentVariableW(L"APP_BASE_URL", runtimeConfig.uiBaseUrl.c_str());
         SetEnvironmentVariableW(L"DRAKON_UI_URL", (runtimeConfig.uiBaseUrl + L"/dashboard").c_str());
         SetEnvironmentVariableW(
             L"WEBVIEW2_USER_DATA_FOLDER",

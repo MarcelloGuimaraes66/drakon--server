@@ -1063,7 +1063,7 @@ namespace winrt::DrakonDesktop::services
 
     DrakonApiClient::DrakonApiClient()
         : m_baseUrl([]() {
-            auto const envCandidates = { "DRAKON_BASE_URL", "PERCEPTRUM_BASE_URL" };
+            auto const envCandidates = { "DRAKON_BASE_URL", "PERCEPTRUM_BASE_URL", "APP_BASE_URL" };
             for (auto const* envName : envCandidates)
             {
                 auto envValue = NormalizeBaseUrl(ReadEnvVar(envName));
@@ -1119,7 +1119,7 @@ namespace winrt::DrakonDesktop::services
                 }
             }
 
-            return std::string("http://localhost:4000");
+            return NormalizeBaseUrl(winrt::to_string(runtimeConfig.uiBaseUrl));
           }()),
           m_sessionCookiePath([]() {
               auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();

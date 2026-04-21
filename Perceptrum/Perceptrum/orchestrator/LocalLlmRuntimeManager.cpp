@@ -8,6 +8,7 @@
 
 #include "ConfigUtils.h"
 #include "HttpUtils.h"
+#include "../platform/platform_process.h"
 
 namespace chatv2 {
 
@@ -17,8 +18,13 @@ std::vector<std::filesystem::path> buildServerCandidates_()
 {
     std::vector<std::filesystem::path> candidates;
     for (const auto& root : buildLocalLlmRootCandidates()) {
+#ifdef _WIN32
         candidates.push_back(root / "bin" / "llama-server.exe");
         candidates.push_back(root / "llama-server.exe");
+#else
+        candidates.push_back(root / "bin" / "llama-server");
+        candidates.push_back(root / "llama-server");
+#endif
     }
     return candidates;
 }
@@ -32,29 +38,6 @@ std::vector<std::filesystem::path> buildModelDirectoryCandidates_()
         directories.push_back(root);
     }
     return directories;
-}
-
-std::wstring toWide_(const std::string& value)
-{
-    if (value.empty()) return std::wstring();
-    const int required = MultiByteToWideChar(
-        CP_UTF8,
-        0,
-        value.c_str(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0);
-    if (required <= 0) return std::wstring(value.begin(), value.end());
-
-    std::wstring out(static_cast<size_t>(required), L'\0');
-    MultiByteToWideChar(
-        CP_UTF8,
-        0,
-        value.c_str(),
-        static_cast<int>(value.size()),
-        out.data(),
-        required);
-    return out;
 }
 
 std::string normalizeBaseUrl_(std::string value)
@@ -167,12 +150,10 @@ bool LocalLlmRuntimeManager::isHealthy_(const std::string& baseUrl) const
     return modelsResponse.ok();
 }
 
-bool LocalLlmRuntimeManager::isManagedProcessRunning_() const
+bool LocalLlmRuntimeManager::isManagedProcessRunning_()
 {
-    if (!processActive_ || !processInfo_.hProcess) return false;
-
-    DWORD waitResult = WaitForSingleObject(processInfo_.hProcess, 0);
-    return waitResult == WAIT_TIMEOUT;
+    if (!processActive_) return false;
+    return perceptrum::platform::IsProcessRunning(processHandle_);
 }
 
 bool LocalLlmRuntimeManager::launchManagedProcess_()
@@ -188,55 +169,37 @@ bool LocalLlmRuntimeManager::launchManagedProcess_()
         return false;
     }
 
-    const std::wstring serverPath = toWide_(config_.serverPath);
-    const std::wstring modelPath = toWide_(config_.modelPath);
+    closeProcessHandles_();
 
-    std::wostringstream command;
-    command
-        << L"\"" << serverPath << L"\""
-        << L" -m \"" << modelPath << L"\""
-        << L" --host " << toWide_(config_.host)
-        << L" --port " << config_.port
-        << L" -t " << config_.threads
-        << L" -c " << config_.contextSize
-        << L" -ngl 0"
-        << L" -np 1";
+    perceptrum::platform::ProcessLaunchOptions options;
+    options.executablePath = config_.serverPath;
+    options.workingDirectory = std::filesystem::path(config_.serverPath).parent_path();
+    options.hideWindow = true;
+    options.arguments = {
+        "-m",
+        config_.modelPath,
+        "--host",
+        config_.host,
+        "--port",
+        std::to_string(config_.port),
+        "-t",
+        std::to_string(config_.threads),
+        "-c",
+        std::to_string(config_.contextSize),
+        "-ngl",
+        "0",
+        "-np",
+        "1",
+    };
 
-    std::wstring cmdLine = command.str();
-
-    STARTUPINFOW startupInfo;
-    ZeroMemory(&startupInfo, sizeof(startupInfo));
-    startupInfo.cb = sizeof(startupInfo);
-    startupInfo.dwFlags = STARTF_USESHOWWINDOW;
-    startupInfo.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION processInfo;
-    ZeroMemory(&processInfo, sizeof(processInfo));
-
-    std::vector<wchar_t> mutableCommand(cmdLine.begin(), cmdLine.end());
-    mutableCommand.push_back(L'\0');
-
-    const std::wstring workingDirectory = std::filesystem::path(serverPath).parent_path().wstring();
-    BOOL created = CreateProcessW(
-        nullptr,
-        mutableCommand.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
-        &startupInfo,
-        &processInfo);
-
-    if (!created) {
-        lastError_ =
-            "CreateProcessW failed for llama-server.exe, GetLastError=" + std::to_string(GetLastError());
+    std::string launchError;
+    if (!perceptrum::platform::LaunchProcess(options, processHandle_, launchError)) {
+        lastError_ = launchError.empty()
+            ? "Failed to launch local LLM process."
+            : launchError;
         return false;
     }
 
-    closeProcessHandles_();
-    processInfo_ = processInfo;
     processActive_ = true;
     usingManagedProcess_ = true;
     lastError_.clear();
@@ -254,10 +217,8 @@ bool LocalLlmRuntimeManager::waitForHealthy_(int timeoutMs)
         }
 
         if (usingManagedProcess_ && !isManagedProcessRunning_()) {
-            DWORD exitCode = 0;
-            if (processInfo_.hProcess) {
-                GetExitCodeProcess(processInfo_.hProcess, &exitCode);
-            }
+            int exitCode = 0;
+            (void)perceptrum::platform::TryGetProcessExitCode(processHandle_, exitCode);
             lastError_ =
                 "llama-server exited before becoming healthy. exit_code=" + std::to_string(exitCode);
             terminateManagedProcess_();
@@ -275,22 +236,16 @@ bool LocalLlmRuntimeManager::waitForHealthy_(int timeoutMs)
 
 void LocalLlmRuntimeManager::closeProcessHandles_()
 {
-    if (processInfo_.hThread) {
-        CloseHandle(processInfo_.hThread);
-        processInfo_.hThread = nullptr;
-    }
-    if (processInfo_.hProcess) {
-        CloseHandle(processInfo_.hProcess);
-        processInfo_.hProcess = nullptr;
-    }
+    perceptrum::platform::CloseProcess(processHandle_);
 }
 
 void LocalLlmRuntimeManager::terminateManagedProcess_()
 {
-    if (processInfo_.hProcess) {
-        if (isManagedProcessRunning_()) {
-            TerminateProcess(processInfo_.hProcess, 0);
-            WaitForSingleObject(processInfo_.hProcess, 2000);
+    if (processActive_ || processHandle_.active) {
+        std::string terminateError;
+        (void)perceptrum::platform::TerminateProcess(processHandle_, 0, 2000, &terminateError);
+        if (!terminateError.empty()) {
+            lastError_ = terminateError;
         }
     }
 

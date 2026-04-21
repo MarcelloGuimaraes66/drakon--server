@@ -1,28 +1,14 @@
 #include "BrandingRuntime.h"
 
 #include <cctype>
-#include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
-#include <windows.h>
 
 using json = nlohmann::json;
 
 namespace {
 std::wstring Utf8ToWide(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    const int required = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
-    if (required <= 0) {
-        return std::wstring(value.begin(), value.end());
-    }
-
-    std::wstring wide(static_cast<size_t>(required), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, wide.data(), required);
-    wide.resize(static_cast<size_t>(required) - 1);
-    return wide;
+    return perceptrum::platform::Utf8ToWide(value);
 }
 
 std::string TrimCopy(std::string value) {
@@ -37,15 +23,7 @@ std::string TrimCopy(std::string value) {
 }
 
 std::string ReadEnvVar(const char* name) {
-    char* buffer = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr) {
-        return {};
-    }
-
-    std::string value(buffer);
-    free(buffer);
-    return TrimCopy(std::move(value));
+    return TrimCopy(perceptrum::platform::ReadEnvVar(name));
 }
 
 std::string ReadFirstLine(const std::filesystem::path& filePath) {
@@ -61,22 +39,21 @@ std::string ReadFirstLine(const std::filesystem::path& filePath) {
 
 std::filesystem::path ResolveConfigPath() {
     const std::string fromEnv = ReadEnvVar("APP_BRAND_CONFIG_PATH");
-    if (!fromEnv.empty() && std::filesystem::exists(fromEnv)) {
-        return std::filesystem::path(fromEnv);
+    const std::filesystem::path expandedEnvPath =
+        perceptrum::platform::ExpandUserPath(std::filesystem::path(fromEnv));
+    if (!fromEnv.empty() && std::filesystem::exists(expandedEnvPath)) {
+        return expandedEnvPath;
     }
 
-    wchar_t modulePath[MAX_PATH]{};
-    const auto written = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
-    std::filesystem::path executableDirectory;
-    if (written > 0) {
-        executableDirectory = std::filesystem::path(modulePath).parent_path();
-    }
+    const std::filesystem::path executableDirectory = perceptrum::platform::GetExecutableDirectory();
 
     const std::filesystem::path candidates[] = {
         executableDirectory / "brand.config.json",
         executableDirectory.parent_path() / "brand.config.json",
         executableDirectory.parent_path().parent_path() / "brand.config.json",
+#ifdef _WIN32
         L"C:\\dev\\Workspace\\brand.config.json",
+#endif
     };
 
     for (const auto& candidate : candidates) {
@@ -124,7 +101,14 @@ AppBrand::detail::RuntimeBrandConfig LoadFallbackConfig(const std::string& brand
     config.trayIconGuid = isDrakon
         ? "{A0BEB4AE-3A79-4E65-B8D8-3A7C5F99D601}"
         : "{0F84A457-60F0-4E95-A60C-0C28E0BC61C7}";
+    config.storageNamespace = config.brandId;
     config.dataRootWindows = isDrakon ? "C:\\DrakonData" : "C:\\PerceptrumData";
+    config.dataRootMacOS = isDrakon
+        ? "~/Library/Application Support/DrakonData"
+        : "~/Library/Application Support/PerceptrumData";
+    config.dataRootLinux = isDrakon
+        ? "~/.local/share/DrakonData"
+        : "~/.local/share/PerceptrumData";
     config.inferenceLoopTempDirName = isDrakon ? "inferenceLoopDrakon" : "inferenceLoopPerceptrum";
     config.jobsInferenceTempDirName = isDrakon ? "jobsInferenceDrakon" : "jobsInferencePerceptrum";
     config.videoSegmentsTempDirName = isDrakon ? "drakon_video_segments" : "perceptrum_video_segments";
@@ -206,7 +190,10 @@ AppBrand::detail::RuntimeBrandConfig LoadConfigFromJson() {
     readString("emailSubjectPrefix", &AppBrand::detail::RuntimeBrandConfig::emailSubjectPrefix);
     readString("appUserModelId", &AppBrand::detail::RuntimeBrandConfig::appUserModelId);
     readString("trayIconGuid", &AppBrand::detail::RuntimeBrandConfig::trayIconGuid);
+    readString("storageNamespace", &AppBrand::detail::RuntimeBrandConfig::storageNamespace);
     readString("dataRootWindows", &AppBrand::detail::RuntimeBrandConfig::dataRootWindows);
+    readString("dataRootMacOS", &AppBrand::detail::RuntimeBrandConfig::dataRootMacOS);
+    readString("dataRootLinux", &AppBrand::detail::RuntimeBrandConfig::dataRootLinux);
     readString("inferenceLoopTempDirName", &AppBrand::detail::RuntimeBrandConfig::inferenceLoopTempDirName);
     readString("jobsInferenceTempDirName", &AppBrand::detail::RuntimeBrandConfig::jobsInferenceTempDirName);
     readString("videoSegmentsTempDirName", &AppBrand::detail::RuntimeBrandConfig::videoSegmentsTempDirName);

@@ -54,6 +54,9 @@
     <ClInclude Include="comm\BackendConfig.h">
       <Filter>Source Files\comm</Filter>
     </ClInclude>
+    <ClInclude Include="core\AnalysisRegionGeometry.h">
+      <Filter>Source Files\core</Filter>
+    </ClInclude>
     <ClInclude Include="core\AgentCore.h">
       <Filter>Source Files\core</Filter>
     </ClInclude>
@@ -82,6 +85,9 @@
       <Filter>Source Files\camera</Filter>
     </ClInclude>
     <ClInclude Include="core\Localization.h">
+      <Filter>Source Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="core\VideoPolygonOverlayRenderer.h">
       <Filter>Source Files\core</Filter>
     </ClInclude>
     <ClInclude Include="comm\TelegramNotifier.h">
@@ -125,6 +131,9 @@
     <ClCompile Include="comm\PairingClient.cpp">
       <Filter>Source Files\comm</Filter>
     </ClCompile>
+    <ClCompile Include="core\AnalysisRegionGeometry.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
     <ClCompile Include="core\AgentCore.cpp">
       <Filter>Source Files\core</Filter>
     </ClCompile>
@@ -151,6 +160,9 @@
     </ClCompile>
     <ClCompile Include="comm\TelegramNotifierSendVideo.cpp">
       <Filter>Source Files\comm</Filter>
+    </ClCompile>
+    <ClCompile Include="core\VideoPolygonOverlayRenderer.cpp">
+      <Filter>Source Files\core</Filter>
     </ClCompile>
     <ClCompile Include="jobs\JobPayloadParser.cpp">
       <Filter>Source Files</Filter>

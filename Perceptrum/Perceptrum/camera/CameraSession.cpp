@@ -28,7 +28,9 @@
 
 
 #include "../core/AgentCore.h"
+#include "../core/AnalysisRegionGeometry.h"
 #include "../core/TemporalEngine.h"
+#include "../core/VideoPolygonOverlayRenderer.h"
 #include "../comm/BackendConfig.h"
 #include "../comm/PairingClient.h"
 #include "../generated/Branding.h"
@@ -140,6 +142,23 @@ static bool openVideoCaptureForClipPathCamera_(
     std::string* outErr = nullptr);
 
 static constexpr auto kDashboardThumbnailIntervalCamera_ = std::chrono::seconds(3);
+static std::string buildCameraTemporalReportScopeKey_(
+    const CameraConfig& config,
+    const AlgorithmConfig& algo,
+    const std::string& cameraAgentRunId)
+{
+    std::ostringstream oss;
+    oss << "camera=" << config.id
+        << "|algorithm_type=" << algo.type
+        << "|algorithm_id=" << (algo.algorithmId > 0 ? algo.algorithmId : 0);
+    if (!config.cameraSessionId.empty()) {
+        oss << "|camera_session_id=" << config.cameraSessionId;
+    }
+    if (!cameraAgentRunId.empty()) {
+        oss << "|agent_run_id=" << cameraAgentRunId;
+    }
+    return oss.str();
+}
 static bool buildFrameWindowCroppedClipWithFfmpegCamera_(
     const std::string& srcClipPath,
     const AlgorithmConfig::FrameWindowNorm& frameWindow,
@@ -789,53 +808,111 @@ static std::vector<AlgorithmConfig::AnalysisRegion> collectPolygonRegionsForAlgo
     return out;
 }
 
+static analysisregion::FrameWindowNorm toSharedFrameWindowCamera_(
+    const AlgorithmConfig::FrameWindowNorm& frameWindow)
+{
+    analysisregion::FrameWindowNorm out;
+    out.enabled = frameWindow.enabled;
+    out.x = frameWindow.x;
+    out.y = frameWindow.y;
+    out.width = frameWindow.width;
+    out.height = frameWindow.height;
+    return out;
+}
+
+static AlgorithmConfig::FrameWindowNorm fromSharedFrameWindowCamera_(
+    const analysisregion::FrameWindowNorm& frameWindow)
+{
+    AlgorithmConfig::FrameWindowNorm out;
+    out.enabled = frameWindow.enabled;
+    out.x = frameWindow.x;
+    out.y = frameWindow.y;
+    out.width = frameWindow.width;
+    out.height = frameWindow.height;
+    return out;
+}
+
+static std::vector<analysisregion::PointNorm> toSharedPolygonCamera_(
+    const std::vector<AlgorithmConfig::AnalysisRegionPoint>& polygon)
+{
+    std::vector<analysisregion::PointNorm> out;
+    out.reserve(polygon.size());
+    for (const auto& point : polygon) {
+        out.push_back(analysisregion::PointNorm{ point.x, point.y });
+    }
+    return out;
+}
+
+static std::vector<AlgorithmConfig::AnalysisRegionPoint> fromSharedPolygonCamera_(
+    const std::vector<analysisregion::PointNorm>& polygon)
+{
+    std::vector<AlgorithmConfig::AnalysisRegionPoint> out;
+    out.reserve(polygon.size());
+    for (const auto& point : polygon) {
+        out.push_back(AlgorithmConfig::AnalysisRegionPoint{ point.x, point.y });
+    }
+    return out;
+}
+
+static analysisregion::RegionSpec toSharedRegionSpecCamera_(
+    const AlgorithmConfig::AnalysisRegion& region)
+{
+    analysisregion::RegionSpec out;
+    out.regionId = region.regionId;
+    out.label = region.label;
+    out.enabled = region.enabled;
+    out.fullFrame = region.fullFrame;
+    out.polygonNorm = toSharedPolygonCamera_(region.polygonNorm);
+    out.drawRefWidth = region.drawRefWidth;
+    out.drawRefHeight = region.drawRefHeight;
+    out.frameWindowNorm = toSharedFrameWindowCamera_(region.frameWindowNorm);
+    return out;
+}
+
+static std::vector<analysisregion::RegionSpec> toSharedRegionSpecsCamera_(
+    const std::vector<AlgorithmConfig::AnalysisRegion>& regions)
+{
+    std::vector<analysisregion::RegionSpec> out;
+    out.reserve(regions.size());
+    for (const auto& region : regions) {
+        out.push_back(toSharedRegionSpecCamera_(region));
+    }
+    return out;
+}
+
+static AlgorithmConfig::AnalysisRegion applySharedRegionSpecToCameraRegion_(
+    const AlgorithmConfig::AnalysisRegion& source,
+    const analysisregion::RegionSpec& shared)
+{
+    AlgorithmConfig::AnalysisRegion out = source;
+    out.regionId = shared.regionId;
+    out.label = shared.label;
+    out.enabled = shared.enabled;
+    out.fullFrame = shared.fullFrame;
+    out.polygonNorm = fromSharedPolygonCamera_(shared.polygonNorm);
+    out.drawRefWidth = shared.drawRefWidth;
+    out.drawRefHeight = shared.drawRefHeight;
+    out.frameWindowNorm = fromSharedFrameWindowCamera_(shared.frameWindowNorm);
+    return out;
+}
+
 static bool isFrameWindowActiveCamera_(const AlgorithmConfig::FrameWindowNorm& frameWindow)
 {
-    return frameWindow.enabled &&
-        frameWindow.width > 1e-6 &&
-        frameWindow.height > 1e-6 &&
-        (frameWindow.x > 1e-6 ||
-         frameWindow.y > 1e-6 ||
-         frameWindow.width < (1.0 - 1e-6) ||
-         frameWindow.height < (1.0 - 1e-6));
+    return analysisregion::IsFrameWindowActive(toSharedFrameWindowCamera_(frameWindow));
 }
 
 static AlgorithmConfig::FrameWindowNorm resolveFrameWindowForAlgoCamera_(
     const AlgorithmConfig& algo)
 {
-    for (const auto& region : algo.analysisRegions) {
-        if (isFrameWindowActiveCamera_(region.frameWindowNorm)) {
-            return region.frameWindowNorm;
-        }
-    }
-    return AlgorithmConfig::FrameWindowNorm{};
+    return fromSharedFrameWindowCamera_(
+        analysisregion::ResolveFrameWindow(toSharedRegionSpecsCamera_(algo.analysisRegions)));
 }
 
 static cv::Rect frameWindowToRectCamera_(
     const AlgorithmConfig::FrameWindowNorm& frameWindow,
     const cv::Size& size)
 {
-    if (size.width <= 0 || size.height <= 0) return cv::Rect();
-    if (!isFrameWindowActiveCamera_(frameWindow)) {
-        return cv::Rect(0, 0, size.width, size.height);
-    }
-
-    const double x1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
-    const double y1Norm = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
-    const double x2Norm = (std::max)(x1Norm, (std::min)(1.0, frameWindow.x + frameWindow.width));
-    const double y2Norm = (std::max)(y1Norm, (std::min)(1.0, frameWindow.y + frameWindow.height));
-
-    int x1 = static_cast<int>(std::floor(x1Norm * static_cast<double>(size.width)));
-    int y1 = static_cast<int>(std::floor(y1Norm * static_cast<double>(size.height)));
-    int x2 = static_cast<int>(std::ceil(x2Norm * static_cast<double>(size.width)));
-    int y2 = static_cast<int>(std::ceil(y2Norm * static_cast<double>(size.height)));
-
-    x1 = (std::max)(0, (std::min)(size.width - 1, x1));
-    y1 = (std::max)(0, (std::min)(size.height - 1, y1));
-    x2 = (std::max)(x1 + 1, (std::min)(size.width, x2));
-    y2 = (std::max)(y1 + 1, (std::min)(size.height, y2));
-
-    return cv::Rect(x1, y1, x2 - x1, y2 - y1);
+    return analysisregion::FrameWindowToRect(toSharedFrameWindowCamera_(frameWindow), size);
 }
 
 static cv::Mat cropFrameToFrameWindowCamera_(
@@ -854,78 +931,10 @@ static std::vector<AlgorithmConfig::AnalysisRegionPoint> clipPolygonToFrameWindo
     const std::vector<AlgorithmConfig::AnalysisRegionPoint>& polygon,
     const AlgorithmConfig::FrameWindowNorm& frameWindow)
 {
-    using Point = AlgorithmConfig::AnalysisRegionPoint;
-    if (!isFrameWindowActiveCamera_(frameWindow) || polygon.size() < 3) {
-        return polygon;
-    }
-
-    const double minX = (std::max)(0.0, (std::min)(1.0, frameWindow.x));
-    const double minY = (std::max)(0.0, (std::min)(1.0, frameWindow.y));
-    const double maxX = (std::max)(minX, (std::min)(1.0, frameWindow.x + frameWindow.width));
-    const double maxY = (std::max)(minY, (std::min)(1.0, frameWindow.y + frameWindow.height));
-
-    auto intersectAtX = [](const Point& a, const Point& b, double x) -> Point {
-        const double dx = b.x - a.x;
-        if (std::abs(dx) <= 1e-9) {
-            return Point{ x, a.y };
-        }
-        const double t = (x - a.x) / dx;
-        return Point{ x, a.y + ((b.y - a.y) * t) };
-    };
-    auto intersectAtY = [](const Point& a, const Point& b, double y) -> Point {
-        const double dy = b.y - a.y;
-        if (std::abs(dy) <= 1e-9) {
-            return Point{ a.x, y };
-        }
-        const double t = (y - a.y) / dy;
-        return Point{ a.x + ((b.x - a.x) * t), y };
-    };
-    auto clipEdge = [](const std::vector<Point>& input, const auto& inside, const auto& intersect) {
-        std::vector<Point> output;
-        if (input.empty()) return output;
-        output.reserve(input.size() + 4);
-
-        Point prev = input.back();
-        bool prevInside = inside(prev);
-        for (const auto& curr : input) {
-            const bool currInside = inside(curr);
-            if (currInside) {
-                if (!prevInside) {
-                    output.push_back(intersect(prev, curr));
-                }
-                output.push_back(curr);
-            }
-            else if (prevInside) {
-                output.push_back(intersect(prev, curr));
-            }
-            prev = curr;
-            prevInside = currInside;
-        }
-        return output;
-    };
-
-    std::vector<Point> clipped = polygon;
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.x >= minX; },
-        [&](const Point& a, const Point& b) { return intersectAtX(a, b, minX); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.x <= maxX; },
-        [&](const Point& a, const Point& b) { return intersectAtX(a, b, maxX); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.y >= minY; },
-        [&](const Point& a, const Point& b) { return intersectAtY(a, b, minY); }
-    );
-    clipped = clipEdge(
-        clipped,
-        [&](const Point& p) { return p.y <= maxY; },
-        [&](const Point& a, const Point& b) { return intersectAtY(a, b, maxY); }
-    );
-    return clipped;
+    return fromSharedPolygonCamera_(
+        analysisregion::ClipPolygonToFrameWindow(
+            toSharedPolygonCamera_(polygon),
+            toSharedFrameWindowCamera_(frameWindow)));
 }
 
 static std::vector<AlgorithmConfig::AnalysisRegion> remapRegionsToFrameWindowCamera_(
@@ -934,26 +943,42 @@ static std::vector<AlgorithmConfig::AnalysisRegion> remapRegionsToFrameWindowCam
 {
     if (!isFrameWindowActiveCamera_(frameWindow)) return regions;
 
-    std::vector<AlgorithmConfig::AnalysisRegion> out;
-    out.reserve(regions.size());
-    const double invWidth = frameWindow.width > 1e-6 ? (1.0 / frameWindow.width) : 1.0;
-    const double invHeight = frameWindow.height > 1e-6 ? (1.0 / frameWindow.height) : 1.0;
+    const std::vector<analysisregion::RegionSpec> remapped =
+        analysisregion::RemapRegionsToFrameWindow(
+            toSharedRegionSpecsCamera_(regions),
+            toSharedFrameWindowCamera_(frameWindow));
 
-    for (const auto& region : regions) {
-        AlgorithmConfig::AnalysisRegion next = region;
-        next.frameWindowNorm = AlgorithmConfig::FrameWindowNorm{};
-        if (!next.fullFrame && !next.polygonNorm.empty()) {
-            auto clippedPolygon = clipPolygonToFrameWindowCamera_(next.polygonNorm, frameWindow);
-            if (clippedPolygon.size() < 3) {
-                continue;
-            }
-            for (auto& point : clippedPolygon) {
-                point.x = (std::max)(0.0, (std::min)(1.0, (point.x - frameWindow.x) * invWidth));
-                point.y = (std::max)(0.0, (std::min)(1.0, (point.y - frameWindow.y) * invHeight));
-            }
-            next.polygonNorm = std::move(clippedPolygon);
+    std::unordered_map<std::string, analysisregion::RegionSpec> remappedById;
+    remappedById.reserve(remapped.size());
+    std::vector<analysisregion::RegionSpec> unnamedRegions;
+    unnamedRegions.reserve(remapped.size());
+    for (const auto& region : remapped) {
+        if (!region.regionId.empty()) {
+            remappedById[region.regionId] = region;
         }
-        out.push_back(std::move(next));
+        else {
+            unnamedRegions.push_back(region);
+        }
+    }
+
+    std::vector<AlgorithmConfig::AnalysisRegion> out;
+    out.reserve(remapped.size());
+    std::size_t unnamedIndex = 0;
+    for (const auto& region : regions) {
+        const analysisregion::RegionSpec* shared = nullptr;
+        if (!region.regionId.empty()) {
+            auto it = remappedById.find(region.regionId);
+            if (it != remappedById.end()) {
+                shared = &it->second;
+            }
+        }
+        else if (unnamedIndex < unnamedRegions.size()) {
+            shared = &unnamedRegions[unnamedIndex++];
+        }
+        if (!shared) {
+            continue;
+        }
+        out.push_back(applySharedRegionSpecToCameraRegion_(region, *shared));
     }
     return out;
 }
@@ -994,21 +1019,7 @@ static std::vector<cv::Point> regionPolygonToPixelsForCamera_(
     const AlgorithmConfig::AnalysisRegion& region,
     const cv::Size& size)
 {
-    std::vector<cv::Point> polygon;
-    if (size.width <= 0 || size.height <= 0) return polygon;
-    polygon.reserve(region.polygonNorm.size());
-    const int maxX = (std::max)(0, size.width - 1);
-    const int maxY = (std::max)(0, size.height - 1);
-    for (const auto& p : region.polygonNorm) {
-        const double nx = std::max(0.0, std::min(1.0, p.x));
-        const double ny = std::max(0.0, std::min(1.0, p.y));
-        int x = static_cast<int>(std::round(nx * maxX));
-        int y = static_cast<int>(std::round(ny * maxY));
-        x = (std::max)(0, (std::min)(maxX, x));
-        y = (std::max)(0, (std::min)(maxY, y));
-        polygon.emplace_back(x, y);
-    }
-    return polygon;
+    return analysisregion::RegionPolygonToPixels(toSharedRegionSpecCamera_(region), size);
 }
 
 static cv::Scalar regionOverlayColorByIndexCamera_(std::size_t index)
@@ -1029,78 +1040,10 @@ static int drawAnalysisOverlaysOnFrameCamera_(
     const std::vector<AlgorithmConfig::AnalysisRegion>& polygonRegions,
     std::vector<std::string>* outDrawnRegionIds)
 {
-    if (frame.empty() || polygonRegions.empty()) return 0;
-    cv::Mat overlay = frame.clone();
-    int drawn = 0;
-    if (outDrawnRegionIds) outDrawnRegionIds->clear();
-
-    for (std::size_t i = 0; i < polygonRegions.size(); ++i) {
-        const auto& region = polygonRegions[i];
-        const auto polygon = regionPolygonToPixelsForCamera_(region, frame.size());
-        if (polygon.size() < 3) continue;
-        const cv::Scalar color = regionOverlayColorByIndexCamera_(i);
-        std::vector<std::vector<cv::Point>> polygons{ polygon };
-        cv::fillPoly(overlay, polygons, color, cv::LINE_AA);
-        drawn++;
-        if (outDrawnRegionIds && !region.regionId.empty()) {
-            outDrawnRegionIds->push_back(region.regionId);
-        }
-    }
-
-    if (drawn <= 0) return 0;
-    cv::addWeighted(overlay, 0.20, frame, 0.80, 0.0, frame);
-
-    for (std::size_t i = 0; i < polygonRegions.size(); ++i) {
-        const auto& region = polygonRegions[i];
-        const auto polygon = regionPolygonToPixelsForCamera_(region, frame.size());
-        if (polygon.size() < 3) continue;
-
-        const cv::Scalar color = regionOverlayColorByIndexCamera_(i);
-        std::vector<std::vector<cv::Point>> polygons{ polygon };
-        cv::polylines(frame, polygons, true, color, 2, cv::LINE_AA);
-        for (const auto& pt : polygon) {
-            cv::circle(frame, pt, 4, color, cv::FILLED, cv::LINE_AA);
-        }
-
-        std::string label = region.label;
-        if (label.empty()) label = region.regionId;
-        if (label.empty()) continue;
-
-        cv::Point anchor = polygon.front();
-        int baseline = 0;
-        const double fontScale = 0.62;
-        const int thickness = 2;
-        const cv::Size textSize =
-            cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
-
-        int boxLeft = anchor.x - (textSize.width / 2);
-        int boxTop = anchor.y - textSize.height - 8;
-        boxLeft = (std::max)(0, (std::min)(boxLeft, frame.cols - textSize.width - 12));
-        boxTop = (std::max)(0, (std::min)(boxTop, frame.rows - textSize.height - 12));
-
-        cv::Rect labelRect(
-            boxLeft,
-            boxTop,
-            textSize.width + 12,
-            textSize.height + 10);
-
-        cv::rectangle(frame, labelRect, cv::Scalar(18, 24, 40), cv::FILLED, cv::LINE_AA);
-        cv::rectangle(frame, labelRect, color, 1, cv::LINE_AA);
-
-        cv::Point textOrg(labelRect.x + 6, labelRect.y + labelRect.height - 6);
-        cv::putText(
-            frame,
-            label,
-            textOrg,
-            cv::FONT_HERSHEY_SIMPLEX,
-            fontScale,
-            cv::Scalar(245, 248, 255),
-            thickness,
-            cv::LINE_AA
-        );
-    }
-
-    return drawn;
+    return analysisregion::DrawRegionsOnFrame(
+        frame,
+        toSharedRegionSpecsCamera_(polygonRegions),
+        outDrawnRegionIds);
 }
 
 static bool detectMotionInAnyRegionFromClipCamera_(
@@ -1213,64 +1156,26 @@ static bool buildOverlayClipForRegionsCamera_(
     std::string& outClipPath,
     std::vector<std::string>* outDrawnRegionIds)
 {
-    outClipPath.clear();
-    if (outDrawnRegionIds) outDrawnRegionIds->clear();
-    if (polygonRegions.empty()) return false;
-
-    ensureOpenCvVideoIoThreadReadyCamera_();
-
-    cv::VideoCapture cap;
-    TempOpenCvClipPathGuardCamera_ tempOpenPathGuard;
-    if (!openVideoCaptureForClipPathCamera_(srcClipPath, cap, tempOpenPathGuard.path)) {
-        return false;
-    }
-
-    cv::Mat firstFrame;
-    if (!cap.read(firstFrame) || firstFrame.empty()) {
-        return false;
-    }
-
-    const int width = firstFrame.cols;
-    const int height = firstFrame.rows;
-    if (width <= 0 || height <= 0) return false;
-
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (!std::isfinite(fps) || fps <= 0.0) fps = 10.0;
-
-    std::string dstClipPath = srcClipPath + ".roi_overlay.mp4";
-    cv::VideoWriter writer;
-    const std::vector<int> fourccCandidates = {
-        cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
-        cv::VideoWriter::fourcc('m', 'p', '4', 'v')
-    };
-    for (const int fourcc : fourccCandidates) {
-        if (writer.open(dstClipPath, fourcc, fps, cv::Size(width, height), true)) {
-            break;
-        }
-    }
-    if (!writer.isOpened()) return false;
-
+    fs::path dstClipPath;
+    std::string overlayErr;
+    if (!analysisregion::AnnotateVideoClipWithOverlay(
+            fs::path(srcClipPath),
+            toSharedRegionSpecsCamera_(polygonRegions),
+            dstClipPath,
+            outDrawnRegionIds,
+            &overlayErr))
     {
-        cv::Mat drawFrame = firstFrame.clone();
-        drawAnalysisOverlaysOnFrameCamera_(drawFrame, polygonRegions, outDrawnRegionIds);
-        writer.write(drawFrame);
-    }
-
-    cv::Mat frame;
-    while (cap.read(frame)) {
-        if (frame.empty()) continue;
-        cv::Mat drawFrame = frame.clone();
-        drawAnalysisOverlaysOnFrameCamera_(drawFrame, polygonRegions, nullptr);
-        writer.write(drawFrame);
-    }
-
-    writer.release();
-    cap.release();
-    if (!waitForReadableClipPathCamera_(dstClipPath)) {
+        if (!overlayErr.empty()) {
+            Logger::instance().logDebug(
+                "camera",
+                "buildOverlayClipForRegionsCamera_: " + overlayErr +
+                " src=" + srcClipPath
+            );
+        }
         return false;
     }
-    outClipPath = dstClipPath;
-    return true;
+    outClipPath = dstClipPath.string();
+    return !outClipPath.empty();
 }
 
 
@@ -6314,15 +6219,28 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
     auto promptCoreForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
         return algo.promptTemplate.empty() ? algo.llmPrompt : algo.promptTemplate;
     };
+    auto promptInputTypeForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
+        return algo.inputType.empty() ? std::string("video") : algo.inputType;
+    };
     auto promptHashForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
-        return temporal::computePromptRevisionHash(promptCoreForAlgo(algo), algo.alertCondition);
+        return temporal::computePromptRevisionHash(
+            promptCoreForAlgo(algo),
+            algo.alertCondition,
+            algo.negativeCondition,
+            promptInputTypeForAlgo(algo),
+            "pt-BR",
+            true);
     };
     auto payloadPlanMatchesAlgo = [&](const AlgorithmConfig& algo) -> bool {
         return temporal::decisionCacheable(algo.temporalPlanEnvelope) &&
                temporal::planMatchesPromptRevision(
                    algo.temporalPlanEnvelope,
                    promptCoreForAlgo(algo),
-                   algo.alertCondition
+                   algo.alertCondition,
+                   algo.negativeCondition,
+                   promptInputTypeForAlgo(algo),
+                   "pt-BR",
+                   true
                );
     };
     auto slotPlanMatchesAlgo = [&](const TemporalRuntimeSlot& slot, const AlgorithmConfig& algo) -> bool {
@@ -6332,7 +6250,11 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                temporal::planMatchesPromptRevision(
                    slot.planEnvelope,
                    promptCoreForAlgo(algo),
-                   algo.alertCondition
+                   algo.alertCondition,
+                   algo.negativeCondition,
+                   promptInputTypeForAlgo(algo),
+                   "pt-BR",
+                   true
                );
     };
 
@@ -6357,7 +6279,14 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                 }
             }
             if (!temporal::decisionCacheable(envelope) ||
-                !temporal::planMatchesPromptRevision(envelope, promptCore, algo.alertCondition))
+                !temporal::planMatchesPromptRevision(
+                    envelope,
+                    promptCore,
+                    algo.alertCondition,
+                    algo.negativeCondition,
+                    promptInputTypeForAlgo(algo),
+                    "pt-BR",
+                    true))
             {
                 envelope = nlohmann::json::object();
             }
@@ -6367,7 +6296,7 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                 promptCore,
                 algo.alertCondition,
                 algo.negativeCondition,
-                algo.inputType.empty() ? std::string("video") : algo.inputType,
+                promptInputTypeForAlgo(algo),
                 "pt-BR",
                 algo.inferenceModel,
                 algo.modelApiKey,
@@ -7351,13 +7280,19 @@ void CameraSession::inferenceLoop_() {
                     const std::string nowIsoForInference = temporal::nowIso();
                     const std::string basePromptCore =
                         customAlgo.promptTemplate.empty() ? customAlgo.llmPrompt : customAlgo.promptTemplate;
+                    const std::string temporalLanguage = "pt-BR";
                     const std::string temporalPromptHash =
-                        temporal::computePromptRevisionHash(basePromptCore, customAlgo.alertCondition);
+                        temporal::computePromptRevisionHash(
+                            basePromptCore,
+                            customAlgo.alertCondition,
+                            customAlgo.negativeCondition,
+                            customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType,
+                            temporalLanguage,
+                            true);
                     std::string runtimePrompt = basePromptCore;
                     bool temporalPlanActive = false;
                     bool temporalReport = false;
                     nlohmann::json temporalOperatorResults = nlohmann::json::array();
-                    const std::string temporalLanguage = "pt-BR";
                     const std::string temporalSlotKey =
                         customAlgo.type + "#" +
                         std::to_string(customAlgo.algorithmId > 0 ? customAlgo.algorithmId : 0);
@@ -7368,7 +7303,11 @@ void CameraSession::inferenceLoop_() {
                         temporal::planMatchesPromptRevision(
                             customAlgo.temporalPlanEnvelope,
                             basePromptCore,
-                            customAlgo.alertCondition
+                            customAlgo.alertCondition,
+                            customAlgo.negativeCondition,
+                            customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType,
+                            temporalLanguage,
+                            true
                         );
                     {
                         std::lock_guard<std::mutex> lock(temporalMutex_);
@@ -7383,7 +7322,11 @@ void CameraSession::inferenceLoop_() {
                          temporal::planMatchesPromptRevision(
                              temporalSlot.planEnvelope,
                              basePromptCore,
-                             customAlgo.alertCondition
+                             customAlgo.alertCondition,
+                             customAlgo.negativeCondition,
+                             customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType,
+                             temporalLanguage,
+                             true
                          ));
                     if (!slotPlanMatchesCurrentPrompt) {
                         temporalSlot.planEnvelope = payloadPlanMatchesCurrentPrompt
@@ -7484,6 +7427,7 @@ void CameraSession::inferenceLoop_() {
                     const bool llmAlertCondition = primaryHit.alertCondition;
                     std::string decisionSource = "llm";
                     std::string temporalDecisionSummary;
+                    nlohmann::json temporalReportDeliveryMarkers = nlohmann::json::array();
 
                     const bool localAlertSignal = finalAlert;
                     const std::string localDecisionSource = decisionSource;
@@ -7528,6 +7472,7 @@ void CameraSession::inferenceLoop_() {
                             temporal::shouldFallbackToLocalAlert(eval, localAlertSignal);
                         temporalOperatorResults = eval.operatorResults;
                         temporalReport = eval.report;
+                        temporalReportDeliveryMarkers = eval.reportDeliveryMarkers;
                         finalAlert = eval.alert;
                         primaryHit.alertCondition = eval.alert;
                         decisionSource = "temporal_engine";
@@ -7718,13 +7663,54 @@ void CameraSession::inferenceLoop_() {
                         if (!temporalDecisionSummary.empty()) {
                             reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
                         }
-                        owner_->postAgentEvent(
-                            "temporal_report",
-                            std::optional<int>(cameraIdNumeric),
-                            "",
-                            "",
-                            reportDetails
-                        );
+                        if (temporalReportDeliveryMarkers.is_array() &&
+                            !temporalReportDeliveryMarkers.empty())
+                        {
+                            reportDetails["external_event_id"] =
+                                temporal::buildTemporalReportExternalEventId(
+                                    buildCameraTemporalReportScopeKey_(
+                                        config_,
+                                        customAlgo,
+                                        cameraAgentRunId),
+                                    temporalReportDeliveryMarkers);
+                        }
+                        const AgentCore::AgentEventPostResult reportPostResult =
+                            owner_->postAgentEventWithResult(
+                                "temporal_report",
+                                std::optional<int>(cameraIdNumeric),
+                                "",
+                                "",
+                                reportDetails
+                            );
+                        if (reportPostResult.ok) {
+                            temporal::acknowledgeDeliveredReportMarkers(
+                                temporalSlot.state,
+                                temporalReportDeliveryMarkers,
+                                cameraAgentEventAtUtc);
+                            temporalSlot.touchedAt = std::chrono::steady_clock::now();
+                            temporalSlot.promptHash = temporalPromptHash;
+                            std::lock_guard<std::mutex> lock(temporalMutex_);
+                            temporalByAlgo_[temporalSlotKey] = temporalSlot;
+                        }
+                        else {
+                            Logger::instance().logError(
+                                config_.id,
+                                "failed to post temporal report for camera image inference",
+                                ErrorLogContext{
+                                    "camera_agent",
+                                    "CameraSession::inferenceLoop_",
+                                    "post_temporal_report_image",
+                                    nlohmann::json{
+                                        { "camera_id", cameraIdNumeric },
+                                        { "camera_session_id", config_.cameraSessionId },
+                                        { "algorithm_type", customAlgo.type },
+                                        { "algorithm_id", customAlgo.algorithmId },
+                                        { "http_code", reportPostResult.httpCode },
+                                        { "response", reportPostResult.response }
+                                    }.dump()
+                                }
+                            );
+                        }
                     }
 
                     if (finalAlert) {
@@ -8645,13 +8631,19 @@ void CameraSession::inferenceLoop_() {
                             temporal::decisionAnchorUtc(nowIsoForInference, primarySegment.endTs);
                         const std::string basePromptCore =
                             customAlgo.promptTemplate.empty() ? customAlgo.llmPrompt : customAlgo.promptTemplate;
+                        const std::string temporalLanguage = "pt-BR";
                         const std::string temporalPromptHash =
-                            temporal::computePromptRevisionHash(basePromptCore, customAlgo.alertCondition);
+                            temporal::computePromptRevisionHash(
+                                basePromptCore,
+                                customAlgo.alertCondition,
+                                customAlgo.negativeCondition,
+                                customAlgo.inputType.empty() ? std::string("video") : customAlgo.inputType,
+                                temporalLanguage,
+                                true);
                         std::string runtimePrompt = basePromptCore;
                         bool temporalPlanActive = false;
                         bool temporalReport = false;
                         nlohmann::json temporalOperatorResults = nlohmann::json::array();
-                        const std::string temporalLanguage = "pt-BR";
                         const std::string temporalSlotKey =
                             customAlgo.type + "#" +
                             std::to_string(customAlgo.algorithmId > 0 ? customAlgo.algorithmId : 0);
@@ -8823,7 +8815,11 @@ void CameraSession::inferenceLoop_() {
                             temporal::planMatchesPromptRevision(
                                 customAlgo.temporalPlanEnvelope,
                                 basePromptCore,
-                                customAlgo.alertCondition
+                                customAlgo.alertCondition,
+                                customAlgo.negativeCondition,
+                                customAlgo.inputType.empty() ? std::string("video") : customAlgo.inputType,
+                                temporalLanguage,
+                                true
                             );
                         {
                             std::lock_guard<std::mutex> lock(temporalMutex_);
@@ -8838,7 +8834,11 @@ void CameraSession::inferenceLoop_() {
                              temporal::planMatchesPromptRevision(
                                  temporalSlot.planEnvelope,
                                  basePromptCore,
-                                 customAlgo.alertCondition
+                                 customAlgo.alertCondition,
+                                 customAlgo.negativeCondition,
+                                 customAlgo.inputType.empty() ? std::string("video") : customAlgo.inputType,
+                                 temporalLanguage,
+                                 true
                              ));
                         const bool resetTemporalEvidenceTrail = !slotPlanMatchesCurrentPrompt;
                         if (!slotPlanMatchesCurrentPrompt) {
@@ -8950,6 +8950,7 @@ void CameraSession::inferenceLoop_() {
                         const bool llmAlertCondition = primaryHit.alertCondition;
                         std::string decisionSource = "llm";
                         std::string temporalDecisionSummary;
+                        nlohmann::json temporalReportDeliveryMarkers = nlohmann::json::array();
 
                         const bool localAlertSignal = finalAlert;
                         const std::string localDecisionSource = decisionSource;
@@ -8996,6 +8997,7 @@ void CameraSession::inferenceLoop_() {
                                 temporal::shouldFallbackToLocalAlert(eval, localAlertSignal);
                             temporalOperatorResults = eval.operatorResults;
                             temporalReport = eval.report;
+                            temporalReportDeliveryMarkers = eval.reportDeliveryMarkers;
                             finalAlert = eval.alert;
                             primaryHit.alertCondition = eval.alert;
                             decisionSource = "temporal_engine";
@@ -9239,13 +9241,54 @@ void CameraSession::inferenceLoop_() {
                             if (!temporalDecisionSummary.empty()) {
                                 reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
                             }
-                            owner_->postAgentEvent(
-                                "temporal_report",
-                                std::optional<int>(primarySegment.cameraId),
-                                "",
-                                "",
-                                reportDetails
-                            );
+                            if (temporalReportDeliveryMarkers.is_array() &&
+                                !temporalReportDeliveryMarkers.empty())
+                            {
+                                reportDetails["external_event_id"] =
+                                    temporal::buildTemporalReportExternalEventId(
+                                        buildCameraTemporalReportScopeKey_(
+                                            config_,
+                                            customAlgo,
+                                            cameraAgentRunId),
+                                        temporalReportDeliveryMarkers);
+                            }
+                            const AgentCore::AgentEventPostResult reportPostResult =
+                                owner_->postAgentEventWithResult(
+                                    "temporal_report",
+                                    std::optional<int>(primarySegment.cameraId),
+                                    "",
+                                    "",
+                                    reportDetails
+                                );
+                            if (reportPostResult.ok) {
+                                temporal::acknowledgeDeliveredReportMarkers(
+                                    temporalSlot.state,
+                                    temporalReportDeliveryMarkers,
+                                    cameraAgentEventAtUtc);
+                                temporalSlot.touchedAt = std::chrono::steady_clock::now();
+                                temporalSlot.promptHash = temporalPromptHash;
+                                std::lock_guard<std::mutex> lock(temporalMutex_);
+                                temporalByAlgo_[temporalSlotKey] = temporalSlot;
+                            }
+                            else {
+                                Logger::instance().logError(
+                                    config_.id,
+                                    "failed to post temporal report for camera video inference",
+                                    ErrorLogContext{
+                                        "camera_agent",
+                                        "CameraSession::inferenceLoop_",
+                                        "post_temporal_report_video",
+                                        nlohmann::json{
+                                            { "camera_id", primarySegment.cameraId },
+                                            { "camera_session_id", config_.cameraSessionId },
+                                            { "algorithm_type", customAlgo.type },
+                                            { "algorithm_id", customAlgo.algorithmId },
+                                            { "http_code", reportPostResult.httpCode },
+                                            { "response", reportPostResult.response }
+                                        }.dump()
+                                    }
+                                );
+                            }
                         }
 
                         if (finalAlert) {

@@ -5223,6 +5223,8 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
                 if (region.label.empty()) region.label = region.regionId;
                 region.enabled = jsonBoolOr(r, "enabled", true);
                 region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                region.drawRefWidth = jsonIntOr(r, "draw_ref_width", 1920);
+                region.drawRefHeight = jsonIntOr(r, "draw_ref_height", 1080);
                 region.frameWindowNorm = parseFrameWindowNorm(r);
                 if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
                     for (const auto& pnt : r["polygon_norm"]) {
@@ -6099,6 +6101,46 @@ void AgentCore::processCommand_(const json& cmd) {
                 }
             }).detach();
         }
+        else if (type == "temporal_recompile") {
+            std::thread([this, commandId, payload]() {
+                try {
+                    handleTemporalRecompileCommand_(commandId, payload);
+                }
+                catch (const std::exception& e) {
+                    logAgentException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::temporalRecompileThread",
+                        "temporal_recompile",
+                        {
+                            { "command_id", commandId }
+                        },
+                        e
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = std::string("temporal_recompile exception: ") + e.what();
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+                catch (...) {
+                    logAgentUnknownException_(
+                        "agent",
+                        "agent",
+                        "AgentCore::processCommand_::temporalRecompileThread",
+                        "temporal_recompile",
+                        {
+                            { "command_id", commandId }
+                        }
+                    );
+                    if (commandId > 0) {
+                        nlohmann::json err;
+                        err["error"] = "temporal_recompile unknown exception";
+                        postCommandResult_(commandId, "failed", err);
+                    }
+                }
+            }).detach();
+        }
         else if (type == "agent_design") {
             std::thread([this, commandId, payload]() {
                 try {
@@ -6828,6 +6870,8 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                     if (region.label.empty()) region.label = region.regionId;
                     region.enabled = jsonBoolOr(r, "enabled", true);
                     region.fullFrame = jsonBoolOr(r, "full_frame", false);
+                    region.drawRefWidth = jsonIntOr(r, "draw_ref_width", 1920);
+                    region.drawRefHeight = jsonIntOr(r, "draw_ref_height", 1080);
                     region.frameWindowNorm = parseFrameWindowNorm(r);
                     if (r.contains("polygon_norm") && r["polygon_norm"].is_array()) {
                         for (const auto& pnt : r["polygon_norm"]) {
@@ -7155,6 +7199,8 @@ namespace {
     constexpr long kHttpConnectTimeoutSec = 10;
     constexpr long kHttpTimeoutSec = 30;
     constexpr int  kHttpMaxAttempts = 3;
+    constexpr int  kAgentInferenceRequestTimeoutCapSeconds = 60;
+    constexpr long kChatHistoryAnswerTimeoutMs = 60000L;
 
     // Per-thread hook used to notify UI on the *first* retry (e.g. show "Still analyzing...").
     thread_local std::function<void()> tl_onFirstRetry;
@@ -9234,8 +9280,8 @@ static VideoSearchHistoryAnswerDecision_ decideVideoSearchHistoryAnswer_(
 
     llmConfig.answerTimeoutMs =
         (llmConfig.answerTimeoutMs > 0)
-        ? (std::min)(llmConfig.answerTimeoutMs, 18000L)
-        : 18000L;
+        ? (std::min)(llmConfig.answerTimeoutMs, kChatHistoryAnswerTimeoutMs)
+        : kChatHistoryAnswerTimeoutMs;
     llmConfig.answerRetries = 0;
 
     chatv2::LocalLlmClient llmClient;
@@ -19862,6 +19908,12 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     chatTemporalState.planEnvelope,
                     temporalDecisionNowIso
                 );
+                if (eval.report) {
+                    temporal::acknowledgeDeliveredReportMarkers(
+                        chatTemporalState.state,
+                        eval.reportDeliveryMarkers,
+                        temporalDecisionNowIso);
+                }
                 if (eval.alert) chatTemporalAlert = true;
                 if (eval.report) chatTemporalReport = true;
                 if (eval.operatorResults.is_array() && !eval.operatorResults.empty()) {
@@ -27626,7 +27678,8 @@ VideoHit AgentCore::callGeminiVisionVideoSegment_(
     const std::string& geminiApiKey,
     int& outPromptTokens,
     int& outOutputTokens,
-    int& outTotalTokens)
+    int& outTotalTokens,
+    int requestTimeoutSeconds)
 {
     VideoHit hit;
     hit.segmentStartTs = segment.startTs;
@@ -27639,6 +27692,9 @@ VideoHit AgentCore::callGeminiVisionVideoSegment_(
     hit.segmentEndTs = segment.endTs;
 
     outPromptTokens = outOutputTokens = outTotalTokens = 0;
+    if (requestTimeoutSeconds <= 0) {
+        requestTimeoutSeconds = kAgentInferenceRequestTimeoutCapSeconds;
+    }
 
 
     if (segment.bytes.empty()) {
@@ -27652,6 +27708,22 @@ VideoHit AgentCore::callGeminiVisionVideoSegment_(
     const std::vector<FaceReferenceImage> effectiveFaceReferences =
         buildEffectiveFaceReferences_(std::vector<FaceReferenceImage>{}, uploadedImageBase64);
     const bool hasFaceReferences = !effectiveFaceReferences.empty();
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     // 1) Build parts
     //nlohmann::json parts = nlohmann::json::array();
@@ -27809,11 +27881,21 @@ VideoHit AgentCore::callGeminiVisionVideoSegment_(
         //}
         std::string rawResp;
         try {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    "agent",
+                    "callGeminiVisionVideoSegment_: request budget exhausted before HTTP call"
+                );
+                return hit;
+            }
             rawResp = httpPostJsonGemini(
                 apiKey,
                 modelName,
                 body,
-                []() { MaybeNotifyFirstRetry(); }
+                []() { MaybeNotifyFirstRetry(); },
+                remainingRequestTimeoutSeconds()
             );
         }
         catch (const std::exception& e) {
@@ -29437,7 +29519,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     int& outOutputTokens,
     int& outTotalTokens,
     bool requestCoreChatPriority,
-    const std::function<bool()>& shouldAbort)
+    const std::function<bool()>& shouldAbort,
+    int requestTimeoutSeconds)
 {
     VideoHit hit;
     hit.segmentStartTs = segment.startTs;
@@ -29448,6 +29531,9 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
     modelInputFps = clampRequestedModelFps_(modelInputFps);
     if (expectedWindowSeconds < 0) expectedWindowSeconds = 0;
     runningResolution = (runningResolution == 1024) ? 1024 : 640;
+    if (requestTimeoutSeconds <= 0) {
+        requestTimeoutSeconds = kAgentInferenceRequestTimeoutCapSeconds;
+    }
 
     if (openAiApiKey.empty()) {
         Logger::instance().logDebug("agent", "callOpenAIVisionVideoSegment_: missing OpenAI api key");
@@ -29494,6 +29580,22 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         !faceReferences.empty() ||
         !negativeReferences.empty();
     const std::string errorSource = cameraStyleFlow ? "job_or_camera_video" : "chat_video";
+    const auto requestBudgetDeadline =
+        requestTimeoutSeconds > 0
+            ? (std::chrono::steady_clock::now() + std::chrono::seconds(requestTimeoutSeconds))
+            : std::chrono::steady_clock::time_point{};
+    auto remainingRequestTimeoutSeconds = [&]() -> long {
+        if (requestTimeoutSeconds <= 0) {
+            return 0L;
+        }
+        const auto nowForBudget = std::chrono::steady_clock::now();
+        if (nowForBudget >= requestBudgetDeadline) {
+            return 1L;
+        }
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(requestBudgetDeadline - nowForBudget).count();
+        return (std::max)(1L, static_cast<long>((remainingMs + 999) / 1000));
+    };
 
     try {
         std::string videoPath = segment.sourceFilePath;
@@ -29619,9 +29721,33 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
         std::string rawResp;
         OpenAITextObjectResponse_ parsedResponse;
         auto postAndParse = [&](int requestedLimit, int attemptNo) -> bool {
+            if (requestTimeoutSeconds > 0 &&
+                std::chrono::steady_clock::now() >= requestBudgetDeadline)
+            {
+                Logger::instance().logDebug(
+                    camLogId,
+                    "callOpenAIVisionVideoSegment_: request budget exhausted before attempt=" +
+                    std::to_string(attemptNo)
+                );
+                return false;
+            }
             nlohmann::json reqBody = body;
             applyOpenAITokenLimitField_(reqBody, modelName, requestedLimit);
             const auto coreRequestStart = std::chrono::steady_clock::now();
+            std::function<bool()> shouldAbortWait;
+            long requestTimeoutOverrideSec = 0L;
+            if (requestTimeoutSeconds > 0 || shouldAbort) {
+                shouldAbortWait = [shouldAbort, requestTimeoutSeconds, requestBudgetDeadline]() {
+                    if (shouldAbort && shouldAbort()) {
+                        return true;
+                    }
+                    return requestTimeoutSeconds > 0 &&
+                        std::chrono::steady_clock::now() >= requestBudgetDeadline;
+                };
+            }
+            if (requestTimeoutSeconds > 0) {
+                requestTimeoutOverrideSec = remainingRequestTimeoutSeconds();
+            }
 
             try {
                 if (useResponsesTransport) {
@@ -29630,9 +29756,10 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         requestCoreChatPriority,
-                        shouldAbort,
+                        shouldAbortWait,
                         requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
                 else {
@@ -29641,9 +29768,10 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                         reqBody,
                         []() { MaybeNotifyFirstRetry(); },
                         requestCoreChatPriority,
-                        shouldAbort,
+                        shouldAbortWait,
                         requestCoreChatPriority ? "chat_video_segment" : "background_video_segment",
-                        camLogId
+                        camLogId,
+                        requestTimeoutOverrideSec
                     );
                 }
             }
@@ -29676,7 +29804,8 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                         { "attempt", attemptNo },
                         { "segment_start_ts", segmentStartForPrompt },
                         { "segment_end_ts", segmentEndForPrompt },
-                        { "expected_window_seconds", expectedWindowSeconds }
+                        { "expected_window_seconds", expectedWindowSeconds },
+                        { "request_timeout_seconds", requestTimeoutSeconds }
                     }
                 );
                 return false;
@@ -30502,7 +30631,10 @@ VideoHit AgentCore::runCameraCustomVideoInference(
             videoPackagingMode,
             outPromptTokens,
             outOutputTokens,
-            outTotalTokens
+            outTotalTokens,
+            false,
+            std::function<bool()>{},
+            kAgentInferenceRequestTimeoutCapSeconds
         );
     }
     catch (const std::exception& ex) {
@@ -30585,7 +30717,8 @@ VideoHit AgentCore::runCameraCustomImageInference(
             snapshotTsUtcIso,
             outPromptTokens,
             outOutputTokens,
-            outTotalTokens
+            outTotalTokens,
+            kAgentInferenceRequestTimeoutCapSeconds
         );
     }
     catch (const std::exception& ex) {
@@ -35343,6 +35476,98 @@ void AgentCore::postTemporalCompileResultEvent_(
     postAgentEvent("temporal_compile_result", std::nullopt, "", "", details);
 }
 
+void AgentCore::handleTemporalRecompileCommand_(
+    int commandId,
+    const nlohmann::json& payload)
+{
+    auto fail = [&](const std::string& reason) {
+        if (commandId <= 0) return;
+        nlohmann::json err;
+        err["error"] = reason;
+        postCommandResult_(commandId, "failed", err);
+    };
+
+    const std::string sourceType = trimAscii(payload.value("source_type", std::string()));
+    const int sourceId = payload.value("source_id", -1);
+    const std::string promptCore = trimAscii(
+        payload.value("prompt_core", payload.value("prompt_template", std::string()))
+    );
+    const std::string alertCondition = trimAscii(payload.value("alert_condition", std::string()));
+    const std::string negativeCondition =
+        trimAscii(payload.value("negative_condition", std::string()));
+    std::string inputType = trimAscii(payload.value("input_type", std::string("video")));
+    if (inputType.empty()) inputType = "video";
+    std::string language = trimAscii(
+        payload.value("user_language", payload.value("language", std::string("pt-BR")))
+    );
+    if (language.empty()) language = "pt-BR";
+    std::string modelFamily = trimAscii(
+        payload.value("model_family", payload.value("inference_model", std::string("ultra")))
+    );
+    if (modelFamily.empty()) modelFamily = "ultra";
+    const std::string compileApiKey = trimAscii(
+        payload.value("model_api_key", payload.value("api_key", std::string()))
+    );
+    const bool persistResult = payload.value("persist_result", true);
+    std::string runtimeLogId = trimAscii(payload.value("runtime_log_id", std::string()));
+
+    if (sourceType != "camera_algorithm" && sourceType != "job_step_agent") {
+        fail("source_type must be camera_algorithm or job_step_agent");
+        return;
+    }
+    if (sourceId <= 0) {
+        fail("source_id must be a positive integer");
+        return;
+    }
+    if (promptCore.empty()) {
+        fail("prompt_core is required");
+        return;
+    }
+    if (alertCondition.empty()) {
+        fail("alert_condition is required");
+        return;
+    }
+    if (compileApiKey.empty()) {
+        fail("model_api_key is required");
+        return;
+    }
+    if (runtimeLogId.empty()) {
+        runtimeLogId =
+            sourceType == "camera_algorithm"
+                ? std::string("camera")
+                : std::string("agent");
+    }
+
+    nlohmann::json envelope = nlohmann::json::object();
+    const bool temporalReady = ensureTemporalPlanForRuntime(
+        sourceType,
+        sourceId,
+        promptCore,
+        alertCondition,
+        negativeCondition,
+        inputType,
+        language,
+        modelFamily,
+        compileApiKey,
+        envelope,
+        persistResult,
+        runtimeLogId
+    );
+
+    if (commandId > 0) {
+        const nlohmann::json plan = temporal::extractPlan(envelope);
+        nlohmann::json result = {
+            { "source_type", sourceType },
+            { "source_id", sourceId },
+            { "temporal_ready", temporalReady },
+            { "plan_usable", temporal::planUsable(envelope) },
+            { "compile_status", temporal::compileStatusValue(envelope, temporalReady ? "ok" : "legacy_fallback") },
+            { "plan_hash", plan.is_object() ? plan.value("plan_hash", std::string()) : std::string() }
+        };
+        postCommandResult_(commandId, "completed", result);
+    }
+}
+
 void AgentCore::pruneChatTemporalSessions_()
 {
     std::lock_guard<std::mutex> lock(chatTemporalMu_);
@@ -35375,7 +35600,13 @@ bool AgentCore::ensureTemporalPlanForRuntime(
 {
     const std::string schemaVersion = "temporal-plan/1.0";
     const std::string promptHash =
-        temporal::computePromptRevisionHash(promptCore, alertCondition);
+        temporal::computePromptRevisionHash(
+            promptCore,
+            alertCondition,
+            negativeCondition,
+            inputType,
+            language,
+            true);
     const std::string mergedTemporalPrompt =
         temporal::lower(temporal::trim(promptCore + " " + alertCondition + " " + negativeCondition));
     const std::string compileModel = temporal::compileModelForFamily(modelFamily);
@@ -35427,7 +35658,14 @@ bool AgentCore::ensureTemporalPlanForRuntime(
     };
 
     auto envelopeMatchesPromptRevision = [&](const nlohmann::json& env) -> bool {
-        return temporal::planMatchesPromptRevision(env, promptCore, alertCondition);
+        return temporal::planMatchesPromptRevision(
+            env,
+            promptCore,
+            alertCondition,
+            negativeCondition,
+            inputType,
+            language,
+            true);
     };
     auto envelopeHasUnsafeThreatShortcut = [&](const nlohmann::json& env) -> bool {
         return temporal::looksLikeThreatEvidencePrompt(mergedTemporalPrompt) &&
@@ -35445,7 +35683,8 @@ bool AgentCore::ensureTemporalPlanForRuntime(
             alertCondition,
             negativeCondition,
             inputType,
-            language
+            language,
+            true
         );
         if (compileStatus == "ok") {
             nlohmann::json plan = temporal::extractPlan(env);
@@ -35700,7 +35939,8 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithGemini_(
                     geminiApiKey,
                     batchPrompt,
                     batchOutput,
-                    batchTotal
+                    batchTotal,
+                    kAgentInferenceRequestTimeoutCapSeconds
                 );
 
                 hit.segmentIndex = idx;
@@ -35860,7 +36100,8 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithOpenAI_(
                     batchOutput,
                     batchTotal,
                     requestCoreChatPriority,
-                    shouldAbort
+                    shouldAbort,
+                    kAgentInferenceRequestTimeoutCapSeconds
                 );
 
                 hit.segmentIndex = idx;
@@ -36193,6 +36434,12 @@ AgentCore::ChatTemporalVideoAnalysisResult AgentCore::analyzeVideosWithOpenAISeq
             chatTemporalState.planEnvelope,
             roundDecisionNow
         );
+        if (eval.report) {
+            temporal::acknowledgeDeliveredReportMarkers(
+                chatTemporalState.state,
+                eval.reportDeliveryMarkers,
+                roundDecisionNow);
+        }
         if (eval.alert) result.temporalAlert = true;
         if (eval.report) result.temporalReport = true;
         if (eval.operatorResults.is_array() && !eval.operatorResults.empty()) {

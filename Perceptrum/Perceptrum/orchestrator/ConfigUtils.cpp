@@ -7,7 +7,7 @@
 #include <limits>
 #include <unordered_set>
 
-#include <windows.h>
+#include "../platform/platform_common.h"
 
 namespace chatv2 {
 
@@ -79,28 +79,18 @@ std::string trimCopy(std::string value)
 
 std::string readEnvVar(const char* name)
 {
-    if (!name || !*name) return "";
-
-    char* raw = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&raw, &length, name) != 0 || !raw) {
-        return "";
-    }
-
-    std::string value(raw);
-    free(raw);
-    return trimCopy(std::move(value));
+    return trimCopy(perceptrum::platform::ReadEnvVar(name));
 }
 
 fs::path getExecutableDirPath()
 {
-    wchar_t buffer[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        return fs::current_path();
+    const fs::path executableDirectory = perceptrum::platform::GetExecutableDirectory();
+    if (!executableDirectory.empty()) {
+        return executableDirectory;
     }
 
-    return fs::path(buffer).parent_path();
+    std::error_code ec;
+    return fs::current_path(ec);
 }
 
 std::vector<fs::path> buildConfigSearchRoots()

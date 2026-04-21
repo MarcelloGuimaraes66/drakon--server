@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../platform/platform_common.h"
+
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -22,7 +24,10 @@ struct RuntimeBrandConfig {
     std::string emailSubjectPrefix;
     std::string appUserModelId;
     std::string trayIconGuid;
+    std::string storageNamespace;
     std::string dataRootWindows;
+    std::string dataRootMacOS;
+    std::string dataRootLinux;
     std::string inferenceLoopTempDirName;
     std::string jobsInferenceTempDirName;
     std::string videoSegmentsTempDirName;
@@ -100,7 +105,10 @@ inline const detail::NarrowValue kAboutVersionText{ []() { return detail::config
 inline const detail::NarrowValue kEmailSubjectPrefix{ []() { return detail::config().emailSubjectPrefix.c_str(); } };
 inline const detail::NarrowValue kAppUserModelId{ []() { return detail::config().appUserModelId.c_str(); } };
 inline const detail::NarrowValue kTrayIconGuid{ []() { return detail::config().trayIconGuid.c_str(); } };
+inline const detail::NarrowValue kStorageNamespace{ []() { return detail::config().storageNamespace.c_str(); } };
 inline const detail::NarrowValue kDataRootWindows{ []() { return detail::config().dataRootWindows.c_str(); } };
+inline const detail::NarrowValue kDataRootMacOS{ []() { return detail::config().dataRootMacOS.c_str(); } };
+inline const detail::NarrowValue kDataRootLinux{ []() { return detail::config().dataRootLinux.c_str(); } };
 inline const detail::NarrowValue kInferenceLoopTempDirName{ []() { return detail::config().inferenceLoopTempDirName.c_str(); } };
 inline const detail::NarrowValue kJobsInferenceTempDirName{ []() { return detail::config().jobsInferenceTempDirName.c_str(); } };
 inline const detail::NarrowValue kVideoSegmentsTempDirName{ []() { return detail::config().videoSegmentsTempDirName.c_str(); } };
@@ -123,7 +131,25 @@ inline const detail::WideValue kAppUserModelIdW{ []() { return detail::config().
 inline const detail::WideValue kTrayIconGuidW{ []() { return detail::config().trayIconGuidW.c_str(); } };
 
 inline std::filesystem::path dataRoot() {
-    return std::filesystem::path(static_cast<const char*>(kDataRootWindows));
+#if defined(_WIN32)
+    const std::string configuredRoot = detail::config().dataRootWindows;
+#elif defined(__APPLE__)
+    const std::string configuredRoot = detail::config().dataRootMacOS;
+#elif defined(__linux__)
+    const std::string configuredRoot = detail::config().dataRootLinux;
+#else
+    const std::string configuredRoot;
+#endif
+
+    if (!configuredRoot.empty()) {
+        return perceptrum::platform::ExpandUserPath(std::filesystem::path(configuredRoot));
+    }
+
+    const std::string baseFolderName =
+        detail::config().displayName.empty()
+            ? detail::config().brandId + "Data"
+            : detail::config().displayName + "Data";
+    return perceptrum::platform::GetPlatformDataRoot(baseFolderName);
 }
 
 inline std::filesystem::path inferenceLoopTempRoot() {

@@ -98,6 +98,12 @@
     <VcpkgLibraryRoot Condition="'$(VcpkgLibraryRoot)' == ''">$(VcpkgInstalledDir)\installed\x64-windows\lib\</VcpkgLibraryRoot>
     <VcpkgRuntimeBinRoot Condition="'$(Configuration)' == 'Debug'">$(VcpkgInstalledDir)\installed\x64-windows\debug\bin\</VcpkgRuntimeBinRoot>
     <VcpkgRuntimeBinRoot Condition="'$(VcpkgRuntimeBinRoot)' == ''">$(VcpkgInstalledDir)\installed\x64-windows\bin\</VcpkgRuntimeBinRoot>
+    <CurlImportLibrary Condition="'$(Configuration)' == 'Debug'">libcurl-d.lib</CurlImportLibrary>
+    <CurlImportLibrary Condition="'$(CurlImportLibrary)' == ''">libcurl.lib</CurlImportLibrary>
+    <CurlRuntimeDll Condition="'$(Configuration)' == 'Debug'">libcurl-d.dll</CurlRuntimeDll>
+    <CurlRuntimeDll Condition="'$(CurlRuntimeDll)' == ''">libcurl.dll</CurlRuntimeDll>
+    <ZlibRuntimeDll Condition="'$(Configuration)' == 'Debug'">zlibd1.dll</ZlibRuntimeDll>
+    <ZlibRuntimeDll Condition="'$(ZlibRuntimeDll)' == ''">zlib1.dll</ZlibRuntimeDll>
     <DisableXbfGeneration>true</DisableXbfGeneration>
     <WebView2ProjectKind>native</WebView2ProjectKind>
     <WindowsSdkBuildToolsPackageDir>$(NuGetPackageRoot)microsoft.windows.sdk.buildtools\$(WindowsSdkBuildToolsPackageVersion)\</WindowsSdkBuildToolsPackageDir>
@@ -132,7 +138,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>libcurl.lib;avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;shell32.lib;winhttp.lib;winsqlite3.lib;libpq.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -316,10 +322,10 @@
       <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avcodec-61.dll" />
       <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avformat-61.dll" />
       <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)avutil-59.dll" />
-      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)libcurl.dll" />
+    <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)$(CurlRuntimeDll)" />
       <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)swresample-5.dll" />
       <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)swscale-8.dll" />
-      <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)zlib1.dll" />
+    <PerceptrumRuntimeDll Include="$(VcpkgRuntimeBinRoot)$(ZlibRuntimeDll)" />
     </ItemGroup>
     <Copy SourceFiles="@(PerceptrumRuntimeDll)"
           DestinationFolder="$(OutDir)"
