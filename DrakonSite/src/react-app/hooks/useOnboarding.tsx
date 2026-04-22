@@ -190,12 +190,23 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    writeOnboardingState({
+      version: 1,
+      status: "in_progress",
+      tutorialKind: "intro",
+      currentStepId: "welcome",
+      selectedProvider: null,
+      tutorialCameraId: null,
+      tutorialAgentId: null,
+      tutorialProceedWithoutWebcam: false,
+    }, onboardingUserId);
     moveToStep("welcome");
   }, [
     isHydrated,
     isOpen,
     location.pathname,
     moveToStep,
+    onboardingUserId,
     status,
     user?.requires_secret_recovery_setup,
   ]);

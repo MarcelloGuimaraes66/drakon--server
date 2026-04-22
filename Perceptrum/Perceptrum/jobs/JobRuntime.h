@@ -2,6 +2,8 @@
 #pragma once
 #include "JobTypes.h"
 #include "../core/ContentCoverageTracker.h"
+#include "../core/TemporalEvidence.h"
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -81,6 +83,8 @@ private:
                 std::chrono::system_clock::time_point targetEndUtc{};
                 std::string anchorUtcIso;
                 std::string targetEndUtcIso;
+                std::string capturedFrontierUtcIso;
+                std::string materializedFrontierUtcIso;
                 std::string coveredUntilUtcIso;
                 std::string latestCapturedUtcIso;
                 std::string firstGapStartUtcIso;
@@ -95,6 +99,7 @@ private:
                 long long analysisLagSeconds = 0;
                 bool analysisComplete = false;
                 std::string analysisStatus = "not_applicable";
+                std::string materializationStatus = "not_applicable";
                 contentcoverage::Tracker tracker;
             };
 
@@ -147,8 +152,23 @@ private:
         std::string promptHash;
         std::chrono::steady_clock::time_point touchedAt{};
     };
+    struct TemporalEvidenceItem {
+        std::string evidenceKey;
+        std::string eventName;
+        std::string entityId;
+        std::string zone;
+        int frameIndex = -1;
+        std::string frameTimestampInSegment;
+        std::string timestampName;
+        std::string timestampUtcIso;
+        std::string timestampLocalIso;
+        std::string reason;
+        std::string imageJpegBase64;
+    };
+    using TemporalEvidenceTrail = std::deque<TemporalEvidenceItem>;
     std::mutex temporalMu_;
     std::unordered_map<std::string, TemporalRuntimeSlot> temporalBySlot_;
+    std::unordered_map<std::string, TemporalEvidenceTrail> temporalEvidenceBySlot_;
     std::mutex crossCameraHuntsMu_;
     std::unordered_map<std::string, json> crossCameraHuntsByStep_;
 
@@ -211,4 +231,21 @@ private:
     static bool isLikelyJson_(const std::string& s);
 
     bool stepNeedsVideoCaptureForCamera_(const JobStepDef& step, int cameraId) const;
+
+    TemporalEvidenceTrail loadTemporalEvidenceTrail_(const std::string& temporalSlotKey);
+    void saveTemporalEvidenceTrail_(
+        const std::string& temporalSlotKey,
+        const TemporalEvidenceTrail& trail);
+    static std::string trimTemporalEvidenceValue_(const std::string& value);
+    static void mergeTemporalEvidenceTrail_(
+        TemporalEvidenceTrail& trail,
+        const std::vector<TemporalEvidenceCandidate>& candidates,
+        const std::vector<std::string>& acceptedEvidenceKeys);
+    static json buildTemporalAlertGroupImages_(
+        const TemporalEvidenceTrail& trail,
+        const json& operatorResults,
+        const std::vector<std::string>& fallbackEvidenceKeys,
+        int cameraId,
+        const std::string& cameraName);
+    static std::string extractFirstTemporalGroupImageB64_(const json& groupImages);
 };

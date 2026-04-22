@@ -1489,6 +1489,7 @@ void CameraSession::stop() {
         streamOnline_.store(false, std::memory_order_relaxed);
         descriptionFrameRequested_.store(false, std::memory_order_release);
         firstFrameCv_.notify_all();
+        forceFinalizeOpenClips("camera_stop_prejoin");
         if (!wasRunning) {
             Logger::instance().logDebug(
                 config_.id,
@@ -1581,6 +1582,8 @@ void CameraSession::stop() {
             );
         }
 
+        forceFinalizeOpenClips("camera_stop_postjoin");
+
 
         Logger::instance().logDebug(
             config_.id,
@@ -1635,6 +1638,18 @@ void CameraSession::stop() {
             "CameraSession::stop(): unknown exception"
         );
     }
+}
+
+FrameDiskWriter::MaterializeOpenClipResult CameraSession::materializeOpenClipThroughUtc(
+    const std::chrono::system_clock::time_point& targetUtc,
+    int preferredClipSeconds)
+{
+    return frameDiskWriter_.materializeOpenClipThroughUtc(targetUtc, preferredClipSeconds);
+}
+
+void CameraSession::forceFinalizeOpenClips(const std::string& reason)
+{
+    frameDiskWriter_.forceFinalizeAllOpenClips(reason);
 }
 
 
@@ -6367,6 +6382,9 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
         this->temporalEvidenceByAlgo_ = std::move(nextTemporalEvidence);
     }
 
+    if (running_.load(std::memory_order_relaxed)) {
+        forceFinalizeOpenClips("camera_algorithm_update");
+    }
     frameDiskWriter_.setCaptureProfiles(getEffectiveRecordingProfiles_());
 }
 
@@ -7328,6 +7346,7 @@ void CameraSession::inferenceLoop_() {
                              temporalLanguage,
                              true
                          ));
+                    const bool resetTemporalEvidenceTrail = !slotPlanMatchesCurrentPrompt;
                     if (!slotPlanMatchesCurrentPrompt) {
                         temporalSlot.planEnvelope = payloadPlanMatchesCurrentPrompt
                             ? customAlgo.temporalPlanEnvelope
@@ -7428,9 +7447,213 @@ void CameraSession::inferenceLoop_() {
                     std::string decisionSource = "llm";
                     std::string temporalDecisionSummary;
                     nlohmann::json temporalReportDeliveryMarkers = nlohmann::json::array();
+                    auto trimImageEvidenceValue = [](const std::string& value) -> std::string {
+                        const auto first = value.find_first_not_of(" \t\r\n");
+                        if (first == std::string::npos) return std::string();
+                        const auto last = value.find_last_not_of(" \t\r\n");
+                        return value.substr(first, last - first + 1);
+                    };
+                    auto mergeImageTemporalEvidenceTrailLocked =
+                        [&](TemporalEvidenceTrail& trail,
+                            const std::vector<TemporalEvidenceCandidate>& candidates,
+                            const std::vector<std::string>& acceptedEvidenceKeys) {
+                            if (trail.empty() && candidates.empty()) return;
+
+                            std::set<std::string> acceptedKeys;
+                            for (const auto& rawKey : acceptedEvidenceKeys) {
+                                const std::string key = trimImageEvidenceValue(rawKey);
+                                if (!key.empty()) acceptedKeys.insert(key);
+                            }
+
+                            std::set<std::string> existingKeys;
+                            for (const auto& item : trail) {
+                                const std::string key = trimImageEvidenceValue(item.evidenceKey);
+                                if (!key.empty()) existingKeys.insert(key);
+                            }
+
+                            constexpr std::size_t kMaxTemporalEvidenceTrailItems = 48;
+                            for (const auto& candidate : candidates) {
+                                const std::string evidenceKey =
+                                    trimImageEvidenceValue(candidate.evidenceKey);
+                                if (evidenceKey.empty()) continue;
+                                if (!acceptedKeys.empty() &&
+                                    acceptedKeys.find(evidenceKey) == acceptedKeys.end())
+                                {
+                                    continue;
+                                }
+                                if (!existingKeys.insert(evidenceKey).second) continue;
+                                if (trimImageEvidenceValue(candidate.imageJpegBase64).empty()) continue;
+
+                                TemporalEvidenceItem item;
+                                item.evidenceKey = evidenceKey;
+                                item.eventName = trimImageEvidenceValue(candidate.eventName);
+                                item.entityId = trimImageEvidenceValue(candidate.entityId);
+                                item.zone = trimImageEvidenceValue(candidate.zone);
+                                item.frameIndex = candidate.frameIndex;
+                                item.frameTimestampInSegment =
+                                    trimImageEvidenceValue(candidate.frameTimestampInSegment);
+                                item.timestampName = trimImageEvidenceValue(candidate.timestampName);
+                                item.timestampUtcIso = trimImageEvidenceValue(candidate.timestampUtcIso);
+                                item.timestampLocalIso =
+                                    trimImageEvidenceValue(candidate.timestampLocalIso);
+                                item.reason = trimImageEvidenceValue(candidate.reason);
+                                item.imageJpegBase64 =
+                                    trimImageEvidenceValue(candidate.imageJpegBase64);
+                                trail.push_back(std::move(item));
+                            }
+
+                            while (trail.size() > kMaxTemporalEvidenceTrailItems) {
+                                trail.pop_front();
+                            }
+                        };
+                    auto buildImageTemporalAlertGroupImages =
+                        [&](const TemporalEvidenceTrail& trail,
+                            const nlohmann::json& operatorResults,
+                            const std::vector<std::string>& fallbackEvidenceKeys) -> nlohmann::json {
+                            std::set<std::string> requestedEvidenceKeys;
+                            auto enqueueRequestedKey = [&](const std::string& rawKey) {
+                                const std::string key = trimImageEvidenceValue(rawKey);
+                                if (!key.empty()) requestedEvidenceKeys.insert(key);
+                            };
+                            auto enqueueContributingEvents =
+                                [&](const nlohmann::json& contributingEvents) {
+                                if (!contributingEvents.is_array()) return;
+                                for (const auto& contributing : contributingEvents) {
+                                    if (!contributing.is_object()) continue;
+                                    enqueueRequestedKey(
+                                        temporal::strField(contributing, "temporal_evidence_key"));
+                                }
+                            };
+
+                            if (operatorResults.is_array()) {
+                                for (const auto& result : operatorResults) {
+                                    if (!result.is_object()) continue;
+                                    const auto itContributing = result.find("contributing_events");
+                                    if (itContributing != result.end()) {
+                                        enqueueContributingEvents(*itContributing);
+                                    }
+                                    const auto itLatestCheckpoint = result.find("latest_checkpoint");
+                                    if (itLatestCheckpoint != result.end() &&
+                                        itLatestCheckpoint->is_object())
+                                    {
+                                        const auto itCheckpointContributing =
+                                            itLatestCheckpoint->find("contributing_events");
+                                        if (itCheckpointContributing != itLatestCheckpoint->end()) {
+                                            enqueueContributingEvents(*itCheckpointContributing);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (requestedEvidenceKeys.empty()) {
+                                for (const auto& key : fallbackEvidenceKeys) {
+                                    enqueueRequestedKey(key);
+                                }
+                            }
+
+                            auto selectImagesForKeys = [&](const std::set<std::string>& selectedKeys) {
+                                nlohmann::json out = nlohmann::json::array();
+                                std::set<std::string> visualKeys;
+                                constexpr std::size_t kMaxAlertImages = 8;
+                                for (const auto& item : trail) {
+                                    const std::string evidenceKey =
+                                        trimImageEvidenceValue(item.evidenceKey);
+                                    if (!selectedKeys.empty() &&
+                                        selectedKeys.find(evidenceKey) == selectedKeys.end())
+                                    {
+                                        continue;
+                                    }
+                                    if (trimImageEvidenceValue(item.imageJpegBase64).empty()) continue;
+
+                                    std::string visualKey = item.timestampName;
+                                    if (visualKey.empty() && item.frameIndex >= 0) {
+                                        visualKey = "frame:" + std::to_string(item.frameIndex);
+                                    }
+                                    if (visualKey.empty()) {
+                                        visualKey = trimImageEvidenceValue(item.timestampUtcIso);
+                                    }
+                                    if (visualKey.empty()) {
+                                        visualKey = evidenceKey;
+                                    }
+                                    if (!visualKeys.insert(visualKey).second) continue;
+
+                                    nlohmann::json entry = nlohmann::json::object();
+                                    entry["camera_id"] = cameraIdNumeric;
+                                    entry["camera_name"] = config_.name;
+                                    entry["image_jpeg_b64"] = item.imageJpegBase64;
+                                    entry["temporal_evidence_key"] = evidenceKey;
+                                    if (!item.timestampUtcIso.empty()) {
+                                        entry["snapshot_ts_utc_iso"] = item.timestampUtcIso;
+                                    }
+                                    if (!item.timestampLocalIso.empty()) {
+                                        entry["snapshot_ts_local_iso"] = item.timestampLocalIso;
+                                    }
+                                    if (!item.timestampName.empty()) {
+                                        entry["timestamp_name"] = item.timestampName;
+                                    }
+                                    if (item.frameIndex >= 0) {
+                                        entry["frame_index"] = item.frameIndex;
+                                    }
+                                    if (!item.frameTimestampInSegment.empty()) {
+                                        entry["frame_timestamp_in_segment"] =
+                                            item.frameTimestampInSegment;
+                                    }
+                                    if (!item.eventName.empty()) {
+                                        entry["event"] = item.eventName;
+                                    }
+                                    if (!item.entityId.empty()) {
+                                        entry["entity_id"] = item.entityId;
+                                    }
+                                    if (!item.zone.empty()) {
+                                        entry["zone"] = item.zone;
+                                    }
+                                    if (!item.reason.empty()) {
+                                        entry["reason"] = item.reason;
+                                    }
+                                    out.push_back(std::move(entry));
+                                }
+
+                                while (out.size() > kMaxAlertImages) {
+                                    out.erase(out.begin());
+                                }
+                                return out;
+                            };
+
+                            nlohmann::json selectedImages =
+                                selectImagesForKeys(requestedEvidenceKeys);
+                            if (selectedImages.empty() && !trail.empty()) {
+                                std::set<std::string> fallbackKeys;
+                                fallbackKeys.insert(
+                                    trimImageEvidenceValue(trail.back().evidenceKey));
+                                selectedImages = selectImagesForKeys(fallbackKeys);
+                            }
+                            return selectedImages;
+                        };
+                    auto extractFirstImageTemporalGroupImageB64 =
+                        [&](const nlohmann::json& groupImages) -> std::string {
+                        if (!groupImages.is_array()) return std::string();
+                        for (const auto& item : groupImages) {
+                            if (!item.is_object()) continue;
+                            const auto itImage = item.find("image_jpeg_b64");
+                            if (itImage != item.end() && itImage->is_string()) {
+                                const std::string value =
+                                    trimImageEvidenceValue(itImage->get<std::string>());
+                                if (!value.empty()) return value;
+                            }
+                            const auto itFrame = item.find("frame_jpeg_base64");
+                            if (itFrame != item.end() && itFrame->is_string()) {
+                                const std::string value =
+                                    trimImageEvidenceValue(itFrame->get<std::string>());
+                                if (!value.empty()) return value;
+                            }
+                        }
+                        return std::string();
+                    };
 
                     const bool localAlertSignal = finalAlert;
                     const std::string localDecisionSource = decisionSource;
+                    std::vector<std::string> roundEvidenceKeys;
+                    TemporalEvidenceTrail temporalEvidenceTrailSnapshot;
                     if (temporalPlanActive) {
                         temporal::applyRound(
                             temporalSlot.state,
@@ -7477,6 +7700,7 @@ void CameraSession::inferenceLoop_() {
                         primaryHit.alertCondition = eval.alert;
                         decisionSource = "temporal_engine";
                         temporalDecisionSummary = eval.summary;
+                        roundEvidenceKeys = temporal::extractLastRoundEvidenceKeys(temporalSlot.state);
                         if (finalAlert &&
                             temporal::shouldSuppressStalePresenceCarryAlert(
                                 temporalOperatorResults,
@@ -7510,6 +7734,17 @@ void CameraSession::inferenceLoop_() {
                         {
                             std::lock_guard<std::mutex> lock(temporalMutex_);
                             temporalByAlgo_[temporalSlotKey] = temporalSlot;
+                            TemporalEvidenceTrail& trail =
+                                this->temporalEvidenceByAlgo_[temporalSlotKey];
+                            if (resetTemporalEvidenceTrail) {
+                                trail.clear();
+                            }
+                            mergeImageTemporalEvidenceTrailLocked(
+                                trail,
+                                primaryHit.temporalEvidenceCandidates,
+                                roundEvidenceKeys
+                            );
+                            temporalEvidenceTrailSnapshot = trail;
                         }
                         if (fallbackToLocalAlert && !finalAlert) {
                             finalAlert = true;
@@ -7540,6 +7775,14 @@ void CameraSession::inferenceLoop_() {
                         std::lock_guard<std::mutex> lock(temporalMutex_);
                         temporalByAlgo_[temporalSlotKey] = temporalSlot;
                     }
+
+                    const nlohmann::json temporalGroupImages =
+                        buildImageTemporalAlertGroupImages(
+                            temporalEvidenceTrailSnapshot,
+                            temporalOperatorResults,
+                            roundEvidenceKeys);
+                    const std::string temporalFallbackImageB64 =
+                        extractFirstImageTemporalGroupImageB64(temporalGroupImages);
 
                     const std::string cameraAgentEventAtUtc =
                         !primaryHit.eventTimestampUtcIso.empty()
@@ -7635,6 +7878,7 @@ void CameraSession::inferenceLoop_() {
                         reportDetails["inference_model"] = customAlgo.inferenceModel;
                         reportDetails["model"] = customAlgo.modelName;
                         reportDetails["operator_results"] = temporalOperatorResults;
+                        reportDetails["temporal_operator_results"] = temporalOperatorResults;
                         reportDetails["answer"] = primaryHit.answer;
                         reportDetails["decision_source"] = decisionSource;
                         reportDetails["llm_alert_condition"] = llmAlertCondition;
@@ -7662,6 +7906,13 @@ void CameraSession::inferenceLoop_() {
                         }
                         if (!temporalDecisionSummary.empty()) {
                             reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
+                        }
+                        if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+                            reportDetails["group_images"] = temporalGroupImages;
+                            reportDetails["group_image_count"] = temporalGroupImages.size();
+                        }
+                        if (!temporalFallbackImageB64.empty()) {
+                            reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
                         }
                         if (temporalReportDeliveryMarkers.is_array() &&
                             !temporalReportDeliveryMarkers.empty())
@@ -7767,6 +8018,10 @@ void CameraSession::inferenceLoop_() {
                             extra["temporal_operator_results"] = temporalOperatorResults;
                             if (!temporalDecisionSummary.empty()) {
                                 extra["temporal_decision_summary"] = temporalDecisionSummary;
+                            }
+                            if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+                                extra["group_images"] = temporalGroupImages;
+                                extra["group_image_count"] = temporalGroupImages.size();
                             }
                         }
 
@@ -8712,19 +8967,32 @@ void CameraSession::inferenceLoop_() {
                                     const std::string key = trimEvidenceValue(rawKey);
                                     if (!key.empty()) requestedEvidenceKeys.insert(key);
                                 };
+                                auto enqueueContributingEvents =
+                                    [&](const nlohmann::json& contributingEvents) {
+                                    if (!contributingEvents.is_array()) return;
+                                    for (const auto& contributing : contributingEvents) {
+                                        if (!contributing.is_object()) continue;
+                                        enqueueRequestedKey(
+                                            temporal::strField(contributing, "temporal_evidence_key"));
+                                    }
+                                };
 
                                 if (operatorResults.is_array()) {
                                     for (const auto& result : operatorResults) {
                                         if (!result.is_object()) continue;
-                                        if (temporal::lower(temporal::trim(temporal::strField(result, "value"))) != "true") {
-                                            continue;
-                                        }
                                         const auto itContributing = result.find("contributing_events");
-                                        if (itContributing == result.end() || !itContributing->is_array()) continue;
-                                        for (const auto& contributing : *itContributing) {
-                                            if (!contributing.is_object()) continue;
-                                            enqueueRequestedKey(
-                                                temporal::strField(contributing, "temporal_evidence_key"));
+                                        if (itContributing != result.end()) {
+                                            enqueueContributingEvents(*itContributing);
+                                        }
+                                        const auto itLatestCheckpoint = result.find("latest_checkpoint");
+                                        if (itLatestCheckpoint != result.end() &&
+                                            itLatestCheckpoint->is_object())
+                                        {
+                                            const auto itCheckpointContributing =
+                                                itLatestCheckpoint->find("contributing_events");
+                                            if (itCheckpointContributing != itLatestCheckpoint->end()) {
+                                                enqueueContributingEvents(*itCheckpointContributing);
+                                            }
                                         }
                                     }
                                 }
@@ -8810,6 +9078,26 @@ void CameraSession::inferenceLoop_() {
                                 }
                                 return selectedImages;
                             };
+                        auto extractFirstTemporalGroupImageB64 =
+                            [&](const nlohmann::json& groupImages) -> std::string {
+                            if (!groupImages.is_array()) return std::string();
+                            for (const auto& item : groupImages) {
+                                if (!item.is_object()) continue;
+                                const auto itImage = item.find("image_jpeg_b64");
+                                if (itImage != item.end() && itImage->is_string()) {
+                                    const std::string value =
+                                        trimEvidenceValue(itImage->get<std::string>());
+                                    if (!value.empty()) return value;
+                                }
+                                const auto itFrame = item.find("frame_jpeg_base64");
+                                if (itFrame != item.end() && itFrame->is_string()) {
+                                    const std::string value =
+                                        trimEvidenceValue(itFrame->get<std::string>());
+                                    if (!value.empty()) return value;
+                                }
+                            }
+                            return std::string();
+                        };
                         const bool payloadPlanMatchesCurrentPrompt =
                             temporal::decisionCacheable(customAlgo.temporalPlanEnvelope) &&
                             temporal::planMatchesPromptRevision(
@@ -9078,6 +9366,14 @@ void CameraSession::inferenceLoop_() {
                             temporalByAlgo_[temporalSlotKey] = temporalSlot;
                         }
 
+                        const nlohmann::json temporalGroupImages =
+                            buildTemporalAlertGroupImages(
+                                temporalEvidenceTrailSnapshot,
+                                temporalOperatorResults,
+                                roundEvidenceKeys);
+                        const std::string temporalFallbackImageB64 =
+                            extractFirstTemporalGroupImageB64(temporalGroupImages);
+
                         const std::string cameraAgentEventAtUtc =
                             !primaryHit.eventTimestampUtcIso.empty()
                                 ? primaryHit.eventTimestampUtcIso
@@ -9207,6 +9503,7 @@ void CameraSession::inferenceLoop_() {
                             reportDetails["inference_model"] = customAlgo.inferenceModel;
                             reportDetails["model"] = customAlgo.modelName;
                             reportDetails["operator_results"] = temporalOperatorResults;
+                            reportDetails["temporal_operator_results"] = temporalOperatorResults;
                             reportDetails["answer"] = primaryHit.answer;
                             reportDetails["decision_source"] = decisionSource;
                             reportDetails["llm_alert_condition"] = llmAlertCondition;
@@ -9240,6 +9537,13 @@ void CameraSession::inferenceLoop_() {
                             }
                             if (!temporalDecisionSummary.empty()) {
                                 reportDetails["temporal_decision_summary"] = temporalDecisionSummary;
+                            }
+                            if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+                                reportDetails["group_images"] = temporalGroupImages;
+                                reportDetails["group_image_count"] = temporalGroupImages.size();
+                            }
+                            if (!temporalFallbackImageB64.empty()) {
+                                reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
                             }
                             if (temporalReportDeliveryMarkers.is_array() &&
                                 !temporalReportDeliveryMarkers.empty())
@@ -9370,11 +9674,6 @@ void CameraSession::inferenceLoop_() {
                                 if (!temporalDecisionSummary.empty()) {
                                     extra["temporal_decision_summary"] = temporalDecisionSummary;
                                 }
-                                const nlohmann::json temporalGroupImages =
-                                    buildTemporalAlertGroupImages(
-                                        temporalEvidenceTrailSnapshot,
-                                        temporalOperatorResults,
-                                        roundEvidenceKeys);
                                 if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
                                     extra["group_images"] = temporalGroupImages;
                                     extra["group_image_count"] = temporalGroupImages.size();

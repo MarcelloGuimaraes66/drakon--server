@@ -1243,6 +1243,8 @@ function buildTemporalContributionKey(entry: any, fallbackIndex: number): string
 function countTemporalContributingEvents(payloadDetails: any): number {
   const operatorResults = Array.isArray(payloadDetails?.temporal_operator_results)
     ? payloadDetails.temporal_operator_results
+    : Array.isArray(payloadDetails?.operator_results)
+    ? payloadDetails.operator_results
     : [];
   const seen = new Set<string>();
 

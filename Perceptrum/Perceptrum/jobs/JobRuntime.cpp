@@ -1979,6 +1979,267 @@ static std::string trimCopyRuntime_(std::string s) {
     return s;
 }
 
+std::string JobRuntime::trimTemporalEvidenceValue_(const std::string& value) {
+    return trimCopyRuntime_(value);
+}
+
+JobRuntime::TemporalEvidenceTrail JobRuntime::loadTemporalEvidenceTrail_(
+    const std::string& temporalSlotKey)
+{
+    if (temporalSlotKey.empty()) {
+        return TemporalEvidenceTrail{};
+    }
+    std::lock_guard<std::mutex> lock(temporalMu_);
+    auto it = temporalEvidenceBySlot_.find(temporalSlotKey);
+    if (it == temporalEvidenceBySlot_.end()) {
+        return TemporalEvidenceTrail{};
+    }
+    return it->second;
+}
+
+void JobRuntime::saveTemporalEvidenceTrail_(
+    const std::string& temporalSlotKey,
+    const TemporalEvidenceTrail& trail)
+{
+    if (temporalSlotKey.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(temporalMu_);
+    temporalEvidenceBySlot_[temporalSlotKey] = trail;
+}
+
+void JobRuntime::mergeTemporalEvidenceTrail_(
+    TemporalEvidenceTrail& trail,
+    const std::vector<TemporalEvidenceCandidate>& candidates,
+    const std::vector<std::string>& acceptedEvidenceKeys)
+{
+    if (trail.empty() && candidates.empty()) {
+        return;
+    }
+
+    std::unordered_set<std::string> acceptedKeys;
+    acceptedKeys.reserve(acceptedEvidenceKeys.size());
+    for (const auto& rawKey : acceptedEvidenceKeys) {
+        const std::string key = trimTemporalEvidenceValue_(rawKey);
+        if (!key.empty()) {
+            acceptedKeys.insert(key);
+        }
+    }
+
+    std::unordered_set<std::string> existingKeys;
+    existingKeys.reserve(trail.size());
+    for (const auto& item : trail) {
+        const std::string key = trimTemporalEvidenceValue_(item.evidenceKey);
+        if (!key.empty()) {
+            existingKeys.insert(key);
+        }
+    }
+
+    constexpr std::size_t kMaxTemporalEvidenceTrailItems = 48;
+    for (const auto& candidate : candidates) {
+        const std::string evidenceKey = trimTemporalEvidenceValue_(candidate.evidenceKey);
+        if (evidenceKey.empty()) {
+            continue;
+        }
+        if (!acceptedKeys.empty() && acceptedKeys.find(evidenceKey) == acceptedKeys.end()) {
+            continue;
+        }
+        if (!existingKeys.insert(evidenceKey).second) {
+            continue;
+        }
+        if (trimTemporalEvidenceValue_(candidate.imageJpegBase64).empty()) {
+            continue;
+        }
+
+        TemporalEvidenceItem item;
+        item.evidenceKey = evidenceKey;
+        item.eventName = trimTemporalEvidenceValue_(candidate.eventName);
+        item.entityId = trimTemporalEvidenceValue_(candidate.entityId);
+        item.zone = trimTemporalEvidenceValue_(candidate.zone);
+        item.frameIndex = candidate.frameIndex;
+        item.frameTimestampInSegment =
+            trimTemporalEvidenceValue_(candidate.frameTimestampInSegment);
+        item.timestampName = trimTemporalEvidenceValue_(candidate.timestampName);
+        item.timestampUtcIso = trimTemporalEvidenceValue_(candidate.timestampUtcIso);
+        item.timestampLocalIso = trimTemporalEvidenceValue_(candidate.timestampLocalIso);
+        item.reason = trimTemporalEvidenceValue_(candidate.reason);
+        item.imageJpegBase64 = trimTemporalEvidenceValue_(candidate.imageJpegBase64);
+        trail.push_back(std::move(item));
+    }
+
+    while (trail.size() > kMaxTemporalEvidenceTrailItems) {
+        trail.pop_front();
+    }
+}
+
+json JobRuntime::buildTemporalAlertGroupImages_(
+    const TemporalEvidenceTrail& trail,
+    const json& operatorResults,
+    const std::vector<std::string>& fallbackEvidenceKeys,
+    int cameraId,
+    const std::string& cameraName)
+{
+    std::unordered_set<std::string> requestedEvidenceKeys;
+    auto enqueueRequestedKey = [&](const std::string& rawKey) {
+        const std::string key = trimTemporalEvidenceValue_(rawKey);
+        if (!key.empty()) {
+            requestedEvidenceKeys.insert(key);
+        }
+    };
+    auto enqueueContributingEvents = [&](const json& contributingEvents) {
+        if (!contributingEvents.is_array()) {
+            return;
+        }
+        for (const auto& contributing : contributingEvents) {
+            if (!contributing.is_object()) {
+                continue;
+            }
+            enqueueRequestedKey(
+                temporal::strField(contributing, "temporal_evidence_key"));
+        }
+    };
+
+    if (operatorResults.is_array()) {
+        for (const auto& result : operatorResults) {
+            if (!result.is_object()) {
+                continue;
+            }
+            const auto itContributing = result.find("contributing_events");
+            if (itContributing != result.end()) {
+                enqueueContributingEvents(*itContributing);
+            }
+            const auto itCheckpoint = result.find("latest_checkpoint");
+            if (itCheckpoint != result.end() && itCheckpoint->is_object()) {
+                const auto itCheckpointContributing =
+                    itCheckpoint->find("contributing_events");
+                if (itCheckpointContributing != itCheckpoint->end()) {
+                    enqueueContributingEvents(*itCheckpointContributing);
+                }
+            }
+        }
+    }
+
+    if (requestedEvidenceKeys.empty()) {
+        for (const auto& key : fallbackEvidenceKeys) {
+            enqueueRequestedKey(key);
+        }
+    }
+
+    auto selectImagesForKeys =
+        [&](const std::unordered_set<std::string>& selectedKeys) -> json {
+        json out = json::array();
+        std::unordered_set<std::string> visualKeys;
+        constexpr std::size_t kMaxAlertImages = 8;
+        for (const auto& item : trail) {
+            const std::string evidenceKey =
+                trimTemporalEvidenceValue_(item.evidenceKey);
+            if (!selectedKeys.empty() &&
+                selectedKeys.find(evidenceKey) == selectedKeys.end())
+            {
+                continue;
+            }
+            if (trimTemporalEvidenceValue_(item.imageJpegBase64).empty()) {
+                continue;
+            }
+
+            std::string visualKey = item.timestampName;
+            if (visualKey.empty() && item.frameIndex >= 0) {
+                visualKey = "frame:" + std::to_string(item.frameIndex);
+            }
+            if (visualKey.empty()) {
+                visualKey = trimTemporalEvidenceValue_(item.timestampUtcIso);
+            }
+            if (visualKey.empty()) {
+                visualKey = evidenceKey;
+            }
+            if (visualKey.empty() || !visualKeys.insert(visualKey).second) {
+                continue;
+            }
+
+            json entry = json::object();
+            if (cameraId > 0) {
+                entry["camera_id"] = cameraId;
+            }
+            if (!cameraName.empty()) {
+                entry["camera_name"] = cameraName;
+            }
+            entry["image_jpeg_b64"] = item.imageJpegBase64;
+            entry["temporal_evidence_key"] = evidenceKey;
+            if (!item.timestampUtcIso.empty()) {
+                entry["snapshot_ts_utc_iso"] = item.timestampUtcIso;
+            }
+            if (!item.timestampLocalIso.empty()) {
+                entry["snapshot_ts_local_iso"] = item.timestampLocalIso;
+            }
+            if (!item.timestampName.empty()) {
+                entry["timestamp_name"] = item.timestampName;
+            }
+            if (item.frameIndex >= 0) {
+                entry["frame_index"] = item.frameIndex;
+            }
+            if (!item.frameTimestampInSegment.empty()) {
+                entry["frame_timestamp_in_segment"] = item.frameTimestampInSegment;
+            }
+            if (!item.eventName.empty()) {
+                entry["event"] = item.eventName;
+            }
+            if (!item.entityId.empty()) {
+                entry["entity_id"] = item.entityId;
+            }
+            if (!item.zone.empty()) {
+                entry["zone"] = item.zone;
+            }
+            if (!item.reason.empty()) {
+                entry["reason"] = item.reason;
+            }
+            out.push_back(std::move(entry));
+        }
+
+        while (out.size() > kMaxAlertImages) {
+            out.erase(out.begin());
+        }
+        return out;
+    };
+
+    json selectedImages = selectImagesForKeys(requestedEvidenceKeys);
+    if (selectedImages.empty() && !trail.empty()) {
+        std::unordered_set<std::string> fallbackKeys;
+        const std::string lastEvidenceKey =
+            trimTemporalEvidenceValue_(trail.back().evidenceKey);
+        if (!lastEvidenceKey.empty()) {
+            fallbackKeys.insert(lastEvidenceKey);
+        }
+        selectedImages = selectImagesForKeys(fallbackKeys);
+    }
+    return selectedImages;
+}
+
+std::string JobRuntime::extractFirstTemporalGroupImageB64_(const json& groupImages) {
+    if (!groupImages.is_array()) {
+        return std::string();
+    }
+    for (const auto& item : groupImages) {
+        if (!item.is_object()) {
+            continue;
+        }
+        const auto itImage = item.find("image_jpeg_b64");
+        if (itImage != item.end() && itImage->is_string()) {
+            const std::string value = trimTemporalEvidenceValue_(itImage->get<std::string>());
+            if (!value.empty()) {
+                return value;
+            }
+        }
+        const auto itFrame = item.find("frame_jpeg_base64");
+        if (itFrame != item.end() && itFrame->is_string()) {
+            const std::string value = trimTemporalEvidenceValue_(itFrame->get<std::string>());
+            if (!value.empty()) {
+                return value;
+            }
+        }
+    }
+    return std::string();
+}
+
 static std::string normalizeVideoPackagingMode_(std::string s) {
     s = trimCopyRuntime_(std::move(s));
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
@@ -4155,11 +4416,22 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                 (run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::Finalizing ||
                  run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::Completed ||
                  std::chrono::steady_clock::now() >= run.hardStopDeadline);
+            const std::string materializedFrontierUtcIso =
+                coverage.materializedFrontierUtcIso.empty()
+                    ? coverage.latestCapturedUtcIso
+                    : coverage.materializedFrontierUtcIso;
             const bool contentGapBeforeTarget =
                 !coverage.analysisComplete &&
-                (coverage.latestCapturedUtcIso.empty() ||
+                (materializedFrontierUtcIso.empty() ||
                  (!run.analysisTargetEndUtcIso.empty() &&
-                  coverage.latestCapturedUtcIso < run.analysisTargetEndUtcIso));
+                  materializedFrontierUtcIso < run.analysisTargetEndUtcIso));
+            const bool captureReachedTargetWithoutMaterialization =
+                !coverage.analysisComplete &&
+                !run.analysisTargetEndUtcIso.empty() &&
+                !coverage.capturedFrontierUtcIso.empty() &&
+                coverage.capturedFrontierUtcIso >= run.analysisTargetEndUtcIso &&
+                (materializedFrontierUtcIso.empty() ||
+                 materializedFrontierUtcIso < run.analysisTargetEndUtcIso);
 
             if (run.cancel.load()) {
                 coverage.analysisStatus = "step_cancelled";
@@ -4172,8 +4444,10 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             }
             else if (terminalTimeoutPhase) {
                 coverage.analysisStatus =
-                    contentGapBeforeTarget ? "content_gap_before_target"
-                                           : "analysis_backlog_timeout";
+                    captureReachedTargetWithoutMaterialization
+                        ? "materialization_gap_before_target"
+                        : (contentGapBeforeTarget ? "content_gap_before_target"
+                                                  : "analysis_backlog_timeout");
             }
             else if (run.timeoutRequested.load() ||
                      run.completionPhase.load() == JobInstance::StepRun::CompletionPhase::DrainingToTarget)
@@ -4196,6 +4470,9 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                     {"coverage_required", false},
                     {"coverage_complete", true},
                     {"coverage_status", "not_applicable"},
+                    {"captured_frontier_utc", ""},
+                    {"materialized_frontier_utc", ""},
+                    {"materialization_status", "not_applicable"},
                     {"analysis_driven", run.analysisDriven},
                     {"analysis_completion_mode", run.analysisCompletionMode},
                     {"analysis_complete", true},
@@ -4217,6 +4494,12 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                 {"coverage_status", coverage.complete ? "complete" : "coverage_incomplete"},
                 {"coverage_anchor_utc", coverage.anchorUtcIso},
                 {"required_completion_end_utc", coverage.targetEndUtcIso},
+                {"captured_frontier_utc", coverage.capturedFrontierUtcIso},
+                {"materialized_frontier_utc",
+                 coverage.materializedFrontierUtcIso.empty()
+                     ? coverage.latestCapturedUtcIso
+                     : coverage.materializedFrontierUtcIso},
+                {"materialization_status", coverage.materializationStatus},
                 {"covered_until_utc", coverage.coveredUntilUtcIso},
                 {"latest_captured_utc", coverage.latestCapturedUtcIso},
                 {"first_gap_start_utc", coverage.firstGapStartUtcIso},
@@ -4269,7 +4552,69 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             if (it == run.coverageByCamera.end() || !it->second.enabled) {
                 return;
             }
+            it->second.capturedFrontierUtcIso = latestCapturedEndUtc;
+            it->second.materializedFrontierUtcIso = latestCapturedEndUtc;
+            it->second.materializationStatus = "materialized";
             it->second.tracker.observeCapturedEnd(endTp);
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+        };
+
+        auto observeCaptureFrontierForCamera = [&](JobInstance::StepRun& run,
+                                                   int cameraId,
+                                                   const std::string& capturedFrontierUtc,
+                                                   const std::string& materializationStatus) {
+            if (capturedFrontierUtc.empty()) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return;
+            }
+            if (it->second.capturedFrontierUtcIso.empty() ||
+                capturedFrontierUtc > it->second.capturedFrontierUtcIso)
+            {
+                it->second.capturedFrontierUtcIso = capturedFrontierUtc;
+            }
+            if (!materializationStatus.empty()) {
+                it->second.materializationStatus = materializationStatus;
+            }
+            refreshCameraCoverageLocked(it->second);
+            refreshCameraAnalysisLocked(run, it->second);
+        };
+
+        auto observeMaterializedFrontierForCamera = [&](JobInstance::StepRun& run,
+                                                        int cameraId,
+                                                        const std::string& materializedFrontierUtc,
+                                                        const std::string& materializationStatus) {
+            if (materializedFrontierUtc.empty()) {
+                return;
+            }
+            std::chrono::system_clock::time_point endTp;
+            const bool parsedEndTp =
+                parseCoverageTimePoint_(materializedFrontierUtc, endTp);
+            std::lock_guard<std::mutex> lock(run.coverageMu);
+            auto it = run.coverageByCamera.find(cameraId);
+            if (it == run.coverageByCamera.end() || !it->second.enabled) {
+                return;
+            }
+            if (it->second.materializedFrontierUtcIso.empty() ||
+                materializedFrontierUtc > it->second.materializedFrontierUtcIso)
+            {
+                it->second.materializedFrontierUtcIso = materializedFrontierUtc;
+            }
+            if (it->second.capturedFrontierUtcIso.empty() ||
+                materializedFrontierUtc > it->second.capturedFrontierUtcIso)
+            {
+                it->second.capturedFrontierUtcIso = materializedFrontierUtc;
+            }
+            if (!materializationStatus.empty()) {
+                it->second.materializationStatus = materializationStatus;
+            }
+            if (parsedEndTp) {
+                it->second.tracker.observeCapturedEnd(endTp);
+            }
             refreshCameraCoverageLocked(it->second);
             refreshCameraAnalysisLocked(run, it->second);
         };
@@ -5964,6 +6309,8 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                           &currentCaptureBudgetDeadline,
                                           &buildCameraCoverageJson,
                                           &observeLatestCapturedForCamera,
+                                          &observeCaptureFrontierForCamera,
+                                          &observeMaterializedFrontierForCamera,
                                           &observeSuccessfulCoverageSpanForCamera,
                                           &isCameraCoverageComplete,
                                           &isCameraAnalysisComplete,
@@ -6320,6 +6667,10 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             !isImageAgentInput)
                         {
                             const bool useAnalysisDrivenDrain = run.analysisDriven;
+                            const auto requiredDrainTargetUtc =
+                                useAnalysisDrivenDrain
+                                    ? run.analysisTargetEndUtc
+                                    : run.requiredCompletionEndUtc;
                             const auto timeoutDrainDeadline =
                                 useAnalysisDrivenDrain
                                     ? run.hardStopDeadline
@@ -6364,6 +6715,63 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                         currentCoverageCutoffUtcIso()
                                     );
                                 if (!pendingReady.has_value()) {
+                                    bool shouldRetryAfterMaterialization = false;
+                                    if (owner_ &&
+                                        requiredDrainTargetUtc.time_since_epoch().count() != 0)
+                                    {
+                                        if (CameraSession* session = owner_->getCameraSession(cameraId)) {
+                                            const auto materializeResult =
+                                                session->materializeOpenClipThroughUtc(
+                                                    requiredDrainTargetUtc,
+                                                    10);
+                                            if (!materializeResult.lastFrameUtcIso.empty()) {
+                                                observeCaptureFrontierForCamera(
+                                                    run,
+                                                    cameraId,
+                                                    materializeResult.lastFrameUtcIso,
+                                                    materializeResult.reason);
+                                            }
+                                            if (materializeResult.materialized &&
+                                                !materializeResult.finalizedEndUtcIso.empty())
+                                            {
+                                                observeMaterializedFrontierForCamera(
+                                                    run,
+                                                    cameraId,
+                                                    materializeResult.finalizedEndUtcIso,
+                                                    "materialized");
+                                                noReadyClipWaitDeadline =
+                                                    (std::min)(
+                                                        timeoutDrainDeadline,
+                                                        std::chrono::steady_clock::now() +
+                                                            std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
+                                                    );
+                                                Logger::instance().logDebug(
+                                                    "job",
+                                                    "runAgentInferenceOnCamera_: materialized tail clip during timeout drain"
+                                                    " job_id=" + std::to_string(jobId) +
+                                                    " step_id=" + std::to_string(step.id) +
+                                                    " camera_id=" + std::to_string(cameraId) +
+                                                    " finalized_end_utc=" + materializeResult.finalizedEndUtcIso +
+                                                    " path=" + materializeResult.finalizedPath
+                                                );
+                                                shouldRetryAfterMaterialization = true;
+                                            }
+                                            else if (materializeResult.waitingForTarget ||
+                                                     (!materializeResult.lastFrameUtcIso.empty() &&
+                                                      !materializeResult.reason.empty()))
+                                            {
+                                                noReadyClipWaitDeadline =
+                                                    (std::min)(
+                                                        timeoutDrainDeadline,
+                                                        std::chrono::steady_clock::now() +
+                                                            std::chrono::seconds(kTimeoutDrainIdleWaitSeconds_)
+                                                    );
+                                            }
+                                        }
+                                    }
+                                    if (shouldRetryAfterMaterialization) {
+                                        continue;
+                                    }
                                     if (std::chrono::steady_clock::now() >= noReadyClipWaitDeadline) {
                                         break;
                                     }
@@ -6737,7 +7145,6 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             if (timeoutReason) {
                 run.timeoutRequested = true;
                 run.completionPhase.store(JobInstance::StepRun::CompletionPhase::DrainingToTarget);
-                freezeStepCaptureAndCamera(run);
             }
             else {
                 run.cancel = true;
@@ -6749,9 +7156,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             }
             run.workers.clear();
 
-            if (!timeoutReason) {
-                freezeStepCaptureAndCamera(run);
-            }
+            freezeStepCaptureAndCamera(run);
 
             if (run.state == JobInstance::StepState::Running) {
                 run.completionPhase.store(JobInstance::StepRun::CompletionPhase::Finalizing);
@@ -7698,6 +8103,23 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
         return "";
     }
 
+    const TemporalEvidenceTrail temporalEvidenceTrail =
+        loadTemporalEvidenceTrail_(temporalSlotKey);
+    const std::vector<std::string> lastRoundEvidenceKeys =
+        temporal::extractLastRoundEvidenceKeys(temporalSlot.state);
+    const std::string reportCameraName =
+        (coverageDetails && coverageDetails->is_object())
+            ? coverageDetails->value("camera_name", std::string())
+            : std::string();
+    const json temporalGroupImages = buildTemporalAlertGroupImages_(
+        temporalEvidenceTrail,
+        eval.operatorResults,
+        lastRoundEvidenceKeys,
+        cameraId,
+        reportCameraName);
+    const std::string temporalFallbackImageB64 =
+        extractFirstTemporalGroupImageB64_(temporalGroupImages);
+
     const json identityCards =
         owner_->collectOperationalIdentityCards(temporalSlot.state, temporalSlot.visualState);
     std::string primaryIdentityCardId;
@@ -7717,6 +8139,7 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
         { "camera_id", cameraId },
         { "agent_id", agent.id },
         { "operator_results", eval.operatorResults },
+        { "temporal_operator_results", eval.operatorResults },
         { "answer", eval.summary },
         { "decision_source", "temporal_engine" },
         { "llm_alert_condition", false },
@@ -7748,6 +8171,13 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
     }
     if (identityCards.is_array() && !identityCards.empty()) {
         reportDetails["identity_cards"] = identityCards;
+    }
+    if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+        reportDetails["group_images"] = temporalGroupImages;
+        reportDetails["group_image_count"] = temporalGroupImages.size();
+    }
+    if (!temporalFallbackImageB64.empty()) {
+        reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
     }
     if (coverageDetails && coverageDetails->is_object()) {
         for (auto it = coverageDetails->begin(); it != coverageDetails->end(); ++it) {
@@ -7827,6 +8257,13 @@ std::string JobRuntime::maybeEmitFinalTemporalReportOnTimeout_(
     }
     if (identityCards.is_array() && !identityCards.empty()) {
         out["identity_cards"] = identityCards;
+    }
+    if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+        out["group_images"] = temporalGroupImages;
+        out["group_image_count"] = temporalGroupImages.size();
+    }
+    if (!temporalFallbackImageB64.empty()) {
+        out["image_jpeg_b64"] = temporalFallbackImageB64;
     }
     if (coverageDetails && coverageDetails->is_object()) {
         for (auto it = coverageDetails->begin(); it != coverageDetails->end(); ++it) {
@@ -7933,6 +8370,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 : nlohmann::json::object();
             slot.state = temporal::defaultState();
             slot.visualState = json::object();
+            temporalEvidenceBySlot_.erase(temporalSlotKey);
         }
         if (!slot.state.is_object() || slot.state.empty()) {
             slot.state = temporal::defaultState();
@@ -9767,6 +10205,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
         const bool localAlertSignal = hit.alertCondition;
         const std::string localDecisionSource = decisionSource;
+        std::vector<std::string> roundEvidenceKeys;
+        TemporalEvidenceTrail temporalEvidenceTrailSnapshot;
         if (temporalPlanActive) {
             temporal::applyRound(
                 temporalSlot.state,
@@ -9803,6 +10243,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             hit.alertCondition = eval.alert;
             decisionSource = "temporal_engine";
             temporalDecisionSummary = eval.summary;
+            roundEvidenceKeys = temporal::extractLastRoundEvidenceKeys(temporalSlot.state);
             if (hit.alertCondition &&
                 temporal::shouldSuppressStalePresenceCarryAlert(
                     temporalOperatorResults,
@@ -9868,6 +10309,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             temporalSlot.touchedAt = std::chrono::steady_clock::now();
             temporalSlot.promptHash = temporalPromptHash;
             saveTemporalSlot(temporalSlot);
+            TemporalEvidenceTrail trail = loadTemporalEvidenceTrail_(temporalSlotKey);
+            mergeTemporalEvidenceTrail_(
+                trail,
+                hit.temporalEvidenceCandidates,
+                roundEvidenceKeys);
+            saveTemporalEvidenceTrail_(temporalSlotKey, trail);
+            temporalEvidenceTrailSnapshot = std::move(trail);
         }
 
         const bool identityCardsMaterialized =
@@ -9927,6 +10375,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
         const bool includeTemporalDiagnostics =
             temporalPlanActive || (temporalOperatorResults.is_array() && !temporalOperatorResults.empty());
+        const json temporalGroupImages =
+            buildTemporalAlertGroupImages_(
+                temporalEvidenceTrailSnapshot,
+                temporalOperatorResults,
+                roundEvidenceKeys,
+                cameraId,
+                hit.cameraName);
+        const std::string temporalFallbackImageB64 =
+            extractFirstTemporalGroupImageB64_(temporalGroupImages);
 
         std::vector<std::string> rejectedAlertRegionIds;
         std::vector<std::string> alertRegionIds = sanitizeAlertRegionIds_(
@@ -10093,6 +10550,10 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 out["temporal_decision_summary"] = temporalDecisionSummary;
             }
         }
+        if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+            out["group_images"] = temporalGroupImages;
+            out["group_image_count"] = temporalGroupImages.size();
+        }
         if (!overlayRegionIds.empty()) {
             out["overlay_region_ids"] = overlayRegionIds;
         }
@@ -10102,6 +10563,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (!representativeImageB64.empty()) {
             out["image_jpeg_b64"] = representativeImageB64;
             out["image_ts_utc"] = tsUtcIso;
+        } else if (!temporalFallbackImageB64.empty()) {
+            out["image_jpeg_b64"] = temporalFallbackImageB64;
         }
         if (temporalPlanActive && temporalReport && owner_) {
             const json reportIdentityCards =
@@ -10123,6 +10586,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 { "camera_id", cameraId },
                 { "agent_id", agent.id },
                 { "operator_results", temporalOperatorResults },
+                { "temporal_operator_results", temporalOperatorResults },
                 { "answer", representativeAnswer },
                 { "decision_source", decisionSource },
                 { "llm_alert_condition", llmAlertCondition },
@@ -10146,6 +10610,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             }
             else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
                 reportDetails["identity_cards"] = hit.identityCards;
+            }
+            if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+                reportDetails["group_images"] = temporalGroupImages;
+                reportDetails["group_image_count"] = temporalGroupImages.size();
+            }
+            if (!temporalFallbackImageB64.empty()) {
+                reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
+            } else if (!representativeImageB64.empty()) {
+                reportDetails["image_jpeg_b64"] = representativeImageB64;
             }
             attachTemporalReportDeliveryIds(reportDetails, temporalReportDeliveryMarkers);
             const AgentCore::AgentEventPostResult reportPostResult =
@@ -10707,6 +11180,8 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     }
     const bool localAlertSignal = hit.alertCondition;
     const std::string localDecisionSource = decisionSource;
+    std::vector<std::string> roundEvidenceKeys;
+    TemporalEvidenceTrail temporalEvidenceTrailSnapshot;
     if (temporalPlanActive) {
         temporal::applyRound(
             temporalSlot.state,
@@ -10743,6 +11218,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         hit.alertCondition = eval.alert;
         decisionSource = "temporal_engine";
         temporalDecisionSummary = eval.summary;
+        roundEvidenceKeys = temporal::extractLastRoundEvidenceKeys(temporalSlot.state);
         if (hit.alertCondition &&
             temporal::shouldSuppressStalePresenceCarryAlert(
                 temporalOperatorResults,
@@ -10808,6 +11284,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         temporalSlot.touchedAt = std::chrono::steady_clock::now();
         temporalSlot.promptHash = temporalPromptHash;
         saveTemporalSlot(temporalSlot);
+        TemporalEvidenceTrail trail = loadTemporalEvidenceTrail_(temporalSlotKey);
+        mergeTemporalEvidenceTrail_(
+            trail,
+            hit.temporalEvidenceCandidates,
+            roundEvidenceKeys);
+        saveTemporalEvidenceTrail_(temporalSlotKey, trail);
+        temporalEvidenceTrailSnapshot = std::move(trail);
     }
 
     const bool identityCardsMaterialized =
@@ -10867,6 +11350,15 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     }
     const bool includeTemporalDiagnostics =
         temporalPlanActive || (temporalOperatorResults.is_array() && !temporalOperatorResults.empty());
+    const json temporalGroupImages =
+        buildTemporalAlertGroupImages_(
+            temporalEvidenceTrailSnapshot,
+            temporalOperatorResults,
+            roundEvidenceKeys,
+            cameraId,
+            hit.cameraName);
+    const std::string temporalFallbackImageB64 =
+        extractFirstTemporalGroupImageB64_(temporalGroupImages);
 
     std::vector<std::string> rejectedAlertRegionIds;
     std::vector<std::string> alertRegionIds = sanitizeAlertRegionIds_(
@@ -11026,6 +11518,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             out["temporal_decision_summary"] = temporalDecisionSummary;
         }
     }
+    if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+        out["group_images"] = temporalGroupImages;
+        out["group_image_count"] = temporalGroupImages.size();
+    }
+    if (!temporalFallbackImageB64.empty()) {
+        out["image_jpeg_b64"] = temporalFallbackImageB64;
+    }
     if (!overlayRegionIds.empty()) {
         out["overlay_region_ids"] = overlayRegionIds;
     }
@@ -11063,6 +11562,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             { "camera_id", cameraId },
             { "agent_id", agent.id },
             { "operator_results", temporalOperatorResults },
+            { "temporal_operator_results", temporalOperatorResults },
             { "answer", representativeAnswer },
             { "decision_source", decisionSource },
             { "llm_alert_condition", llmAlertCondition },
@@ -11086,6 +11586,13 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         }
         else if (hit.identityCards.is_array() && !hit.identityCards.empty()) {
             reportDetails["identity_cards"] = hit.identityCards;
+        }
+        if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
+            reportDetails["group_images"] = temporalGroupImages;
+            reportDetails["group_image_count"] = temporalGroupImages.size();
+        }
+        if (!temporalFallbackImageB64.empty()) {
+            reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
         }
         attachTemporalReportDeliveryIds(reportDetails, temporalReportDeliveryMarkers);
         const AgentCore::AgentEventPostResult reportPostResult =
@@ -12374,12 +12881,22 @@ void JobRuntime::clearJobEphemeralState_(int jobId) {
     const std::string scopedPrefix = "job:" + std::to_string(jobId) + "|";
 
     size_t clearedTemporalSlots = 0;
+    size_t clearedTemporalEvidenceTrails = 0;
     {
         std::lock_guard<std::mutex> lock(temporalMu_);
         for (auto it = temporalBySlot_.begin(); it != temporalBySlot_.end();) {
             if (it->first.rfind(scopedPrefix, 0) == 0) {
                 it = temporalBySlot_.erase(it);
                 ++clearedTemporalSlots;
+            }
+            else {
+                ++it;
+            }
+        }
+        for (auto it = temporalEvidenceBySlot_.begin(); it != temporalEvidenceBySlot_.end();) {
+            if (it->first.rfind(scopedPrefix, 0) == 0) {
+                it = temporalEvidenceBySlot_.erase(it);
+                ++clearedTemporalEvidenceTrails;
             }
             else {
                 ++it;
@@ -12401,12 +12918,15 @@ void JobRuntime::clearJobEphemeralState_(int jobId) {
         }
     }
 
-    if (clearedTemporalSlots > 0 || clearedCrossCameraSteps > 0)
+    if (clearedTemporalSlots > 0 ||
+        clearedTemporalEvidenceTrails > 0 ||
+        clearedCrossCameraSteps > 0)
     {
         Logger::instance().logDebug(
             "job",
             "clearJobEphemeralState_: job_id=" + std::to_string(jobId) +
             " temporal_slots=" + std::to_string(clearedTemporalSlots) +
+            " temporal_evidence_trails=" + std::to_string(clearedTemporalEvidenceTrails) +
             " cross_camera_steps=" + std::to_string(clearedCrossCameraSteps)
         );
     }

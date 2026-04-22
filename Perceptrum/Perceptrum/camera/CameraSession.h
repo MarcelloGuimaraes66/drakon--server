@@ -86,6 +86,10 @@ public:
     void updateAlgorithms(std::vector<AlgorithmConfig> algos);
     void updateTelegramSettings(bool enabled, std::string botToken, std::string chatId);
     bool matchesStartConfig(const CameraConfig& cfg) const;
+    FrameDiskWriter::MaterializeOpenClipResult materializeOpenClipThroughUtc(
+        const std::chrono::system_clock::time_point& targetUtc,
+        int preferredClipSeconds = 10);
+    void forceFinalizeOpenClips(const std::string& reason = std::string());
 
     std::string getLastJobStillJpegBase64() const;
 

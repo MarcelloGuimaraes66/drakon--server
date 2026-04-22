@@ -207,6 +207,97 @@ function normalizePersistedCameraId(value: unknown): number | null {
   return null;
 }
 
+function encodeCookieNameSegment(value: string): string {
+  try {
+    let binary = "";
+    for (const byte of new TextEncoder().encode(value)) {
+      binary += String.fromCharCode(byte);
+    }
+
+    return window.btoa(binary)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/u, "");
+  } catch {
+    return value.replace(/[^A-Za-z0-9_-]/g, "_");
+  }
+}
+
+function getOnboardingCookieName(userId?: string | null): string {
+  return `${brand.id}_guided_onboarding_${encodeCookieNameSegment(
+    normalizeOnboardingStorageUserSegment(userId)
+  )}_v${ONBOARDING_STORAGE_VERSION}`;
+}
+
+function readCookieValue(name: string): string | null {
+  if (typeof document === "undefined" || !document.cookie) {
+    return null;
+  }
+
+  for (const entry of document.cookie.split(";")) {
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    const cookieName = separatorIndex >= 0 ? trimmed.slice(0, separatorIndex) : trimmed;
+    if (cookieName !== name) {
+      continue;
+    }
+
+    const rawValue = separatorIndex >= 0 ? trimmed.slice(separatorIndex + 1) : "";
+    try {
+      return decodeURIComponent(rawValue);
+    } catch {
+      return rawValue;
+    }
+  }
+
+  return null;
+}
+
+function writeCookieValue(name: string, value: string): void {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const expires = new Date();
+  expires.setFullYear(expires.getFullYear() + 10);
+  document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires.toUTCString()}; path=/; SameSite=Lax`;
+}
+
+function parsePersistedOnboardingState(raw: string | null): PersistedOnboardingState | null {
+  if (!raw) {
+    return null;
+  }
+
+  const parsed = JSON.parse(raw) as Partial<PersistedOnboardingState> | null;
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (parsed.version !== ONBOARDING_STORAGE_VERSION) {
+    return null;
+  }
+
+  return {
+    version: ONBOARDING_STORAGE_VERSION,
+    status: isValidStatus(parsed.status) ? parsed.status : DEFAULT_PERSISTED_STATE.status,
+    tutorialKind: isValidTutorialKind(parsed.tutorialKind)
+      ? parsed.tutorialKind
+      : DEFAULT_PERSISTED_STATE.tutorialKind,
+    currentStepId: normalizePersistedStepId(parsed.currentStepId),
+    selectedProvider: isValidProvider(parsed.selectedProvider) ? parsed.selectedProvider : null,
+    tutorialCameraId: normalizePersistedCameraId(parsed.tutorialCameraId),
+    tutorialAgentId: normalizePersistedCameraId(parsed.tutorialAgentId),
+    tutorialProceedWithoutWebcam:
+      typeof parsed.tutorialProceedWithoutWebcam === "boolean"
+        ? parsed.tutorialProceedWithoutWebcam
+        : DEFAULT_PERSISTED_STATE.tutorialProceedWithoutWebcam,
+  };
+}
+
 export function getOnboardingStorageKey(userId?: string | null): string {
   return `${brand.id}:guided-onboarding:${normalizeOnboardingStorageUserSegment(userId)}:v${ONBOARDING_STORAGE_VERSION}`;
 }
@@ -217,35 +308,32 @@ export function readOnboardingState(userId?: string | null): PersistedOnboarding
   }
 
   try {
-    const raw = window.localStorage.getItem(getOnboardingStorageKey(userId));
-    if (!raw) {
+    const cookieState = parsePersistedOnboardingState(
+      readCookieValue(getOnboardingCookieName(userId))
+    );
+    if (cookieState) {
+      return cookieState;
+    }
+  } catch {
+    // Fall back to local storage below.
+  }
+
+  try {
+    const localStorageState = parsePersistedOnboardingState(
+      window.localStorage.getItem(getOnboardingStorageKey(userId))
+    );
+    if (!localStorageState) {
       return DEFAULT_PERSISTED_STATE;
     }
 
-    const parsed = JSON.parse(raw) as Partial<PersistedOnboardingState> | null;
-    if (!parsed || typeof parsed !== "object") {
-      return DEFAULT_PERSISTED_STATE;
-    }
-
-    if (parsed.version !== ONBOARDING_STORAGE_VERSION) {
-      return DEFAULT_PERSISTED_STATE;
-    }
-
-    return {
-      version: ONBOARDING_STORAGE_VERSION,
-      status: isValidStatus(parsed.status) ? parsed.status : DEFAULT_PERSISTED_STATE.status,
-      tutorialKind: isValidTutorialKind(parsed.tutorialKind)
-        ? parsed.tutorialKind
-        : DEFAULT_PERSISTED_STATE.tutorialKind,
-      currentStepId: normalizePersistedStepId(parsed.currentStepId),
-      selectedProvider: isValidProvider(parsed.selectedProvider) ? parsed.selectedProvider : null,
-      tutorialCameraId: normalizePersistedCameraId(parsed.tutorialCameraId),
-      tutorialAgentId: normalizePersistedCameraId(parsed.tutorialAgentId),
-      tutorialProceedWithoutWebcam:
-        typeof parsed.tutorialProceedWithoutWebcam === "boolean"
-          ? parsed.tutorialProceedWithoutWebcam
-          : DEFAULT_PERSISTED_STATE.tutorialProceedWithoutWebcam,
-    };
+    // Desktop builds can rotate the localhost port between launches, so mirror
+    // the same onboarding payload into a host-level cookie that survives
+    // cross-port restarts on 127.0.0.1.
+    writeCookieValue(
+      getOnboardingCookieName(userId),
+      JSON.stringify(localStorageState)
+    );
+    return localStorageState;
   } catch {
     return DEFAULT_PERSISTED_STATE;
   }
@@ -259,8 +347,16 @@ export function writeOnboardingState(
     return;
   }
 
+  const serialized = JSON.stringify(state);
+
   try {
-    window.localStorage.setItem(getOnboardingStorageKey(userId), JSON.stringify(state));
+    window.localStorage.setItem(getOnboardingStorageKey(userId), serialized);
+  } catch {
+    // Ignore storage failures. The tutorial should remain optional.
+  }
+
+  try {
+    writeCookieValue(getOnboardingCookieName(userId), serialized);
   } catch {
     // Ignore storage failures. The tutorial should remain optional.
   }

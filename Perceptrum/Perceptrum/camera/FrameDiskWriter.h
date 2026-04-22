@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <cstdint>
 #include <atomic>
+#include <mutex>
 #include <opencv2/opencv.hpp>
 #include <functional>
 #include <vector>
@@ -73,6 +74,27 @@ public:
     void flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold);
     bool shouldEmitImageSnapshotOnlyNow() const;
 
+    struct MaterializeOpenClipResult {
+        bool attempted = false;
+        bool materialized = false;
+        bool waitingForTarget = false;
+        bool targetOutsideOpenClip = false;
+        bool noOpenClip = false;
+        int clipSeconds = 0;
+        std::string reason;
+        std::string openClipPath;
+        std::string clipStartUtcIso;
+        std::string clipScheduledEndUtcIso;
+        std::string lastFrameUtcIso;
+        std::string finalizedPath;
+        std::string finalizedEndUtcIso;
+    };
+
+    MaterializeOpenClipResult materializeOpenClipThroughUtc(
+        const std::chrono::system_clock::time_point& targetUtc,
+        int preferredClipSeconds = 10);
+    void forceFinalizeAllOpenClips(const std::string& reason = std::string());
+
     
     //void setJobsCopyPredicate(std::function<bool()> pred);
 
@@ -95,6 +117,7 @@ public:
     
 
 private:
+    mutable std::mutex writerMutex_;
     std::string cameraId_;
     std::string baseDir_;
     bool enabled_{ false };
@@ -184,10 +207,14 @@ private:
     };
     std::chrono::steady_clock::time_point lastVideoFrameWriteAt10_{};
     std::chrono::steady_clock::time_point lastVideoFrameWriteAt60_{};
+    std::chrono::system_clock::time_point lastVideoFrameWallTime10_{};
+    std::chrono::system_clock::time_point lastVideoFrameWallTime60_{};
     TimeParts lastVideoFrameWriteTp10_{};
     TimeParts lastVideoFrameWriteTp60_{};
     bool hasLastVideoFrameWriteTp10_{ false };
     bool hasLastVideoFrameWriteTp60_{ false };
+    bool hasLastVideoFrameWallTime10_{ false };
+    bool hasLastVideoFrameWallTime60_{ false };
     TimeParts getTimeParts_() const;
     TimeParts getTimePartsForSystemTime_(
         const std::chrono::system_clock::time_point& tp) const;
@@ -241,6 +268,32 @@ private:
         const std::vector<JobsCopyTarget>& jobsTargets,
         bool shouldCopyInferenceVideo,
         const TimeParts* forcedEndTp = nullptr);
+    MaterializeOpenClipResult materializeProfileThroughUtc_(
+        SegmentWriter& writer,
+        int clipSeconds,
+        int& framesInClip,
+        std::deque<std::string>& clipPaths,
+        std::chrono::steady_clock::time_point& lastWriteAt,
+        TimeParts& lastWriteTp,
+        bool& hasLastWriteTp,
+        std::chrono::system_clock::time_point& lastFrameWallTime,
+        bool& hasLastFrameWallTime,
+        const std::vector<JobsCopyTarget>& jobsTargets,
+        bool shouldCopyInferenceVideo,
+        const std::chrono::system_clock::time_point& targetUtc);
+    bool forceFinalizeProfile_(
+        SegmentWriter& writer,
+        int clipSeconds,
+        int& framesInClip,
+        std::deque<std::string>& clipPaths,
+        std::chrono::steady_clock::time_point& lastWriteAt,
+        TimeParts& lastWriteTp,
+        bool& hasLastWriteTp,
+        std::chrono::system_clock::time_point& lastFrameWallTime,
+        bool& hasLastFrameWallTime,
+        const std::vector<JobsCopyTarget>& jobsTargets,
+        bool shouldCopyInferenceVideo,
+        const std::string& reason);
 
     // merge helpers (re-encode from existing short clips)
     bool mergeTenSecondClipsInto60_(const cv::Size& size);

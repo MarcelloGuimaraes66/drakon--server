@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <fstream>
+#include <ctime>
 #include "../logging/Logging.h"
 #include "../generated/Branding.h"
 #include <mutex>
@@ -28,6 +29,29 @@ static bool parseClipLocalTimestamp_(
 
 static std::chrono::system_clock::time_point fileTimeToSystemClock_(
     const fs::file_time_type& ft);
+
+static std::string formatUtcIso_(
+    const std::chrono::system_clock::time_point& tp)
+{
+    if (tp.time_since_epoch().count() == 0) {
+        return std::string();
+    }
+
+    using namespace std::chrono;
+    const auto ms = duration_cast<milliseconds>(tp.time_since_epoch());
+    const std::time_t tt = static_cast<std::time_t>(ms.count() / 1000);
+
+    std::tm tmUtc{};
+#ifdef _WIN32
+    gmtime_s(&tmUtc, &tt);
+#else
+    gmtime_r(&tt, &tmUtc);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmUtc, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
+}
 
 #ifdef _WIN32
 
@@ -291,18 +315,22 @@ static bool copyTenSecondClipToJobsTemp(
 //}
 
 void FrameDiskWriter::setJobsCopyTargetsProvider(std::function<std::vector<JobsCopyTarget>()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     jobsTargetsProvider_ = std::move(provider);
 }
 
 void FrameDiskWriter::setInferenceCopyEnabledProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     inferenceCopyEnabledProvider_ = std::move(provider);
 }
 
 void FrameDiskWriter::setInferenceImageCopyEnabledProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     inferenceImageCopyEnabledProvider_ = std::move(provider);
 }
 
 void FrameDiskWriter::setForceVideoCaptureProvider(std::function<bool()> provider) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     forceVideoCaptureProvider_ = std::move(provider);
 }
 
@@ -328,6 +356,7 @@ void FrameDiskWriter::recordWriteTelemetry_(std::uint64_t bytesWritten, std::uin
 
 bool FrameDiskWriter::shouldEmitImageSnapshotOnlyNow() const
 {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     if (!enabled_) return false;
 
     const auto now = Clock::now();
@@ -832,10 +861,12 @@ FrameDiskWriter::FrameDiskWriter(
 }
 
 void FrameDiskWriter::setEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     enabled_ = enabled;
 }
 
 void FrameDiskWriter::setMinInterval(std::chrono::milliseconds interval) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     minInterval_ = interval;
 }
 
@@ -844,6 +875,7 @@ void FrameDiskWriter::setOutputFps(double fps) {
 }
 
 void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>& profiles) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     int new10Fps = 0;
     int new60Fps = 0;
 
@@ -869,6 +901,8 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
             lastVideoFrameWriteTp10_,
             hasLastVideoFrameWriteTp10_
         );
+        lastVideoFrameWallTime10_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime10_ = false;
     }
 
     if ((capture60Enabled_ && new60Fps != capture60Fps_) || (!capture60Enabled_ && new60Fps > 0) ||
@@ -882,6 +916,8 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
             lastVideoFrameWriteTp60_,
             hasLastVideoFrameWriteTp60_
         );
+        lastVideoFrameWallTime60_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime60_ = false;
     }
 
     capture10Enabled_ = new10Fps > 0;
@@ -2652,6 +2688,7 @@ void FrameDiskWriter::setJobsCopyPredicate(std::function<bool()> pred) {
 // --- main entry point ---
 
 void FrameDiskWriter::save(const cv::Mat& frame) {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     if (!enabled_ || frame.empty()) {
         Logger::instance().logDebug(cameraId_,
             "save: skipping - enabled=" + std::to_string(enabled_) +
@@ -2789,6 +2826,8 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
             lastVideoFrameWriteTp10_,
             hasLastVideoFrameWriteTp10_
         );
+        lastVideoFrameWallTime10_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime10_ = false;
         discardOpenClip_(
             writer60_,
             framesIn60_,
@@ -2797,6 +2836,8 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
             lastVideoFrameWriteTp60_,
             hasLastVideoFrameWriteTp60_
         );
+        lastVideoFrameWallTime60_ = std::chrono::system_clock::time_point{};
+        hasLastVideoFrameWallTime60_ = false;
         emitImageSnapshotIfDue();
         return;
     }
@@ -2811,7 +2852,9 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
                                  std::deque<std::string>& clipPaths,
                                  std::chrono::steady_clock::time_point& lastWriteAt,
                                  TimeParts& lastWriteTp,
-                                 bool& hasLastWriteTp) {
+                                 bool& hasLastWriteTp,
+                                 std::chrono::system_clock::time_point& lastFrameWallTime,
+                                 bool& hasLastFrameWallTime) {
         if (!enabled || clipFps <= 0) return;
         if (interval.count() > 0 && (now - lastSavedAt) < interval) return;
 
@@ -2947,6 +2990,8 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
             lastWriteAt = now;
             lastWriteTp = tp;
             hasLastWriteTp = true;
+            lastFrameWallTime = nowWall;
+            hasLastFrameWallTime = true;
         }
     };
 
@@ -2961,7 +3006,9 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
         tenSecondPaths_,
         lastVideoFrameWriteAt10_,
         lastVideoFrameWriteTp10_,
-        hasLastVideoFrameWriteTp10_
+        hasLastVideoFrameWriteTp10_,
+        lastVideoFrameWallTime10_,
+        hasLastVideoFrameWallTime10_
     );
 
     writeProfileIfDue(
@@ -2975,7 +3022,9 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
         sixtySecondPaths_,
         lastVideoFrameWriteAt60_,
         lastVideoFrameWriteTp60_,
-        hasLastVideoFrameWriteTp60_
+        hasLastVideoFrameWriteTp60_,
+        lastVideoFrameWallTime60_,
+        hasLastVideoFrameWallTime60_
     );
 
     // In mixed mode (video + image demand), keep video pipeline and also emit periodic snapshots.
@@ -2984,6 +3033,7 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
 
 void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold)
 {
+    std::lock_guard<std::mutex> lk(writerMutex_);
     if (idleThreshold.count() <= 0) {
         return;
     }
@@ -3076,6 +3126,387 @@ void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThresho
         lastVideoFrameWriteAt60_,
         lastVideoFrameWriteTp60_,
         hasLastVideoFrameWriteTp60_
+    );
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeProfileThroughUtc_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    std::chrono::system_clock::time_point& lastFrameWallTime,
+    bool& hasLastFrameWallTime,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo,
+    const std::chrono::system_clock::time_point& targetUtc)
+{
+    MaterializeOpenClipResult result;
+    result.attempted = true;
+    result.clipSeconds = clipSeconds;
+
+    if (!writer.timelineInitialized && !writer.isOpened()) {
+        result.noOpenClip = true;
+        result.reason = "no_open_clip";
+        return result;
+    }
+
+    result.openClipPath = writer.path;
+    result.clipStartUtcIso = formatUtcIso_(writer.clipStartWallTime);
+    const auto clipScheduledEndUtc = writer.clipStartWallTime + std::chrono::seconds(clipSeconds);
+    result.clipScheduledEndUtcIso = formatUtcIso_(clipScheduledEndUtc);
+    if (hasLastFrameWallTime) {
+        result.lastFrameUtcIso = formatUtcIso_(lastFrameWallTime);
+    }
+
+    if (writer.clipStartWallTime.time_since_epoch().count() == 0) {
+        result.noOpenClip = true;
+        result.reason = "no_clip_start";
+        return result;
+    }
+
+    if (targetUtc < writer.clipStartWallTime || targetUtc > clipScheduledEndUtc) {
+        result.targetOutsideOpenClip = true;
+        result.reason = "target_outside_open_clip";
+        return result;
+    }
+
+    if (!hasLastFrameWallTime || lastFrameWallTime.time_since_epoch().count() == 0) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_first_frame";
+        return result;
+    }
+
+    if (lastFrameWallTime < targetUtc) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_target";
+        return result;
+    }
+
+    if (!writer.hasHeldFrame || writer.heldFrame.empty()) {
+        result.waitingForTarget = true;
+        result.reason = "waiting_for_held_frame";
+        return result;
+    }
+
+    const int clipFps = clipSeconds >= 60 ? capture60Fps_ : capture10Fps_;
+    if (clipFps <= 0) {
+        result.reason = "profile_disabled";
+        return result;
+    }
+
+    const auto sampleIntervalNs =
+        (std::max)(1LL, 1000000000LL / static_cast<long long>(clipFps));
+    const auto sampleInterval = std::chrono::nanoseconds(sampleIntervalNs);
+    const std::int64_t targetSamples =
+        (std::max)(1LL, static_cast<long long>(clipFps) * static_cast<long long>(clipSeconds));
+
+    auto ensureWriterForCurrentTimeline = [&]() -> bool {
+        if (!writer.timelineInitialized || writer.heldFrame.empty()) {
+            return false;
+        }
+        if (writer.isOpened()) {
+            return true;
+        }
+
+        const cv::Size size(writer.heldFrame.cols, writer.heldFrame.rows);
+        const TimeParts clipStartTp = getTimePartsForSystemTime_(writer.clipStartWallTime);
+        if (clipSeconds >= 60) {
+            rotate60s_(size, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+        }
+        else {
+            rotate10s_(size, clipStartTp, writer.clipStartAt, writer.clipStartWallTime);
+        }
+
+        return writer.isOpened();
+    };
+
+    auto targetAt =
+        writer.clipStartAt +
+        std::chrono::duration_cast<Clock::duration>(targetUtc - writer.clipStartWallTime);
+    const auto clipEndAt = writer.clipStartAt + std::chrono::seconds(clipSeconds);
+    if (targetAt < writer.clipStartAt) {
+        result.targetOutsideOpenClip = true;
+        result.reason = "target_before_open_clip";
+        return result;
+    }
+    if (targetAt > clipEndAt) {
+        targetAt = clipEndAt;
+    }
+
+    while (writer.timelineInitialized) {
+        if (!ensureWriterForCurrentTimeline()) {
+            result.reason = "open_writer_failed";
+            return result;
+        }
+
+        bool wroteAnySampleThisPass = false;
+        while (writer.frameCount < targetSamples &&
+               writer.nextSampleAt < clipEndAt &&
+               writer.nextSampleAt <= targetAt)
+        {
+            const auto frameCountBeforeWrite = writer.frameCount;
+            writeFrame_(writer, writer.heldFrame);
+            if (writer.frameCount == frameCountBeforeWrite) {
+                discardOpenClip_(
+                    writer,
+                    framesInClip,
+                    clipPaths,
+                    lastWriteAt,
+                    lastWriteTp,
+                    hasLastWriteTp
+                );
+                result.reason = "write_frame_failed";
+                return result;
+            }
+
+            wroteAnySampleThisPass = true;
+            framesInClip = static_cast<int>(writer.frameCount);
+            const auto sampleOffset = writer.nextSampleAt - writer.clipStartAt;
+            const auto sampleWallTime =
+                writer.clipStartWallTime +
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(sampleOffset);
+            lastWriteAt = Clock::now();
+            lastWriteTp = getTimePartsForSystemTime_(sampleWallTime);
+            hasLastWriteTp = true;
+            writer.nextSampleAt += sampleInterval;
+        }
+
+        const bool targetSatisfied =
+            writer.frameCount > 0 &&
+            writer.nextSampleAt > targetAt;
+        if (writer.frameCount >= targetSamples || targetSatisfied || targetAt >= clipEndAt) {
+            break;
+        }
+
+        if (!wroteAnySampleThisPass) {
+            break;
+        }
+    }
+
+    if (framesInClip <= 0 || writer.frameCount <= 0) {
+        result.reason = "no_frames_materialized";
+        return result;
+    }
+
+    const TimeParts forcedEndTp = getTimePartsForSystemTime_(targetUtc);
+    if (!finalizeOpenClip_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            jobsTargets,
+            shouldCopyInferenceVideo,
+            &forcedEndTp))
+    {
+        result.reason = "finalize_failed";
+        return result;
+    }
+
+    clearSegmentTimeline_(writer);
+    writer.path.clear();
+
+    result.materialized = true;
+    result.reason = "materialized_to_target";
+    result.finalizedEndUtcIso = formatUtcIso_(targetUtc);
+    if (!clipPaths.empty()) {
+        result.finalizedPath = clipPaths.back();
+    }
+    return result;
+}
+
+bool FrameDiskWriter::forceFinalizeProfile_(
+    SegmentWriter& writer,
+    int clipSeconds,
+    int& framesInClip,
+    std::deque<std::string>& clipPaths,
+    std::chrono::steady_clock::time_point& lastWriteAt,
+    TimeParts& lastWriteTp,
+    bool& hasLastWriteTp,
+    std::chrono::system_clock::time_point& lastFrameWallTime,
+    bool& hasLastFrameWallTime,
+    const std::vector<JobsCopyTarget>& jobsTargets,
+    bool shouldCopyInferenceVideo,
+    const std::string& reason)
+{
+    if ((!writer.timelineInitialized && !writer.isOpened()) ||
+        !hasLastFrameWallTime ||
+        lastFrameWallTime.time_since_epoch().count() == 0)
+    {
+        return false;
+    }
+
+    const auto clipStartUtc = writer.clipStartWallTime;
+    const auto clipScheduledEndUtc = clipStartUtc + std::chrono::seconds(clipSeconds);
+    auto targetUtc = lastFrameWallTime;
+    if (targetUtc < clipStartUtc) {
+        targetUtc = clipStartUtc;
+    }
+    if (targetUtc > clipScheduledEndUtc) {
+        targetUtc = clipScheduledEndUtc;
+    }
+
+    const MaterializeOpenClipResult result =
+        materializeProfileThroughUtc_(
+            writer,
+            clipSeconds,
+            framesInClip,
+            clipPaths,
+            lastWriteAt,
+            lastWriteTp,
+            hasLastWriteTp,
+            lastFrameWallTime,
+            hasLastFrameWallTime,
+            jobsTargets,
+            shouldCopyInferenceVideo,
+            targetUtc
+        );
+
+    if (result.materialized) {
+        Logger::instance().logDebug(
+            cameraId_,
+            "FrameDiskWriter: force-finalized open clip reason=" + reason +
+            " profile=" + std::to_string(clipSeconds) +
+            " finalized_end_utc=" + result.finalizedEndUtcIso +
+            " path=" + result.finalizedPath
+        );
+        return true;
+    }
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: force-finalize skipped reason=" + reason +
+        " profile=" + std::to_string(clipSeconds) +
+        " status=" + result.reason
+    );
+    return false;
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipThroughUtc(
+    const std::chrono::system_clock::time_point& targetUtc,
+    int preferredClipSeconds)
+{
+    std::lock_guard<std::mutex> lk(writerMutex_);
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    const int normalizedClipSeconds = preferredClipSeconds >= 60 ? 60 : 10;
+    MaterializeOpenClipResult result =
+        normalizedClipSeconds >= 60
+            ? materializeProfileThroughUtc_(
+                  writer60_,
+                  60,
+                  framesIn60_,
+                  sixtySecondPaths_,
+                  lastVideoFrameWriteAt60_,
+                  lastVideoFrameWriteTp60_,
+                  hasLastVideoFrameWriteTp60_,
+                  lastVideoFrameWallTime60_,
+                  hasLastVideoFrameWallTime60_,
+                  jobsTargets,
+                  shouldCopyInferenceVideo,
+                  targetUtc)
+            : materializeProfileThroughUtc_(
+                  writer10_,
+                  10,
+                  framesIn10_,
+                  tenSecondPaths_,
+                  lastVideoFrameWriteAt10_,
+                  lastVideoFrameWriteTp10_,
+                  hasLastVideoFrameWriteTp10_,
+                  lastVideoFrameWallTime10_,
+                  hasLastVideoFrameWallTime10_,
+                  jobsTargets,
+                  shouldCopyInferenceVideo,
+                  targetUtc);
+
+    Logger::instance().logDebug(
+        cameraId_,
+        "FrameDiskWriter: materializeOpenClipThroughUtc profile=" +
+            std::to_string(normalizedClipSeconds) +
+            " target_utc=" + formatUtcIso_(targetUtc) +
+            " status=" + result.reason +
+            " materialized=" + std::string(result.materialized ? "true" : "false") +
+            " waiting=" + std::string(result.waitingForTarget ? "true" : "false") +
+            " no_open_clip=" + std::string(result.noOpenClip ? "true" : "false")
+    );
+    return result;
+}
+
+void FrameDiskWriter::forceFinalizeAllOpenClips(const std::string& reason)
+{
+    std::lock_guard<std::mutex> lk(writerMutex_);
+
+    bool shouldCopyInferenceVideo = true;
+    if (inferenceCopyEnabledProvider_) {
+        try {
+            shouldCopyInferenceVideo = inferenceCopyEnabledProvider_();
+        }
+        catch (...) {
+            shouldCopyInferenceVideo = true;
+        }
+    }
+
+    std::vector<JobsCopyTarget> jobsTargets;
+    if (jobsTargetsProvider_) {
+        try {
+            jobsTargets = jobsTargetsProvider_();
+        }
+        catch (...) {
+            jobsTargets.clear();
+        }
+    }
+
+    forceFinalizeProfile_(
+        writer10_,
+        10,
+        framesIn10_,
+        tenSecondPaths_,
+        lastVideoFrameWriteAt10_,
+        lastVideoFrameWriteTp10_,
+        hasLastVideoFrameWriteTp10_,
+        lastVideoFrameWallTime10_,
+        hasLastVideoFrameWallTime10_,
+        jobsTargets,
+        shouldCopyInferenceVideo,
+        reason.empty() ? "force_finalize_all" : reason
+    );
+    forceFinalizeProfile_(
+        writer60_,
+        60,
+        framesIn60_,
+        sixtySecondPaths_,
+        lastVideoFrameWriteAt60_,
+        lastVideoFrameWriteTp60_,
+        hasLastVideoFrameWriteTp60_,
+        lastVideoFrameWallTime60_,
+        hasLastVideoFrameWallTime60_,
+        jobsTargets,
+        shouldCopyInferenceVideo,
+        reason.empty() ? "force_finalize_all" : reason
     );
 }
 
