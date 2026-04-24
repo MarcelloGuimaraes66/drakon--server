@@ -10,6 +10,12 @@ type Props = {
   onUpdateIdentityCard?: (input: UpdateIdentityCardOptions) => Promise<void>;
 };
 
+const CHAT_TEXT_ENTRY_PROPS = {
+  spellCheck: false,
+  autoCorrect: "off" as const,
+  autoCapitalize: "off" as const,
+};
+
 function normalizeStringArray(raw: unknown, maxItems: number): string[] {
   if (!Array.isArray(raw)) {
     return [];
@@ -1042,6 +1048,7 @@ export default function ChatIdentityCardsPanel({ cards, busy = false, onUpdateId
                           </span>
                           <input
                             type="text"
+                            {...CHAT_TEXT_ENTRY_PROPS}
                             value={draftName}
                             onChange={(event) => setDraftName(event.target.value)}
                             disabled={!canSubmit}
@@ -1055,6 +1062,7 @@ export default function ChatIdentityCardsPanel({ cards, busy = false, onUpdateId
                           </span>
                           <textarea
                             rows={4}
+                            {...CHAT_TEXT_ENTRY_PROPS}
                             value={draftTraits}
                             onChange={(event) => setDraftTraits(event.target.value)}
                             disabled={!canSubmit}

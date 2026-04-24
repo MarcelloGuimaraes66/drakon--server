@@ -49,6 +49,11 @@ type Props = {
 };
 
 const VALID_RETENTION_DAYS = [1, 3, 7, 15, 30, 90, 180] as const;
+const CHAT_TEXT_ENTRY_PROPS = {
+  spellCheck: false,
+  autoCorrect: "off" as const,
+  autoCapitalize: "off" as const,
+};
 
 function toNonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
@@ -554,6 +559,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.name}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.name}
               disabled={isRegistered}
               onChange={(e) => setField("name", e.target.value)}
@@ -580,6 +586,7 @@ export default function ChatCameraRegistrationCard({
             <label className="block md:col-span-2">
               <span className="mb-1.5 block text-xs text-slate-300">{copy.webcamIndex}</span>
               <input
+                {...CHAT_TEXT_ENTRY_PROPS}
                 type="number"
                 value={form.webcam_index ?? ""}
                 disabled={isRegistered}
@@ -592,6 +599,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.ipAddress}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.ip_address}
                   disabled={isRegistered}
                   onChange={(e) => setField("ip_address", e.target.value)}
@@ -601,6 +609,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.rtspPort}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.rtsp_port}
                   disabled={isRegistered}
                   onChange={(e) => setField("rtsp_port", e.target.value)}
@@ -610,6 +619,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.manufacturer}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.manufacturer}
                   disabled={isRegistered}
                   onChange={(e) => setField("manufacturer", e.target.value)}
@@ -619,6 +629,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.username}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.username}
                   disabled={isRegistered}
                   onChange={(e) => setField("username", e.target.value)}
@@ -628,6 +639,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.password}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   type="password"
                   value={form.password}
                   disabled={isRegistered}
@@ -638,6 +650,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.channel}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.channel}
                   disabled={isRegistered}
                   onChange={(e) => setField("channel", e.target.value)}
@@ -647,6 +660,7 @@ export default function ChatCameraRegistrationCard({
               <label className="block md:col-span-2">
                 <span className="mb-1.5 block text-xs text-slate-300">{copy.subtype}</span>
                 <input
+                  {...CHAT_TEXT_ENTRY_PROPS}
                   value={form.subtype}
                   disabled={isRegistered}
                   onChange={(e) => setField("subtype", e.target.value)}
@@ -662,6 +676,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.zipCode}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.zip_code}
               disabled={isRegistered}
               onChange={(e) => setField("zip_code", e.target.value)}
@@ -696,6 +711,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block md:col-span-2">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.street}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.street}
               disabled={isRegistered}
               onChange={(e) => setField("street", e.target.value)}
@@ -705,6 +721,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.number}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.number}
               disabled={isRegistered}
               onChange={(e) => setField("number", e.target.value)}
@@ -714,6 +731,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.city}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.city}
               disabled={isRegistered}
               onChange={(e) => setField("city", e.target.value)}
@@ -723,6 +741,7 @@ export default function ChatCameraRegistrationCard({
           <label className="block md:col-span-2">
             <span className="mb-1.5 block text-xs text-slate-300">{copy.state}</span>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.state}
               disabled={isRegistered}
               onChange={(e) => setField("state", e.target.value)}
@@ -770,6 +789,7 @@ export default function ChatCameraRegistrationCard({
               <p className="mt-1 text-xs text-slate-300">{copy.shareInviteeHint}</p>
             </div>
             <input
+              {...CHAT_TEXT_ENTRY_PROPS}
               value={form.shared_find_invitee_query}
               disabled={isRegistered}
               onChange={(e) => setField("shared_find_invitee_query", e.target.value)}

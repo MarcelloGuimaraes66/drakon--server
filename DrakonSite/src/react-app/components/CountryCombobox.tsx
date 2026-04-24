@@ -219,6 +219,9 @@ export default function CountryCombobox({
                     onChange={(event) => setSearchValue(event.target.value)}
                     placeholder={searchPlaceholder}
                     autoComplete="off"
+                    spellCheck={false}
+                    autoCorrect="off"
+                    autoCapitalize="off"
                     className={searchInputClassName}
                   />
                 </div>

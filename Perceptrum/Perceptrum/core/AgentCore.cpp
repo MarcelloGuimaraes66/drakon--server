@@ -12978,19 +12978,18 @@ static std::string buildSyntheticChatFallbackEntityId_(
     if (!candidate.is_object()) return std::string();
 
     const std::string entityType =
-        normalizeFallbackEntityType_(trimAscii(candidate.value("entity_type", std::string())));
+        normalizeFallbackEntityType_(readTemporalNodeStringAlias_(candidate, { "entity_type" }));
     const std::string base = entityType.empty() ? std::string("entity") : entityType;
     const int cameraId =
         candidate.contains("camera_id") && candidate["camera_id"].is_number_integer()
             ? candidate["camera_id"].get<int>()
             : -1;
     const std::string frameTs =
-        trimAscii(candidate.value(
-            "frame_timestamp_in_segment",
-            candidate.value("timestamp_name", std::string())));
-    const std::string timestampUtc = trimAscii(candidate.value("timestamp_utc_iso", std::string()));
+        readTemporalNodeStringAlias_(candidate, { "frame_timestamp_in_segment", "timestamp_name" });
+    const std::string timestampUtc =
+        readTemporalNodeStringAlias_(candidate, { "timestamp_utc_iso" });
     const std::string description =
-        trimAscii(candidate.value("description", candidate.value("short_description", std::string())));
+        readTemporalNodeStringAlias_(candidate, { "description", "short_description" });
     const std::string hashSource =
         base + "|" +
         std::to_string(cameraId) + "|" +
@@ -13046,6 +13045,9 @@ static nlohmann::json buildIdentityPatchDebugSummary_(const nlohmann::json& item
         return summary;
     }
 
+    const auto readStringField = [&](std::initializer_list<const char*> keys) {
+        return readTemporalNodeStringAlias_(item, keys);
+    };
     const auto putStringField = [&](const char* key, const std::string& value) {
         const std::string trimmed = trimAscii(value);
         if (!trimmed.empty()) summary[key] = trimmed;
@@ -13056,21 +13058,19 @@ static nlohmann::json buildIdentityPatchDebugSummary_(const nlohmann::json& item
         }
     };
 
-    putStringField("entity_id", item.value("entity_id", item.value("id", std::string())));
-    putStringField("entity_key", item.value("entity_key", std::string()));
-    putStringField("entity_type", item.value("entity_type", std::string()));
-    putStringField("decision", item.value("decision", std::string()));
-    putStringField("event", item.value("event", item.value("evidence_event", std::string())));
-    putStringField("status", item.value("status", item.value("state", std::string())));
-    putStringField(
-        "timestamp_utc",
-        item.value("ts_utc", item.value("timestamp", item.value("time", std::string()))));
-    putStringField("last_seen_ts_utc", item.value("last_seen_ts_utc", std::string()));
-    putStringField("timestamp_name", item.value("timestamp_name", std::string()));
+    putStringField("entity_id", readStringField({ "entity_id", "id" }));
+    putStringField("entity_key", readStringField({ "entity_key" }));
+    putStringField("entity_type", readStringField({ "entity_type" }));
+    putStringField("decision", readStringField({ "decision" }));
+    putStringField("event", readStringField({ "event", "evidence_event" }));
+    putStringField("status", readStringField({ "status", "state" }));
+    putStringField("timestamp_utc", readStringField({ "ts_utc", "timestamp", "time" }));
+    putStringField("last_seen_ts_utc", readStringField({ "last_seen_ts_utc" }));
+    putStringField("timestamp_name", readStringField({ "timestamp_name" }));
     putStringField(
         "frame_timestamp_in_segment",
-        item.value("frame_timestamp_in_segment", std::string()));
-    putStringField("evidence_key", item.value("temporal_evidence_key", std::string()));
+        readStringField({ "frame_timestamp_in_segment" }));
+    putStringField("evidence_key", readStringField({ "temporal_evidence_key" }));
 
     if (item.contains("frame_index") && item["frame_index"].is_number_integer()) {
         summary["frame_index"] = item["frame_index"].get<int>();
@@ -13083,7 +13083,9 @@ static nlohmann::json buildIdentityPatchDebugSummary_(const nlohmann::json& item
 
     if (item.contains("portrait_crop") && item["portrait_crop"].is_object()) {
         summary["has_portrait_crop"] = true;
-        putStringField("portrait_kind", item["portrait_crop"].value("kind", std::string()));
+        putStringField(
+            "portrait_kind",
+            readTemporalNodeStringAlias_(item["portrait_crop"], { "kind" }));
     }
     else {
         summary["has_portrait_crop"] = false;
@@ -13100,15 +13102,29 @@ static void logIdentityPatchCheckpoint_(
 {
     if (logStreamId.empty() || scopeTag.empty()) return;
 
-    nlohmann::json payload = nlohmann::json::array();
-    if (identityPatch.is_array()) {
-        for (const auto& item : identityPatch) {
-            payload.push_back(buildIdentityPatchDebugSummary_(item));
+    try {
+        nlohmann::json payload = nlohmann::json::array();
+        if (identityPatch.is_array()) {
+            for (const auto& item : identityPatch) {
+                payload.push_back(buildIdentityPatchDebugSummary_(item));
+            }
         }
+        Logger::instance().logDebug(
+            logStreamId,
+            scopeTag + ": " + checkpoint + " identity_patch=" + payload.dump());
     }
-    Logger::instance().logDebug(
-        logStreamId,
-        scopeTag + ": " + checkpoint + " identity_patch=" + payload.dump());
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            logStreamId,
+            scopeTag + ": " + checkpoint +
+                " identity_patch_logging_skipped error=" + trimAscii(e.what()));
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            logStreamId,
+            scopeTag + ": " + checkpoint +
+                " identity_patch_logging_skipped error=unknown");
+    }
 }
 
 static void logIdentityPatchTraceCheckpoint_(
@@ -13752,13 +13768,16 @@ static void appendUniqueIdentityFeatureCandidatesToJsonArray_(
     const nlohmann::json& value)
 {
     if (!target.is_array()) target = nlohmann::json::array();
+    const auto buildDedupeKey = [](const nlohmann::json& item) {
+        return
+            lowerAsciiCopy_(readTemporalNodeStringAlias_(item, { "text" })) + "|" +
+            lowerAsciiCopy_(readTemporalNodeStringAlias_(item, { "category" })) + "|" +
+            lowerAsciiCopy_(readTemporalNodeStringAlias_(item, { "relation_to_target" }));
+    };
     std::unordered_set<std::string> seen;
     for (const auto& item : target) {
         if (!item.is_object()) continue;
-        const std::string dedupeKey =
-            lowerAsciiCopy_(trimAscii(item.value("text", std::string()))) + "|" +
-            lowerAsciiCopy_(trimAscii(item.value("category", std::string()))) + "|" +
-            lowerAsciiCopy_(trimAscii(item.value("relation_to_target", std::string())));
+        const std::string dedupeKey = buildDedupeKey(item);
         if (dedupeKey == "||") continue;
         seen.insert(dedupeKey);
     }
@@ -13767,10 +13786,7 @@ static void appendUniqueIdentityFeatureCandidatesToJsonArray_(
     if (!normalized.is_array()) return;
     for (const auto& item : normalized) {
         if (!item.is_object()) continue;
-        const std::string dedupeKey =
-            lowerAsciiCopy_(trimAscii(item.value("text", std::string()))) + "|" +
-            lowerAsciiCopy_(trimAscii(item.value("category", std::string()))) + "|" +
-            lowerAsciiCopy_(trimAscii(item.value("relation_to_target", std::string())));
+        const std::string dedupeKey = buildDedupeKey(item);
         if (dedupeKey == "||" || !seen.insert(dedupeKey).second) continue;
         target.push_back(item);
         if (target.size() >= 12) return;
@@ -14643,17 +14659,18 @@ static nlohmann::json buildFallbackIdentityPatchForPositiveHit_(
         if (!seed.is_object()) return;
         if (candidateEntityId.empty()) {
             candidateEntityId =
-                trimAscii(seed.value("candidate_entity_id", seed.value("entity_id", std::string())));
+                readTemporalNodeStringAlias_(seed, { "candidate_entity_id", "entity_id" });
         }
         if (candidateEntityHint.empty()) {
             candidateEntityHint =
-                trimAscii(seed.value("candidate_entity_hint", seed.value("entity_key", std::string())));
+                readTemporalNodeStringAlias_(seed, { "candidate_entity_hint", "entity_key" });
         }
         if (candidateEntityType.empty()) {
-            candidateEntityType = trimAscii(seed.value("entity_type", std::string()));
+            candidateEntityType = readTemporalNodeStringAlias_(seed, { "entity_type" });
         }
         if (candidateDescription.empty()) {
-            candidateDescription = trimAscii(seed.value("description", std::string()));
+            candidateDescription =
+                readTemporalNodeStringAlias_(seed, { "description", "short_description" });
         }
         if (candidateFrameRef.empty() &&
             seed.contains("frame_ref") &&
@@ -14674,20 +14691,23 @@ static nlohmann::json buildFallbackIdentityPatchForPositiveHit_(
             candidateIdentityFeatureCandidates = seed["identity_feature_candidates"];
         }
         if (candidateTimestampUtcIso.empty()) {
-            candidateTimestampUtcIso = trimAscii(seed.value("timestamp_utc_iso", std::string()));
+            candidateTimestampUtcIso =
+                readTemporalNodeStringAlias_(seed, { "timestamp_utc_iso" });
         }
         if (candidateLastSeenTsUtc.empty()) {
-            candidateLastSeenTsUtc = trimAscii(seed.value("last_seen_ts_utc", std::string()));
+            candidateLastSeenTsUtc =
+                readTemporalNodeStringAlias_(seed, { "last_seen_ts_utc" });
         }
         if (candidateFrameIndex < 0 && seed.contains("frame_index") && seed["frame_index"].is_number_integer()) {
             candidateFrameIndex = seed["frame_index"].get<int>();
         }
         if (candidateFrameTimestampInSegment.empty()) {
             candidateFrameTimestampInSegment =
-                trimAscii(seed.value("frame_timestamp_in_segment", std::string()));
+                readTemporalNodeStringAlias_(seed, { "frame_timestamp_in_segment" });
         }
         if (candidateTimestampName.empty()) {
-            candidateTimestampName = trimAscii(seed.value("timestamp_name", std::string()));
+            candidateTimestampName =
+                readTemporalNodeStringAlias_(seed, { "timestamp_name" });
         }
     };
 
@@ -14703,13 +14723,15 @@ static nlohmann::json buildFallbackIdentityPatchForPositiveHit_(
         for (const auto& match : hit.faceIdentityMatches) {
             if (!match.is_object()) continue;
             if (candidateEntityHint.empty()) {
-                candidateEntityHint = trimAscii(match.value("target_name", std::string()));
+                candidateEntityHint =
+                    readTemporalNodeStringAlias_(match, { "target_name" });
             }
             if (candidateEntityType.empty()) {
                 candidateEntityType = "person";
             }
             if (candidateDescription.empty()) {
-                candidateDescription = trimAscii(match.value("target_description", std::string()));
+                candidateDescription =
+                    readTemporalNodeStringAlias_(match, { "target_description" });
             }
             if (!candidateEntityHint.empty() && !candidateEntityType.empty() && !candidateDescription.empty()) {
                 break;
@@ -14853,19 +14875,17 @@ static bool forceIdentityCardForPositiveHit_(
     mergeMissingPatchFields(buildFallbackIdentityPatchForPositiveHit_(hit, temporalState, true));
 
     std::string entityId =
-        trimAscii(forcedPatch.value("entity_id", std::string()));
+        readTemporalNodeStringAlias_(forcedPatch, { "entity_id" });
     std::string entityHint =
-        trimAscii(forcedPatch.value("entity_key", std::string()));
+        readTemporalNodeStringAlias_(forcedPatch, { "entity_key" });
     std::string entityType =
-        normalizeFallbackEntityType_(forcedPatch.value("entity_type", std::string()));
+        normalizeFallbackEntityType_(readTemporalNodeStringAlias_(forcedPatch, { "entity_type" }));
 
     if (entityId.empty() && hit.identityPortraitCandidates.is_array()) {
         for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
             if (!portraitCandidate.is_object()) continue;
-            entityId = trimAscii(
-                portraitCandidate.value(
-                    "candidate_entity_id",
-                    portraitCandidate.value("entity_id", std::string())));
+            entityId =
+                readTemporalNodeStringAlias_(portraitCandidate, { "candidate_entity_id", "entity_id" });
             if (!entityId.empty()) break;
         }
     }
@@ -14873,10 +14893,8 @@ static bool forceIdentityCardForPositiveHit_(
     if (entityHint.empty() && hit.identityPortraitCandidates.is_array()) {
         for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
             if (!portraitCandidate.is_object()) continue;
-            entityHint = trimAscii(
-                portraitCandidate.value(
-                    "candidate_entity_hint",
-                    portraitCandidate.value("entity_key", std::string())));
+            entityHint =
+                readTemporalNodeStringAlias_(portraitCandidate, { "candidate_entity_hint", "entity_key" });
             if (!entityHint.empty()) break;
         }
     }
@@ -14885,7 +14903,7 @@ static bool forceIdentityCardForPositiveHit_(
         for (const auto& portraitCandidate : hit.identityPortraitCandidates) {
             if (!portraitCandidate.is_object()) continue;
             entityType = normalizeFallbackEntityType_(
-                portraitCandidate.value("entity_type", std::string()));
+                readTemporalNodeStringAlias_(portraitCandidate, { "entity_type" }));
             if (!entityType.empty()) break;
         }
     }
@@ -14942,9 +14960,7 @@ static bool forceIdentityCardForPositiveHit_(
     forcedPatch["confidence"] = entityExistedBefore ? 0.90 : 0.78;
 
     std::string seenTsUtc = trimAscii(
-        forcedPatch.value(
-            "last_seen_ts_utc",
-            forcedPatch.value("ts_utc", std::string())));
+        readTemporalNodeStringAlias_(forcedPatch, { "last_seen_ts_utc", "ts_utc" }));
     if (seenTsUtc.empty()) seenTsUtc = trimAscii(hit.eventTimestampUtcIso);
     if (seenTsUtc.empty()) seenTsUtc = temporal::nowIso();
 
@@ -17947,6 +17963,12 @@ void AgentCore::handleChatQuery_(const json& payload)
 
     executeVideoSearchPipeline(payload);
 }
+namespace {
+    void appendUniqueTemporalEvidenceCandidates_(
+        std::vector<TemporalEvidenceCandidate>& destination,
+        const std::vector<TemporalEvidenceCandidate>& source);
+    bool hitCanYieldChatMediaEvidence_(const VideoHit& hit);
+}
 
 void AgentCore::executeVideoSearchPipeline(const json& payload)
 {
@@ -20103,10 +20125,49 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
 
         const int kMaxTotalFrames = 50;
         int totalFrames = 0;
-        
+        std::vector<VideoHit> mediaSourceHits = videoHits;
+        auto buildMediaHitKey = [](const VideoHit& hit) {
+            std::ostringstream oss;
+            oss << hit.cameraId << '|'
+                << hit.segmentIndex << '|'
+                << trimAscii(hit.segmentStartTs) << '|'
+                << trimAscii(hit.segmentEndTs) << '|'
+                << trimAscii(hit.eventFrameTimestampInSegment) << '|'
+                << trimAscii(hit.answer);
+            return oss.str();
+        };
+        std::set<std::string> seenMediaHitKeys;
+        for (const auto& hit : mediaSourceHits) {
+            seenMediaHitKeys.insert(buildMediaHitKey(hit));
+        }
+        if (answerSourceHits != nullptr) {
+            for (const auto& hit : *answerSourceHits) {
+                if (!answerSupportsPositiveChatIdentityFallback_(hit.answer)) {
+                    continue;
+                }
+                if (!hitCanYieldChatMediaEvidence_(hit)) {
+                    continue;
+                }
+                const std::string hitKey = buildMediaHitKey(hit);
+                if (!seenMediaHitKeys.insert(hitKey).second) {
+                    continue;
+                }
+                mediaSourceHits.push_back(hit);
+            }
+        }
 
+        Logger::instance().logDebug(
+            "agent",
+            "handleChatQuery_: media payload source_hits=" + std::to_string(mediaSourceHits.size()) +
+                " matched_hits=" + std::to_string(videoHits.size()) +
+                " answer_hits=" +
+                std::to_string(answerSourceHits != nullptr ? answerSourceHits->size() : 0));
 
-        for (const auto& h : videoHits) {
+        for (const auto& h : mediaSourceHits) {
+            std::vector<TemporalEvidenceCandidate> mergedEvidenceCandidates = h.temporalEvidenceCandidates;
+            appendUniqueTemporalEvidenceCandidates_(
+                mergedEvidenceCandidates,
+                h.chatFallbackEvidenceCandidates);
             nlohmann::json hitObj;
             hitObj["segment_start_ts"] = h.segmentStartTs;
             hitObj["segment_end_ts"] = h.segmentEndTs;
@@ -20128,9 +20189,9 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             if (!h.eventTimestampLocalIso.empty()) {
                 hitObj["event_timestamp_local_iso"] = h.eventTimestampLocalIso;
             }
-            if (!h.temporalEvidenceCandidates.empty()) {
+            if (!mergedEvidenceCandidates.empty()) {
                 nlohmann::json evidenceMeta = nlohmann::json::array();
-                for (const auto& candidate : h.temporalEvidenceCandidates) {
+                for (const auto& candidate : mergedEvidenceCandidates) {
                     nlohmann::json item;
                     if (!candidate.evidenceKey.empty()) item["evidence_key"] = candidate.evidenceKey;
                     if (!candidate.eventName.empty()) item["event_name"] = candidate.eventName;
@@ -20190,14 +20251,14 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                 appendEvidenceTime(t);
             }
             appendEvidenceTime(h.eventFrameTimestampInSegment);
-            for (const auto& candidate : h.temporalEvidenceCandidates) {
+            for (const auto& candidate : mergedEvidenceCandidates) {
                 appendEvidenceTime(candidate.frameTimestampInSegment);
             }
 
             std::vector<std::pair<std::vector<unsigned char>, std::string>> directEvidenceImages;
             {
                 std::set<std::string> seenEvidenceImages;
-                for (const auto& candidate : h.temporalEvidenceCandidates) {
+                for (const auto& candidate : mergedEvidenceCandidates) {
                     const std::string rawImage = trimAscii(candidate.imageJpegBase64);
                     if (rawImage.empty()) continue;
 
@@ -23395,12 +23456,12 @@ namespace {
     {
         if (!patch.is_object()) return std::string();
         const std::string description =
-            trimAscii(patch.value("description", std::string()));
+            readTemporalNodeStringAlias_(patch, { "description" });
         if (!description.empty()) return description;
         const std::string shortDescription =
-            trimAscii(patch.value("short_description", std::string()));
+            readTemporalNodeStringAlias_(patch, { "short_description" });
         if (!shortDescription.empty()) return shortDescription;
-        return trimAscii(patch.value("identity_signature_summary", std::string()));
+        return readTemporalNodeStringAlias_(patch, { "identity_signature_summary" });
     }
 
     static void normalizeIdentityPatchItemForMemory_(
@@ -23409,7 +23470,7 @@ namespace {
         if (!item.is_object()) return;
 
         const std::string entityType =
-            normalizeFallbackEntityType_(item.value("entity_type", std::string()));
+            normalizeFallbackEntityType_(readTemporalNodeStringAlias_(item, { "entity_type" }));
         const nlohmann::json explicitSignatureTraits =
             item.contains("identity_signature_traits")
                 ? temporal::parseTraitsValue(item["identity_signature_traits"])
@@ -23759,6 +23820,171 @@ namespace {
         hit.detectionTimeInVideo.push_back(std::move(fallbackTime));
     }
 
+    static std::string temporalEvidenceCandidateDedupKey_(
+        const TemporalEvidenceCandidate& candidate)
+    {
+        const std::string explicitKey = trimAscii(candidate.evidenceKey);
+        if (!explicitKey.empty()) {
+            return explicitKey;
+        }
+
+        const std::string synthesizedKey = buildTemporalEvidenceKey_(
+            trimAscii(candidate.eventName),
+            trimAscii(candidate.entityId),
+            candidate.frameIndex,
+            trimAscii(candidate.timestampName),
+            trimAscii(candidate.frameTimestampInSegment),
+            trimAscii(candidate.timestampUtcIso));
+        if (!synthesizedKey.empty()) {
+            return synthesizedKey;
+        }
+
+        std::ostringstream oss;
+        oss << candidate.frameIndex << '|'
+            << trimAscii(candidate.frameTimestampInSegment) << '|'
+            << trimAscii(candidate.timestampName) << '|'
+            << trimAscii(candidate.timestampUtcIso) << '|'
+            << trimAscii(candidate.reason);
+        return oss.str();
+    }
+
+    static bool temporalEvidenceCandidateCanYieldChatMedia_(
+        const TemporalEvidenceCandidate& candidate)
+    {
+        return !trimAscii(candidate.imageJpegBase64).empty() ||
+            !trimAscii(candidate.frameTimestampInSegment).empty();
+    }
+
+    static bool temporalEvidenceCandidatesContainRenderableMedia_(
+        const std::vector<TemporalEvidenceCandidate>& candidates)
+    {
+        for (const auto& candidate : candidates) {
+            if (temporalEvidenceCandidateCanYieldChatMedia_(candidate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void appendUniqueTemporalEvidenceCandidates_(
+        std::vector<TemporalEvidenceCandidate>& destination,
+        const std::vector<TemporalEvidenceCandidate>& source)
+    {
+        std::set<std::string> seenKeys;
+        for (const auto& candidate : destination) {
+            const std::string key = temporalEvidenceCandidateDedupKey_(candidate);
+            if (!key.empty()) {
+                seenKeys.insert(key);
+            }
+        }
+
+        for (const auto& candidate : source) {
+            const std::string key = temporalEvidenceCandidateDedupKey_(candidate);
+            if (key.empty()) {
+                continue;
+            }
+            if (!seenKeys.insert(key).second) {
+                continue;
+            }
+            destination.push_back(candidate);
+        }
+    }
+
+    static bool hitCanYieldChatMediaEvidence_(const VideoHit& hit)
+    {
+        if (!hit.detectionTimeInVideo.empty()) {
+            return true;
+        }
+        if (!trimAscii(hit.eventFrameTimestampInSegment).empty()) {
+            return true;
+        }
+        if (temporalEvidenceCandidatesContainRenderableMedia_(hit.temporalEvidenceCandidates)) {
+            return true;
+        }
+        if (temporalEvidenceCandidatesContainRenderableMedia_(hit.chatFallbackEvidenceCandidates)) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool ensureFallbackVisualEvidenceForPositiveChatHit_(
+        VideoHit& hit,
+        const std::vector<PromptVideoFrame>* frameCatalog,
+        const std::string& videoPackagingMode,
+        const std::string& logStreamId = std::string(),
+        const std::string& scopeTag = std::string())
+    {
+        if (hit.hasMatch) {
+            return false;
+        }
+        if (!answerSupportsPositiveChatIdentityFallback_(hit.answer)) {
+            return false;
+        }
+        if (frameCatalog == nullptr || frameCatalog->empty()) {
+            return false;
+        }
+        if (temporalEvidenceCandidatesContainRenderableMedia_(hit.temporalEvidenceCandidates) ||
+            temporalEvidenceCandidatesContainRenderableMedia_(hit.chatFallbackEvidenceCandidates))
+        {
+            return false;
+        }
+
+        const PromptVideoFrame* representativeFrame =
+            selectRepresentativePromptVideoFrameForHit_(hit, frameCatalog, videoPackagingMode);
+        if (representativeFrame == nullptr) {
+            return false;
+        }
+
+        TemporalEvidenceCandidate candidate;
+        candidate.eventName = "present";
+        candidate.reason = "chat_positive_answer_fallback";
+        candidate.frameIndex = representativeFrame->frameIndex;
+        candidate.frameTimestampInSegment = trimAscii(representativeFrame->frameTimestampInSegment);
+        candidate.timestampName = trimAscii(representativeFrame->timestampName);
+        candidate.imageJpegBase64 = trimAscii(representativeFrame->jpegBase64);
+        if (candidate.timestampName.empty() && representativeFrame->hasAbsoluteTimestamp) {
+            candidate.timestampName =
+                formatTimePointToCompactLocalTimestampWithMillis_(representativeFrame->absoluteTimestamp);
+        }
+        if (representativeFrame->hasAbsoluteTimestamp) {
+            candidate.timestampUtcIso = formatTimePointToIsoUtcZ_(representativeFrame->absoluteTimestamp);
+            candidate.timestampLocalIso = formatTimePointToLocalIso_(representativeFrame->absoluteTimestamp);
+        }
+        candidate.evidenceKey = buildTemporalEvidenceKey_(
+            candidate.eventName,
+            candidate.entityId,
+            candidate.frameIndex,
+            candidate.timestampName,
+            candidate.frameTimestampInSegment,
+            candidate.timestampUtcIso);
+        if (candidate.evidenceKey.empty()) {
+            candidate.evidenceKey = temporalEvidenceCandidateDedupKey_(candidate);
+        }
+        if (candidate.evidenceKey.empty() || !temporalEvidenceCandidateCanYieldChatMedia_(candidate)) {
+            return false;
+        }
+
+        const std::string candidateKey = temporalEvidenceCandidateDedupKey_(candidate);
+        for (const auto& existing : hit.temporalEvidenceCandidates) {
+            if (temporalEvidenceCandidateDedupKey_(existing) == candidateKey) {
+                return false;
+            }
+        }
+        for (const auto& existing : hit.chatFallbackEvidenceCandidates) {
+            if (temporalEvidenceCandidateDedupKey_(existing) == candidateKey) {
+                return false;
+            }
+        }
+
+        hit.chatFallbackEvidenceCandidates.push_back(std::move(candidate));
+        if (!logStreamId.empty() && !scopeTag.empty()) {
+            Logger::instance().logDebug(
+                logStreamId,
+                scopeTag + ": synthesized fallback visual evidence for positive chat hit");
+        }
+        return true;
+    }
+
     static void ensureFallbackIdentityPortraitCandidatesForChatHit_(
         VideoHit& hit,
         const std::string& rawPrompt,
@@ -23862,7 +24088,7 @@ namespace {
             buildFallbackIdentityAttributesFromText_(
                 focusText,
                 descriptor.entityType.empty()
-                    ? candidate.value("entity_type", std::string())
+                    ? readTemporalNodeStringAlias_(candidate, { "entity_type" })
                     : descriptor.entityType,
                 signatureTraits,
                 featureCandidates);
@@ -30070,6 +30296,12 @@ VideoHit AgentCore::callOpenAIVisionVideoSegment_(
                     camLogId,
                     "callOpenAIVisionVideoSegment_: promoted direct-chat hit via fallback identity evidence");
             }
+            (void)ensureFallbackVisualEvidenceForPositiveChatHit_(
+                hit,
+                &frames,
+                videoPackagingMode,
+                camLogId,
+                "callOpenAIVisionVideoSegment_");
         }
         return hit;
     }

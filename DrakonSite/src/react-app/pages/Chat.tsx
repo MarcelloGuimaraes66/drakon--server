@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
@@ -330,7 +330,7 @@ export default function Chat() {
     }
   }, [messages, shouldAutoScroll]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const previousMessageMeta = previousMessageMetaRef.current;
     const nextMessageMeta = new Map<number, { isPending: boolean; revealId: string; messageType: string | null }>();
     let nextRevealId: string | null = null;
@@ -979,6 +979,9 @@ export default function Chat() {
                           type="text"
                           value={editingTitle}
                           onChange={(e) => setEditingTitle(e.target.value)}
+                          spellCheck={false}
+                          autoCorrect="off"
+                          autoCapitalize="off"
                           onKeyDown={(e) => {
                             if (e.key === "Enter") {
                               handleSaveEdit(session.id);

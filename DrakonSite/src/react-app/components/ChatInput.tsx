@@ -539,6 +539,9 @@ export default function ChatInput({
             onKeyDown={handleTextKeyDown}
             placeholder={placeholder}
             rows={1}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
             className={
               isChatPageVariant
                 ? "h-[48px] flex-1 resize-none rounded-2xl border border-white/[0.08] bg-[#171b26]/90 px-4 py-3 text-sm leading-6 text-gray-100 transition-all placeholder:text-gray-500 focus:border-blue-400/30 focus:outline-none focus:ring-2 focus:ring-blue-400/60 md:text-base"

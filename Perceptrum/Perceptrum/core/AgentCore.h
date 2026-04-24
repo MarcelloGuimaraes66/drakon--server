@@ -130,6 +130,9 @@ struct VideoHit {
     std::string eventTimestampUtcIso;
     std::string eventTimestampLocalIso;
     std::vector<TemporalEvidenceCandidate> temporalEvidenceCandidates;
+    // Chat-only visual fallback evidence synthesized from the analyzed prompt frames.
+    // Kept separate from temporalEvidenceCandidates so it does not affect temporal state/memory.
+    std::vector<TemporalEvidenceCandidate> chatFallbackEvidenceCandidates;
     nlohmann::json identityPortraitCandidates = nlohmann::json::array();
     nlohmann::json matchedEntityIds = nlohmann::json::array();
     nlohmann::json identityCards = nlohmann::json::array();
