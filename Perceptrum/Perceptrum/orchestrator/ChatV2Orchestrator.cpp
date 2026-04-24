@@ -1053,31 +1053,25 @@ SkillSelection finalizeSelectionLanguages_(SkillSelection selection)
 {
     selection.replyLanguage = normalizeAssistantLanguageTag(selection.replyLanguage);
 
-    if (selection.knowledgeLanguage.empty()) {
-        selection.knowledgeLanguage = defaultKnowledgeLanguageForReply_(selection.replyLanguage);
-    }
-    else {
-        selection.knowledgeLanguage = normalizeAssistantLanguageTag(selection.knowledgeLanguage);
-    }
-
     if (selection.replyLanguage.empty()) {
+        if (!selection.knowledgeLanguage.empty()) {
+            selection.knowledgeLanguage = normalizeAssistantLanguageTag(selection.knowledgeLanguage);
+        }
+        if (selection.knowledgeLanguage.empty()) {
+            selection.knowledgeLanguage = "en";
+        }
         selection.knowledgeLanguageFallback = true;
-    }
-    else if (selection.knowledgeLanguage.empty()) {
-        selection.knowledgeLanguage = "en";
-        selection.knowledgeLanguageFallback = true;
-    }
-    else {
-        selection.knowledgeLanguageFallback =
-            selection.knowledgeLanguage != normalizeAssistantLanguageTag(selection.replyLanguage) ||
-            selection.knowledgeLanguage != selection.replyLanguage;
+        return selection;
     }
 
+    selection.knowledgeLanguage = defaultKnowledgeLanguageForReply_(selection.replyLanguage);
     if (selection.knowledgeLanguage.empty()) {
         selection.knowledgeLanguage = "en";
         selection.knowledgeLanguageFallback = true;
+        return selection;
     }
 
+    selection.knowledgeLanguageFallback = false;
     return selection;
 }
 

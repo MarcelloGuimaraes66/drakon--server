@@ -1,6 +1,7 @@
 #include "EditJobSkill.h"
 
 #include <algorithm>
+#include <regex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -17,6 +18,15 @@ namespace chatv2 {
 namespace {
 
 using json = nlohmann::json;
+
+constexpr int kDefaultNewStepTimeoutSeconds_ = 300;
+constexpr int kMinimumNewStepTimeoutSeconds_ = 120;
+
+struct PendingStepCreate_ {
+    std::string name;
+    int stepOrder = 0;
+    int timeoutSeconds = 0;
+};
 
 std::string safeText_(const json& value, const char* key)
 {
@@ -146,6 +156,191 @@ json normalizeJobPatch_(const json& value)
     return normalized;
 }
 
+std::string trimQuotedLabel_(std::string value)
+{
+    value = shared::trimText(std::move(value));
+    if (value.size() >= 2) {
+        const char first = value.front();
+        const char last = value.back();
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            value = value.substr(1, value.size() - 2);
+        }
+    }
+    while (!value.empty()) {
+        const char last = value.back();
+        if (last == '.' || last == ',' || last == ';' || last == ':') {
+            value.pop_back();
+            continue;
+        }
+        break;
+    }
+    return shared::normalizeInlineWhitespace(std::move(value));
+}
+
+bool containsAnyNeedle_(const std::string& haystack, const std::vector<const char*>& needles)
+{
+    return std::any_of(needles.begin(), needles.end(), [&](const char* needle) {
+        return needle && *needle && haystack.find(needle) != std::string::npos;
+    });
+}
+
+bool looksLikeCreateStepRequest_(const std::string& normalizedQuery)
+{
+    const bool mentionsStep = containsAnyNeedle_(normalizedQuery, {
+        "step",
+        "steps",
+        "etapa",
+        "etapas",
+    });
+    const bool wantsCreate = containsAnyNeedle_(normalizedQuery, {
+        "create",
+        "add",
+        "new",
+        "crie",
+        "criar",
+        "adicione",
+        "adicionar",
+        "nova",
+        "novo",
+    });
+    return mentionsStep && wantsCreate;
+}
+
+std::string extractRegexGroup_(const std::string& text, const std::vector<std::regex>& patterns)
+{
+    std::smatch match;
+    for (const auto& pattern : patterns) {
+        if (std::regex_search(text, match, pattern) && match.size() > 1) {
+            const std::string candidate = trimQuotedLabel_(match[1].str());
+            if (!candidate.empty()) {
+                return candidate;
+            }
+        }
+    }
+    return "";
+}
+
+std::string extractStepNameFromCreateStepQuery_(const std::string& query)
+{
+    static const std::vector<std::regex> patterns = {
+        std::regex(R"(\b(?:called|named|chamado|chamada|nomeado|nomeada|com\s+nome)\s+["']?(.+?)["']?\s*$)", std::regex::icase),
+        std::regex(R"(\b(?:step|etapa)\s+["']([^"']+)["']\s*$)", std::regex::icase),
+    };
+    return extractRegexGroup_(query, patterns);
+}
+
+std::string extractJobNameFromCreateStepQuery_(const std::string& query)
+{
+    static const std::vector<std::regex> patterns = {
+        std::regex(R"(\bin\s+(?:the\s+)?(.+?)\s+job\b)", std::regex::icase),
+        std::regex(R"(^\s*(.+?)\s+and\s+i\s+want\s+you\s+to\s+create\s+(?:a\s+new\s+)?step\b)", std::regex::icase),
+        std::regex(R"(^\s*(.+?)\s+e\s+eu\s+quero\s+criar\s+(?:uma\s+nova\s+)?etapa\b)", std::regex::icase),
+    };
+    return extractRegexGroup_(query, patterns);
+}
+
+json normalizeStepCreations_(const json& value)
+{
+    json normalized = json::array();
+
+    auto appendOne = [&](const json& raw) {
+        json item = json::object();
+        if (raw.is_string()) {
+            const std::string name = trimQuotedLabel_(raw.get<std::string>());
+            if (!name.empty()) {
+                item["name"] = name;
+            }
+        }
+        else if (raw.is_object()) {
+            std::string name = safeText_(raw, "name");
+            if (name.empty()) {
+                name = safeText_(raw, "title");
+            }
+            name = trimQuotedLabel_(std::move(name));
+            if (!name.empty()) {
+                item["name"] = name;
+            }
+
+            int stepOrder = 0;
+            if (shared::tryJsonIntField(raw, "step_order", stepOrder) && stepOrder > 0) {
+                item["step_order"] = stepOrder;
+            }
+
+            int timeoutSeconds = 0;
+            if (shared::tryJsonIntField(raw, "timeout_seconds", timeoutSeconds) && timeoutSeconds > 0) {
+                item["timeout_seconds"] = timeoutSeconds;
+            }
+        }
+
+        if (!item.empty()) {
+            normalized.push_back(item);
+        }
+    };
+
+    if (value.is_object()) {
+        if (value.contains("steps")) {
+            return normalizeStepCreations_(value["steps"]);
+        }
+        return normalized;
+    }
+    if (value.is_array()) {
+        for (const auto& item : value) {
+            appendOne(item);
+        }
+    }
+    return normalized;
+}
+
+std::vector<PendingStepCreate_> pendingStepCreates_(const json& draft)
+{
+    std::vector<PendingStepCreate_> pending;
+    const json normalized = normalizeStepCreations_(draft.value("step_creations", json::array()));
+    for (const auto& item : normalized) {
+        if (!item.is_object()) {
+            continue;
+        }
+
+        PendingStepCreate_ entry;
+        entry.name = safeText_(item, "name");
+        if (entry.name.empty()) {
+            continue;
+        }
+        shared::tryJsonIntField(item, "step_order", entry.stepOrder);
+        shared::tryJsonIntField(item, "timeout_seconds", entry.timeoutSeconds);
+        pending.push_back(entry);
+    }
+    return pending;
+}
+
+json heuristicDraftFromPayload_(const json& payload)
+{
+    const std::string query = safeText_(payload, "query");
+    if (query.empty()) {
+        return json::object();
+    }
+
+    const std::string normalizedQuery = shared::lowerAscii(query);
+    if (!looksLikeCreateStepRequest_(normalizedQuery)) {
+        return json::object();
+    }
+
+    json draft = json::object();
+    const std::string stepName = extractStepNameFromCreateStepQuery_(query);
+    if (!stepName.empty()) {
+        draft["step_creations"] = json::array({
+            json::object({ { "name", stepName } }),
+        });
+    }
+
+    const std::string jobName = extractJobNameFromCreateStepQuery_(query);
+    if (!jobName.empty()) {
+        draft["target_selector"] = json::object({
+            { "name", jobName },
+        });
+    }
+    return draft;
+}
+
 bool hasPatchChanges_(const json& patch)
 {
     return patch.is_object() && !patch.empty();
@@ -220,6 +415,10 @@ json selectionDraft_(const SkillSelection& selection)
             if (!patch.empty()) {
                 draft["job_patch"] = patch;
             }
+            const json stepCreations = normalizeStepCreations_(selection.arguments["draft_patch"]);
+            if (!stepCreations.empty()) {
+                draft["step_creations"] = stepCreations;
+            }
         }
         if (selection.arguments.contains("resolved_job") && selection.arguments["resolved_job"].is_object()) {
             draft["resolved_job"] = selection.arguments["resolved_job"];
@@ -230,6 +429,10 @@ json selectionDraft_(const SkillSelection& selection)
         draft["job_patch"] = mergeObjectValues_(
             draft.value("job_patch", json::object()),
             normalizeJobPatch_(selection.draftPatch));
+        const json stepCreations = normalizeStepCreations_(selection.draftPatch);
+        if (!stepCreations.empty()) {
+            draft["step_creations"] = stepCreations;
+        }
     }
 
     return draft;
@@ -290,6 +493,52 @@ std::string buildSuccessAnswer_(const std::string& language, const json& job)
         : "Done, I updated the job \"" + jobName_(job) + "\".";
 }
 
+std::string buildCreatedStepsAnswer_(const std::string& language, const json& job, const json& createdSteps)
+{
+    const std::size_t count = createdSteps.is_array() ? createdSteps.size() : 0;
+    if (count == 1) {
+        const std::string stepName = safeText_(createdSteps[0], "name");
+        return isPt_(language)
+            ? "Pronto, criei a etapa \"" + (stepName.empty() ? std::string("nova etapa") : stepName) +
+                "\" no job \"" + jobName_(job) + "\"."
+            : "Done, I created the step \"" + (stepName.empty() ? std::string("new step") : stepName) +
+                "\" in the job \"" + jobName_(job) + "\".";
+    }
+
+    return isPt_(language)
+        ? "Pronto, criei " + std::to_string(count) + " etapas no job \"" + jobName_(job) + "\"."
+        : "Done, I created " + std::to_string(count) + " steps in the job \"" + jobName_(job) + "\".";
+}
+
+std::string buildJobAndStepsSuccessAnswer_(const std::string& language, const json& job, const json& createdSteps)
+{
+    const std::size_t count = createdSteps.is_array() ? createdSteps.size() : 0;
+    if (count == 1) {
+        const std::string stepName = safeText_(createdSteps[0], "name");
+        return isPt_(language)
+            ? "Pronto, atualizei o job \"" + jobName_(job) + "\" e criei a etapa \"" +
+                (stepName.empty() ? std::string("nova etapa") : stepName) + "\"."
+            : "Done, I updated the job \"" + jobName_(job) + "\" and created the step \"" +
+                (stepName.empty() ? std::string("new step") : stepName) + "\".";
+    }
+
+    return isPt_(language)
+        ? "Pronto, atualizei o job \"" + jobName_(job) + "\" e criei " +
+            std::to_string(count) + " etapas."
+        : "Done, I updated the job \"" + jobName_(job) + "\" and created " +
+            std::to_string(count) + " steps.";
+}
+
+std::string buildStepCreationFailureAfterJobUpdateAnswer_(
+    const std::string& language,
+    const json& job,
+    const std::string& detail)
+{
+    return isPt_(language)
+        ? "Atualizei o job \"" + jobName_(job) + "\", mas nao consegui criar a nova etapa. Detalhe: " + detail
+        : "I updated the job \"" + jobName_(job) + "\", but I could not create the new step. Detail: " + detail;
+}
+
 std::string buildFailureAnswer_(const std::string& language, const std::string& detail)
 {
     if (!detail.empty()) {
@@ -347,6 +596,15 @@ std::string jobUrl_(AgentCore& agent, const json& payload, int jobId)
         std::to_string(jobId) + "?client_id=" + clientId;
 }
 
+std::string jobStepsUrl_(AgentCore& agent, const json& payload, int jobId)
+{
+    const std::string clientId = shared::clientIdFromPayload(payload).empty()
+        ? agent.getClientId()
+        : shared::clientIdFromPayload(payload);
+    return agent.getBackendBaseUrl() + "/api/agent/jobs/" +
+        std::to_string(jobId) + "/steps?client_id=" + clientId;
+}
+
 } // namespace
 
 SkillDefinition EditJobSkill::definition() const
@@ -371,7 +629,9 @@ SkillRunResult EditJobSkill::execute(
     const json conversationContext = shared::loadConversationContext(agent, payload);
     const std::string language = shared::effectiveReplyLanguage(selection, payload, conversationContext);
 
-    json draft = mergeObjectValues_(activeDraft_(conversationContext), selectionDraft_(selection));
+    json draft = mergeObjectValues_(
+        mergeObjectValues_(activeDraft_(conversationContext), heuristicDraftFromPayload_(payload)),
+        selectionDraft_(selection));
 
     postChatProgress(
         agent,
@@ -451,7 +711,8 @@ SkillRunResult EditJobSkill::execute(
     draft.erase("candidate_jobs");
 
     const json jobPatch = normalizeJobPatch_(draft.value("job_patch", json::object()));
-    if (!hasPatchChanges_(jobPatch)) {
+    const std::vector<PendingStepCreate_> stepCreates = pendingStepCreates_(draft);
+    if (!hasPatchChanges_(jobPatch) && stepCreates.empty()) {
         result.answer = buildNeedChangesAnswer_(language, resolvedJob);
         result.metadata["task_state"] = buildTaskState_(
             conversationContext,
@@ -472,52 +733,179 @@ SkillRunResult EditJobSkill::execute(
         makeProgressUpdate(language, "edit_job", "applying_action", 3, 3, 3),
         2500);
 
-    const HttpResponse response = putJson(
-        jobUrl_(agent, payload, resolvedJob.value("id", 0)),
-        jobPatch.dump(),
-        agent.getExeToken(),
-        {},
-        20000);
-    if (!response.ok()) {
-        result.answer = buildFailureAnswer_(language, shared::parseErrorMessage(response));
-        result.metadata["task_state"] = buildTaskState_(
-            conversationContext,
-            draft,
-            language,
-            "pending",
-            "awaiting_retry",
-            isPt_(language) ? "Falha ao editar o job" : "Failed to edit the job",
-            result.answer,
+    json updatedJob = resolvedJob;
+    bool jobUpdated = false;
+    if (hasPatchChanges_(jobPatch)) {
+        const HttpResponse response = putJson(
+            jobUrl_(agent, payload, resolvedJob.value("id", 0)),
+            jobPatch.dump(),
+            agent.getExeToken(),
             {},
-            false);
-        return result;
+            20000);
+        if (!response.ok()) {
+            result.answer = buildFailureAnswer_(language, shared::parseErrorMessage(response));
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_retry",
+                isPt_(language) ? "Falha ao editar o job" : "Failed to edit the job",
+                result.answer,
+                {},
+                false);
+            return result;
+        }
+
+        json responseBody = json::parse(response.body, nullptr, false);
+        if (!responseBody.is_object()) {
+            responseBody = json::object();
+        }
+
+        updatedJob = responseBody.value("job", json::object());
+        if (!updatedJob.is_object() || updatedJob.empty()) {
+            updatedJob = resolvedJob;
+            for (auto it = jobPatch.begin(); it != jobPatch.end(); ++it) {
+                updatedJob[it.key()] = it.value();
+            }
+        }
+        jobUpdated = true;
     }
 
-    json responseBody = json::parse(response.body, nullptr, false);
-    if (!responseBody.is_object()) {
-        responseBody = json::object();
-    }
+    json createdSteps = json::array();
+    if (!stepCreates.empty()) {
+        const json snapshotResponse = shared::fetchJobSnapshot(agent, payload, resolvedJob.value("id", 0));
+        if (!snapshotResponse.value("ok", false)) {
+            result.answer = jobUpdated
+                ? buildStepCreationFailureAfterJobUpdateAnswer_(language, updatedJob, safeText_(snapshotResponse, "error"))
+                : buildFailureAnswer_(language, safeText_(snapshotResponse, "error"));
+            result.metadata["job"] = updatedJob;
+            result.metadata["task_state"] = buildTaskState_(
+                conversationContext,
+                draft,
+                language,
+                "pending",
+                "awaiting_retry",
+                isPt_(language) ? "Falha ao criar a etapa" : "Failed to create the step",
+                result.answer,
+                {},
+                false);
+            return result;
+        }
 
-    json updatedJob = responseBody.value("job", json::object());
-    if (!updatedJob.is_object() || updatedJob.empty()) {
-        updatedJob = resolvedJob;
-        for (auto it = jobPatch.begin(); it != jobPatch.end(); ++it) {
-            updatedJob[it.key()] = it.value();
+        int nextStepOrder = 1;
+        for (const auto& existingStep : snapshotResponse.value("snapshot", json::object()).value("steps", json::array())) {
+            const int currentOrder = existingStep.value("step_order", 0);
+            if (currentOrder >= nextStepOrder) {
+                nextStepOrder = currentOrder + 1;
+            }
+        }
+
+        for (const auto& requestedStep : stepCreates) {
+            const int requestedTimeout = requestedStep.timeoutSeconds > 0
+                ? (std::max)(kMinimumNewStepTimeoutSeconds_, requestedStep.timeoutSeconds)
+                : kDefaultNewStepTimeoutSeconds_;
+            const int requestedOrder = requestedStep.stepOrder > 0 ? requestedStep.stepOrder : nextStepOrder;
+
+            json createPayload = json::object({
+                { "step_order", requestedOrder },
+                { "name", requestedStep.name },
+                { "timeout_seconds", requestedTimeout },
+            });
+
+            HttpResponse createResponse = postJson(
+                jobStepsUrl_(agent, payload, resolvedJob.value("id", 0)),
+                createPayload.dump(),
+                agent.getExeToken(),
+                {},
+                20000);
+            if (!createResponse.ok() &&
+                requestedTimeout > kMinimumNewStepTimeoutSeconds_ &&
+                shared::parseErrorMessage(createResponse).find("Step timeout exceeds this job limit") != std::string::npos) {
+                createPayload["timeout_seconds"] = kMinimumNewStepTimeoutSeconds_;
+                createResponse = postJson(
+                    jobStepsUrl_(agent, payload, resolvedJob.value("id", 0)),
+                    createPayload.dump(),
+                    agent.getExeToken(),
+                    {},
+                    20000);
+            }
+
+            if (!createResponse.ok()) {
+                result.answer = jobUpdated
+                    ? buildStepCreationFailureAfterJobUpdateAnswer_(language, updatedJob, shared::parseErrorMessage(createResponse))
+                    : buildFailureAnswer_(language, shared::parseErrorMessage(createResponse));
+                result.metadata["job"] = updatedJob;
+                if (!createdSteps.empty()) {
+                    result.metadata["steps"] = createdSteps;
+                }
+                result.metadata["task_state"] = buildTaskState_(
+                    conversationContext,
+                    draft,
+                    language,
+                    "pending",
+                    "awaiting_retry",
+                    isPt_(language) ? "Falha ao criar a etapa" : "Failed to create the step",
+                    result.answer,
+                    {},
+                    false);
+                return result;
+            }
+
+            json createBody = json::parse(createResponse.body, nullptr, false);
+            if (!createBody.is_object()) {
+                createBody = json::object();
+            }
+
+            const json createdStep = createBody.value("step", json::object());
+            if (createdStep.is_object() && !createdStep.empty()) {
+                createdSteps.push_back(createdStep);
+                nextStepOrder = (std::max)(nextStepOrder, createdStep.value("step_order", requestedOrder) + 1);
+            }
+            else {
+                createdSteps.push_back(json::object({
+                    { "name", requestedStep.name },
+                    { "step_order", requestedOrder },
+                    { "timeout_seconds", createPayload.value("timeout_seconds", requestedTimeout) },
+                }));
+                nextStepOrder = (std::max)(nextStepOrder, requestedOrder + 1);
+            }
         }
     }
 
     draft["resolved_job"] = buildResolvedJob_(updatedJob);
     draft["job_patch"] = jobPatch;
+    if (!createdSteps.empty()) {
+        draft["step_creations"] = normalizeStepCreations_(createdSteps);
+    }
 
-    result.answer = buildSuccessAnswer_(language, draft["resolved_job"]);
+    if (jobUpdated && !createdSteps.empty()) {
+        result.answer = buildJobAndStepsSuccessAnswer_(language, draft["resolved_job"], createdSteps);
+    }
+    else if (!createdSteps.empty()) {
+        result.answer = buildCreatedStepsAnswer_(language, draft["resolved_job"], createdSteps);
+    }
+    else {
+        result.answer = buildSuccessAnswer_(language, draft["resolved_job"]);
+    }
+
     result.metadata["job"] = updatedJob;
+    if (!createdSteps.empty()) {
+        result.metadata["steps"] = createdSteps;
+    }
     result.metadata["task_state"] = buildTaskState_(
         conversationContext,
         draft,
         language,
         "completed",
-        "job_updated",
-        isPt_(language) ? "Job atualizado" : "Job updated",
+        !createdSteps.empty()
+            ? (jobUpdated ? "job_updated_with_step_created" : "job_step_created")
+            : "job_updated",
+        !createdSteps.empty()
+            ? (isPt_(language)
+                ? (jobUpdated ? "Job atualizado e etapa criada" : "Etapa criada no job")
+                : (jobUpdated ? "Job updated and step created" : "Step created in the job"))
+            : (isPt_(language) ? "Job atualizado" : "Job updated"),
         result.answer,
         {},
         true);

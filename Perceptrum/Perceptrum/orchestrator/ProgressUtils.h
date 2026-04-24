@@ -25,11 +25,14 @@ struct ChatProgressUpdate {
 
 inline std::string progressLanguageFromPayload(const nlohmann::json& payload)
 {
-    if (payload.is_object() && payload.contains("query_language") && payload["query_language"].is_string()) {
-        return normalizeAssistantLanguageTag(payload["query_language"].get<std::string>());
+    if (payload.is_object() && payload.contains("reply_language") && payload["reply_language"].is_string()) {
+        return normalizeAssistantLanguageTag(payload["reply_language"].get<std::string>());
     }
     if (payload.is_object() && payload.contains("language") && payload["language"].is_string()) {
         return normalizeAssistantLanguageTag(payload["language"].get<std::string>());
+    }
+    if (payload.is_object() && payload.contains("query_language") && payload["query_language"].is_string()) {
+        return normalizeAssistantLanguageTag(payload["query_language"].get<std::string>());
     }
     if (payload.is_object() && payload.contains("app_language") && payload["app_language"].is_string()) {
         return normalizeAssistantLanguageTag(payload["app_language"].get<std::string>());

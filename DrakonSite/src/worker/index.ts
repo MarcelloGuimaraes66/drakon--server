@@ -56771,6 +56771,37 @@ app.put("/api/agent/jobs/:id", async (c) => {
   return c.json(result.body, result.statusCode as any);
 });
 
+app.post("/api/agent/jobs/:id/steps", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = (url.searchParams.get("client_id") || "").trim();
+  const id = c.req.param("id");
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+
+  const pairing = await resolveAgentPairingForClient(
+    c.env.DB,
+    clientId,
+    c.req.header("authorization") || c.req.header("Authorization")
+  );
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const body = await c.req.json<{
+    step_order?: number | string;
+    name?: string;
+    timeout_seconds?: number | string;
+  }>().catch(() => null);
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const result = await createJobStepForUser(c.env.DB, pairing.userId, id, body);
+  return c.json(result.body, result.statusCode as any);
+});
+
 app.put("/api/jobs/:id", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const id = c.req.param("id");
@@ -62043,6 +62074,84 @@ const getJobMaxStepTimeoutSeconds = async (
   return null;
 };
 
+async function createJobStepForUser(
+  db: D1Database,
+  userId: string,
+  jobIdInput: string | number,
+  body: {
+    step_order?: number | string;
+    name?: string;
+    timeout_seconds?: number | string;
+  }
+): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  const jobId = Number(jobIdInput);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return { statusCode: 400, body: { error: "Invalid job id" } };
+  }
+
+  const job = await db.prepare(
+    "SELECT * FROM jobs WHERE id = ? AND user_id = ?"
+  )
+    .bind(jobId, userId)
+    .first();
+
+  if (!job) {
+    return { statusCode: 404, body: { error: "Job not found" } };
+  }
+
+  const timeoutSeconds = Math.round(Number(body.timeout_seconds));
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < MIN_JOB_STEP_TIMEOUT_SECONDS) {
+    return {
+      statusCode: 400,
+      body: { error: `timeout_seconds must be an integer >= ${MIN_JOB_STEP_TIMEOUT_SECONDS}` },
+    };
+  }
+
+  const maxTimeoutSeconds = await getJobMaxStepTimeoutSeconds(db, job);
+  if (maxTimeoutSeconds !== null && timeoutSeconds > maxTimeoutSeconds) {
+    return {
+      statusCode: 400,
+      body: {
+        error: `Step timeout exceeds this job limit (${formatDurationHuman(maxTimeoutSeconds)} max)`,
+      },
+    };
+  }
+
+  const requestedStepOrder = Math.round(Number(body.step_order));
+  const stepOrder =
+    Number.isFinite(requestedStepOrder) && requestedStepOrder > 0
+      ? requestedStepOrder
+      : 1;
+  const stepName = typeof body.name === "string" ? body.name.trim() : "";
+  if (!stepName) {
+    return { statusCode: 400, body: { error: "name is required" } };
+  }
+
+  const now = new Date().toISOString();
+
+  const result = await db.prepare(
+    `INSERT INTO job_steps (job_id, step_order, name, timeout_seconds, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'draft', ?, ?)`
+  )
+    .bind(
+      jobId,
+      stepOrder,
+      stepName,
+      timeoutSeconds,
+      now,
+      now
+    )
+    .run();
+
+  const step = await db.prepare(
+    "SELECT * FROM job_steps WHERE id = ?"
+  )
+    .bind(result.meta.last_row_id)
+    .first();
+
+  return { statusCode: 201, body: { step } };
+}
+
 // Job steps endpoints
 app.get("/api/jobs/:jobId/steps", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
@@ -62071,62 +62180,13 @@ app.post("/api/jobs/:jobId/steps", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const jobId = c.req.param("jobId");
   const body = await c.req.json<{
-    step_order: number;
-    name: string;
-    timeout_seconds: number;
+    step_order?: number | string;
+    name?: string;
+    timeout_seconds?: number | string;
   }>();
 
-  const job = await c.env.DB.prepare(
-    "SELECT * FROM jobs WHERE id = ? AND user_id = ?"
-  )
-    .bind(jobId, user.id)
-    .first();
-
-  if (!job) {
-    return c.json({ error: "Job not found" }, 404);
-  }
-
-  const timeoutSeconds = Math.round(Number(body.timeout_seconds));
-  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < MIN_JOB_STEP_TIMEOUT_SECONDS) {
-    return c.json(
-      { error: `timeout_seconds must be an integer >= ${MIN_JOB_STEP_TIMEOUT_SECONDS}` },
-      400
-    );
-  }
-
-  const maxTimeoutSeconds = await getJobMaxStepTimeoutSeconds(c.env.DB, job);
-  if (maxTimeoutSeconds !== null && timeoutSeconds > maxTimeoutSeconds) {
-    return c.json(
-      {
-        error: `Step timeout exceeds this job limit (${formatDurationHuman(maxTimeoutSeconds)} max)`,
-      },
-      400
-    );
-  }
-
-  const now = new Date().toISOString();
-
-  const result = await c.env.DB.prepare(
-    `INSERT INTO job_steps (job_id, step_order, name, timeout_seconds, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'draft', ?, ?)`
-  )
-    .bind(
-      jobId,
-      body.step_order,
-      body.name,
-      timeoutSeconds,
-      now,
-      now
-    )
-    .run();
-
-  const step = await c.env.DB.prepare(
-    "SELECT * FROM job_steps WHERE id = ?"
-  )
-    .bind(result.meta.last_row_id)
-    .first();
-
-  return c.json({ step }, 201);
+  const result = await createJobStepForUser(c.env.DB, user.id, jobId, body);
+  return c.json(result.body, result.statusCode as any);
 });
 
 app.patch("/api/job-steps/:stepId", anyAuthMiddleware, async (c) => {

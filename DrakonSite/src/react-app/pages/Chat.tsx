@@ -72,7 +72,7 @@ const DEFAULT_CHAT_CORE_RUNNING_RESOLUTION = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const CHAT_PLEXUS_BACKGROUND_ENABLED = true;
 const CHAT_VISUAL_TYPING_ENABLED = true;
-const CHAT_VISUAL_TYPING_MESSAGE_TYPES = new Set(["final"]);
+const CHAT_VISUAL_TYPING_MESSAGE_TYPES = new Set(["final", "router_ack"]);
 const CHAT_PAGE_TEXTAREA_ID = "chat-page-message-input";
 
 function normalizeChatModelTier(value: string | null | undefined): ChatModelTier {

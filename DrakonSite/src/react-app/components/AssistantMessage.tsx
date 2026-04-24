@@ -164,10 +164,6 @@ interface TypingMarkdownProps {
   onRevealComplete?: (revealId: string) => void;
 }
 
-function easeOutCubic(progress: number): number {
-  return 1 - Math.pow(1 - progress, 3);
-}
-
 function TypingMarkdown({
   markdown,
   compact,
@@ -192,18 +188,12 @@ function TypingMarkdown({
   const revealPlan = planCacheRef.current!;
   const [forceRevealComplete, setForceRevealComplete] = useState(false);
   const [visibleChunkCount, setVisibleChunkCount] = useState(() =>
-    animateReveal && revealId ? 1 : revealPlan.chunks.length,
+    animateReveal && revealId ? 0 : revealPlan.chunks.length,
+  );
+  const [isRevealInProgress, setIsRevealInProgress] = useState(() =>
+    Boolean(animateReveal && revealId),
   );
   const markdownComponents = assistantMarkdownComponents(compact);
-
-  const markRevealComplete = () => {
-    if (!revealId || completedRevealIdRef.current === revealId) {
-      return;
-    }
-
-    completedRevealIdRef.current = revealId;
-    onRevealCompleteRef.current?.(revealId);
-  };
 
   useEffect(() => {
     onRevealProgressRef.current = onRevealProgress;
@@ -216,31 +206,44 @@ function TypingMarkdown({
   useEffect(() => {
     setForceRevealComplete(false);
     completedRevealIdRef.current = null;
-  }, [markdown, revealId]);
+    setIsRevealInProgress(Boolean(animateReveal && revealId));
+  }, [animateReveal, markdown, revealId]);
 
   useEffect(() => {
     const totalChunks = revealPlan.chunks.length;
+    const completeCurrentReveal = () => {
+      if (!revealId || completedRevealIdRef.current === revealId) {
+        return;
+      }
+
+      completedRevealIdRef.current = revealId;
+      onRevealCompleteRef.current?.(revealId);
+    };
 
     if (!animateReveal || !revealId) {
       setVisibleChunkCount(totalChunks);
+      setIsRevealInProgress(false);
       return;
     }
 
-    if (forceRevealComplete || prefersReducedMotion || totalChunks <= 1) {
+    if (forceRevealComplete || prefersReducedMotion || revealPlan.totalDurationMs <= 0) {
       setVisibleChunkCount(totalChunks);
+      setIsRevealInProgress(false);
       onRevealProgressRef.current?.();
-      markRevealComplete();
+      completeCurrentReveal();
       return;
     }
 
     let animationFrameId = 0;
     let cancelled = false;
-    let lastRenderedChunkCount = 1;
+    let lastRenderedChunkCount = 0;
 
-    setVisibleChunkCount(1);
+    setVisibleChunkCount(0);
+    setIsRevealInProgress(true);
     onRevealProgressRef.current?.();
 
     const animationStartedAt = performance.now();
+    const revealTimingsMs = revealPlan.revealAtMs;
     const revealDurationMs = revealPlan.totalDurationMs;
 
     const renderFrame = (timestamp: number) => {
@@ -248,15 +251,15 @@ function TypingMarkdown({
         return;
       }
 
-      const rawProgress =
-        revealDurationMs <= 0
-          ? 1
-          : Math.min(1, (timestamp - animationStartedAt) / revealDurationMs);
-      const easedProgress = easeOutCubic(rawProgress);
-      const nextChunkCount = Math.max(
-        1,
-        Math.min(totalChunks, Math.ceil(easedProgress * totalChunks)),
-      );
+      const elapsedMs = Math.max(0, timestamp - animationStartedAt);
+      let nextChunkCount = lastRenderedChunkCount;
+
+      while (
+        nextChunkCount < totalChunks &&
+        elapsedMs >= (revealTimingsMs[nextChunkCount] ?? Number.POSITIVE_INFINITY)
+      ) {
+        nextChunkCount += 1;
+      }
 
       if (nextChunkCount !== lastRenderedChunkCount) {
         lastRenderedChunkCount = nextChunkCount;
@@ -264,8 +267,15 @@ function TypingMarkdown({
         onRevealProgressRef.current?.();
       }
 
-      if (rawProgress >= 1) {
-        markRevealComplete();
+      if (elapsedMs >= revealDurationMs) {
+        if (lastRenderedChunkCount !== totalChunks) {
+          lastRenderedChunkCount = totalChunks;
+          setVisibleChunkCount(totalChunks);
+          onRevealProgressRef.current?.();
+        }
+
+        setIsRevealInProgress(false);
+        completeCurrentReveal();
         return;
       }
 
@@ -285,6 +295,7 @@ function TypingMarkdown({
     prefersReducedMotion,
     revealId,
     revealPlan.chunks.length,
+    revealPlan.revealAtMs,
     revealPlan.totalDurationMs,
   ]);
 
@@ -292,6 +303,12 @@ function TypingMarkdown({
     animateReveal && revealId
       ? revealPlan.chunks.slice(0, visibleChunkCount).join("")
       : markdown;
+  const showRevealCursor =
+    animateReveal &&
+    revealId &&
+    isRevealInProgress &&
+    !forceRevealComplete &&
+    !prefersReducedMotion;
 
   const handleTextInteractionStart = () => {
     if (!animateReveal || !revealId || forceRevealComplete) {
@@ -312,6 +329,15 @@ function TypingMarkdown({
       >
         {displayMarkdown}
       </ReactMarkdown>
+      {showRevealCursor ? (
+        <span
+          aria-hidden="true"
+          className={[
+            "pointer-events-none inline-block h-[1.08em] w-[2px] rounded-full bg-gradient-to-b from-sky-200/90 via-blue-300/85 to-sky-400/90 align-[-0.18em] opacity-85 animate-pulse",
+            displayMarkdown ? "ml-1" : "",
+          ].join(" ").trim()}
+        />
+      ) : null}
     </div>
   );
 }
