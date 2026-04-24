@@ -18,6 +18,7 @@ export interface SavedAgentLibraryEntry {
   prompt_template: string;
   alert_condition: string;
   negative_condition: string;
+  priority_level: string | null;
   input_type: string;
   video_packaging_mode: string | null;
   inference_model: string | null;
@@ -186,6 +187,7 @@ export const normalizeSavedAgentLibraryEntry = (
     prompt_template: normalizeText(row.prompt_template),
     alert_condition: normalizeText(row.alert_condition),
     negative_condition: normalizeText(row.negative_condition),
+    priority_level: normalizeText(row.priority_level ?? row.priorityLevel) || null,
     input_type: normalizeText(row.input_type) || "video",
     video_packaging_mode: normalizeText(row.video_packaging_mode) || null,
     inference_model: normalizeText(row.inference_model) || null,

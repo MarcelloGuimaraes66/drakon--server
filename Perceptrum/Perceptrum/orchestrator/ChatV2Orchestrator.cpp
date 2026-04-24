@@ -2838,6 +2838,7 @@ SkillSelection ChatV2Orchestrator::chooseSkill_(
             { "registered_skills", payload.is_object() ? payload.value("registered_skills", nlohmann::json::array()) : nlohmann::json::array() },
             { "knowledge_topics", nlohmann::json::array({
                 "app_overview",
+                "chat_capabilities",
                 "tutorial",
                 "billing",
                 "pairing",

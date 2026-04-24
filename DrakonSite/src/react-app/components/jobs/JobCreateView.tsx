@@ -64,7 +64,7 @@ export default function JobCreateView({
           <span className="text-gray-400">{t("jobs.title")}</span>
           <span className="text-gray-600">/</span>
           <span className="truncate text-gray-100">
-            {t("jobs.tabCreateLabel", { defaultValue: "Criar Job" })}
+            {t("jobs.createJob", { defaultValue: "Create Job" })}
           </span>
         </div>
         {tabs ? <div className="xl:justify-self-center">{tabs}</div> : <div className="hidden xl:block" />}

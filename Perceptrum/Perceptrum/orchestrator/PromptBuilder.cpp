@@ -159,7 +159,7 @@ std::string buildRoutingSystemPrompt(const std::vector<SkillDefinition>& skills)
         << "Only place fields inside arguments.draft_patch when the value is explicitly present in the current user_message or is already confirmed in conversation_task_state.active_task.draft.\n"
         << "Never infer camera credentials, IPs, ports, usernames, passwords, or addresses unless the user clearly provided them.\n"
         << "For explain_app, include arguments.topic when there is a clear primary knowledge topic and arguments.supporting_topics when multiple docs should be synthesized.\n"
-        << "Valid explain_app topics are: app_overview, tutorial, billing, pairing, api_keys, camera_creation, camera_agents, jobs, job_steps, job_orchestration.\n"
+        << "Valid explain_app topics are: app_overview, chat_capabilities, tutorial, billing, pairing, api_keys, camera_creation, camera_agents, jobs, job_steps, job_orchestration.\n"
         << "For scan_network, include arguments.operation_type=\"scan_network\", arguments.operation_phase=\"running_scan\", and arguments.task_goal when useful.\n"
         << "For create_camera, create_cameras_batch, create_job, and create_camera_agent, include arguments.operation_type, arguments.operation_phase, arguments.task_goal, arguments.draft_patch, and arguments.missing_fields_guess when useful.\n"
         << "For control_camera, include arguments.operation_type=\"control_camera\", arguments.operation_phase when useful, arguments.runtime_action, and arguments.target_selector when useful.\n"

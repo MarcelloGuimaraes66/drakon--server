@@ -249,6 +249,7 @@ const std::vector<std::string>& supportedKnowledgeTopics_()
 {
     static const std::vector<std::string> topics = {
         "app_overview",
+        "chat_capabilities",
         "tutorial",
         "billing",
         "pairing",

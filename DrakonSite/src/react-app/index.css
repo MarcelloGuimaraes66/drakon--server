@@ -140,8 +140,8 @@
 }
 
 .sidebar-nav-scroll::-webkit-scrollbar {
-  width: 2px;
-  height: 2px;
+  width: var(--app-scrollbar-size);
+  height: var(--app-scrollbar-size);
 }
 
 .sidebar-nav-scroll::-webkit-scrollbar-track {
@@ -190,7 +190,7 @@
 .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
   border: 0;
   background: linear-gradient(180deg, rgba(88, 96, 124, 0.96), rgba(62, 68, 88, 0.92));
-  box-shadow: 0 0 4px rgba(12, 16, 28, 0.16);
+  box-shadow: var(--app-scrollbar-shadow);
 }
 
 .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
@@ -208,7 +208,7 @@
 .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
   border: 0;
   background: linear-gradient(180deg, rgba(116, 118, 128, 0.94), rgba(86, 88, 98, 0.88));
-  box-shadow: 0 0 6px rgba(0, 0, 0, 0.22);
+  box-shadow: var(--app-scrollbar-shadow);
 }
 
 .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
@@ -232,7 +232,7 @@
 .light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
   border: 0;
   background: linear-gradient(180deg, rgba(123, 132, 160, 0.94), rgba(94, 101, 124, 0.88));
-  box-shadow: 0 0 4px rgba(15, 23, 42, 0.08);
+  box-shadow: var(--app-scrollbar-shadow);
 }
 
 .light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
@@ -250,7 +250,7 @@
 .light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
   border: 0;
   background: linear-gradient(180deg, rgba(125, 130, 144, 0.92), rgba(96, 101, 114, 0.84));
-  box-shadow: 0 0 6px rgba(15, 23, 42, 0.08);
+  box-shadow: var(--app-scrollbar-shadow);
 }
 
 .light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
@@ -435,25 +435,317 @@ body {
 @layer utilities {
   .scrollbar-thin {
     scrollbar-width: thin;
-    scrollbar-color: rgb(52 52 52) transparent;
+    scrollbar-color: var(--app-scrollbar-color) var(--app-scrollbar-track);
   }
   
   .scrollbar-thin::-webkit-scrollbar {
-    width: 4px;
-    height: 4px;
+    width: var(--app-scrollbar-size);
+    height: var(--app-scrollbar-size);
   }
   
   .scrollbar-thin::-webkit-scrollbar-track {
-    background: transparent;
+    background: var(--app-scrollbar-track);
   }
   
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    background: rgb(52 52 52);
+    background: linear-gradient(180deg, var(--app-scrollbar-thumb-start), var(--app-scrollbar-thumb-end));
     border-radius: 9999px;
+    box-shadow: var(--app-scrollbar-shadow);
   }
   
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-    background: rgb(75 75 75);
+    background: linear-gradient(180deg, var(--app-scrollbar-thumb-hover-start), var(--app-scrollbar-thumb-hover-end));
+  }
+}
+
+:root {
+  --app-scrollbar-size: 3px;
+  --app-scrollbar-track: transparent;
+  --app-scrollbar-color: rgba(118, 118, 124, 0.9);
+  --app-scrollbar-thumb-start: rgba(126, 126, 132, 0.96);
+  --app-scrollbar-thumb-end: rgba(58, 59, 64, 0.94);
+  --app-scrollbar-thumb-hover-start: rgba(148, 148, 154, 0.98);
+  --app-scrollbar-thumb-hover-end: rgba(74, 75, 80, 0.96);
+  --app-scrollbar-shadow: none;
+}
+
+.light {
+  --app-scrollbar-color: rgba(112, 115, 124, 0.72);
+  --app-scrollbar-thumb-start: rgba(140, 144, 152, 0.94);
+  --app-scrollbar-thumb-end: rgba(104, 108, 116, 0.88);
+  --app-scrollbar-thumb-hover-start: rgba(154, 158, 166, 0.96);
+  --app-scrollbar-thumb-hover-end: rgba(116, 120, 128, 0.9);
+  --app-scrollbar-shadow: none;
+}
+
+/* Unify scrollbars for utility-driven scrollers and textareas that only overflow at runtime. */
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+) {
+  scrollbar-width: thin;
+  scrollbar-color: var(--app-scrollbar-color) var(--app-scrollbar-track);
+}
+
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar {
+  width: var(--app-scrollbar-size);
+  height: var(--app-scrollbar-size);
+}
+
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-track,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-corner {
+  background: var(--app-scrollbar-track);
+  border-radius: 9999px;
+}
+
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-thumb {
+  border: 0;
+  border-radius: 9999px;
+  background: linear-gradient(180deg, var(--app-scrollbar-thumb-start), var(--app-scrollbar-thumb-end));
+  box-shadow: var(--app-scrollbar-shadow);
+}
+
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--app-scrollbar-thumb-hover-start), var(--app-scrollbar-thumb-hover-end));
+}
+
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button:single-button,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button:vertical:decrement,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button:vertical:increment,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button:horizontal:decrement,
+:where(
+  .sidebar-nav-scroll,
+  .scrollbar-thin,
+  .app-scrollbar,
+  [class^="overflow-auto"],
+  [class*=" overflow-auto"],
+  [class^="overflow-scroll"],
+  [class*=" overflow-scroll"],
+  [class^="overflow-x-auto"],
+  [class*=" overflow-x-auto"],
+  [class^="overflow-x-scroll"],
+  [class*=" overflow-x-scroll"],
+  [class^="overflow-y-auto"],
+  [class*=" overflow-y-auto"],
+  [class^="overflow-y-scroll"],
+  [class*=" overflow-y-scroll"],
+  textarea
+)::-webkit-scrollbar-button:horizontal:increment {
+  display: none;
+  width: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  -webkit-appearance: none;
+}
+
+@supports selector(::-webkit-scrollbar) {
+  :where(
+    .sidebar-nav-scroll,
+    .scrollbar-thin,
+    .app-scrollbar,
+    [class^="overflow-auto"],
+    [class*=" overflow-auto"],
+    [class^="overflow-scroll"],
+    [class*=" overflow-scroll"],
+    [class^="overflow-x-auto"],
+    [class*=" overflow-x-auto"],
+    [class^="overflow-x-scroll"],
+    [class*=" overflow-x-scroll"],
+    [class^="overflow-y-auto"],
+    [class*=" overflow-y-auto"],
+    [class^="overflow-y-scroll"],
+    [class*=" overflow-y-scroll"],
+    textarea
+  ) {
+    scrollbar-width: auto;
   }
 }
 

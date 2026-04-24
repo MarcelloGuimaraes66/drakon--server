@@ -117,7 +117,15 @@ function getAlertDisplayMeta(
       details?.summary,
       details?.reason,
     ) || "-";
-  const rawBadge = String(
+  const friendlyBadge = readAlertLabelString(
+    alert?.agent_label,
+    alert?.agentLabel,
+    details?.agent_label,
+    details?.agentLabel,
+    details?.display_name,
+    details?.displayName,
+  );
+  const rawBadge = friendlyBadge || String(
     readAlertLabelString(
       details?.agent_key,
       details?.agentKey,
@@ -156,6 +164,8 @@ function getAlertDisplayMeta(
     (Number.isInteger(sourceCameraId) && sourceCameraId > 0 ? `#${sourceCameraId}` : null);
 
   const sourceAgentKey = readAlertLabelString(
+    firstMatch?.display_source_agent_label,
+    firstMatch?.displaySourceAgentLabel,
     firstMatch?.display_source_agent_key,
     firstMatch?.displaySourceAgentKey,
     details?.display_source_agent_key,
@@ -211,6 +221,7 @@ function buildAlertGroupKey(alert: any): string {
     Number.isInteger(rawCameraId) && rawCameraId > 0 ? String(rawCameraId) : "na";
   const agentToken = (
     readAlertLabelString(
+      alert?.agent_key,
       details?.agent_key,
       details?.agentKey,
       alert?.algo_type,
@@ -338,6 +349,8 @@ function DashboardContent() {
   const [isAlertPanelOpen, setIsAlertPanelOpen] = useState(false);
   const [isDeletingFalsePositive, setIsDeletingFalsePositive] = useState(false);
   const [isFalsePositiveConfirmOpen, setIsFalsePositiveConfirmOpen] = useState(false);
+  const [isAlertGroupConfirmOpen, setIsAlertGroupConfirmOpen] = useState(false);
+  const [isDeletingAlertGroup, setIsDeletingAlertGroup] = useState(false);
   const [removedAlertIds, setRemovedAlertIds] = useState<Set<number>>(new Set());
   const [isGroupAlbumOpen, setIsGroupAlbumOpen] = useState(false);
   const [groupAlbumImages, setGroupAlbumImages] = useState<any[]>([]);
@@ -397,10 +410,17 @@ function DashboardContent() {
     MEDIUM: "50%",
     LOW: "25%",
   };
+  const getAlertEventId = (alert: any): number | null => {
+    const eventId = Number(alert?.id);
+    return Number.isInteger(eventId) && eventId > 0 ? eventId : null;
+  };
+  const isAlertEventDeletable = (alert: any): boolean => {
+    const eventType = String(alert?.event_type || "").trim().toLowerCase();
+    return eventType === "job_alert_triggered" || eventType === "ai_detection";
+  };
   const activeAlertEventType = String(activeAlert?.event_type || "").trim().toLowerCase();
   const activeAlertIsJobTriggered = activeAlertEventType === "job_alert_triggered";
-  const activeAlertCanBeDeleted =
-    activeAlertEventType === "job_alert_triggered" || activeAlertEventType === "ai_detection";
+  const activeAlertCanBeDeleted = isAlertEventDeletable(activeAlert);
 
   const openAlertPanel = (
     alert: any,
@@ -421,18 +441,18 @@ function DashboardContent() {
     setAlertPanelFocusTarget(null);
     setHighlightEmittedAlerts(false);
     setIsFalsePositiveConfirmOpen(false);
+    setIsAlertGroupConfirmOpen(false);
   };
 
   const requestDeleteFalsePositive = () => {
-    if (!activeAlert || isDeletingFalsePositive) return;
-    const eventId = Number(activeAlert?.id);
-    const eventType = String(activeAlert?.event_type || "").trim().toLowerCase();
+    if (!activeAlert || isDeletingFalsePositive || isDeletingAlertGroup) return;
+    const eventId = getAlertEventId(activeAlert);
 
-    if (!Number.isInteger(eventId) || eventId <= 0) {
+    if (!eventId) {
       setToast({ message: t("dashboard.invalidAlertId"), type: "error" });
       return;
     }
-    if (eventType !== "job_alert_triggered" && eventType !== "ai_detection") {
+    if (!isAlertEventDeletable(activeAlert)) {
       setToast({ message: "Only dashboard alert events can be deleted here.", type: "warning" });
       return;
     }
@@ -441,8 +461,12 @@ function DashboardContent() {
   };
 
   const handleDeleteFalsePositive = async () => {
-    if (!activeAlert || isDeletingFalsePositive) return;
-    const eventId = Number(activeAlert?.id);
+    if (!activeAlert || isDeletingFalsePositive || isDeletingAlertGroup) return;
+    const eventId = getAlertEventId(activeAlert);
+    if (!eventId) {
+      setToast({ message: t("dashboard.invalidAlertId"), type: "error" });
+      return;
+    }
 
     setIsFalsePositiveConfirmOpen(false);
     setIsDeletingFalsePositive(true);
@@ -474,6 +498,80 @@ function DashboardContent() {
       setToast({ message: t("dashboard.falsePositiveDeleteFailed"), type: "error" });
     } finally {
       setIsDeletingFalsePositive(false);
+    }
+  };
+
+  const requestDeleteAlertGroup = () => {
+    if (!activeAlert || isDeletingFalsePositive || isDeletingAlertGroup || activeAlertHistoryDeletableIds.length <= 1) return;
+    setIsAlertGroupConfirmOpen(true);
+  };
+
+  const handleDeleteAlertGroup = async () => {
+    const targetIds = [...activeAlertHistoryDeletableIds];
+    if (isDeletingAlertGroup || targetIds.length <= 1) return;
+
+    setIsAlertGroupConfirmOpen(false);
+    setIsDeletingAlertGroup(true);
+    try {
+      const response = await fetch("/api/events/bulk-delete", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ids: targetIds }),
+      });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        setToast({
+          message:
+            typeof payload?.error === "string"
+              ? payload.error
+              : t("dashboard.alertGroupDeleteFailed"),
+          type: "error",
+        });
+        return;
+      }
+
+      const deletedIds = Array.isArray(payload?.deleted_ids)
+        ? payload.deleted_ids
+            .map((value: unknown) => Number(value))
+            .filter((value: number) => Number.isInteger(value) && value > 0)
+        : [];
+
+      if (deletedIds.length === 0) {
+        setToast({ message: t("dashboard.alertGroupDeleteFailed"), type: "error" });
+        return;
+      }
+
+      setRemovedAlertIds((prev) => {
+        const next = new Set(prev);
+        for (const deletedId of deletedIds) {
+          next.add(deletedId);
+        }
+        return next;
+      });
+      closeAlertPanel();
+
+      const failedDeletes = Array.isArray(payload?.failed) ? payload.failed.length : 0;
+      if (failedDeletes > 0) {
+        setToast({
+          message: isPortuguese
+            ? `Removidos ${deletedIds.length} de ${targetIds.length} alertas do grupo.`
+            : `Removed ${deletedIds.length} of ${targetIds.length} alerts from the group.`,
+          type: "warning",
+        });
+      } else {
+        setToast({ message: t("dashboard.alertGroupDeleted"), type: "success" });
+      }
+
+      // Keep store synced in background; UI removal happens immediately via local state.
+      refresh();
+    } catch (error) {
+      console.error("Failed to delete alert group:", error);
+      setToast({ message: t("dashboard.alertGroupDeleteFailed"), type: "error" });
+    } finally {
+      setIsDeletingAlertGroup(false);
     }
   };
 
@@ -607,6 +705,42 @@ function DashboardContent() {
       ? mediaUrl.toLowerCase().endsWith(".mp4") || mediaUrl.toLowerCase().includes("/api/job-clips/")
       : false;
     return { mediaUrl, isVideo, albumImages };
+  };
+
+  const normalizeAlertAnalysisInputType = (...values: any[]): "video" | "image" | null => {
+    for (const value of values) {
+      if (typeof value !== "string") continue;
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "video" || normalized === "image") {
+        return normalized;
+      }
+    }
+    return null;
+  };
+
+  const getAlertAnalysisInputType = (
+    alert: any,
+    alertMedia: ReturnType<typeof getAlertMedia>,
+  ): "video" | "image" | null => {
+    const details = alert?.details || {};
+    const explicitInputType = normalizeAlertAnalysisInputType(
+      details?.input_type,
+      details?.inputType,
+      details?.agent_input_type,
+      details?.agentInputType,
+      alert?.input_type,
+      alert?.inputType,
+    );
+    if (explicitInputType) {
+      return explicitInputType;
+    }
+    if (alertMedia.mediaUrl) {
+      return alertMedia.isVideo ? "video" : "image";
+    }
+    if (alertMedia.albumImages.length > 0) {
+      return "image";
+    }
+    return null;
   };
 
   const getAlertTimestampMs = (alert: any) => {
@@ -1058,6 +1192,18 @@ function DashboardContent() {
     ? groupedRecentAlertsByKey.get(activeAlertGroupKey) || null
     : null;
   const activeAlertHistory = activeAlertGroup?.alerts || (activeAlert ? [activeAlert] : []);
+  const activeAlertHistoryDeletableIds = Array.from(
+    new Set(
+      activeAlertHistory.flatMap((alert: any) => {
+        const eventId = getAlertEventId(alert);
+        if (!eventId || removedAlertIds.has(eventId) || !isAlertEventDeletable(alert)) {
+          return [];
+        }
+        return [eventId];
+      }),
+    ),
+  );
+  const activeAlertCanRemoveGroup = activeAlertHistoryDeletableIds.length > 1;
   useEffect(() => {
     let focusTimer: number | null = null;
     let highlightTimer: number | null = null;
@@ -1138,22 +1284,7 @@ function DashboardContent() {
         ? "MEDIUM"
         : String(rawPriority || "").toUpperCase();
     const priorityLabel = alertPriorityChipClasses[priorityValue] ? priorityValue : null;
-    const rawInputType = String(
-      details?.input_type ||
-        details?.agent_input_type ||
-        alert?.input_type ||
-        ""
-    ).toLowerCase();
-    const normalizedInputType =
-      rawInputType === "video" || rawInputType === "image"
-        ? rawInputType
-        : alertMedia.albumImages.length > 0
-        ? "image"
-        : alertMedia.mediaUrl
-        ? alertMedia.isVideo
-          ? "video"
-          : "image"
-        : null;
+    const normalizedInputType = getAlertAnalysisInputType(alert, alertMedia);
     const mediaTypeLabel =
       normalizedInputType === "video"
         ? t("dashboard.videoBased")
@@ -1422,6 +1553,18 @@ function DashboardContent() {
         cancelLabel={t("dashboard.deleteFalsePositiveCancel")}
         onConfirm={handleDeleteFalsePositive}
         onCancel={() => setIsFalsePositiveConfirmOpen(false)}
+        variant="danger"
+      />
+      <ConfirmDialog
+        isOpen={isAlertGroupConfirmOpen}
+        title={t("dashboard.deleteAlertGroupTitle")}
+        message={t("dashboard.deleteAlertGroupMessage", {
+          count: activeAlertHistoryDeletableIds.length,
+        })}
+        confirmLabel={isDeletingAlertGroup ? t("dashboard.deleting") : t("dashboard.deleteAlertGroupConfirm")}
+        cancelLabel={t("dashboard.deleteFalsePositiveCancel")}
+        onConfirm={handleDeleteAlertGroup}
+        onCancel={() => setIsAlertGroupConfirmOpen(false)}
         variant="danger"
       />
       
@@ -2044,24 +2187,13 @@ function DashboardContent() {
                 : [];
               const hiddenAlbumImagesCount = Math.max(0, albumImages.length - albumPreviewImages.length);
               const showTileCameraName = albumMosaicLayout.previewCount <= 6;
-              const rawInputType = String(
-                alertDetails.input_type ||
-                alertDetails.agent_input_type ||
-                alert.input_type ||
-                ""
-              ).toLowerCase();
               const isJobAlertCard =
                 String(alert?.event_type || "").trim().toLowerCase() === "job_alert_triggered";
-              const normalizedInputType =
-                rawInputType === "video" || rawInputType === "image"
-                  ? rawInputType
-                  : hasImageAlbum
-                  ? "image"
-                  : mediaUrl
-                  ? isVideo
-                    ? "video"
-                    : "image"
-                  : null;
+              const normalizedInputType = getAlertAnalysisInputType(alert, {
+                mediaUrl,
+                isVideo,
+                albumImages,
+              });
               const mediaTypeBadgeLabel =
                 normalizedInputType === "video"
                   ? t("dashboard.videoBased")
@@ -2093,6 +2225,8 @@ function DashboardContent() {
               const rawPriority =
                 alert.priority_level ||
                 alertDetails.priority_level ||
+                alertDetails.priorityLevel ||
+                alertDetails.priority ||
                 "";
               const priorityValue = String(rawPriority).toUpperCase() === "MEDUIM"
                 ? "MEDIUM"
@@ -2110,7 +2244,7 @@ function DashboardContent() {
                 LOW: "text-green-400",
               };
               const showPriority =
-                isJobAlertCard && !!priorityValue && priorityBadgeClasses[priorityValue];
+                !!priorityValue && priorityBadgeClasses[priorityValue];
               const timeAgoText = alertTime ? timeAgo(alertTime) : null;
               const usePortuguesePrefix =
                 i18n.language?.startsWith("pt") && timeAgoText && timeAgoText !== "Just now";
@@ -2183,7 +2317,13 @@ function DashboardContent() {
                       ) : singleAlbumImage?.url ? (
                         <img
                           src={singleAlbumImage.url}
-                          alt={singleAlbumImage.cameraName || alertDetails.agent_key || alert.algo_type || "Alert"}
+                          alt={
+                            singleAlbumImage.cameraName ||
+                            agentLabel ||
+                            alertDetails.agent_key ||
+                            alert.algo_type ||
+                            "Alert"
+                          }
                           className="w-full h-full object-cover"
                         />
                       ) : mediaUrl ? (
@@ -2198,7 +2338,7 @@ function DashboardContent() {
                         ) : (
                           <img
                             src={mediaUrl}
-                            alt={alertDetails.agent_key || alert.algo_type || "Alert"}
+                            alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
                             className="w-full h-full object-cover"
                           />
                         )
@@ -2219,7 +2359,7 @@ function DashboardContent() {
                       ) : (
                         <img
                           src={mediaUrl}
-                          alt={alertDetails.agent_key || alert.algo_type || "Alert"}
+                          alt={agentLabel || alertDetails.agent_key || alert.algo_type || "Alert"}
                           className="w-full h-full object-cover"
                         />
                       )
@@ -3135,11 +3275,27 @@ function DashboardContent() {
                 <FileText className="w-4 h-4" />
                 {t("dashboard.addNote")}
               </button>
+              {activeAlertCanRemoveGroup && (
+                <button
+                  type="button"
+                  onClick={requestDeleteAlertGroup}
+                  disabled={isDeletingAlertGroup}
+                  className="w-full flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm font-medium bg-red-950/50 text-red-200 border border-red-700/40 hover:bg-red-950/70 transition-colors disabled:opacity-70 disabled:cursor-not-allowed"
+                >
+                  <span className="flex items-center gap-2">
+                    <Layers className="w-4 h-4" />
+                    {isDeletingAlertGroup ? t("dashboard.removing") : t("dashboard.removeAlertGroup")}
+                  </span>
+                  <span className="rounded-full border border-red-400/30 bg-red-500/15 px-2 py-0.5 text-[11px] font-semibold text-red-50">
+                    {activeAlertHistoryDeletableIds.length}
+                  </span>
+                </button>
+              )}
               {activeAlertCanBeDeleted && (
                 <button
                   type="button"
                   onClick={requestDeleteFalsePositive}
-                  disabled={isDeletingFalsePositive}
+                  disabled={isDeletingFalsePositive || isDeletingAlertGroup}
                   className="w-full flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium bg-rose-900/40 text-rose-300 border border-rose-700/40 hover:bg-rose-900/60 transition-colors"
                 >
                   <XCircle className="w-4 h-4" />

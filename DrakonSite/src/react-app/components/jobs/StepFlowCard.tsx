@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { type KeyboardEvent, type ReactNode } from "react";
 import { AlertCircle, Check, ChevronDown, ChevronRight, Edit2, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -34,6 +34,19 @@ export default function StepFlowCard({
   const { t } = useTranslation();
   const isCompact = density === "compact";
 
+  const shouldIgnoreToggleKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    const nestedInteractiveElement = target.closest(
+      'input, textarea, select, button, a, [contenteditable="true"], [role="button"], [role="link"]'
+    );
+
+    return nestedInteractiveElement !== null && nestedInteractiveElement !== event.currentTarget;
+  };
+
   return (
     <div
       ref={rootRef}
@@ -49,6 +62,9 @@ export default function StepFlowCard({
             tabIndex={0}
             onClick={onToggle}
             onKeyDown={(event) => {
+              if (shouldIgnoreToggleKey(event)) {
+                return;
+              }
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
                 onToggle();

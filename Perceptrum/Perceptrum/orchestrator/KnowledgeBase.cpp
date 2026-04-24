@@ -404,6 +404,22 @@ void KnowledgeBase::loadDocuments_()
             { "overview", "app", "site", "platform", "dashboard", "painel", "aplicativo" },
         },
         {
+            "chat_capabilities",
+            "Chat Capabilities",
+            "chat_capabilities.md",
+            {
+                "chat", "assistant", "capability", "capabilities", "what can chat do",
+                "what can you do", "what are you capable of", "what is chat for",
+                "what does the chat do", "chat help", "assistant help",
+                "memory", "context", "continuity", "coherence",
+                "o que o chat pode fazer", "do que o chat e capaz",
+                "para que o chat serve", "como o chat ajuda",
+                "capacidades do chat", "funcoes do chat", "o que voce pode fazer",
+                "do que voce e capaz", "memoria do chat", "contexto do chat",
+                "continuidade do chat", "coerencia do chat", "assistente"
+            },
+        },
+        {
             "tutorial",
             "Tutorial",
             "tutorial.md",

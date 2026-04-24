@@ -795,6 +795,7 @@ const EXE_HEARTBEAT_STALE_AFTER_MS = 35_000;
 const CHAT_DESKTOP_AGENT_REQUIRED_FRESH_AFTER_MS = 25_000;
 const SUPPORTED_CHAT_LANGUAGE_CODES = ["en", "es", "pt", "fr", "zh", "ar"] as const;
 const JOB_ALERT_MEDIA_MAX_VIDEO_BYTES = 100 * 1024 * 1024;
+const PROMPT_ENHANCER_LANGUAGE_STRATEGY = "match_input_language";
 
 function normalizeSupportedChatLanguage(value: unknown, fallback: string = "en"): string {
   const fallbackLanguage = typeof fallback === "string" && fallback.trim() ? fallback.trim().toLowerCase() : "en";
@@ -1395,8 +1396,6 @@ function normalizeDashboardAlertRow(row: any) {
   const agentLabel = resolveDashboardAlertAgentLabel(
     rawAgentKey,
     readDashboardAlertString(
-      details?.algo_type,
-      details?.algoType,
       details?.agent_label,
       details?.agentLabel,
       details?.display_name,
@@ -1431,12 +1430,9 @@ function normalizeDashboardAlertRow(row: any) {
   const stepName = readDashboardAlertString(details?.step_name, details?.stepName);
   const groupName = readDashboardAlertString(details?.group_name, details?.groupName, row?.group_name);
   const message = typeof row?.message === "string" ? row.message : "";
-  const normalizedPriority =
-    eventType === "job_alert_triggered"
-      ? normalizeJobStepPriorityLevel(
-          details?.priority_level ?? details?.priorityLevel ?? details?.priority,
-        )
-      : null;
+  const normalizedPriority = normalizeJobStepPriorityLevel(
+    details?.priority_level ?? details?.priorityLevel ?? details?.priority,
+  );
   const searchText = buildDashboardAlertSearchText({
     cameraName,
     algoType,
@@ -7870,6 +7866,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `ALTER TABLE camera_algorithms ADD COLUMN only_capture_on_motion INTEGER DEFAULT 0`
         );
         await addColumnIfMissing(
+          `ALTER TABLE camera_algorithms ADD COLUMN priority_level TEXT`
+        );
+        await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN alert_channels_json TEXT`
         );
         await addColumnIfMissing(
@@ -7890,6 +7889,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(
           `ALTER TABLE camera_algorithms ADD COLUMN temporal_explain_json TEXT`
         );
+
+        await db.prepare(
+          `UPDATE camera_algorithms
+             SET priority_level = 'MEDIUM'
+           WHERE COALESCE(TRIM(priority_level), '') = ''`
+        ).run();
 
         await db.prepare(
           `UPDATE camera_algorithms
@@ -29952,6 +29957,7 @@ app.get("/api/custom-agents/library", anyAuthMiddleware, async (c) => {
         prompt_template: entry.prompt_template,
         alert_condition: entry.alert_condition,
         negative_condition: entry.negative_condition,
+        priority_level: entry.snapshot.priority_level || null,
         input_type: entry.snapshot.input_type,
         video_packaging_mode: entry.snapshot.video_packaging_mode || null,
         inference_model: entry.snapshot.inference_model || null,
@@ -30017,6 +30023,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     .json<{
       algorithm_type?: string;
       display_name?: string;
+      priority_level?: string;
       input_type?: string;
       video_packaging_mode?: string;
       inference_model?: string;
@@ -30061,6 +30068,15 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
   if (!alertCondition) {
     return c.json({ error: "alert_condition is required" }, 400);
   }
+
+  const requestedPriorityLevel =
+    body.priority_level === undefined
+      ? "MEDIUM"
+      : normalizeJobStepPriorityLevel(body.priority_level);
+  if (body.priority_level !== undefined && !requestedPriorityLevel) {
+    return c.json({ error: "Invalid priority_level. Allowed values: CRITIC, HIGH, MEDIUM, LOW" }, 400);
+  }
+  const priorityLevel = requestedPriorityLevel || "MEDIUM";
 
   const requestedInputType = body.input_type === undefined
     ? "video"
@@ -30212,11 +30228,11 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
          camera_id, algorithm_type, is_enabled, llm_prompt, image_region, config_json,
          alert_channels_json,
          prompt_template, alert_condition, negative_condition, analysis_regions,
-         input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
+         input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, priority_level,
          temporal_plan_json, temporal_plan_hash, temporal_plan_version, temporal_compiled_at, temporal_compile_model, temporal_explain_json,
          created_at, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       cameraId,
@@ -30241,6 +30257,7 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
       executionSettings.runEvery,
       executionSettings.runningResolution,
       directCaptureOnMotionOnly ? 1 : 0,
+      priorityLevel,
       null,
       null,
       null,
@@ -30322,6 +30339,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
   const body = await c.req
     .json<{
       display_name?: string;
+      priority_level?: string;
       input_type?: string;
       video_packaging_mode?: string;
       inference_model?: string;
@@ -30365,6 +30383,17 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
   if (!alertCondition) {
     return c.json({ error: "alert_condition is required" }, 400);
   }
+
+  const existingPriorityLevel =
+    normalizeJobStepPriorityLevel((ownedAlgorithm as any)?.priority_level) || "MEDIUM";
+  const requestedPriorityLevel =
+    body.priority_level === undefined
+      ? existingPriorityLevel
+      : normalizeJobStepPriorityLevel(body.priority_level);
+  if (body.priority_level !== undefined && !requestedPriorityLevel) {
+    return c.json({ error: "Invalid priority_level. Allowed values: CRITIC, HIGH, MEDIUM, LOW" }, 400);
+  }
+  const priorityLevel = requestedPriorityLevel || existingPriorityLevel;
 
   const existingInputType = normalizeJobStepInputType((ownedAlgorithm as any).input_type) || "video";
   const requestedInputType = body.input_type === undefined
@@ -30635,6 +30664,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
            run_every = ?,
            running_resolution = ?,
            only_capture_on_motion = ?,
+           priority_level = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`
     )
@@ -30664,6 +30694,7 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
       executionSettings.runEvery,
       executionSettings.runningResolution,
       onlyCaptureOnMotion ? 1 : 0,
+      priorityLevel,
       algorithmId
     )
     .run();
@@ -31186,7 +31217,6 @@ app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddlewar
     typeof body.alert_condition === "string" ? body.alert_condition.trim() : "";
   const negativeCondition =
     typeof body.negative_condition === "string" ? body.negative_condition.trim() : "";
-  const languageHint = typeof body.language === "string" ? body.language.trim() : "";
   if (!promptTemplate) {
     return c.json({ error: "Prompt Core is required" }, 400);
   }
@@ -31238,7 +31268,7 @@ app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddlewar
     prompt_core: promptTemplate,
     alert_condition: alertCondition,
     negative_condition: negativeCondition,
-    user_language: languageHint || "pt-BR",
+    user_language: PROMPT_ENHANCER_LANGUAGE_STRATEGY,
     model_name: "gpt-5.1",
     model_api_key: modelApiKey,
     analysis_regions: enhanceAnalysisRegions,
@@ -38932,6 +38962,7 @@ const hydrateCustomCameraAgentRows = async (
         };
       })(),
       only_capture_on_motion: effectiveOnlyCaptureOnMotion,
+      priority_level: normalizeJobStepPriorityLevel(agent?.priority_level) || "MEDIUM",
       face_target_ids: faceTargetIds,
       negative_reference_images: negativeImages,
       analysis_regions: parseStoredAnalysisRegions(agent?.analysis_regions, {
@@ -41241,32 +41272,39 @@ app.get("/api/events", anyAuthMiddleware, async (c) => {
   return c.json(eventsWithDetails);
 });
 
-app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-  const rawId = c.req.param("id");
-  const eventId = parseInt(rawId, 10);
-
+const deleteDashboardAlertEvent = async (
+  env: any,
+  userId: number | string,
+  eventId: number,
+): Promise<
+  | { ok: true; deletedId: number; deletedEventType: string }
+  | { ok: false; status: 400 | 404 | 409; error: string }
+> => {
   if (!Number.isInteger(eventId) || eventId <= 0) {
-    return c.json({ error: "Invalid event id" }, 400);
+    return { ok: false, status: 400, error: "Invalid event id" };
   }
 
   // Safety: only allow deleting THIS user's own alert events.
-  const eventRow = await c.env.DB.prepare(
+  const eventRow = await env.DB.prepare(
     `SELECT id, event_type, details_json
      FROM events
      WHERE id = ? AND user_id = ?
      LIMIT 1`
   )
-    .bind(eventId, user.id)
+    .bind(eventId, userId)
     .first();
 
   if (!eventRow) {
-    return c.json({ error: "Event not found" }, 404);
+    return { ok: false, status: 404, error: "Event not found" };
   }
 
   const eventType = String((eventRow as any)?.event_type || "").trim().toLowerCase();
   if (eventType !== "job_alert_triggered" && eventType !== "ai_detection") {
-    return c.json({ error: "Only dashboard alert events can be deleted from this action" }, 400);
+    return {
+      ok: false,
+      status: 400,
+      error: "Only dashboard alert events can be deleted from this action",
+    };
   }
 
   let details: Record<string, any> | null = null;
@@ -41355,12 +41393,12 @@ app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
       }
     }
 
-    const { results: linkedDetections } = await c.env.DB.prepare(
+    const { results: linkedDetections } = await env.DB.prepare(
       `SELECT id, image_key, video_key
        FROM detections
        WHERE event_id = ? AND user_id = ?`
     )
-      .bind(eventId, user.id)
+      .bind(eventId, userId)
       .all();
 
     for (const row of linkedDetections || []) {
@@ -41370,7 +41408,7 @@ app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
 
     for (const key of r2DeleteKeys) {
       try {
-        await c.env.R2_BUCKET.delete(key);
+        await env.R2_BUCKET.delete(key);
       } catch (error) {
         console.warn("[DELETE EVENT] Failed to delete R2 object:", key, error);
       }
@@ -41398,7 +41436,7 @@ app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
 
         const allowedRoots = [
           ...brand.dataPaths.mediaBaseDirCandidates,
-          String(c.env.LOCAL_MEDIA_BASE_DIR || "").trim(),
+          String(env.LOCAL_MEDIA_BASE_DIR || "").trim(),
         ].filter((entry) => !!entry);
 
         const resolvedRoots = allowedRoots.map((root) => pathMod.resolve(root));
@@ -41433,35 +41471,116 @@ app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
       }
     }
 
-    await c.env.DB.prepare(
+    await env.DB.prepare(
       `DELETE FROM detections
        WHERE event_id = ? AND user_id = ?`
     )
-      .bind(eventId, user.id)
+      .bind(eventId, userId)
       .run();
 
-    await c.env.DB.prepare(
+    await env.DB.prepare(
       `DELETE FROM notifications
        WHERE event_id = ? AND user_id = ?`
     )
-      .bind(eventId, user.id)
+      .bind(eventId, userId)
       .run();
   }
 
-  const deleteResult = await c.env.DB.prepare(
+  const deleteResult = await env.DB.prepare(
     `DELETE FROM events
      WHERE id = ? AND user_id = ?
        AND event_type IN ('job_alert_triggered', 'ai_detection')`
   )
-    .bind(eventId, user.id)
+    .bind(eventId, userId)
     .run();
 
   const deletedCount = Number((deleteResult as any)?.meta?.changes ?? 0);
   if (deletedCount < 1) {
-    return c.json({ error: "Event could not be deleted" }, 409);
+    return { ok: false, status: 409, error: "Event could not be deleted" };
   }
 
-  return c.json({ success: true, deleted_id: eventId, deleted_event_type: eventType });
+  return { ok: true, deletedId: eventId, deletedEventType: eventType };
+};
+
+app.post("/api/events/bulk-delete", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  let body: { ids?: number[] } = {};
+
+  try {
+    body = await c.req.json<{ ids?: number[] }>();
+  } catch {
+    return c.json({ error: "Alert ids are required" }, 400);
+  }
+
+  const eventIds = Array.from(
+    new Set(
+      (Array.isArray(body.ids) ? body.ids : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  );
+
+  if (eventIds.length === 0) {
+    return c.json({ error: "Alert ids are required" }, 400);
+  }
+
+  if (eventIds.length > 200) {
+    return c.json({ error: "Too many alert ids requested" }, 400);
+  }
+
+  const deletedIds: number[] = [];
+  const failed: Array<{ id: number; status: 400 | 404 | 409; error: string }> = [];
+
+  for (const eventId of eventIds) {
+    const deleteResult = await deleteDashboardAlertEvent(c.env, user.id, eventId);
+    if (deleteResult.ok) {
+      deletedIds.push(deleteResult.deletedId);
+      continue;
+    }
+    failed.push({
+      id: eventId,
+      status: deleteResult.status,
+      error: deleteResult.error,
+    });
+  }
+
+  if (deletedIds.length === 0) {
+    const firstFailure = failed[0];
+    const failureStatus: 400 | 404 | 409 = firstFailure?.status || 400;
+    return c.json(
+      {
+        error: firstFailure?.error || "No alert events were deleted",
+        deleted_ids: [],
+        failed,
+      },
+      failureStatus,
+    );
+  }
+
+  return c.json({
+    success: failed.length === 0,
+    deleted_ids: deletedIds,
+    deleted_count: deletedIds.length,
+    failed,
+  });
+});
+
+app.delete("/api/events/:id", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const rawId = c.req.param("id");
+  const eventId = parseInt(rawId, 10);
+  const deleteResult = await deleteDashboardAlertEvent(c.env, user.id, eventId);
+
+  if (!deleteResult.ok) {
+    const deleteStatus: 400 | 404 | 409 = deleteResult.status;
+    return c.json({ error: deleteResult.error }, deleteStatus);
+  }
+
+  return c.json({
+    success: true,
+    deleted_id: deleteResult.deletedId,
+    deleted_event_type: deleteResult.deletedEventType,
+  });
 });
 
 app.post("/api/events/mark-read", anyAuthMiddleware, async (c) => {
@@ -51119,10 +51238,18 @@ app.post("/api/agent/events", async (c) => {
     const payloadPriority = normalizePriorityLevel(
       details.priority_level ?? details.priorityLevel ?? details.priority
     );
+    const payloadAgentLabel = readOperationalString(
+      details.agent_label,
+      details.agentLabel,
+      details.display_name,
+      details.displayName
+    );
 
     if (payloadPriority) {
       details.priority_level = payloadPriority;
-    } else {
+    }
+
+    if (!payloadPriority || !payloadAgentLabel) {
       const stepId = Number(details.step_id ?? details.stepId);
       const resolvedCameraId = Number(cameraId ?? details.camera_id ?? details.cameraId);
       const agentKey = typeof details.agent_key === "string"
@@ -51136,7 +51263,7 @@ app.post("/api/agent/events", async (c) => {
 
         if (Number.isInteger(resolvedCameraId) && resolvedCameraId > 0) {
           agentRow = await c.env.DB.prepare(
-            `SELECT priority_level
+            `SELECT priority_level, params, agent_key
              FROM job_step_agents
              WHERE step_id = ? AND agent_key = ? AND is_active = 1
                AND (camera_id = ? OR camera_id IS NULL)
@@ -51147,7 +51274,7 @@ app.post("/api/agent/events", async (c) => {
             .first();
         } else {
           agentRow = await c.env.DB.prepare(
-            `SELECT priority_level
+            `SELECT priority_level, params, agent_key
              FROM job_step_agents
              WHERE step_id = ? AND agent_key = ? AND is_active = 1
              ORDER BY CASE WHEN camera_id IS NULL THEN 0 ELSE 1 END, id DESC
@@ -51157,9 +51284,21 @@ app.post("/api/agent/events", async (c) => {
             .first();
         }
 
-        const resolvedPriority = normalizePriorityLevel((agentRow as any)?.priority_level);
-        if (resolvedPriority) {
-          details.priority_level = resolvedPriority;
+        if (!payloadPriority) {
+          const resolvedPriority = normalizePriorityLevel((agentRow as any)?.priority_level);
+          if (resolvedPriority) {
+            details.priority_level = resolvedPriority;
+          }
+        }
+
+        if (!payloadAgentLabel) {
+          const resolvedAgentLabel = getStoredJobStepAgentDisplayName(agentRow);
+          if (resolvedAgentLabel) {
+            details.agent_label = resolvedAgentLabel;
+            if (!readOperationalString(details.display_name, details.displayName)) {
+              details.display_name = resolvedAgentLabel;
+            }
+          }
         }
       }
     }
@@ -53684,7 +53823,7 @@ app.post("/api/agent/agent-design", async (c) => {
 
   const commandPayload: Record<string, unknown> = {
     goal_summary: goalSummary,
-    user_language: normalizeAgentDesignText(body.language, 32) || "pt-BR",
+    user_language: normalizeAgentDesignText(body.language, 32) || PROMPT_ENHANCER_LANGUAGE_STRATEGY,
     model_name: "gpt-5.1",
     model_api_key: userOpenAiApiKey,
     agent_patch: agentPatch,
@@ -58151,6 +58290,7 @@ type HubAgentSnapshot = {
   summary?: string;
   agent_key: string;
   is_enabled?: boolean;
+  priority_level?: JobStepPriorityLevel | null;
   input_type: "video" | "image";
   video_packaging_mode?: string | null;
   inference_model?: string;
@@ -59201,6 +59341,9 @@ function normalizeHubAgentSnapshot(value: unknown): HubAgentSnapshot | null {
       readHubSnapshotField(row, "is_enabled", "isEnabled"),
       false
     ),
+    priority_level:
+      normalizeJobStepPriorityLevel(readHubSnapshotField(row, "priority_level", "priorityLevel")) ||
+      "MEDIUM",
     input_type: normalizeJobStepInputType(inputTypeValue) || "video",
     video_packaging_mode: normalizeVideoPackagingMode(
       readHubSnapshotField(row, "video_packaging_mode", "videoPackagingMode")
@@ -59389,9 +59532,14 @@ function normalizeHubTaskStepAgentEntries(rawStep: unknown): NormalizedHubTaskSt
               onlyCaptureOnMotionValue,
               normalizeJobStepOnlyCaptureOnMotion(baseSnapshot.only_capture_on_motion, true)
             );
+      const resolvedPriorityLevel =
+        normalizeJobStepPriorityLevel(readHubSnapshotField(group, "priority_level", "priorityLevel")) ||
+        normalizeJobStepPriorityLevel(baseSnapshot.priority_level) ||
+        "MEDIUM";
       const mergedSnapshot = normalizeHubAgentSnapshot({
         ...baseSnapshot,
         agent_key: agentKey,
+        priority_level: resolvedPriorityLevel,
         input_type: executionSettings.inputType,
         video_packaging_mode: resolvedVideoPackagingMode,
         inference_model: executionSettings.inferenceModel,
@@ -59521,6 +59669,7 @@ async function buildHubAgentSnapshotFromCameraAlgorithm(
     summary: getCustomCameraAgentSummary(agent),
     agent_key: normalizeText(agent?.algorithm_type) || "custom_template",
     is_enabled: normalizeDbBoolean(agent?.is_enabled, false),
+    priority_level: normalizeJobStepPriorityLevel(agent?.priority_level) || "MEDIUM",
     input_type: execution.inputType,
     video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
     inference_model: execution.inferenceModel,
@@ -59585,6 +59734,7 @@ function buildHubAgentSnapshotFromStepAgent(agent: any): HubAgentSnapshot | null
     summary: getStoredJobStepAgentSummary(agent),
     agent_key: normalizeText(agent?.agent_key) || "custom_template",
     is_enabled: normalizeDbBoolean(agent?.is_active, true),
+    priority_level: normalizeJobStepPriorityLevel(agent?.priority_level) || "MEDIUM",
     input_type: execution.inputType,
     video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
     inference_model: execution.inferenceModel,
@@ -59638,6 +59788,7 @@ function buildHubAgentSnapshotFromCustomCameraAgentRow(agent: any): HubAgentSnap
     summary: getCustomCameraAgentSummary(agent),
     agent_key: normalizeText(agent?.algorithm_type) || "custom_template",
     is_enabled: normalizeDbBoolean(agent?.is_enabled, false),
+    priority_level: normalizeJobStepPriorityLevel(agent?.priority_level) || "MEDIUM",
     input_type: execution.inputType,
     video_packaging_mode: normalizeVideoPackagingMode(agent?.video_packaging_mode),
     inference_model: execution.inferenceModel,
@@ -60287,6 +60438,7 @@ async function createCameraAlgorithmFromHubSnapshot(
       )
     : "";
   const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
+  const priorityLevel = normalizeJobStepPriorityLevel(snapshot.priority_level) || "MEDIUM";
   const normalizedRegionsResult = normalizeAnalysisRegionsInput(
     Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
     {
@@ -60316,11 +60468,11 @@ async function createCameraAlgorithmFromHubSnapshot(
       `INSERT INTO camera_algorithms (
          camera_id, algorithm_type, is_enabled, llm_prompt, image_region, config_json,
          prompt_template, alert_condition, negative_condition, analysis_regions,
-         input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion,
+         input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, priority_level,
          temporal_plan_json, temporal_plan_hash, temporal_plan_version, temporal_compiled_at, temporal_compile_model, temporal_explain_json,
          created_at, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       cameraId,
@@ -60344,6 +60496,7 @@ async function createCameraAlgorithmFromHubSnapshot(
       execution.runEvery,
       execution.runningResolution,
       directCaptureOnMotionOnly ? 1 : 0,
+      priorityLevel,
       null,
       null,
       null,
@@ -60482,6 +60635,7 @@ async function updateCameraAlgorithmFromHubSnapshot(
       )
     : "";
   const requestedFaceTargetIds = normalizeFaceTargetIdsInput(snapshot.face_target_ids) || [];
+  const priorityLevel = normalizeJobStepPriorityLevel(snapshot.priority_level) || "MEDIUM";
   const normalizedRegionsResult = normalizeAnalysisRegionsInput(
     Array.isArray(snapshot.analysis_regions) ? snapshot.analysis_regions : [],
     {
@@ -60548,6 +60702,7 @@ async function updateCameraAlgorithmFromHubSnapshot(
            run_every = ?,
            running_resolution = ?,
            only_capture_on_motion = ?,
+           priority_level = ?,
            updated_at = ?
        WHERE id = ?`
     )
@@ -60577,6 +60732,7 @@ async function updateCameraAlgorithmFromHubSnapshot(
       execution.runEvery,
       execution.runningResolution,
       directCaptureOnMotionOnly ? 1 : 0,
+      priorityLevel,
       now,
       algorithmId
     )
@@ -60656,6 +60812,7 @@ async function upsertStepAgentFromHubSnapshot(
     snapshot.use_temporal_context,
     true
   );
+  const priorityLevel = normalizeJobStepPriorityLevel(snapshot.priority_level) || "MEDIUM";
   const promptParts = parsePromptTemplatePartsForJobStepTemporalMode(
     snapshot.prompt_template,
     snapshot.alert_condition,
@@ -60808,7 +60965,7 @@ async function upsertStepAgentFromHubSnapshot(
       )
       .bind(
         snapshot.agent_key,
-        "MEDIUM",
+        priorityLevel,
         execution.inputType,
         normalizeVideoPackagingMode(snapshot.video_packaging_mode),
         execution.inferenceModel,
@@ -60893,7 +61050,7 @@ async function upsertStepAgentFromHubSnapshot(
       stepId,
       cameraId,
       snapshot.agent_key,
-      "MEDIUM",
+      priorityLevel,
       execution.inputType,
       normalizeVideoPackagingMode(snapshot.video_packaging_mode),
       execution.inferenceModel,
@@ -61000,6 +61157,7 @@ async function updateStepAgentFromHubSnapshot(
     snapshot.use_temporal_context,
     true
   );
+  const priorityLevel = normalizeJobStepPriorityLevel(snapshot.priority_level) || "MEDIUM";
   const promptParts = parsePromptTemplatePartsForJobStepTemporalMode(
     snapshot.prompt_template,
     snapshot.alert_condition,
@@ -61120,7 +61278,7 @@ async function updateStepAgentFromHubSnapshot(
     )
     .bind(
       stableAgentKey,
-      "MEDIUM",
+      priorityLevel,
       execution.inputType,
       normalizeVideoPackagingMode(snapshot.video_packaging_mode),
       execution.inferenceModel,
@@ -64318,7 +64476,6 @@ app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, asyn
   const alertCondition = typeof body.alert_condition === "string" ? body.alert_condition.trim() : "";
   const negativeCondition =
     typeof body.negative_condition === "string" ? body.negative_condition.trim() : "";
-  const languageHint = typeof body.language === "string" ? body.language.trim() : "";
   const analysisRegionsRaw = body.analysis_regions;
 
   if (!promptTemplate) {
@@ -64411,7 +64568,7 @@ app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, asyn
     prompt_core: promptTemplate,
     alert_condition: alertCondition,
     negative_condition: negativeCondition,
-    user_language: languageHint || "pt-BR",
+    user_language: PROMPT_ENHANCER_LANGUAGE_STRATEGY,
     model_name: "gpt-5.1",
     model_api_key: modelApiKey,
     analysis_regions: enhanceAnalysisRegions,

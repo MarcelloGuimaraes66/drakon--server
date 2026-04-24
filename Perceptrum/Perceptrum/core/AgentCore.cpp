@@ -847,6 +847,16 @@ static std::string normalizeVideoPackagingMode_(const std::string& value)
     return "frame_sequence";
 }
 
+static std::string normalizePriorityLevel_(const std::string& value)
+{
+    const std::string normalized = lowerAsciiCopy_(trimAscii(value));
+    if (normalized == "critic") return "CRITIC";
+    if (normalized == "high") return "HIGH";
+    if (normalized == "medium" || normalized == "meduim") return "MEDIUM";
+    if (normalized == "low") return "LOW";
+    return "MEDIUM";
+}
+
 
 static bool extractTimestampFromFrameStem(const std::string& stem,
     std::string& outTs)
@@ -5106,6 +5116,9 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
             jsonIntOr(a, "runningResolution", 640)
         );
         ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
+        ac.priorityLevel = normalizePriorityLevel_(
+            jsonStringOr(a, "priority_level", jsonStringOr(a, "priorityLevel", "MEDIUM"))
+        );
         ac.onlyCaptureOnMotion = jsonBoolOr(a, "only_capture_on_motion", directCaptureOnMotionOnly);
         ac.modelFps = normalizeAlgorithmModelFps_(
             jsonIntOr(a, "model_fps", 1),
@@ -6747,6 +6760,9 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
                 jsonIntOr(algo, "runningResolution", 640)
             );
             ac.runningResolution = (ac.runningResolution == 1024) ? 1024 : 640;
+            ac.priorityLevel = normalizePriorityLevel_(
+                jsonStringOr(algo, "priority_level", jsonStringOr(algo, "priorityLevel", "MEDIUM"))
+            );
             ac.onlyCaptureOnMotion = jsonBoolOr(
                 algo,
                 "only_capture_on_motion",
@@ -8800,14 +8816,7 @@ json AgentCore::routeQuestionToCamerasWithLlm_(
             return std::string("ultra");
         };
         const std::string normalizedTier = normalizeRouterTier(routerModelTier);
-        const std::string modelName =
-            (normalizedTier == "core")
-            ? std::string("GLM-4.6V-Flash")
-            : ((normalizedTier == "ultra")
-                ? std::string("gpt-5.1")
-                : ((normalizedTier == "ultra_plus")
-                    ? std::string("gpt-5.4")
-                    : ((normalizedTier == "light") ? std::string("gpt-5.4-mini") : std::string("gpt-5-mini"))));
+        const std::string modelName = chatv2::chatModelNameForTier(normalizedTier);
         auto extractRouterText = [](const json& responseJson) {
             if (!responseJson.contains("choices") ||
                 !responseJson["choices"].is_array() ||
@@ -17882,12 +17891,7 @@ static bool isOpenAIChatModelTier(const std::string& tier)
 
 static std::string chatOpenAIModelNameForTier(const std::string& tier)
 {
-    const std::string normalized = normalizeChatModelTierName(tier);
-    if (normalized == "core") return "GLM-4.6V-Flash";
-    if (normalized == "ultra") return "gpt-5.1";
-    if (normalized == "ultra_plus") return "gpt-5.4";
-    if (normalized == "light") return "gpt-5.4-mini";
-    return "gpt-5-mini";
+    return chatv2::chatModelNameForTier(tier);
 }
 
 void AgentCore::handleOrchestratorQuery_(const json& payload)
@@ -21452,7 +21456,10 @@ namespace {
             }
             std::transform(m.begin(), m.end(), m.begin(),
                 [](unsigned char c) { return (char)std::tolower(c); });
-            return m == "glm-4.6v-flash" || (m.rfind("glm-4.6v-flash-", 0) == 0);
+            return m == "glm-4.7-flash" ||
+                (m.rfind("glm-4.7-flash-", 0) == 0) ||
+                m == "glm-4.6v-flash" ||
+                (m.rfind("glm-4.6v-flash-", 0) == 0);
         };
         const bool useZAiCore = isZAiCoreModelLocal(modelName);
         std::string normalizedModelName = modelName;
@@ -21559,7 +21566,7 @@ namespace {
             if (useZAiCore) {
                 logCoreLatency(
                     "core_inference_http_latency_ms model=" +
-                    (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                    (modelName.empty() ? std::string("GLM-4.7-Flash") : modelName) +
                     " provider=" + providerLabel +
                     " attempt=" + std::to_string(attempt) +
                     " latency_ms=" + std::to_string(attemptLatencyMs) +
@@ -21575,7 +21582,7 @@ namespace {
                             std::chrono::steady_clock::now() - requestCycleStart).count();
                     logCoreLatency(
                         "core_inference_http_total_latency_ms model=" +
-                        (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                        (modelName.empty() ? std::string("GLM-4.7-Flash") : modelName) +
                         " provider=" + providerLabel +
                         " attempts=" + std::to_string(attempt) +
                         " total_latency_ms=" + std::to_string(totalLatencyMs) +
@@ -21616,7 +21623,7 @@ namespace {
                         std::chrono::steady_clock::now() - requestCycleStart).count();
                 logCoreLatency(
                     "core_inference_http_total_latency_ms model=" +
-                    (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                    (modelName.empty() ? std::string("GLM-4.7-Flash") : modelName) +
                     " provider=" + providerLabel +
                     " attempts=" + std::to_string(attempt) +
                     " total_latency_ms=" + std::to_string(totalLatencyMs) +
@@ -21632,7 +21639,7 @@ namespace {
                     std::chrono::steady_clock::now() - requestCycleStart).count();
             logCoreLatency(
                 "core_inference_http_total_latency_ms model=" +
-                (modelName.empty() ? std::string("GLM-4.6V-Flash") : modelName) +
+                (modelName.empty() ? std::string("GLM-4.7-Flash") : modelName) +
                 " provider=" + providerLabel +
                 " attempts=" + std::to_string(maxAttempts) +
                 " total_latency_ms=" + std::to_string(totalLatencyMs) +
@@ -22507,6 +22514,7 @@ namespace {
     struct VisionPromptSections_ {
         std::string rawPrompt;
         std::string basePrompt;
+        std::string taskLanguageHint;
         std::string pipelineInput;
         std::string temporalStaticJson;
         std::string temporalRuntimeJson;
@@ -22559,6 +22567,7 @@ namespace {
     static std::size_t findNextPromptSectionBoundary_(const std::string& prompt, std::size_t start)
     {
         const char* markers[] = {
+            "TASK LANGUAGE HINT (SYSTEM):",
             "HIDDEN FACEID TASK (SYSTEM):",
             "HIDDEN NEGATIVE VISUAL REFERENCES TASK (SYSTEM):",
             "INPUT_FROM_PREVIOUS_STEP:",
@@ -22654,6 +22663,12 @@ namespace {
         sections.rawPrompt = trimAscii(userQuestion);
         sections.basePrompt = sections.rawPrompt;
         bool extractedAnySection = false;
+
+        extractedAnySection = extractTextSectionAfterMarker_(
+            sections.basePrompt,
+            "TASK LANGUAGE HINT (SYSTEM):",
+            sections.taskLanguageHint
+        ) || extractedAnySection;
 
         extractedAnySection = extractTextSectionAfterMarker_(
             sections.basePrompt,
@@ -24639,7 +24654,9 @@ namespace {
     static bool isZAiCoreModelName_(const std::string& modelName)
     {
         const std::string normalized = normalizeOpenAIModelName_(modelName);
-        return normalized == "glm-4.6v-flash" ||
+        return normalized == "glm-4.7-flash" ||
+            normalized.rfind("glm-4.7-flash-", 0) == 0 ||
+            normalized == "glm-4.6v-flash" ||
             normalized.rfind("glm-4.6v-flash-", 0) == 0;
     }
 
@@ -24734,6 +24751,7 @@ namespace {
         bool directChatFlow = false;
         bool hasTemporal = false;
         bool useTemporalDeltaContract = false;
+        bool hasZonedTemporalContext = false;
         bool useVideoMosaics = false;
         bool hasFaceReferences = false;
         bool hasLegacySingleFaceReference = false;
@@ -25163,6 +25181,23 @@ namespace {
         return "none";
     }
 
+    static bool hasZonedTemporalContextInStaticJson_(const std::string& temporalStaticJson)
+    {
+        if (temporalStaticJson.empty()) return false;
+        const nlohmann::json staticContext =
+            nlohmann::json::parse(temporalStaticJson, nullptr, false);
+        if (!staticContext.is_object()) return false;
+        if (staticContext.contains("zone_catalog") &&
+            staticContext["zone_catalog"].is_array() &&
+            !staticContext["zone_catalog"].empty())
+        {
+            return true;
+        }
+        return staticContext.contains("event_zone_bindings") &&
+               staticContext["event_zone_bindings"].is_object() &&
+               !staticContext["event_zone_bindings"].empty();
+    }
+
     static std::string buildOpenAIVisionCacheVariant_(const OpenAIVisionPromptOptions_& options)
     {
         const bool directChatIdentityContinuity =
@@ -25176,6 +25211,7 @@ namespace {
         if (options.hasTemporal) variant += "_temporal";
         if (directChatIdentityContinuity && !options.hasTemporal) variant += "_idmem";
         if (options.useTemporalDeltaContract) variant += "_delta";
+        if (options.hasZonedTemporalContext) variant += "_zoned";
         if (options.hasFaceReferences) variant += "_face";
         if (options.hasLegacySingleFaceReference) variant += "_legacy_face";
         if (options.hasNegativeReferences) variant += "_negative";
@@ -25351,6 +25387,10 @@ namespace {
         const bool requireIdentitySignatureTraits =
             requiresIdentitySignatureTraits_(options);
         if (options.useTemporalDeltaContract) {
+            nlohmann::json eventUpdateRequired = nlohmann::json::array({ "event" });
+            if (options.hasZonedTemporalContext) {
+                eventUpdateRequired.push_back("zone");
+            }
             const nlohmann::json identityUpdateRequired =
                 requireIdentitySignatureTraits
                     ? nlohmann::json::array({ "identity_signature_traits" })
@@ -25413,7 +25453,8 @@ namespace {
                         { "continuation", makeNullableBooleanSchema_() },
                         { "counts_as_new_event", makeNullableBooleanSchema_() }
                     },
-                    static_cast<int>(kStructuredVisionMaxObservationItems_)) },
+                    static_cast<int>(kStructuredVisionMaxObservationItems_),
+                    eventUpdateRequired) },
                 { "unknown_reasons", makeNullableObjectArraySchemaWithItemProperties_(
                     nlohmann::json{
                         { "entity_id", makeNullableStringSchema_() },
@@ -25695,6 +25736,10 @@ namespace {
         prompt << "- Use visibility state visible when the entity is clearly visible now.\n";
         prompt << "- Use visibility state not_visible_this_segment or absent when a tracked entity from temporal state is clearly not visible in the current batch.\n";
         prompt << "- event_updates are optional. Emit only atomic current-batch events such as picked_up_cup. Never emit cumulative counts like 'third time'.\n";
+        if (options.hasZonedTemporalContext) {
+            prompt << "- In this zoned temporal context, every emitted event_updates item must include zone using the canonical zone key from TEMPORAL_STATIC_CONTEXT_JSON.\n";
+            prompt << "- If TEMPORAL_STATIC_CONTEXT_JSON provides event_zone_bindings for an event, emitted zone must match that binding exactly. If you are not confident about zone, omit the event update instead of emitting it without zone.\n";
+        }
         prompt << "- unknown_reasons are optional. Emit them only when occlusion, ambiguity, or conflict explains why no stronger update was produced.\n";
         if (options.hasCrossCameraWatchlist) {
             prompt << "- watchlist_updates are optional overall, but if the current batch strongly matches a shared target, emit watchlist_updates even when local_alert_update stays false or the local task text is about something else.\n";
@@ -26191,6 +26236,9 @@ namespace {
                 kStructuredVisionMaxObservationItems_ << " items); emit only for visibility changes, absence, uncertainty, or when visibility needs explicit clarification\n";
             prompt << "- event_updates: optional array (max " <<
                 kStructuredVisionMaxObservationItems_ << " items); omit when there is no new event in this batch\n";
+            if (options.hasZonedTemporalContext) {
+                prompt << "- event_updates[*].zone: required canonical zone key for every emitted event update in zoned temporal context\n";
+            }
             prompt << "- unknown_reasons: optional array (max " <<
                 kStructuredVisionMaxUnknownReasonItems_ << " items); omit when there is no ambiguity or conflict to explain\n";
             if (options.hasFaceReferences) {
@@ -26487,6 +26535,7 @@ namespace {
         options.directChatFlow = !jobMode && !cameraStyleFlow;
         options.hasTemporal = sections.hasTemporal;
         options.useTemporalDeltaContract = options.hasTemporal && !options.directChatFlow;
+        options.hasZonedTemporalContext = hasZonedTemporalContextInStaticJson_(sections.temporalStaticJson);
         options.useVideoMosaics = useVideoMosaics;
         options.hasFaceReferences = !canonicalFaceReferences.empty();
         options.hasLegacySingleFaceReference =
@@ -26507,7 +26556,7 @@ namespace {
         const std::string staticSystemText = buildOpenAIVisionSystemText_(
             options,
             useVideoMosaics ? &mosaicBundle : nullptr
-        );
+        ) + (sections.taskLanguageHint.empty() ? "" : ("\n" + sections.taskLanguageHint));
         const std::string staticUserText = buildOpenAIVideoStaticText_(
             options,
             sections,
@@ -26729,12 +26778,15 @@ namespace {
         options.jobMode = true;
         options.hasTemporal = sections.hasTemporal;
         options.useTemporalDeltaContract = options.hasTemporal;
+        options.hasZonedTemporalContext = hasZonedTemporalContextInStaticJson_(sections.temporalStaticJson);
         options.hasFaceReferences = !canonicalFaceReferences.empty();
         options.hasNegativeReferences = !canonicalNegativeReferences.empty();
         options.hasCrossCameraWatchlist = sections.hasCrossCameraWatchlist;
         options.temporalAlertMayUsePriorState = true;
 
-        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticSystemText =
+            buildOpenAIVisionSystemText_(options) +
+            (sections.taskLanguageHint.empty() ? "" : ("\n" + sections.taskLanguageHint));
         const std::string staticUserText = buildOpenAIImageStaticText_(
             options,
             sections,
@@ -27056,7 +27108,9 @@ namespace {
             options.hasFaceReferences,
             options.hasNegativeReferences
         );
-        const std::string staticSystemText = buildOpenAIVisionSystemText_(options);
+        const std::string staticSystemText =
+            buildOpenAIVisionSystemText_(options) +
+            (sections.taskLanguageHint.empty() ? "" : ("\n" + sections.taskLanguageHint));
         const std::string staticUserText = buildOpenAIGroupImageStaticText_(
             sections,
             alertConditionText,
@@ -34174,7 +34228,7 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
         std::string promptCore = payload.value("prompt_core", std::string());
         std::string alertCondition = payload.value("alert_condition", std::string());
         std::string negativeCondition = payload.value("negative_condition", std::string());
-        std::string languageHint = payload.value("user_language", std::string("pt-BR"));
+        std::string languageHint = payload.value("user_language", std::string("match_input_language"));
         std::string modelName = payload.value("model_name", std::string("gpt-5.1"));
         std::string modelApiKey = payload.value("model_api_key", std::string());
         std::string cameraName = payload.value("camera_name", std::string());
@@ -34207,8 +34261,9 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
             modelName = "gpt-5.1";
         }
         if (languageHint.empty()) {
-            languageHint = "pt-BR";
+            languageHint = "match_input_language";
         }
+        const std::string normalizedLanguageHint = toLowerCopyPromptEnhance(languageHint);
 
         int warmupSeconds = 6;
         int targetSecond = 5;
@@ -34402,7 +34457,9 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
         }
 
         prompt << "MANDATORY RULES:\n";
-        prompt << "- Respond in the same language as the user inputs.\n";
+        prompt << "- Write prompt_template, alert_condition, and negative_condition in the predominant language already used in prompt_core / alert_condition / negative_condition.\n";
+        prompt << "- Never translate the output to match browser, UI, account, or application locale.\n";
+        prompt << "- If the inputs mix languages, follow the language used in prompt_core.\n";
         prompt << "- Keep JSON field names in English.\n";
         prompt << "- Produce binary and testable conditions.\n";
         prompt << "- Avoid vague expressions.\n";
@@ -34419,7 +34476,14 @@ void AgentCore::handlePromptEnhanceCommand_(int commandId, const nlohmann::json&
         prompt << "  \"negative_condition\": \"...\"\n";
         prompt << "}\n\n";
 
-        prompt << "Language hint from user: " << languageHint << "\n";
+        if (normalizedLanguageHint == "match_input_language") {
+            prompt << "INPUT LANGUAGE DIRECTIVE: derive the output language from prompt_core / alert_condition / negative_condition only.\n";
+        }
+        else {
+            prompt << "INPUT LANGUAGE DIRECTIVE: the predominant input language appears to be "
+                   << languageHint
+                   << ". Use that only when it matches the language already present in the input fields.\n";
+        }
 
         nlohmann::json content = nlohmann::json::array();
         content.push_back({ { "type", "text" }, { "text", prompt.str() } });
@@ -34539,7 +34603,7 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
     try {
         const int cameraId = payload.value("camera_id", -1);
         std::string goalSummary = payload.value("goal_summary", std::string());
-        std::string languageHint = payload.value("user_language", std::string("pt-BR"));
+        std::string languageHint = payload.value("user_language", std::string("match_input_language"));
         std::string modelName = payload.value("model_name", std::string("gpt-5.1"));
         std::string modelApiKey = payload.value("model_api_key", std::string());
         std::string cameraName = payload.value("camera_name", std::string());
@@ -34580,8 +34644,9 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
             modelName = "gpt-5.1";
         }
         if (languageHint.empty()) {
-            languageHint = "pt-BR";
+            languageHint = "match_input_language";
         }
+        const std::string normalizedLanguageHint = toLowerCopyPromptEnhance(languageHint);
 
         auto jsonTextField = [](const nlohmann::json& node, const char* key) -> std::string {
             if (!node.is_object() || !node.contains(key) || !node[key].is_string()) {
@@ -35031,7 +35096,9 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
         }
 
         prompt << "DESIGN RULES:\n";
-        prompt << "- Respond in the same language as the user's goal.\n";
+        prompt << "- Write display_name, summary, prompt_template, alert_condition, negative_condition, and region text in the predominant language already used in goal_summary and any existing agent_patch text.\n";
+        prompt << "- Never translate the output to match browser, UI, account, or application locale.\n";
+        prompt << "- If the inputs mix languages, follow the language used in goal_summary.\n";
         prompt << "- Output JSON field names in English.\n";
         prompt << "- prompt_template and alert_condition must be non-empty.\n";
         prompt << "- Infer a concrete alert_condition even if the user only described what they want to detect.\n";
@@ -35087,7 +35154,14 @@ void AgentCore::handleAgentDesignCommand_(int commandId, const nlohmann::json& p
         prompt << "    }\n";
         prompt << "  ]\n";
         prompt << "}\n\n";
-        prompt << "Language hint from user: " << languageHint << "\n";
+        if (normalizedLanguageHint == "match_input_language") {
+            prompt << "INPUT LANGUAGE DIRECTIVE: derive the output language from goal_summary and any existing agent_patch text only.\n";
+        }
+        else {
+            prompt << "INPUT LANGUAGE DIRECTIVE: the predominant input language appears to be "
+                   << languageHint
+                   << ". Use that only when it matches the language already present in the input fields.\n";
+        }
 
         nlohmann::json content = nlohmann::json::array();
         content.push_back({ { "type", "text" }, { "text", prompt.str() } });

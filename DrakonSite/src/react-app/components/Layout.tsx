@@ -105,11 +105,7 @@ function getStandaloneAgentTutorialCameraId(
     }))
     .filter((camera): camera is { id: number; name: string } => camera.id !== null);
 
-  return (
-    availableCameras.find((camera) => camera.name.includes("tutorial"))?.id ??
-    availableCameras[0]?.id ??
-    null
-  );
+  return availableCameras.find((camera) => camera.name.includes("tutorial"))?.id ?? null;
 }
 
 type ApiKeyPromptStatus = {

@@ -22,6 +22,12 @@ std::string normalizeChatCompletionsUrl_(std::string baseUrl)
         baseUrl.pop_back();
     }
 
+    const std::string genericSuffix = "/chat/completions";
+    if (baseUrl.size() >= genericSuffix.size() &&
+        baseUrl.compare(baseUrl.size() - genericSuffix.size(), genericSuffix.size(), genericSuffix) == 0) {
+        return baseUrl;
+    }
+
     const std::string suffix = "/v1/chat/completions";
     if (baseUrl.size() >= suffix.size() &&
         baseUrl.compare(baseUrl.size() - suffix.size(), suffix.size(), suffix) == 0) {
@@ -52,6 +58,15 @@ std::string normalizeResponsesUrl_(std::string baseUrl)
         return baseUrl.substr(0, baseUrl.size() - chatSuffix.size()) + responsesSuffix;
     }
 
+    const std::string genericChatSuffix = "/chat/completions";
+    if (baseUrl.size() >= genericChatSuffix.size() &&
+        baseUrl.compare(
+            baseUrl.size() - genericChatSuffix.size(),
+            genericChatSuffix.size(),
+            genericChatSuffix) == 0) {
+        return baseUrl.substr(0, baseUrl.size() - genericChatSuffix.size()) + "/responses";
+    }
+
     return baseUrl + responsesSuffix;
 }
 
@@ -67,7 +82,9 @@ std::string normalizeOpenAIModelName_(std::string modelName)
 bool isZAiCoreModelName_(const std::string& modelName)
 {
     const std::string normalized = normalizeOpenAIModelName_(modelName);
-    return normalized == "glm-4.6v-flash" ||
+    return normalized == "glm-4.7-flash" ||
+        normalized.rfind("glm-4.7-flash-", 0) == 0 ||
+        normalized == "glm-4.6v-flash" ||
         normalized.rfind("glm-4.6v-flash-", 0) == 0;
 }
 

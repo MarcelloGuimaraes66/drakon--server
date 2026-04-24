@@ -224,6 +224,9 @@ function AutoGrowingTextarea({
       onChange={(event) => onChange(event.target.value)}
       rows={rows}
       readOnly={readOnly}
+      spellCheck={false}
+      autoCorrect="off"
+      autoCapitalize="off"
       className={className}
       placeholder={placeholder}
     />
@@ -1128,6 +1131,12 @@ interface InferenceGroup {
 }
 
 type AgentPriority = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
+const AGENT_PRIORITY_OPTIONS: ReadonlyArray<AgentPriority> = [
+  "CRITIC",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+];
 
 interface GroupAgentSourceOption {
   targetId: number;
@@ -1786,6 +1795,28 @@ const buildEmptyAgentForm = (): AgentFormState => ({
     ),
   ],
 });
+
+const syncAgentFormDisplayName = (
+  form: AgentFormState,
+  nextDisplayName: string
+): AgentFormState => {
+  const nextParams = {
+    ...parseAgentParamsObject(form.params),
+  };
+  const trimmedDisplayName = nextDisplayName.trim();
+
+  if (trimmedDisplayName) {
+    nextParams.display_name = trimmedDisplayName;
+  } else {
+    delete nextParams.display_name;
+  }
+
+  return {
+    ...form,
+    agent_key: nextDisplayName,
+    params: JSON.stringify(nextParams),
+  };
+};
 
 const getFaceTargetImageCount = (target: FaceTarget | null | undefined): number => {
   if (!target) return 0;
@@ -4405,6 +4436,7 @@ function StepCard({
   const [showAgentForm, setShowAgentForm] = useState(false);
   const [agentFormCameraId, setAgentFormCameraId] = useState<number | null>(null);
   const [showPipelineForm, setShowPipelineForm] = useState(false);
+  const [isKnowledgeSharingCollapsed, setIsKnowledgeSharingCollapsed] = useState(false);
   const [showStartConditionForm, setShowStartConditionForm] = useState(false);
   const [showAlertForm, setShowAlertForm] = useState(false);
   const [editStepName, setEditStepName] = useState(step.name);
@@ -6216,10 +6248,14 @@ function StepCard({
     const inferenceModel = normalizeAgentInferenceModel(source.inference_model);
     const sourceParams = parseAgentParamsObject(source.params ?? "{}");
     const summaryLocked = normalizeAgentSummaryLocked(sourceParams.summary_locked);
+    const sourceAgentKey = String(source.agent_key || "").trim();
+    const paramsDisplayName =
+      typeof sourceParams.display_name === "string" ? sourceParams.display_name.trim() : "";
     const displayName =
       (typeof source.display_name === "string" ? source.display_name.trim() : "") ||
-      (typeof sourceParams.display_name === "string" ? sourceParams.display_name.trim() : "") ||
-      String(source.agent_key || "").trim();
+      (typeof source.stored_agent_key === "string" ? sourceAgentKey : paramsDisplayName) ||
+      paramsDisplayName ||
+      sourceAgentKey;
     const summary =
       summaryLocked
         ? (typeof sourceParams.summary === "string" ? sourceParams.summary.trim() : "") ||
@@ -7290,6 +7326,9 @@ function StepCard({
           display_name: displayName,
           summary,
         }),
+        priority_level: normalizeAgentPriority(
+          template.priority_level ?? fallbackForm.priority_level
+        ),
         inference_model: execution.inferenceModel,
         model_fps: execution.modelFps,
         run_every: execution.runEvery,
@@ -7918,11 +7957,6 @@ function StepCard({
     setPromptEnhanceSuggestion(null);
 
     try {
-      const languageHint =
-        typeof navigator !== "undefined" && typeof navigator.language === "string"
-          ? navigator.language
-          : "";
-
       const enqueueResponse = await fetch(
         `/api/job-steps/${step.id}/agents/enhance-prompt`,
         {
@@ -7933,7 +7967,6 @@ function StepCard({
             prompt_template: normalized.prompt_template,
             alert_condition: normalized.alert_condition,
             negative_condition: normalized.negative_condition,
-            language: languageHint,
             analysis_regions: enhanceAnalysisRegions,
           }),
         }
@@ -8565,12 +8598,10 @@ function StepCard({
             aria-label={t("jobs.agentKey")}
             type="text"
             value={agentForm.agent_key}
-            onChange={(e) =>
-              setAgentForm((prev) => ({
-                ...prev,
-                agent_key: e.target.value,
-              }))
-            }
+            onChange={(e) => setAgentForm((prev) => syncAgentFormDisplayName(prev, e.target.value))}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
             className={PROMPT_DOCUMENT_INPUT_CLASS}
             placeholder={t("jobs.agentKeyPlaceholder")}
           />
@@ -8597,6 +8628,9 @@ function StepCard({
               value={promptEditorDraft.prompt_template}
               onChange={(e) => updatePromptEditorPromptCore(e.target.value)}
               rows={8}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
             />
@@ -8624,6 +8658,9 @@ function StepCard({
               value={promptEditorDraft.alert_condition}
               onChange={(e) => updatePromptEditorAlertCondition(e.target.value)}
               rows={5}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
             />
@@ -8651,6 +8688,9 @@ function StepCard({
               value={promptEditorDraft.negative_condition}
               onChange={(e) => updatePromptEditorNegativeCondition(e.target.value)}
               rows={4}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
             />
@@ -8693,8 +8733,8 @@ function StepCard({
         model_fps: constrained.modelFps,
       }));
     }
-    if (showPromptEditor && promptEditorTargetInputType !== "video") {
-      setPromptEditorInputTypeDraft("video");
+    if (showPromptEditor && constrained.inputType !== promptEditorTargetInputType) {
+      setPromptEditorInputTypeDraft(constrained.inputType);
     }
   }, [
     agentForm.inference_model,
@@ -8702,7 +8742,6 @@ function StepCard({
     agentForm.run_every,
     agentForm.running_resolution,
     showPromptEditor,
-    promptEditorTarget,
     promptEditorTargetInputType,
   ]);
 
@@ -8961,6 +9000,7 @@ function StepCard({
       pipelines: buildPipelineFormRows(stepPipelines, step.id),
       on_missing_input: step.on_missing_input || "skip",
     });
+    setIsKnowledgeSharingCollapsed(false);
     setShowPipelineForm(true);
   };
 
@@ -9935,6 +9975,7 @@ function StepCard({
                     />
                     <div
                       className="relative h-[92vh] max-h-[1100px] w-[min(96vw,1560px)] max-w-[1560px] rounded-2xl border border-gray-700 bg-gray-800 text-gray-100 shadow-2xl overflow-hidden flex flex-col"
+                      spellCheck={false}
                     >
                       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
                         <div>
@@ -9946,6 +9987,29 @@ function StepCard({
                           </p>
                         </div>
                         <div className="flex flex-wrap items-center justify-end gap-2">
+                          <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                            <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                              Priority
+                            </span>
+                            <select
+                              value={normalizeAgentPriority(agentForm.priority_level)}
+                              onChange={(e) =>
+                                setAgentForm((prev) => ({
+                                  ...prev,
+                                  priority_level: normalizeAgentPriority(e.target.value),
+                                }))
+                              }
+                              disabled={enhancingPrompt}
+                              className="w-[118px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                              title="Choose the alert priority for this agent"
+                            >
+                              {AGENT_PRIORITY_OPTIONS.map((priority) => (
+                                <option key={priority} value={priority}>
+                                  {priority}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
                           <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
                             <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
                               Load
@@ -11807,13 +11871,42 @@ function StepCard({
           {/* Pipeline Section */}
           {showPipelineForm || stepPipelines.length > 0 ? (
           <div className="rounded-[20px] border border-gray-800/80 bg-gray-950/55 p-3.5">
-            <div className="flex items-center justify-between mb-3">
-              <h5 className="text-sm font-medium text-gray-300">
-                {t("jobs.knowledgeSharing", { defaultValue: "Knowledge sharing" })}
-              </h5>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <h5 className="text-sm font-medium text-gray-300">
+                  {t("jobs.knowledgeSharing", { defaultValue: "Knowledge sharing" })}
+                </h5>
+                {stepPipelines.length > 0 ? (
+                  <span className="inline-flex items-center rounded-full border border-gray-800 bg-gray-900/80 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.16em] text-gray-500">
+                    {stepPipelines.length}
+                  </span>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsKnowledgeSharingCollapsed((current) => !current)}
+                aria-expanded={!isKnowledgeSharingCollapsed}
+                aria-label={
+                  isKnowledgeSharingCollapsed
+                    ? "Expand knowledge sharing"
+                    : "Collapse knowledge sharing"
+                }
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-gray-800 bg-gray-950/70 text-gray-500 transition-colors hover:border-blue-500/30 hover:bg-blue-500/10 hover:text-blue-200"
+                title={
+                  isKnowledgeSharingCollapsed
+                    ? "Expand knowledge sharing"
+                    : "Collapse knowledge sharing"
+                }
+              >
+                {isKnowledgeSharingCollapsed ? (
+                  <ChevronRight className="h-4 w-4" />
+                ) : (
+                  <ChevronDown className="h-4 w-4" />
+                )}
+              </button>
             </div>
 
-            {showPipelineForm ? (
+            {!isKnowledgeSharingCollapsed ? showPipelineForm ? (
               <div className="space-y-4">
                 {pipelineForm.pipelines.map((row, idx) => {
                   const targetsForStep = row.input_from_step_id
@@ -12029,7 +12122,7 @@ function StepCard({
               </div>
             ) : (
               <p className="text-xs text-gray-500">{t("jobs.noPipelineConfigured")}</p>
-            )}
+            ) : null}
           </div>
           ) : null}
 

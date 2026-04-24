@@ -33,11 +33,14 @@ type IntruderArea = {
   description: string;
 };
 
+type CustomAgentPriority = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
+
 type CustomAlgorithm = {
   id: number;
   algorithm_type: string;
   display_name: string;
   is_enabled: boolean;
+  priority_level: CustomAgentPriority;
   input_type: "video" | "image";
   video_packaging_mode: "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
   inference_model: "core" | "ultra" | "ultra_plus" | "light" | "legacy" | "pro";
@@ -104,6 +107,19 @@ const normalizeCameraDirectCaptureOnMotion = (
     if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
       return true;
     }
+  }
+  return fallback;
+};
+
+const normalizeCustomAgentPriority = (
+  value: unknown,
+  fallback: CustomAgentPriority = "MEDIUM"
+): CustomAgentPriority => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "MEDUIM") return "MEDIUM";
+  if (normalized === "CRITIC" || normalized === "HIGH" || normalized === "MEDIUM" || normalized === "LOW") {
+    return normalized;
   }
   return fallback;
 };
@@ -557,6 +573,9 @@ export default function Algorithms() {
               typeof row?.is_enabled === "boolean"
                 ? row.is_enabled
                 : Number(row?.is_enabled || 0) !== 0,
+            priority_level: normalizeCustomAgentPriority(
+              row?.priority_level ?? row?.priorityLevel
+            ),
             input_type:
               String(row?.input_type || "").trim().toLowerCase() === "image" ? "image" : "video",
             video_packaging_mode: (() => {
@@ -711,6 +730,7 @@ export default function Algorithms() {
       run_every: custom.run_every,
       running_resolution: custom.running_resolution,
       only_capture_on_motion: custom.only_capture_on_motion,
+      priority_level: custom.priority_level,
       prompt_template: custom.prompt_template,
       alert_condition: custom.alert_condition,
       negative_condition: custom.negative_condition,
@@ -1581,7 +1601,11 @@ export default function Algorithms() {
         <div className="mb-6 grid gap-3 md:grid-cols-2">
           <button
             onClick={openCreateCustomEditor}
-            data-onboarding-target={ONBOARDING_TARGETS.algorithmsCreateCustom}
+            data-onboarding-target={
+              isTutorialCamera && isOnboardingOpen
+                ? ONBOARDING_TARGETS.algorithmsCreateCustom
+                : undefined
+            }
             className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-purple-500/20 to-pink-500/20 hover:from-purple-500/30 hover:to-pink-500/30 border border-purple-500/30 text-purple-300 rounded-xl font-medium transition-all shadow-lg shadow-purple-500/10"
           >
             <Plus className="w-5 h-5" />

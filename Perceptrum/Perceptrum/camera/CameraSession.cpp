@@ -61,6 +61,305 @@ using json = nlohmann::json;
 
 namespace fs = std::filesystem;
 
+static bool nextUtf8CodepointForCameraTaskLanguage_(
+    const std::string& text,
+    std::size_t& index,
+    std::uint32_t& outCodepoint)
+{
+    if (index >= text.size()) {
+        return false;
+    }
+
+    const unsigned char first = static_cast<unsigned char>(text[index++]);
+    if ((first & 0x80u) == 0u) {
+        outCodepoint = static_cast<std::uint32_t>(first);
+        return true;
+    }
+
+    int continuationCount = 0;
+    std::uint32_t codepoint = 0;
+    if ((first & 0xE0u) == 0xC0u) {
+        continuationCount = 1;
+        codepoint = static_cast<std::uint32_t>(first & 0x1Fu);
+    }
+    else if ((first & 0xF0u) == 0xE0u) {
+        continuationCount = 2;
+        codepoint = static_cast<std::uint32_t>(first & 0x0Fu);
+    }
+    else if ((first & 0xF8u) == 0xF0u) {
+        continuationCount = 3;
+        codepoint = static_cast<std::uint32_t>(first & 0x07u);
+    }
+    else {
+        outCodepoint = static_cast<std::uint32_t>(' ');
+        return true;
+    }
+
+    if (index + static_cast<std::size_t>(continuationCount) > text.size()) {
+        index = text.size();
+        outCodepoint = static_cast<std::uint32_t>(' ');
+        return true;
+    }
+
+    for (int i = 0; i < continuationCount; ++i) {
+        const unsigned char next = static_cast<unsigned char>(text[index++]);
+        if ((next & 0xC0u) != 0x80u) {
+            outCodepoint = static_cast<std::uint32_t>(' ');
+            return true;
+        }
+        codepoint = (codepoint << 6) | static_cast<std::uint32_t>(next & 0x3Fu);
+    }
+
+    outCodepoint = codepoint;
+    return true;
+}
+
+static char foldLatinCodepointForCameraTaskLanguage_(std::uint32_t codepoint)
+{
+    switch (codepoint) {
+    case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+    case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+        return 'a';
+    case 0x00C7: case 0x00E7:
+        return 'c';
+    case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+    case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+        return 'e';
+    case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+    case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+        return 'i';
+    case 0x00D1: case 0x00F1:
+        return 'n';
+    case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8:
+    case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8:
+        return 'o';
+    case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+    case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+        return 'u';
+    case 0x00DD: case 0x00FD: case 0x00FF:
+        return 'y';
+    default:
+        return '\0';
+    }
+}
+
+static std::string normalizePromptSampleForCameraTaskLanguage_(
+    const std::string& text,
+    bool* outHasArabic = nullptr,
+    bool* outHasCjk = nullptr)
+{
+    bool hasArabic = false;
+    bool hasCjk = false;
+    std::string normalized;
+    normalized.reserve(text.size());
+
+    std::size_t index = 0;
+    while (index < text.size()) {
+        std::uint32_t codepoint = 0;
+        if (!nextUtf8CodepointForCameraTaskLanguage_(text, index, codepoint)) {
+            break;
+        }
+
+        if ((codepoint >= 0x0600u && codepoint <= 0x06FFu) ||
+            (codepoint >= 0x0750u && codepoint <= 0x077Fu) ||
+            (codepoint >= 0x08A0u && codepoint <= 0x08FFu))
+        {
+            hasArabic = true;
+        }
+        if ((codepoint >= 0x3400u && codepoint <= 0x4DBFu) ||
+            (codepoint >= 0x4E00u && codepoint <= 0x9FFFu) ||
+            (codepoint >= 0xF900u && codepoint <= 0xFAFFu))
+        {
+            hasCjk = true;
+        }
+
+        const char foldedLatin = foldLatinCodepointForCameraTaskLanguage_(codepoint);
+        if (foldedLatin != '\0') {
+            normalized.push_back(foldedLatin);
+        }
+        else if (codepoint < 128u && std::isalpha(static_cast<unsigned char>(codepoint))) {
+            normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(codepoint))));
+        }
+        else {
+            normalized.push_back(' ');
+        }
+    }
+
+    if (outHasArabic) *outHasArabic = hasArabic;
+    if (outHasCjk) *outHasCjk = hasCjk;
+    return normalized;
+}
+
+static int countWholeWordHitsForCameraTaskLanguage_(
+    const std::string& normalizedText,
+    const char* const* words,
+    std::size_t wordCount)
+{
+    if (normalizedText.empty() || words == nullptr || wordCount == 0) {
+        return 0;
+    }
+
+    const std::string padded = " " + normalizedText + " ";
+    int score = 0;
+    for (std::size_t i = 0; i < wordCount; ++i) {
+        const std::string word = words[i] ? words[i] : "";
+        if (word.empty()) continue;
+        const std::string needle = " " + word + " ";
+        std::size_t pos = 0;
+        while ((pos = padded.find(needle, pos)) != std::string::npos) {
+            score += word.size() >= 7 ? 3 : (word.size() >= 4 ? 2 : 1);
+            pos += needle.size() - 1;
+        }
+    }
+    return score;
+}
+
+static void appendPromptSampleForCameraTaskLanguage_(
+    std::string& sample,
+    const std::string& rawValue,
+    int weight = 1)
+{
+    if (weight <= 0) return;
+    const std::string trimmed = temporal::trim(rawValue);
+    if (trimmed.empty()) return;
+    for (int i = 0; i < weight; ++i) {
+        if (!sample.empty()) sample.push_back('\n');
+        sample += trimmed;
+    }
+}
+
+static std::string detectTaskLanguageTagForCameraPrompt_(
+    const std::string& promptCore,
+    const std::string& alertConditionText,
+    const std::string& negativeConditionText)
+{
+    std::string sample;
+    appendPromptSampleForCameraTaskLanguage_(sample, promptCore, 2);
+    appendPromptSampleForCameraTaskLanguage_(sample, alertConditionText);
+    appendPromptSampleForCameraTaskLanguage_(sample, negativeConditionText);
+    if (sample.empty()) return "";
+
+    bool hasArabic = false;
+    bool hasCjk = false;
+    const std::string normalized =
+        normalizePromptSampleForCameraTaskLanguage_(sample, &hasArabic, &hasCjk);
+    if (hasArabic) return "ar";
+    if (hasCjk) return "zh";
+    if (normalized.empty()) return "";
+
+    static const char* const kEnglishWords[] = {
+        "the", "with", "without", "should", "must", "when", "inside",
+        "person", "people", "customer", "item", "items", "bag", "purse",
+        "clothes", "their", "own", "clear", "visible", "alert", "camera",
+        "scene", "snapshot", "monitoring", "walking", "standing"
+    };
+    static const char* const kSpanishWords[] = {
+        "el", "los", "las", "con", "sin", "debe", "cuando", "dentro",
+        "persona", "personas", "cliente", "articulo", "articulos", "bolsa",
+        "cartera", "ropa", "propia", "claro", "visible", "alerta", "camara",
+        "escena"
+    };
+    static const char* const kPortugueseWords[] = {
+        "com", "sem", "deve", "quando", "dentro", "pessoa", "pessoas",
+        "cliente", "item", "itens", "bolsa", "carteira", "roupa", "propria",
+        "claro", "visivel", "alerta", "camera", "cena"
+    };
+    static const char* const kFrenchWords[] = {
+        "avec", "sans", "doit", "quand", "dans", "personne", "client",
+        "article", "articles", "sac", "bourse", "vetements", "propre",
+        "clair", "visible", "alerte", "camera", "scene"
+    };
+
+    const int englishScore = countWholeWordHitsForCameraTaskLanguage_(
+        normalized,
+        kEnglishWords,
+        sizeof(kEnglishWords) / sizeof(kEnglishWords[0]));
+    const int spanishScore = countWholeWordHitsForCameraTaskLanguage_(
+        normalized,
+        kSpanishWords,
+        sizeof(kSpanishWords) / sizeof(kSpanishWords[0]));
+    const int portugueseScore = countWholeWordHitsForCameraTaskLanguage_(
+        normalized,
+        kPortugueseWords,
+        sizeof(kPortugueseWords) / sizeof(kPortugueseWords[0]));
+    const int frenchScore = countWholeWordHitsForCameraTaskLanguage_(
+        normalized,
+        kFrenchWords,
+        sizeof(kFrenchWords) / sizeof(kFrenchWords[0]));
+
+    struct Candidate {
+        const char* tag;
+        int score;
+    };
+    const Candidate candidates[] = {
+        { "en", englishScore },
+        { "es", spanishScore },
+        { "pt", portugueseScore },
+        { "fr", frenchScore }
+    };
+
+    std::string bestTag;
+    int bestScore = 0;
+    int secondBestScore = 0;
+    for (const auto& candidate : candidates) {
+        if (candidate.score > bestScore) {
+            secondBestScore = bestScore;
+            bestScore = candidate.score;
+            bestTag = candidate.tag;
+        }
+        else if (candidate.score > secondBestScore) {
+            secondBestScore = candidate.score;
+        }
+    }
+
+    if (bestScore < 3) {
+        return "";
+    }
+    if (bestScore == secondBestScore) {
+        return "";
+    }
+    return bestTag;
+}
+
+static const char* displayNameForCameraTaskLanguageTag_(const std::string& languageTag)
+{
+    if (languageTag == "pt") return "Portuguese";
+    if (languageTag == "es") return "Spanish";
+    if (languageTag == "fr") return "French";
+    if (languageTag == "ar") return "Arabic";
+    if (languageTag == "zh") return "Chinese";
+    if (languageTag == "en") return "English";
+    return "";
+}
+
+static std::string buildTaskLanguageHintPromptForCamera_(
+    const std::string& promptCore,
+    const std::string& alertConditionText,
+    const std::string& negativeConditionText)
+{
+    const std::string languageTag = detectTaskLanguageTagForCameraPrompt_(
+        promptCore,
+        alertConditionText,
+        negativeConditionText
+    );
+    if (languageTag.empty()) {
+        return "";
+    }
+
+    const char* languageName = displayNameForCameraTaskLanguageTag_(languageTag);
+    if (languageName == nullptr || *languageName == '\0') {
+        return "";
+    }
+
+    std::ostringstream oss;
+    oss << "TASK LANGUAGE HINT (SYSTEM):\n";
+    oss << "- Detected primary language of TASK TEXT: "
+        << languageName << " (" << languageTag << ").\n";
+    oss << "- Write `answer` in " << languageName << ".\n";
+    oss << "- Do not switch languages unless TASK TEXT explicitly asks for translation or quoted output in another language.\n";
+    return oss.str();
+}
+
 static bool jsonBoolLikeCamera_(const nlohmann::json& value, bool fallback = false)
 {
     try {
@@ -878,6 +1177,78 @@ static std::vector<analysisregion::RegionSpec> toSharedRegionSpecsCamera_(
         out.push_back(toSharedRegionSpecCamera_(region));
     }
     return out;
+}
+
+static void appendTemporalZoneAliasCamera_(
+    json& aliases,
+    std::set<std::string>& seenAliases,
+    const std::string& rawValue)
+{
+    const std::string trimmedValue = temporal::trim(rawValue);
+    if (trimmedValue.empty()) return;
+
+    if (seenAliases.insert(trimmedValue).second) {
+        aliases.push_back(trimmedValue);
+    }
+
+    const std::string loweredValue = temporal::lower(trimmedValue);
+    if (!loweredValue.empty() && seenAliases.insert(loweredValue).second) {
+        aliases.push_back(loweredValue);
+    }
+
+    const std::string canonicalValue = temporal::canonicalZoneKey(trimmedValue);
+    if (!canonicalValue.empty() && seenAliases.insert(canonicalValue).second) {
+        aliases.push_back(canonicalValue);
+    }
+}
+
+static json buildTemporalZoneCatalogFromCameraRegions_(
+    const std::vector<AlgorithmConfig::AnalysisRegion>& regions)
+{
+    json out = json::array();
+    std::set<std::string> seenCanonicalKeys;
+    for (const auto& region : regions) {
+        if (region.fullFrame && region.polygonNorm.empty()) continue;
+
+        const std::string regionId = temporal::trim(region.regionId);
+        const std::string label = temporal::trim(region.label);
+        std::string canonicalZoneKey =
+            temporal::canonicalZoneKey(label.empty() ? regionId : label);
+        if (canonicalZoneKey.empty()) {
+            canonicalZoneKey = temporal::canonicalZoneKey(regionId);
+        }
+        if (canonicalZoneKey.empty()) continue;
+        if (!seenCanonicalKeys.insert(canonicalZoneKey).second) continue;
+
+        json aliases = json::array();
+        std::set<std::string> seenAliases;
+        appendTemporalZoneAliasCamera_(aliases, seenAliases, canonicalZoneKey);
+        appendTemporalZoneAliasCamera_(aliases, seenAliases, regionId);
+        appendTemporalZoneAliasCamera_(aliases, seenAliases, label);
+
+        json row = {
+            { "canonical_zone_key", canonicalZoneKey },
+            { "aliases", aliases }
+        };
+        if (!regionId.empty()) row["region_id"] = regionId;
+        if (!label.empty()) row["label"] = label;
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+static void attachTemporalZoneCatalogCamera_(
+    json& planEnvelope,
+    const std::vector<AlgorithmConfig::AnalysisRegion>& regions)
+{
+    if (!planEnvelope.is_object()) return;
+    const json zoneCatalog = buildTemporalZoneCatalogFromCameraRegions_(regions);
+    if (zoneCatalog.is_array() && !zoneCatalog.empty()) {
+        planEnvelope["zone_catalog"] = zoneCatalog;
+    }
+    else if (planEnvelope.contains("zone_catalog")) {
+        planEnvelope.erase("zone_catalog");
+    }
 }
 
 static AlgorithmConfig::AnalysisRegion applySharedRegionSpecToCameraRegion_(
@@ -6237,16 +6608,25 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
     auto promptInputTypeForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
         return algo.inputType.empty() ? std::string("video") : algo.inputType;
     };
+    auto promptLanguageForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
+        return detectTaskLanguageTagForCameraPrompt_(
+            promptCoreForAlgo(algo),
+            algo.alertCondition,
+            algo.negativeCondition
+        );
+    };
     auto promptHashForAlgo = [&](const AlgorithmConfig& algo) -> std::string {
+        const std::string promptLanguage = promptLanguageForAlgo(algo);
         return temporal::computePromptRevisionHash(
             promptCoreForAlgo(algo),
             algo.alertCondition,
             algo.negativeCondition,
             promptInputTypeForAlgo(algo),
-            "pt-BR",
+            promptLanguage,
             true);
     };
     auto payloadPlanMatchesAlgo = [&](const AlgorithmConfig& algo) -> bool {
+        const std::string promptLanguage = promptLanguageForAlgo(algo);
         return temporal::decisionCacheable(algo.temporalPlanEnvelope) &&
                temporal::planMatchesPromptRevision(
                    algo.temporalPlanEnvelope,
@@ -6254,13 +6634,14 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                    algo.alertCondition,
                    algo.negativeCondition,
                    promptInputTypeForAlgo(algo),
-                   "pt-BR",
+                   promptLanguage,
                    true
                );
     };
     auto slotPlanMatchesAlgo = [&](const TemporalRuntimeSlot& slot, const AlgorithmConfig& algo) -> bool {
         if (!temporal::decisionCacheable(slot.planEnvelope)) return false;
         const std::string promptHash = promptHashForAlgo(algo);
+        const std::string promptLanguage = promptLanguageForAlgo(algo);
         return (!slot.promptHash.empty() && slot.promptHash == promptHash) ||
                temporal::planMatchesPromptRevision(
                    slot.planEnvelope,
@@ -6268,7 +6649,7 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                    algo.alertCondition,
                    algo.negativeCondition,
                    promptInputTypeForAlgo(algo),
-                   "pt-BR",
+                   promptLanguage,
                    true
                );
     };
@@ -6278,6 +6659,7 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
             if (!algo.isCustomV2) continue;
 
             const std::string promptCore = promptCoreForAlgo(algo);
+            const std::string promptLanguage = promptLanguageForAlgo(algo);
             if (temporal::trim(promptCore).empty() || temporal::trim(algo.alertCondition).empty()) {
                 continue;
             }
@@ -6300,7 +6682,7 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                     algo.alertCondition,
                     algo.negativeCondition,
                     promptInputTypeForAlgo(algo),
-                    "pt-BR",
+                    promptLanguage,
                     true))
             {
                 envelope = nlohmann::json::object();
@@ -6312,7 +6694,7 @@ void CameraSession::updateAlgorithms(std::vector<AlgorithmConfig> algos)
                 algo.alertCondition,
                 algo.negativeCondition,
                 promptInputTypeForAlgo(algo),
-                "pt-BR",
+                promptLanguage,
                 algo.inferenceModel,
                 algo.modelApiKey,
                 envelope,
@@ -7298,7 +7680,11 @@ void CameraSession::inferenceLoop_() {
                     const std::string nowIsoForInference = temporal::nowIso();
                     const std::string basePromptCore =
                         customAlgo.promptTemplate.empty() ? customAlgo.llmPrompt : customAlgo.promptTemplate;
-                    const std::string temporalLanguage = "pt-BR";
+                    const std::string temporalLanguage = detectTaskLanguageTagForCameraPrompt_(
+                        basePromptCore,
+                        customAlgo.alertCondition,
+                        customAlgo.negativeCondition
+                    );
                     const std::string temporalPromptHash =
                         temporal::computePromptRevisionHash(
                             basePromptCore,
@@ -7308,6 +7694,16 @@ void CameraSession::inferenceLoop_() {
                             temporalLanguage,
                             true);
                     std::string runtimePrompt = basePromptCore;
+                    const std::string taskLanguageHint = buildTaskLanguageHintPromptForCamera_(
+                        basePromptCore,
+                        customAlgo.alertCondition,
+                        customAlgo.negativeCondition
+                    );
+                    if (!taskLanguageHint.empty()) {
+                        runtimePrompt = runtimePrompt.empty()
+                            ? taskLanguageHint
+                            : (taskLanguageHint + "\n\n" + runtimePrompt);
+                    }
                     bool temporalPlanActive = false;
                     bool temporalReport = false;
                     nlohmann::json temporalOperatorResults = nlohmann::json::array();
@@ -7377,6 +7773,9 @@ void CameraSession::inferenceLoop_() {
                                 customAlgo.algorithmId > 0,
                                 config_.id
                             );
+                            attachTemporalZoneCatalogCamera_(
+                                temporalSlot.planEnvelope,
+                                customAlgo.analysisRegions);
                             if (temporal::decisionCacheable(temporalSlot.planEnvelope)) {
                                 temporalSlot.promptHash = temporalPromptHash;
                                 std::lock_guard<std::mutex> lock(temporalMutex_);
@@ -7803,6 +8202,9 @@ void CameraSession::inferenceLoop_() {
                         cameraAgentResultDetails["event_id"] = cameraAgentResultEventId;
                         cameraAgentResultDetails["agent_run_id"] = cameraAgentRunId;
                         cameraAgentResultDetails["agent_label"] = eventDisplayName;
+                        if (!customAlgo.priorityLevel.empty()) {
+                            cameraAgentResultDetails["priority_level"] = customAlgo.priorityLevel;
+                        }
                         cameraAgentResultDetails["algorithm_type"] = customAlgo.type;
                         cameraAgentResultDetails["algo_type"] = customAlgo.type;
                         cameraAgentResultDetails["input_type"] =
@@ -7871,6 +8273,9 @@ void CameraSession::inferenceLoop_() {
                         reportDetails["event_id"] = cameraAgentResultEventId + ":temporal";
                         reportDetails["agent_run_id"] = cameraAgentRunId;
                         reportDetails["agent_label"] = eventDisplayName;
+                        if (!customAlgo.priorityLevel.empty()) {
+                            reportDetails["priority_level"] = customAlgo.priorityLevel;
+                        }
                         reportDetails["input_type"] =
                             customAlgo.inputType.empty() ? std::string("image") : customAlgo.inputType;
                         reportDetails["algorithm_type"] = customAlgo.type;
@@ -8000,6 +8405,9 @@ void CameraSession::inferenceLoop_() {
                         extra["final_alert_condition"] = finalAlert;
                         extra["agent_run_id"] = cameraAgentRunId;
                         extra["agent_label"] = eventDisplayName;
+                        if (!customAlgo.priorityLevel.empty()) {
+                            extra["priority_level"] = customAlgo.priorityLevel;
+                        }
                         extra["answer"] = primaryHit.answer;
                         if (!primaryHit.primaryIdentityCardId.empty()) {
                             extra["primary_identity_card_id"] = primaryHit.primaryIdentityCardId;
@@ -8886,7 +9294,11 @@ void CameraSession::inferenceLoop_() {
                             temporal::decisionAnchorUtc(nowIsoForInference, primarySegment.endTs);
                         const std::string basePromptCore =
                             customAlgo.promptTemplate.empty() ? customAlgo.llmPrompt : customAlgo.promptTemplate;
-                        const std::string temporalLanguage = "pt-BR";
+                        const std::string temporalLanguage = detectTaskLanguageTagForCameraPrompt_(
+                            basePromptCore,
+                            customAlgo.alertCondition,
+                            customAlgo.negativeCondition
+                        );
                         const std::string temporalPromptHash =
                             temporal::computePromptRevisionHash(
                                 basePromptCore,
@@ -8896,6 +9308,16 @@ void CameraSession::inferenceLoop_() {
                                 temporalLanguage,
                                 true);
                         std::string runtimePrompt = basePromptCore;
+                        const std::string taskLanguageHint = buildTaskLanguageHintPromptForCamera_(
+                            basePromptCore,
+                            customAlgo.alertCondition,
+                            customAlgo.negativeCondition
+                        );
+                        if (!taskLanguageHint.empty()) {
+                            runtimePrompt = runtimePrompt.empty()
+                                ? taskLanguageHint
+                                : (taskLanguageHint + "\n\n" + runtimePrompt);
+                        }
                         bool temporalPlanActive = false;
                         bool temporalReport = false;
                         nlohmann::json temporalOperatorResults = nlohmann::json::array();
@@ -9163,6 +9585,9 @@ void CameraSession::inferenceLoop_() {
                                 customAlgo.algorithmId > 0,
                                 config_.id
                             );
+                            attachTemporalZoneCatalogCamera_(
+                                temporalSlot.planEnvelope,
+                                customAlgo.analysisRegions);
                             if (temporal::decisionCacheable(temporalSlot.planEnvelope)) {
                                 temporalSlot.promptHash = temporalPromptHash;
                                 std::lock_guard<std::mutex> lock(temporalMutex_);
@@ -9403,6 +9828,9 @@ void CameraSession::inferenceLoop_() {
                             cameraAgentResultDetails["event_id"] = cameraAgentResultEventId;
                             cameraAgentResultDetails["agent_run_id"] = cameraAgentRunId;
                             cameraAgentResultDetails["agent_label"] = eventDisplayName;
+                            if (!customAlgo.priorityLevel.empty()) {
+                                cameraAgentResultDetails["priority_level"] = customAlgo.priorityLevel;
+                            }
                             cameraAgentResultDetails["algorithm_type"] = customAlgo.type;
                             cameraAgentResultDetails["algo_type"] = customAlgo.type;
                             cameraAgentResultDetails["input_type"] =
@@ -9495,6 +9923,9 @@ void CameraSession::inferenceLoop_() {
                             reportDetails["event_id"] = cameraAgentResultEventId + ":temporal";
                             reportDetails["agent_run_id"] = cameraAgentRunId;
                             reportDetails["agent_label"] = eventDisplayName;
+                            if (!customAlgo.priorityLevel.empty()) {
+                                reportDetails["priority_level"] = customAlgo.priorityLevel;
+                            }
                             reportDetails["algorithm_type"] = customAlgo.type;
                             reportDetails["algo_type"] = customAlgo.type;
                             reportDetails["input_type"] =
@@ -9632,6 +10063,9 @@ void CameraSession::inferenceLoop_() {
                             extra["final_alert_condition"] = finalAlert;
                             extra["agent_run_id"] = cameraAgentRunId;
                             extra["agent_label"] = eventDisplayName;
+                            if (!customAlgo.priorityLevel.empty()) {
+                                extra["priority_level"] = customAlgo.priorityLevel;
+                            }
                             extra["answer"] = primaryHit.answer;
                             if (!primaryHit.primaryIdentityCardId.empty()) {
                                 extra["primary_identity_card_id"] = primaryHit.primaryIdentityCardId;

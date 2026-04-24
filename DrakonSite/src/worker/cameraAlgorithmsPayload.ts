@@ -67,6 +67,7 @@ type CameraCustomInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "l
 type CameraCustomRunEvery = 10 | 60;
 type CameraCustomRunningResolution = 640 | 1024;
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
+type CameraCustomPriorityLevel = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
 
 const FIXED_CAMERA_CUSTOM_INFERENCE_MODEL: CameraCustomInferenceModel = "ultra";
 const DEFAULT_CAMERA_CUSTOM_RUN_EVERY = 60;
@@ -140,6 +141,19 @@ const normalizeCameraAgentInputType = (value: unknown): "video" | "image" => {
   if (typeof value !== "string") return "video";
   const normalized = value.trim().toLowerCase();
   return normalized === "image" ? "image" : "video";
+};
+
+const normalizeCameraAgentPriority = (
+  value: unknown,
+  fallback: CameraCustomPriorityLevel = "MEDIUM"
+): CameraCustomPriorityLevel => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "MEDUIM") return "MEDIUM";
+  if (normalized === "CRITIC" || normalized === "HIGH" || normalized === "MEDIUM" || normalized === "LOW") {
+    return normalized;
+  }
+  return fallback;
 };
 
 const normalizeCameraVideoPackagingMode = (
@@ -890,6 +904,7 @@ export async function buildEnabledAlgorithmsForCamera(
       prompt_template: promptTemplate,
       alert_condition: alertCondition,
       negative_condition: negativeCondition,
+      priority_level: normalizeCameraAgentPriority(row.priority_level),
       analysis_regions: analysisRegions,
       input_type: executionSettings.inputType,
       video_packaging_mode: executionSettings.videoPackagingMode,

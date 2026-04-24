@@ -21,23 +21,27 @@ export default function JobsTabs({
 
   const tabs: Array<{
     id: JobsTabView;
+    index: number;
     label: string;
     onClick: () => void;
     disabled?: boolean;
   }> = [
     {
       id: "list",
-      label: t("jobs.tabListLabel", { defaultValue: "1. Lista de Jobs" }),
+      index: 1,
+      label: t("jobs.jobsList", { defaultValue: "Jobs List" }),
       onClick: onSelectList,
     },
     {
       id: "create",
-      label: t("jobs.tabCreateLabel", { defaultValue: "2. Criar Job" }),
+      index: 2,
+      label: t("jobs.createJob", { defaultValue: "Create Job" }),
       onClick: onSelectCreate,
     },
     {
       id: "steps",
-      label: t("jobs.tabStepsLabel", { defaultValue: "3. Detalhes do Job" }),
+      index: 3,
+      label: t("jobs.jobDetails", { defaultValue: "Job Details" }),
       onClick: onSelectSteps,
       disabled: !stepsEnabled,
     },
@@ -63,7 +67,7 @@ export default function JobsTabs({
             }`}
             aria-pressed={isActive}
           >
-            {tab.label}
+            {tab.index}. {tab.label}
           </button>
         );
       })}

@@ -103,9 +103,7 @@ namespace winrt::DrakonDesktop::implementation
   }
 
   async function tryProvisionResidentRuntime() {
-    if (window.__drakonDesktopPairRuntimeCompleted) {
-      completed = true;
-    }
+    completed = Boolean(window.__drakonDesktopPairRuntimeCompleted);
 
     if (busy || completed || !window.chrome || !window.chrome.webview) {
       return;
@@ -137,6 +135,9 @@ namespace winrt::DrakonDesktop::implementation
       const exeId = cleanSessionValue(payload && payload.exe_id);
       const exeToken = cleanSessionValue(payload && payload.exe_token);
       if (clientId && exeId && exeToken) {
+        // Lock out follow-up provisioning calls before native acknowledgement.
+        completed = true;
+        window.__drakonDesktopPairRuntimeCompleted = true;
         window.chrome.webview.postMessage({
           type: "resident-runtime-session",
           client_id: clientId,
@@ -784,6 +785,13 @@ namespace winrt::DrakonDesktop::implementation
         if (clientId.empty() || exeId.empty() || exeToken.empty())
         {
             AppendBootstrapTrace("site-host: ignored invalid resident runtime session payload");
+            try
+            {
+                sender.ExecuteScriptAsync(L"window.__drakonDesktopPairRuntimeCompleted = false;");
+            }
+            catch (...)
+            {
+            }
             return;
         }
 
@@ -800,6 +808,22 @@ namespace winrt::DrakonDesktop::implementation
             try
             {
                 sender.ExecuteScriptAsync(L"window.__drakonDesktopPairRuntimeCompleted = true;");
+            }
+            catch (...)
+            {
+            }
+        }
+        else
+        {
+            m_pairingCompleted = false;
+            AppendBootstrapTrace("site-host: failed to apply resident runtime session");
+            if (!result.message.empty())
+            {
+                AppendBootstrapTrace(winrt::to_string(result.message));
+            }
+            try
+            {
+                sender.ExecuteScriptAsync(L"window.__drakonDesktopPairRuntimeCompleted = false;");
             }
             catch (...)
             {

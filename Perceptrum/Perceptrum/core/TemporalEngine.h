@@ -105,24 +105,7 @@ inline void appendZoneAliasCandidate(
     }
 }
 
-inline json normalizeZoneCatalog(const json& envelope) {
-    json rawCatalog = json::array();
-    if (envelope.is_object() &&
-        envelope.contains("zone_catalog") &&
-        envelope["zone_catalog"].is_array())
-    {
-        rawCatalog = envelope["zone_catalog"];
-    }
-    else {
-        const json plan = effectivePlan(envelope);
-        if (plan.is_object() &&
-            plan.contains("zone_catalog") &&
-            plan["zone_catalog"].is_array())
-        {
-            rawCatalog = plan["zone_catalog"];
-        }
-    }
-
+inline json normalizeZoneCatalogValue(const json& rawCatalog) {
     json out = json::array();
     if (!rawCatalog.is_array()) return out;
 
@@ -167,6 +150,283 @@ inline json normalizeZoneCatalog(const json& envelope) {
         out.push_back(std::move(row));
     }
     return out;
+}
+
+inline json normalizeZoneCatalog(const json& envelope) {
+    if (envelope.is_object() &&
+        envelope.contains("zone_catalog") &&
+        envelope["zone_catalog"].is_array())
+    {
+        return normalizeZoneCatalogValue(envelope["zone_catalog"]);
+    }
+
+    const json plan = effectivePlan(envelope);
+    if (plan.is_object() &&
+        plan.contains("zone_catalog") &&
+        plan["zone_catalog"].is_array())
+    {
+        return normalizeZoneCatalogValue(plan["zone_catalog"]);
+    }
+
+    return json::array();
+}
+
+inline std::string canonicalZoneKeyFromCatalog(
+    const json& rawZoneCatalog,
+    const std::string& rawZone)
+{
+    const std::string candidate = canonicalZoneKey(rawZone);
+    if (candidate.empty()) return std::string();
+
+    const json zoneCatalog = normalizeZoneCatalogValue(rawZoneCatalog);
+    if (!zoneCatalog.is_array() || zoneCatalog.empty()) return candidate;
+
+    const auto aliasMatches = [&](const std::string& rawAlias) -> bool {
+        return canonicalZoneKey(rawAlias) == candidate;
+    };
+
+    for (const auto& item : zoneCatalog) {
+        if (!item.is_object()) continue;
+        const std::string canonical =
+            canonicalZoneKey(
+                strField(item, "canonical_zone_key", strField(item, "canonicalZoneKey", std::string())));
+        if (canonical.empty()) continue;
+        if (candidate == canonical) return canonical;
+        if (aliasMatches(strField(item, "region_id", strField(item, "regionId", std::string())))) {
+            return canonical;
+        }
+        if (aliasMatches(strField(item, "label", std::string()))) return canonical;
+        if (item.contains("aliases") && item["aliases"].is_array()) {
+            for (const auto& alias : item["aliases"]) {
+                if (!alias.is_string()) continue;
+                if (aliasMatches(alias.get<std::string>())) return canonical;
+            }
+        }
+    }
+
+    return candidate;
+}
+
+inline std::string canonicalZoneKeyForPlan(const json& plan, const std::string& rawZone) {
+    if (!plan.is_object() ||
+        !plan.contains("zone_catalog") ||
+        !plan["zone_catalog"].is_array())
+    {
+        return canonicalZoneKey(rawZone);
+    }
+    return canonicalZoneKeyFromCatalog(plan["zone_catalog"], rawZone);
+}
+
+inline void registerEventZoneBindingCandidateForPlan(
+    const json& plan,
+    std::unordered_map<std::string, std::string>& bindings,
+    std::unordered_set<std::string>& conflicts,
+    const std::string& rawEvent,
+    const std::string& rawZone)
+{
+    const std::string eventName = lower(trim(normalizeEventName(rawEvent)));
+    const std::string zone = canonicalZoneKeyForPlan(plan, rawZone);
+    if (eventName.empty() || zone.empty()) return;
+    if (conflicts.find(eventName) != conflicts.end()) return;
+
+    auto it = bindings.find(eventName);
+    if (it == bindings.end()) {
+        bindings.emplace(eventName, zone);
+        return;
+    }
+
+    if (it->second != zone) {
+        bindings.erase(it);
+        conflicts.insert(eventName);
+    }
+}
+
+inline json normalizeEventZoneBindingsForPlan(const json& plan) {
+    json out = json::object();
+    if (!plan.is_object()) return out;
+
+    std::unordered_map<std::string, std::string> bindings;
+    std::unordered_set<std::string> conflicts;
+
+    if (plan.contains("event_zone_bindings") && plan["event_zone_bindings"].is_object()) {
+        for (auto it = plan["event_zone_bindings"].begin(); it != plan["event_zone_bindings"].end(); ++it) {
+            std::string zone;
+            if (it.value().is_string()) {
+                zone = it.value().get<std::string>();
+            } else if (it.value().is_object()) {
+                zone = extractZoneField(it.value());
+            }
+            registerEventZoneBindingCandidateForPlan(plan, bindings, conflicts, it.key(), zone);
+        }
+    }
+
+    if (plan.contains("operators") && plan["operators"].is_array()) {
+        for (const auto& op : plan["operators"]) {
+            if (!op.is_object()) continue;
+            const json params = op.value("params", json::object());
+            if (!params.is_object()) continue;
+
+            registerEventZoneBindingCandidateForPlan(
+                plan,
+                bindings,
+                conflicts,
+                strField(params, "event", std::string()),
+                extractZoneField(params));
+
+            const json source = params.value("source", json::object());
+            if (source.is_object()) {
+                registerEventZoneBindingCandidateForPlan(
+                    plan,
+                    bindings,
+                    conflicts,
+                    strField(source, "event", std::string()),
+                    extractZoneField(source));
+            }
+        }
+    }
+
+    if (plan.contains("runtime_variables") && plan["runtime_variables"].is_array()) {
+        for (const auto& rv : plan["runtime_variables"]) {
+            if (!rv.is_object()) continue;
+            const json params = rv.value("compute_params", json::object());
+            if (!params.is_object()) continue;
+            registerEventZoneBindingCandidateForPlan(
+                plan,
+                bindings,
+                conflicts,
+                strField(params, "event", std::string()),
+                extractZoneField(params));
+        }
+    }
+
+    for (const auto& entry : bindings) {
+        out[entry.first] = json{
+            { "zone", entry.second },
+            { "zone_required", true }
+        };
+    }
+
+    return out;
+}
+
+inline std::string eventBoundZoneForPlan(const json& plan, const std::string& rawEvent) {
+    if (!plan.is_object() ||
+        !plan.contains("event_zone_bindings") ||
+        !plan["event_zone_bindings"].is_object())
+    {
+        return std::string();
+    }
+
+    const std::string eventName = lower(trim(normalizeEventName(rawEvent)));
+    if (eventName.empty() || !plan["event_zone_bindings"].contains(eventName)) {
+        return std::string();
+    }
+
+    const json& binding = plan["event_zone_bindings"][eventName];
+    if (binding.is_string()) {
+        return canonicalZoneKeyForPlan(plan, binding.get<std::string>());
+    }
+    if (!binding.is_object()) return std::string();
+    return canonicalZoneKeyForPlan(plan, extractZoneField(binding));
+}
+
+inline bool hasZonedEventContext(const json& plan) {
+    if (!plan.is_object()) return false;
+    if (plan.contains("zone_catalog") &&
+        plan["zone_catalog"].is_array() &&
+        !plan["zone_catalog"].empty())
+    {
+        return true;
+    }
+    return plan.contains("event_zone_bindings") &&
+           plan["event_zone_bindings"].is_object() &&
+           !plan["event_zone_bindings"].empty();
+}
+
+struct ResolvedEventZone {
+    std::string zone;
+    bool hasExplicitZone = false;
+    bool usedEventBinding = false;
+    bool conflict = false;
+    bool zoneRequired = false;
+};
+
+inline std::string normalizeNodeEventNameForZoneBinding(
+    const json& node,
+    const std::string& fallbackEvent = std::string())
+{
+    std::string eventName =
+        trim(strField(
+            node,
+            "event",
+            strField(
+                node,
+                "event_type",
+                strField(node, "type", fallbackEvent))));
+    if (eventName.empty() &&
+        node.is_object() &&
+        node.contains("event/type") &&
+        node["event/type"].is_string())
+    {
+        eventName = trim(node["event/type"].get<std::string>());
+    }
+    return lower(trim(normalizeEventName(eventName)));
+}
+
+inline ResolvedEventZone resolveEffectiveEventZone(
+    const json& plan,
+    const std::string& rawEvent,
+    const std::string& rawExplicitZone)
+{
+    ResolvedEventZone resolved;
+    resolved.zoneRequired = hasZonedEventContext(plan);
+
+    const std::string explicitZone = canonicalZoneKeyForPlan(plan, rawExplicitZone);
+    const std::string boundZone = eventBoundZoneForPlan(plan, rawEvent);
+
+    if (!explicitZone.empty()) {
+        resolved.zone = explicitZone;
+        resolved.hasExplicitZone = true;
+    }
+
+    if (!boundZone.empty()) {
+        if (!resolved.zone.empty() && resolved.zone != boundZone) {
+            resolved.conflict = true;
+            resolved.zone.clear();
+            return resolved;
+        }
+        if (resolved.zone.empty()) {
+            resolved.zone = boundZone;
+            resolved.usedEventBinding = true;
+        }
+    }
+
+    return resolved;
+}
+
+inline ResolvedEventZone resolveEffectiveEventZoneForNode(
+    const json& plan,
+    const json& node,
+    const std::string& fallbackZone = std::string(),
+    const std::string& fallbackEvent = std::string())
+{
+    return resolveEffectiveEventZone(
+        plan,
+        normalizeNodeEventNameForZoneBinding(node, fallbackEvent),
+        extractZoneField(node, fallbackZone));
+}
+
+inline bool eventZoneMatchesPlanFilter(
+    const json& plan,
+    const json& node,
+    const std::string& rawExpectedZone)
+{
+    const ResolvedEventZone resolved = resolveEffectiveEventZoneForNode(plan, node);
+    if (resolved.conflict) return false;
+    if (resolved.zoneRequired && resolved.zone.empty()) return false;
+    const std::string expectedZone = canonicalZoneKeyForPlan(plan, rawExpectedZone);
+    if (expectedZone.empty()) return true;
+    return resolved.zone == expectedZone;
 }
 
 inline bool replaceWholeToken(std::string& text,
@@ -2719,6 +2979,21 @@ inline json effectivePlan(const json& envelope) {
     json plan = extractPlan(envelope);
     if (!plan.is_object()) return plan;
 
+    json normalizedZoneCatalog = json::array();
+    if (envelope.is_object() &&
+        envelope.contains("zone_catalog") &&
+        envelope["zone_catalog"].is_array())
+    {
+        normalizedZoneCatalog = normalizeZoneCatalogValue(envelope["zone_catalog"]);
+    } else if (plan.contains("zone_catalog") && plan["zone_catalog"].is_array()) {
+        normalizedZoneCatalog = normalizeZoneCatalogValue(plan["zone_catalog"]);
+    }
+    if (normalizedZoneCatalog.is_array() && !normalizedZoneCatalog.empty()) {
+        plan["zone_catalog"] = normalizedZoneCatalog;
+    } else if (plan.contains("zone_catalog")) {
+        plan.erase("zone_catalog");
+    }
+
     normalizeEventCatalog(plan);
     normalizeOperators(plan);
 
@@ -2816,6 +3091,28 @@ inline json effectivePlan(const json& envelope) {
                     params["event"] = "entered_zone";
                 }
                 rv["compute_params"] = params;
+            }
+        }
+    }
+
+    const json eventZoneBindings = normalizeEventZoneBindingsForPlan(plan);
+    if (eventZoneBindings.is_object() && !eventZoneBindings.empty()) {
+        plan["event_zone_bindings"] = eventZoneBindings;
+    } else if (plan.contains("event_zone_bindings")) {
+        plan.erase("event_zone_bindings");
+    }
+
+    if (plan.contains("runtime_variables") && plan["runtime_variables"].is_array()) {
+        for (auto& rv : plan["runtime_variables"]) {
+            if (!rv.is_object()) continue;
+            json params = rv.value("compute_params", json::object());
+            if (!params.is_object()) continue;
+            if (!trim(strField(params, "event")).empty() && extractZoneField(params).empty()) {
+                const std::string boundZone = eventBoundZoneForPlan(plan, strField(params, "event"));
+                if (!boundZone.empty()) {
+                    params["zone"] = boundZone;
+                    rv["compute_params"] = params;
+                }
             }
         }
     }
@@ -3409,6 +3706,26 @@ inline bool validatePlanEnvelope(const json& envelope, std::string* outReason = 
         const std::string eventName = trim(ev.get<std::string>());
         if (eventName.empty()) return fail("event_catalog_item_empty");
         events.insert(eventName);
+    }
+
+    if (plan.contains("event_zone_bindings")) {
+        if (!plan["event_zone_bindings"].is_object()) return fail("event_zone_bindings_invalid");
+        for (auto it = plan["event_zone_bindings"].begin(); it != plan["event_zone_bindings"].end(); ++it) {
+            const std::string eventName = trim(normalizeEventName(it.key()));
+            if (eventName.empty()) return fail("event_zone_binding_event_invalid");
+            if (events.find(eventName) == events.end()) return fail("event_zone_binding_event_missing");
+
+            std::string zone;
+            if (it.value().is_string()) {
+                zone = trim(it.value().get<std::string>());
+            } else if (it.value().is_object()) {
+                zone = extractZoneField(it.value());
+            } else {
+                return fail("event_zone_binding_value_invalid");
+            }
+
+            if (zone.empty()) return fail("event_zone_binding_zone_missing");
+        }
     }
 
     for (const auto& op : plan["operators"]) {
@@ -5357,7 +5674,8 @@ inline long long countDistinctEventEntities(
     const std::string& nowIsoUtc,
     int windowSeconds,
     const std::string& entityFilter = std::string(),
-    const std::string& zoneFilter = std::string())
+    const std::string& zoneFilter = std::string(),
+    const json& plan = json::object())
 {
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
 
@@ -5368,7 +5686,7 @@ inline long long countDistinctEventEntities(
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), nowIsoUtc) > windowSeconds) continue;
         const std::string entityToken = eventEntityToken(item);
         if (entityToken.empty()) continue;
@@ -5383,7 +5701,8 @@ inline long long countLoggedEventsBetween(
     const std::string& startIsoUtc,
     const std::string& endIsoUtc,
     const std::string& entityFilter = std::string(),
-    const std::string& zoneFilter = std::string())
+    const std::string& zoneFilter = std::string(),
+    const json& plan = json::object())
 {
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
     const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
@@ -5393,7 +5712,7 @@ inline long long countLoggedEventsBetween(
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc)) continue;
         ++count;
     }
@@ -5406,7 +5725,8 @@ inline long long countDistinctLoggedEventEntitiesBetween(
     const std::string& startIsoUtc,
     const std::string& endIsoUtc,
     const std::string& entityFilter = std::string(),
-    const std::string& zoneFilter = std::string())
+    const std::string& zoneFilter = std::string(),
+    const json& plan = json::object())
 {
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
     const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
@@ -5416,7 +5736,7 @@ inline long long countDistinctLoggedEventEntitiesBetween(
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc)) continue;
         const std::string entityToken = eventEntityToken(item);
         if (entityToken.empty()) continue;
@@ -5474,7 +5794,8 @@ inline json collectLoggedEventDocsBetween(
     const std::string& endIsoUtc,
     const std::string& entityFilter = std::string(),
     const std::string& zoneFilter = std::string(),
-    int maxItems = 20)
+    int maxItems = 20,
+    const json& plan = json::object())
 {
     json docs = json::array();
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return docs;
@@ -5486,7 +5807,10 @@ inline json collectLoggedEventDocsBetween(
         if (eventRepresentsSyntheticAbsence(st, *it)) continue;
         if (!eventName.empty() && lower(trim(strField(*it, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, *it, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(*it), zoneFilter)) continue;
+        const ResolvedEventZone resolvedZone = resolveEffectiveEventZoneForNode(plan, *it);
+        if (resolvedZone.conflict) continue;
+        if (resolvedZone.zoneRequired && resolvedZone.zone.empty()) continue;
+        if (!zoneMatchesFilter(resolvedZone.zone, canonicalZoneKeyForPlan(plan, zoneFilter))) continue;
 
         std::string normalizedTs;
         if (!normalizeTsBetweenInclusive(strField(*it, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
@@ -5494,6 +5818,11 @@ inline json collectLoggedEventDocsBetween(
         json doc = makePromptEventDoc(*it);
         if (!doc.is_object() || doc.empty()) continue;
         doc["ts_utc"] = normalizedTs;
+        if (!resolvedZone.zone.empty()) {
+            doc["zone"] = resolvedZone.zone;
+        } else if (doc.contains("zone")) {
+            doc.erase("zone");
+        }
 
         const std::string identityKey = promptEventDocIdentityKey(doc);
         if (identityKey.empty() || !seenIdentityKeys.insert(identityKey).second) continue;
@@ -5512,7 +5841,8 @@ inline std::string earliestLoggedEventTsBetween(
     const std::string& startIsoUtc,
     const std::string& endIsoUtc,
     const std::string& entityFilter = std::string(),
-    const std::string& zoneFilter = std::string())
+    const std::string& zoneFilter = std::string(),
+    const json& plan = json::object())
 {
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return std::string();
     const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
@@ -5522,7 +5852,7 @@ inline std::string earliestLoggedEventTsBetween(
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         std::string normalizedTs;
         if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
         if (earliest.empty() || normalizedTs < earliest) earliest = normalizedTs;
@@ -5536,7 +5866,8 @@ inline std::string latestLoggedEventTsBetween(
     const std::string& startIsoUtc,
     const std::string& endIsoUtc,
     const std::string& entityFilter = std::string(),
-    const std::string& zoneFilter = std::string())
+    const std::string& zoneFilter = std::string(),
+    const json& plan = json::object())
 {
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return std::string();
     const std::string eventName = lower(trim(normalizeEventName(rawEventName)));
@@ -5546,7 +5877,7 @@ inline std::string latestLoggedEventTsBetween(
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!eventName.empty() && lower(trim(strField(item, "event"))) != eventName) continue;
         if (!eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         std::string normalizedTs;
         if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startIsoUtc, endIsoUtc, &normalizedTs)) continue;
         if (latest.empty() || normalizedTs > latest) latest = normalizedTs;
@@ -6459,39 +6790,57 @@ inline void applyRound(json& st,
                                          const std::string& tsRaw,
                                          const std::string& zoneRaw,
                                          const json& evidenceRef,
-                                         bool preferObservationsForUntimedEvent) -> bool {
+                                         bool preferObservationsForUntimedEvent,
+                                         std::string* outEffectiveZone = nullptr,
+                                         std::string* outRejectReason = nullptr) -> bool {
+        auto reject = [&](const std::string& reason) -> bool {
+            if (outRejectReason != nullptr) *outRejectReason = reason;
+            return false;
+        };
+
         const std::string entityId = trim(entityIdRaw);
-        if (entityId.empty()) return false;
+        if (entityId.empty()) return reject("rejected_missing_entity");
         const std::string eventName = trim(normalizeEventName(eventRaw));
-        if (eventName.empty()) return false;
-        if (!isAllowedStateEvent(eventName)) return false;
+        if (eventName.empty()) return reject("rejected_missing_event");
+        if (!isAllowedStateEvent(eventName)) return reject("rejected_not_in_catalog");
 
         const bool isPresenceEvent = isPresentEventName(eventName);
         const bool hasDirectAnchor =
             !trim(tsRaw).empty() ||
             (evidenceRef.is_object() && nodeHasDirectTemporalAnchor(evidenceRef));
-        if (!isPresenceEvent && !hasDirectAnchor) return false;
+        if (!isPresenceEvent && !hasDirectAnchor) return reject("rejected_missing_timestamp");
 
         if (preferObservationsForUntimedEvent && trim(tsRaw).empty()) {
             const std::string idKey = makeObservationHintKey(entityId, eventName);
             const std::string hintKey = makeObservationHintKey(entityHintRaw, eventName);
             if ((!idKey.empty() && observationEventHints.find(idKey) != observationEventHints.end()) ||
                 (!hintKey.empty() && observationEventHints.find(hintKey) != observationEventHints.end())) {
-                return false;
+                return reject("rejected_prefer_observation_path");
             }
         }
 
-        const std::string zone = trim(zoneRaw);
+        const ResolvedEventZone resolvedZone = resolveEffectiveEventZone(plan, eventName, zoneRaw);
+        if (resolvedZone.conflict) {
+            return reject("rejected_zone_binding_conflict");
+        }
+        if (resolvedZone.zoneRequired && resolvedZone.zone.empty()) {
+            return reject("rejected_missing_zone");
+        }
+
+        const std::string zone = resolvedZone.zone;
         const std::string acceptedTs = normalizeAcceptedEventTs(tsRaw, defaultRoundEventTs);
-        if (acceptedTs.empty()) return false;
+        if (acceptedTs.empty()) return reject("rejected_missing_timestamp");
 
         const std::string dedupeKey =
             lower(entityId) + "|" +
             lower(eventName) + "|" +
             lower(zone) + "|" +
             acceptedTs;
-        if (!roundAppendedEventKeys.insert(dedupeKey).second) return false;
+        if (!roundAppendedEventKeys.insert(dedupeKey).second) {
+            return reject("rejected_duplicate_round_event");
+        }
 
+        if (outEffectiveZone != nullptr) *outEffectiveZone = zone;
         appendEvent(st, eventName, entityId, acceptedTs, zone, evidenceRef);
         markRoundEvent(entityId, eventName, acceptedTs);
         return true;
@@ -6783,21 +7132,25 @@ inline void applyRound(json& st,
         if (acceptedTs.empty()) return std::string();
 
         const std::string normalizedEvent = trim(normalizeEventName(eventRaw));
-        const std::string zone = trim(zoneRaw);
+        std::string effectiveZone = trim(zoneRaw);
         const std::string dedupeHint = trim(entityHintRaw).empty() ? entityId : trim(entityHintRaw);
         if (!normalizedEvent.empty() && isAllowedStateEvent(normalizedEvent)) {
-            appendValidatedRoundEvent(
+            if (!appendValidatedRoundEvent(
                 entityId,
                 dedupeHint,
                 normalizedEvent,
                 acceptedTs,
-                zone,
+                zoneRaw,
                 evidenceRef,
-                false);
+                false,
+                &effectiveZone))
+            {
+                return std::string();
+            }
         }
 
         applyEntityStateMetadata(entityId, entityHintRaw, entityTypeRaw, evidenceRef, acceptedTs);
-        markEntityAbsent(st, entityId, acceptedTs, zone);
+        markEntityAbsent(st, entityId, acceptedTs, effectiveZone);
         roundTouchedEntityIds.insert(entityId);
         return entityId;
     };
@@ -6865,6 +7218,8 @@ inline void applyRound(json& st,
             evidenceRef["timestamp_name"] = trim(candidate.timestampName);
         }
 
+        std::string effectiveZone;
+        std::string appendRejectReason;
         const bool appended = appendValidatedRoundEvent(
             resolvedEntityId,
             entityToken,
@@ -6872,12 +7227,14 @@ inline void applyRound(json& st,
             acceptedTs,
             trim(candidate.zone),
             evidenceRef,
-            false);
+            false,
+            &effectiveZone,
+            &appendRejectReason);
         if (!appended) {
             recordLastRoundCandidateDecision(
                 st,
                 candidate,
-                "rejected_duplicate_evidence_key",
+                appendRejectReason.empty() ? "rejected_event_validation" : appendRejectReason,
                 resolvedEntityId,
                 acceptedTs);
             continue;
@@ -6886,10 +7243,10 @@ inline void applyRound(json& st,
         if (!evidenceKey.empty()) roundAcceptedCandidateEvidenceKeys.insert(evidenceKey);
         if (absenceEvent) {
             applyEntityStateMetadata(resolvedEntityId, entityToken, std::string(), evidenceRef, acceptedTs);
-            markEntityAbsent(st, resolvedEntityId, acceptedTs, trim(candidate.zone));
+            markEntityAbsent(st, resolvedEntityId, acceptedTs, effectiveZone);
             roundTouchedEntityIds.insert(resolvedEntityId);
         } else {
-            touchEntity(st, resolvedEntityId, acceptedTs, trim(candidate.zone), json::array(), forgetEntityMissingForSeconds);
+            touchEntity(st, resolvedEntityId, acceptedTs, effectiveZone, json::array(), forgetEntityMissingForSeconds);
             applyEntityStateMetadata(resolvedEntityId, entityToken, std::string(), evidenceRef, acceptedTs);
             roundTouchedEntityIds.insert(resolvedEntityId);
             roundPositiveEntityIds.insert(resolvedEntityId);
@@ -6919,6 +7276,7 @@ inline void applyRound(json& st,
         const std::string acceptedTs = normalizeAcceptedEventTs(tsRaw, defaultRoundEventTs);
         if (acceptedTs.empty()) return;
 
+        std::string effectiveZone;
         if (!appendValidatedRoundEvent(
                 entityId,
                 entityHintRaw,
@@ -6926,17 +7284,18 @@ inline void applyRound(json& st,
                 acceptedTs,
                 zone,
                 json::object(),
-                false))
+                false,
+                &effectiveZone))
         {
             return;
         }
-        touchEntity(st, entityId, acceptedTs, zone, json::array(), forgetEntityMissingForSeconds);
+        touchEntity(st, entityId, acceptedTs, effectiveZone, json::array(), forgetEntityMissingForSeconds);
         roundTouchedEntityIds.insert(entityId);
         roundPositiveEntityIds.insert(entityId);
         json pseudoPatch = json::object();
         pseudoPatch["entity_id"] = entityId;
         if (!description.empty()) pseudoPatch["description"] = description;
-        upsertIdentityMemory(st, entityId, pseudoPatch, acceptedTs, zone);
+        upsertIdentityMemory(st, entityId, pseudoPatch, acceptedTs, effectiveZone);
     };
 
     if (identityPatch.is_array()) {
@@ -7249,6 +7608,7 @@ inline void applyRound(json& st,
                 continue;
             }
             const std::string entityHintToken = observationEntityHint.empty() ? entityId : observationEntityHint;
+            std::string effectiveZone;
             if (!appendValidatedRoundEvent(
                     entityId,
                     entityHintToken,
@@ -7256,11 +7616,12 @@ inline void applyRound(json& st,
                     ts,
                     zone,
                     observationEvidenceRef,
-                    false))
+                    false,
+                    &effectiveZone))
             {
                 continue;
             }
-            touchEntity(st, entityId, acceptedTs, zone, observationTraits, forgetEntityMissingForSeconds);
+            touchEntity(st, entityId, acceptedTs, effectiveZone, observationTraits, forgetEntityMissingForSeconds);
             applyEntityStateMetadata(entityId, observationEntityHint, observationEntityType, observationEvidenceRef, acceptedTs);
             roundTouchedEntityIds.insert(entityId);
             roundPositiveEntityIds.insert(entityId);
@@ -7272,7 +7633,7 @@ inline void applyRound(json& st,
                 trim(strField(o, "description", strField(o, "note", strField(o, "entity_description", strField(o, "person_description")))));
             if (!description.empty()) pseudoPatch["description"] = description;
             if (observationTraits.is_array() && !observationTraits.empty()) pseudoPatch["updated_traits"] = observationTraits;
-            upsertIdentityMemory(st, entityId, pseudoPatch, acceptedTs, zone);
+            upsertIdentityMemory(st, entityId, pseudoPatch, acceptedTs, effectiveZone);
         }
     }
 
@@ -7428,15 +7789,16 @@ inline void applyRound(json& st,
             if (windowSeconds > 0) {
                 return countPresentEntitiesInState(st, nowTs, windowSeconds, entityIdExact, zoneFilter);
             }
-            return countDistinctEventEntities(st, eventName, nowTs, 0, entityIdExact, zoneFilter);
+            return countDistinctEventEntities(st, eventName, nowTs, 0, entityIdExact, zoneFilter, plan);
         }
         long long count = 0;
         const std::string ev = lower(trim(eventName));
         for (const auto& item : st["events"]) {
             if (!item.is_object()) continue;
+            if (eventRepresentsSyntheticAbsence(st, item)) continue;
             if (!ev.empty() && lower(trim(strField(item, "event"))) != ev) continue;
             if (!entityIdExact.empty() && trim(strField(item, "entity_id")) != entityIdExact) continue;
-            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), nowTs) > windowSeconds) continue;
             ++count;
         }
@@ -7453,9 +7815,10 @@ inline void applyRound(json& st,
         std::string latest;
         for (const auto& item : st["events"]) {
             if (!item.is_object()) continue;
+            if (eventRepresentsSyntheticAbsence(st, item)) continue;
             if (!ev.empty() && lower(trim(strField(item, "event"))) != ev) continue;
             if (!entityIdExact.empty() && trim(strField(item, "entity_id")) != entityIdExact) continue;
-            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             const std::string ts = strField(item, "ts_utc");
             if (ts.empty()) continue;
             if (latest.empty() || ts > latest) latest = ts;
@@ -7472,9 +7835,10 @@ inline void applyRound(json& st,
         const std::string ev = lower(trim(eventName));
         for (auto it = st["events"].rbegin(); it != st["events"].rend(); ++it) {
             if (!it->is_object()) continue;
+            if (eventRepresentsSyntheticAbsence(st, *it)) continue;
             if (!ev.empty() && lower(trim(strField(*it, "event"))) != ev) continue;
             if (!entityIdExact.empty() && trim(strField(*it, "entity_id")) != entityIdExact) continue;
-            if (!zoneMatchesFilter(extractZoneField(*it), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, *it, zoneFilter)) continue;
             if (windowSeconds > 0 && ageSeconds(strField(*it, "ts_utc"), nowTs) > windowSeconds) continue;
             arr.push_back(*it);
             if (maxItems > 0 && static_cast<int>(arr.size()) >= maxItems) break;
@@ -7785,7 +8149,7 @@ inline json buildConfirmedRefs(const json& envelope,
             if (eventRepresentsSyntheticAbsence(st, item)) continue;
             if (!normalizedEvent.empty() && lower(trim(strField(item, "event"))) != normalizedEvent) continue;
             if (!targetEntity.empty() && trim(strField(item, "entity_id")) != targetEntity) continue;
-            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             if (!normalizeTsBetweenInclusive(strField(item, "ts_utc"), startTs, endTs)) continue;
             ++count;
         }
@@ -7800,7 +8164,7 @@ inline json buildConfirmedRefs(const json& envelope,
             if (windowSeconds > 0) {
                 return countPresentEntitiesInState(st, cutoffTs, windowSeconds, entityFilter, zoneFilter);
             }
-            return countDistinctEventEntities(st, eventName, cutoffTs, 0, entityFilter, zoneFilter);
+            return countDistinctEventEntities(st, eventName, cutoffTs, 0, entityFilter, zoneFilter, plan);
         }
         if (!st.contains("events") || !st["events"].is_array()) return 0;
         const std::string normalizedEvent = lower(trim(normalizeEventName(eventName)));
@@ -7810,7 +8174,7 @@ inline json buildConfirmedRefs(const json& envelope,
             if (eventRepresentsSyntheticAbsence(st, item)) continue;
             if (!normalizedEvent.empty() && lower(trim(strField(item, "event"))) != normalizedEvent) continue;
             if (!trim(entityFilter).empty() && !eventMatchesFilter(st, item, entityFilter)) continue;
-            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), cutoffTs) > windowSeconds) continue;
             ++count;
         }
@@ -8015,7 +8379,7 @@ inline json buildConfirmedRefs(const json& envelope,
                     }
                 } else if (anchorMode == "first_matching_event") {
                     analysisAnchorTs =
-                        earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), entityFilter, zoneFilter);
+                        earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), entityFilter, zoneFilter, plan);
                     if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
                         firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
                     }
@@ -8051,26 +8415,26 @@ inline json buildConfirmedRefs(const json& envelope,
 
             json value = nullptr;
             if (analysisKind == "count_occurrences") {
-                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
             } else if (analysisKind == "count_distinct_entities") {
-                value = countDistinctLoggedEventEntitiesBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                value = countDistinctLoggedEventEntitiesBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
             } else if (analysisKind == "has_any_event") {
-                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter) > 0;
+                value = countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan) > 0;
             } else if (analysisKind == "last_event_age_seconds") {
                 const std::string latestTs =
-                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
                 value = latestTs.empty() ? json(nullptr) : json(std::max(0LL, ageSeconds(latestTs, windowEndTs)));
             } else if (analysisKind == "first_event_ts") {
                 const std::string firstTs =
-                    earliestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                    earliestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
                 value = firstTs.empty() ? json(nullptr) : json(firstTs);
             } else if (analysisKind == "last_event_ts") {
                 const std::string lastTs =
-                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                    latestLoggedEventTsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
                 value = lastTs.empty() ? json(nullptr) : json(lastTs);
             } else if (analysisKind == "event_rate") {
                 const long long count =
-                    countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter);
+                    countLoggedEventsBetween(st, eventName, windowStartTs, windowEndTs, entityFilter, zoneFilter, plan);
                 const long long seconds = (std::max)(1LL, ageSeconds(windowStartTs, windowEndTs));
                 value = static_cast<double>(count) / static_cast<double>(seconds);
             } else if (analysisKind == "window_buffer") {
@@ -8081,7 +8445,8 @@ inline json buildConfirmedRefs(const json& envelope,
                     windowEndTs,
                     entityFilter,
                     zoneFilter,
-                    20);
+                    20,
+                    plan);
             } else {
                 continue;
             }
@@ -8183,6 +8548,7 @@ inline json buildInferenceStaticContext(const json& envelope) {
         }},
         { "entities_contract", plan.value("entities", json::array()) },
         { "event_catalog", plan.value("event_catalog", json::array()) },
+        { "event_zone_bindings", plan.value("event_zone_bindings", json::object()) },
         { "identity_policy", plan.value("identity_policy", json::object()) },
         { "runtime_variable_contract", buildRuntimeVariableContract(envelope) },
         { "state_semantics", {
@@ -8199,7 +8565,10 @@ inline json buildInferenceStaticContext(const json& envelope) {
             { "unknown_reasons", json::array() }
         }}
     };
-    const json zoneCatalog = normalizeZoneCatalog(envelope);
+    const json zoneCatalog =
+        plan.contains("zone_catalog") && plan["zone_catalog"].is_array()
+            ? plan["zone_catalog"]
+            : json::array();
     if (zoneCatalog.is_array() && !zoneCatalog.empty()) {
         out["zone_catalog"] = zoneCatalog;
     }
@@ -8313,6 +8682,7 @@ inline void splitInferenceInputForPrompt(const json& runtimeInput, json& staticC
         "plan_ref",
         "entities_contract",
         "event_catalog",
+        "event_zone_bindings",
         "identity_policy",
         "zone_catalog",
         "runtime_variable_contract",
@@ -8383,6 +8753,8 @@ inline std::string runtimePromptAppendix(const json& runtimeInput) {
         << "- For stills or when no exact frame reference is available, use event, ts_utc, and zone.\n"
         << "- When providing zone information in identity_patch or observations, use zone as the canonical field name instead of zone_id, zone_key, region, region_id, or region_key.\n"
         << "- If TEMPORAL_STATIC_CONTEXT_JSON contains zone_catalog, any emitted zone must use one of zone_catalog[*].canonical_zone_key exactly; do not emit the human label instead.\n"
+        << "- If TEMPORAL_STATIC_CONTEXT_JSON contains zone_catalog or event_zone_bindings, every emitted event update must include zone.\n"
+        << "- If event_zone_bindings defines a zone for an event, emitted zone must match that binding exactly; if uncertain, omit the event update instead of emitting it without zone.\n"
         << "- When the scenario is about entering/leaving places, use entered_zone and left_zone from event_catalog instead of only generic present.\n"
         << "- Do not infer entered_zone just because the entity is already visible in the first frame of the batch; only use entered_zone when the entry is actually visible.\n"
         << "- If an entity leaves and later re-enters in the same batch, emit both events in chronological order.\n"
@@ -8612,12 +8984,13 @@ inline long long countEvents(const json& st,
                              const std::string& nowIsoUtc,
                              int windowSeconds,
                              const std::string& entityFilter = std::string(),
-                             const std::string& zoneFilter = std::string()) {
+                             const std::string& zoneFilter = std::string(),
+                             const json& plan = json::object()) {
     if (isPresentEventName(eventName)) {
         if (windowSeconds > 0) {
             return countPresentEntitiesInState(st, nowIsoUtc, windowSeconds, entityFilter, zoneFilter);
         }
-        return countDistinctEventEntities(st, eventName, nowIsoUtc, 0, entityFilter, zoneFilter);
+        return countDistinctEventEntities(st, eventName, nowIsoUtc, 0, entityFilter, zoneFilter, plan);
     }
     if (!st.is_object() || !st.contains("events") || !st["events"].is_array()) return 0;
     const std::string ev = lower(trim(eventName));
@@ -8627,7 +9000,7 @@ inline long long countEvents(const json& st,
         if (eventRepresentsSyntheticAbsence(st, item)) continue;
         if (!ev.empty() && lower(trim(strField(item, "event"))) != ev) continue;
         if (!trim(entityFilter).empty() && !eventMatchesFilter(st, item, entityFilter)) continue;
-        if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+        if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
         if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), nowIsoUtc) > windowSeconds) continue;
         ++n;
     }
@@ -8685,7 +9058,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (windowSeconds > 0) {
                 return countPresentEntitiesInState(st, nowIsoUtc, windowSeconds, entityId, zoneFilter);
             }
-            return countDistinctEventEntities(st, eventName, nowIsoUtc, 0, entityId, zoneFilter);
+            return countDistinctEventEntities(st, eventName, nowIsoUtc, 0, entityId, zoneFilter, plan);
         }
         long long n = 0;
         const std::string ev = lower(trim(eventName));
@@ -8695,7 +9068,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (eventRepresentsSyntheticAbsence(st, item)) continue;
             if (!ev.empty() && lower(trim(strField(item, "event"))) != ev) continue;
             if (!targetEntity.empty() && !eventMatchesFilter(st, item, targetEntity)) continue;
-            if (!zoneMatchesFilter(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             if (windowSeconds > 0 && ageSeconds(strField(item, "ts_utc"), nowIsoUtc) > windowSeconds) continue;
             ++n;
         }
@@ -8773,7 +9146,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (!item.is_object()) continue;
             if (trim(strField(item, "entity_id")) != targetEntity) continue;
             if (lower(trim(strField(item, "event"))) != eventName) continue;
-            if (!zoneMatches(extractZoneField(item), zoneFilter)) continue;
+            if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
             const std::string ts = trim(strField(item, "ts_utc"));
             if (ts.empty()) continue;
             if (latest.empty() || ts > latest) latest = ts;
@@ -8801,9 +9174,10 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
         if (st.contains("events") && st["events"].is_array()) {
             for (const auto& item : st["events"]) {
                 if (!item.is_object()) continue;
+                if (eventRepresentsSyntheticAbsence(st, item)) continue;
                 const std::string entityId = eventEntityToken(item);
                 if (!eventMatchesFilter(st, item, filter)) continue;
-                if (!zoneMatches(extractZoneField(item), zoneFilter)) continue;
+                if (!eventZoneMatchesPlanFilter(plan, item, zoneFilter)) continue;
                 const std::string ts = trim(strField(item, "ts_utc"));
                 if (ts.empty()) continue;
                 if (latest.empty() || ts > latest) latest = ts;
@@ -8909,11 +9283,19 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                     continue;
                 }
             }
-            if (!zoneMatchesFilter(extractZoneField(*it), zoneFilter)) continue;
+            const ResolvedEventZone resolvedZone = resolveEffectiveEventZoneForNode(plan, *it);
+            if (resolvedZone.conflict) continue;
+            if (resolvedZone.zoneRequired && resolvedZone.zone.empty()) continue;
+            if (!zoneMatchesFilter(resolvedZone.zone, canonicalZoneKeyForPlan(plan, zoneFilter))) continue;
             if (windowSeconds > 0 && ageSeconds(strField(*it, "ts_utc"), nowIsoUtc) > windowSeconds) continue;
 
-            const json doc = makeContributionDoc(*it, normalizedEntity, eventName);
+            json doc = makeContributionDoc(*it, normalizedEntity, eventName);
             if (!doc.is_object() || doc.empty()) continue;
+            if (!resolvedZone.zone.empty()) {
+                doc["zone"] = resolvedZone.zone;
+            } else if (doc.contains("zone")) {
+                doc.erase("zone");
+            }
             arr.push_back(doc);
             if (maxItems > 0 && static_cast<int>(arr.size()) >= maxItems) break;
         }
@@ -9255,7 +9637,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (!trim(zone).empty()) result["zone"] = zone;
             if (w <= 0 || trim(eventName).empty()) unk = true;
             else {
-                const long long currentCount = countEvents(st, eventName, nowIsoUtc, w, ent, zone);
+                const long long currentCount = countEvents(st, eventName, nowIsoUtc, w, ent, zone, plan);
                 json contributingEvents = json::array();
                 std::unordered_set<std::string> seenContributionKeys;
                 result["current_count"] = currentCount;
@@ -9532,7 +9914,10 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                             continue;
                         }
                         if (!trim(ent).empty() && !eventMatchesFilter(st, *it, ent)) continue;
-                        if (!zoneMatchesFilter(extractZoneField(*it), zone)) continue;
+                        const ResolvedEventZone resolvedZone = resolveEffectiveEventZoneForNode(plan, *it);
+                        if (resolvedZone.conflict) continue;
+                        if (resolvedZone.zoneRequired && resolvedZone.zone.empty()) continue;
+                        if (!zoneMatchesFilter(resolvedZone.zone, canonicalZoneKeyForPlan(plan, zone))) continue;
                         std::string normalizedTs;
                         if (!normalizeTsBetweenInclusive(strField(*it, "ts_utc"), startTs, endTs, &normalizedTs)) {
                             continue;
@@ -9540,6 +9925,11 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         json doc = makeContributionDoc(*it, trim(ent), eventName);
                         if (!doc.is_object() || doc.empty()) continue;
                         doc["ts_utc"] = normalizedTs;
+                        if (!resolvedZone.zone.empty()) {
+                            doc["zone"] = resolvedZone.zone;
+                        } else if (doc.contains("zone")) {
+                            doc.erase("zone");
+                        }
                         appendContributionDoc(docs, seenContributionKeys, doc);
                         if (maxItems > 0 && static_cast<int>(docs.size()) >= maxItems) break;
                     }
@@ -9555,32 +9945,32 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         endTs,
                         analysisKind == "window_buffer" ? 50 : 20);
                     if (analysisKind == "count_occurrences") {
-                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone));
+                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone, plan));
                     }
                     if (analysisKind == "count_distinct_entities") {
-                        return json(countDistinctLoggedEventEntitiesBetween(st, eventName, startTs, endTs, ent, zone));
+                        return json(countDistinctLoggedEventEntitiesBetween(st, eventName, startTs, endTs, ent, zone, plan));
                     }
                     if (analysisKind == "has_any_event") {
-                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone) > 0);
+                        return json(countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone, plan) > 0);
                     }
                     if (analysisKind == "last_event_age_seconds") {
                         const std::string latestTs =
-                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone, plan);
                         return latestTs.empty() ? json(nullptr) : json(std::max(0LL, ageSeconds(latestTs, endTs)));
                     }
                     if (analysisKind == "first_event_ts") {
                         const std::string firstTs =
-                            earliestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                            earliestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone, plan);
                         return firstTs.empty() ? json(nullptr) : json(firstTs);
                     }
                     if (analysisKind == "last_event_ts") {
                         const std::string lastTs =
-                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone);
+                            latestLoggedEventTsBetween(st, eventName, startTs, endTs, ent, zone, plan);
                         return lastTs.empty() ? json(nullptr) : json(lastTs);
                     }
                     if (analysisKind == "event_rate") {
                         const long long count =
-                            countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone);
+                            countLoggedEventsBetween(st, eventName, startTs, endTs, ent, zone, plan);
                         const long long seconds = (std::max)(1LL, ageSeconds(startTs, endTs));
                         return json(static_cast<double>(count) / static_cast<double>(seconds));
                     }
@@ -9681,7 +10071,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
                         if (intervalSeconds > 0) firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
                     } else if (anchorMode == "first_matching_event") {
                         analysisAnchorTs =
-                            earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), ent, zone);
+                            earliestLoggedEventTsBetween(st, eventName, std::string(), std::string(), ent, zone, plan);
                         if (!analysisAnchorTs.empty() && intervalSeconds > 0) {
                             firstDueTs = addSecondsIso(analysisAnchorTs, intervalSeconds);
                         }
@@ -9913,7 +10303,7 @@ inline EvalResult evaluate(json& st, const json& envelope, const std::string& no
             if (!trim(zone).empty()) result["zone"] = zone;
             if (d <= 0 || trim(eventName).empty()) unk = true;
             else {
-                const long long currentCount = countEvents(st, eventName, nowIsoUtc, d, ent, zone);
+                const long long currentCount = countEvents(st, eventName, nowIsoUtc, d, ent, zone, plan);
                 result["current_count"] = currentCount;
                 v = currentCount == 0;
                 if (v) {

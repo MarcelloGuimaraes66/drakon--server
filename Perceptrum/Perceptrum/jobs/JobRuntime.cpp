@@ -16,11 +16,13 @@
 
 #include <fstream>
 #include <cctype>
+#include <cstdint>
 #include <ctime>
 #include <cstdio>
 #include <sstream>
 #include <iomanip>
 
+#include <iterator>
 #include <tuple>
 #include <utility>
 #include <chrono>
@@ -3448,8 +3450,269 @@ static std::string buildHiddenNegativeReferencePrompt_(
     return oss.str();
 }
 
+static bool nextUtf8CodepointForLanguageHint_(
+    const std::string& text,
+    std::size_t& index,
+    std::uint32_t& outCodepoint)
+{
+    if (index >= text.size()) {
+        return false;
+    }
+
+    const unsigned char first = static_cast<unsigned char>(text[index++]);
+    if ((first & 0x80u) == 0u) {
+        outCodepoint = static_cast<std::uint32_t>(first);
+        return true;
+    }
+
+    int continuationCount = 0;
+    std::uint32_t codepoint = 0;
+    if ((first & 0xE0u) == 0xC0u) {
+        continuationCount = 1;
+        codepoint = static_cast<std::uint32_t>(first & 0x1Fu);
+    }
+    else if ((first & 0xF0u) == 0xE0u) {
+        continuationCount = 2;
+        codepoint = static_cast<std::uint32_t>(first & 0x0Fu);
+    }
+    else if ((first & 0xF8u) == 0xF0u) {
+        continuationCount = 3;
+        codepoint = static_cast<std::uint32_t>(first & 0x07u);
+    }
+    else {
+        outCodepoint = static_cast<std::uint32_t>(' ');
+        return true;
+    }
+
+    if (index + static_cast<std::size_t>(continuationCount) > text.size()) {
+        index = text.size();
+        outCodepoint = static_cast<std::uint32_t>(' ');
+        return true;
+    }
+
+    for (int i = 0; i < continuationCount; ++i) {
+        const unsigned char next = static_cast<unsigned char>(text[index++]);
+        if ((next & 0xC0u) != 0x80u) {
+            outCodepoint = static_cast<std::uint32_t>(' ');
+            return true;
+        }
+        codepoint = (codepoint << 6) | static_cast<std::uint32_t>(next & 0x3Fu);
+    }
+
+    outCodepoint = codepoint;
+    return true;
+}
+
+static std::string normalizePromptSampleForLanguageHint_(const std::string& text,
+                                                         bool* outHasArabic = nullptr,
+                                                         bool* outHasCjk = nullptr)
+{
+    bool hasArabic = false;
+    bool hasCjk = false;
+    std::string normalized;
+    normalized.reserve(text.size());
+
+    std::size_t index = 0;
+    while (index < text.size()) {
+        std::uint32_t codepoint = 0;
+        if (!nextUtf8CodepointForLanguageHint_(text, index, codepoint)) {
+            break;
+        }
+
+        if ((codepoint >= 0x0600u && codepoint <= 0x06FFu) ||
+            (codepoint >= 0x0750u && codepoint <= 0x077Fu) ||
+            (codepoint >= 0x08A0u && codepoint <= 0x08FFu))
+        {
+            hasArabic = true;
+        }
+        if ((codepoint >= 0x3400u && codepoint <= 0x4DBFu) ||
+            (codepoint >= 0x4E00u && codepoint <= 0x9FFFu) ||
+            (codepoint >= 0xF900u && codepoint <= 0xFAFFu))
+        {
+            hasCjk = true;
+        }
+
+        if (codepoint < 128u && std::isalpha(static_cast<unsigned char>(codepoint))) {
+            normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(codepoint))));
+        }
+        else {
+            normalized.push_back(' ');
+        }
+    }
+
+    if (outHasArabic) *outHasArabic = hasArabic;
+    if (outHasCjk) *outHasCjk = hasCjk;
+    return normalized;
+}
+
+static int countWholeWordHitsForLanguageHint_(const std::string& normalizedText,
+                                              const char* const* words,
+                                              std::size_t wordCount)
+{
+    if (normalizedText.empty() || words == nullptr || wordCount == 0) {
+        return 0;
+    }
+
+    const std::string padded = " " + normalizedText + " ";
+    int score = 0;
+    for (std::size_t i = 0; i < wordCount; ++i) {
+        const std::string word = words[i] ? words[i] : "";
+        if (word.empty()) continue;
+        const std::string needle = " " + word + " ";
+        std::size_t pos = 0;
+        while ((pos = padded.find(needle, pos)) != std::string::npos) {
+            score += word.size() >= 7 ? 3 : (word.size() >= 4 ? 2 : 1);
+            pos += needle.size() - 1;
+        }
+    }
+    return score;
+}
+
+static std::string detectTaskLanguageTag_(
+    const std::string& promptCore,
+    const std::string& alertConditionText,
+    const std::string& negativeConditionText,
+    const std::string& injectedInput)
+{
+    std::string sample;
+    auto appendSample = [&](const std::string& rawValue, int weight = 1) {
+        if (weight <= 0) return;
+        const std::string trimmed = trimCopyRuntime_(rawValue);
+        if (trimmed.empty()) return;
+        for (int i = 0; i < weight; ++i) {
+            if (!sample.empty()) sample.push_back('\n');
+            sample += trimmed;
+        }
+    };
+    appendSample(promptCore, 2);
+    appendSample(alertConditionText);
+    appendSample(negativeConditionText);
+    appendSample(injectedInput);
+    if (sample.empty()) return "";
+
+    bool hasArabic = false;
+    bool hasCjk = false;
+    const std::string normalized =
+        normalizePromptSampleForLanguageHint_(sample, &hasArabic, &hasCjk);
+    if (hasArabic) return "ar";
+    if (hasCjk) return "zh";
+    if (normalized.empty()) return "";
+
+    static const char* const kEnglishWords[] = {
+        "the", "with", "without", "should", "must", "when", "inside",
+        "person", "people", "customer", "item", "items", "bag", "purse",
+        "clothes", "their", "own", "clear", "visible", "alert", "camera",
+        "scene", "snapshot", "monitoring", "walking", "standing",
+        "child", "adult", "pool"
+    };
+    static const char* const kSpanishWords[] = {
+        "el", "los", "las", "con", "sin", "debe", "cuando", "dentro",
+        "persona", "personas", "cliente", "articulo", "articulos", "bolsa",
+        "cartera", "ropa", "propia", "claro", "visible", "alerta", "camara",
+        "escena", "ningun", "ninguna", "cerca", "borde", "piscina",
+        "adulto", "adultos", "activar", "patio", "joven"
+    };
+    static const char* const kPortugueseWords[] = {
+        "com", "sem", "deve", "quando", "dentro", "pessoa", "pessoas",
+        "cliente", "item", "itens", "bolsa", "carteira", "roupa", "propria",
+        "claro", "visivel", "alerta", "camera", "cena", "nenhum", "nenhuma",
+        "perto", "borda", "piscina", "adulto", "adultos", "acionar",
+        "quintal", "jovem"
+    };
+    static const char* const kFrenchWords[] = {
+        "aucun", "aucune", "proche", "bord", "scene", "alerte",
+        "piscine", "adulte", "adultes", "doit", "camera", "visible",
+        "jeune", "surveiller"
+    };
+
+    const int englishScore =
+        countWholeWordHitsForLanguageHint_(normalized, kEnglishWords, std::size(kEnglishWords));
+    const int spanishScore =
+        countWholeWordHitsForLanguageHint_(normalized, kSpanishWords, std::size(kSpanishWords));
+    const int portugueseScore =
+        countWholeWordHitsForLanguageHint_(normalized, kPortugueseWords, std::size(kPortugueseWords));
+    const int frenchScore =
+        countWholeWordHitsForLanguageHint_(normalized, kFrenchWords, std::size(kFrenchWords));
+
+    struct Candidate {
+        const char* tag;
+        int score;
+    };
+    const Candidate candidates[] = {
+        { "en", englishScore },
+        { "es", spanishScore },
+        { "pt", portugueseScore },
+        { "fr", frenchScore }
+    };
+
+    std::string bestTag;
+    int bestScore = 0;
+    int secondBestScore = 0;
+    for (const auto& candidate : candidates) {
+        if (candidate.score > bestScore) {
+            secondBestScore = bestScore;
+            bestScore = candidate.score;
+            bestTag = candidate.tag;
+        }
+        else if (candidate.score > secondBestScore) {
+            secondBestScore = candidate.score;
+        }
+    }
+
+    if (bestScore < 3) {
+        return "";
+    }
+    if (bestScore == secondBestScore) {
+        return "";
+    }
+    return bestTag;
+}
+
+static const char* displayNameForTaskLanguageTag_(const std::string& languageTag)
+{
+    if (languageTag == "pt") return "Portuguese";
+    if (languageTag == "es") return "Spanish";
+    if (languageTag == "fr") return "French";
+    if (languageTag == "ar") return "Arabic";
+    if (languageTag == "zh") return "Chinese";
+    if (languageTag == "en") return "English";
+    return "";
+}
+
+static std::string buildTaskLanguageHintPrompt_(
+    const std::string& promptCore,
+    const std::string& alertConditionText,
+    const std::string& negativeConditionText,
+    const std::string& injectedInput)
+{
+    const std::string languageTag =
+        detectTaskLanguageTag_(
+            promptCore,
+            alertConditionText,
+            negativeConditionText,
+            injectedInput
+        );
+    if (languageTag.empty()) {
+        return "";
+    }
+
+    const char* languageName = displayNameForTaskLanguageTag_(languageTag);
+    if (languageName == nullptr || *languageName == '\0') {
+        return "";
+    }
+
+    std::ostringstream oss;
+    oss << "TASK LANGUAGE HINT (SYSTEM):\n";
+    oss << "- Detected primary language of TASK TEXT: "
+        << languageName << " (" << languageTag << ").\n";
+    oss << "- Write `answer` in " << languageName << ".\n";
+    oss << "- Do not switch languages unless TASK TEXT explicitly asks for translation or quoted output in another language.\n";
+    return oss.str();
+}
+
 static std::string buildInferencePrompt_(
     const std::string& promptCore,
+    const std::string& alertConditionText,
     const std::string& negativeConditionText,
     const std::string& injectedInput,
     const std::vector<JobFaceTarget>& faceTargets,
@@ -3457,10 +3720,21 @@ static std::string buildInferencePrompt_(
 ) {
     std::string finalPrompt = trimCopyRuntime_(promptCore);
     const std::string negative = trimCopyRuntime_(negativeConditionText);
+    const std::string taskLanguageHint = buildTaskLanguageHintPrompt_(
+        promptCore,
+        alertConditionText,
+        negativeConditionText,
+        injectedInput
+    );
     const std::string hiddenFacePrompt = buildHiddenFaceIdPrompt_(faceTargets);
     const std::string hiddenNegativeRefPrompt = buildHiddenNegativeReferencePrompt_(
         negativeReferenceImages
     );
+
+    if (!taskLanguageHint.empty()) {
+        if (!finalPrompt.empty()) finalPrompt = taskLanguageHint + "\n\n" + finalPrompt;
+        else finalPrompt = taskLanguageHint;
+    }
 
     if (!negative.empty()) {
         if (!finalPrompt.empty()) finalPrompt += "\n\n";
@@ -5749,6 +6023,7 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                 collectFaceTargetDisplayNames_(pg.g.face_targets);
                             const std::string groupPromptForInference = buildInferencePrompt_(
                                 pg.g.prompt_template,
+                                pg.g.alert_condition_text,
                                 pg.g.negative_condition_text,
                                 /*injectedInput*/ "",
                                 pg.g.face_targets,
@@ -10072,6 +10347,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         const std::string nowIsoForInference = temporal::nowIso();
         const std::string inferencePromptBase = buildInferencePrompt_(
             agent.prompt_template,
+            alertConditionText,
             agent.negative_condition_text,
             injectedInput,
             agent.face_targets,
@@ -11043,6 +11319,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         temporal::decisionAnchorUtc(nowIsoForInference, seg.endTs);
     const std::string inferencePromptBase = buildInferencePrompt_(
         agent.prompt_template,
+        alertConditionText,
         agent.negative_condition_text,
         injectedInput,
         agent.face_targets,

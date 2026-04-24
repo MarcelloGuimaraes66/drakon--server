@@ -101,6 +101,7 @@ export interface CameraCustomAgentRow {
   prompt_template?: string | null;
   alert_condition?: string | null;
   negative_condition?: string | null;
+  priority_level?: CameraAgentPriority | null;
   face_target_ids?: number[];
   negative_reference_images?: NegativeReferenceImage[];
   analysis_regions?: unknown;
@@ -168,6 +169,13 @@ const buildPreviewViewportMetrics = (
 };
 type CameraAgentRunEverySeconds = 10 | 60;
 const CAMERA_AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<CameraAgentRunEverySeconds> = [60, 10];
+type CameraAgentPriority = "CRITIC" | "HIGH" | "MEDIUM" | "LOW";
+const CAMERA_AGENT_PRIORITY_OPTIONS: ReadonlyArray<CameraAgentPriority> = [
+  "CRITIC",
+  "HIGH",
+  "MEDIUM",
+  "LOW",
+];
 type CameraAgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type CameraVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 type CameraAgentRunningResolution = 640 | 1024;
@@ -262,6 +270,9 @@ function AutoGrowingTextarea({
       onChange={(event) => onChange(event.target.value)}
       rows={rows}
       readOnly={readOnly}
+      spellCheck={false}
+      autoCorrect="off"
+      autoCapitalize="off"
       className={className}
       placeholder={placeholder}
     />
@@ -445,6 +456,19 @@ const normalizeInferenceModel = (
     normalized === "light" ||
     normalized === "core"
   ) {
+    return normalized;
+  }
+  return fallback;
+};
+
+const normalizeCameraAgentPriority = (
+  value: unknown,
+  fallback: CameraAgentPriority = "MEDIUM"
+): CameraAgentPriority => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toUpperCase();
+  if (normalized === "MEDUIM") return "MEDIUM";
+  if (normalized === "CRITIC" || normalized === "HIGH" || normalized === "MEDIUM" || normalized === "LOW") {
     return normalized;
   }
   return fallback;
@@ -920,6 +944,7 @@ export default function CameraCustomAgentEditorModal({
     currentStepId: onboardingStepId,
     isOpen: isOnboardingOpen,
     providerStatus,
+    tutorialCameraId,
   } = useOnboarding();
   const tutorialAgentSeededRef = useRef(false);
   const localizedOptionalSuffix = extractOptionalSuffix(
@@ -929,6 +954,7 @@ export default function CameraCustomAgentEditorModal({
   );
   const [displayName, setDisplayName] = useState("");
   const [isEnabled, setIsEnabled] = useState(true);
+  const [priorityLevel, setPriorityLevel] = useState<CameraAgentPriority>("MEDIUM");
   const [inputType, setInputType] = useState<"video" | "image">("video");
   const [videoPackagingMode, setVideoPackagingMode] = useState<CameraVideoPackagingMode>(
     DEFAULT_CAMERA_VIDEO_PACKAGING_MODE
@@ -1037,6 +1063,12 @@ export default function CameraCustomAgentEditorModal({
   const isStepTarget = targetType === "step_default" || targetType === "step_camera";
   const stepCameraId = targetType === "step_camera" ? previewCameraId : null;
   const cameraId = previewCameraId ?? 0;
+  const isTutorialCameraEditorTarget =
+    !isStepTarget &&
+    typeof tutorialCameraId === "number" &&
+    Number.isInteger(tutorialCameraId) &&
+    tutorialCameraId > 0 &&
+    previewCameraId === tutorialCameraId;
   const targetLabel =
     targetType === "step_default"
       ? editorTarget?.step_title?.trim() ||
@@ -1253,6 +1285,7 @@ export default function CameraCustomAgentEditorModal({
 
     setDisplayName(getDisplayNameFromAgent(agent));
     setIsEnabled(normalizeBool(agent?.is_enabled, true));
+    setPriorityLevel(normalizeCameraAgentPriority(agent?.priority_level));
     setInputType(execution.inputType);
     setVideoPackagingMode(
       hasExplicitVideoPackagingMode
@@ -1489,13 +1522,20 @@ export default function CameraCustomAgentEditorModal({
   }, [open, canLoadSavedAgentTemplate]);
 
   useEffect(() => {
-    if (!open) {
+    if (!open || !isTutorialCameraEditorTarget) {
       tutorialAgentSeededRef.current = false;
+      if (!open) {
+        return;
+      }
+    }
+
+    if (!open) {
       return;
     }
 
     if (
       initialAgent ||
+      !isTutorialCameraEditorTarget ||
       !isOnboardingOpen ||
       !onboardingStepId ||
       !AGENT_EDITOR_ONBOARDING_STEPS.has(onboardingStepId)
@@ -1541,6 +1581,7 @@ export default function CameraCustomAgentEditorModal({
     providerStatus.openai,
     providerStatus.zai,
     t,
+    isTutorialCameraEditorTarget,
   ]);
 
   useEffect(() => {
@@ -2270,6 +2311,7 @@ export default function CameraCustomAgentEditorModal({
         prompt_template: selectedTemplateAgent.prompt_template,
         alert_condition: selectedTemplateAgent.alert_condition,
         negative_condition: selectedTemplateAgent.negative_condition,
+        priority_level: normalizeCameraAgentPriority(selectedTemplateAgent.priority_level),
         face_target_ids: faceIds,
         negative_reference_images: [],
         analysis_regions: selectedTemplateAgent.analysis_regions,
@@ -2341,6 +2383,7 @@ export default function CameraCustomAgentEditorModal({
       analysis_regions: analysisRegions,
       face_target_ids: faceIds,
       is_enabled: isEnabled ? 1 : 0,
+      priority_level: priorityLevel,
       input_type: inputType,
       video_packaging_mode: videoPackagingMode,
       inference_model: inferenceModel,
@@ -2371,6 +2414,7 @@ export default function CameraCustomAgentEditorModal({
               display_name: displayName.trim(),
               summary: getSummaryFromAgent(initialAgent) || normalized.alert_condition,
             }),
+            priority_level: priorityLevel,
             input_type: inputType,
             video_packaging_mode: videoPackagingMode,
             inference_model: inferenceModel,
@@ -2470,6 +2514,9 @@ export default function CameraCustomAgentEditorModal({
             type="text"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
             className={PROMPT_DOCUMENT_INPUT_CLASS}
             placeholder="Custom agent name"
           />
@@ -2500,6 +2547,9 @@ export default function CameraCustomAgentEditorModal({
                 setFields((prev) => ({ ...prev, prompt_template: e.target.value }))
               }
               rows={8}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.promptCorePlaceholder")}
             />
@@ -2531,6 +2581,9 @@ export default function CameraCustomAgentEditorModal({
                 setFields((prev) => ({ ...prev, alert_condition: e.target.value }))
               }
               rows={5}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.alertConditionPlaceholder")}
             />
@@ -2562,6 +2615,9 @@ export default function CameraCustomAgentEditorModal({
                 setFields((prev) => ({ ...prev, negative_condition: e.target.value }))
               }
               rows={4}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
               className={PROMPT_DOCUMENT_TEXTAREA_CLASS}
               placeholder={t("jobs.promptEditor.negativeConditionPlaceholder")}
             />
@@ -2583,7 +2639,9 @@ export default function CameraCustomAgentEditorModal({
     return (
       <div
         className={PROMPT_DOCUMENT_BLOCK_CLASS}
-        data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorFields}
+        data-onboarding-target={
+          isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorFields : undefined
+        }
       >
         {documentSections}
       </div>
@@ -2608,13 +2666,34 @@ export default function CameraCustomAgentEditorModal({
           aria-label="Close agent editor"
         />
 
-        <div className="relative h-[90vh] max-h-[1050px] w-[min(88vw,1320px)] max-w-[88vw] bg-gray-800 text-gray-100 rounded-md shadow-2xl border border-gray-700 overflow-hidden flex flex-col">
+        <div
+          className="relative h-[90vh] max-h-[1050px] w-[min(88vw,1320px)] max-w-[88vw] bg-gray-800 text-gray-100 rounded-md shadow-2xl border border-gray-700 overflow-hidden flex flex-col"
+          spellCheck={false}
+        >
           <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-gray-700">
             <div className="min-w-0">
               <h4 className="text-lg font-semibold leading-tight">Agent Editor</h4>
               <p className="text-xs text-gray-400 mt-1">Define the full agent context.</p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
+                <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
+                  Priority
+                </span>
+                <select
+                  value={normalizeCameraAgentPriority(priorityLevel)}
+                  onChange={(e) => setPriorityLevel(normalizeCameraAgentPriority(e.target.value))}
+                  disabled={saving || enhancingPrompt}
+                  className="w-[118px] rounded border border-gray-700 bg-gray-950 px-2 py-1.5 text-xs text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                  title="Choose the alert priority for this agent"
+                >
+                  {CAMERA_AGENT_PRIORITY_OPTIONS.map((priority) => (
+                    <option key={priority} value={priority}>
+                      {priority}
+                    </option>
+                  ))}
+                </select>
+              </div>
               {canLoadSavedAgentTemplate ? (
                 <div className="flex items-center gap-2 rounded border border-gray-700 bg-gray-900/80 px-2 py-1.5">
                   <span className="text-[10px] uppercase tracking-[0.18em] text-gray-500">
@@ -2662,7 +2741,9 @@ export default function CameraCustomAgentEditorModal({
               ) : null}
               <div
                 className="flex items-center gap-2"
-                data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorModel}
+                data-onboarding-target={
+                  isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorModel : undefined
+                }
               >
                 <select
                   value={inferenceModel}
@@ -2707,7 +2788,11 @@ export default function CameraCustomAgentEditorModal({
                 </select>
                 <ModelHostingBadge modelTier={inferenceModel} />
               </div>
-              <div data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorInputType}>
+              <div
+                data-onboarding-target={
+                  isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorInputType : undefined
+                }
+              >
                 <select
                   value={inputType}
                   onChange={(e) => {
@@ -2754,7 +2839,9 @@ export default function CameraCustomAgentEditorModal({
               >
                 <div
                   className="min-h-0 rounded-xl border border-gray-600/80 bg-gray-900/55 overflow-hidden flex flex-col shadow-lg shadow-black/30"
-                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorPolygons}
+                  data-onboarding-target={
+                    isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorPolygons : undefined
+                  }
                 >
                   <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between gap-2">
                     <div className="text-xs text-gray-300 truncate">{targetLabel}</div>
@@ -3285,7 +3372,9 @@ export default function CameraCustomAgentEditorModal({
                 >
                 <div
                   className="space-y-5"
-                  data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorExecution}
+                  data-onboarding-target={
+                    isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorExecution : undefined
+                  }
                 >
                   <div className="space-y-2">
                     <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
@@ -3431,11 +3520,11 @@ export default function CameraCustomAgentEditorModal({
 
           <div className="px-8 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
             <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">Cancel</button>
-            <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorEnhance} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
+            <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorEnhance : undefined} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
               <Sparkles className="w-3.5 h-3.5" />
               {enhancingPrompt ? "Enhancing..." : "Enhance Prompt with AI"}
             </button>
-            <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={ONBOARDING_TARGETS.cameraAgentEditorSave} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
+            <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorSave : undefined} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
               {saving ? "Saving..." : "Apply & Save"}
             </button>
           </div>

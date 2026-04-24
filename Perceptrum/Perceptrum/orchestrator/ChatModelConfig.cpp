@@ -48,7 +48,7 @@ std::string normalizeChatModelTierName(std::string tier)
 std::string chatModelNameForTier(const std::string& tier)
 {
     const std::string normalized = normalizeChatModelTierName(tier);
-    if (normalized == "core") return "GLM-4.6V-Flash";
+    if (normalized == "core") return "GLM-4.7-Flash";
     if (normalized == "ultra") return "gpt-5.1";
     if (normalized == "ultra_plus") return "gpt-5.4";
     if (normalized == "light") return "gpt-5.4-mini";

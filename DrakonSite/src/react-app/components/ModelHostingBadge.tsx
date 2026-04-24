@@ -29,7 +29,7 @@ const MODEL_HOSTING_META: Record<HostedModelTier, HostingMeta> = {
     flag: "🇸🇬",
     location: "Singapore",
     title:
-      "Core uses GLM-4.6V-Flash via Z.ai. Z.ai states that all Z.ai services are based in Singapore.",
+      "Core uses Z.ai in Singapore. Chat orchestration and written answers use GLM-4.7-Flash, while video search, uploaded-video analysis, and core visual pipelines use GLM-4.6V-Flash.",
   },
 };
 

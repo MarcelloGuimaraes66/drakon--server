@@ -11,6 +11,7 @@ struct AlgorithmConfig {
     std::string displayName;
     nlohmann::json configJson;
     bool isCustomV2{ false };
+    std::string priorityLevel{ "MEDIUM" };
     std::string promptTemplate;
     std::string alertCondition;
     std::string negativeCondition;
