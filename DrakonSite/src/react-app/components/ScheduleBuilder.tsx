@@ -81,23 +81,27 @@ function normalizeWindowError(error: string | null, t: (key: string, options?: a
   return error;
 }
 
-const TIME_FALLBACK = "00:00";
+const TIME_FALLBACK = "00:00:00";
+const DEFAULT_WINDOW: TimeWindow = { start_time: "09:00:00", end_time: "17:00:00" };
 
-function parseHHMM(value: string): { hours: number; minutes: number } {
-  const match = /^(\d{2}):(\d{2})$/.exec(String(value || ""));
-  if (!match) return { hours: 0, minutes: 0 };
+function parseTimeParts(value: string): { hours: number; minutes: number; seconds: number } {
+  const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(value || ""));
+  if (!match) return { hours: 0, minutes: 0, seconds: 0 };
   const hours = Number.parseInt(match[1], 10);
   const minutes = Number.parseInt(match[2], 10);
+  const seconds = Number.parseInt(match[3] ?? "0", 10);
   return {
     hours: Number.isFinite(hours) ? Math.min(23, Math.max(0, hours)) : 0,
     minutes: Number.isFinite(minutes) ? Math.min(59, Math.max(0, minutes)) : 0,
+    seconds: Number.isFinite(seconds) ? Math.min(59, Math.max(0, seconds)) : 0,
   };
 }
 
-function toHHMM(hours: number, minutes: number): string {
+function toHHMMSS(hours: number, minutes: number, seconds: number): string {
   const safeHours = Math.min(23, Math.max(0, Math.floor(hours)));
   const safeMinutes = Math.min(59, Math.max(0, Math.floor(minutes)));
-  return `${String(safeHours).padStart(2, "0")}:${String(safeMinutes).padStart(2, "0")}`;
+  const safeSeconds = Math.min(59, Math.max(0, Math.floor(seconds)));
+  return `${String(safeHours).padStart(2, "0")}:${String(safeMinutes).padStart(2, "0")}:${String(safeSeconds).padStart(2, "0")}`;
 }
 
 function sanitizeTimePart(raw: string, max: number, fallback: number): number {
@@ -108,7 +112,7 @@ function sanitizeTimePart(raw: string, max: number, fallback: number): number {
   return Math.min(max, Math.max(0, parsed));
 }
 
-function HHMMInput({
+function TimeInput({
   value,
   onChange,
   ariaLabel,
@@ -117,25 +121,31 @@ function HHMMInput({
   onChange: (nextValue: string) => void;
   ariaLabel: string;
 }) {
-  const { hours, minutes } = parseHHMM(value || TIME_FALLBACK);
+  const { hours, minutes, seconds } = parseTimeParts(value || TIME_FALLBACK);
   const [hourDraft, setHourDraft] = useState(String(hours).padStart(2, "0"));
   const [minuteDraft, setMinuteDraft] = useState(String(minutes).padStart(2, "0"));
+  const [secondDraft, setSecondDraft] = useState(String(seconds).padStart(2, "0"));
   const hourInputRef = useRef<HTMLInputElement | null>(null);
   const minuteInputRef = useRef<HTMLInputElement | null>(null);
+  const secondInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setHourDraft(String(hours).padStart(2, "0"));
     setMinuteDraft(String(minutes).padStart(2, "0"));
-  }, [hours, minutes]);
+    setSecondDraft(String(seconds).padStart(2, "0"));
+  }, [hours, minutes, seconds]);
 
-  const commitValue = (nextHourRaw: string, nextMinuteRaw: string) => {
+  const commitValue = (nextHourRaw: string, nextMinuteRaw: string, nextSecondRaw: string) => {
     const nextHour = sanitizeTimePart(nextHourRaw, 23, hours);
     const nextMinute = sanitizeTimePart(nextMinuteRaw, 59, minutes);
+    const nextSecond = sanitizeTimePart(nextSecondRaw, 59, seconds);
     const normalizedHour = String(nextHour).padStart(2, "0");
     const normalizedMinute = String(nextMinute).padStart(2, "0");
+    const normalizedSecond = String(nextSecond).padStart(2, "0");
     setHourDraft(normalizedHour);
     setMinuteDraft(normalizedMinute);
-    const normalizedValue = toHHMM(nextHour, nextMinute);
+    setSecondDraft(normalizedSecond);
+    const normalizedValue = toHHMMSS(nextHour, nextMinute, nextSecond);
     if (normalizedValue !== value) {
       onChange(normalizedValue);
     }
@@ -147,6 +157,13 @@ function HHMMInput({
     requestAnimationFrame(() => {
       minuteInputRef.current?.focus();
       minuteInputRef.current?.select();
+    });
+  };
+
+  const focusSecondInput = () => {
+    requestAnimationFrame(() => {
+      secondInputRef.current?.focus();
+      secondInputRef.current?.select();
     });
   };
 
@@ -163,16 +180,16 @@ function HHMMInput({
           const nextHourRaw = normalizeDraft(e.target.value);
           setHourDraft(nextHourRaw);
           if (nextHourRaw.length === 2) {
-            commitValue(nextHourRaw, minuteDraft);
+            commitValue(nextHourRaw, minuteDraft, secondDraft);
             focusMinuteInput();
           }
         }}
-        onBlur={() => commitValue(hourDraft, minuteDraft)}
+        onBlur={() => commitValue(hourDraft, minuteDraft, secondDraft)}
         onFocus={(e) => e.currentTarget.select()}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
-            commitValue(hourDraft, minuteDraft);
+            commitValue(hourDraft, minuteDraft, secondDraft);
           }
         }}
         className="w-7 bg-transparent text-center text-sm text-gray-200 focus:outline-none"
@@ -190,19 +207,46 @@ function HHMMInput({
           const nextMinuteRaw = normalizeDraft(e.target.value);
           setMinuteDraft(nextMinuteRaw);
           if (nextMinuteRaw.length === 2) {
-            commitValue(hourDraft, nextMinuteRaw);
+            commitValue(hourDraft, nextMinuteRaw, secondDraft);
+            focusSecondInput();
           }
         }}
-        onBlur={() => commitValue(hourDraft, minuteDraft)}
+        onBlur={() => commitValue(hourDraft, minuteDraft, secondDraft)}
         onFocus={(e) => e.currentTarget.select()}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
-            commitValue(hourDraft, minuteDraft);
+            commitValue(hourDraft, minuteDraft, secondDraft);
           }
         }}
         className="w-7 bg-transparent text-center text-sm text-gray-200 focus:outline-none"
         aria-label={`${ariaLabel} minute`}
+      />
+      <span className="text-sm text-gray-500">:</span>
+      <input
+        ref={secondInputRef}
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        maxLength={2}
+        value={secondDraft}
+        onChange={(e) => {
+          const nextSecondRaw = normalizeDraft(e.target.value);
+          setSecondDraft(nextSecondRaw);
+          if (nextSecondRaw.length === 2) {
+            commitValue(hourDraft, minuteDraft, nextSecondRaw);
+          }
+        }}
+        onBlur={() => commitValue(hourDraft, minuteDraft, secondDraft)}
+        onFocus={(e) => e.currentTarget.select()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitValue(hourDraft, minuteDraft, secondDraft);
+          }
+        }}
+        className="w-7 bg-transparent text-center text-sm text-gray-200 focus:outline-none"
+        aria-label={`${ariaLabel} second`}
       />
     </div>
   );
@@ -250,7 +294,7 @@ export default function ScheduleBuilder({
     if (isWeekdayEnabled(dayOfWeek)) {
       onScheduleDaysChange(scheduleDays.filter((d) => d.day_of_week !== dayOfWeek));
     } else {
-      const newDay = createWeeklyDay(dayOfWeek, [{ start_time: "09:00", end_time: "17:00" }]);
+      const newDay = createWeeklyDay(dayOfWeek, [{ ...DEFAULT_WINDOW }]);
       onScheduleDaysChange(
         [...scheduleDays, newDay].sort((a, b) => (a.day_of_week ?? 0) - (b.day_of_week ?? 0))
       );
@@ -266,7 +310,7 @@ export default function ScheduleBuilder({
       onScheduleDaysChange(scheduleDays.filter((d) => d.day_of_month !== dayOfMonth));
     } else {
       const newDay = createMonthlyDay(dayOfMonth);
-      newDay.windows = [{ start_time: "09:00", end_time: "17:00" }];
+      newDay.windows = [{ ...DEFAULT_WINDOW }];
       onScheduleDaysChange(
         [...scheduleDays, newDay].sort((a, b) => (a.day_of_month ?? 0) - (b.day_of_month ?? 0))
       );
@@ -280,7 +324,7 @@ export default function ScheduleBuilder({
   const addYearlyDate = (month: number, day: number) => {
     if (findYearlyDay(month, day)) return;
     const newDay = createYearlyDay(month, day);
-    newDay.windows = [{ start_time: "09:00", end_time: "17:00" }];
+    newDay.windows = [{ ...DEFAULT_WINDOW }];
     onScheduleDaysChange(
       [...scheduleDays, newDay].sort((a, b) => {
         const monthDiff = (a.month_of_year ?? 0) - (b.month_of_year ?? 0);
@@ -302,7 +346,7 @@ export default function ScheduleBuilder({
 
   const addWindow = (dayIndex: number) => {
     const day = scheduleDays[dayIndex];
-    updateDayWindows(dayIndex, [...day.windows, { start_time: "09:00", end_time: "17:00" }]);
+    updateDayWindows(dayIndex, [...day.windows, { ...DEFAULT_WINDOW }]);
   };
 
   const updateWindow = (
@@ -528,13 +572,13 @@ function DayCard({
             return (
               <div key={windowIndex} className="flex items-center gap-2 bg-gray-800/50 p-2 rounded">
                 <Clock className="w-3.5 h-3.5 text-gray-500" />
-                <HHMMInput
+                <TimeInput
                   value={window.start_time}
                   onChange={(nextValue) => onUpdateWindow(windowIndex, "start_time", nextValue)}
                   ariaLabel={t("jobs.startTime")}
                 />
                 <span className="text-gray-500">-&gt;</span>
-                <HHMMInput
+                <TimeInput
                   value={window.end_time}
                   onChange={(nextValue) => onUpdateWindow(windowIndex, "end_time", nextValue)}
                   ariaLabel={t("jobs.endTime")}

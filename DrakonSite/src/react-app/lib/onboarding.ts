@@ -2,7 +2,7 @@ import { brand } from "@/shared/brand";
 
 export type OnboardingProviderKind = "zai" | "openai";
 
-export type OnboardingTutorialKind = "intro" | "api-key" | "camera" | "agent";
+export type OnboardingTutorialKind = "intro" | "api-key" | "camera" | "agent" | "chat";
 
 export type OnboardingStepId =
   | "welcome"
@@ -33,6 +33,10 @@ export type OnboardingStepId =
   | "agent-toggle"
   | "ai-agents-camera-start"
   | "agent-camera-required"
+  | "chat-offer"
+  | "chat-intro"
+  | "chat-compose"
+  | "chat-examples"
   | "complete";
 
 export type OnboardingStatus =
@@ -67,7 +71,8 @@ export type OnboardingTargetId =
   | "camera-agent-editor.execution"
   | "camera-agent-editor.save"
   | "algorithms.custom-agent.toggle"
-  | "ai-agents.camera.start";
+  | "ai-agents.camera.start"
+  | "chat.composer";
 
 export const ONBOARDING_TARGET_ATTRIBUTE = "data-onboarding-target";
 
@@ -98,6 +103,7 @@ export const ONBOARDING_TARGETS = {
   cameraAgentEditorSave: "camera-agent-editor.save",
   algorithmsCustomAgentToggle: "algorithms.custom-agent.toggle",
   aiAgentsCameraStart: "ai-agents.camera.start",
+  chatComposer: "chat.composer",
 } as const satisfies Record<string, OnboardingTargetId>;
 
 export type PersistedOnboardingState = {
@@ -107,6 +113,7 @@ export type PersistedOnboardingState = {
   currentStepId: OnboardingStepId | null;
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
+  tutorialCameraName: string | null;
   tutorialAgentId: number | null;
   tutorialProceedWithoutWebcam: boolean;
 };
@@ -120,6 +127,7 @@ const DEFAULT_PERSISTED_STATE: PersistedOnboardingState = {
   currentStepId: null,
   selectedProvider: null,
   tutorialCameraId: null,
+  tutorialCameraName: null,
   tutorialAgentId: null,
   tutorialProceedWithoutWebcam: false,
 };
@@ -163,6 +171,10 @@ function isValidStepId(value: unknown): value is OnboardingStepId {
     value === "agent-toggle" ||
     value === "ai-agents-camera-start" ||
     value === "agent-camera-required" ||
+    value === "chat-offer" ||
+    value === "chat-intro" ||
+    value === "chat-compose" ||
+    value === "chat-examples" ||
     value === "complete"
   );
 }
@@ -181,7 +193,13 @@ function isValidProvider(value: unknown): value is OnboardingProviderKind {
 }
 
 function isValidTutorialKind(value: unknown): value is OnboardingTutorialKind {
-  return value === "intro" || value === "api-key" || value === "camera" || value === "agent";
+  return (
+    value === "intro" ||
+    value === "api-key" ||
+    value === "camera" ||
+    value === "agent" ||
+    value === "chat"
+  );
 }
 
 function normalizePersistedStepId(value: unknown): OnboardingStepId | null {
@@ -205,6 +223,15 @@ function normalizePersistedCameraId(value: unknown): number | null {
   }
 
   return null;
+}
+
+function normalizePersistedCameraName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized : null;
 }
 
 function encodeCookieNameSegment(value: string): string {
@@ -290,6 +317,7 @@ function parsePersistedOnboardingState(raw: string | null): PersistedOnboardingS
     currentStepId: normalizePersistedStepId(parsed.currentStepId),
     selectedProvider: isValidProvider(parsed.selectedProvider) ? parsed.selectedProvider : null,
     tutorialCameraId: normalizePersistedCameraId(parsed.tutorialCameraId),
+    tutorialCameraName: normalizePersistedCameraName(parsed.tutorialCameraName),
     tutorialAgentId: normalizePersistedCameraId(parsed.tutorialAgentId),
     tutorialProceedWithoutWebcam:
       typeof parsed.tutorialProceedWithoutWebcam === "boolean"
@@ -410,6 +438,10 @@ export function getOnboardingRoute(
     return "/ai-agents";
   }
 
+  if (stepId === "chat-intro" || stepId === "chat-compose" || stepId === "chat-examples") {
+    return "/chat";
+  }
+
   return null;
 }
 
@@ -474,6 +506,8 @@ export function getOnboardingTargetId(
       return ONBOARDING_TARGETS.algorithmsCustomAgentToggle;
     case "ai-agents-camera-start":
       return ONBOARDING_TARGETS.aiAgentsCameraStart;
+    case "chat-compose":
+      return ONBOARDING_TARGETS.chatComposer;
     default:
       return null;
   }

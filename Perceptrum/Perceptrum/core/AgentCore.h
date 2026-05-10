@@ -24,7 +24,7 @@ struct EncodedVideoSegment {
     std::string endTs;    // "YYYYMMDD_HHMMSS"
 
     std::string sourceFilePath; // caminho do mp4 usado para este segmento
-    bool isTempFile = false;    // true se é um segment_*.mp4 temporário; false se é um clip gravado em storage
+    bool isTempFile = false;    // true if this is a temporary segment_*.mp4 file
 
     int cameraId = -1;           
     std::string cameraName;      
@@ -325,12 +325,12 @@ public:
 
     struct JobStepKeyHash {
         size_t operator()(const JobStepKey& k) const noexcept {
-            // hash simples e estável
+            // simple stable hash
             return (std::hash<int>{}(k.jobId) * 1315423911u) ^ std::hash<int>{}(k.stepId);
         }
     };
 
-    // liga/desliga cópia por step
+    // enable/disable capture copy per step
     void jobsCaptureAcquire(
         int cameraId,
         int jobId,
@@ -418,6 +418,7 @@ private:
     void handleCameraImportPreviewCommand_(int commandId, const nlohmann::json& payload);
     void handleTemporalRecompileCommand_(int commandId, const nlohmann::json& payload);
     void handleProbeWebcamsCommand_(int commandId, const nlohmann::json& payload);
+    void handleProbeCameraCaptureAccelerationCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindStartCommand_(int commandId, const nlohmann::json& payload);
     void handleDrakonFindCancelCommand_(int commandId, const nlohmann::json& payload);
     void handleChatCancelCommand_(int commandId, const nlohmann::json& payload);

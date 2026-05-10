@@ -78,6 +78,9 @@
     <ClInclude Include="camera\MotionDetector.h">
       <Filter>Source Files\camera</Filter>
     </ClInclude>
+    <ClInclude Include="camera\PortalCounter.h">
+      <Filter>Source Files\camera</Filter>
+    </ClInclude>
     <ClInclude Include="camera\RtspCapture.h">
       <Filter>Source Files\camera</Filter>
     </ClInclude>
@@ -147,6 +150,9 @@
       <Filter>Source Files\camera</Filter>
     </ClCompile>
     <ClCompile Include="camera\MotionDetector.cpp">
+      <Filter>Source Files\camera</Filter>
+    </ClCompile>
+    <ClCompile Include="camera\PortalCounter.cpp">
       <Filter>Source Files\camera</Filter>
     </ClCompile>
     <ClCompile Include="camera\RtspCapture.cpp">

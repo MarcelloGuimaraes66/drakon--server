@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import {
   Archive,
   Camera,
+  Cpu,
   FileUp,
   Pencil,
   Play,
@@ -40,6 +41,10 @@ import {
   formatDiscoveryImportErrorMessage,
   type CameraDiscoveryImportRequest,
 } from "@/react-app/utils/cameraDiscovery";
+import {
+  applyCameraCaptureAcceleration,
+  type CameraCaptureAccelerationMode,
+} from "@/react-app/utils/cameraCaptureAcceleration";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
 import { Camera as CameraType } from "@/shared/types";
@@ -57,6 +62,16 @@ const CAMERA_EDITOR_ONBOARDING_STEPS = new Set([
   "camera-webcam-form",
   "camera-webcam-save",
 ]);
+
+function getCameraCaptureAccelerationMode(camera: CameraType): CameraCaptureAccelerationMode {
+  return camera.capture_acceleration_mode === "nvidia" ? "nvidia" : "cpu";
+}
+
+function getCameraDisplayName(camera: CameraType): string {
+  return typeof camera.name === "string" && camera.name.trim()
+    ? camera.name.trim()
+    : `Camera #${camera.id}`;
+}
 
 function findSavedCameraId(
   cameras: CameraType[],
@@ -110,6 +125,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const [deleteCandidate, setDeleteCandidate] = useState<CameraType | null>(null);
   const [isDeletingCamera, setIsDeletingCamera] = useState(false);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
+  const [pendingAccelerationCameraIds, setPendingAccelerationCameraIds] = useState<Set<number>>(
+    () => new Set()
+  );
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast, pushToast } = useEvents();
@@ -350,7 +368,10 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     const refreshedCameras = await refreshCameras();
     refreshDashboardSummary();
     if (onboardingStepId === "camera-webcam-save") {
-      completeCameraTutorial(findSavedCameraId(refreshedCameras, saved));
+      completeCameraTutorial(
+        findSavedCameraId(refreshedCameras, saved),
+        saved?.cameraName ?? null
+      );
     }
   };
 
@@ -421,6 +442,18 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     });
   };
 
+  const updatePendingAccelerationState = (cameraId: number, isPending: boolean) => {
+    setPendingAccelerationCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
   const handleToggleService = async (camera: CameraType) => {
     if (pendingCameraIds.has(camera.id)) {
       return;
@@ -473,6 +506,81 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
       console.error("Failed to toggle service:", error);
     } finally {
       updatePendingCameraState(camera.id, false);
+    }
+  };
+
+  const handleToggleCaptureAcceleration = async (camera: CameraType) => {
+    const cameraId = camera.id;
+    const currentMode = getCameraCaptureAccelerationMode(camera);
+    const requestedMode: CameraCaptureAccelerationMode =
+      currentMode === "nvidia" ? "cpu" : "nvidia";
+
+    if (pendingAccelerationCameraIds.has(cameraId)) {
+      return;
+    }
+
+    updatePendingAccelerationState(cameraId, true);
+
+    try {
+      const result = await applyCameraCaptureAcceleration(cameraId, requestedMode, true);
+      if (result.status !== "applied") {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "GPU Decode Unavailable",
+          message: result.scan?.reason || "GPU decode is not available for this camera.",
+          type: "agent_api_error",
+        });
+        return;
+      }
+
+      patchCamera(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      dashboardSummaryStore.patchCameraLocal(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      refreshDashboardSummary();
+      void refreshCameras();
+
+      const switchedToGpu = result.persisted_mode === "nvidia";
+      const restartMessage =
+        result.running_before_apply && result.restart_enqueued
+          ? "The camera restart was queued on this machine."
+          : result.running_before_apply
+          ? "The preference was saved, but the camera restart could not be queued automatically."
+          : "The new capture mode will be used next time this camera starts.";
+
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: switchedToGpu ? "GPU Decode Enabled" : "CPU Decode Enabled",
+        message: restartMessage,
+        type: "job_started",
+      });
+
+      if (result.restart_error) {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "Camera Restart Pending",
+          message: result.restart_error,
+          type: "agent_api_error",
+        });
+      }
+    } catch (error) {
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: "GPU Decode Error",
+        message:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "Failed to change the camera decode mode.",
+        type: "agent_api_error",
+      });
+    } finally {
+      updatePendingAccelerationState(cameraId, false);
     }
   };
 
@@ -619,6 +727,11 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                 {filteredCameras.map((camera) => {
                   const connectionState = getCameraConnectionState(camera);
                   const isRunning = isCameraServiceRunning(camera);
+                  const isAccelerationPending = pendingAccelerationCameraIds.has(camera.id);
+                  const captureAccelerationMode = getCameraCaptureAccelerationMode(camera);
+                  const isGpuRequested = captureAccelerationMode === "nvidia";
+                  const canToggleAcceleration =
+                    String(camera.connection_method || "").trim().toUpperCase() !== "WEBCAM";
                   const isAuthLost = connectionState === "auth_lost";
                   const isReconnecting = connectionState === "reconnecting";
                   const isOnline = connectionState === "online";
@@ -688,6 +801,42 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                             <Square className="h-4 w-4" />
                           ) : (
                             <Play className="h-4 w-4" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleToggleCaptureAcceleration(camera)}
+                          disabled={
+                            !canToggleAcceleration ||
+                            isAccelerationPending ||
+                            pendingCameraIds.has(camera.id)
+                          }
+                          title={
+                            canToggleAcceleration
+                              ? isGpuRequested
+                                ? "Switch to CPU decode"
+                                : "Try GPU decode"
+                              : "GPU decode is only available for RTSP cameras"
+                          }
+                          aria-label={
+                            canToggleAcceleration
+                              ? isGpuRequested
+                                ? "Switch to CPU decode"
+                                : "Try GPU decode"
+                              : "GPU decode is only available for RTSP cameras"
+                          }
+                          className={`inline-flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
+                            !canToggleAcceleration
+                              ? "text-gray-500"
+                              : isGpuRequested
+                              ? "text-amber-300 hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                              : "text-gray-300 hover:bg-gray-700/60 disabled:cursor-not-allowed disabled:opacity-60"
+                          }`}
+                        >
+                          {isAccelerationPending ? (
+                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          ) : (
+                            <Cpu className="h-4 w-4" />
                           )}
                         </button>
                         <button

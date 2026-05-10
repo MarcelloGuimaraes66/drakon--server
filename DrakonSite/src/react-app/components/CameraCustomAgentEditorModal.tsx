@@ -106,7 +106,23 @@ export interface CameraCustomAgentRow {
   negative_reference_images?: NegativeReferenceImage[];
   analysis_regions?: unknown;
   config_json?: unknown;
+  params?: unknown;
 }
+
+type StepAgentExecutionBackend = "llm" | "opencv_portal_counter";
+
+type PortalCounterConfig = {
+  region_id: string;
+  min_count_to_alert: number;
+  min_area: number;
+  max_area: number;
+  warmup_frames: number;
+  min_track_frames_for_count: number;
+  max_missed_frames: number;
+  min_path_length_px: number;
+  max_proof_frames: number;
+  save_annotated_video: boolean;
+};
 
 export type CameraAgentEditorTarget = {
   type: "camera" | "step_default" | "step_camera";
@@ -185,6 +201,21 @@ const DEFAULT_LIGHT_VIDEO_PACKAGING_MODE: CameraVideoPackagingMode = "mosaic_2x2
 const DEFAULT_CORE_RUNNING_RESOLUTION: CameraAgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
+const PORTAL_COUNTER_EXECUTION_BACKEND: StepAgentExecutionBackend = "opencv_portal_counter";
+const DEFAULT_PORTAL_COUNTER_SUMMARY =
+  "Counts portal passages with native OpenCV analysis after the step finishes.";
+const DEFAULT_PORTAL_COUNTER_CONFIG: PortalCounterConfig = {
+  region_id: "",
+  min_count_to_alert: 1,
+  min_area: 1800,
+  max_area: 70000,
+  warmup_frames: 60,
+  min_track_frames_for_count: 3,
+  max_missed_frames: 12,
+  min_path_length_px: 85,
+  max_proof_frames: 6,
+  save_annotated_video: true,
+};
 const AGENT_EDITOR_ONBOARDING_STEPS = new Set([
   "agent-model",
   "agent-input-type",
@@ -209,6 +240,70 @@ const PROMPT_DOCUMENT_EXPANDED_TEXTAREA_CLASS =
   "w-full resize-none overflow-hidden border-0 bg-transparent p-0 text-sm leading-6 text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-0";
 const PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS =
   "inline-flex h-7 w-7 items-center justify-center rounded border border-gray-600 bg-gray-800 text-gray-300 transition-colors hover:border-gray-500 hover:text-gray-100";
+
+const parseAgentParamsObject = (value: unknown): Record<string, unknown> => {
+  if (!value) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown> | null;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+};
+
+const normalizeStepAgentExecutionBackend = (
+  value: unknown
+): StepAgentExecutionBackend => {
+  return String(value || "").trim().toLowerCase() === PORTAL_COUNTER_EXECUTION_BACKEND
+    ? PORTAL_COUNTER_EXECUTION_BACKEND
+    : "llm";
+};
+
+const clampInteger = (value: unknown, fallback: number, min: number, max: number): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+};
+
+const hasPolygonRegion = (region: AnalysisRegion | null | undefined): boolean =>
+  !!region &&
+  !region.full_frame &&
+  Array.isArray(region.polygon_norm) &&
+  region.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS;
+
+const normalizePortalCounterConfig = (value: unknown): PortalCounterConfig => {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const regionId =
+    typeof raw.region_id === "string"
+      ? raw.region_id.trim()
+      : typeof raw.regionId === "string"
+      ? raw.regionId.trim()
+      : "";
+  return {
+    region_id: regionId,
+    min_count_to_alert: clampInteger(raw.min_count_to_alert ?? raw.minCountToAlert, 1, 0, 9999),
+    min_area: clampInteger(raw.min_area ?? raw.minArea, 1800, 1, 500000),
+    max_area: clampInteger(raw.max_area ?? raw.maxArea, 70000, 1, 1000000),
+    warmup_frames: clampInteger(raw.warmup_frames ?? raw.warmupFrames, 60, 0, 10000),
+    min_track_frames_for_count: clampInteger(
+      raw.min_track_frames_for_count ?? raw.minTrackFramesForCount,
+      3,
+      1,
+      300
+    ),
+    max_missed_frames: clampInteger(raw.max_missed_frames ?? raw.maxMissedFrames, 12, 1, 300),
+    min_path_length_px: clampInteger(raw.min_path_length_px ?? raw.minPathLengthPx, 85, 1, 5000),
+    max_proof_frames: clampInteger(raw.max_proof_frames ?? raw.maxProofFrames, 6, 1, 24),
+    save_annotated_video:
+      raw.save_annotated_video === false || raw.saveAnnotatedVideo === false ? false : true,
+  };
+};
 
 const extractOptionalSuffix = (label: string): string => {
   const match = String(label || "").match(OPTIONAL_SUFFIX_PATTERN);
@@ -372,17 +467,21 @@ const constrainFrameWindow = (
   candidate: FrameWindowNorm,
   metrics: PreviewViewportMetrics | null | undefined
 ): FrameWindowNorm => {
+  const normalizedCandidate = normalizeFrameWindowFromUnknown(candidate);
+  if (!metrics) {
+    return normalizedCandidate;
+  }
   const base = buildBaseFrameWindowForViewport(metrics);
-  const rawWidth = clamp01(candidate.width) || base.width;
-  const rawHeight = clamp01(candidate.height) || base.height;
+  const rawWidth = clamp01(normalizedCandidate.width) || base.width;
+  const rawHeight = clamp01(normalizedCandidate.height) || base.height;
   const zoom = Math.min(
     FRAME_WINDOW_MAX_ZOOM,
     Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
   );
   const width = base.width / zoom;
   const height = base.height / zoom;
-  const centerX = clamp01((Number(candidate.x) || 0) + rawWidth / 2);
-  const centerY = clamp01((Number(candidate.y) || 0) + rawHeight / 2);
+  const centerX = clamp01(normalizedCandidate.x + rawWidth / 2);
+  const centerY = clamp01(normalizedCandidate.y + rawHeight / 2);
   const maxX = Math.max(0, 1 - width);
   const maxY = Math.max(0, 1 - height);
   return {
@@ -897,12 +996,18 @@ const normalizeRegionsForPayload = (
 
 const getDisplayNameFromAgent = (agent: CameraCustomAgentRow | null): string => {
   if (!agent) return "";
+  const paramsObject = parseAgentParamsObject(agent.params);
   const topLevelDisplayName =
     typeof (agent as unknown as { display_name?: unknown }).display_name === "string"
       ? String((agent as unknown as { display_name?: string }).display_name).trim()
       : "";
   if (topLevelDisplayName && !isGeneratedCustomAgentName(topLevelDisplayName)) {
     return topLevelDisplayName;
+  }
+  const fromParams =
+    typeof paramsObject.display_name === "string" ? String(paramsObject.display_name).trim() : "";
+  if (fromParams && !isGeneratedCustomAgentName(fromParams)) {
+    return fromParams;
   }
   if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
     const fromCfg = typeof (agent.config_json as any).display_name === "string"
@@ -922,6 +1027,9 @@ const getDisplayNameFromAgent = (agent: CameraCustomAgentRow | null): string => 
 
 const getSummaryFromAgent = (agent: CameraCustomAgentRow | null): string => {
   if (!agent) return "";
+  const paramsObject = parseAgentParamsObject(agent.params);
+  const fromParams = typeof paramsObject.summary === "string" ? String(paramsObject.summary).trim() : "";
+  if (fromParams) return fromParams;
   if (agent.config_json && typeof agent.config_json === "object" && !Array.isArray(agent.config_json)) {
     const fromCfg = typeof (agent.config_json as any).summary === "string"
       ? String((agent.config_json as any).summary).trim()
@@ -973,6 +1081,11 @@ export default function CameraCustomAgentEditorModal({
     alert_condition: "",
     negative_condition: "",
   });
+  const [portalCounterExpanded, setPortalCounterExpanded] = useState(false);
+  const [portalCounterEnabled, setPortalCounterEnabled] = useState(false);
+  const [portalCounterConfig, setPortalCounterConfig] = useState<PortalCounterConfig>(
+    DEFAULT_PORTAL_COUNTER_CONFIG
+  );
   const [algorithmId, setAlgorithmId] = useState<number | null>(null);
 
   const [polygonRegions, setPolygonRegions] = useState<AnalysisRegion[]>([]);
@@ -1073,17 +1186,44 @@ export default function CameraCustomAgentEditorModal({
     targetType === "step_default"
       ? editorTarget?.step_title?.trim() ||
         (stepId ? `Step #${stepId}` : "Step default agent")
-      : targetType === "step_camera"
-        ? editorTarget?.camera_name?.trim() ||
-          (previewCameraId ? `Camera #${previewCameraId}` : "Step target camera")
+        : targetType === "step_camera"
+          ? editorTarget?.camera_name?.trim() ||
+            (previewCameraId ? `Camera #${previewCameraId}` : "Step target camera")
         : editorTarget?.camera_name?.trim() ||
           (previewCameraId ? `Camera #${previewCameraId}` : "Camera");
+  const portalCounterSelectable = targetType === "step_camera";
+  const portalCounterRegionOptions = useMemo(
+    () => polygonRegions.filter((region) => hasPolygonRegion(region)),
+    [polygonRegions]
+  );
+  const hasPortalCounterRegionOptions = portalCounterRegionOptions.length > 0;
+  const isPortalCounterActive = isStepTarget && portalCounterSelectable && portalCounterEnabled;
 
   const snapshotUrl = snapshotMeta.thumbnail_url
     ? `/api/thumbnails/${snapshotMeta.thumbnail_url}${
         snapshotMeta.last_thumbnail_update ? `?ts=${encodeURIComponent(snapshotMeta.last_thumbnail_update)}` : ""
       }`
     : null;
+
+  useEffect(() => {
+    if (!portalCounterSelectable && portalCounterEnabled) {
+      setPortalCounterEnabled(false);
+    }
+  }, [portalCounterEnabled, portalCounterSelectable]);
+
+  useEffect(() => {
+    if (!portalCounterEnabled) return;
+    if (portalCounterRegionOptions.length === 0) return;
+    const hasSelectedRegion = portalCounterRegionOptions.some(
+      (region) => region.region_id === portalCounterConfig.region_id
+    );
+    if (!hasSelectedRegion) {
+      setPortalCounterConfig((prev) => ({
+        ...prev,
+        region_id: portalCounterRegionOptions[0]?.region_id || "",
+      }));
+    }
+  }, [portalCounterConfig.region_id, portalCounterEnabled, portalCounterRegionOptions]);
 
   useEffect(() => {
     if (!open || !snapshotUrl) {
@@ -1263,6 +1403,8 @@ export default function CameraCustomAgentEditorModal({
     options?: { loadMode?: "existing" | "template" }
   ) => {
     const loadMode = options?.loadMode === "template" ? "template" : "existing";
+    const paramsObject = parseAgentParamsObject(agent?.params);
+    const executionBackend = normalizeStepAgentExecutionBackend(paramsObject.execution_backend);
     const parsedFields = parsePromptTemplate(agent?.prompt_template, agent?.alert_condition, agent?.negative_condition);
     const faceIds = normalizeFaceTargetIds(agent?.face_target_ids);
     const negativeImagesFromAgent =
@@ -1309,6 +1451,18 @@ export default function CameraCustomAgentEditorModal({
     setNegativeImages(negativeImagesFromAgent);
     setSelectedNegativeImageIds(negativeIds);
     setPolygonRegions(normalizedRegions);
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(paramsObject.portal_counter);
+    const defaultPortalRegionId =
+      normalizedPortalCounterConfig.region_id ||
+      normalizedRegions.find((region) => hasPolygonRegion(region))?.region_id ||
+      "";
+    setPortalCounterEnabled(executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND);
+    setPortalCounterExpanded(executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND);
+    setPortalCounterConfig({
+      ...normalizedPortalCounterConfig,
+      region_id: defaultPortalRegionId,
+      save_annotated_video: true,
+    });
     setFrameWindow(
       constrainFrameWindow(
         extractFrameWindowFromAnalysisRegions(agent?.analysis_regions),
@@ -2187,7 +2341,43 @@ export default function CameraCustomAgentEditorModal({
     }
   };
 
+  const onTogglePortalCounter = (nextEnabled: boolean) => {
+    if (nextEnabled) {
+      if (!portalCounterSelectable || !stepCameraId) {
+        showToast(
+          "Validation",
+          "Portal counter can only be enabled for a step camera target",
+          "destructive"
+        );
+        return;
+      }
+      if (!hasPortalCounterRegionOptions) {
+        showToast(
+          "Validation",
+          "Draw at least one polygon region before enabling the portal counter",
+          "destructive"
+        );
+        return;
+      }
+      setPortalCounterConfig((prev) => ({
+        ...prev,
+        region_id: prev.region_id || portalCounterRegionOptions[0]?.region_id || "",
+        save_annotated_video: true,
+      }));
+      setPortalCounterExpanded(true);
+    }
+    setPortalCounterEnabled(nextEnabled);
+  };
+
   const onEnhancePrompt = async () => {
+    if (isPortalCounterActive) {
+      showToast(
+        "Validation",
+        "Prompt enhancement is disabled while the native portal counter mode is active",
+        "destructive"
+      );
+      return;
+    }
     const normalized = normalizeFields(fields);
     if (!normalized.prompt_template || !normalized.alert_condition) {
       showToast("Validation", "Prompt Core and Alert Condition are required", "destructive");
@@ -2334,7 +2524,11 @@ export default function CameraCustomAgentEditorModal({
 
   const onApplyAndSave = async () => {
     const normalized = normalizeFields(fields);
-    if (!displayName.trim() || !normalized.prompt_template || !normalized.alert_condition) {
+    if (!displayName.trim()) {
+      showToast("Validation", "Agent Name is required", "destructive");
+      return;
+    }
+    if (!isPortalCounterActive && (!normalized.prompt_template || !normalized.alert_condition)) {
       showToast("Validation", "Agent Name, Prompt Core and Alert Condition are required", "destructive");
       return;
     }
@@ -2371,6 +2565,28 @@ export default function CameraCustomAgentEditorModal({
       selectedNegativeImageIds,
       frameWindow
     );
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(portalCounterConfig);
+    if (isPortalCounterActive) {
+      if (!stepCameraId) {
+        showToast(
+          "Validation",
+          "Portal counter can only be saved on a step camera target",
+          "destructive"
+        );
+        return;
+      }
+      const selectedPortalRegion = analysisRegions.find(
+        (region) => region.region_id === normalizedPortalCounterConfig.region_id
+      );
+      if (!selectedPortalRegion || !hasPolygonRegion(selectedPortalRegion as AnalysisRegion)) {
+        showToast(
+          "Validation",
+          "Select a polygon region for the portal counter before saving",
+          "destructive"
+        );
+        return;
+      }
+    }
     const modelFpsForSave =
       supportsAdjustableVideoFps(inferenceModel) && inputType === "video"
         ? modelFps
@@ -2402,26 +2618,41 @@ export default function CameraCustomAgentEditorModal({
       const method = isStepTarget ? "POST" : algorithmId ? "PATCH" : "POST";
       const stepPayload = isStepTarget
         ? {
-            agent_key:
-              typeof initialAgent?.algorithm_type === "string" && initialAgent.algorithm_type.trim()
+            agent_key: isPortalCounterActive
+              ? "portal_counter"
+              : typeof initialAgent?.algorithm_type === "string" && initialAgent.algorithm_type.trim()
                 ? initialAgent.algorithm_type.trim()
                 : "custom_template",
-            prompt_template: normalized.prompt_template,
-            alert_condition: normalized.alert_condition,
-            negative_condition: normalized.negative_condition,
+            prompt_template: isPortalCounterActive ? "" : normalized.prompt_template,
+            alert_condition: isPortalCounterActive ? "" : normalized.alert_condition,
+            negative_condition: isPortalCounterActive ? "" : normalized.negative_condition,
             camera_id: stepCameraId ?? null,
             params: JSON.stringify({
               display_name: displayName.trim(),
-              summary: getSummaryFromAgent(initialAgent) || normalized.alert_condition,
+              summary: isPortalCounterActive
+                ? DEFAULT_PORTAL_COUNTER_SUMMARY
+                : getSummaryFromAgent(initialAgent) || normalized.alert_condition,
+              execution_backend: isPortalCounterActive ? PORTAL_COUNTER_EXECUTION_BACKEND : "llm",
+              ...(isPortalCounterActive
+                ? {
+                    portal_counter: {
+                      ...normalizedPortalCounterConfig,
+                      region_id: normalizedPortalCounterConfig.region_id,
+                      save_annotated_video: true,
+                    },
+                  }
+                : {}),
             }),
             priority_level: priorityLevel,
-            input_type: inputType,
-            video_packaging_mode: videoPackagingMode,
-            inference_model: inferenceModel,
-            model_fps: modelFpsForSave,
-            run_every: runEvery,
-            running_resolution: inferenceModel === "core" ? runningResolution : null,
-            only_capture_on_motion: onlyCaptureOnMotion,
+            input_type: isPortalCounterActive ? "video" : inputType,
+            video_packaging_mode: isPortalCounterActive ? "frame_sequence" : videoPackagingMode,
+            inference_model: isPortalCounterActive ? "ultra" : inferenceModel,
+            model_fps: isPortalCounterActive ? DEFAULT_ULTRA_VIDEO_MODEL_FPS : modelFpsForSave,
+            run_every: isPortalCounterActive ? 60 : runEvery,
+            running_resolution:
+              isPortalCounterActive ? null : inferenceModel === "core" ? runningResolution : null,
+            only_capture_on_motion: isPortalCounterActive ? false : onlyCaptureOnMotion,
+            use_temporal_context: isPortalCounterActive ? false : undefined,
             face_target_ids: faceIds,
             analysis_regions: analysisRegions,
           }
@@ -2462,6 +2693,240 @@ export default function CameraCustomAgentEditorModal({
       : t("jobs.runEveryOption.seconds60");
   };
 
+  const renderPortalCounterCollapse = () => {
+    if (!isStepTarget) return null;
+
+    return (
+      <div className="rounded-xl border border-gray-700 bg-gray-800/70">
+        <button
+          type="button"
+          onClick={() => setPortalCounterExpanded((prev) => !prev)}
+          className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+        >
+          <div>
+            <div className="text-sm font-semibold text-gray-100">
+              Native Portal Counter
+            </div>
+            <div className="text-xs text-gray-400">
+              Hidden advanced option for full-step OpenCV counting.
+            </div>
+          </div>
+          {portalCounterExpanded ? (
+            <Minimize2 className="h-4 w-4 text-gray-400" />
+          ) : (
+            <Maximize2 className="h-4 w-4 text-gray-400" />
+          )}
+        </button>
+        {portalCounterExpanded ? (
+          <div className="space-y-4 border-t border-gray-700 px-4 py-4">
+            <label className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                checked={portalCounterEnabled}
+                onChange={(e) => onTogglePortalCounter(e.target.checked)}
+                disabled={!portalCounterSelectable || !hasPortalCounterRegionOptions}
+                className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-900 text-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <div>
+                <div className="text-sm font-medium text-gray-100">
+                  Use OpenCV portal counter
+                </div>
+                <div className="text-xs text-gray-400">
+                  Captures the full step video, counts passages after timeout, and
+                  always saves an annotated MP4.
+                </div>
+              </div>
+            </label>
+            {!portalCounterSelectable ? (
+              <p className="text-xs text-amber-400">
+                This option is only available for step camera agents.
+              </p>
+            ) : !hasPortalCounterRegionOptions ? (
+              <p className="text-xs text-amber-400">
+                Draw and save at least one polygon region before enabling this mode.
+              </p>
+            ) : null}
+            {portalCounterEnabled ? (
+              <>
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-gray-100">
+                    Polygon Region
+                  </label>
+                  <select
+                    value={portalCounterConfig.region_id}
+                    onChange={(e) =>
+                      setPortalCounterConfig((prev) => ({
+                        ...prev,
+                        region_id: e.target.value,
+                      }))
+                    }
+                    className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                  >
+                    {portalCounterRegionOptions.map((region) => (
+                      <option key={region.region_id} value={region.region_id}>
+                        {region.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-gray-100">
+                    Minimum Count To Alert
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={9999}
+                    value={portalCounterConfig.min_count_to_alert}
+                    onChange={(e) =>
+                      setPortalCounterConfig((prev) => ({
+                        ...prev,
+                        min_count_to_alert: clampInteger(e.target.value, 1, 0, 9999),
+                      }))
+                    }
+                    className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                  />
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Blob Area
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={500000}
+                      value={portalCounterConfig.min_area}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_area: clampInteger(e.target.value, 1800, 1, 500000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Max Blob Area
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1000000}
+                      value={portalCounterConfig.max_area}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_area: clampInteger(e.target.value, 70000, 1, 1000000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Warmup Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      value={portalCounterConfig.warmup_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          warmup_frames: clampInteger(e.target.value, 60, 0, 10000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Track Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={300}
+                      value={portalCounterConfig.min_track_frames_for_count}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_track_frames_for_count: clampInteger(e.target.value, 3, 1, 300),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Max Missed Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={300}
+                      value={portalCounterConfig.max_missed_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_missed_frames: clampInteger(e.target.value, 12, 1, 300),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Min Path Length (px)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={5000}
+                      value={portalCounterConfig.min_path_length_px}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          min_path_length_px: clampInteger(e.target.value, 85, 1, 5000),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold uppercase tracking-[0.12em] text-gray-400">
+                      Proof Frames
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={24}
+                      value={portalCounterConfig.max_proof_frames}
+                      onChange={(e) =>
+                        setPortalCounterConfig((prev) => ({
+                          ...prev,
+                          max_proof_frames: clampInteger(e.target.value, 6, 1, 24),
+                        }))
+                      }
+                      className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400">
+                  Annotated video evidence is always saved in this mode and will be
+                  used by the alert card when the alert threshold is met.
+                </p>
+              </>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
   const renderPromptDocument = (options?: { expanded?: boolean }) => {
     const expanded = options?.expanded ?? false;
     const togglePromptDocumentLabel = expanded
@@ -2483,6 +2948,80 @@ export default function CameraCustomAgentEditorModal({
     const negativeConditionSectionClassName = expanded
       ? sectionClassName
       : `${PROMPT_DOCUMENT_SECTION_CLASS} border-t border-gray-700`;
+
+    if (isPortalCounterActive) {
+      const nativeSections = (
+        <>
+          <div className={sectionClassName}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="font-mono text-[13px] font-semibold text-gray-100">
+                  {formatPromptDocumentHeading("Agent Name")}
+                </span>
+                <span className="text-red-600">*</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPromptDocumentExpanded((prev) => !prev)}
+                className={PROMPT_DOCUMENT_TOGGLE_BUTTON_CLASS}
+                title={togglePromptDocumentLabel}
+                aria-label={togglePromptDocumentLabel}
+                aria-expanded={expanded}
+              >
+                {expanded ? (
+                  <Minimize2 className="h-3.5 w-3.5" />
+                ) : (
+                  <Maximize2 className="h-3.5 w-3.5" />
+                )}
+              </button>
+            </div>
+            <input
+              aria-label="Agent Name"
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              className={PROMPT_DOCUMENT_INPUT_CLASS}
+              placeholder="Portal counter name"
+            />
+          </div>
+          <div className={promptCoreSectionClassName}>
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-100">
+              <div className="font-medium">Native portal counter mode</div>
+              <p className="mt-2 text-emerald-100/80">
+                Prompt Core, Alert Condition, Negative Condition and LLM inference settings are
+                disabled here. This step captures video for the full step duration, runs the
+                OpenCV portal counter only after the timeout, and always saves an annotated video
+                as evidence.
+              </p>
+            </div>
+          </div>
+        </>
+      );
+
+      if (expanded) {
+        return (
+          <div className={PROMPT_DOCUMENT_EXPANDED_SHEET_CLASS}>
+            <div className={PROMPT_DOCUMENT_EXPANDED_CONTENT_CLASS}>
+              <div className="space-y-5">{nativeSections}</div>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div
+          className={PROMPT_DOCUMENT_BLOCK_CLASS}
+          data-onboarding-target={
+            isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorFields : undefined
+          }
+        >
+          {nativeSections}
+        </div>
+      );
+    }
 
     const documentSections = (
       <>
@@ -2748,6 +3287,7 @@ export default function CameraCustomAgentEditorModal({
                 <select
                   value={inferenceModel}
                   onChange={(e) => {
+                    if (isPortalCounterActive) return;
                     const previousModel = inferenceModel;
                     const nextModel = normalizeInferenceModel(e.target.value);
                     if (shouldShowCoreModelNotice(nextModel, previousModel)) {
@@ -2771,9 +3311,13 @@ export default function CameraCustomAgentEditorModal({
                     setRunningResolution(constrained.runningResolution);
                     setModelFps(constrained.modelFps);
                   }}
-                  disabled={saving || enhancingPrompt}
+                  disabled={saving || enhancingPrompt || isPortalCounterActive}
                   className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                  title={t("jobs.inferenceModel")}
+                  title={
+                    isPortalCounterActive
+                      ? "Disabled while native portal counter mode is active"
+                      : t("jobs.inferenceModel")
+                  }
                 >
                   <option value="ultra_plus">{t("jobs.inferenceModelOption.ultraPlus")}</option>
                   <option value="ultra">{t("jobs.inferenceModelOption.ultra")}</option>
@@ -2796,6 +3340,7 @@ export default function CameraCustomAgentEditorModal({
                 <select
                   value={inputType}
                   onChange={(e) => {
+                    if (isPortalCounterActive) return;
                     const nextInputType = e.target.value === "image" ? "image" : "video";
                     const constrained = applyExecutionConstraints(
                       nextInputType,
@@ -2809,9 +3354,13 @@ export default function CameraCustomAgentEditorModal({
                     setRunningResolution(constrained.runningResolution);
                     setModelFps(constrained.modelFps);
                   }}
-                  disabled={saving || enhancingPrompt || inferenceModel === "core"}
+                  disabled={saving || enhancingPrompt || inferenceModel === "core" || isPortalCounterActive}
                   className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                  title={t("jobs.inputType")}
+                  title={
+                    isPortalCounterActive
+                      ? "Disabled while native portal counter mode is active"
+                      : t("jobs.inputType")
+                  }
                 >
                   <option value="video">{t("jobs.video")}</option>
                   {inferenceModel !== "core" && <option value="image">{t("jobs.image")}</option>}
@@ -3376,95 +3925,105 @@ export default function CameraCustomAgentEditorModal({
                     isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorExecution : undefined
                   }
                 >
-                  <div className="space-y-2">
-                    <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
-                    <select
-                      value={inferenceModel === "core" ? 60 : runEvery}
-                      onChange={(e) => setRunEvery(normalizeRunEverySeconds(e.target.value, 60))}
-                      disabled={inferenceModel === "core"}
-                      className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
-                    >
-                  {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
-                    <option key={seconds} value={seconds}>
-                      {getRunEveryOptionLabel(seconds)}
-                    </option>
-                  ))}
-                    </select>
-                  </div>
-                  {inputType === "video" ? (
-                    <div className="space-y-2">
-                      <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
-                      <select
-                        value={getVideoPackagingSelectValue(videoPackagingMode)}
-                        onChange={(e) => {
-                          videoPackagingWasManuallySelectedRef.current = true;
-                          setVideoPackagingMode(
-                            normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
-                          );
-                        }}
-                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
-                      >
-                        {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
-                          <option value="" disabled>
-                            Legacy Packaging Mode
-                          </option>
-                        ) : null}
-                        <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
-                        <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
-                      </select>
-                      <p className="text-xs text-gray-400">
-                        Standard Resolution uses a 2x2 mosaic and sends fewer image inputs than High Resolution.
-                      </p>
-                      {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
-                        <p className="text-xs text-amber-400">
-                          This agent is using a legacy packaging mode that is no longer available here.
-                          Choose High Resolution or Standard Resolution to replace it.
-                        </p>
+                  {!isPortalCounterActive ? (
+                    <>
+                      <div className="space-y-2">
+                        <label className="block text-sm font-semibold text-gray-100">{t("jobs.runEvery")}</label>
+                        <select
+                          value={inferenceModel === "core" ? 60 : runEvery}
+                          onChange={(e) => setRunEvery(normalizeRunEverySeconds(e.target.value, 60))}
+                          disabled={inferenceModel === "core"}
+                          className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                      {CAMERA_AGENT_RUN_EVERY_OPTIONS.map((seconds) => (
+                        <option key={seconds} value={seconds}>
+                          {getRunEveryOptionLabel(seconds)}
+                        </option>
+                      ))}
+                        </select>
+                      </div>
+                      {inputType === "video" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">Video Packaging</label>
+                          <select
+                            value={getVideoPackagingSelectValue(videoPackagingMode)}
+                            onChange={(e) => {
+                              videoPackagingWasManuallySelectedRef.current = true;
+                              setVideoPackagingMode(
+                                normalizeVideoPackagingMode(e.target.value, videoPackagingMode)
+                              );
+                            }}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
+                              <option value="" disabled>
+                                Legacy Packaging Mode
+                              </option>
+                            ) : null}
+                            <option value="frame_sequence">{getVideoPackagingModeLabel("frame_sequence")}</option>
+                            <option value="mosaic_2x2">{getVideoPackagingModeLabel("mosaic_2x2")}</option>
+                          </select>
+                          <p className="text-xs text-gray-400">
+                            Standard Resolution uses a 2x2 mosaic and sends fewer image inputs than High Resolution.
+                          </p>
+                          {!isSelectableVideoPackagingMode(videoPackagingMode) ? (
+                            <p className="text-xs text-amber-400">
+                              This agent is using a legacy packaging mode that is no longer available here.
+                              Choose High Resolution or Standard Resolution to replace it.
+                            </p>
+                          ) : null}
+                        </div>
                       ) : null}
-                    </div>
-                  ) : null}
-                  {supportsAdjustableVideoFps(inferenceModel) && inputType === "video" ? (
-                    <div className="space-y-2">
-                      <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
-                      <select
-                        value={modelFps}
-                        onChange={(e) => setModelFps(normalizeModelFps(e.target.value, modelFps))}
-                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
-                      >
-                        {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
-                          const fps = index + 1;
-                          return (
-                            <option key={fps} value={fps}>
-                              {`${fps} FPS`}
+                      {supportsAdjustableVideoFps(inferenceModel) && inputType === "video" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">Video FPS</label>
+                          <select
+                            value={modelFps}
+                            onChange={(e) => setModelFps(normalizeModelFps(e.target.value, modelFps))}
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
+                              const fps = index + 1;
+                              return (
+                                <option key={fps} value={fps}>
+                                  {`${fps} FPS`}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </div>
+                      ) : null}
+                      {inferenceModel === "core" ? (
+                        <div className="space-y-2">
+                          <label className="block text-sm font-semibold text-gray-100">
+                            {t("jobs.runningResolution")}
+                          </label>
+                          <select
+                            value={runningResolution}
+                            onChange={(e) =>
+                              setRunningResolution(normalizeRunningResolution(e.target.value))
+                            }
+                            className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
+                          >
+                            <option value={640}>
+                              {t("jobs.runningResolutionOption.640")}
                             </option>
-                          );
-                        })}
-                      </select>
+                            <option value={1024}>
+                              {t("jobs.runningResolutionOption.1024")}
+                            </option>
+                          </select>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="rounded-lg border border-emerald-500/25 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-100">
+                      This step will capture video continuously for the whole timeout and run the
+                      OpenCV portal counter only after the step ends.
                     </div>
-                  ) : null}
-                  {inferenceModel === "core" ? (
-                    <div className="space-y-2">
-                      <label className="block text-sm font-semibold text-gray-100">
-                        {t("jobs.runningResolution")}
-                      </label>
-                      <select
-                        value={runningResolution}
-                        onChange={(e) =>
-                          setRunningResolution(normalizeRunningResolution(e.target.value))
-                        }
-                        className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm"
-                      >
-                        <option value={640}>
-                          {t("jobs.runningResolutionOption.640")}
-                        </option>
-                        <option value={1024}>
-                          {t("jobs.runningResolutionOption.1024")}
-                        </option>
-                      </select>
-                    </div>
-                  ) : null}
+                  )}
                 </div>
                 {renderPromptDocument()}
+                {!isPortalCounterActive ? (
                   <div className="space-y-2">
                   <label className="block font-mono text-[13px] font-semibold text-gray-100">
                     {formatPromptDocumentHeading("Negative Reference Images", {
@@ -3502,7 +4061,9 @@ export default function CameraCustomAgentEditorModal({
                       ))}
                     </div>
                   </div>
-                </div>
+                  </div>
+                ) : null}
+                {renderPortalCounterCollapse()}
                 </div>
                 {enhancingPrompt ? (
                   <div className="absolute -inset-px z-20 rounded-xl bg-gray-950/55 backdrop-blur-[2px] flex items-center justify-center">
@@ -3520,16 +4081,18 @@ export default function CameraCustomAgentEditorModal({
 
           <div className="px-8 py-4 border-t border-gray-700 bg-gray-800/70 flex justify-end gap-2">
             <button type="button" onClick={onClose} disabled={enhancingPrompt || saving} className="px-3 py-1.5 rounded bg-gray-700 text-gray-100 text-sm">Cancel</button>
-            <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorEnhance : undefined} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
-              <Sparkles className="w-3.5 h-3.5" />
-              {enhancingPrompt ? "Enhancing..." : "Enhance Prompt with AI"}
-            </button>
+            {!isPortalCounterActive ? (
+              <button type="button" onClick={() => void onEnhancePrompt()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorEnhance : undefined} className="px-3 py-1.5 rounded bg-gray-700 border border-white/85 hover:border-white disabled:border-white/35 text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]">
+                <Sparkles className="w-3.5 h-3.5" />
+                {enhancingPrompt ? "Enhancing..." : "Enhance Prompt with AI"}
+              </button>
+            ) : null}
             <button type="button" onClick={() => void onApplyAndSave()} disabled={enhancingPrompt || saving} data-onboarding-target={isTutorialCameraEditorTarget ? ONBOARDING_TARGETS.cameraAgentEditorSave : undefined} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm">
               {saving ? "Saving..." : "Apply & Save"}
             </button>
           </div>
 
-          {suggestion ? (
+          {!isPortalCounterActive && suggestion ? (
             <div className="absolute inset-0 z-20 bg-gray-950/65 backdrop-blur-sm flex items-center justify-center p-6">
               <div className="w-full max-w-3xl max-h-[85vh] bg-gray-800 border border-gray-700 rounded-lg shadow-xl overflow-hidden flex flex-col">
                 <div className="px-6 py-4 border-b border-gray-700">

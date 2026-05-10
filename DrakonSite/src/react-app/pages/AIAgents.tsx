@@ -39,6 +39,10 @@ import {
   formatDiscoveryImportErrorMessage,
   type CameraDiscoveryImportRequest,
 } from "@/react-app/utils/cameraDiscovery";
+import {
+  applyCameraCaptureAcceleration,
+  type CameraCaptureAccelerationMode,
+} from "@/react-app/utils/cameraCaptureAcceleration";
 import { toggleCameraService } from "@/react-app/utils/cameraService";
 import { brand } from "@/shared/brand";
 import {
@@ -136,6 +140,16 @@ function applyAIAgentsDirectoryState(
   return nextParams;
 }
 
+function getCameraCaptureAccelerationMode(camera: CameraType): CameraCaptureAccelerationMode {
+  return camera.capture_acceleration_mode === "nvidia" ? "nvidia" : "cpu";
+}
+
+function getCameraDisplayName(camera: CameraType): string {
+  return typeof camera.name === "string" && camera.name.trim()
+    ? camera.name.trim()
+    : `Camera #${camera.id}`;
+}
+
 function AIAgentsContent() {
   const { t, i18n } = useTranslation();
   const location = useLocation();
@@ -166,6 +180,9 @@ function AIAgentsContent() {
   const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
+  const [pendingAccelerationCameraIds, setPendingAccelerationCameraIds] = useState<Set<number>>(
+    () => new Set()
+  );
   const editRequestCameraId = useRef<number | null>(null);
   const hasAlignedTutorialCameraStartTabRef = useRef(false);
   const {
@@ -261,6 +278,18 @@ function AIAgentsContent() {
     });
   };
 
+  const updatePendingAccelerationState = (cameraId: number, isPending: boolean) => {
+    setPendingAccelerationCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
   const toggleService = async (camera: CameraType) => {
     const cameraId = camera.id;
     const isRunning = camera.is_service_running === 1;
@@ -308,6 +337,77 @@ function AIAgentsContent() {
       console.error("Failed to toggle service:", error);
     } finally {
       updatePendingCameraState(cameraId, false);
+    }
+  };
+
+  const applyCaptureAcceleration = async (camera: CameraType) => {
+    const cameraId = camera.id;
+    const currentMode = getCameraCaptureAccelerationMode(camera);
+    const requestedMode: CameraCaptureAccelerationMode =
+      currentMode === "nvidia" ? "cpu" : "nvidia";
+
+    if (pendingAccelerationCameraIds.has(cameraId)) {
+      return;
+    }
+
+    updatePendingAccelerationState(cameraId, true);
+
+    try {
+      const result = await applyCameraCaptureAcceleration(cameraId, requestedMode, true);
+      if (result.status !== "applied") {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "GPU Decode Unavailable",
+          message: result.scan?.reason || "GPU decode is not available for this camera.",
+          type: "agent_api_error",
+        });
+        return;
+      }
+
+      dashboardSummaryStore.patchCameraLocal(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      dashboardSummaryStore.refresh();
+
+      const switchedToGpu = result.persisted_mode === "nvidia";
+      const restartMessage =
+        result.running_before_apply && result.restart_enqueued
+          ? "The camera restart was queued on this machine."
+          : result.running_before_apply
+          ? "The preference was saved, but the camera restart could not be queued automatically."
+          : "The new capture mode will be used next time this camera starts.";
+
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: switchedToGpu ? "GPU Decode Enabled" : "CPU Decode Enabled",
+        message: restartMessage,
+        type: "job_started",
+      });
+
+      if (result.restart_error) {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "Camera Restart Pending",
+          message: result.restart_error,
+          type: "agent_api_error",
+        });
+      }
+    } catch (error) {
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: "GPU Decode Error",
+        message:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "Failed to change the camera decode mode.",
+        type: "agent_api_error",
+      });
+    } finally {
+      updatePendingAccelerationState(cameraId, false);
     }
   };
 
@@ -472,6 +572,11 @@ function AIAgentsContent() {
     const isOverlay = mode === "overlay";
     const isRunning = isCameraServiceRunning(camera);
     const isTogglePending = pendingCameraIds.has(camera.id);
+    const isAccelerationPending = pendingAccelerationCameraIds.has(camera.id);
+    const captureAccelerationMode = getCameraCaptureAccelerationMode(camera);
+    const isGpuRequested = captureAccelerationMode === "nvidia";
+    const canToggleAcceleration =
+      String(camera.connection_method || "").trim().toUpperCase() !== "WEBCAM";
     const isTutorialCameraStartTarget =
       !isOverlay &&
       isOnboardingOpen &&
@@ -532,6 +637,35 @@ function AIAgentsContent() {
               {t("dashboard.start")}
             </>
           )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => applyCaptureAcceleration(camera)}
+          disabled={!canToggleAcceleration || isAccelerationPending || isTogglePending}
+          title={
+            canToggleAcceleration
+              ? isGpuRequested
+                ? "Switch to CPU decode"
+                : "Try GPU decode"
+              : "GPU decode is only available for RTSP cameras"
+          }
+          className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
+            !canToggleAcceleration
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-white/10 bg-gray-950/60 px-3 py-2 text-gray-500 backdrop-blur-sm"
+                : "min-h-[44px] rounded-lg bg-gray-800/70 px-3 py-2.5 text-gray-500 md:min-h-0 md:py-2"
+              : isGpuRequested
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-amber-400/20 bg-amber-500/20 px-3 py-2 text-amber-100 backdrop-blur-sm hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                : "min-h-[44px] rounded-lg bg-amber-500/10 px-3 py-2.5 text-amber-300 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
+              : isOverlay
+              ? "min-h-[40px] rounded-xl border border-gray-300/15 bg-gray-950/85 px-3 py-2 text-gray-100 backdrop-blur-sm hover:bg-gray-800/95 disabled:cursor-not-allowed disabled:opacity-60"
+              : "min-h-[44px] rounded-lg bg-gray-800 px-3 py-2.5 text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
+          }`}
+        >
+          <Cpu className="w-4 h-4" />
+          {isAccelerationPending ? t("common.loading") : isGpuRequested ? "GPU" : "CPU"}
         </button>
 
         <button

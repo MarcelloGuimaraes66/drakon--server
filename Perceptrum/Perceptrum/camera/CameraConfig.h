@@ -95,7 +95,8 @@ struct CameraConfig {
     std::string modelPath;
     std::string labelsPath;
 
-    bool useGpu{ true };
+    std::string captureAccelerationMode{ "cpu" };
+    bool useGpu{ false };
 
     // List of algorithm types that came from payload.enabled_algorithms
     std::vector<std::string> enabledAlgorithms;

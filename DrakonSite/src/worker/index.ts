@@ -1828,6 +1828,7 @@ type TimezoneLocalDateTimeParts = {
   day: number;
   hour: number;
   minute: number;
+  second: number;
 };
 
 function getLocalDateTimePartsInTimezone(
@@ -1842,6 +1843,7 @@ function getLocalDateTimePartsInTimezone(
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hour12: false,
     });
 
@@ -1853,18 +1855,20 @@ function getLocalDateTimePartsInTimezone(
     const day = Number.parseInt(get("day"), 10);
     const hour = Number.parseInt(get("hour"), 10);
     const minute = Number.parseInt(get("minute"), 10);
+    const second = Number.parseInt(get("second"), 10);
 
     if (
       !Number.isInteger(year) ||
       !Number.isInteger(month) ||
       !Number.isInteger(day) ||
       !Number.isInteger(hour) ||
-      !Number.isInteger(minute)
+      !Number.isInteger(minute) ||
+      !Number.isInteger(second)
     ) {
       return null;
     }
 
-    return { year, month, day, hour, minute };
+    return { year, month, day, hour, minute, second };
   } catch {
     return null;
   }
@@ -1872,7 +1876,7 @@ function getLocalDateTimePartsInTimezone(
 
 function parseIsoLocalDateParts(
   localDate: string
-): Omit<TimezoneLocalDateTimeParts, "hour" | "minute"> | null {
+): Omit<TimezoneLocalDateTimeParts, "hour" | "minute" | "second"> | null {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(localDate.trim());
   if (!match) return null;
 
@@ -1886,19 +1890,22 @@ function parseIsoLocalDateParts(
 
 function parseHHMMPartsForWindow(
   value: string
-): Pick<TimezoneLocalDateTimeParts, "hour" | "minute"> | null {
-  const match = /^([0-1]?\d|2[0-3]):([0-5]\d)$/.exec(value.trim());
+): Pick<TimezoneLocalDateTimeParts, "hour" | "minute" | "second"> | null {
+  const match = /^([0-1]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/.exec(value.trim());
   if (!match) return null;
 
   const hour = Number.parseInt(match[1], 10);
   const minute = Number.parseInt(match[2], 10);
-  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null;
+  const second = Number.parseInt(match[3] ?? "0", 10);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || !Number.isInteger(second)) {
+    return null;
+  }
 
-  return { hour, minute };
+  return { hour, minute, second };
 }
 
 function wallClockUtcMillis(parts: TimezoneLocalDateTimeParts): number {
-  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0);
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
 }
 
 function localDateTimeInTimezoneToUtcIso(
@@ -1913,7 +1920,7 @@ function localDateTimeInTimezoneToUtcIso(
 
   const target: TimezoneLocalDateTimeParts = { ...dateParts, ...timeParts };
   let guess = new Date(
-    Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute, 0, 0)
+    Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute, target.second, 0)
   );
 
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -1922,7 +1929,6 @@ function localDateTimeInTimezoneToUtcIso(
 
     const deltaMs = wallClockUtcMillis(observed) - wallClockUtcMillis(target);
     if (deltaMs === 0) {
-      guess.setUTCSeconds(0, 0);
       return guess.toISOString();
     }
 
@@ -1936,9 +1942,9 @@ function localDateTimeInTimezoneToUtcIso(
     observed.month === target.month &&
     observed.day === target.day &&
     observed.hour === target.hour &&
-    observed.minute === target.minute
+    observed.minute === target.minute &&
+    observed.second === target.second
   ) {
-    guess.setUTCSeconds(0, 0);
     return guess.toISOString();
   }
 
@@ -7784,6 +7790,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN country_code TEXT`);
         await addColumnIfMissing(
           `ALTER TABLE cameras ADD COLUMN direct_capture_on_motion_only INTEGER NOT NULL DEFAULT 0`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE cameras ADD COLUMN capture_acceleration_mode TEXT NOT NULL DEFAULT 'cpu'`
         );
       }
 
@@ -18800,6 +18809,7 @@ type CameraInsertPayload = {
   webcam_index?: number | null;
   allowpublicaccess?: boolean | number | null;
   direct_capture_on_motion_only?: boolean | number | string | null;
+  capture_acceleration_mode?: "cpu" | "nvidia" | string | null;
 };
 
 function normalizeCameraNameForConnectionMethod(name: string, connectionMethod: string) {
@@ -18878,6 +18888,10 @@ async function createCameraForUser(
     input.direct_capture_on_motion_only,
     false
   );
+  const captureAccelerationMode = normalizeCameraCaptureAccelerationMode(
+    input.capture_acceleration_mode,
+    "cpu"
+  );
 
   const insertResult = await db
     .prepare(
@@ -18887,9 +18901,10 @@ async function createCameraForUser(
         connection_method, store_frames, retention_days, description,
         description_first_check_successful, description_first_check_success_at,
         street, number, city, state, state_code, zip_code, country, country_code,
-        webcam_index, allowpublicaccess, direct_capture_on_motion_only, updated_at
+        webcam_index, allowpublicaccess, direct_capture_on_motion_only,
+        capture_acceleration_mode, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
     )
     .bind(
       userId,
@@ -18931,7 +18946,8 @@ async function createCameraForUser(
       normalizedGeo.countryCode,
       connectionMethod === "WEBCAM" ? input.webcam_index ?? null : null,
       allowPublicAccess,
-      directCaptureOnMotionOnly ? 1 : 0
+      directCaptureOnMotionOnly ? 1 : 0,
+      captureAccelerationMode
     )
     .run();
 
@@ -19088,6 +19104,9 @@ async function updateCameraForUser(
       directCaptureOnMotionOnlyPatch = normalizedDirectCaptureOnMotionOnly;
       updates.push(`${key} = ?`);
       values.push(normalizedDirectCaptureOnMotionOnly ? 1 : 0);
+    } else if (key === "capture_acceleration_mode") {
+      updates.push(`${key} = ?`);
+      values.push(normalizeCameraCaptureAccelerationMode(value, "cpu"));
     } else if (key === "webcam_index") {
       if (value === null) return;
       updates.push(`${key} = ?`);
@@ -24908,6 +24927,7 @@ type LocalTimeParts = {
   monthOfYear: number;    // 1-12
   year: number;
   localTimeHHMM: string;  // HH:MM
+  localTimeHHMMSS: string;  // HH:MM:SS
 };
 
 function getLocalTimeInTimezoneAt(timezone: string, date: Date = new Date()): LocalTimeParts {
@@ -24918,6 +24938,7 @@ function getLocalTimeInTimezoneAt(timezone: string, date: Date = new Date()): Lo
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
     weekday: "short",
     hour12: false,
   });
@@ -24930,6 +24951,7 @@ function getLocalTimeInTimezoneAt(timezone: string, date: Date = new Date()): Lo
   const day = get("day");
   const hour = get("hour");
   const minute = get("minute");
+  const second = get("second");
   const weekdayStr = get("weekday"); // "Sun", "Mon", etc.
 
   const weekdayMap: Record<string, number> = {
@@ -24944,6 +24966,7 @@ function getLocalTimeInTimezoneAt(timezone: string, date: Date = new Date()): Lo
     monthOfYear: parseInt(month, 10),
     year,
     localTimeHHMM: `${hour}:${minute}`,
+    localTimeHHMMSS: `${hour}:${minute}:${second}`,
   };
 }
 
@@ -24987,24 +25010,49 @@ const normalizeTokenUsageAggregate = (row: any): TokenUsageAggregate => {
   };
 };
 
-const normalizeTimeHHMM = (time: string): string | null => {
+type ParsedScheduleTime = {
+  totalSeconds: number;
+  hhmm: string;
+  hhmmss: string;
+  canonical: string;
+  hasExplicitSeconds: boolean;
+};
+
+const parseScheduleTime = (time: string): ParsedScheduleTime | null => {
   if (!time) return null;
   const trimmed = String(time).trim();
   if (!trimmed) return null;
-  const base = trimmed.length >= 5 ? trimmed.slice(0, 5) : trimmed;
-  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec(base);
+  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?$/.exec(trimmed);
   if (!match) return null;
   const hh = match[1].padStart(2, "0");
   const mm = match[2];
-  return `${hh}:${mm}`;
+  const ss = (match[3] || "0").padStart(2, "0");
+  const totalSeconds = parseInt(hh, 10) * 3600 + parseInt(mm, 10) * 60 + parseInt(ss, 10);
+  const hhmm = `${hh}:${mm}`;
+  const hhmmss = `${hhmm}:${ss}`;
+  return {
+    totalSeconds,
+    hhmm,
+    hhmmss,
+    canonical: match[3] ? hhmmss : hhmm,
+    hasExplicitSeconds: !!match[3],
+  };
 };
 
-const parseHHMMToMinutes = (time: string): number | null => {
-  const normalized = normalizeTimeHHMM(time);
-  if (!normalized) return null;
-  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec(normalized);
-  if (!match) return null;
-  return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+const normalizeTimeHHMM = (time: string): string | null => {
+  return parseScheduleTime(time)?.canonical ?? null;
+};
+
+const parseTimeToSeconds = (time: string): number | null => {
+  return parseScheduleTime(time)?.totalSeconds ?? null;
+};
+
+const formatSecondsToHHMMSS = (totalSeconds: number): string => {
+  const safe = Math.max(0, Math.min(86399, Math.floor(totalSeconds)));
+  const hh = String(Math.floor(safe / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((safe % 3600) / 60)).padStart(2, "0");
+  const ss = String(safe % 60).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 };
 
 const formatLocalDate = (y: number, m: number, d: number): string => {
@@ -25087,13 +25135,13 @@ const computeNextScheduleTime = (
   const mode = (scheduleMode || "").toLowerCase();
 
   let baseDate = localNow.localDate;
-  let baseMinutes = parseHHMMToMinutes(localNow.localTimeHHMM) ?? 0;
+  let baseSeconds = parseTimeToSeconds(localNow.localTimeHHMMSS || localNow.localTimeHHMM) ?? 0;
   let baseParts = parseLocalDate(baseDate);
   if (!baseParts) return null;
 
   if (activeFrom && activeFrom > baseDate) {
     baseDate = activeFrom;
-    baseMinutes = 0;
+    baseSeconds = 0;
     const parsed = parseLocalDate(activeFrom);
     if (parsed) {
       baseParts = parsed;
@@ -25105,6 +25153,7 @@ const computeNextScheduleTime = (
         dayOfMonth: parsed.day,
         dayOfWeek: getDayOfWeekForDate(parsed.year, parsed.month, parsed.day),
         localTimeHHMM: "00:00",
+        localTimeHHMMSS: "00:00:00",
       };
     }
   }
@@ -25112,12 +25161,12 @@ const computeNextScheduleTime = (
   const candidates: { date: string; time: string; sortKey: number }[] = [];
 
   for (const entry of entries) {
-    const startMinutes = parseHHMMToMinutes(entry.start_time);
-    if (startMinutes === null) continue;
+    const startSeconds = parseTimeToSeconds(entry.start_time);
+    if (startSeconds === null) continue;
 
     if (mode === "weekly" && entry.day_of_week !== null) {
       let daysUntil = (entry.day_of_week - localNow.dayOfWeek + 7) % 7;
-      if (daysUntil === 0 && startMinutes <= baseMinutes) {
+      if (daysUntil === 0 && startSeconds <= baseSeconds) {
         daysUntil = 7;
       }
       const nextDate = addDaysToDate(baseParts.year, baseParts.month, baseParts.day, daysUntil);
@@ -25126,7 +25175,14 @@ const computeNextScheduleTime = (
       candidates.push({
         date: dateStr,
         time: entry.start_time,
-        sortKey: Date.UTC(nextDate.year, nextDate.month - 1, nextDate.day, Math.floor(startMinutes / 60), startMinutes % 60),
+        sortKey: Date.UTC(
+          nextDate.year,
+          nextDate.month - 1,
+          nextDate.day,
+          Math.floor(startSeconds / 3600),
+          Math.floor((startSeconds % 3600) / 60),
+          startSeconds % 60
+        ),
       });
     }
 
@@ -25138,14 +25194,24 @@ const computeNextScheduleTime = (
         const dim = daysInMonth(year, month);
         if (targetDay <= dim) {
           const isSameMonth = year === baseParts.year && month === baseParts.month;
-          const shouldUse = !isSameMonth || targetDay > baseParts.day || (targetDay === baseParts.day && startMinutes > baseMinutes);
+          const shouldUse =
+            !isSameMonth ||
+            targetDay > baseParts.day ||
+            (targetDay === baseParts.day && startSeconds > baseSeconds);
           if (shouldUse) {
             const dateStr = formatLocalDate(year, month, targetDay);
             if (!activeUntil || dateStr <= activeUntil) {
               candidates.push({
                 date: dateStr,
                 time: entry.start_time,
-                sortKey: Date.UTC(year, month - 1, targetDay, Math.floor(startMinutes / 60), startMinutes % 60),
+                sortKey: Date.UTC(
+                  year,
+                  month - 1,
+                  targetDay,
+                  Math.floor(startSeconds / 3600),
+                  Math.floor((startSeconds % 3600) / 60),
+                  startSeconds % 60
+                ),
               });
             }
             break;
@@ -25170,14 +25236,23 @@ const computeNextScheduleTime = (
           const shouldUse =
             !isSameYear ||
             targetMonth > baseParts.month ||
-            (targetMonth === baseParts.month && (targetDay > baseParts.day || (targetDay === baseParts.day && startMinutes > baseMinutes)));
+            (targetMonth === baseParts.month &&
+              (targetDay > baseParts.day ||
+                (targetDay === baseParts.day && startSeconds > baseSeconds)));
           if (shouldUse) {
             const dateStr = formatLocalDate(year, targetMonth, targetDay);
             if (!activeUntil || dateStr <= activeUntil) {
               candidates.push({
                 date: dateStr,
                 time: entry.start_time,
-                sortKey: Date.UTC(year, targetMonth - 1, targetDay, Math.floor(startMinutes / 60), startMinutes % 60),
+                sortKey: Date.UTC(
+                  year,
+                  targetMonth - 1,
+                  targetDay,
+                  Math.floor(startSeconds / 3600),
+                  Math.floor((startSeconds % 3600) / 60),
+                  startSeconds % 60
+                ),
               });
             }
             break;
@@ -25205,6 +25280,7 @@ const computeNextScheduleTime = (
         monthOfYear: activeBase.month,
         year: activeBase.year,
         localTimeHHMM: "00:00",
+        localTimeHHMMSS: "00:00:00",
       },
       activeFrom,
       activeUntil
@@ -25226,7 +25302,7 @@ const computeUpcomingOccurrences = (
 
   const mode = (scheduleMode || "").toLowerCase();
 
-  const baseMinutes = parseHHMMToMinutes(localNow.localTimeHHMM) ?? 0;
+  const baseSeconds = parseTimeToSeconds(localNow.localTimeHHMMSS || localNow.localTimeHHMM) ?? 0;
   const occurrences: Array<{ date: string; time: string; sortKey: number }> = [];
 
   for (let i = 0; i <= daysAhead; i++) {
@@ -25240,8 +25316,8 @@ const computeUpcomingOccurrences = (
     for (const entry of entries) {
       const normalizedTime = normalizeTimeHHMM(entry.start_time);
       if (!normalizedTime) continue;
-      const startMinutes = parseHHMMToMinutes(normalizedTime);
-      if (startMinutes === null) continue;
+      const startSeconds = parseTimeToSeconds(normalizedTime);
+      if (startSeconds === null) continue;
 
       if (mode === "weekly") {
         if (entry.day_of_week === null || entry.day_of_week !== dow) continue;
@@ -25260,7 +25336,7 @@ const computeUpcomingOccurrences = (
         continue;
       }
 
-      if (i === 0 && startMinutes <= baseMinutes) continue;
+      if (i === 0 && startSeconds <= baseSeconds) continue;
 
       occurrences.push({
         date: dateStr,
@@ -25269,8 +25345,9 @@ const computeUpcomingOccurrences = (
           dateParts.year,
           dateParts.month - 1,
           dateParts.day,
-          Math.floor(startMinutes / 60),
-          startMinutes % 60
+          Math.floor(startSeconds / 3600),
+          Math.floor((startSeconds % 3600) / 60),
+          startSeconds % 60
         ),
       });
     }
@@ -25282,8 +25359,8 @@ const computeUpcomingOccurrences = (
 
 type RecurringScheduleMode = "weekly" | "monthly" | "yearly";
 type RecurringScheduleWindow = {
-  startMinutes: number;
-  endMinutes: number;
+  startSeconds: number;
+  endSeconds: number;
 };
 type RecurringScheduleDay = {
   day_of_week: number | null;
@@ -25322,13 +25399,6 @@ const normalizeRecurringScheduleMode = (value: unknown): RecurringScheduleMode |
   return null;
 };
 
-const formatMinutesToHHMM = (totalMinutes: number): string => {
-  const safe = Math.max(0, Math.min(1439, Math.floor(totalMinutes)));
-  const hh = String(Math.floor(safe / 60)).padStart(2, "0");
-  const mm = String(safe % 60).padStart(2, "0");
-  return `${hh}:${mm}`;
-};
-
 const normalizeRecurringScheduleDayFromRaw = (
   mode: RecurringScheduleMode,
   rawDay: {
@@ -25341,14 +25411,20 @@ const normalizeRecurringScheduleDayFromRaw = (
   const windowsRaw = Array.isArray(rawDay.windows) ? rawDay.windows : [];
   const windows: RecurringScheduleWindow[] = [];
   for (const window of windowsRaw) {
-    const startMinutes = parseHHMMToMinutes(String(window?.start_time ?? ""));
-    const endMinutes = parseHHMMToMinutes(String(window?.end_time ?? ""));
-    if (startMinutes === null || endMinutes === null) continue;
-    if (endMinutes <= startMinutes) continue;
+    const startSeconds = parseTimeToSeconds(String(window?.start_time ?? ""));
+    const endSeconds = parseTimeToSeconds(String(window?.end_time ?? ""));
+    if (startSeconds === null || endSeconds === null) continue;
+    if (endSeconds <= startSeconds) continue;
     windows.push({
-      startMinutes,
-      endMinutes,
+      startSeconds,
+      endSeconds,
     });
+  }
+  windows.sort((a, b) => a.startSeconds - b.startSeconds || a.endSeconds - b.endSeconds);
+  for (let i = 1; i < windows.length; i += 1) {
+    if (windows[i - 1].endSeconds > windows[i].startSeconds) {
+      return null;
+    }
   }
   if (windows.length === 0) return null;
 
@@ -25446,8 +25522,8 @@ const buildRecurringScheduleDaysInputFromSchedule = (
     ...(day.day_of_month !== null ? { day_of_month: day.day_of_month } : {}),
     ...(day.month_of_year !== null ? { month_of_year: day.month_of_year } : {}),
     windows: day.windows.map((window) => ({
-      start_time: formatMinutesToHHMM(window.startMinutes),
-      end_time: formatMinutesToHHMM(window.endMinutes),
+      start_time: formatSecondsToHHMMSS(window.startSeconds),
+      end_time: formatSecondsToHHMMSS(window.endSeconds),
     })),
   }));
 };
@@ -25507,7 +25583,7 @@ const buildRecurringIntervalsByDate = (
       if (day.windows.length === 0) continue;
       const current = intervalsByDate.get(dateStr) || [];
       for (const window of day.windows) {
-        if (window.endMinutes <= window.startMinutes) continue;
+        if (window.endSeconds <= window.startSeconds) continue;
         current.push(window);
       }
       if (current.length > 0) {
@@ -25537,7 +25613,7 @@ const recurringSchedulesOverlap = (
     if (!secondIntervals || secondIntervals.length === 0) continue;
     for (const first of firstIntervals) {
       for (const second of secondIntervals) {
-        if (first.startMinutes < second.endMinutes && second.startMinutes < first.endMinutes) {
+        if (first.startSeconds < second.endSeconds && second.startSeconds < first.endSeconds) {
           return true;
         }
       }
@@ -25545,6 +25621,142 @@ const recurringSchedulesOverlap = (
   }
 
   return false;
+};
+
+type PersistedScheduleDayInput = {
+  day_name: string;
+  day_of_week?: number;
+  day_of_month?: number;
+  month_of_year?: number;
+  windows: Array<{ start_time: string; end_time: string }>;
+};
+
+const normalizeScheduleDaysForPersistence = (
+  scheduleMode: string,
+  rawDays: Array<{
+    day_name?: unknown;
+    day_of_week?: unknown;
+    day_of_month?: unknown;
+    month_of_year?: unknown;
+    windows?: Array<{ start_time?: unknown; end_time?: unknown }>;
+  }>
+): { days: PersistedScheduleDayInput[] } | { error: string } => {
+  const mode = normalizeRecurringScheduleMode(scheduleMode);
+  if (!mode) {
+    return { error: "Invalid schedule mode" };
+  }
+  if (!Array.isArray(rawDays) || rawDays.length === 0) {
+    return { error: "At least one schedule day is required for recurring schedules" };
+  }
+
+  const seenDays = new Set<string>();
+  const normalizedDays: PersistedScheduleDayInput[] = [];
+
+  for (const rawDay of rawDays) {
+    const dayName =
+      typeof rawDay?.day_name === "string" ? rawDay.day_name.trim() : "";
+    if (!dayName) {
+      return { error: "day_name is required for each schedule day" };
+    }
+
+    const dayOfWeek = Number(rawDay?.day_of_week);
+    const dayOfMonth = Number(rawDay?.day_of_month);
+    const monthOfYear = Number(rawDay?.month_of_year);
+
+    let dayKey = dayName;
+    if (mode === "weekly") {
+      if (!Number.isInteger(dayOfWeek) || dayOfWeek < 0 || dayOfWeek > 6) {
+        return { error: `day_of_week is required for weekly schedule (${dayName})` };
+      }
+      dayKey = `w:${dayOfWeek}`;
+    } else if (mode === "monthly") {
+      if (!Number.isInteger(dayOfMonth) || dayOfMonth < 1 || dayOfMonth > 31) {
+        return { error: `day_of_month is required for monthly schedule (${dayName})` };
+      }
+      dayKey = `m:${dayOfMonth}`;
+    } else {
+      if (!Number.isInteger(monthOfYear) || monthOfYear < 1 || monthOfYear > 12) {
+        return { error: `month_of_year and day_of_month are required for yearly schedule (${dayName})` };
+      }
+      if (!Number.isInteger(dayOfMonth) || dayOfMonth < 1 || dayOfMonth > 31) {
+        return { error: `month_of_year and day_of_month are required for yearly schedule (${dayName})` };
+      }
+      dayKey = `y:${monthOfYear}:${dayOfMonth}`;
+    }
+
+    if (seenDays.has(dayKey)) {
+      return { error: `Duplicate schedule day detected for ${dayName}` };
+    }
+    seenDays.add(dayKey);
+
+    if (!Array.isArray(rawDay?.windows) || rawDay.windows.length === 0) {
+      return { error: `At least one time window is required for ${dayName}` };
+    }
+
+    const normalizedWindowsRaw = rawDay.windows
+      .map((window) => {
+        const startSeconds = parseTimeToSeconds(String(window?.start_time ?? ""));
+        const endSeconds = parseTimeToSeconds(String(window?.end_time ?? ""));
+        if (startSeconds === null || endSeconds === null) {
+          return { error: `Invalid time format in ${dayName}. Use HH:MM or HH:MM:SS format.` };
+        }
+        if (endSeconds <= startSeconds) {
+          return { error: `Start time must be before end time in ${dayName}` };
+        }
+        return {
+          start_time: formatSecondsToHHMMSS(startSeconds),
+          end_time: formatSecondsToHHMMSS(endSeconds),
+          startSeconds,
+          endSeconds,
+        };
+      });
+
+    const invalidWindow = normalizedWindowsRaw.find(
+      (window): window is { error: string } => "error" in window
+    );
+    if (invalidWindow) {
+      return { error: invalidWindow.error };
+    }
+
+    const normalizedWindows = normalizedWindowsRaw.filter(
+      (
+        window
+      ): window is {
+        start_time: string;
+        end_time: string;
+        startSeconds: number;
+        endSeconds: number;
+      } => !("error" in window)
+    );
+
+    normalizedWindows.sort(
+      (a, b) => a.startSeconds - b.startSeconds || a.endSeconds - b.endSeconds
+    );
+
+    for (let i = 1; i < normalizedWindows.length; i += 1) {
+      const previousWindow = normalizedWindows[i - 1];
+      const currentWindow = normalizedWindows[i];
+      if (!previousWindow || !currentWindow) {
+        continue;
+      }
+      if (previousWindow.endSeconds > currentWindow.startSeconds) {
+        return { error: `Time windows cannot overlap in ${dayName}` };
+      }
+    }
+
+    normalizedDays.push({
+      day_name: dayName,
+      ...(mode === "weekly" ? { day_of_week: dayOfWeek } : {}),
+      ...(mode === "monthly" ? { day_of_month: dayOfMonth } : {}),
+      ...(mode === "yearly" ? { month_of_year: monthOfYear, day_of_month: dayOfMonth } : {}),
+      windows: normalizedWindows.map(({ start_time, end_time }) => ({
+        start_time,
+        end_time,
+      })),
+    });
+  }
+
+  return { days: normalizedDays };
 };
 
 const doesInferenceGroupsUseCoreModel = (raw: unknown): boolean => {
@@ -28190,7 +28402,11 @@ app.delete("/api/cameras/:id", anyAuthMiddleware, async (c) => {
 async function enqueueStartCameraCommand(
   env: Env,
   userId: string,
-  cameraId: number
+  cameraId: number,
+  options?: {
+    targetClientId?: string | null;
+    targetExeId?: string | null;
+  }
 ): Promise<{
   success: boolean;
   agents_disabled_no_subscription?: boolean;
@@ -28204,12 +28420,32 @@ async function enqueueStartCameraCommand(
       return { success: false, error: "Invalid camera id" };
     }
 
-    // Optional: ensure EXE is connected
-    const pairing = await env.DB.prepare(
-      "SELECT * FROM exe_pairings WHERE user_id = ? AND status = 'connected'"
-    )
-      .bind(userId)
-      .first();
+    const requestedTargetClientId =
+      typeof options?.targetClientId === "string" && options.targetClientId.trim()
+        ? options.targetClientId.trim()
+        : null;
+    const requestedTargetExeId =
+      typeof options?.targetExeId === "string" && options.targetExeId.trim()
+        ? options.targetExeId.trim()
+        : null;
+
+    let pairingQuery =
+      `SELECT *
+       FROM exe_pairings
+       WHERE user_id = ? AND status = 'connected'`;
+    const pairingQueryArgs: Array<string | null> = [userId];
+
+    if (requestedTargetClientId) {
+      pairingQuery += ` AND client_id = ?`;
+      pairingQueryArgs.push(requestedTargetClientId);
+    }
+    if (requestedTargetExeId) {
+      pairingQuery += ` AND exe_id = ?`;
+      pairingQueryArgs.push(requestedTargetExeId);
+    }
+    pairingQuery += ` ORDER BY COALESCE(last_seen_at, paired_at) DESC LIMIT 1`;
+
+    const pairing = await env.DB.prepare(pairingQuery).bind(...pairingQueryArgs).first();
 
     if (!pairing) {
       return { success: false, error: "No EXE connected" };
@@ -28341,6 +28577,10 @@ async function enqueueStartCameraCommand(
     // Perceptrum follows subscription-backed limits; Drakon preserves camera-level settings.
     const effectiveAnalysisSpeed = subscriptionSecondsPerFrame;
     const effectiveModelTier = subscriptionModelTier;
+    const captureAccelerationMode = normalizeCameraCaptureAccelerationMode(
+      cam.capture_acceleration_mode,
+      "cpu"
+    );
 
     console.log(
       enforcePerceptrumLicenseRules
@@ -28374,6 +28614,8 @@ async function enqueueStartCameraCommand(
       retention_days: cam.retention_days,
       frame_rate: frameRate,
       webcam_index: cam.webcam_index,
+      capture_acceleration_mode: captureAccelerationMode,
+      use_gpu: captureAccelerationMode === "nvidia",
       analysis_speed: effectiveAnalysisSpeed,
       model_tier: effectiveModelTier,
       telegram_enabled: telegram.enabled,
@@ -28437,8 +28679,20 @@ async function enqueueStartCameraCommand(
     // Send start_camera command to EXE
     await env.DB.prepare(
       `INSERT INTO commands 
-         (user_id, camera_id, command_type, payload, status, created_at, updated_at, command_event_id, camera_session_id)
-       VALUES (?, ?, 'start_camera', ?, 'pending', ?, ?, ?, ?)`
+         (
+           user_id,
+           camera_id,
+           command_type,
+           payload,
+           status,
+           created_at,
+           updated_at,
+           command_event_id,
+           camera_session_id,
+           target_client_id,
+           target_exe_id
+         )
+       VALUES (?, ?, 'start_camera', ?, 'pending', ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         userId,
@@ -28447,7 +28701,9 @@ async function enqueueStartCameraCommand(
         now,
         now,
         commandEventId,
-        cameraSessionId
+        cameraSessionId,
+        typeof (pairing as any)?.client_id === "string" ? String((pairing as any).client_id) : null,
+        typeof (pairing as any)?.exe_id === "string" ? String((pairing as any).exe_id) : null
       )
       .run();
 
@@ -28887,6 +29143,261 @@ async function waitForCommandTerminalResult(
   return null;
 }
 
+type CameraCommandTarget = {
+  clientId: string;
+  exeId: string | null;
+  source: "camera_runtime" | "pairing_latest";
+};
+
+async function resolveLatestConnectedExeTarget(
+  db: D1Database,
+  userId: string
+): Promise<CameraCommandTarget | null> {
+  const pairing = await db
+    .prepare(
+      `SELECT client_id, exe_id
+       FROM exe_pairings
+       WHERE user_id = ? AND status = 'connected'
+       ORDER BY COALESCE(last_seen_at, paired_at) DESC
+       LIMIT 1`
+    )
+    .bind(userId)
+    .first();
+
+  const clientId =
+    typeof (pairing as any)?.client_id === "string" && String((pairing as any).client_id).trim()
+      ? String((pairing as any).client_id).trim()
+      : null;
+  const exeId =
+    typeof (pairing as any)?.exe_id === "string" && String((pairing as any).exe_id).trim()
+      ? String((pairing as any).exe_id).trim()
+      : null;
+
+  if (!clientId) {
+    return null;
+  }
+
+  return {
+    clientId,
+    exeId,
+    source: "pairing_latest",
+  };
+}
+
+async function resolveCameraCommandTarget(
+  db: D1Database,
+  userId: string,
+  cameraId: number
+): Promise<CameraCommandTarget | null> {
+  const runtimeTarget = await db
+    .prepare(
+      `SELECT client_id, exe_id
+       FROM open_monitor_camera_latest
+       WHERE user_id = ? AND camera_id = ?
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    )
+    .bind(userId, cameraId)
+    .first();
+
+  const runtimeClientId =
+    typeof (runtimeTarget as any)?.client_id === "string" &&
+    String((runtimeTarget as any).client_id).trim()
+      ? String((runtimeTarget as any).client_id).trim()
+      : null;
+  const runtimeExeId =
+    typeof (runtimeTarget as any)?.exe_id === "string" && String((runtimeTarget as any).exe_id).trim()
+      ? String((runtimeTarget as any).exe_id).trim()
+      : null;
+
+  if (runtimeClientId) {
+    return {
+      clientId: runtimeClientId,
+      exeId: runtimeExeId,
+      source: "camera_runtime",
+    };
+  }
+
+  return resolveLatestConnectedExeTarget(db, userId);
+}
+
+async function enqueueCameraCaptureAccelerationProbeCommand(
+  env: Env,
+  userId: string,
+  cameraId: number,
+  target: CameraCommandTarget,
+  requestedMode: CameraCaptureAccelerationMode
+): Promise<{
+  success: boolean;
+  status?: "supported" | "unsupported" | "unavailable";
+  reasonCode?: string;
+  reason?: string;
+  requestedMode?: CameraCaptureAccelerationMode;
+}> {
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return {
+      success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "invalid_camera_id",
+      reason: "Invalid camera id",
+    };
+  }
+
+  if (!target?.clientId) {
+    return {
+      success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "no_connected_exe",
+      reason: "No EXE connected",
+    };
+  }
+
+  const camera = await getCameraForUser(env.DB, userId, cameraId);
+  if (!camera) {
+    return {
+      success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "camera_not_found",
+      reason: "Camera not found",
+    };
+  }
+
+  const cam = camera as any;
+  const connectionMethod = normalizeCameraTransportField(cam.connection_method) ?? "";
+  if (String(connectionMethod).trim().toUpperCase() === "WEBCAM") {
+    return {
+      success: true,
+      status: "unsupported",
+      requestedMode,
+      reasonCode: "not_rtsp",
+      reason: "GPU decode is only available for RTSP cameras in this version.",
+    };
+  }
+
+  const payload = {
+    camera_id: cam.id,
+    name: cam.name,
+    ip: normalizeCameraTransportField(cam.ip_address) ?? "",
+    port: normalizeCameraTransportField(cam.rtsp_port),
+    username: normalizeCameraTransportField(cam.username) ?? "",
+    password: typeof cam.password === "string" ? cam.password : "",
+    channel: normalizeCameraTransportField(cam.channel),
+    subtype: normalizeCameraTransportField(cam.subtype),
+    manufacturer: normalizeCameraTransportField(cam.manufacturer),
+    connection_method: connectionMethod,
+    webcam_index:
+      cam.webcam_index === null || cam.webcam_index === undefined
+        ? null
+        : Number(cam.webcam_index),
+    requested_mode: requestedMode,
+  };
+
+  const now = new Date().toISOString();
+  const insertResult = await env.DB
+    .prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         target_client_id,
+         target_exe_id
+       )
+       VALUES (?, ?, 'probe_camera_capture_acceleration', ?, 'pending', ?, ?, ?, ?)`
+    )
+    .bind(
+      userId,
+      cameraId,
+      JSON.stringify(payload),
+      now,
+      now,
+      target.clientId,
+      target.exeId
+    )
+    .run();
+
+  const commandId = Number(insertResult.meta.last_row_id || 0);
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return {
+      success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "command_enqueue_failed",
+      reason: "Failed to enqueue GPU probe command",
+    };
+  }
+
+  const terminalResult = await waitForCommandTerminalResult(env.DB, userId, commandId);
+  if (!terminalResult) {
+    const timeoutAt = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE commands
+       SET status = 'failed', result = ?, updated_at = ?
+       WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
+    )
+      .bind(
+        JSON.stringify({
+          status: "failed",
+          result: null,
+          error: "camera capture acceleration probe timed out",
+          reported_at: timeoutAt,
+        }),
+        timeoutAt,
+        commandId,
+        userId
+      )
+      .run();
+
+    return {
+      success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "probe_timed_out",
+      reason: "GPU probe timed out",
+    };
+  }
+
+  const resultObject = parseJsonObject(terminalResult.envelope.result);
+  const statusRaw =
+    typeof resultObject.status === "string" ? resultObject.status.trim().toLowerCase() : "";
+  const normalizedStatus =
+    statusRaw === "supported" || statusRaw === "unsupported" || statusRaw === "unavailable"
+      ? statusRaw
+      : terminalResult.status === "failed"
+      ? "unavailable"
+      : "unsupported";
+  const reasonCode =
+    typeof resultObject.reason_code === "string" && resultObject.reason_code.trim()
+      ? resultObject.reason_code.trim()
+      : terminalResult.status === "failed"
+      ? "probe_failed"
+      : normalizedStatus === "supported"
+      ? "ok"
+      : "unsupported";
+  const reason =
+    typeof resultObject.reason === "string" && resultObject.reason.trim()
+      ? resultObject.reason.trim()
+      : typeof terminalResult.envelope.error === "string" && terminalResult.envelope.error.trim()
+      ? terminalResult.envelope.error.trim()
+      : normalizedStatus === "supported"
+      ? "GPU decode is available on this machine."
+      : "GPU decode is not available for this camera on this machine.";
+
+  return {
+    success: normalizedStatus === "supported",
+    status: normalizedStatus,
+    requestedMode,
+    reasonCode,
+    reason,
+  };
+}
+
 async function enqueueWebcamProbeCommand(
   env: Env,
   userId: string,
@@ -28904,7 +29415,7 @@ async function enqueueWebcamProbeCommand(
     `SELECT client_id, exe_id
      FROM exe_pairings
      WHERE user_id = ? AND status = 'connected'
-     ORDER BY COALESCE(last_seen_at, created_at) DESC
+     ORDER BY COALESCE(last_seen_at, paired_at) DESC
      LIMIT 1`
   )
     .bind(userId)
@@ -29138,6 +29649,134 @@ app.post("/api/cameras/:cameraId/stop", anyAuthMiddleware, async (c) => {
     success: true,
     already_stopped: Boolean(result.already_stopped),
     camera_name: result.camera_name ?? null,
+  });
+});
+
+app.post("/api/cameras/:cameraId/capture-acceleration/apply", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
+
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return c.json({ error: "Invalid camera id" }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const requestedModeRaw =
+    body && typeof body === "object" ? (body as Record<string, unknown>).requested_mode : null;
+  const requestedModeIsValid =
+    typeof requestedModeRaw === "string" &&
+    ["cpu", "nvidia", "gpu", "cuda", "nvdec", "software", "sw", "off"].includes(
+      requestedModeRaw.trim().toLowerCase()
+    );
+  if (!requestedModeIsValid) {
+    return c.json({ error: "requested_mode must be 'cpu' or 'nvidia'" }, 400);
+  }
+
+  const requestedMode = normalizeCameraCaptureAccelerationMode(requestedModeRaw, "cpu");
+  const restartIfRunning =
+    !body || typeof body !== "object" || (body as Record<string, unknown>).restart_if_running !== false;
+
+  const existingCamera = await getCameraForUser(c.env.DB, user.id, cameraId);
+  if (!existingCamera) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+
+  const camera = existingCamera as any;
+  const currentMode = normalizeCameraCaptureAccelerationMode(camera.capture_acceleration_mode, "cpu");
+  const runningBeforeApply = Number(camera.is_service_running) === 1;
+
+  let scan:
+    | {
+        status: "supported" | "unsupported" | "unavailable" | "not_needed";
+        reason_code: string;
+        reason: string;
+      }
+    | null = null;
+  let target: CameraCommandTarget | null = null;
+
+  if (requestedMode === "nvidia") {
+    target = await resolveCameraCommandTarget(c.env.DB, user.id, cameraId);
+    if (!target) {
+      return c.json({
+        status: "unavailable",
+        persisted_mode: currentMode,
+        running_before_apply: runningBeforeApply,
+        restart_enqueued: false,
+        scan: {
+          status: "unavailable",
+          reason_code: "no_connected_exe",
+          reason: "No EXE connected to run the GPU compatibility scan.",
+        },
+      });
+    }
+
+    const probe = await enqueueCameraCaptureAccelerationProbeCommand(
+      c.env,
+      user.id,
+      cameraId,
+      target,
+      requestedMode
+    );
+    scan = {
+      status: probe.status || "unavailable",
+      reason_code: probe.reasonCode || "probe_failed",
+      reason: probe.reason || "GPU compatibility scan failed.",
+    };
+    if (probe.status !== "supported") {
+      return c.json({
+        status: probe.status || "unsupported",
+        persisted_mode: currentMode,
+        running_before_apply: runningBeforeApply,
+        restart_enqueued: false,
+        scan,
+      });
+    }
+  } else {
+    scan = {
+      status: "not_needed",
+      reason_code: "cpu_selected",
+      reason: "CPU decode does not require a GPU compatibility scan.",
+    };
+  }
+
+  if (currentMode !== requestedMode) {
+    await updateCameraForUser(c.env.DB, user.id, cameraId, {
+      capture_acceleration_mode: requestedMode,
+    });
+  }
+
+  let restartEnqueued = false;
+  let restartError: string | null = null;
+
+  if (runningBeforeApply && restartIfRunning) {
+    target = target || (await resolveCameraCommandTarget(c.env.DB, user.id, cameraId));
+    if (target) {
+      const restartResult = await enqueueStartCameraCommand(c.env, user.id, cameraId, {
+        targetClientId: target.clientId,
+        targetExeId: target.exeId,
+      });
+      restartEnqueued = restartResult.success;
+      if (!restartResult.success) {
+        restartError = restartResult.error || "Failed to enqueue camera restart";
+      }
+    } else {
+      restartError = "Saved the capture mode, but no EXE is connected to restart this camera.";
+    }
+  }
+
+  const updatedCamera = await getCameraForUser(c.env.DB, user.id, cameraId);
+  const persistedMode = normalizeCameraCaptureAccelerationMode(
+    (updatedCamera as any)?.capture_acceleration_mode,
+    requestedMode
+  );
+
+  return c.json({
+    status: "applied",
+    persisted_mode: persistedMode,
+    running_before_apply: runningBeforeApply,
+    restart_enqueued: restartEnqueued,
+    restart_error: restartError,
+    scan,
   });
 });
 
@@ -30191,6 +30830,16 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
     else if (!cfg.display_name) cfg.display_name = algorithmType;
     return cfg;
   })();
+  if (
+    normalizeJobStepExecutionBackend(configJsonObject.execution_backend) ===
+      PORTAL_COUNTER_EXECUTION_BACKEND ||
+    algorithmType === PORTAL_COUNTER_AGENT_KEY
+  ) {
+    return c.json(
+      { error: "Portal counter is only supported on job step camera agents" },
+      400
+    );
+  }
   const storedAlertChannelsJson = serializeAlertChannelsInput(body.alert_channels);
 
   const now = new Date().toISOString();
@@ -30382,6 +31031,34 @@ app.patch("/api/cameras/:cameraId/custom-agents/:algorithmId", anyAuthMiddleware
   }
   if (!alertCondition) {
     return c.json({ error: "alert_condition is required" }, 400);
+  }
+  const bodyConfigJsonObject = (() => {
+    let cfg: any = {};
+    if (typeof body.config_json === "string" && body.config_json.trim()) {
+      try {
+        const parsed = JSON.parse(body.config_json);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) cfg = parsed;
+      } catch {
+        cfg = {};
+      }
+    } else if (
+      body.config_json &&
+      typeof body.config_json === "object" &&
+      !Array.isArray(body.config_json)
+    ) {
+      cfg = { ...(body.config_json as Record<string, unknown>) };
+    }
+    return cfg;
+  })();
+  if (
+    normalizeJobStepExecutionBackend(bodyConfigJsonObject.execution_backend) ===
+      PORTAL_COUNTER_EXECUTION_BACKEND ||
+    algorithmType === PORTAL_COUNTER_AGENT_KEY
+  ) {
+    return c.json(
+      { error: "Portal counter is only supported on job step camera agents" },
+      400
+    );
   }
 
   const existingPriorityLevel =
@@ -38421,6 +39098,34 @@ function normalizeCameraDirectCaptureOnMotion(
     }
     if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
       return true;
+    }
+  }
+  return fallback;
+}
+
+type CameraCaptureAccelerationMode = "cpu" | "nvidia";
+
+function normalizeCameraCaptureAccelerationMode(
+  value: unknown,
+  fallback: CameraCaptureAccelerationMode = "cpu"
+): CameraCaptureAccelerationMode {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "nvidia" ||
+      normalized === "gpu" ||
+      normalized === "cuda" ||
+      normalized === "nvdec"
+    ) {
+      return "nvidia";
+    }
+    if (
+      normalized === "cpu" ||
+      normalized === "software" ||
+      normalized === "sw" ||
+      normalized === "off"
+    ) {
+      return "cpu";
     }
   }
   return fallback;
@@ -56185,51 +56890,14 @@ app.post("/api/jobs", anyAuthMiddleware, async (c) => {
     }
   }
 
-  // Validate schedule_days for recurring schedules
-  if (scheduleDays.length === 0) {
-    return c.json({ 
-      error: "At least one schedule day is required for recurring schedules" 
-    }, 400);
+  const normalizedScheduleDaysResult = normalizeScheduleDaysForPersistence(
+    scheduleMode,
+    scheduleDays
+  );
+  if ("error" in normalizedScheduleDaysResult) {
+    return c.json({ error: normalizedScheduleDaysResult.error }, 400);
   }
-
-  for (const day of scheduleDays) {
-    if (!day.day_name || day.day_name.trim() === "") {
-      return c.json({ error: "day_name is required for each schedule day" }, 400);
-    }
-    
-    if (!day.windows || day.windows.length === 0) {
-      return c.json({ error: `At least one time window is required for ${day.day_name}` }, 400);
-    }
-
-    // Validate windows
-    for (const window of day.windows) {
-      if (!window.start_time || !window.end_time) {
-        return c.json({ error: `start_time and end_time are required for windows in ${day.day_name}` }, 400);
-      }
-      
-      // Basic time format validation
-      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-      if (!timeRegex.test(window.start_time) || !timeRegex.test(window.end_time)) {
-        return c.json({ error: `Invalid time format in ${day.day_name}. Use HH:MM format.` }, 400);
-      }
-      
-      // Validate start < end
-      if (window.start_time >= window.end_time) {
-        return c.json({ error: `Start time must be before end time in ${day.day_name}` }, 400);
-      }
-    }
-
-    // Validate mode-specific fields
-    if (scheduleMode === "weekly" && day.day_of_week === undefined) {
-      return c.json({ error: `day_of_week is required for weekly schedule (${day.day_name})` }, 400);
-    }
-    if (scheduleMode === "monthly" && day.day_of_month === undefined) {
-      return c.json({ error: `day_of_month is required for monthly schedule (${day.day_name})` }, 400);
-    }
-    if (scheduleMode === "yearly" && (day.month_of_year === undefined || day.day_of_month === undefined)) {
-      return c.json({ error: `month_of_year and day_of_month are required for yearly schedule (${day.day_name})` }, 400);
-    }
-  }
+  const normalizedScheduleDays = normalizedScheduleDaysResult.days;
 
   // Set active_from to today if not provided
   const activeFrom = body.active_from || todayDate;
@@ -56257,7 +56925,7 @@ app.post("/api/jobs", anyAuthMiddleware, async (c) => {
 
   // Insert schedule days and windows
   let daySortOrder = 0;
-  for (const day of scheduleDays) {
+  for (const day of normalizedScheduleDays) {
     // Insert into job_schedule_days
     const dayResult = await c.env.DB.prepare(
       `INSERT INTO job_schedule_days (job_id, schedule_mode, day_name, day_of_week, day_of_month, month_of_year, sort_order, created_at, updated_at)
@@ -56614,7 +57282,14 @@ async function updateJobForUser(
         scheduleDays = convertLegacySchedule(body.weekly_schedule, newScheduleMode) ?? [];
       }
       if (scheduleDays.length > 0) {
-        await insertScheduleData(scheduleDays, newScheduleMode);
+        const normalizedScheduleDaysResult = normalizeScheduleDaysForPersistence(
+          newScheduleMode,
+          scheduleDays
+        );
+        if ("error" in normalizedScheduleDaysResult) {
+          return { statusCode: 400, body: { error: normalizedScheduleDaysResult.error } };
+        }
+        await insertScheduleData(normalizedScheduleDaysResult.days, newScheduleMode);
       }
     }
   } else if (isRecurringMode) {
@@ -56624,8 +57299,15 @@ async function updateJobForUser(
     }
 
     if (scheduleDays.length > 0) {
+      const normalizedScheduleDaysResult = normalizeScheduleDaysForPersistence(
+        newScheduleMode,
+        scheduleDays
+      );
+      if ("error" in normalizedScheduleDaysResult) {
+        return { statusCode: 400, body: { error: normalizedScheduleDaysResult.error } };
+      }
       await deleteScheduleData();
-      await insertScheduleData(scheduleDays, newScheduleMode);
+      await insertScheduleData(normalizedScheduleDaysResult.days, newScheduleMode);
     }
 
     const updates: string[] = [];
@@ -57073,7 +57755,14 @@ app.put("/api/jobs/:id", anyAuthMiddleware, async (c) => {
         scheduleDays = convertLegacySchedule(body.weekly_schedule, newScheduleMode) ?? [];
       }
       if (scheduleDays.length > 0) {
-        await insertScheduleData(scheduleDays, newScheduleMode);
+        const normalizedScheduleDaysResult = normalizeScheduleDaysForPersistence(
+          newScheduleMode,
+          scheduleDays
+        );
+        if ("error" in normalizedScheduleDaysResult) {
+          return c.json({ error: normalizedScheduleDaysResult.error }, 400);
+        }
+        await insertScheduleData(normalizedScheduleDaysResult.days, newScheduleMode);
       }
     }
   } else if (isRecurringMode) {
@@ -57085,8 +57774,15 @@ app.put("/api/jobs/:id", anyAuthMiddleware, async (c) => {
 
     // If schedule_days provided, replace all schedule data
     if (scheduleDays.length > 0) {
+      const normalizedScheduleDaysResult = normalizeScheduleDaysForPersistence(
+        newScheduleMode,
+        scheduleDays
+      );
+      if ("error" in normalizedScheduleDaysResult) {
+        return c.json({ error: normalizedScheduleDaysResult.error }, 400);
+      }
       await deleteScheduleData();
-      await insertScheduleData(scheduleDays, newScheduleMode);
+      await insertScheduleData(normalizedScheduleDaysResult.days, newScheduleMode);
     }
 
     // Update job fields (but not start_at/end_at for recurring jobs)
@@ -58480,6 +59176,80 @@ function parseJobStepAgentParamsObject(value: unknown): Record<string, unknown> 
     return {};
   }
   return { ...parsed };
+}
+
+type JobStepExecutionBackend = "llm" | "opencv_portal_counter";
+
+type PortalCounterParams = {
+  region_id: string;
+  min_count_to_alert: number;
+  min_area: number;
+  max_area: number;
+  warmup_frames: number;
+  min_track_frames_for_count: number;
+  max_missed_frames: number;
+  min_path_length_px: number;
+  max_proof_frames: number;
+  save_annotated_video: boolean;
+};
+
+const PORTAL_COUNTER_EXECUTION_BACKEND: JobStepExecutionBackend = "opencv_portal_counter";
+const PORTAL_COUNTER_AGENT_KEY = "portal_counter";
+const DEFAULT_PORTAL_COUNTER_SUMMARY =
+  "Counts portal passages with native OpenCV analysis after the step finishes.";
+
+function normalizeJobStepExecutionBackend(value: unknown): JobStepExecutionBackend {
+  return String(value ?? "").trim().toLowerCase() === PORTAL_COUNTER_EXECUTION_BACKEND
+    ? PORTAL_COUNTER_EXECUTION_BACKEND
+    : "llm";
+}
+
+function normalizePortalCounterParams(value: unknown): PortalCounterParams {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const normalizeInt = (input: unknown, fallback: number, min: number, max: number): number => {
+    const parsed = Number(input);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(parsed)));
+  };
+  const regionId =
+    typeof raw.region_id === "string"
+      ? raw.region_id.trim()
+      : typeof raw.regionId === "string"
+      ? raw.regionId.trim()
+      : "";
+  return {
+    region_id: regionId,
+    min_count_to_alert: normalizeInt(raw.min_count_to_alert ?? raw.minCountToAlert, 1, 0, 9999),
+    min_area: normalizeInt(raw.min_area ?? raw.minArea, 1800, 1, 500000),
+    max_area: normalizeInt(raw.max_area ?? raw.maxArea, 70000, 1, 1000000),
+    warmup_frames: normalizeInt(raw.warmup_frames ?? raw.warmupFrames, 60, 0, 10000),
+    min_track_frames_for_count: normalizeInt(
+      raw.min_track_frames_for_count ?? raw.minTrackFramesForCount,
+      3,
+      1,
+      300
+    ),
+    max_missed_frames: normalizeInt(raw.max_missed_frames ?? raw.maxMissedFrames, 12, 1, 300),
+    min_path_length_px: normalizeInt(raw.min_path_length_px ?? raw.minPathLengthPx, 85, 1, 5000),
+    max_proof_frames: normalizeInt(raw.max_proof_frames ?? raw.maxProofFrames, 6, 1, 24),
+    save_annotated_video:
+      raw.save_annotated_video === false || raw.saveAnnotatedVideo === false ? false : true,
+  };
+}
+
+function isPolygonAnalysisRegion(region: AnalysisRegionPayload | null | undefined): boolean {
+  return !!region && !region.full_frame && Array.isArray(region.polygon_norm) && region.polygon_norm.length >= ANALYSIS_REGION_MIN_POINTS;
+}
+
+function findAnalysisRegionById(
+  regions: AnalysisRegionPayload[],
+  regionId: string
+): AnalysisRegionPayload | null {
+  if (!regionId) return null;
+  return regions.find((region) => region.region_id === regionId) || null;
 }
 
 function buildJobStepTemporalFingerprint(
@@ -62014,13 +62784,9 @@ async function resolveHubInstallItem(
   return null;
 }
 
-const parseHHMMToMinutesForStepTimeout = (value: unknown): number | null => {
+const parseTimeToSecondsForStepTimeout = (value: unknown): number | null => {
   if (typeof value !== "string") return null;
-  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec(value.trim());
-  if (!match) return null;
-  const hours = parseInt(match[1], 10);
-  const minutes = parseInt(match[2], 10);
-  return hours * 60 + minutes;
+  return parseTimeToSeconds(value);
 };
 
 const formatDurationHuman = (seconds: number): string => {
@@ -62059,10 +62825,10 @@ const getJobMaxStepTimeoutSeconds = async (
 
     const durations: number[] = [];
     for (const row of results || []) {
-      const startMinutes = parseHHMMToMinutesForStepTimeout((row as any).start_time);
-      const endMinutes = parseHHMMToMinutesForStepTimeout((row as any).end_time);
-      if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) continue;
-      durations.push((endMinutes - startMinutes) * 60);
+      const startSeconds = parseTimeToSecondsForStepTimeout((row as any).start_time);
+      const endSeconds = parseTimeToSecondsForStepTimeout((row as any).end_time);
+      if (startSeconds === null || endSeconds === null || endSeconds <= startSeconds) continue;
+      durations.push(endSeconds - startSeconds);
     }
 
     if (durations.length > 0) {
@@ -63722,6 +64488,12 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   const cameraId = body.camera_id ?? null;
   const normalizedAgentKey = String(body.agent_key || "").trim().toLowerCase();
   const requestedParamsObject = parseJobStepAgentParamsObject(body.params);
+  const requestedExecutionBackend = normalizeJobStepExecutionBackend(
+    requestedParamsObject.execution_backend
+  );
+  const requestedPortalCounter = normalizePortalCounterParams(
+    requestedParamsObject.portal_counter
+  );
   const isFaceIdAgent =
     normalizedAgentKey === "faceid" ||
     normalizedAgentKey === "face_id" ||
@@ -63912,22 +64684,20 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     const existingVideoPackagingMode = normalizeVideoPackagingMode(
       (existingAgent as any).video_packaging_mode
     );
-    const useTemporalContext =
-      requestedUseTemporalContext ?? existingUseTemporalContext;
-    const normalizedPromptParts = resolveNormalizedPromptParts(
-      body.prompt_template === undefined
-        ? (existingAgent as any)?.prompt_template
-        : body.prompt_template,
-      body.alert_condition === undefined
-        ? (existingAgent as any)?.alert_condition
-        : body.alert_condition,
-      body.negative_condition === undefined
-        ? (existingAgent as any)?.negative_condition
-        : body.negative_condition,
-      useTemporalContext
-    );
-    const storedPromptTemplate = buildPromptTemplateFromParts(normalizedPromptParts);
     const existingParamsObject = parseJobStepAgentParamsObject((existingAgent as any)?.params);
+    const existingExecutionBackend = normalizeJobStepExecutionBackend(
+      existingParamsObject.execution_backend
+    );
+    const effectiveExecutionBackend =
+      requestedParamsObject.execution_backend === undefined
+        ? existingExecutionBackend
+        : requestedExecutionBackend;
+    const portalCounterEnabled = effectiveExecutionBackend === PORTAL_COUNTER_EXECUTION_BACKEND;
+    const effectivePortalCounter = portalCounterEnabled
+      ? normalizePortalCounterParams(
+          requestedParamsObject.portal_counter ?? existingParamsObject.portal_counter
+        )
+      : null;
     const existingSummaryLocked = normalizeJobStepSummaryLocked(
       existingParamsObject.summary_locked,
       false
@@ -63937,26 +64707,70 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
         ? null
         : normalizeJobStepSummaryLocked(requestedParamsObject.summary_locked, false);
     const summaryLocked = requestedSummaryLocked ?? existingSummaryLocked;
+    const useTemporalContext = portalCounterEnabled
+      ? false
+      : requestedUseTemporalContext ?? existingUseTemporalContext;
+    const normalizedPromptParts = portalCounterEnabled
+      ? resolveNormalizedPromptParts("", "", "", false)
+      : resolveNormalizedPromptParts(
+          body.prompt_template === undefined
+            ? (existingAgent as any)?.prompt_template
+            : body.prompt_template,
+          body.alert_condition === undefined
+            ? (existingAgent as any)?.alert_condition
+            : body.alert_condition,
+          body.negative_condition === undefined
+            ? (existingAgent as any)?.negative_condition
+            : body.negative_condition,
+          useTemporalContext
+        );
+    const storedPromptTemplate = buildPromptTemplateFromParts(normalizedPromptParts);
     const derivedSummary =
+      (portalCounterEnabled ? DEFAULT_PORTAL_COUNTER_SUMMARY : "") ||
       normalizeText(normalizedPromptParts.alert_condition) ||
       getStoredJobStepAgentSummary(existingAgent) ||
       "Reusable step agent";
     const lockedSummary =
       normalizeText(requestedParamsObject.summary) ||
       (existingSummaryLocked ? normalizeText(existingParamsObject.summary) : "");
+    const storedAgentKey =
+      portalCounterEnabled
+        ? PORTAL_COUNTER_AGENT_KEY
+        : normalizeText(body.agent_key) ||
+          normalizeText((existingAgent as any)?.agent_key) ||
+          "custom_template";
     const storedParams = buildStoredJobStepAgentParams(
       {
         ...existingParamsObject,
         ...requestedParamsObject,
+        execution_backend: portalCounterEnabled ? PORTAL_COUNTER_EXECUTION_BACKEND : "llm",
+        ...(portalCounterEnabled
+          ? {
+              portal_counter: {
+                ...effectivePortalCounter,
+                save_annotated_video: true,
+              },
+            }
+          : {
+              portal_counter: undefined,
+            }),
       },
       {
         displayName:
           normalizeText(requestedParamsObject.display_name) ||
           getStoredJobStepAgentDisplayName(existingAgent) ||
-          normalizeText(body.agent_key) ||
+          storedAgentKey ||
           "Hub Agent",
         summary: summaryLocked ? lockedSummary || derivedSummary : derivedSummary,
         summaryLocked,
+      }
+    );
+    let effectiveAnalysisRegions: AnalysisRegionPayload[] = parseStoredAnalysisRegions(
+      (existingAgent as any)?.analysis_regions,
+      {
+        promptParts: normalizedPromptParts,
+        faceTargetIds: effectiveFaceTargetIds || [],
+        negativeImageIds: effectiveNegativeImageIds,
       }
     );
     let analysisRegionsToStore: string | null = (existingAgent as any)?.analysis_regions ?? null;
@@ -63972,35 +64786,74 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       if (normalizedAnalysisRegions.error) {
         return c.json({ error: normalizedAnalysisRegions.error }, 400);
       }
+      effectiveAnalysisRegions = normalizedAnalysisRegions.regions;
       const regionsToStore = useTemporalContext
         ? normalizedAnalysisRegions.regions
         : sanitizeAnalysisRegionsForLegacyFlow(normalizedAnalysisRegions.regions);
       analysisRegionsToStore = JSON.stringify(regionsToStore);
     } else if (!useTemporalContext) {
-      const existingRegions = parseStoredAnalysisRegions((existingAgent as any)?.analysis_regions, {
-        promptParts: normalizedPromptParts,
-        faceTargetIds: effectiveFaceTargetIds || [],
-        negativeImageIds: effectiveNegativeImageIds,
-      });
       analysisRegionsToStore = JSON.stringify(
-        sanitizeAnalysisRegionsForLegacyFlow(existingRegions)
+        sanitizeAnalysisRegionsForLegacyFlow(effectiveAnalysisRegions)
       );
     }
-    const inputType = requestedInputType || existingInputType;
-    const inferenceModel = requestedInferenceModel || existingInferenceModel;
-    const videoPackagingMode = requestedVideoPackagingMode || existingVideoPackagingMode;
-    const runEvery = requestedRunEvery ?? existingRunEvery;
-    const modelFps = requestedModelFps ?? existingModelFps;
-    const runningResolution = requestedRunningResolution ?? existingRunningResolution;
-    const executionSettings = applyInferenceExecutionConstraints(
-      inputType,
-      inferenceModel,
-      runEvery,
-      runningResolution,
-      modelFps
-    );
-    const onlyCaptureOnMotion =
-      requestedOnlyCaptureOnMotion ?? existingOnlyCaptureOnMotion;
+    if (portalCounterEnabled) {
+      if (!Number.isInteger(cameraId) || Number(cameraId) <= 0) {
+        return c.json(
+          { error: "Portal counter is only supported on step camera agents" },
+          400
+        );
+      }
+      const selectedRegion = findAnalysisRegionById(
+        effectiveAnalysisRegions,
+        effectivePortalCounter?.region_id || ""
+      );
+      if (!isPolygonAnalysisRegion(selectedRegion)) {
+        return c.json(
+          { error: "Portal counter requires a valid polygon region_id in analysis_regions" },
+          400
+        );
+      }
+      if (!effectivePortalCounter?.save_annotated_video) {
+        return c.json(
+          { error: "Portal counter requires save_annotated_video = true" },
+          400
+        );
+      }
+    }
+    const inputType = portalCounterEnabled ? "video" : requestedInputType || existingInputType;
+    const inferenceModel = portalCounterEnabled
+      ? FIXED_JOB_STEP_INFERENCE_MODEL
+      : requestedInferenceModel || existingInferenceModel;
+    const videoPackagingMode = portalCounterEnabled
+      ? "frame_sequence"
+      : requestedVideoPackagingMode || existingVideoPackagingMode;
+    const runEvery = portalCounterEnabled ? 60 : requestedRunEvery ?? existingRunEvery;
+    const modelFps = portalCounterEnabled
+      ? DEFAULT_ULTRA_VIDEO_MODEL_FPS
+      : requestedModelFps ?? existingModelFps;
+    const runningResolution = portalCounterEnabled
+      ? null
+      : requestedRunningResolution ?? existingRunningResolution;
+    const executionSettings = portalCounterEnabled
+      ? {
+          inputType: "video" as const,
+          inferenceModel: FIXED_JOB_STEP_INFERENCE_MODEL,
+          runEvery: 60 as JobStepRunEverySeconds,
+          runningResolution: null,
+          modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+          requiresOpenAiKey: false,
+          requiresZAiKey: false,
+        }
+      : applyInferenceExecutionConstraints(
+          inputType,
+          inferenceModel,
+          runEvery,
+          runningResolution,
+          modelFps
+        );
+    const onlyCaptureOnMotion = portalCounterEnabled
+      ? false
+      : requestedOnlyCaptureOnMotion ?? existingOnlyCaptureOnMotion;
     const existingPromptParts = parsePromptTemplatePartsForJobStepTemporalMode(
       (existingAgent as any)?.prompt_template,
       (existingAgent as any)?.alert_condition,
@@ -64112,7 +64965,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
        WHERE id = ?`
     )
       .bind(
-        body.agent_key,
+        storedAgentKey,
         priorityLevel,
         executionSettings.inputType,
         videoPackagingMode,
@@ -64259,19 +65112,38 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     return c.json({ agent: responseAgent }, 200);
   }
 
-  const inputType = requestedInputType || "video";
-  const inferenceModel = requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
-  const videoPackagingMode = requestedVideoPackagingMode || "frame_sequence";
-  const runEvery = requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
-  const modelFps = requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
-  const runningResolution = requestedRunningResolution ?? null;
-  const executionSettings = applyInferenceExecutionConstraints(
-    inputType,
-    inferenceModel,
-    runEvery,
-    runningResolution,
-    modelFps
-  );
+  const portalCounterEnabled =
+    requestedExecutionBackend === PORTAL_COUNTER_EXECUTION_BACKEND;
+  const effectivePortalCounter = portalCounterEnabled ? requestedPortalCounter : null;
+  const inputType = portalCounterEnabled ? "video" : requestedInputType || "video";
+  const inferenceModel = portalCounterEnabled
+    ? FIXED_JOB_STEP_INFERENCE_MODEL
+    : requestedInferenceModel || FIXED_JOB_STEP_INFERENCE_MODEL;
+  const videoPackagingMode = portalCounterEnabled
+    ? "frame_sequence"
+    : requestedVideoPackagingMode || "frame_sequence";
+  const runEvery = portalCounterEnabled ? 60 : requestedRunEvery ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
+  const modelFps = portalCounterEnabled
+    ? DEFAULT_ULTRA_VIDEO_MODEL_FPS
+    : requestedModelFps ?? DEFAULT_ULTRA_VIDEO_MODEL_FPS;
+  const runningResolution = portalCounterEnabled ? null : requestedRunningResolution ?? null;
+  const executionSettings = portalCounterEnabled
+    ? {
+        inputType: "video" as const,
+        inferenceModel: FIXED_JOB_STEP_INFERENCE_MODEL,
+        runEvery: 60 as JobStepRunEverySeconds,
+        runningResolution: null,
+        modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+        requiresOpenAiKey: false,
+        requiresZAiKey: false,
+      }
+    : applyInferenceExecutionConstraints(
+        inputType,
+        inferenceModel,
+        runEvery,
+        runningResolution,
+        modelFps
+      );
   if (executionSettings.inferenceModel === "core") {
     if (!Number.isInteger(jobId) || jobId <= 0) {
       return c.json({ error: "Invalid job reference for step" }, 400);
@@ -64319,34 +65191,62 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     }
     temporalCompileApiKey = userZAiApiKey;
   }
-  const onlyCaptureOnMotion = requestedOnlyCaptureOnMotion ?? false;
-  const useTemporalContext = requestedUseTemporalContext ?? true;
-  const normalizedPromptParts = resolveNormalizedPromptParts(
-    body.prompt_template,
-    body.alert_condition,
-    body.negative_condition,
-    useTemporalContext
-  );
+  const onlyCaptureOnMotion = portalCounterEnabled
+    ? false
+    : requestedOnlyCaptureOnMotion ?? false;
+  const useTemporalContext = portalCounterEnabled
+    ? false
+    : requestedUseTemporalContext ?? true;
+  const normalizedPromptParts = portalCounterEnabled
+    ? resolveNormalizedPromptParts("", "", "", false)
+    : resolveNormalizedPromptParts(
+        body.prompt_template,
+        body.alert_condition,
+        body.negative_condition,
+        useTemporalContext
+      );
   const storedPromptTemplate = buildPromptTemplateFromParts(normalizedPromptParts);
   const requestedSummaryLocked = normalizeJobStepSummaryLocked(
     requestedParamsObject.summary_locked,
     false
   );
   const derivedSummary =
-    normalizeText(normalizedPromptParts.alert_condition) || "Reusable step agent";
-  const storedParams = buildStoredJobStepAgentParams(requestedParamsObject, {
+    (portalCounterEnabled ? DEFAULT_PORTAL_COUNTER_SUMMARY : "") ||
+    normalizeText(normalizedPromptParts.alert_condition) ||
+    "Reusable step agent";
+  const storedAgentKey = portalCounterEnabled
+    ? PORTAL_COUNTER_AGENT_KEY
+    : normalizeText(body.agent_key) || "custom_template";
+  const storedParams = buildStoredJobStepAgentParams(
+    {
+      ...requestedParamsObject,
+      execution_backend: portalCounterEnabled ? PORTAL_COUNTER_EXECUTION_BACKEND : "llm",
+      ...(portalCounterEnabled
+        ? {
+            portal_counter: {
+              ...effectivePortalCounter,
+              save_annotated_video: true,
+            },
+          }
+        : {
+            portal_counter: undefined,
+          }),
+    },
+    {
     displayName:
       normalizeText(requestedParamsObject.display_name) ||
-      normalizeText(body.agent_key) ||
+      storedAgentKey ||
       "Hub Agent",
     summary:
       requestedSummaryLocked
         ? normalizeText(requestedParamsObject.summary) || derivedSummary
         : derivedSummary,
     summaryLocked: requestedSummaryLocked,
-  });
+    }
+  );
   const insertFaceTargetIds = requestedFaceTargetIds || [];
   let insertAnalysisRegionsJson: string | null = null;
+  let insertAnalysisRegions: AnalysisRegionPayload[] = [];
   if (requestedAnalysisRegionsRaw !== undefined) {
     const normalizedAnalysisRegions = normalizeAnalysisRegionsInput(
       requestedAnalysisRegionsRaw,
@@ -64359,6 +65259,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     if (normalizedAnalysisRegions.error) {
       return c.json({ error: normalizedAnalysisRegions.error }, 400);
     }
+    insertAnalysisRegions = normalizedAnalysisRegions.regions;
     const regionsToStore = useTemporalContext
       ? normalizedAnalysisRegions.regions
       : sanitizeAnalysisRegionsForLegacyFlow(normalizedAnalysisRegions.regions);
@@ -64370,6 +65271,30 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
       400
     );
   }
+  if (portalCounterEnabled) {
+    if (!Number.isInteger(cameraId) || Number(cameraId) <= 0) {
+      return c.json(
+        { error: "Portal counter is only supported on step camera agents" },
+        400
+      );
+    }
+    const selectedRegion = findAnalysisRegionById(
+      insertAnalysisRegions,
+      effectivePortalCounter?.region_id || ""
+    );
+    if (!isPolygonAnalysisRegion(selectedRegion)) {
+      return c.json(
+        { error: "Portal counter requires a valid polygon region_id in analysis_regions" },
+        400
+      );
+    }
+    if (!effectivePortalCounter?.save_annotated_video) {
+      return c.json(
+        { error: "Portal counter requires save_annotated_video = true" },
+        400
+      );
+    }
+  }
 
   const result = await c.env.DB.prepare(
     `INSERT INTO job_step_agents (step_id, camera_id, agent_key, priority_level, input_type, video_packaging_mode, inference_model, model_fps, run_every, running_resolution, only_capture_on_motion, use_temporal_context, prompt_template, params, input_schema, alert_condition, negative_condition, analysis_regions, is_active, created_at, updated_at)
@@ -64378,7 +65303,7 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     .bind(
       stepId,
       cameraId,
-      body.agent_key,
+      storedAgentKey,
       priorityLevel,
       executionSettings.inputType,
       videoPackagingMode,
@@ -64974,13 +65899,12 @@ app.post("/api/scheduler/tick", async (c) => {
       );
     }
 
-    // runJobSchedulerTick already handles:
-    // - Acquiring cron lock (55 seconds) to prevent overlapping ticks
-    // - Finding eligible jobs
-    // - Matching schedule windows
-    // - Inserting fire records (idempotent via fire_key)
-    // - Starting cameras and enqueuing job_start commands
-    await runJobSchedulerTick(c.env);
+    // EXE heartbeat ticks run frequently, so keep the lock short and use a small
+    // lookback window to recover a missed second without replaying too much work.
+    await runJobSchedulerTick(c.env, {
+      lockDurationMs: 1800,
+      slotLookbackSeconds: 2,
+    });
     await dispatchQueuedDrakonFindSearches(c.env);
     
     console.log("[SCHEDULER TICK HTTP] Scheduler tick completed successfully");
@@ -65005,7 +65929,13 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext | any) {
     ctx.waitUntil(
-      Promise.all([runJobSchedulerTick(env), dispatchQueuedDrakonFindSearches(env)]).then(
+      Promise.all([
+        runJobSchedulerTick(env, {
+          lockDurationMs: 1800,
+          slotLookbackSeconds: 65,
+        }),
+        dispatchQueuedDrakonFindSearches(env),
+      ]).then(
         () => undefined
       )
     );

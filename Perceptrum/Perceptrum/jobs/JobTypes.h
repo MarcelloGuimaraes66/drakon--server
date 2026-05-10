@@ -56,6 +56,19 @@ struct JobAnalysisRegion {
     JobFrameWindowNorm frame_window_norm;
 };
 
+struct PortalCounterConfig {
+    std::string region_id;
+    int min_count_to_alert = 1;
+    int min_area = 1800;
+    int max_area = 70000;
+    int warmup_frames = 60;
+    int min_track_frames_for_count = 3;
+    int max_missed_frames = 12;
+    int min_path_length_px = 85;
+    int max_proof_frames = 6;
+    bool save_annotated_video = true;
+};
+
 struct JobAgentDef {
     int id = -1;
     std::string agent_run_id;
@@ -65,6 +78,8 @@ struct JobAgentDef {
     std::string input_schema_json;
     std::optional<int> camera_id; // null means default
 
+    std::string execution_backend = "llm";
+    PortalCounterConfig portal_counter_config;
     std::string priority_level;
     std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core"
     std::string api_key;

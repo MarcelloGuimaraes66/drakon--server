@@ -93,9 +93,9 @@ function formatSidebarBadgeCount(count?: number) {
   return count > 99 ? "99+" : String(count);
 }
 
-function getStandaloneAgentTutorialCameraId(
+function getStandaloneTutorialCamera(
   cameras: Array<{ id?: unknown; name?: unknown }>
-): number | null {
+): { id: number; name: string } | null {
   const availableCameras = cameras
     .map((camera) => ({
       id: typeof camera.id === "number" && Number.isInteger(camera.id) && camera.id > 0
@@ -105,7 +105,8 @@ function getStandaloneAgentTutorialCameraId(
     }))
     .filter((camera): camera is { id: number; name: string } => camera.id !== null);
 
-  return availableCameras.find((camera) => camera.name.includes("tutorial"))?.id ?? null;
+  const matchedCamera = availableCameras.find((camera) => camera.name.includes("tutorial"));
+  return matchedCamera ?? null;
 }
 
 type ApiKeyPromptStatus = {
@@ -804,7 +805,8 @@ export default function Layout({ children }: LayoutProps) {
     onboardingStatus === "never_started"
       ? t("tutorial.entry.getStarted")
       : t("tutorial.entry.tutorial");
-  const standaloneAgentTutorialCameraId = getStandaloneAgentTutorialCameraId(cameras);
+  const standaloneTutorialCamera = getStandaloneTutorialCamera(cameras);
+  const standaloneAgentTutorialCameraId = standaloneTutorialCamera?.id ?? null;
   const tutorialMenuItems: Array<{
     kind: OnboardingTutorialKind;
     label: string;
@@ -832,13 +834,23 @@ export default function Layout({ children }: LayoutProps) {
         ? t("tutorial.entry.menu.agent.description")
         : t("tutorial.entry.menu.agent.noCameraDescription"),
     },
+    {
+      kind: "chat",
+      label: t("tutorial.entry.menu.chat.label"),
+      description: t("tutorial.entry.menu.chat.description"),
+    },
   ];
 
   const handleTutorialMenuSelect = (kind: OnboardingTutorialKind) => {
     setIsTutorialMenuOpen(false);
     startTutorial(
       kind,
-      kind === "agent" ? { cameraId: standaloneAgentTutorialCameraId } : undefined
+      kind === "agent" || kind === "chat"
+        ? {
+            cameraId: standaloneTutorialCamera?.id ?? null,
+            cameraName: standaloneTutorialCamera?.name ?? null,
+          }
+        : undefined
     );
   };
 

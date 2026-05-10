@@ -23,6 +23,7 @@ export const CreateCameraSchema = z.object({
   webcam_index: z.number().optional(),
   allowpublicaccess: z.boolean().optional(),
   direct_capture_on_motion_only: z.boolean().optional(),
+  capture_acceleration_mode: z.enum(["cpu", "nvidia"]).optional(),
 });
 
 export const UpdateCameraSchema = z.object({
@@ -48,6 +49,7 @@ export const UpdateCameraSchema = z.object({
   webcam_index: z.number().int().nonnegative().nullable().optional(),
   allowpublicaccess: z.boolean().optional(),
   direct_capture_on_motion_only: z.boolean().optional(),
+  capture_acceleration_mode: z.enum(["cpu", "nvidia"]).optional(),
   is_service_running: z.number().min(0).max(1).optional(),
 });
 
@@ -224,6 +226,7 @@ export interface Camera {
   allowpublicaccess?: number;
   analysis_speed?: number;
   model_tier?: string;
+  capture_acceleration_mode?: "cpu" | "nvidia";
 }
 
 export interface DrakonFindTarget {

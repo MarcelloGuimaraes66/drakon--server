@@ -8,6 +8,8 @@ brand.txt
 *.log
 backup/
 backup.zip
+scratch/
+/-
 
 # Legacy nested git repositories to be flattened into the root repo
 DrakonSite/.git/

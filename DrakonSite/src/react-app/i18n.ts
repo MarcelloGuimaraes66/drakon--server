@@ -7,6 +7,7 @@ import { securityRecoveryTranslations } from "@/react-app/securityRecoveryTransl
 import { tutorialFeatureTranslations } from "@/react-app/tutorialTranslations";
 import { tutorialCameraStepTranslations } from "@/react-app/tutorialCameraStepTranslations";
 import { tutorialAgentStepTranslations } from "@/react-app/tutorialAgentStepTranslations";
+import { tutorialChatStepTranslations } from "@/react-app/tutorialChatStepTranslations";
 
 const resources = {
   en: {
@@ -4149,6 +4150,10 @@ for (const [lang, entries] of Object.entries(tutorialCameraStepTranslations)) {
 }
 
 for (const [lang, entries] of Object.entries(tutorialAgentStepTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(tutorialChatStepTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 

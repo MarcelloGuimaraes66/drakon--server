@@ -31,17 +31,18 @@ type OnboardingContextValue = {
   currentStepId: OnboardingStepId | null;
   selectedProvider: OnboardingProviderKind | null;
   tutorialCameraId: number | null;
+  tutorialCameraName: string | null;
   tutorialAgentId: number | null;
   tutorialProceedWithoutWebcam: boolean;
   providerStatus: ProviderStatusMap;
   inlineMessage: string;
   startTutorial: (
     kind?: OnboardingTutorialKind,
-    options?: { cameraId?: number | null }
+    options?: { cameraId?: number | null; cameraName?: string | null }
   ) => void;
   closeTutorial: () => void;
   finishTutorial: () => void;
-  completeCameraTutorial: (cameraId?: number | null) => void;
+  completeCameraTutorial: (cameraId?: number | null, cameraName?: string | null) => void;
   completeAgentTutorial: (agentId?: number | null) => void;
   setTutorialProceedWithoutWebcam: (value: boolean) => void;
   next: () => Promise<void>;
@@ -78,6 +79,15 @@ function normalizeCameraId(value: unknown): number | null {
   return null;
 }
 
+function normalizeCameraName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+  return normalized ? normalized : null;
+}
+
 function normalizeHydratedOnboardingState(
   persisted: ReturnType<typeof readOnboardingState>
 ): ReturnType<typeof readOnboardingState> {
@@ -94,6 +104,7 @@ function normalizeHydratedOnboardingState(
     currentStepId: null,
     selectedProvider: null,
     tutorialCameraId: null,
+    tutorialCameraName: null,
     tutorialAgentId: null,
     tutorialProceedWithoutWebcam: false,
   };
@@ -115,6 +126,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const [currentStepId, setCurrentStepId] = useState<OnboardingStepId | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<OnboardingProviderKind | null>(null);
   const [tutorialCameraId, setTutorialCameraId] = useState<number | null>(null);
+  const [tutorialCameraName, setTutorialCameraName] = useState<string | null>(null);
   const [tutorialAgentId, setTutorialAgentId] = useState<number | null>(null);
   const [tutorialProceedWithoutWebcam, setTutorialProceedWithoutWebcam] = useState(false);
   const [providerStatus, setProviderStatus] = useState<ProviderStatusMap>(DEFAULT_PROVIDER_STATUS);
@@ -139,6 +151,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setCurrentStepId(persisted.currentStepId);
     setSelectedProvider(persisted.selectedProvider);
     setTutorialCameraId(persisted.tutorialCameraId);
+    setTutorialCameraName(persisted.tutorialCameraName);
     setTutorialAgentId(persisted.tutorialAgentId);
     setTutorialProceedWithoutWebcam(persisted.tutorialProceedWithoutWebcam);
     if (persisted.status === "in_progress" && persisted.currentStepId) {
@@ -162,6 +175,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       currentStepId,
       selectedProvider,
       tutorialCameraId,
+      tutorialCameraName,
       tutorialAgentId,
       tutorialProceedWithoutWebcam,
     }, onboardingUserId);
@@ -176,6 +190,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     tutorialKind,
     tutorialAgentId,
     tutorialCameraId,
+    tutorialCameraName,
     tutorialProceedWithoutWebcam,
   ]);
 
@@ -197,6 +212,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       currentStepId: "welcome",
       selectedProvider: null,
       tutorialCameraId: null,
+      tutorialCameraName: null,
       tutorialAgentId: null,
       tutorialProceedWithoutWebcam: false,
     }, onboardingUserId);
@@ -292,12 +308,14 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
 
   const startTutorial = useCallback((
     kind: OnboardingTutorialKind = "intro",
-    options: { cameraId?: number | null } = {}
+    options: { cameraId?: number | null; cameraName?: string | null } = {}
   ) => {
     const cameraId = normalizeCameraId(options.cameraId);
+    const cameraName = normalizeCameraName(options.cameraName);
     setTutorialKind(kind);
     setSelectedProvider(null);
-    setTutorialCameraId(kind === "agent" ? cameraId : null);
+    setTutorialCameraId(kind === "agent" || kind === "chat" ? cameraId : null);
+    setTutorialCameraName(kind === "agent" || kind === "chat" ? cameraName : null);
     setTutorialAgentId(null);
     setTutorialProceedWithoutWebcam(false);
 
@@ -310,6 +328,9 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
         return;
       case "agent":
         moveToStep(cameraId ? "agent-intro" : "agent-camera-required");
+        return;
+      case "chat":
+        moveToStep("chat-intro");
         return;
       case "intro":
       default:
@@ -325,6 +346,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setTutorialKind("intro");
     setSelectedProvider(null);
     setTutorialCameraId(null);
+    setTutorialCameraName(null);
     setTutorialAgentId(null);
     setTutorialProceedWithoutWebcam(false);
     setStatus((current) => (current === "completed" ? current : "dismissed"));
@@ -337,14 +359,16 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setTutorialKind("intro");
     setSelectedProvider(null);
     setTutorialCameraId(null);
+    setTutorialCameraName(null);
     setTutorialAgentId(null);
     setTutorialProceedWithoutWebcam(false);
     setStatus("completed");
   }, []);
 
-  const completeCameraTutorial = useCallback((cameraId?: number | null) => {
+  const completeCameraTutorial = useCallback((cameraId?: number | null, cameraName?: string | null) => {
     setInlineMessage("");
     setTutorialCameraId((current) => normalizeCameraId(cameraId) ?? current);
+    setTutorialCameraName((current) => normalizeCameraName(cameraName) ?? current);
     setTutorialAgentId(null);
     moveToStep(tutorialKind === "camera" ? "complete" : "agent-intro");
   }, [moveToStep, tutorialKind]);
@@ -464,6 +488,18 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
         moveToStep("ai-agents-camera-start");
         return;
       case "ai-agents-camera-start":
+        moveToStep(tutorialKind === "intro" ? "chat-offer" : "complete");
+        return;
+      case "chat-offer":
+        startTutorial("chat", {
+          cameraId: tutorialCameraId,
+          cameraName: tutorialCameraName,
+        });
+        return;
+      case "chat-intro":
+        moveToStep("chat-compose");
+        return;
+      case "chat-examples":
         moveToStep("complete");
         return;
       case "complete":
@@ -482,6 +518,8 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     refreshProviderStatus,
     selectedProvider,
     startTutorial,
+    tutorialCameraId,
+    tutorialCameraName,
     tutorialKind,
   ]);
 
@@ -576,7 +614,26 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       case "ai-agents-camera-start":
         moveToStep("agent-toggle");
         return;
+      case "chat-offer":
+        moveToStep("ai-agents-camera-start");
+        return;
+      case "chat-intro":
+        if (tutorialKind === "chat") {
+          return;
+        }
+        moveToStep("chat-offer");
+        return;
+      case "chat-compose":
+        moveToStep("chat-intro");
+        return;
+      case "chat-examples":
+        moveToStep("chat-compose");
+        return;
       case "complete":
+        if (tutorialKind === "chat") {
+          moveToStep("chat-examples");
+          return;
+        }
         moveToStep("ai-agents-camera-start");
         return;
       default:
@@ -597,6 +654,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       currentStepId,
       selectedProvider,
       tutorialCameraId,
+      tutorialCameraName,
       tutorialAgentId,
       tutorialProceedWithoutWebcam,
       providerStatus,
@@ -636,6 +694,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       tutorialKind,
       tutorialAgentId,
       tutorialCameraId,
+      tutorialCameraName,
       tutorialProceedWithoutWebcam,
       updateTutorialProceedWithoutWebcam,
     ]

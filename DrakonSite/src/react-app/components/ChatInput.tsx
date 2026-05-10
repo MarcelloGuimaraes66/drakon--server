@@ -31,6 +31,7 @@ interface ChatInputProps {
   isRunning?: boolean;
   placeholder?: string;
   textareaId?: string;
+  containerTargetId?: string;
   className?: string;
   variant?: "default" | "chat-page";
   uploadedImage?: string | null;
@@ -121,6 +122,7 @@ export default function ChatInput({
   isRunning = false,
   placeholder = "Ask about your cameras...",
   textareaId,
+  containerTargetId,
   className = "",
   variant = "default",
   uploadedImage = null,
@@ -412,6 +414,7 @@ export default function ChatInput({
   return (
     <form onSubmit={handleSubmit} className={className}>
       <div
+        data-onboarding-target={containerTargetId}
         className={
           isChatPageVariant
             ? "flex flex-col gap-3 rounded-[30px] border border-white/[0.08] bg-[#222634]/82 p-3 shadow-[0_24px_80px_-42px_rgba(0,0,0,0.88)] backdrop-blur-xl md:p-4"

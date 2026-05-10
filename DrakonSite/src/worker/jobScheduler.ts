@@ -1,12 +1,12 @@
 /**
- * Job Scheduler - runs every minute via cron to start scheduled jobs
- * 
+ * Job Scheduler - runs on periodic scheduler ticks to start or stop scheduled jobs.
+ *
  * Responsibilities:
- * 1. Acquire cron lock to prevent overlapping ticks
+ * 1. Acquire a short scheduler lock to prevent overlapping ticks
  * 2. Find jobs with status='scheduled' and matching schedule windows
- * 3. Ensure idempotency via job_schedule_fires table
- * 4. Start required cameras (enqueue start_camera commands)
- * 5. Enqueue job_start command with full payload
+ * 3. Ensure idempotency via job_schedule_fires / job_schedule_stops tables
+ * 4. Start required cameras and enqueue job_start commands
+ * 5. Enqueue job_stop commands when a window ends
  */
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
 import {
@@ -1472,6 +1472,7 @@ type LocalTimeParts = {
   dayOfMonth: number;     // 1-31
   monthOfYear: number;    // 1-12
   localTimeHHMM: string;  // HH:MM
+  localTimeHHMMSS: string;  // HH:MM:SS
 };
 
 type LocalDateTimeParts = {
@@ -1480,6 +1481,15 @@ type LocalDateTimeParts = {
   day: number;
   hour: number;
   minute: number;
+  second: number;
+};
+
+type ParsedSchedulerBoundaryTime = {
+  totalSeconds: number;
+  hhmm: string;
+  hhmmss: string;
+  canonical: string;
+  hasExplicitSeconds: boolean;
 };
 
 function isValidIanaTimezoneForScheduler(timezone: string): boolean {
@@ -1530,6 +1540,7 @@ function getLocalDateTimePartsInTimezone(timezone: string, atDate: Date): LocalD
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hour12: false,
     });
 
@@ -1541,24 +1552,26 @@ function getLocalDateTimePartsInTimezone(timezone: string, atDate: Date): LocalD
     const day = Number.parseInt(get("day"), 10);
     const hour = Number.parseInt(get("hour"), 10);
     const minute = Number.parseInt(get("minute"), 10);
+    const second = Number.parseInt(get("second"), 10);
 
     if (
       !Number.isInteger(year) ||
       !Number.isInteger(month) ||
       !Number.isInteger(day) ||
       !Number.isInteger(hour) ||
-      !Number.isInteger(minute)
+      !Number.isInteger(minute) ||
+      !Number.isInteger(second)
     ) {
       return null;
     }
 
-    return { year, month, day, hour, minute };
+    return { year, month, day, hour, minute, second };
   } catch {
     return null;
   }
 }
 
-function parseIsoLocalDateParts(localDate: string): Omit<LocalDateTimeParts, "hour" | "minute"> | null {
+function parseIsoLocalDateParts(localDate: string): Omit<LocalDateTimeParts, "hour" | "minute" | "second"> | null {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(localDate.trim());
   if (!match) return null;
 
@@ -1570,19 +1583,46 @@ function parseIsoLocalDateParts(localDate: string): Omit<LocalDateTimeParts, "ho
   return { year, month, day };
 }
 
-function parseHHMMParts(value: string): Pick<LocalDateTimeParts, "hour" | "minute"> | null {
-  const match = /^([0-1]?\d|2[0-3]):([0-5]\d)$/.exec(value.trim());
+function parseSchedulerBoundaryTime(value: string): ParsedSchedulerBoundaryTime | null {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return null;
+  const match = /^([0-1]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/.exec(trimmed);
   if (!match) return null;
 
   const hour = Number.parseInt(match[1], 10);
   const minute = Number.parseInt(match[2], 10);
-  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null;
+  const second = Number.parseInt(match[3] ?? "0", 10);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || !Number.isInteger(second)) {
+    return null;
+  }
 
-  return { hour, minute };
+  const hh = String(hour).padStart(2, "0");
+  const mm = String(minute).padStart(2, "0");
+  const ss = String(second).padStart(2, "0");
+  const hhmm = `${hh}:${mm}`;
+  const hhmmss = `${hhmm}:${ss}`;
+
+  return {
+    totalSeconds: hour * 3600 + minute * 60 + second,
+    hhmm,
+    hhmmss,
+    canonical: match[3] ? hhmmss : hhmm,
+    hasExplicitSeconds: !!match[3],
+  };
+}
+
+function parseHHMMParts(value: string): Pick<LocalDateTimeParts, "hour" | "minute" | "second"> | null {
+  const parsed = parseSchedulerBoundaryTime(value);
+  if (!parsed) return null;
+  return {
+    hour: Math.floor(parsed.totalSeconds / 3600),
+    minute: Math.floor((parsed.totalSeconds % 3600) / 60),
+    second: parsed.totalSeconds % 60,
+  };
 }
 
 function wallClockUtcMillis(parts: LocalDateTimeParts): number {
-  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0);
+  return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second, 0);
 }
 
 function localDateTimeInTimezoneToUtcIso(
@@ -1597,7 +1637,7 @@ function localDateTimeInTimezoneToUtcIso(
 
   const target: LocalDateTimeParts = { ...dateParts, ...timeParts };
   let guess = new Date(
-    Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute, 0, 0)
+    Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute, target.second, 0)
   );
 
   for (let attempt = 0; attempt < 6; attempt += 1) {
@@ -1606,7 +1646,6 @@ function localDateTimeInTimezoneToUtcIso(
 
     const deltaMs = wallClockUtcMillis(observed) - wallClockUtcMillis(target);
     if (deltaMs === 0) {
-      guess.setUTCSeconds(0, 0);
       return guess.toISOString();
     }
 
@@ -1620,9 +1659,9 @@ function localDateTimeInTimezoneToUtcIso(
     observed.month === target.month &&
     observed.day === target.day &&
     observed.hour === target.hour &&
-    observed.minute === target.minute
+    observed.minute === target.minute &&
+    observed.second === target.second
   ) {
-    guess.setUTCSeconds(0, 0);
     return guess.toISOString();
   }
 
@@ -1679,6 +1718,7 @@ function getLocalTimeInTimezone(timezone: string, atDate: Date = new Date()): Lo
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
     weekday: "short",
     hour12: false,
   });
@@ -1691,6 +1731,7 @@ function getLocalTimeInTimezone(timezone: string, atDate: Date = new Date()): Lo
   const day = get("day");
   const hour = get("hour");
   const minute = get("minute");
+  const second = get("second");
   const weekdayStr = get("weekday"); // "Sun", "Mon", etc.
 
   // Map weekday string to number
@@ -1705,6 +1746,7 @@ function getLocalTimeInTimezone(timezone: string, atDate: Date = new Date()): Lo
     dayOfMonth: parseInt(day, 10),
     monthOfYear: parseInt(month, 10),
     localTimeHHMM: `${hour}:${minute}`,
+    localTimeHHMMSS: `${hour}:${minute}:${second}`,
   };
 }
 
@@ -1728,19 +1770,32 @@ function normalizeDateOnly(value: unknown): string | null {
   return parsed.toISOString().slice(0, 10);
 }
 
-function buildSchedulerTickSlots(timezone: string): LocalTimeParts[] {
-  const now = new Date();
-  const oneMinuteAgo = new Date(now.getTime() - 60_000);
+function doesBoundaryMatchLocalTime(boundaryTime: unknown, localTime: LocalTimeParts): boolean {
+  if (typeof boundaryTime !== "string") return false;
+  const parsed = parseSchedulerBoundaryTime(boundaryTime);
+  if (!parsed) return false;
+  return parsed.hasExplicitSeconds
+    ? parsed.hhmmss === localTime.localTimeHHMMSS
+    : parsed.hhmm === localTime.localTimeHHMM;
+}
 
-  const candidates = [
-    getLocalTimeInTimezone(timezone, oneMinuteAgo),
-    getLocalTimeInTimezone(timezone, now),
-  ];
+function getBoundaryKeyTime(boundaryTime: unknown): string | null {
+  if (typeof boundaryTime !== "string") return null;
+  return parseSchedulerBoundaryTime(boundaryTime)?.canonical ?? null;
+}
+
+function buildSchedulerTickSlots(timezone: string, lookbackSeconds: number = 1): LocalTimeParts[] {
+  const now = new Date();
+  const safeLookbackSeconds = Math.max(0, Math.floor(lookbackSeconds));
+  const candidates: LocalTimeParts[] = [];
+  for (let offset = safeLookbackSeconds; offset >= 0; offset -= 1) {
+    candidates.push(getLocalTimeInTimezone(timezone, new Date(now.getTime() - offset * 1000)));
+  }
 
   const seen = new Set<string>();
   const uniqueSlots: LocalTimeParts[] = [];
   for (const slot of candidates) {
-    const key = `${slot.localDate}|${slot.localTimeHHMM}`;
+    const key = `${slot.localDate}|${slot.localTimeHHMMSS}`;
     if (seen.has(key)) continue;
     seen.add(key);
     uniqueSlots.push(slot);
@@ -1752,9 +1807,10 @@ function buildSchedulerTickSlots(timezone: string): LocalTimeParts[] {
 /**
  * Try to acquire cron lock. Returns true if lock acquired, false if another tick is running.
  */
-async function acquireCronLock(db: D1Database, lockName: string, durationSeconds: number): Promise<boolean> {
+async function acquireCronLock(db: D1Database, lockName: string, durationMs: number): Promise<boolean> {
   const nowUtc = new Date().toISOString();
-  const lockedUntil = new Date(Date.now() + durationSeconds * 1000).toISOString();
+  const safeDurationMs = Math.max(250, Math.floor(durationMs));
+  const lockedUntil = new Date(Date.now() + safeDurationMs).toISOString();
 
   // Try to insert or update the lock
   const existing = await db.prepare(
@@ -1879,7 +1935,7 @@ async function buildJobStartPayload(
   job: any,
   scheduleDay: any,
   window: any,
-  localTime: { localDate: string; localTimeHHMM: string },
+  localTime: Pick<LocalTimeParts, "localDate" | "localTimeHHMM" | "localTimeHHMMSS">,
   effectiveTimezone: string,
   jobRunId: string
 ): Promise<any> {
@@ -1892,13 +1948,11 @@ async function buildJobStartPayload(
     typeof window?.end_time === "string"
       ? localDateTimeInTimezoneToUtcIso(localTime.localDate, window.end_time, effectiveTimezone)
       : null;
-  const parseTimeToMinutes = (value: string): number | null => {
-    const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec(value);
-    if (!match) return null;
-    const hours = parseInt(match[1], 10);
-    const minutes = parseInt(match[2], 10);
-    return hours * 60 + minutes;
-  };
+  const triggerLocalTime =
+    (typeof window?.start_time === "string" && getBoundaryKeyTime(window.start_time)) ||
+    localTime.localTimeHHMMSS;
+  const parseTimeToSeconds = (value: string): number | null =>
+    parseSchedulerBoundaryTime(value)?.totalSeconds ?? null;
 
   // Fetch Telegram settings once for the job user
   const telegramSettings = await getTelegramSettingsForUser(env.DB, job.user_id);
@@ -2082,12 +2136,12 @@ async function buildJobStartPayload(
           
           if (modeType === "time") {
             const timeStr = parts.slice(2).join(":");
-            const targetMinutes = parseTimeToMinutes(timeStr || "");
-            const windowStartMinutes = parseTimeToMinutes(window?.start_time || "");
+            const targetSeconds = parseTimeToSeconds(timeStr || "");
+            const windowStartSeconds = parseTimeToSeconds(window?.start_time || "");
             let offsetSeconds = 0;
-            if (targetMinutes !== null && windowStartMinutes !== null) {
-              const delta = targetMinutes - windowStartMinutes;
-              offsetSeconds = delta > 0 ? delta * 60 : 0;
+            if (targetSeconds !== null && windowStartSeconds !== null) {
+              const delta = targetSeconds - windowStartSeconds;
+              offsetSeconds = delta > 0 ? delta : 0;
             }
             start_condition = {
               mode: "time",
@@ -2164,12 +2218,12 @@ async function buildJobStartPayload(
         
         if (modeType === "time") {
           const timeStr = parts.slice(2).join(":");
-          const targetMinutes = parseTimeToMinutes(timeStr || "");
-          const windowStartMinutes = parseTimeToMinutes(window?.start_time || "");
+          const targetSeconds = parseTimeToSeconds(timeStr || "");
+          const windowStartSeconds = parseTimeToSeconds(window?.start_time || "");
           let offsetSeconds = 0;
-          if (targetMinutes !== null && windowStartMinutes !== null) {
-            const delta = targetMinutes - windowStartMinutes;
-            offsetSeconds = delta > 0 ? delta * 60 : 0;
+          if (targetSeconds !== null && windowStartSeconds !== null) {
+            const delta = targetSeconds - windowStartSeconds;
+            offsetSeconds = delta > 0 ? delta : 0;
           }
           start_condition = {
             mode: "time",
@@ -2658,7 +2712,7 @@ async function buildJobStartPayload(
       trigger_type: "schedule",
       timezone: effectiveTimezone,
       local_date: localTime.localDate,
-      local_time: localTime.localTimeHHMM,
+      local_time: triggerLocalTime,
       schedule_mode: job.schedule_mode,
       schedule_day: {
         id: scheduleDay.id,
@@ -2714,8 +2768,8 @@ export async function enqueueManualJobStart(
     };
     const manualWindow = {
       id: null,
-      start_time: localTime.localTimeHHMM,
-      end_time: localTime.localTimeHHMM,
+      start_time: localTime.localTimeHHMMSS,
+      end_time: localTime.localTimeHHMMSS,
     };
     const jobRunId = crypto.randomUUID();
 
@@ -2770,7 +2824,7 @@ export async function enqueueManualJobStart(
         trigger_type: "manual",
         timezone,
         local_date: localTime.localDate,
-        local_time: localTime.localTimeHHMM,
+        local_time: localTime.localTimeHHMMSS,
         triggered_at_utc: nowUtc,
       },
       start_camera_payloads: startCameraPayloads,
@@ -2852,7 +2906,7 @@ export async function enqueueManualJobStart(
       job_run_id: jobRunId,
       job_name: job.name,
       local_date: localTime.localDate,
-      local_time: localTime.localTimeHHMM,
+      local_time: localTime.localTimeHHMMSS,
       timezone,
     };
 
@@ -2893,13 +2947,30 @@ export async function enqueueManualJobStart(
 }
 
 /**
- * Main scheduler tick function - called every minute by cron
+ * Main scheduler tick function - called by both cron fallback and EXE heartbeat ticks.
  */
-export async function runJobSchedulerTick(env: Env): Promise<void> {
-  console.log("[JOB SCHEDULER] Starting scheduler tick");
+export async function runJobSchedulerTick(
+  env: Env,
+  options: {
+    lockDurationMs?: number;
+    slotLookbackSeconds?: number;
+  } = {}
+): Promise<void> {
+  const lockDurationMs =
+    typeof options.lockDurationMs === "number" && Number.isFinite(options.lockDurationMs)
+      ? Math.max(250, Math.floor(options.lockDurationMs))
+      : 1800;
+  const slotLookbackSeconds =
+    typeof options.slotLookbackSeconds === "number" &&
+    Number.isFinite(options.slotLookbackSeconds)
+      ? Math.max(0, Math.floor(options.slotLookbackSeconds))
+      : 1;
 
-  // Acquire lock (55 seconds to avoid overlap)
-  const lockAcquired = await acquireCronLock(env.DB, "job_scheduler", 55);
+  console.log(
+    `[JOB SCHEDULER] Starting scheduler tick (lock=${lockDurationMs}ms, lookback=${slotLookbackSeconds}s)`
+  );
+
+  const lockAcquired = await acquireCronLock(env.DB, "job_scheduler", lockDurationMs);
   if (!lockAcquired) {
     console.log("[JOB SCHEDULER] Could not acquire lock, skipping tick");
     return;
@@ -2939,15 +3010,15 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
       let tickSlots: LocalTimeParts[];
       try {
         currentLocalTime = getLocalTimeInTimezone(timezone);
-        tickSlots = buildSchedulerTickSlots(timezone);
+        tickSlots = buildSchedulerTickSlots(timezone, slotLookbackSeconds);
       } catch (err) {
         console.error(`[JOB SCHEDULER] Invalid timezone "${timezone}" for job ${j.id}, using UTC`);
         currentLocalTime = getLocalTimeInTimezone("UTC");
-        tickSlots = buildSchedulerTickSlots("UTC");
+        tickSlots = buildSchedulerTickSlots("UTC", slotLookbackSeconds);
       }
 
       console.log(
-        `[JOB SCHEDULER] Job ${j.id} (${j.name}): timezone=${timezone}, localDate=${currentLocalTime.localDate}, localTime=${currentLocalTime.localTimeHHMM}, dow=${currentLocalTime.dayOfWeek}`
+        `[JOB SCHEDULER] Job ${j.id} (${j.name}): timezone=${timezone}, localDate=${currentLocalTime.localDate}, localTime=${currentLocalTime.localTimeHHMMSS}, dow=${currentLocalTime.dayOfWeek}`
       );
 
       const activeFromDate = normalizeDateOnly(j.active_from);
@@ -3013,16 +3084,24 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
 
         for (const day of matchingDays) {
           const d = day as any;
+          const { results: dayWindowsRaw } = await env.DB.prepare(
+            `SELECT * FROM job_schedule_windows
+             WHERE schedule_day_id = ? AND is_enabled = 1`
+          )
+            .bind(d.id)
+            .all();
+          const dayWindows = (dayWindowsRaw || []).map((row: any) => row as any);
 
           // --- START windows (optional) ---
-          const { results: startingWindows } = await env.DB.prepare(
-            `SELECT * FROM job_schedule_windows
-             WHERE schedule_day_id = ? AND start_time = ? AND is_enabled = 1`
-          ).bind(d.id, localTime.localTimeHHMM).all();
+          const startingWindows = dayWindows.filter((window: any) =>
+            doesBoundaryMatchLocalTime(window?.start_time, localTime)
+          );
 
           if (startingWindows && startingWindows.length > 0) {
             for (const window of startingWindows) {
               const w = window as any;
+              const boundaryStartTime =
+                getBoundaryKeyTime(w.start_time) || localTime.localTimeHHMMSS;
 
               const runtimeState = await env.DB.prepare(
                 `SELECT status FROM job_runtime_states WHERE job_id = ? LIMIT 1`
@@ -3032,7 +3111,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                 : "";
               if (runtimeStatus === "running" || runtimeStatus === "stopping") {
                 console.log(
-                  `[JOB SCHEDULER] Job ${j.id} already ${runtimeStatus}, skipping scheduled start at ${localTime.localTimeHHMM}`
+                  `[JOB SCHEDULER] Job ${j.id} already ${runtimeStatus}, skipping scheduled start at ${boundaryStartTime}`
                 );
                 continue;
               }
@@ -3056,7 +3135,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                     : `Job "${j.name}" was not started because ${missingProviders[0]} API key is not configured in Settings.`;
 
                 console.log(
-                  `[JOB SCHEDULER] Skipping job ${j.id} start at ${localTime.localTimeHHMM}: missing ${missingProviders.join(" + ")} API key`
+                  `[JOB SCHEDULER] Skipping job ${j.id} start at ${boundaryStartTime}: missing ${missingProviders.join(" + ")} API key`
                 );
                 try {
                   const blockedDetails = JSON.stringify({
@@ -3069,7 +3148,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                     schedule_day_id: d.id,
                     schedule_window_id: w.id,
                     local_date: localTime.localDate,
-                    local_time: localTime.localTimeHHMM,
+                    local_time: boundaryStartTime,
                     timezone,
                   });
 
@@ -3113,7 +3192,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                 continue;
               }
 
-              const fireKey = `${j.id}:${localTime.localDate}:${d.id}:${localTime.localTimeHHMM}`;
+              const fireKey = `${j.id}:${localTime.localDate}:${d.id}:${boundaryStartTime}`;
               console.log(`[JOB SCHEDULER] Attempting to fire job ${j.id} with key ${fireKey}`);
 
               try {
@@ -3127,7 +3206,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                   d.id,
                   w.id,
                   localTime.localDate,
-                  localTime.localTimeHHMM,
+                  boundaryStartTime,
                   nowUtc,
                   nowUtc,
                   nowUtc
@@ -3259,7 +3338,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                     schedule_day_id: d.id,
                     schedule_window_id: w.id,
                     local_date: localTime.localDate,
-                    local_time: localTime.localTimeHHMM,
+                    local_time: boundaryStartTime,
                     timezone,
                   };
 
@@ -3296,20 +3375,21 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
               }
             }
           } else {
-            console.log(`[JOB SCHEDULER] No start windows for job ${j.id} at ${localTime.localTimeHHMM} (still checking stops)`);
+            console.log(`[JOB SCHEDULER] No start windows for job ${j.id} at ${localTime.localTimeHHMMSS} (still checking stops)`);
           }
 
           // --- STOP windows (always check) ---
-          const { results: endingWindows } = await env.DB.prepare(
-            `SELECT * FROM job_schedule_windows
-             WHERE schedule_day_id = ? AND end_time = ? AND is_enabled = 1`
-          ).bind(d.id, localTime.localTimeHHMM).all();
+          const endingWindows = dayWindows.filter((window: any) =>
+            doesBoundaryMatchLocalTime(window?.end_time, localTime)
+          );
 
           if (endingWindows && endingWindows.length > 0) {
             for (const window of endingWindows) {
               const w = window as any;
+              const boundaryEndTime =
+                getBoundaryKeyTime(w.end_time) || localTime.localTimeHHMMSS;
 
-              const stopKey = `${j.id}:${localTime.localDate}:${d.id}:${localTime.localTimeHHMM}:stop`;
+              const stopKey = `${j.id}:${localTime.localDate}:${d.id}:${boundaryEndTime}:stop`;
               console.log(`[JOB SCHEDULER] Attempting to stop job ${j.id} with key ${stopKey}`);
 
               try {
@@ -3323,7 +3403,7 @@ export async function runJobSchedulerTick(env: Env): Promise<void> {
                   d.id,
                   w.id,
                   localTime.localDate,
-                  localTime.localTimeHHMM,
+                  boundaryEndTime,
                   nowUtc,
                   nowUtc,
                   nowUtc

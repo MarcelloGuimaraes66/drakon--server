@@ -1211,7 +1211,7 @@ static std::string getExecutableDir()
         return "";
     }
 
-    // Convert full EXE path ÃƒÂ¢Ã‚â€ Ã‚â€™ parent folder
+    // Convert full EXE path ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â‚¬Â Ãƒâ€šÃ¢â‚¬â„¢ parent folder
     fs::path exePath(buffer);
     return exePath.parent_path().string();
 }
@@ -1599,7 +1599,7 @@ static bool buildEncodedSegmentFromGroup(
         while (std::getline(dbg, line)) {
             Logger::instance().logDebug("agent", "CONCAT: " + line);
         }
-    } // <-- dbg destruÃƒÆ’Ã‚Â­do aqui
+    } // <-- dbg destruÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â­do aqui
 
 
     auto probeClipFps = [](const std::string& path) -> int {
@@ -2204,7 +2204,7 @@ static bool deriveSegmentRangeFromPathForPrompt_(
 
 
 
-// Main: from routerResult (start/end + search_paths) ÃƒÂ¢Ã‚â€ Ã‚â€™ EncodedVideoSegment list
+// Main: from routerResult (start/end + search_paths) ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â‚¬Â Ãƒâ€šÃ¢â‚¬â„¢ EncodedVideoSegment list
 static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
     const std::string& clipsRoot,
     const json& routerResult,
@@ -2491,7 +2491,7 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
                 continue;
             }
 
-            // If you didnÃƒÂ¢Ã‚â‚¬Ã‚â„¢t set cameraId/cameraName inside buildEncodedSegmentFromGroup,
+            // If you didnÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â€šÂ¬Ãƒâ€šÃ¢â€žÂ¢t set cameraId/cameraName inside buildEncodedSegmentFromGroup,
             // you can also enforce here:
             // ev.cameraId = camId;
             // if (!group.empty()) ev.cameraName = group[0]->cameraName;
@@ -2550,9 +2550,9 @@ static std::vector<EncodedVideoSegment> buildEncodedVideosFromMp4Clips(
     // 4) Decide which types to use based on window length.
     //
     // Heuristic (unchanged):
-    //  - <= 60s            ÃƒÂ¢Ã‚â€ Ã‚â€™ use only 10s clips (if any)
-    //  - <= 20 minutes     ÃƒÂ¢Ã‚â€ Ã‚â€™ use 10s + 60s + 300s (all we have)
-    //  - > 20 minutes      ÃƒÂ¢Ã‚â€ Ã‚â€™ prefer 300s clips; fallback to 60s/10s if needed
+    //  - <= 60s            ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â‚¬Â Ãƒâ€šÃ¢â‚¬â„¢ use only 10s clips (if any)
+    //  - <= 20 minutes     ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â‚¬Â Ãƒâ€šÃ¢â‚¬â„¢ use 10s + 60s + 300s (all we have)
+    //  - > 20 minutes      ÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â‚¬Â Ãƒâ€šÃ¢â‚¬â„¢ prefer 300s clips; fallback to 60s/10s if needed
     //
     std::vector<const ClipInfo*> chosen;
 
@@ -4673,7 +4673,7 @@ static long HttpGetJson(const std::string& url,
     std::string& outResponse);
 
 // How often the EXE should trigger the scheduler tick:
-static constexpr int kSchedulerTickIntervalSeconds = 60;
+static constexpr int kSchedulerTickIntervalSeconds = 1;
 
 // Uses EXE bearer token (same auth already used by /api/agent/* endpoints).
 
@@ -5294,103 +5294,40 @@ void AgentCore::updateCameraAlgorithms_(int cameraId,
 }
 
 
-
-
-
-/*
-void AgentCore::schedulerPingLoop_() {
-    // give the app a moment to fully boot
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-
-    while (schedulerPingerRunning_) {
-        try {
-            triggerSchedulerTickOnce_();
-        }
-        catch (const std::exception& e) {
-            Logger::instance().logDebug(
-                "agent",
-                std::string("SchedulerTick exception: ") + e.what()
-            );
-        }
-        catch (...) {
-            Logger::instance().logDebug("agent", "SchedulerTick unknown exception");
-        }
-
-        // sleep in 1s slices so stop() is responsive
-        for (int i = 0; i < kSchedulerTickIntervalSeconds && schedulerPingerRunning_; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-}
-*/
-
-
-
-
 void AgentCore::schedulerPingLoop_() {
     using namespace std::chrono;
 
     // give the app a moment to fully boot
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    // Choose a fixed second <= 30 so we always start attempting early in the minute.
-    // 5 is a good default (gives the OS/network a moment after the minute flips).
-    constexpr int kTickSecondInMinute = 5; // MUST be <= 30
-
     auto sleepResponsive = [&](steady_clock::duration d) {
-        // sleep in 1s slices so stop() is responsive
+        constexpr auto kSleepSlice = milliseconds(250);
         auto end = steady_clock::now() + d;
         while (schedulerPingerRunning_) {
             auto now = steady_clock::now();
             if (now >= end) break;
             auto remaining = end - now;
-            auto slice = (remaining > seconds(1)) ? seconds(1) : remaining;
+            auto slice = (remaining > kSleepSlice) ? kSleepSlice : remaining;
             std::this_thread::sleep_for(slice);
         }
-        };
+    };
 
     while (schedulerPingerRunning_) {
-        // --- Compute next tick wall time: "this minute at :kTickSecondInMinute",
-        // or if we've already passed it, "next minute at :kTickSecondInMinute".
         auto nowWall = system_clock::now();
-        auto nowSec = time_point_cast<seconds>(nowWall);
-        auto epochSec = nowSec.time_since_epoch();
-        auto secCount = duration_cast<seconds>(epochSec).count();
-
-        // seconds since start of current minute (0..59)
-        int secInMinute = (int)(secCount % 60);
-
-        // wall time of start of current minute
-        auto minuteStart = nowSec - seconds(secInMinute);
-
-        // desired tick time in this minute
-        auto desired = minuteStart + seconds(kTickSecondInMinute);
-
-        // if already past desired, schedule next minute
-        //if (nowSec > desired) {
-            //desired += minutes(1);
-        //}
-
-
-        if (nowWall >= desired) {
-            desired += minutes(1);
+        auto nextTick = time_point_cast<seconds>(nowWall) + seconds(kSchedulerTickIntervalSeconds);
+        if (nextTick <= nowWall) {
+            nextTick += seconds(kSchedulerTickIntervalSeconds);
         }
 
-
-        // Sleep until desired (convert to steady_clock duration for reliable sleeps)
-        // We compute remaining using system_clock, then sleep that long.
-        auto nowWall2 = system_clock::now();
-        if (desired > nowWall2) {
-            auto remaining = duration_cast<steady_clock::duration>(desired - nowWall2);
+        if (nextTick > nowWall) {
+            auto remaining = duration_cast<steady_clock::duration>(nextTick - nowWall);
             sleepResponsive(remaining);
         }
 
         if (!schedulerPingerRunning_) break;
 
-        // Fire tick attempt (still only once per minute by construction)
         try {
             triggerSchedulerTickOnce_();
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         catch (const std::exception& e) {
             logAgentException_(
@@ -5434,8 +5371,6 @@ void AgentCore::schedulerPingLoop_() {
                 json::object()
             );
         }
-
-        // Loop continues; next desired tick will be next minute at :05
     }
 }
 
@@ -5455,8 +5390,10 @@ void AgentCore::triggerSchedulerTickOnce_() {
 
     const std::string body = "{}";
 
-    // 1 initial attempt + 2 retries on TIMEOUT
-    const int kMaxAttempts = 3;
+    constexpr long kSchedulerTickConnectTimeoutMs = 750L;
+    constexpr long kSchedulerTickTimeoutMs = 1500L;
+    // The scheduler heartbeat already runs every second, so each beat acts as the retry.
+    const int kMaxAttempts = 1;
 
     for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
         CURL* curl = curl_easy_init();
@@ -5480,9 +5417,9 @@ void AgentCore::triggerSchedulerTickOnce_() {
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-        // keep your existing timeouts (UNCHANGED)
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, kSchedulerTickConnectTimeoutMs);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, kSchedulerTickTimeoutMs);
 
         CURLcode res = curl_easy_perform(curl);
 
@@ -5520,7 +5457,6 @@ void AgentCore::triggerSchedulerTickOnce_() {
 
         // Retry only on TIMEOUT, and only if we still have attempts left
         if (isTimeout && attempt < kMaxAttempts) {
-            // tiny backoff to avoid hammering (optional, but recommended)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
@@ -6018,6 +5954,9 @@ void AgentCore::processCommand_(const json& cmd) {
         }
         else if (type == "probe_webcams") {
             handleProbeWebcamsCommand_(commandId, payload);
+        }
+        else if (type == "probe_camera_capture_acceleration") {
+            handleProbeCameraCaptureAccelerationCommand_(commandId, payload);
         }
         else if (type == "job_start") {
             const int commandId = cmd.value("id", -1);
@@ -6564,7 +6503,48 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
     cfg.expectedFps = 1.0;
     cfg.modelPath = "";
     cfg.labelsPath = "";
-    cfg.useGpu = true;
+    cfg.captureAccelerationMode = "cpu";
+    if (p.contains("capture_acceleration_mode") && p["capture_acceleration_mode"].is_string()) {
+        cfg.captureAccelerationMode =
+            lowerAsciiCopy_(trimAscii(p["capture_acceleration_mode"].get<std::string>()));
+    }
+
+    if (cfg.captureAccelerationMode != "nvidia") {
+        bool legacyUseGpu = false;
+        bool hasLegacyUseGpu = false;
+        if (p.contains("use_gpu")) {
+            const auto& useGpuNode = p["use_gpu"];
+            if (useGpuNode.is_boolean()) {
+                legacyUseGpu = useGpuNode.get<bool>();
+                hasLegacyUseGpu = true;
+            }
+            else if (useGpuNode.is_number_integer()) {
+                legacyUseGpu = useGpuNode.get<int>() != 0;
+                hasLegacyUseGpu = true;
+            }
+            else if (useGpuNode.is_string()) {
+                const std::string normalized =
+                    lowerAsciiCopy_(trimAscii(useGpuNode.get<std::string>()));
+                if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+                    legacyUseGpu = true;
+                    hasLegacyUseGpu = true;
+                }
+                else if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+                    legacyUseGpu = false;
+                    hasLegacyUseGpu = true;
+                }
+            }
+        }
+
+        if (hasLegacyUseGpu && legacyUseGpu) {
+            cfg.captureAccelerationMode = "nvidia";
+        }
+    }
+
+    if (cfg.captureAccelerationMode != "nvidia") {
+        cfg.captureAccelerationMode = "cpu";
+    }
+    cfg.useGpu = cfg.captureAccelerationMode == "nvidia";
 
     cfg.cameraSessionId.clear();
     if (p.contains("camera_session_id") && p["camera_session_id"].is_string()) {
@@ -8169,20 +8149,20 @@ void AgentCore::initTimeSync()
     try {
         using namespace std::chrono;
 
-        // 1) horÃƒÆ’Ã‚Â¡rio atual da mÃƒÆ’Ã‚Â¡quina (UTC)
+        // 1) horÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡rio atual da mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡quina (UTC)
         auto now = system_clock::now();
         std::time_t localUtc = system_clock::to_time_t(now);
 
-        // 2) TODO: pegar horÃƒÆ’Ã‚Â¡rio "real" do servidor (UTC)
-        // Aqui vocÃƒÆ’Ã‚Âª pode:
+        // 2) TODO: pegar horÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡rio "real" do servidor (UTC)
+        // Aqui vocÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Âª pode:
         //  - chamar um endpoint no seu backend (ex: /api/agent/time)
         //  - ou ler de um arquivo de config com offset manual
         //
-        // Exemplo genÃƒÆ’Ã‚Â©rico usando HttpGetJson (ajuste URL e parsing):
+        // Exemplo genÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©rico usando HttpGetJson (ajuste URL e parsing):
 
         std::string url = baseUrl_ + "/api/agent/time?client_id=" + clientId_;
         std::string body;
-        long code = HttpGetJson(url, exeToken_, body);  // vocÃƒÆ’Ã‚Âª jÃƒÆ’Ã‚Â¡ tem HttpGetJson em AgentCore :contentReference[oaicite:1]{index=1}
+        long code = HttpGetJson(url, exeToken_, body);  // vocÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Âª jÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ tem HttpGetJson em AgentCore :contentReference[oaicite:1]{index=1}
 
         if (code != 200) {
             Logger::instance().logDebug(
@@ -16286,7 +16266,7 @@ static std::vector<uint8_t> extractMp4ClipAtTime(
     std::wstring ssW = utf8ToWide(ffStart);
 
     // IMPORTANT:
-    // - map video always, audio optionally (0:a?) so cameras w/ no audio wonÃƒÂ¢Ã‚â‚¬Ã‚â„¢t fail
+    // - map video always, audio optionally (0:a?) so cameras w/ no audio wonÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â€šÂ¬Ãƒâ€šÃ¢â€žÂ¢t fail
     // - re-encode for accurate cut (copy can snap to keyframes and shift timing)
     std::wstring cmdLine =
         L"\"" + ffmpegW + L"\""
@@ -18662,7 +18642,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
             "from ",
             " ago",
             " atras",
-            " atrás"
+            " atrÃ¡s"
             });
 
         const int routedMinutes = routerResult.value("time_window_minutes_before_now", 0);
@@ -19996,7 +19976,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
         const std::vector<VideoHit>* answerSourceHits =
             !allVideoHits.empty() ? &allVideoHits : &videoHits;
         if (answerSourceHits != nullptr && !answerSourceHits->empty()) {
-            // (Opcional) ordenar por comeÃƒÆ’Ã‚Â§o do segmento pra ficar bonito
+            // (Opcional) ordenar por comeÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â§o do segmento pra ficar bonito
             std::vector<VideoHit> sorted = *answerSourceHits;
             std::sort(sorted.begin(), sorted.end(),
                 [](const VideoHit& a, const VideoHit& b) {
@@ -20023,7 +20003,7 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                     ? h.cameraName
                     : ("camera " + std::to_string(h.cameraId));
 
-                // 1 linha por segmento, com cÃƒÆ’Ã‚Â¢mera + range + resposta
+                // 1 linha por segmento, com cÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢mera + range + resposta
                 oss << "Camera: " << camLabel << "<br/>"
                     << startHuman << " - " << endHuman
                     << " | " << h.answer
@@ -20388,8 +20368,8 @@ void AgentCore::executeVideoSearchPipeline(const json& payload)
                             
                             //bool ok = sendHitVideosAndGetUrls_(cameraIdInt, chatSessionId, mp4AndTimes, uploadedVideos);
 
-                            int uploadCamId = seg.cameraId;               // preferÃƒÆ’Ã‚Â­vel (correto por segmento)
-                            if (uploadCamId <= 0) uploadCamId = h.cameraId; // fallback se necessÃƒÆ’Ã‚Â¡rio
+                            int uploadCamId = seg.cameraId;               // preferÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â­vel (correto por segmento)
+                            if (uploadCamId <= 0) uploadCamId = h.cameraId; // fallback se necessÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡rio
 
                             bool ok = sendHitVideosAndGetUrls_(uploadCamId, chatSessionId, mp4AndTimes, uploadedVideos);
 
@@ -21047,7 +21027,7 @@ static bool convertToVideoOnlyWebmWithFfmpeg(const std::string& inputPathMp4, co
     // -an        : ensure no audio stream
     // VP9 params: -b:v 0 -crf 32 (reasonable quality/size)
     //
-    // If performance is too slow, IÃƒÂ¢Ã‚â‚¬Ã‚â„¢ll give you a VP8 variant.
+    // If performance is too slow, IÃƒÆ’Ã‚Â¢Ãƒâ€šÃ¢â€šÂ¬Ãƒâ€šÃ¢â€žÂ¢ll give you a VP8 variant.
     std::wstring cmdLine =
         L"\"" + ffmpegW + L"\""
         L" -hide_banner -loglevel error -y"
@@ -23178,9 +23158,9 @@ namespace {
     {
         static const std::pair<const char*, const char*> kBuildCues[] = {
             { "porte fisico mediano", "medium build" },
-            { "porte físico mediano", "medium build" },
+            { "porte fÃ­sico mediano", "medium build" },
             { "porte medio", "medium build" },
-            { "porte médio", "medium build" },
+            { "porte mÃ©dio", "medium build" },
             { "porte mediano", "medium build" },
             { "average build", "medium build" },
             { "medium build", "medium build" },
@@ -32359,6 +32339,304 @@ void AgentCore::postCommandResult_(
     }
 }
 
+static std::string normalizeCaptureAccelerationProbeReasonCode_(const std::string& rawReasonCode)
+{
+    const std::string normalized = lowerAsciiCopy_(trimAscii(rawReasonCode));
+    return normalized.empty() ? std::string("unsupported") : normalized;
+}
+
+static std::string buildCaptureAccelerationProbeReasonMessage_(
+    const std::string& reasonCode,
+    const std::string& technicalDetail = std::string())
+{
+    std::string message;
+    if (reasonCode == "ok" || reasonCode == "supported") {
+        message = "GPU decode is available on this machine.";
+    }
+    else if (reasonCode == "not_needed") {
+        message = "CPU mode does not require a GPU scan.";
+    }
+    else if (reasonCode == "not_rtsp") {
+        message = "GPU decode is only available for RTSP cameras in this version.";
+    }
+    else if (reasonCode == "no_rtsp_candidates") {
+        message = "The camera is missing RTSP transport details for a GPU scan.";
+    }
+    else if (reasonCode == "build_missing_nvidia_decode" ||
+             reasonCode == "build_missing_gpu_decode" ||
+             reasonCode.ends_with("_backend_not_supported")) {
+        message = "This installed desktop build does not expose a compatible GPU decode backend for this stream.";
+    }
+    else if (reasonCode.ends_with("_no_nvidia_adapter")) {
+        message = "No NVIDIA GPU adapter was available for GPU decode on this machine.";
+    }
+    else if (reasonCode == "hw_decoder_init_failed" ||
+             reasonCode.ends_with("_backend_init_failed")) {
+        message = "A compatible GPU decode backend could not be initialized on this machine.";
+    }
+    else if (reasonCode == "hw_decoder_open_failed" ||
+             reasonCode.ends_with("_decoder_open_failed")) {
+        message = "The GPU decoder could not be opened for this camera stream.";
+    }
+    else if (reasonCode == "nvidia_decoder_format_unavailable" ||
+             reasonCode.ends_with("_decoder_format_unavailable")) {
+        message = "The stream opened, but FFmpeg did not expose a compatible GPU decode format for it.";
+    }
+    else if (reasonCode == "nvidia_decode_not_activated" ||
+             reasonCode == "gpu_decode_not_activated") {
+        message = "The stream decoded successfully, but it stayed on CPU instead of GPU decode.";
+    }
+    else if (reasonCode == "stream_open_failed") {
+        message = "The camera stream could not be opened during the GPU scan.";
+    }
+    else if (reasonCode == "stream_read_failed") {
+        message = "The camera stream opened, but the GPU scan could not decode a frame.";
+    }
+    else {
+        message = "GPU decode is not available for this camera on this machine.";
+    }
+
+    const std::string detail = trimAscii(technicalDetail);
+    if (!detail.empty() &&
+        (reasonCode == "hw_decoder_init_failed" ||
+         reasonCode == "hw_decoder_open_failed" ||
+         reasonCode.ends_with("_backend_init_failed") ||
+         reasonCode.ends_with("_decoder_open_failed") ||
+         reasonCode.ends_with("_no_nvidia_adapter") ||
+         reasonCode == "stream_open_failed" ||
+         reasonCode == "stream_read_failed")) {
+        message += " Technical detail: " + detail;
+    }
+
+    return message;
+}
+
+void AgentCore::handleProbeCameraCaptureAccelerationCommand_(int commandId, const nlohmann::json& payload)
+{
+    if (commandId <= 0) {
+        return;
+    }
+
+    try {
+        std::string requestedMode = "nvidia";
+        if (payload.is_object()) {
+            if (payload.contains("requested_mode") && payload["requested_mode"].is_string()) {
+                requestedMode = lowerAsciiCopy_(trimAscii(payload["requested_mode"].get<std::string>()));
+            }
+            else if (payload.contains("capture_acceleration_mode") &&
+                     payload["capture_acceleration_mode"].is_string()) {
+                requestedMode = lowerAsciiCopy_(trimAscii(payload["capture_acceleration_mode"].get<std::string>()));
+            }
+        }
+
+        const int probeCameraId =
+            payload.is_object() && payload.contains("camera_id") && payload["camera_id"].is_number_integer()
+                ? payload["camera_id"].get<int>()
+                : -1;
+        const std::string probeCameraName =
+            payload.is_object() && payload.contains("name") && payload["name"].is_string()
+                ? trimAscii(payload["name"].get<std::string>())
+                : std::string();
+        auto diagValue = [](const std::string& value, const char* fallback = "none") {
+            const std::string trimmed = trimAscii(value);
+            return trimmed.empty() ? std::string(fallback) : trimmed;
+            };
+        auto logProbe = [&](const std::string& message) {
+            std::string prefix =
+                "probeCameraCaptureAcceleration: commandId=" + std::to_string(commandId);
+            if (probeCameraId > 0) {
+                prefix += " cameraId=" + std::to_string(probeCameraId);
+            }
+            if (!probeCameraName.empty()) {
+                prefix += " cameraName=\"" + probeCameraName + "\"";
+            }
+            Logger::instance().logDebug("agent", prefix + " " + message);
+            };
+
+        if (requestedMode != "nvidia") {
+            nlohmann::json result;
+            result["status"] = "supported";
+            result["requested_mode"] = requestedMode;
+            result["reason_code"] = "not_needed";
+            result["reason"] = buildCaptureAccelerationProbeReasonMessage_("not_needed");
+            logProbe("result status=supported reason_code=not_needed requested_mode=" + requestedMode);
+            postCommandResult_(commandId, "completed", result);
+            return;
+        }
+
+        std::string connectionMethod;
+        if (payload.is_object() &&
+            payload.contains("connection_method") &&
+            payload["connection_method"].is_string()) {
+            connectionMethod = lowerAsciiCopy_(trimAscii(payload["connection_method"].get<std::string>()));
+        }
+
+        if (connectionMethod == "webcam") {
+            nlohmann::json result;
+            result["status"] = "unsupported";
+            result["requested_mode"] = requestedMode;
+            result["reason_code"] = "not_rtsp";
+            result["reason"] = buildCaptureAccelerationProbeReasonMessage_("not_rtsp");
+            logProbe("result status=unsupported reason_code=not_rtsp connection_method=" + connectionMethod);
+            postCommandResult_(commandId, "completed", result);
+            return;
+        }
+
+        std::vector<std::string> urls = buildRtspCandidatesFromPayload(payload);
+        if (urls.empty()) {
+            nlohmann::json result;
+            result["status"] = "unavailable";
+            result["requested_mode"] = requestedMode;
+            result["reason_code"] = "no_rtsp_candidates";
+            result["reason"] = buildCaptureAccelerationProbeReasonMessage_("no_rtsp_candidates");
+            logProbe("result status=unavailable reason_code=no_rtsp_candidates");
+            postCommandResult_(commandId, "completed", result);
+            return;
+        }
+
+        logProbe(
+            "starting requested_mode=" + requestedMode +
+            " connection_method=" + diagValue(connectionMethod, "unknown") +
+            " candidate_count=" + std::to_string(urls.size()));
+
+        RtspOpenParams params;
+        params.open_timeout_ms = 5000;
+        params.read_timeout_ms = 3000;
+        params.force_tcp = true;
+        params.buffer_size_bytes = 4 * 1024 * 1024;
+        params.max_delay_us = 2'000'000;
+        params.enable_reconnect = true;
+        params.reconnect_max_delay_s = 5;
+        params.low_cpu_skip_nonref = false;
+        params.prefer_nvidia_decode = true;
+        params.require_hardware_decode = false;
+
+        std::string lastStreamError;
+        std::string lastUnsupportedReason;
+        bool streamOpened = false;
+        bool frameDecoded = false;
+
+        for (size_t candidateIndex = 0; candidateIndex < urls.size(); ++candidateIndex) {
+            const auto& url = urls[candidateIndex];
+            params.url = url;
+            logProbe(
+                "candidate_index=" + std::to_string(candidateIndex) +
+                " action=open url=" + url);
+
+            RtspCapture cap;
+            if (!cap.open(params)) {
+                lastStreamError = trimAscii(cap.lastError());
+                const std::string reasonCode =
+                    normalizeCaptureAccelerationProbeReasonCode_(cap.accelerationReason());
+                logProbe(
+                    "candidate_index=" + std::to_string(candidateIndex) +
+                    " result=open_failed reason_code=" + reasonCode +
+                    " last_error=" + diagValue(lastStreamError) +
+                    " selected_device={" + diagValue(cap.selectedHardwareDevice()) + "}" +
+                    " trace={" + diagValue(cap.accelerationDebugTrace()) + "}");
+                continue;
+            }
+
+            streamOpened = true;
+            logProbe(
+                "candidate_index=" + std::to_string(candidateIndex) +
+                " result=open_ok configured_backend=" + diagValue(cap.configuredAccelerationBackend()) +
+                " selected_device={" + diagValue(cap.selectedHardwareDevice()) + "}" +
+                " trace={" + diagValue(cap.accelerationDebugTrace()) + "}");
+
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                cv::Mat frame;
+                if (!cap.read(frame) || frame.empty()) {
+                    lastStreamError = trimAscii(cap.lastError());
+                    logProbe(
+                        "candidate_index=" + std::to_string(candidateIndex) +
+                        " read_attempt=" + std::to_string(attempt) +
+                        " result=read_failed reason_code=" +
+                        normalizeCaptureAccelerationProbeReasonCode_(cap.accelerationReason()) +
+                        " active_mode=" + diagValue(cap.activeAccelerationMode()) +
+                        " active_backend=" + diagValue(cap.activeAccelerationBackend()) +
+                        " last_error=" + diagValue(lastStreamError) +
+                        " trace={" + diagValue(cap.accelerationDebugTrace()) + "}");
+                    continue;
+                }
+
+                frameDecoded = true;
+                const std::string activeMode =
+                    lowerAsciiCopy_(trimAscii(cap.activeAccelerationMode()));
+                if (activeMode == "gpu") {
+                    logProbe(
+                        "candidate_index=" + std::to_string(candidateIndex) +
+                        " read_attempt=" + std::to_string(attempt) +
+                        " result=supported reason_code=ok active_backend=" +
+                        diagValue(cap.activeAccelerationBackend()) +
+                        " selected_device={" + diagValue(cap.selectedHardwareDevice()) + "}" +
+                        " trace={" + diagValue(cap.accelerationDebugTrace()) + "}");
+                    nlohmann::json result;
+                    result["status"] = "supported";
+                    result["requested_mode"] = requestedMode;
+                    result["reason_code"] = "ok";
+                    result["reason"] = buildCaptureAccelerationProbeReasonMessage_("ok");
+                    postCommandResult_(commandId, "completed", result);
+                    return;
+                }
+
+                lastUnsupportedReason =
+                    normalizeCaptureAccelerationProbeReasonCode_(cap.accelerationReason());
+                logProbe(
+                    "candidate_index=" + std::to_string(candidateIndex) +
+                    " read_attempt=" + std::to_string(attempt) +
+                    " result=frame_decoded_not_gpu reason_code=" + lastUnsupportedReason +
+                    " active_mode=" + diagValue(cap.activeAccelerationMode()) +
+                    " active_backend=" + diagValue(cap.activeAccelerationBackend()) +
+                    " selected_device={" + diagValue(cap.selectedHardwareDevice()) + "}" +
+                    " trace={" + diagValue(cap.accelerationDebugTrace()) + "}");
+                break;
+            }
+        }
+
+        if (frameDecoded) {
+            const std::string reasonCode =
+                lastUnsupportedReason.empty()
+                    ? std::string("gpu_decode_not_activated")
+                    : lastUnsupportedReason;
+
+            nlohmann::json result;
+            result["status"] = "unsupported";
+            result["requested_mode"] = requestedMode;
+            result["reason_code"] = reasonCode;
+            result["reason"] =
+                buildCaptureAccelerationProbeReasonMessage_(reasonCode, lastStreamError);
+            logProbe(
+                "final status=unsupported reason_code=" + reasonCode +
+                " last_error=" + diagValue(lastStreamError));
+            postCommandResult_(commandId, "completed", result);
+            return;
+        }
+
+        const std::string reasonCode = streamOpened ? "stream_read_failed" : "stream_open_failed";
+        nlohmann::json result;
+        result["status"] = "unavailable";
+        result["requested_mode"] = requestedMode;
+        result["reason_code"] = reasonCode;
+        result["reason"] =
+            buildCaptureAccelerationProbeReasonMessage_(reasonCode, lastStreamError);
+        logProbe(
+            "final status=unavailable reason_code=" + reasonCode +
+            " last_error=" + diagValue(lastStreamError));
+        postCommandResult_(commandId, "completed", result);
+    }
+    catch (const std::exception& e) {
+        nlohmann::json errorPayload;
+        errorPayload["error"] = std::string("camera capture acceleration probe failed: ") + e.what();
+        postCommandResult_(commandId, "failed", errorPayload);
+    }
+    catch (...) {
+        nlohmann::json errorPayload;
+        errorPayload["error"] = "camera capture acceleration probe failed";
+        postCommandResult_(commandId, "failed", errorPayload);
+    }
+}
+
 void AgentCore::handleProbeWebcamsCommand_(int commandId, const nlohmann::json& payload)
 {
     if (commandId <= 0) {
@@ -37056,3 +37334,4 @@ std::vector<VideoHit> AgentCore::analyzeVideosWithGemini_(
     return allHits;
 }
 */
+

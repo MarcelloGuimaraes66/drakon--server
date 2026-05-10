@@ -8,9 +8,11 @@
 struct AVFormatContext;
 struct AVCodecContext;
 struct AVCodec;
+struct AVCodecParameters;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct AVBufferRef;
 
 struct RtspOpenParams {
     std::string url;
@@ -24,6 +26,8 @@ struct RtspOpenParams {
 
     // liga modo low - cpu(skip frames)
     bool low_cpu_skip_nonref = false;
+    bool prefer_nvidia_decode = false;
+    bool require_hardware_decode = false;
 };
 
 class RtspCapture {
@@ -38,19 +42,31 @@ public:
     // Returns false on EoF or fatal error (caller can decide to reopen).
     bool read(cv::Mat& outBgr);
 
-    // consome 1 pacote por chamada; só converte pra BGR se wantBgr == true
-    bool pump(bool wantBgr, cv::Mat * outBgr);
+    // Consume one packet per call; convert to BGR only when requested.
+    bool pump(bool wantBgr, cv::Mat* outBgr);
 
     // Force reopen with backoff; keeps last params.
     bool reopen();
 
     // Non-fatal errors will return false; check last error string.
     const std::string& lastError() const { return lastError_; }
+    const std::string& activeAccelerationMode() const { return activeAccelerationMode_; }
+    const std::string& activeAccelerationBackend() const { return activeAccelerationBackend_; }
+    const std::string& accelerationReason() const { return accelerationReason_; }
+    const std::string& configuredAccelerationBackend() const { return configuredHardwareBackend_; }
+    const std::string& selectedHardwareDevice() const { return selectedHardwareDevice_; }
+    const std::string& accelerationDebugTrace() const { return accelerationDebugTrace_; }
 
 private:
     bool openInternal();
     void freeAll();
+    bool openDecoderContext(const AVCodecParameters* par, const char* requestedHardwareBackend);
+    bool configureHardwareDecode(const char* backendName);
+    void appendAccelerationDebugTrace_(const std::string& message);
     bool ensureSws(int srcW, int srcH, int srcPixFmt);
+    void noteDecodedFrameAcceleration();
+    AVFrame* currentFrameForConversion();
+    bool convertCurrentFrameToBgr(cv::Mat& outBgr);
 
     // interrupt callback support
     static int interruptCallback(void* opaque);
@@ -63,9 +79,22 @@ private:
     AVCodecContext* dec_ = nullptr;
     AVCodec* codec_ = nullptr;
     AVFrame* frame_ = nullptr;
+    AVFrame* swFrame_ = nullptr;
     AVPacket* pkt_ = nullptr;
     SwsContext* sws_ = nullptr;
+    AVBufferRef* hwDeviceCtx_ = nullptr;
     int              vstream_index_ = -1;
+    int hwPixFmt_ = -1;
+    int swsSrcPixFmt_ = -1;
+    bool requestedGpuDecode_ = false;
+    bool requireHardwareDecode_ = false;
+    std::string activeAccelerationMode_{ "cpu" };
+    std::string activeAccelerationBackend_;
+    std::string accelerationReason_;
+    std::string configuredHardwareBackend_;
+    std::string selectedHardwareDevice_;
+    std::string accelerationDebugTrace_;
+    bool accelerationFrameModeRecorded_ = false;
 
     // Stall/timeout handling
     std::chrono::steady_clock::time_point ioStart_;
