@@ -34,6 +34,7 @@
 #include "../comm/BackendConfig.h"
 #include "../comm/PairingClient.h"
 #include "../generated/Branding.h"
+#include "../orchestrator/ConfigUtils.h"
 
 #include <filesystem>
 #include <fstream>
@@ -880,6 +881,202 @@ static std::string localDateTokenYYYYMMDD_()
         static_cast<unsigned>(st.wDay)
     );
     return std::string(buffer);
+}
+
+struct DailyReportDateParts_ {
+    std::string compactToken;
+    std::string dashedToken;
+    std::string year;
+    std::string month;
+    std::string day;
+};
+
+static DailyReportDateParts_ localDatePartsForDailyReport_()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    char compact[16];
+    char dashed[16];
+    char year[8];
+    char month[4];
+    char day[4];
+
+    std::snprintf(
+        compact,
+        sizeof(compact),
+        "%04u%02u%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(
+        dashed,
+        sizeof(dashed),
+        "%04u-%02u-%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(year, sizeof(year), "%04u", static_cast<unsigned>(st.wYear));
+    std::snprintf(month, sizeof(month), "%02u", static_cast<unsigned>(st.wMonth));
+    std::snprintf(day, sizeof(day), "%02u", static_cast<unsigned>(st.wDay));
+
+    return DailyReportDateParts_{
+        std::string(compact),
+        std::string(dashed),
+        std::string(year),
+        std::string(month),
+        std::string(day)
+    };
+}
+
+static bool dailyReportsEnabled_()
+{
+    static const bool enabled = [] {
+        return chatv2::parseBoolValue(
+            chatv2::loadConfigValue("DAILY_REPORTS", { "daily_reports_enabled.txt" }),
+            false
+        );
+    }();
+    return enabled;
+}
+
+static std::string dailyReportCameraNameToken_(const CameraConfig& config)
+{
+    const std::string fallback =
+        config.id.empty() ? std::string("camera") : std::string("camera_") + config.id;
+    const std::string rawValue = !config.name.empty() ? config.name : fallback;
+    const std::string token = sanitizeCameraAgentEventToken_(rawValue);
+    return token.empty() ? sanitizeCameraAgentEventToken_(fallback) : token;
+}
+
+static std::string dailyReportCameraDirToken_(const CameraConfig& config)
+{
+    const std::string idToken = sanitizeCameraAgentEventToken_(
+        config.id.empty() ? std::string("unknown") : config.id
+    );
+    return idToken.empty() ? std::string("camera_unknown") : std::string("camera_") + idToken;
+}
+
+static fs::path buildDailyReportCameraDir_(
+    const CameraConfig& config,
+    const DailyReportDateParts_& dateParts)
+{
+    fs::path dir = fs::path("C:\\daily_reports");
+    dir /= dateParts.year;
+    dir /= dateParts.month;
+    dir /= dateParts.day;
+    dir /= dailyReportCameraDirToken_(config);
+    return dir;
+}
+
+static std::string buildDailyReportFileName_(
+    const CameraConfig& config,
+    const DailyReportDateParts_& dateParts)
+{
+    return dateParts.dashedToken + "__" + dailyReportCameraNameToken_(config) + ".jpg";
+}
+
+static bool hasDailyReportImageInDir_(const fs::path& dir)
+{
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        return false;
+    }
+
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        if (extension == ".jpg" || extension == ".jpeg") {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool writeDailyReportImageAtomic_(
+    const std::string& cameraId,
+    const fs::path& dir,
+    const std::string& fileName,
+    const std::vector<uchar>& imageBytes)
+{
+    try {
+        if (imageBytes.empty()) return false;
+
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraId,
+                "daily_reports: create_directories failed: " + ec.message() + " dir=" + dir.string()
+            );
+            return false;
+        }
+
+        const fs::path finalPath = dir / fileName;
+        fs::path tmpPath = finalPath;
+        tmpPath += ".tmp";
+
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    "daily_reports: failed opening temp image path: " + tmpPath.string()
+                );
+                return false;
+            }
+
+            ofs.write(
+                reinterpret_cast<const char*>(imageBytes.data()),
+                static_cast<std::streamsize>(imageBytes.size())
+            );
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    "daily_reports: failed writing temp image path: " + tmpPath.string()
+                );
+                ofs.close();
+                fs::remove(tmpPath, ec);
+                return false;
+            }
+        }
+
+        fs::rename(tmpPath, finalPath, ec);
+        if (ec) {
+            fs::remove(tmpPath, ec);
+            Logger::instance().logDebug(
+                cameraId,
+                "daily_reports: rename temp image failed: " + ec.message() +
+                " tmp=" + tmpPath.string() + " final=" + finalPath.string()
+            );
+            return false;
+        }
+
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            cameraId,
+            std::string("daily_reports: exception writing image snapshot: ") + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            cameraId,
+            "daily_reports: unknown exception writing image snapshot"
+        );
+    }
+
+    return false;
 }
 
 
@@ -2881,6 +3078,69 @@ void CameraSession::maybeUpdateJobStill_(const cv::Mat& frame, std::chrono::stea
     }
 }
 
+void CameraSession::maybeWriteDailyReport_(
+    const cv::Mat& frame,
+    std::chrono::steady_clock::time_point now)
+{
+    static const auto kRetryBackoff = std::chrono::seconds(60);
+
+    if (!dailyReportsEnabled_() || frame.empty()) {
+        return;
+    }
+
+    const DailyReportDateParts_ dateParts = localDatePartsForDailyReport_();
+    const std::string& dateToken = dateParts.compactToken;
+    if (!lastDailyReportDateToken_.empty() && lastDailyReportDateToken_ == dateToken) {
+        return;
+    }
+
+    if (!dailyReportRetryDateToken_.empty() &&
+        dailyReportRetryDateToken_ == dateToken &&
+        nextDailyReportRetryAt_.time_since_epoch().count() != 0 &&
+        now < nextDailyReportRetryAt_)
+    {
+        return;
+    }
+
+    const fs::path cameraDir = buildDailyReportCameraDir_(config_, dateParts);
+    if (hasDailyReportImageInDir_(cameraDir)) {
+        lastDailyReportDateToken_ = dateToken;
+        dailyReportRetryDateToken_.clear();
+        nextDailyReportRetryAt_ = std::chrono::steady_clock::time_point{};
+        return;
+    }
+
+    std::vector<uchar> jpgBuf;
+    const std::vector<int> encodeParams{
+        cv::IMWRITE_JPEG_QUALITY,
+        90
+    };
+    if (!cv::imencode(".jpg", frame, jpgBuf, encodeParams) || jpgBuf.empty()) {
+        dailyReportRetryDateToken_ = dateToken;
+        nextDailyReportRetryAt_ = now + kRetryBackoff;
+        Logger::instance().logDebug(
+            config_.id,
+            "daily_reports: failed to encode daily snapshot JPEG"
+        );
+        return;
+    }
+
+    const std::string fileName = buildDailyReportFileName_(config_, dateParts);
+    if (!writeDailyReportImageAtomic_(config_.id, cameraDir, fileName, jpgBuf)) {
+        dailyReportRetryDateToken_ = dateToken;
+        nextDailyReportRetryAt_ = now + kRetryBackoff;
+        return;
+    }
+
+    lastDailyReportDateToken_ = dateToken;
+    dailyReportRetryDateToken_.clear();
+    nextDailyReportRetryAt_ = std::chrono::steady_clock::time_point{};
+    Logger::instance().logDebug(
+        config_.id,
+        "daily_reports: saved daily snapshot " + (cameraDir / fileName).string()
+    );
+}
+
 
 
 
@@ -3115,6 +3375,7 @@ void CameraSession::captureLoop_() {
                 telemetryFrameHeight_.store(frameMat.rows, std::memory_order_relaxed);
 
                 maybeUpdateJobStill_(frameMat, now);
+                maybeWriteDailyReport_(frameMat, now);
 
                 // salva o primeiro frame na memoria para descriÃ§Ã£o de ambiente <<< 
                 if (!firstFrameSaved_.load(std::memory_order_acquire)) {
@@ -3989,6 +4250,7 @@ void CameraSession::captureLoop_() {
             telemetryFrameHeight_.store(frameMat.rows, std::memory_order_relaxed);
 
             maybeUpdateJobStill_(frameMat, now);
+            maybeWriteDailyReport_(frameMat, now);
 
             // salva o primeiro frame na memoria para descriÃ§Ã£o de ambiente <<< 
             if (!firstFrameSaved_.load(std::memory_order_acquire)) {

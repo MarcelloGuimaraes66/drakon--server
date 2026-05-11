@@ -204,10 +204,14 @@ private:
     std::unordered_map<std::string, std::deque<TemporalEvidenceItem>> temporalEvidenceByAlgo_;
 
     void maybeUpdateJobStill_(const cv::Mat& frame, std::chrono::steady_clock::time_point now);
+    void maybeWriteDailyReport_(const cv::Mat& frame, std::chrono::steady_clock::time_point now);
     mutable std::mutex jobStillMutex_;
     std::string lastJobStillB64_;
     std::chrono::steady_clock::time_point lastJobStillAt_{};
     std::string lastJobStillTsUtcIso_;
+    std::string lastDailyReportDateToken_;
+    std::string dailyReportRetryDateToken_;
+    std::chrono::steady_clock::time_point nextDailyReportRetryAt_{};
 
     std::atomic<std::uint64_t> telemetryLastFrameTickMs_{ 0 };
     std::atomic<double> telemetryActualFps_{ 0.0 };

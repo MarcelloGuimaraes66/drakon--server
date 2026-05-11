@@ -114,6 +114,7 @@ function createRuntimeState(overrides = {}) {
         databaseBackend === "sqlite" && sqliteEncryptionConfig
           ? sqliteEncryptionConfig.keyVersion
           : null,
+      dailyReportsEnabled: resolveDailyReportsEnabled(),
     },
     env: null,
   };
@@ -133,6 +134,66 @@ function summarizeError(error) {
     return error.stack || error.message;
   }
   return String(error || "Unknown error");
+}
+
+function parseOptionalBooleanFlag(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on"
+  ) {
+    return true;
+  }
+
+  if (
+    normalized === "0" ||
+    normalized === "false" ||
+    normalized === "no" ||
+    normalized === "off"
+  ) {
+    return false;
+  }
+
+  return null;
+}
+
+function resolveDailyReportsEnabled() {
+  for (const value of [process.env.DAILY_REPORTS, process.env.daily_reports]) {
+    const parsed = parseOptionalBooleanFlag(value);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return false;
+}
+
+function persistDailyReportsFlagFile() {
+  const enabled = resolveDailyReportsEnabled();
+  const targetPath = path.join(serviceSessionDir, "daily_reports_enabled.txt");
+
+  try {
+    fs.writeFileSync(targetPath, enabled ? "true\n" : "false\n", "utf8");
+    console.log(
+      `[desktop-server] daily reports ${
+        enabled ? "enabled" : "disabled"
+      } config synced to ${targetPath}`
+    );
+  } catch (error) {
+    console.warn(
+      `[desktop-server] failed to sync daily reports config to ${targetPath}: ${summarizeError(
+        error
+      )}`
+    );
+  }
+
+  return enabled;
 }
 
 function resolveOptionalEnvSecretValue(inlineValue, filePathValue) {
@@ -569,6 +630,8 @@ async function warmWorkerBootstrap(env) {
 }
 
 async function initializeRuntimeState() {
+  persistDailyReportsFlagFile();
+
   if (databaseBackend === "sqlite") {
     const sqlitePath = resolveDefaultSqlitePath(activeBrand, storageRoot);
     const seedPath = resolveBundledSqliteSeedPath(activeBrand);

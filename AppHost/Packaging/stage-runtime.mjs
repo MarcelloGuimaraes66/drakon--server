@@ -31,6 +31,7 @@ const desktopRuntimeEnvKeys = [
   "GOOGLE_GEOCODING_API_KEY",
   "GEONAMES_USERNAME",
   "CHAT_V2_ENABLED",
+  "DAILY_REPORTS",
   "STRIPE_SECRET_KEY",
   "STRIPE_WEBHOOK_SECRET",
   "STRIPE_CHAT_PAYG_PRICE_ID",
@@ -199,6 +200,14 @@ async function stageDesktopRuntimeEnv() {
     }
   }
 
+  const dailyReportsValue = resolveRuntimeEnvValueFromAliases(
+    ["DAILY_REPORTS", "daily_reports"],
+    sourceLocalEnv
+  );
+  if (dailyReportsValue) {
+    runtimeEnv.DAILY_REPORTS = dailyReportsValue;
+  }
+
   const centralAuthPublicKey = await resolveDesktopCentralAuthPublicKey(sourceLocalEnv);
   const centralAuthBaseUrl = String(runtimeEnv.CENTRAL_AUTH_BASE_URL || "").trim();
   const centralAuthConfigured = Boolean(
@@ -261,6 +270,17 @@ function resolveRuntimeEnvValue(key, sourceEnv) {
   }
 
   return String(sourceEnv[key] || "").trim();
+}
+
+function resolveRuntimeEnvValueFromAliases(keys, sourceEnv) {
+  for (const key of keys) {
+    const value = resolveRuntimeEnvValue(key, sourceEnv);
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
 }
 
 async function resolveDesktopCentralAuthPublicKey(sourceEnv) {
