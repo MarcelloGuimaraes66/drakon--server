@@ -101,6 +101,22 @@ import {
   waitForSharedFindRelayDispatchAck,
 } from "./sharedFindRelayState";
 import {
+  clearPendingWorkspaceApproval,
+  listPendingWorkspaceApprovals,
+  settleWorkspaceProxyResponse,
+  upsertPendingWorkspaceApproval,
+  waitForWorkspaceProxyResponse,
+} from "./workspaceLocalState";
+import {
+  ensureWorkspaceRelayClientConnected,
+  sendWorkspaceRelayClientMessage,
+  type WorkspaceRelayClientContext,
+} from "./workspaceRelayClient";
+import {
+  countWorkspaceRelayConnections,
+  issueWorkspaceRelaySession,
+} from "./workspaceRelayState";
+import {
   getLocalSessionUserByToken,
   migrateAppUserIdReferences,
   migrateLegacyLocalUserIdToCanonicalId,
@@ -7187,6 +7203,24 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       await db.prepare(`
+        CREATE TABLE IF NOT EXISTS workspace_access_settings (
+          user_id TEXT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+          connection_policy TEXT NOT NULL DEFAULT 'allow_while_open',
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      await addColumnIfMissing(
+        `ALTER TABLE workspace_access_settings ADD COLUMN connection_policy TEXT NOT NULL DEFAULT 'allow_while_open'`
+      );
+      await addColumnIfMissing(`ALTER TABLE workspace_access_settings ADD COLUMN updated_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE workspace_access_settings ADD COLUMN created_at TEXT`);
+      await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_access_settings_user
+        ON workspace_access_settings(user_id)
+      `).run();
+
+      await db.prepare(`
         CREATE TABLE IF NOT EXISTS oauth_identities (
           provider TEXT NOT NULL,
           provider_subject TEXT NOT NULL,
@@ -9882,6 +9916,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           `UPDATE job_step_agents
            SET run_every = CASE
                  WHEN run_every = 10 THEN 10
+                 WHEN run_every = 300 THEN 300
+                 WHEN run_every = 600 THEN 600
                  ELSE 60
                END,
                running_resolution = CASE
@@ -14830,6 +14866,12 @@ const GOOGLE_OAUTH_PKCE_COOKIE_NAME = `${brand.id}_google_oauth_pkce`;
 const GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME = `${brand.id}_google_oauth_redirect_uri`;
 const GOOGLE_OAUTH_COUNTRY_CODE_COOKIE_NAME = `${brand.id}_google_oauth_country_code`;
 const GOOGLE_OAUTH_INTENT_COOKIE_NAME = `${brand.id}_google_oauth_intent`;
+const INTERNAL_REMOTE_WORKSPACE_AUTH_HEADER = "x-drakon-internal-remote-workspace-auth";
+const INTERNAL_REMOTE_WORKSPACE_USER_HEADER = "x-drakon-internal-remote-workspace-user-id";
+const INTERNAL_REMOTE_WORKSPACE_SESSION_HEADER = "x-drakon-internal-remote-workspace-session-id";
+const INTERNAL_REMOTE_WORKSPACE_AUTH_SECRET = generateUUID();
+const WORKSPACE_ACCESS_PRESENCE_TTL_MS = 30_000;
+const LOCAL_WORKSPACE_ACCESS_API_PREFIX = "/api/desktop-workspace-access";
 const SESSION_DURATION_DAYS = 30;
 const AUTH_DEBUG = process.env.AUTH_DEBUG === "1";
 const GOOGLE_OIDC_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration";
@@ -14850,14 +14892,16 @@ function base64UrlEncodeBytes(bytes: Uint8Array): string {
 }
 
 function generateRandomBase64Url(byteLength: number): string {
+  const cryptoApi = getWebCrypto();
   const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
+  cryptoApi.getRandomValues(bytes);
   return base64UrlEncodeBytes(bytes);
 }
 
 async function sha256Base64Url(input: string): Promise<string> {
+  const cryptoApi = getWebCrypto();
   const encoded = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  const digest = await cryptoApi.subtle.digest("SHA-256", encoded);
   return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
@@ -15532,6 +15576,73 @@ type CentralCameraFindShareRow = {
   updated_at: string;
 };
 
+type WorkspaceConnectionPolicy = "allow_while_open" | "confirm_each_time";
+type WorkspacePermissionProfile = "full_access";
+type WorkspaceInviteStatus = "pending" | "accepted" | "denied" | "revoked";
+type WorkspaceSessionStatus =
+  | "pending_owner"
+  | "approved"
+  | "active"
+  | "denied"
+  | "ended"
+  | "revoked";
+
+type CentralWorkspaceAccessInviteRow = {
+  id: number;
+  brand_id: string;
+  owner_public_id: string;
+  invitee_public_id: string;
+  permission_profile: WorkspacePermissionProfile;
+  status: WorkspaceInviteStatus;
+  created_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  updated_at: string;
+  owner_handle: string | null;
+  owner_email: string;
+  invitee_handle: string | null;
+  invitee_email: string;
+};
+
+type CentralWorkspaceAccessPresenceRow = {
+  brand_id: string;
+  owner_public_id: string;
+  app_instance_id: string;
+  connection_policy: WorkspaceConnectionPolicy;
+  last_seen_at: string;
+  updated_at: string;
+};
+
+type CentralWorkspaceAccessSessionRow = {
+  session_id: string;
+  brand_id: string;
+  owner_public_id: string;
+  operator_public_id: string;
+  permission_profile: WorkspacePermissionProfile;
+  status: WorkspaceSessionStatus;
+  requested_by_policy: WorkspaceConnectionPolicy;
+  requested_at: string;
+  approved_at: string | null;
+  connected_at: string | null;
+  ended_at: string | null;
+  ended_reason: string | null;
+  updated_at: string;
+  owner_handle: string | null;
+  owner_email: string;
+  operator_handle: string | null;
+  operator_email: string;
+  owner_online: boolean;
+  owner_last_seen_at: string | null;
+  owner_connection_policy: WorkspaceConnectionPolicy;
+};
+
+type WorkspaceAvailableAccessRow = CentralWorkspaceAccessInviteRow & {
+  owner_online: boolean;
+  owner_last_seen_at: string | null;
+  owner_connection_policy: WorkspaceConnectionPolicy;
+  display_label: string;
+};
+
 function normalizeOptionalText(value: unknown): string | null {
   const normalized = normalizeText(value);
   return normalized || null;
@@ -15541,6 +15652,54 @@ function normalizeSharedFindInvitationDirection(
   value: unknown
 ): SharedFindInvitationDirection {
   return normalizeText(value) === "outgoing" ? "outgoing" : "incoming";
+}
+
+function normalizeWorkspaceConnectionPolicy(value: unknown): WorkspaceConnectionPolicy {
+  return normalizeText(value) === "confirm_each_time"
+    ? "confirm_each_time"
+    : "allow_while_open";
+}
+
+function normalizeWorkspacePermissionProfile(_value: unknown): WorkspacePermissionProfile {
+  return "full_access";
+}
+
+function normalizeWorkspaceInviteStatus(value: unknown): WorkspaceInviteStatus {
+  switch (normalizeText(value)) {
+    case "accepted":
+      return "accepted";
+    case "denied":
+      return "denied";
+    case "revoked":
+      return "revoked";
+    default:
+      return "pending";
+  }
+}
+
+function normalizeWorkspaceSessionStatus(value: unknown): WorkspaceSessionStatus {
+  switch (normalizeText(value)) {
+    case "approved":
+      return "approved";
+    case "active":
+      return "active";
+    case "denied":
+      return "denied";
+    case "ended":
+      return "ended";
+    case "revoked":
+      return "revoked";
+    default:
+      return "pending_owner";
+  }
+}
+
+function isWorkspacePresenceFresh(lastSeenAt: unknown, nowMs = Date.now()) {
+  const lastSeenMs = Date.parse(normalizeText(lastSeenAt));
+  if (!Number.isFinite(lastSeenMs)) {
+    return false;
+  }
+  return nowMs - lastSeenMs <= WORKSPACE_ACCESS_PRESENCE_TTL_MS;
 }
 
 async function resolveCurrentUserCentralRelayContext(
@@ -16194,6 +16353,141 @@ async function resolveCentralFindShareUserByQuery(
   };
 }
 
+function normalizeWorkspaceAccessInviteRow(
+  row: Record<string, unknown> | null | undefined
+): CentralWorkspaceAccessInviteRow | null {
+  if (!row) return null;
+
+  const id = clampInteger((row as any)?.id);
+  const ownerPublicId = normalizeText((row as any)?.owner_public_id);
+  const inviteePublicId = normalizeText((row as any)?.invitee_public_id);
+  const brandId = normalizeText((row as any)?.brand_id);
+  if (id <= 0 || !ownerPublicId || !inviteePublicId || !brandId) {
+    return null;
+  }
+
+  return {
+    id,
+    brand_id: brandId,
+    owner_public_id: ownerPublicId,
+    invitee_public_id: inviteePublicId,
+    permission_profile: normalizeWorkspacePermissionProfile((row as any)?.permission_profile),
+    status: normalizeWorkspaceInviteStatus((row as any)?.status),
+    created_at: normalizeText((row as any)?.created_at) || new Date().toISOString(),
+    accepted_at: normalizeOptionalText((row as any)?.accepted_at),
+    revoked_at: normalizeOptionalText((row as any)?.revoked_at),
+    updated_at: normalizeText((row as any)?.updated_at) || new Date().toISOString(),
+    owner_handle: normalizeUserHandleInput((row as any)?.owner_handle),
+    owner_email: normalizeEmail(String((row as any)?.owner_email || "")),
+    invitee_handle: normalizeUserHandleInput((row as any)?.invitee_handle),
+    invitee_email: normalizeEmail(String((row as any)?.invitee_email || "")),
+  };
+}
+
+function normalizeWorkspaceAccessPresenceRow(
+  row: Record<string, unknown> | null | undefined
+): CentralWorkspaceAccessPresenceRow | null {
+  if (!row) return null;
+
+  const brandId = normalizeText((row as any)?.brand_id);
+  const ownerPublicId = normalizeText((row as any)?.owner_public_id);
+  const appInstanceId = normalizeText((row as any)?.app_instance_id);
+  if (!brandId || !ownerPublicId || !appInstanceId) {
+    return null;
+  }
+
+  return {
+    brand_id: brandId,
+    owner_public_id: ownerPublicId,
+    app_instance_id: appInstanceId,
+    connection_policy: normalizeWorkspaceConnectionPolicy((row as any)?.connection_policy),
+    last_seen_at: normalizeText((row as any)?.last_seen_at) || new Date().toISOString(),
+    updated_at: normalizeText((row as any)?.updated_at) || new Date().toISOString(),
+  };
+}
+
+function normalizeWorkspaceAccessSessionRow(
+  row: Record<string, unknown> | null | undefined
+): CentralWorkspaceAccessSessionRow | null {
+  if (!row) return null;
+
+  const sessionId = normalizeText((row as any)?.session_id);
+  const brandId = normalizeText((row as any)?.brand_id);
+  const ownerPublicId = normalizeText((row as any)?.owner_public_id);
+  const operatorPublicId = normalizeText((row as any)?.operator_public_id);
+  if (!sessionId || !brandId || !ownerPublicId || !operatorPublicId) {
+    return null;
+  }
+
+  const ownerLastSeenAt = normalizeOptionalText((row as any)?.owner_last_seen_at);
+
+  return {
+    session_id: sessionId,
+    brand_id: brandId,
+    owner_public_id: ownerPublicId,
+    operator_public_id: operatorPublicId,
+    permission_profile: normalizeWorkspacePermissionProfile((row as any)?.permission_profile),
+    status: normalizeWorkspaceSessionStatus((row as any)?.status),
+    requested_by_policy: normalizeWorkspaceConnectionPolicy((row as any)?.requested_by_policy),
+    requested_at: normalizeText((row as any)?.requested_at) || new Date().toISOString(),
+    approved_at: normalizeOptionalText((row as any)?.approved_at),
+    connected_at: normalizeOptionalText((row as any)?.connected_at),
+    ended_at: normalizeOptionalText((row as any)?.ended_at),
+    ended_reason: normalizeOptionalText((row as any)?.ended_reason),
+    updated_at: normalizeText((row as any)?.updated_at) || new Date().toISOString(),
+    owner_handle: normalizeUserHandleInput((row as any)?.owner_handle),
+    owner_email: normalizeEmail(String((row as any)?.owner_email || "")),
+    operator_handle: normalizeUserHandleInput((row as any)?.operator_handle),
+    operator_email: normalizeEmail(String((row as any)?.operator_email || "")),
+    owner_online:
+      normalizeDbBoolean((row as any)?.owner_online, false) ||
+      isWorkspacePresenceFresh(ownerLastSeenAt),
+    owner_last_seen_at: ownerLastSeenAt,
+    owner_connection_policy: normalizeWorkspaceConnectionPolicy(
+      (row as any)?.owner_connection_policy
+    ),
+  };
+}
+
+async function getWorkspaceAccessConnectionPolicyForUser(
+  db: D1Database,
+  userId: string
+): Promise<WorkspaceConnectionPolicy> {
+  const row = await db
+    .prepare(
+      `SELECT connection_policy
+       FROM workspace_access_settings
+       WHERE user_id = ?
+       LIMIT 1`
+    )
+    .bind(userId)
+    .first();
+  return normalizeWorkspaceConnectionPolicy((row as any)?.connection_policy);
+}
+
+async function upsertWorkspaceAccessConnectionPolicyForUser(
+  db: D1Database,
+  userId: string,
+  policy: WorkspaceConnectionPolicy
+) {
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT INTO workspace_access_settings (
+         user_id,
+         connection_policy,
+         updated_at,
+         created_at
+       )
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         connection_policy = excluded.connection_policy,
+         updated_at = excluded.updated_at`
+    )
+    .bind(userId, normalizeWorkspaceConnectionPolicy(policy), now, now)
+    .run();
+}
+
 async function getCentralCameraFindShareById(db: D1Database, shareId: number) {
   if (!Number.isInteger(shareId) || shareId <= 0) {
     return null;
@@ -16401,6 +16695,606 @@ async function transitionCentralCameraFindShareStatus(
   };
 }
 
+async function appendWorkspaceAccessAuditLog(
+  db: D1Database,
+  input: {
+    brandId: string;
+    action: string;
+    inviteId?: number | null;
+    sessionId?: string | null;
+    ownerPublicId?: string | null;
+    operatorPublicId?: string | null;
+    actorPublicId?: string | null;
+    details?: Record<string, unknown> | null;
+  }
+) {
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT INTO workspace_access_audit_logs (
+         brand_id,
+         session_id,
+         invite_id,
+         owner_public_id,
+         operator_public_id,
+         actor_public_id,
+         action,
+         details_json,
+         created_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      normalizeText(input.brandId),
+      normalizeOptionalText(input.sessionId),
+      Math.max(0, clampInteger(input.inviteId)) || null,
+      normalizeOptionalText(input.ownerPublicId),
+      normalizeOptionalText(input.operatorPublicId),
+      normalizeOptionalText(input.actorPublicId),
+      normalizeText(input.action),
+      JSON.stringify(input.details || {}),
+      now
+    )
+    .run();
+}
+
+async function getCentralWorkspaceAccessInviteById(db: D1Database, inviteId: number) {
+  if (!Number.isInteger(inviteId) || inviteId <= 0) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT i.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email
+       FROM workspace_access_invites i
+       LEFT JOIN server_users owner
+         ON owner.public_id = i.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = i.invitee_public_id
+       WHERE i.id = ?
+       LIMIT 1`
+    )
+    .bind(inviteId)
+    .first();
+
+  return normalizeWorkspaceAccessInviteRow((row as any) || null);
+}
+
+async function listCentralWorkspaceAccessInvites(
+  db: D1Database,
+  input: {
+    role: "incoming" | "outgoing";
+    publicId: string;
+    brandId: string;
+  }
+) {
+  const publicId = normalizeText(input.publicId);
+  const brandId = normalizeText(input.brandId);
+  if (!publicId || !brandId) return [] as CentralWorkspaceAccessInviteRow[];
+
+  const whereClause =
+    input.role === "incoming" ? `i.invitee_public_id = ?` : `i.owner_public_id = ?`;
+  const { results } = await db
+    .prepare(
+      `SELECT i.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email
+       FROM workspace_access_invites i
+       LEFT JOIN server_users owner
+         ON owner.public_id = i.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = i.invitee_public_id
+       WHERE i.brand_id = ?
+         AND ${whereClause}
+       ORDER BY i.updated_at DESC, i.id DESC`
+    )
+    .bind(brandId, publicId)
+    .all();
+
+  return (results || [])
+    .map((row: any) => normalizeWorkspaceAccessInviteRow(row))
+    .filter((row: CentralWorkspaceAccessInviteRow | null): row is CentralWorkspaceAccessInviteRow => Boolean(row));
+}
+
+async function createOrUpdateCentralWorkspaceAccessInvite(
+  db: D1Database,
+  input: {
+    brandId: string;
+    ownerPublicId: string;
+    inviteePublicId: string;
+    permissionProfile: WorkspacePermissionProfile;
+  }
+) {
+  const brandId = normalizeText(input.brandId);
+  const ownerPublicId = normalizeText(input.ownerPublicId);
+  const inviteePublicId = normalizeText(input.inviteePublicId);
+  if (!brandId || !ownerPublicId || !inviteePublicId) {
+    throw new Error("A valid brand, owner, and invitee are required.");
+  }
+  if (ownerPublicId === inviteePublicId) {
+    throw new Error("You cannot invite the same account.");
+  }
+
+  const now = new Date().toISOString();
+  const existing = await db
+    .prepare(
+      `SELECT id
+       FROM workspace_access_invites
+       WHERE brand_id = ?
+         AND owner_public_id = ?
+         AND invitee_public_id = ?
+       LIMIT 1`
+    )
+    .bind(brandId, ownerPublicId, inviteePublicId)
+    .first();
+
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE workspace_access_invites
+         SET permission_profile = ?,
+             status = 'pending',
+             accepted_at = NULL,
+             revoked_at = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(
+        normalizeWorkspacePermissionProfile(input.permissionProfile),
+        now,
+        Number((existing as any)?.id || 0)
+      )
+      .run();
+
+    const invite = await getCentralWorkspaceAccessInviteById(
+      db,
+      Number((existing as any)?.id || 0)
+    );
+    if (invite) {
+      await appendWorkspaceAccessAuditLog(db, {
+        brandId,
+        inviteId: invite.id,
+        ownerPublicId,
+        operatorPublicId: inviteePublicId,
+        actorPublicId: ownerPublicId,
+        action: "invite_resent",
+      });
+    }
+    return invite;
+  }
+
+  const inserted = await db
+    .prepare(
+      `INSERT INTO workspace_access_invites (
+         brand_id,
+         owner_public_id,
+         invitee_public_id,
+         permission_profile,
+         status,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+    )
+    .bind(
+      brandId,
+      ownerPublicId,
+      inviteePublicId,
+      normalizeWorkspacePermissionProfile(input.permissionProfile),
+      now,
+      now
+    )
+    .run();
+
+  const invite = await getCentralWorkspaceAccessInviteById(
+    db,
+    Number(inserted.meta.last_row_id || 0)
+  );
+  if (invite) {
+    await appendWorkspaceAccessAuditLog(db, {
+      brandId,
+      inviteId: invite.id,
+      ownerPublicId,
+      operatorPublicId: inviteePublicId,
+      actorPublicId: ownerPublicId,
+      action: "invite_created",
+    });
+  }
+  return invite;
+}
+
+async function transitionCentralWorkspaceAccessInviteStatus(
+  db: D1Database,
+  input: {
+    inviteId: number;
+    actorPublicId: string;
+    nextStatus: WorkspaceInviteStatus;
+  }
+) {
+  const invite = await getCentralWorkspaceAccessInviteById(db, input.inviteId);
+  if (!invite) {
+    return { error: "Workspace invite not found.", status: 404, invite: null };
+  }
+
+  const actorPublicId = normalizeText(input.actorPublicId);
+  const nextStatus = normalizeWorkspaceInviteStatus(input.nextStatus);
+  const isInviteeAction = nextStatus === "accepted" || nextStatus === "denied";
+  const expectedActor = isInviteeAction ? invite.invitee_public_id : invite.owner_public_id;
+  if (!actorPublicId || actorPublicId !== expectedActor) {
+    return { error: "You are not allowed to update this workspace invite.", status: 403, invite };
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE workspace_access_invites
+       SET status = ?,
+           accepted_at = ?,
+           revoked_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      nextStatus,
+      nextStatus === "accepted" ? now : null,
+      nextStatus === "revoked" ? now : null,
+      now,
+      invite.id
+    )
+    .run();
+
+  const updated = await getCentralWorkspaceAccessInviteById(db, invite.id);
+  if (updated) {
+    await appendWorkspaceAccessAuditLog(db, {
+      brandId: updated.brand_id,
+      inviteId: updated.id,
+      ownerPublicId: updated.owner_public_id,
+      operatorPublicId: updated.invitee_public_id,
+      actorPublicId,
+      action: `invite_${nextStatus}`,
+    });
+  }
+
+  return {
+    error: null,
+    status: 200,
+    invite: updated,
+  };
+}
+
+async function getCentralWorkspaceHostPresence(
+  db: D1Database,
+  brandId: string,
+  ownerPublicId: string
+) {
+  const row = await db
+    .prepare(
+      `SELECT brand_id,
+              owner_public_id,
+              app_instance_id,
+              connection_policy,
+              last_seen_at,
+              updated_at
+       FROM workspace_host_presence
+       WHERE brand_id = ?
+         AND owner_public_id = ?
+       LIMIT 1`
+    )
+    .bind(normalizeText(brandId), normalizeText(ownerPublicId))
+    .first();
+
+  return normalizeWorkspaceAccessPresenceRow((row as any) || null);
+}
+
+async function upsertCentralWorkspaceHostPresence(
+  db: D1Database,
+  input: {
+    brandId: string;
+    ownerPublicId: string;
+    appInstanceId: string;
+    connectionPolicy: WorkspaceConnectionPolicy;
+  }
+) {
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `INSERT INTO workspace_host_presence (
+         brand_id,
+         owner_public_id,
+         app_instance_id,
+         connection_policy,
+         last_seen_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(brand_id, owner_public_id) DO UPDATE SET
+         app_instance_id = excluded.app_instance_id,
+         connection_policy = excluded.connection_policy,
+         last_seen_at = excluded.last_seen_at,
+         updated_at = excluded.updated_at`
+    )
+    .bind(
+      normalizeText(input.brandId),
+      normalizeText(input.ownerPublicId),
+      normalizeText(input.appInstanceId) || `app_${generateUUID()}`,
+      normalizeWorkspaceConnectionPolicy(input.connectionPolicy),
+      now,
+      now
+    )
+    .run();
+
+  return getCentralWorkspaceHostPresence(db, input.brandId, input.ownerPublicId);
+}
+
+async function listCentralWorkspaceAvailableAccesses(
+  db: D1Database,
+  input: {
+    brandId: string;
+    inviteePublicId: string;
+  }
+) {
+  const brandId = normalizeText(input.brandId);
+  const inviteePublicId = normalizeText(input.inviteePublicId);
+  if (!brandId || !inviteePublicId) {
+    return [] as WorkspaceAvailableAccessRow[];
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT i.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email,
+              invitee.handle AS invitee_handle,
+              invitee.email AS invitee_email,
+              presence.last_seen_at AS owner_last_seen_at,
+              presence.connection_policy AS owner_connection_policy
+       FROM workspace_access_invites i
+       LEFT JOIN server_users owner
+         ON owner.public_id = i.owner_public_id
+       LEFT JOIN server_users invitee
+         ON invitee.public_id = i.invitee_public_id
+       LEFT JOIN workspace_host_presence presence
+         ON presence.brand_id = i.brand_id
+        AND presence.owner_public_id = i.owner_public_id
+       WHERE i.brand_id = ?
+         AND i.invitee_public_id = ?
+         AND i.status = 'accepted'
+       ORDER BY COALESCE(owner.handle, owner.email) ASC, i.id ASC`
+    )
+    .bind(brandId, inviteePublicId)
+    .all();
+
+  return (results || [])
+    .map((row: any) => {
+      const invite = normalizeWorkspaceAccessInviteRow(row);
+      if (!invite) return null;
+      const ownerLastSeenAt = normalizeOptionalText((row as any)?.owner_last_seen_at);
+      const ownerRelayOnline = countWorkspaceRelayConnections(invite.owner_public_id) > 0;
+      return {
+        ...invite,
+        owner_online: isWorkspacePresenceFresh(ownerLastSeenAt) && ownerRelayOnline,
+        owner_last_seen_at: ownerLastSeenAt,
+        owner_connection_policy: normalizeWorkspaceConnectionPolicy(
+          (row as any)?.owner_connection_policy
+        ),
+        display_label: buildSharedFindDisplayLabel({
+          handle: invite.owner_handle,
+          email: invite.owner_email,
+        }),
+      } satisfies WorkspaceAvailableAccessRow;
+    })
+    .filter((row: WorkspaceAvailableAccessRow | null): row is WorkspaceAvailableAccessRow => Boolean(row));
+}
+
+async function getCentralWorkspaceAccessSessionById(
+  db: D1Database,
+  sessionId: string
+) {
+  const normalizedSessionId = normalizeText(sessionId);
+  if (!normalizedSessionId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT s.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email,
+              operator_user.handle AS operator_handle,
+              operator_user.email AS operator_email,
+              presence.last_seen_at AS owner_last_seen_at,
+              presence.connection_policy AS owner_connection_policy
+       FROM workspace_access_sessions s
+       LEFT JOIN server_users owner
+         ON owner.public_id = s.owner_public_id
+       LEFT JOIN server_users operator_user
+         ON operator_user.public_id = s.operator_public_id
+       LEFT JOIN workspace_host_presence presence
+         ON presence.brand_id = s.brand_id
+        AND presence.owner_public_id = s.owner_public_id
+       WHERE s.session_id = ?
+       LIMIT 1`
+    )
+    .bind(normalizedSessionId)
+    .first();
+
+  const session = normalizeWorkspaceAccessSessionRow((row as any) || null);
+  if (!session) {
+    return null;
+  }
+
+  session.owner_online =
+    session.owner_online && countWorkspaceRelayConnections(session.owner_public_id) > 0;
+
+  return session;
+}
+
+async function createCentralWorkspaceAccessSession(
+  db: D1Database,
+  input: {
+    brandId: string;
+    ownerPublicId: string;
+    operatorPublicId: string;
+    permissionProfile: WorkspacePermissionProfile;
+    requestedByPolicy: WorkspaceConnectionPolicy;
+  }
+) {
+  const now = new Date().toISOString();
+  const sessionId = generateUUID();
+  const initialStatus: WorkspaceSessionStatus =
+    normalizeWorkspaceConnectionPolicy(input.requestedByPolicy) === "allow_while_open"
+      ? "approved"
+      : "pending_owner";
+
+  await db
+    .prepare(
+      `INSERT INTO workspace_access_sessions (
+         session_id,
+         brand_id,
+         owner_public_id,
+         operator_public_id,
+         permission_profile,
+         status,
+         requested_by_policy,
+         requested_at,
+         approved_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      normalizeText(input.brandId),
+      normalizeText(input.ownerPublicId),
+      normalizeText(input.operatorPublicId),
+      normalizeWorkspacePermissionProfile(input.permissionProfile),
+      initialStatus,
+      normalizeWorkspaceConnectionPolicy(input.requestedByPolicy),
+      now,
+      initialStatus === "approved" ? now : null,
+      now
+    )
+    .run();
+
+  const session = await getCentralWorkspaceAccessSessionById(db, sessionId);
+  if (session) {
+    await appendWorkspaceAccessAuditLog(db, {
+      brandId: session.brand_id,
+      sessionId: session.session_id,
+      ownerPublicId: session.owner_public_id,
+      operatorPublicId: session.operator_public_id,
+      actorPublicId: session.operator_public_id,
+      action: "session_requested",
+      details: {
+        requested_by_policy: session.requested_by_policy,
+      },
+    });
+  }
+  return session;
+}
+
+async function transitionCentralWorkspaceAccessSessionStatus(
+  db: D1Database,
+  input: {
+    sessionId: string;
+    actorPublicId: string;
+    nextStatus: WorkspaceSessionStatus;
+    endedReason?: string | null;
+  }
+) {
+  const session = await getCentralWorkspaceAccessSessionById(db, input.sessionId);
+  if (!session) {
+    return { error: "Workspace session not found.", status: 404, session: null };
+  }
+
+  const actorPublicId = normalizeText(input.actorPublicId);
+  const nextStatus = normalizeWorkspaceSessionStatus(input.nextStatus);
+  const actorAllowed =
+    (nextStatus === "approved" || nextStatus === "denied") &&
+    actorPublicId === session.owner_public_id
+      ? true
+      : nextStatus === "active" &&
+          (actorPublicId === session.owner_public_id ||
+            actorPublicId === session.operator_public_id)
+      ? true
+      : (nextStatus === "ended" || nextStatus === "revoked") &&
+          (actorPublicId === session.owner_public_id ||
+            actorPublicId === session.operator_public_id);
+
+  if (!actorAllowed) {
+    return { error: "You are not allowed to update this workspace session.", status: 403, session };
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE workspace_access_sessions
+       SET status = ?,
+           approved_at = CASE
+             WHEN ? IN ('approved', 'active') AND approved_at IS NULL THEN ?
+             ELSE approved_at
+           END,
+           connected_at = CASE
+             WHEN ? = 'active' THEN ?
+             ELSE connected_at
+           END,
+           ended_at = CASE
+             WHEN ? IN ('ended', 'revoked', 'denied') THEN ?
+             ELSE ended_at
+           END,
+           ended_reason = CASE
+             WHEN ? IN ('ended', 'revoked', 'denied') THEN ?
+             ELSE ended_reason
+           END,
+           updated_at = ?
+       WHERE session_id = ?`
+    )
+    .bind(
+      nextStatus,
+      nextStatus,
+      now,
+      nextStatus,
+      now,
+      nextStatus,
+      now,
+      nextStatus,
+      normalizeOptionalText(input.endedReason) ||
+        (nextStatus === "denied" ? "denied_by_owner" : nextStatus),
+      now,
+      session.session_id
+    )
+    .run();
+
+  const updated = await getCentralWorkspaceAccessSessionById(db, session.session_id);
+  if (updated) {
+    await appendWorkspaceAccessAuditLog(db, {
+      brandId: updated.brand_id,
+      sessionId: updated.session_id,
+      ownerPublicId: updated.owner_public_id,
+      operatorPublicId: updated.operator_public_id,
+      actorPublicId,
+      action: `session_${nextStatus}`,
+      details: {
+        ended_reason:
+          normalizeOptionalText(input.endedReason) ||
+          (nextStatus === "denied" ? "denied_by_owner" : nextStatus),
+      },
+    });
+  }
+
+  return {
+    error: null,
+    status: 200,
+    session: updated,
+  };
+}
+
 async function resolveCurrentUserCentralRelayContextById(
   env: Env,
   appUserId: string
@@ -16508,6 +17402,501 @@ async function ensureSharedFindRelayForBackgroundUser(
     });
   }
   return null;
+}
+
+function normalizeWorkspaceProxyMethod(value: unknown): "DELETE" | "GET" | "HEAD" | "PATCH" | "POST" | "PUT" {
+  switch (normalizeText(value).toUpperCase()) {
+    case "DELETE":
+      return "DELETE";
+    case "HEAD":
+      return "HEAD";
+    case "PATCH":
+      return "PATCH";
+    case "POST":
+      return "POST";
+    case "PUT":
+      return "PUT";
+    default:
+      return "GET";
+  }
+}
+
+function normalizeWorkspaceProxyPath(value: unknown): string {
+  const normalized = normalizeText(value);
+  if (!normalized.startsWith("/api/")) {
+    throw new Error("Only /api/* paths are supported in a remote workspace session.");
+  }
+  return normalized;
+}
+
+function normalizeWorkspaceProxyHeaders(
+  value: unknown
+): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const headers: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    const key = normalizeText(rawKey).toLowerCase();
+    const headerValue = normalizeText(rawValue);
+    if (!key || !headerValue) continue;
+    if (
+      [
+        "cookie",
+        "host",
+        "origin",
+        "referer",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-prefix",
+        "x-forwarded-proto",
+        INTERNAL_REMOTE_WORKSPACE_AUTH_HEADER,
+        INTERNAL_REMOTE_WORKSPACE_USER_HEADER,
+        INTERNAL_REMOTE_WORKSPACE_SESSION_HEADER,
+      ].includes(key)
+    ) {
+      continue;
+    }
+    headers[key] = headerValue;
+  }
+
+  return headers;
+}
+
+function isRemoteWorkspaceAssetKey(key: string) {
+  return /(url|href|image|video|thumbnail|download|clip|preview|poster|src)$/i.test(key);
+}
+
+function buildRemoteWorkspaceAssetUrl(sessionId: string, assetPath: string) {
+  const url = new URL(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/asset`, "http://localhost");
+  url.searchParams.set("session_id", sessionId);
+  url.searchParams.set("path", assetPath);
+  return `${url.pathname}${url.search}`;
+}
+
+function rewriteRemoteWorkspaceJsonUrls(
+  value: unknown,
+  sessionId: string,
+  parentKey = ""
+): unknown {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    if (
+      normalized &&
+      isRemoteWorkspaceAssetKey(parentKey) &&
+      normalized.startsWith("/api/")
+    ) {
+      return buildRemoteWorkspaceAssetUrl(sessionId, normalized);
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => rewriteRemoteWorkspaceJsonUrls(item, sessionId, parentKey));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, nestedValue]) => [
+        key,
+        rewriteRemoteWorkspaceJsonUrls(nestedValue, sessionId, key),
+      ])
+    );
+  }
+
+  return value;
+}
+
+async function fetchCentralWorkspaceSessionByIdForAppUser(
+  env: Env,
+  appUserId: string,
+  sessionId: string
+): Promise<{
+  session: CentralWorkspaceAccessSessionRow;
+  centralContext: CentralUserRelayContext;
+}> {
+  const normalizedSessionId = normalizeText(sessionId);
+  if (!normalizedSessionId) {
+    throw new Error("A valid workspace session id is required.");
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContextById(env, appUserId);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    env,
+    `/api/workspace-access/sessions/${encodeURIComponent(normalizedSessionId)}`,
+    {
+      method: "GET",
+      token: centralContext.grantToken,
+    }
+  );
+
+  if (!remote.response.ok) {
+    throw new Error(
+      normalizeResponseErrorMessage(remote.data, "Failed to load the remote workspace session.")
+    );
+  }
+
+  const session = normalizeWorkspaceAccessSessionRow(remote.data?.session);
+  if (!session) {
+    throw new Error("The remote workspace session payload was invalid.");
+  }
+
+  return {
+    session,
+    centralContext,
+  };
+}
+
+async function activateCentralWorkspaceSessionIfNeeded(
+  env: Env,
+  centralContext: CentralUserRelayContext,
+  session: CentralWorkspaceAccessSessionRow
+) {
+  if (session.status === "active") {
+    return session;
+  }
+
+  if (session.status !== "approved") {
+    return session;
+  }
+
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    env,
+    `/api/workspace-access/sessions/${encodeURIComponent(session.session_id)}/activate`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  if (!remote.response.ok) {
+    throw new Error(
+      normalizeResponseErrorMessage(remote.data, "Failed to activate the remote workspace session.")
+    );
+  }
+
+  return normalizeWorkspaceAccessSessionRow(remote.data?.session) || session;
+}
+
+async function executeInternalRemoteWorkspaceRequest(
+  env: Env,
+  ownerAppUserId: string,
+  sessionId: string,
+  message: Record<string, unknown>
+) {
+  const path = normalizeWorkspaceProxyPath(message.path);
+  const method = normalizeWorkspaceProxyMethod(message.method);
+  const requestHeaders = normalizeWorkspaceProxyHeaders(message.headers);
+  const headers = new Headers(requestHeaders);
+  headers.set(INTERNAL_REMOTE_WORKSPACE_AUTH_HEADER, INTERNAL_REMOTE_WORKSPACE_AUTH_SECRET);
+  headers.set(INTERNAL_REMOTE_WORKSPACE_USER_HEADER, ownerAppUserId);
+  headers.set(INTERNAL_REMOTE_WORKSPACE_SESSION_HEADER, sessionId);
+
+  const bodyBase64 = normalizeText(message.body_base64);
+  const bodyBytes =
+    method === "GET" || method === "HEAD" || !bodyBase64
+      ? null
+      : base64ToUint8Array(bodyBase64);
+  const request = new Request(new URL(path, "http://internal.remote.workspace").toString(), {
+    method,
+    headers,
+    body: bodyBytes && bodyBytes.byteLength > 0 ? bodyBytes : undefined,
+    ...(bodyBytes && bodyBytes.byteLength > 0 ? ({ duplex: "half" } as any) : {}),
+  });
+
+  const response = await app.fetch(request, env, { waitUntil: () => {} } as any);
+  const responseHeaders = new Headers(response.headers);
+  responseHeaders.delete("set-cookie");
+  responseHeaders.delete("content-length");
+
+  let responseBody = new Uint8Array();
+  if (response.body) {
+    const arrayBuffer = await response.arrayBuffer();
+    responseBody = new Uint8Array(arrayBuffer);
+    const contentType = responseHeaders.get("content-type") || "";
+    if (contentType.toLowerCase().includes("application/json")) {
+      try {
+        const rawText = new TextDecoder().decode(responseBody);
+        const parsed = JSON.parse(rawText);
+        const rewritten = rewriteRemoteWorkspaceJsonUrls(parsed, sessionId);
+        responseBody = new TextEncoder().encode(JSON.stringify(rewritten));
+      } catch {
+        // ignore JSON rewrite failures and keep the raw payload
+      }
+    }
+  }
+
+  return {
+    status: response.status,
+    headers: Object.fromEntries(responseHeaders.entries()),
+    body_base64: responseBody.byteLength ? arrayBufferToBase64(responseBody.buffer) : "",
+  };
+}
+
+async function handleWorkspaceRelayInboundMessage(
+  context: WorkspaceRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const type = normalizeText(message.type);
+  if (!type) {
+    return;
+  }
+
+  if (type === "relay_ready" || type === "ping" || type === "pong") {
+    return;
+  }
+
+  if (type === "session_requested") {
+    upsertPendingWorkspaceApproval({
+      appUserId: context.appUserId,
+      sessionId: normalizeText(message.session_id),
+      ownerPublicId: context.publicId,
+      operatorPublicId: normalizeText(message.sender_public_id),
+      operatorDisplayLabel:
+        normalizeText(message.operator_display_label) ||
+        normalizeText(message.operator_handle) ||
+        normalizeText(message.operator_email),
+      permissionProfile: normalizeText(message.permission_profile) || "full_access",
+      requestedAt: normalizeText(message.requested_at) || new Date().toISOString(),
+      requestedByPolicy:
+        normalizeText(message.requested_by_policy) || "confirm_each_time",
+    });
+    return;
+  }
+
+  if (type === "proxy_response") {
+    settleWorkspaceProxyResponse(message);
+    return;
+  }
+
+  if (type !== "proxy_request") {
+    return;
+  }
+
+  const senderPublicId = normalizeText(message.sender_public_id);
+  const sessionId = normalizeText(message.session_id);
+  const requestId = normalizeText(message.request_id);
+  if (!senderPublicId || !sessionId || !requestId) {
+    return;
+  }
+
+  try {
+    const { session } = await fetchCentralWorkspaceSessionByIdForAppUser(
+      context.env,
+      context.appUserId,
+      sessionId
+    );
+
+    if (session.owner_public_id !== context.publicId || session.operator_public_id !== senderPublicId) {
+      throw new Error("The remote workspace relay request did not match the active session.");
+    }
+    if (!["approved", "active"].includes(session.status)) {
+      throw new Error("The remote workspace session is no longer active.");
+    }
+
+    const responsePayload = await executeInternalRemoteWorkspaceRequest(
+      context.env,
+      context.appUserId,
+      sessionId,
+      message
+    );
+    sendWorkspaceRelayClientMessage(context.publicId, {
+      type: "proxy_response",
+      target_public_id: senderPublicId,
+      session_id: sessionId,
+      request_id: requestId,
+      status: responsePayload.status,
+      headers: responsePayload.headers,
+      body_base64: responsePayload.body_base64,
+    });
+  } catch (error) {
+    sendWorkspaceRelayClientMessage(context.publicId, {
+      type: "proxy_response",
+      target_public_id: senderPublicId,
+      session_id: sessionId,
+      request_id: requestId,
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "The remote workspace request failed on the owner app.",
+    });
+  }
+}
+
+async function maybeEnsureWorkspaceRelayForUser(
+  env: Env,
+  user: WorkerAuthenticatedUser | { id: string; email?: string | null }
+) {
+  if (!brand.features.workspaceAccessEnabled || !isCentralIdentityClientConfigured(env)) {
+    return null;
+  }
+
+  try {
+    const centralContext = await resolveCurrentUserCentralRelayContextById(env, user.id);
+    await ensureWorkspaceRelayClientConnected({
+      env,
+      publicId: centralContext.publicId,
+      appUserId: centralContext.appUserId,
+      grantToken: centralContext.grantToken,
+      onMessage: async (context, message) => {
+        await handleWorkspaceRelayInboundMessage(context, message);
+      },
+    });
+    return centralContext;
+  } catch {
+    return null;
+  }
+}
+
+async function performRemoteWorkspaceProxyRequest(
+  env: Env,
+  user: WorkerAuthenticatedUser,
+  input: {
+    sessionId: string;
+    path: string;
+    method: string;
+    headers?: Record<string, unknown>;
+    bodyBase64?: string;
+  }
+): Promise<Response> {
+  const normalizedSessionId = normalizeText(input.sessionId);
+  if (!normalizedSessionId) {
+    return new Response(JSON.stringify({ error: "session_id is required." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let normalizedPath = "";
+  try {
+    normalizedPath = normalizeWorkspaceProxyPath(input.path);
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "An invalid remote workspace path was provided.",
+      }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  }
+
+  let sessionEnvelope: {
+    session: CentralWorkspaceAccessSessionRow;
+    centralContext: CentralUserRelayContext;
+  };
+  try {
+    sessionEnvelope = await fetchCentralWorkspaceSessionByIdForAppUser(
+      env,
+      user.id,
+      normalizedSessionId
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to load the remote workspace session.",
+      }),
+      {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  }
+
+  const centralContext = sessionEnvelope.centralContext;
+  let session = sessionEnvelope.session;
+  if (session.operator_public_id !== centralContext.publicId) {
+    return new Response(JSON.stringify({ error: "This session is not available for the current operator." }), {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (["pending_owner", "denied", "ended", "revoked"].includes(session.status)) {
+    return new Response(JSON.stringify({ error: "The remote workspace session is not available anymore." }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (!session.owner_online) {
+    return new Response(JSON.stringify({ error: "The owner app is offline or closed." }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  try {
+    session = await activateCentralWorkspaceSessionIfNeeded(env, centralContext, session);
+  } catch (error) {
+    return new Response(
+      JSON.stringify({
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to activate the remote workspace session.",
+      }),
+      {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  }
+
+  const relayContext = await maybeEnsureWorkspaceRelayForUser(env, user);
+  if (!relayContext) {
+    return new Response(JSON.stringify({ error: "The operator workspace relay is offline." }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const requestId = generateUUID();
+  const responsePromise = waitForWorkspaceProxyResponse({
+    sessionId: session.session_id,
+    requestId,
+  });
+
+  const sent = sendWorkspaceRelayClientMessage(relayContext.publicId, {
+    type: "proxy_request",
+    target_public_id: session.owner_public_id,
+    session_id: session.session_id,
+    request_id: requestId,
+    path: normalizedPath,
+    method: normalizeWorkspaceProxyMethod(input.method),
+    headers: normalizeWorkspaceProxyHeaders(input.headers),
+    body_base64: normalizeText(input.bodyBase64),
+  });
+  if (!sent) {
+    return new Response(JSON.stringify({ error: "Failed to forward the remote workspace request." }), {
+      status: 409,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const payload = await responsePromise;
+  if (normalizeText(payload.error)) {
+    return new Response(JSON.stringify({ error: normalizeText(payload.error) }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const bodyBase64 = normalizeText(payload.body_base64);
+  const bodyBytes = bodyBase64 ? base64ToUint8Array(bodyBase64) : null;
+  const responseHeaders = new Headers(normalizeWorkspaceProxyHeaders(payload.headers));
+  responseHeaders.delete("content-length");
+
+  return new Response(bodyBytes && bodyBytes.byteLength > 0 ? bodyBytes : undefined, {
+    status: Math.max(100, clampInteger(payload.status) || 200),
+    headers: responseHeaders,
+  });
 }
 
 async function appendSharedFindTargetImages(
@@ -20127,7 +21516,7 @@ async function applyNormalizedCameraImportPreviewForUser(
 // Helper to clear local session
 async function clearLocalSession(c: any) {
   const sessionToken = getCookie(c, LOCAL_SESSION_COOKIE_NAME);
-  
+
   if (sessionToken) {
     // Delete session from database
     await c.env.DB.prepare(
@@ -20136,7 +21525,7 @@ async function clearLocalSession(c: any) {
       .bind(sessionToken)
       .run();
   }
-  
+
   // Clear cookie
   clearSessionCookie(c, LOCAL_SESSION_COOKIE_NAME);
 }
@@ -20158,13 +21547,41 @@ const anyAuthMiddleware = async (c: any, next: any) => {
     console.log("[AUTH] origin=", c.req.header("origin"));
     console.log("[AUTH] cookieHeaderLen=", (c.req.header("cookie") || "").length);
   }
-  
+
   // Ensure schema is initialized
   await ensureRuntimeSchema(c.env);
 
+  const internalRemoteWorkspaceAuth = normalizeText(
+    c.req.header(INTERNAL_REMOTE_WORKSPACE_AUTH_HEADER)
+  );
+  if (internalRemoteWorkspaceAuth && internalRemoteWorkspaceAuth === INTERNAL_REMOTE_WORKSPACE_AUTH_SECRET) {
+    const internalAppUserId = normalizeText(c.req.header(INTERNAL_REMOTE_WORKSPACE_USER_HEADER));
+    if (internalAppUserId) {
+      const appUserRow = await c.env.DB
+        .prepare(
+          `SELECT id, email, auth_provider, country_code
+           FROM app_users
+           WHERE id = ?
+           LIMIT 1`
+        )
+        .bind(internalAppUserId)
+        .first();
+
+      if (appUserRow) {
+        c.set("user", {
+          id: String((appUserRow as any)?.id || ""),
+          email: String((appUserRow as any)?.email || ""),
+          auth_provider: normalizeText((appUserRow as any)?.auth_provider) || "local",
+          country_code: normalizeOptionalText((appUserRow as any)?.country_code),
+        });
+        return next();
+      }
+    }
+  }
+
   // Check Google OAuth session FIRST (priority)
   const googleSessionToken = getCookie(c, GOOGLE_SESSION_COOKIE_NAME);
-  
+
   if (googleSessionToken) {
     try {
       const user = await getGoogleSessionUser(c.env.DB, googleSessionToken);
@@ -20189,14 +21606,14 @@ const anyAuthMiddleware = async (c: any, next: any) => {
 
   // Check Local session only if Google session not valid
   const localSessionToken = getCookie(c, LOCAL_SESSION_COOKIE_NAME);
-  
+
   if (localSessionToken) {
     const session = await getLocalSessionUserByToken(c.env.DB, localSessionToken);
 
     if (session) {
       const sessionData = session as any;
       const userId = resolveCanonicalAppUserIdFromLocalUserRow(sessionData);
-      
+
       // Ensure app_users row exists
       await ensureAppUserRow(c.env.DB, {
         id: userId,
@@ -20205,7 +21622,7 @@ const anyAuthMiddleware = async (c: any, next: any) => {
         country_code: sessionData.country_code || null,
         locale: sessionData.locale || null,
       });
-      
+
       c.set("user", {
         id: userId,
         email: sessionData.email,
@@ -21261,9 +22678,9 @@ const wsHandler = createWebSocketHandler();
 app.get("/api/auth/country", async (c) => {
   // Try to get country from Cloudflare headers
   const countryCode = c.req.header("CF-IPCountry") || null;
-  
-  return c.json({ 
-    detectedCountryCode: countryCode === "XX" ? null : countryCode 
+
+  return c.json({
+    detectedCountryCode: countryCode === "XX" ? null : countryCode
   });
 });
 
@@ -22548,6 +23965,444 @@ app.post("/api/find-shares/:shareId/revoke", async (c) => {
   return c.json({ share: result.share });
 });
 
+app.post("/api/workspace-access/users/resolve", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      query?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const resolved = await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  if (!resolved) {
+    return c.json({ error: "No user matched the provided handle or email." }, 404);
+  }
+  if (resolved.public_id === verified.claims.public_id) {
+    return c.json({ error: "You cannot invite the same account." }, 409);
+  }
+
+  return c.json({
+    user: {
+      public_id: resolved.public_id,
+      email: resolved.email,
+      handle: resolved.handle,
+      display_label: resolved.display_label,
+    },
+  });
+});
+
+app.post("/api/workspace-access/invites", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      invitee_public_id?: string;
+      query?: string;
+      permission_profile?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const inviteePublicId = normalizeText(body.invitee_public_id);
+  const resolvedInvitee = inviteePublicId
+    ? { public_id: inviteePublicId }
+    : await resolveCentralFindShareUserByQuery(c.env.DB, body.query);
+  if (!resolvedInvitee?.public_id) {
+    return c.json({ error: "No user matched the provided handle or email." }, 404);
+  }
+
+  try {
+    const invite = await createOrUpdateCentralWorkspaceAccessInvite(c.env.DB, {
+      brandId: brand.id,
+      ownerPublicId: verified.claims.public_id,
+      inviteePublicId: resolvedInvitee.public_id,
+      permissionProfile: normalizeWorkspacePermissionProfile(body.permission_profile),
+    });
+    if (!invite) {
+      return c.json({ error: "Failed to create the workspace access invite." }, 500);
+    }
+    return c.json({ invite }, 201);
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message
+        ? error.message
+        : "Failed to create the workspace access invite.";
+    return c.json({ error: message }, 400);
+  }
+});
+
+app.get("/api/workspace-access/invites/incoming", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const invites = await listCentralWorkspaceAccessInvites(c.env.DB, {
+    role: "incoming",
+    publicId: verified.claims.public_id,
+    brandId: brand.id,
+  });
+  return c.json({ invites });
+});
+
+app.get("/api/workspace-access/invites/outgoing", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const invites = await listCentralWorkspaceAccessInvites(c.env.DB, {
+    role: "outgoing",
+    publicId: verified.claims.public_id,
+    brandId: brand.id,
+  });
+  return c.json({ invites });
+});
+
+app.get("/api/workspace-access/available", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const accesses = await listCentralWorkspaceAvailableAccesses(c.env.DB, {
+    brandId: brand.id,
+    inviteePublicId: verified.claims.public_id,
+  });
+  return c.json({ accesses });
+});
+
+app.post("/api/workspace-access/invites/:inviteId/accept", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessInviteStatus(c.env.DB, {
+    inviteId: clampInteger(c.req.param("inviteId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "accepted",
+  });
+  if (!result.invite) {
+    return c.json({ error: result.error || "Workspace invite not found." }, result.status as any);
+  }
+  return c.json({ invite: result.invite });
+});
+
+app.post("/api/workspace-access/invites/:inviteId/deny", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessInviteStatus(c.env.DB, {
+    inviteId: clampInteger(c.req.param("inviteId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "denied",
+  });
+  if (!result.invite) {
+    return c.json({ error: result.error || "Workspace invite not found." }, result.status as any);
+  }
+  return c.json({ invite: result.invite });
+});
+
+app.post("/api/workspace-access/invites/:inviteId/revoke", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessInviteStatus(c.env.DB, {
+    inviteId: clampInteger(c.req.param("inviteId")),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "revoked",
+  });
+  if (!result.invite) {
+    return c.json({ error: result.error || "Workspace invite not found." }, result.status as any);
+  }
+  return c.json({ invite: result.invite });
+});
+
+app.post("/api/workspace-access/presence", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body: {
+    app_instance_id?: string;
+    connection_policy?: string;
+  } = await c.req
+    .json<{
+      app_instance_id?: string;
+      connection_policy?: string;
+    }>()
+    .catch(() => ({}));
+
+  const presence = await upsertCentralWorkspaceHostPresence(c.env.DB, {
+    brandId: brand.id,
+    ownerPublicId: verified.claims.public_id,
+    appInstanceId: normalizeText(body?.app_instance_id) || `desktop_${generateUUID()}`,
+    connectionPolicy: normalizeWorkspaceConnectionPolicy(body?.connection_policy),
+  });
+
+  return c.json({
+    presence,
+    online: Boolean(presence && isWorkspacePresenceFresh(presence.last_seen_at)),
+  });
+});
+
+app.post("/api/workspace-access/sessions", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body = await c.req
+    .json<{
+      invite_id?: number;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const invite = await getCentralWorkspaceAccessInviteById(
+    c.env.DB,
+    clampInteger(body.invite_id)
+  );
+  if (!invite || invite.brand_id !== brand.id) {
+    return c.json({ error: "Workspace invite not found." }, 404);
+  }
+  if (invite.invitee_public_id !== verified.claims.public_id || invite.status !== "accepted") {
+    return c.json({ error: "This workspace is not available for the current account." }, 403);
+  }
+
+  const presence = await getCentralWorkspaceHostPresence(
+    c.env.DB,
+    invite.brand_id,
+    invite.owner_public_id
+  );
+  if (!presence || !isWorkspacePresenceFresh(presence.last_seen_at)) {
+    return c.json({ error: "The owner app is offline or closed." }, 409);
+  }
+  if (countWorkspaceRelayConnections(invite.owner_public_id) <= 0) {
+    return c.json({ error: "The owner app relay is offline." }, 409);
+  }
+
+  const session = await createCentralWorkspaceAccessSession(c.env.DB, {
+    brandId: invite.brand_id,
+    ownerPublicId: invite.owner_public_id,
+    operatorPublicId: invite.invitee_public_id,
+    permissionProfile: invite.permission_profile,
+    requestedByPolicy: presence.connection_policy,
+  });
+  if (!session) {
+    return c.json({ error: "Failed to create the workspace session." }, 500);
+  }
+
+  return c.json({ session }, 201);
+});
+
+app.get("/api/workspace-access/sessions/:sessionId", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const session = await getCentralWorkspaceAccessSessionById(
+    c.env.DB,
+    c.req.param("sessionId")
+  );
+  if (!session || session.brand_id !== brand.id) {
+    return c.json({ error: "Workspace session not found." }, 404);
+  }
+  if (
+    verified.claims.public_id !== session.owner_public_id &&
+    verified.claims.public_id !== session.operator_public_id
+  ) {
+    return c.json({ error: "You are not allowed to access this workspace session." }, 403);
+  }
+
+  return c.json({ session });
+});
+
+app.post("/api/workspace-access/sessions/:sessionId/approve", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessSessionStatus(c.env.DB, {
+    sessionId: c.req.param("sessionId"),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "approved",
+  });
+  if (!result.session) {
+    return c.json({ error: result.error || "Workspace session not found." }, result.status as any);
+  }
+  return c.json({ session: result.session });
+});
+
+app.post("/api/workspace-access/sessions/:sessionId/deny", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessSessionStatus(c.env.DB, {
+    sessionId: c.req.param("sessionId"),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "denied",
+    endedReason: "denied_by_owner",
+  });
+  if (!result.session) {
+    return c.json({ error: result.error || "Workspace session not found." }, result.status as any);
+  }
+  return c.json({ session: result.session });
+});
+
+app.post("/api/workspace-access/sessions/:sessionId/activate", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const result = await transitionCentralWorkspaceAccessSessionStatus(c.env.DB, {
+    sessionId: c.req.param("sessionId"),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "active",
+  });
+  if (!result.session) {
+    return c.json({ error: result.error || "Workspace session not found." }, result.status as any);
+  }
+  return c.json({ session: result.session });
+});
+
+app.post("/api/workspace-access/sessions/:sessionId/end", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body: {
+    reason?: string;
+  } =
+    (await c.req
+      .json<{
+        reason?: string;
+      }>()
+      .catch(() => ({}))) || {};
+
+  const result = await transitionCentralWorkspaceAccessSessionStatus(c.env.DB, {
+    sessionId: c.req.param("sessionId"),
+    actorPublicId: verified.claims.public_id,
+    nextStatus: "ended",
+    endedReason: normalizeOptionalText(body.reason) || "closed_by_user",
+  });
+  if (!result.session) {
+    return c.json({ error: result.error || "Workspace session not found." }, result.status as any);
+  }
+  return c.json({ session: result.session });
+});
+
+app.post("/api/workspace-relay/session", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const session = issueWorkspaceRelaySession(verified.claims.public_id, 120_000);
+  const requestUrl = new URL(c.req.url);
+  const forwardedProto = normalizeText(c.req.header("x-forwarded-proto"))
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const forwardedHost = normalizeText(c.req.header("x-forwarded-host"))
+    .split(",")[0]
+    .trim();
+  const host = forwardedHost || normalizeText(c.req.header("host")) || requestUrl.host;
+  const forwardedPrefixRaw = normalizeText(c.req.header("x-forwarded-prefix"))
+    .split(",")[0]
+    .trim();
+  const forwardedPrefix = forwardedPrefixRaw
+    ? `/${forwardedPrefixRaw.replace(/^\/+|\/+$/g, "")}`
+    : "";
+  const wsProtocol =
+    forwardedProto === "https" || requestUrl.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = new URL(`${wsProtocol}//${host}`);
+  wsUrl.pathname = `${forwardedPrefix}/ws/workspace-relay`.replace(/\/{2,}/g, "/");
+  wsUrl.searchParams.set("token", session.token);
+
+  return c.json({
+    success: true,
+    token: session.token,
+    public_id: session.public_id,
+    expires_at: session.expires_at,
+    ws_url: wsUrl.toString(),
+  });
+});
+
 app.post("/api/find-relay/session", async (c) => {
   await ensureCentralIdentitySchema(c.env.DB);
   const verified = await requireVerifiedCentralGrantUser(c);
@@ -22986,6 +24841,506 @@ app.post("/api/shared-find/shares/:shareId/revoke", anyAuthMiddleware, async (c)
     await syncSharedFindCameraCacheForUser(c.env, user);
   }
   return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/settings`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const connectionPolicy = await getWorkspaceAccessConnectionPolicyForUser(c.env.DB, user.id);
+  return c.json({
+    settings: {
+      connection_policy: connectionPolicy,
+    },
+  });
+});
+
+app.patch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/settings`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      connection_policy?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const connectionPolicy = normalizeWorkspaceConnectionPolicy(body.connection_policy);
+  await upsertWorkspaceAccessConnectionPolicyForUser(c.env.DB, user.id, connectionPolicy);
+  return c.json({
+    success: true,
+    settings: {
+      connection_policy: connectionPolicy,
+    },
+  });
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/heartbeat`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const body: {
+    app_instance_id?: string;
+  } =
+    (await c.req
+      .json<{
+        app_instance_id?: string;
+      }>()
+      .catch(() => ({}))) || {};
+
+  const connectionPolicy = await getWorkspaceAccessConnectionPolicyForUser(c.env.DB, user.id);
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  await maybeEnsureWorkspaceRelayForUser(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/presence", {
+    method: "POST",
+    token: centralContext.grantToken,
+    body: {
+      app_instance_id: normalizeText(body.app_instance_id) || `desktop_${generateUUID()}`,
+      connection_policy: connectionPolicy,
+    },
+  });
+
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/pending-requests`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  return c.json({
+    requests: listPendingWorkspaceApprovals(user.id),
+  });
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/users/resolve`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      query?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    "/api/workspace-access/users/resolve",
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {
+        query: body.query,
+      },
+    }
+  );
+
+  return c.json(
+    remote.data || {
+      error: "Unable to resolve the requested workspace access user.",
+    },
+    (remote.response.status || 502) as any
+  );
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const body = await c.req
+    .json<{
+      query?: string;
+      invitee_public_id?: string;
+      permission_profile?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/invites", {
+    method: "POST",
+    token: centralContext.grantToken,
+    body: {
+      query: body.query,
+      invitee_public_id: normalizeText(body.invitee_public_id),
+      permission_profile: normalizeWorkspacePermissionProfile(body.permission_profile),
+    },
+  });
+
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/incoming`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    "/api/workspace-access/invites/incoming",
+    {
+      method: "GET",
+      token: centralContext.grantToken,
+    }
+  );
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/outgoing`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    "/api/workspace-access/invites/outgoing",
+    {
+      method: "GET",
+      token: centralContext.grantToken,
+    }
+  );
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/available`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/available", {
+    method: "GET",
+    token: centralContext.grantToken,
+  });
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/accept`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/invites/${encodeURIComponent(
+      String(clampInteger(c.req.param("inviteId")))
+    )}/accept`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  if (remote.response.ok) {
+    await maybeEnsureWorkspaceRelayForUser(c.env, user);
+  }
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/deny`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/invites/${encodeURIComponent(
+      String(clampInteger(c.req.param("inviteId")))
+    )}/deny`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites/:inviteId/revoke`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/invites/${encodeURIComponent(
+      String(clampInteger(c.req.param("inviteId")))
+    )}/revoke`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      invite_id?: number;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  await maybeEnsureWorkspaceRelayForUser(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/sessions", {
+    method: "POST",
+    token: centralContext.grantToken,
+    body: {
+      invite_id: clampInteger(body.invite_id),
+    },
+  });
+
+  const session = normalizeWorkspaceAccessSessionRow(remote.data?.session);
+  if (remote.response.ok && session && session.status === "pending_owner") {
+    const operatorDisplayLabel = buildSharedFindDisplayLabel({
+      handle: session.operator_handle,
+      email: session.operator_email,
+    });
+    sendWorkspaceRelayClientMessage(centralContext.publicId, {
+      type: "session_requested",
+      target_public_id: session.owner_public_id,
+      session_id: session.session_id,
+      requested_at: session.requested_at,
+      requested_by_policy: session.requested_by_policy,
+      permission_profile: session.permission_profile,
+      operator_handle: session.operator_handle,
+      operator_email: session.operator_email,
+      operator_display_label: operatorDisplayLabel,
+    });
+  }
+
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/bootstrap`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  try {
+    const { session } = await fetchCentralWorkspaceSessionByIdForAppUser(
+      c.env,
+      user.id,
+      c.req.param("sessionId")
+    );
+    return c.json({
+      session,
+      remote_context: {
+        owner_display_label: buildSharedFindDisplayLabel({
+          handle: session.owner_handle,
+          email: session.owner_email,
+        }),
+        operator_display_label: buildSharedFindDisplayLabel({
+          handle: session.operator_handle,
+          email: session.operator_email,
+        }),
+      },
+    });
+  } catch (error) {
+    return c.json(
+      {
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to load the remote workspace bootstrap state.",
+      },
+      409
+    );
+  }
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  try {
+    const { session } = await fetchCentralWorkspaceSessionByIdForAppUser(
+      c.env,
+      user.id,
+      c.req.param("sessionId")
+    );
+    return c.json({ session });
+  } catch (error) {
+    return c.json(
+      {
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to load the remote workspace session.",
+      },
+      409
+    );
+  }
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/approve`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/approve`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  clearPendingWorkspaceApproval(user.id, c.req.param("sessionId"));
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/deny`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/deny`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {},
+    }
+  );
+  clearPendingWorkspaceApproval(user.id, c.req.param("sessionId"));
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/end`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const body: {
+    reason?: string;
+  } =
+    (await c.req
+      .json<{
+        reason?: string;
+      }>()
+      .catch(() => ({}))) || {};
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    `/api/workspace-access/sessions/${encodeURIComponent(c.req.param("sessionId"))}/end`,
+    {
+      method: "POST",
+      token: centralContext.grantToken,
+      body: {
+        reason: normalizeOptionalText(body.reason) || "closed_by_user",
+      },
+    }
+  );
+  clearPendingWorkspaceApproval(user.id, c.req.param("sessionId"));
+  return c.json(remote.data || {}, (remote.response.status || 502) as any);
+});
+
+app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/remote-proxy`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  const body = await c.req
+    .json<{
+      session_id?: string;
+      path?: string;
+      method?: string;
+      headers?: Record<string, unknown>;
+      body_base64?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  return await performRemoteWorkspaceProxyRequest(c.env, user, {
+    sessionId: normalizeText(body.session_id),
+    path: normalizeText(body.path),
+    method: normalizeText(body.method) || "GET",
+    headers: body.headers,
+    bodyBase64: normalizeText(body.body_base64),
+  });
+});
+
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/asset`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  return await performRemoteWorkspaceProxyRequest(c.env, user, {
+    sessionId: normalizeText(c.req.query("session_id")),
+    path: normalizeText(c.req.query("path")),
+    method: "GET",
+    headers: {
+      accept: normalizeText(c.req.header("accept")),
+    },
+    bodyBase64: "",
+  });
 });
 
 // Local auth endpoints
@@ -28592,8 +30947,8 @@ async function enqueueStartCameraCommand(
     const telegram = await getTelegramSettingsForUser(env.DB, cam.user_id);
 
     // Build payload for EXE including effective analysis_speed and model_tier
-    const cameraSessionId = crypto.randomUUID();
-    const commandEventId = crypto.randomUUID();
+    const cameraSessionId = generateUUID();
+    const commandEventId = generateUUID();
     const payload = {
       camera_id: cam.id,
       camera_session_id: cameraSessionId,
@@ -28782,8 +31137,8 @@ async function enqueueStopCameraCommand(
       typeof (latestOpenSession as any)?.camera_session_id === "string" &&
       String((latestOpenSession as any).camera_session_id).trim()
         ? String((latestOpenSession as any).camera_session_id).trim()
-        : crypto.randomUUID();
-    const commandEventId = crypto.randomUUID();
+        : generateUUID();
+    const commandEventId = generateUUID();
 
     await env.DB.prepare(
       "UPDATE cameras SET is_service_running = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?"
@@ -35633,7 +37988,7 @@ function normalizeReportEvidenceCandidates(value: unknown): ReportEvidenceCandid
 
     const fallbackFilename =
       storageKey.split("/").pop()?.trim() ||
-      `evidence-${kind}-${crypto.randomUUID()}.${kind === "video" ? "mp4" : "jpg"}`;
+      `evidence-${kind}-${generateUUID()}.${kind === "video" ? "mp4" : "jpg"}`;
     const filename = sanitizeStoragePathSegment(
       normalizeReportText(row.filename, 140) || fallbackFilename,
       fallbackFilename
@@ -35867,7 +38222,7 @@ async function buildReportContext(params: {
     normalizeTimezoneInput(params.timezoneInput) ||
     (await resolveUserGlobalTimezone(params.db, params.userId));
   const timeWindow = inferReportTimeWindow(requestedQuery, replyLanguage, resolvedTimezone);
-  const reportId = crypto.randomUUID();
+  const reportId = generateUUID();
   const generatedAt = new Date().toISOString();
   const isPt = reportLanguageIsPt(replyLanguage);
 
@@ -49208,7 +51563,7 @@ app.post("/api/agent/reports/create", async (c) => {
     }));
 
   const reportId =
-    normalizeReportText((context as any)?.report_id, 120) || crypto.randomUUID();
+    normalizeReportText((context as any)?.report_id, 120) || generateUUID();
   const reportKind = normalizeReportText((context as any)?.report_kind, 80) || "general";
   const reportReplyLanguage = normalizeSupportedChatLanguage(
     (context as any)?.reply_language,
@@ -52485,6 +54840,38 @@ app.post("/api/agent/events", async (c) => {
     return "";
   };
 
+  let notificationCameraNamePromise: Promise<string> | null = null;
+  const readNotificationCameraName = async () => {
+    if (!cameraId) return "";
+
+    const detailsCameraName = readTrimmedString(
+      detailsObject.camera_name,
+      detailsObject.cameraName
+    );
+    if (detailsCameraName) {
+      return detailsCameraName;
+    }
+
+    if (!notificationCameraNamePromise) {
+      notificationCameraNamePromise = c.env.DB
+        .prepare(
+          `SELECT name
+           FROM cameras
+           WHERE id = ? AND user_id = ?
+           LIMIT 1`
+        )
+        .bind(cameraId, userId)
+        .first()
+        .then((row: unknown) => readTrimmedString((row as any)?.name))
+        .catch((error: unknown) => {
+          console.error("[EVENT NOTIFICATIONS] Failed to resolve camera name:", error);
+          return "";
+        });
+    }
+
+    return notificationCameraNamePromise;
+  };
+
   const insertBellNotification = async ({
     type,
     title,
@@ -52587,7 +54974,7 @@ app.post("/api/agent/events", async (c) => {
     const notificationKind = readTrimmedString(
       detailsObject.notification_kind
     ).toLowerCase();
-    const title =
+    const baseTitle =
       notificationKind === "reminder" && failurePhase === "startup"
         ? "Still Connecting to Camera"
         : notificationKind === "reminder" && failurePhase === "runtime"
@@ -52597,12 +54984,35 @@ app.post("/api/agent/events", async (c) => {
         : failurePhase === "runtime"
         ? "Camera Connection Lost"
         : "Camera Offline";
+    const cameraName = await readNotificationCameraName();
+    const title = cameraName ? `${baseTitle} - ${cameraName}` : baseTitle;
     const notificationMessage =
       readTrimmedString(message) ||
       "Failed to connect to camera. Please check the RTSP settings and credentials.";
 
     await insertBellNotification({
       type: "camera_connection_failed",
+      title,
+      message: notificationMessage,
+    });
+  }
+
+  if (
+    cameraId &&
+    (eventType === "camera_online" || eventType === "camera_recovered")
+  ) {
+    const cameraName = await readNotificationCameraName();
+    const baseTitle =
+      eventType === "camera_recovered" ? "Camera Back Online" : "Camera Online";
+    const title = cameraName ? `${baseTitle} - ${cameraName}` : baseTitle;
+    const notificationMessage =
+      readTrimmedString(message) ||
+      (eventType === "camera_recovered"
+        ? "Camera connection restored. Stream is back online."
+        : "Camera connected successfully and is online.");
+
+    await insertBellNotification({
+      type: "camera_online",
       title,
       message: notificationMessage,
     });
@@ -58002,7 +60412,7 @@ type JobStepInputType = "video" | "image";
 type JobStepInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type VideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_JOB_STEP_INFERENCE_MODEL: JobStepInferenceModel = "ultra";
-type JobStepRunEverySeconds = 10 | 60;
+type JobStepRunEverySeconds = 10 | 60 | 300 | 600;
 const FIXED_JOB_STEP_RUN_EVERY_SECONDS: JobStepRunEverySeconds = 60;
 type JobStepRunningResolution = 640 | 1024;
 const DEFAULT_CORE_RUNNING_RESOLUTION: JobStepRunningResolution = 640;
@@ -58134,7 +60544,10 @@ const normalizeJobStepRunEverySeconds = (
   const normalizeValue = (candidate: unknown): JobStepRunEverySeconds | null => {
     const parsed = parseSeconds(candidate);
     if (parsed === null || parsed <= 0) return null;
-    return parsed <= 10 ? 10 : 60;
+    if (parsed <= 10) return 10;
+    if (parsed === 300) return 300;
+    if (parsed === 600) return 600;
+    return 60;
   };
   return normalizeValue(value) ?? normalizeValue(fallback) ?? FIXED_JOB_STEP_RUN_EVERY_SECONDS;
 };

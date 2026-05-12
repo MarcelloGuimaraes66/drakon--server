@@ -30,11 +30,15 @@ interface CameraEventToastProps {
 }
 
 export default function CameraEventToast({ toasts, onDismiss }: CameraEventToastProps) {
-  if (toasts.length === 0) return null;
+  const visibleToasts = toasts.filter(
+    (toast) => toast.type !== "offline" && toast.type !== "online",
+  );
+
+  if (visibleToasts.length === 0) return null;
 
   return (
     <div className="fixed bottom-4 right-4 z-[140] flex flex-col gap-3 max-w-md pointer-events-none">
-      {toasts.map((toast) => {
+      {visibleToasts.map((toast) => {
         const toastType = toast.type || "offline";
         const isJobStaledToast = toastType === "job_staled";
         const isJobStartBlockedToast = toastType === "job_start_blocked";

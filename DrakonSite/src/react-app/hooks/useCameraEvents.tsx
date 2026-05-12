@@ -1,7 +1,7 @@
 ﻿import { useEffect, useState, useRef } from "react";
 import { pollingManager } from "@/react-app/lib/PollingManager";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
-import { normalizeCameraConnectionFailedEvent, type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
+import { type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
 import { emitOpenAiKeyRequiredPrompt } from "@/react-app/utils/openAiKeyGuard";
 import { formatAiApiErrorDisplay } from "@/shared/aiApiErrorDisplay";
 
@@ -53,7 +53,6 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
   const shownToastIdsRef = useRef<Set<number>>(new Set());
   const offlineCameraIdsRef = useRef<Set<number>>(new Set());
   const previousOnlineStateRef = useRef<Map<number, boolean>>(new Map());
-  const syntheticToastIdRef = useRef(-1);
 
   // Keep refs updated without triggering effects
   useEffect(() => {
@@ -125,32 +124,9 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
           const camera = camerasRef.current.find((row) => row.id === event.camera_id);
           if (!camera) return;
 
-          const failureToast = normalizeCameraConnectionFailedEvent(event);
           shownToastIdsRef.current.add(event.id);
           offlineCameraIdsRef.current.add(event.camera_id);
           previousOnlineStateRef.current.set(event.camera_id, false);
-
-          setToasts((prev) => [
-            ...prev,
-            {
-              id: event.id,
-              cameraId: event.camera_id,
-              cameraName: camera.name,
-              message: failureToast.message,
-              title: failureToast.title,
-              failureCode: failureToast.failureCode,
-              failureSummary: failureToast.failureSummary,
-              failureAction: failureToast.failureAction,
-              technicalDetail: failureToast.technicalDetail,
-              failurePhase: failureToast.failurePhase,
-              failureConfidence: failureToast.failureConfidence,
-              type: "offline",
-            },
-          ]);
-
-          setTimeout(() => {
-            setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
-          }, AUTO_DISMISS_MS);
         });
 
         dashboardSummaryStore.refresh();
@@ -508,27 +484,6 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             isOnline &&
             offlineCameraIdsRef.current.has(cameraId)
           ) {
-            const cameraName =
-              typeof camera?.name === "string" && camera.name.trim()
-                ? camera.name
-                : `Camera ${cameraId}`;
-            const toastId = syntheticToastIdRef.current--;
-
-            setToasts((prev) => [
-              ...prev,
-              {
-                id: toastId,
-                cameraId,
-                cameraName,
-                message: "Connection restored. Camera is back online.",
-                type: "online",
-              },
-            ]);
-
-            setTimeout(() => {
-              setToasts((prev) => prev.filter((toast) => toast.id !== toastId));
-            }, AUTO_DISMISS_MS);
-
             offlineCameraIdsRef.current.delete(cameraId);
             didRecoverCamera = true;
           }

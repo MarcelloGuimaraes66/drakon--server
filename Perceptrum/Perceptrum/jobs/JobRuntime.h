@@ -224,7 +224,8 @@ private:
         const JobStepDef& step,
         int cameraId,
         const JobAgentDef& agent,
-        const std::string& inferenceOutput
+        const std::string& inferenceOutput,
+        bool suppressDelivery = false
     );
 
     // utils

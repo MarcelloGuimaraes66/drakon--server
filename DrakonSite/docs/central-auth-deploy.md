@@ -87,6 +87,12 @@ Example config:
 
 [perceptrum-central-auth.nginx.conf.example](/C:/dev/Workspace/DrakonSite/ops/nginx/perceptrum-central-auth.nginx.conf.example)
 
+If you enable relay features, make sure both WebSocket paths are proxied with
+`Upgrade`/`Connection` headers:
+
+- `/ws/find-relay`
+- `/ws/workspace-relay`
+
 ## 5. Configure the desktop/local app
 
 Local `.env` should contain only:

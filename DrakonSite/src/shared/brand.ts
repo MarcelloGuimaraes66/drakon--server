@@ -5,6 +5,7 @@ type BrandFeatures = {
   billingEnabled: boolean;
   drakonFindEnabled: boolean;
   googleLoginEnabled: boolean;
+  workspaceAccessEnabled: boolean;
 };
 type RuntimeBrandConfig = Omit<typeof generatedBranding.brand, "id" | "features"> & {
   id: BrandId;

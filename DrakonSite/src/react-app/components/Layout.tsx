@@ -11,6 +11,7 @@ import BrandLogo from "@/react-app/components/BrandLogo";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import SystemActivityModal from "@/react-app/components/SystemActivityModal";
 import TutorialOverlay from "@/react-app/components/TutorialOverlay";
+import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { useTheme } from "@/react-app/hooks/useTheme";
@@ -18,6 +19,7 @@ import type { OnboardingTutorialKind } from "@/react-app/lib/onboarding";
 import { brand, getBrandStorageKey, getBrandWindowEventName } from "@/shared/brand";
 import {
   Activity,
+  CheckCircle2,
   LayoutDashboard,
   Camera,
   MessageSquare,
@@ -36,6 +38,7 @@ import {
   ChevronsRight,
   KeyRound,
   Moon,
+  MonitorSmartphone,
   Sun,
   Radar,
   Sparkles,
@@ -75,6 +78,7 @@ type SidebarHoverHint = {
 const CHAT_AUTO_COLLAPSE_DELAY_MS = 260;
 const CHAT_AUTO_EXPAND_DELAY_MS = 1000;
 const SIDEBAR_DESCRIPTION_HOVER_DELAY_MS = 2000;
+const LOCAL_WORKSPACE_ACCESS_API_PREFIX = "/api/desktop-workspace-access";
 
 function getSidebarSectionLabels(language: string) {
   if (language.startsWith("pt") || language.startsWith("es")) {
@@ -115,6 +119,34 @@ type ApiKeyPromptStatus = {
   hasAnyApiKey: boolean | null;
   hasConfirmedNoApiKeys: boolean;
 };
+
+type PendingWorkspaceAccessRequest = {
+  sessionId: string;
+  operatorDisplayLabel: string;
+  permissionProfile: string;
+  requestedAt: string;
+};
+
+type DesktopShellWindow = Window & {
+  chrome?: {
+    webview?: {
+      postMessage?: (message: unknown) => void;
+    };
+  };
+  __drakonDesktopShell?: boolean;
+};
+
+function isDesktopShellWindow(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const desktopWindow = window as DesktopShellWindow;
+  return (
+    desktopWindow.__drakonDesktopShell === true ||
+    Boolean(desktopWindow.chrome?.webview)
+  );
+}
 
 async function readApiKeyPromptStatus(): Promise<ApiKeyPromptStatus | null> {
   const readHasKey = async (url: string): Promise<boolean | null> => {
@@ -158,6 +190,15 @@ async function readApiKeyPromptStatus(): Promise<ApiKeyPromptStatus | null> {
 export default function Layout({ children }: LayoutProps) {
   const { t, i18n } = useTranslation();
   const { user, logout } = useAuth();
+  const {
+    isRemote: isRemoteWorkspace,
+    session: remoteWorkspaceSession,
+    remoteUser,
+    ownerDisplayLabel,
+    operatorDisplayLabel,
+    error: remoteWorkspaceError,
+    endSession: endRemoteWorkspaceSession,
+  } = useRemoteWorkspace();
   const { startTutorial, status: onboardingStatus } = useOnboarding();
   const { theme, setTheme } = useTheme();
   const location = useLocation();
@@ -180,12 +221,19 @@ export default function Layout({ children }: LayoutProps) {
   const [showZAiKeyPrompt, setShowZAiKeyPrompt] = useState(false);
   const [isTutorialMenuOpen, setIsTutorialMenuOpen] = useState(false);
   const [sidebarHoverHint, setSidebarHoverHint] = useState<SidebarHoverHint | null>(null);
+  const [pendingWorkspaceRequests, setPendingWorkspaceRequests] = useState<
+    PendingWorkspaceAccessRequest[]
+  >([]);
+  const [workspaceRequestAction, setWorkspaceRequestAction] = useState("");
   const previousPathnameRef = useRef("");
   const collapseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearCueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expandTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sidebarHoverHintTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousUnreadCountRef = useRef(0);
+  const workspaceHeartbeatInstanceIdRef = useRef(
+    `desktop_${Math.random().toString(36).slice(2, 10)}`
+  );
   const notificationsContainerRef = useRef<HTMLDivElement>(null);
   const tutorialMenuRef = useRef<HTMLDivElement>(null);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
@@ -255,6 +303,64 @@ export default function Layout({ children }: LayoutProps) {
     () => getSidebarSectionLabels((i18n.resolvedLanguage || i18n.language || "en").toLowerCase()),
     [i18n.language, i18n.resolvedLanguage]
   );
+  const localSidebarPrimaryLabel =
+    (typeof user?.google_user_data?.name === "string" && user.google_user_data.name.trim()) ||
+    (typeof user?.email === "string" ? user.email.trim() : "") ||
+    "";
+  const localSidebarSecondaryLabel =
+    typeof user?.email === "string" &&
+    user.email.trim() &&
+    user.email.trim() !== localSidebarPrimaryLabel
+      ? user.email.trim()
+      : "";
+  const remoteSidebarHandleLabel =
+    (typeof remoteUser?.handle === "string" && remoteUser.handle.trim()
+      ? `@${remoteUser.handle.trim().replace(/^@+/, "")}`
+      : "") ||
+    ownerDisplayLabel ||
+    (typeof remoteWorkspaceSession?.owner_handle === "string" &&
+    remoteWorkspaceSession.owner_handle.trim()
+      ? `@${remoteWorkspaceSession.owner_handle.trim().replace(/^@+/, "")}`
+      : "") ||
+    "";
+  const remoteSidebarEmail =
+    (typeof remoteUser?.email === "string" && remoteUser.email.trim()) ||
+    (typeof remoteWorkspaceSession?.owner_email === "string"
+      ? remoteWorkspaceSession.owner_email.trim()
+      : "") ||
+    "";
+  const remoteSidebarName =
+    typeof remoteUser?.google_user_data?.name === "string"
+      ? remoteUser.google_user_data.name.trim()
+      : "";
+  const remoteSidebarPrimaryLabel =
+    remoteSidebarName || remoteSidebarHandleLabel || remoteSidebarEmail;
+  const remoteSidebarSecondaryLabel =
+    remoteSidebarHandleLabel && remoteSidebarHandleLabel !== remoteSidebarPrimaryLabel
+      ? remoteSidebarHandleLabel
+      : remoteSidebarEmail && remoteSidebarEmail !== remoteSidebarPrimaryLabel
+      ? remoteSidebarEmail
+      : "";
+  const remoteWindowOwnerLabel =
+    remoteSidebarName ||
+    ownerDisplayLabel ||
+    remoteSidebarHandleLabel ||
+    remoteSidebarEmail ||
+    "Outro usuario";
+  const remoteWindowOwnerMetaLabel =
+    remoteSidebarHandleLabel && remoteSidebarHandleLabel !== remoteWindowOwnerLabel
+      ? remoteSidebarHandleLabel
+      : remoteSidebarEmail && remoteSidebarEmail !== remoteWindowOwnerLabel
+      ? remoteSidebarEmail
+      : "";
+  const sidebarProfilePrimaryLabel = isRemoteWorkspace
+    ? remoteSidebarPrimaryLabel
+    : localSidebarPrimaryLabel;
+  const sidebarProfileSecondaryLabel = isRemoteWorkspace
+    ? remoteSidebarSecondaryLabel
+    : localSidebarSecondaryLabel;
+  const sidebarProfileAvatarSeed =
+    sidebarProfilePrimaryLabel || sidebarProfileSecondaryLabel || "U";
   
   // Use unified dashboard summary hook
   const { cameras, dashboard, unreadCount, tokenUsageMonth } = useDashboardSummary();
@@ -522,6 +628,83 @@ export default function Layout({ children }: LayoutProps) {
       );
     };
   }, [isSettingsRoute]);
+
+  useEffect(() => {
+    if (
+      !brand.features.workspaceAccessEnabled ||
+      !user?.id ||
+      !isDesktopShellWindow() ||
+      isRemoteWorkspace
+    ) {
+      return;
+    }
+
+    const sendWorkspaceHeartbeat = async () => {
+      await fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/heartbeat`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          app_instance_id: workspaceHeartbeatInstanceIdRef.current,
+        }),
+      }).catch(() => null);
+    };
+
+    void sendWorkspaceHeartbeat();
+    const intervalId = window.setInterval(() => {
+      void sendWorkspaceHeartbeat();
+    }, 15_000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isRemoteWorkspace, user?.id]);
+
+  useEffect(() => {
+    if (!brand.features.workspaceAccessEnabled || !user?.id || !isDesktopShellWindow()) {
+      return;
+    }
+
+    const loadPendingWorkspaceRequests = async () => {
+      try {
+        const response = await fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/pending-requests`, {
+          credentials: "include",
+          cache: "no-store",
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          return;
+        }
+
+        const requests = Array.isArray((payload as any)?.requests)
+          ? ((payload as any).requests as Array<Record<string, unknown>>).map((request) => ({
+              sessionId: String(request.sessionId || request.session_id || ""),
+              operatorDisplayLabel: String(
+                request.operatorDisplayLabel || request.operator_display_label || ""
+              ),
+              permissionProfile: String(
+                request.permissionProfile || request.permission_profile || "full_access"
+              ),
+              requestedAt: String(request.requestedAt || request.requested_at || ""),
+            }))
+          : [];
+        setPendingWorkspaceRequests(requests.filter((request) => request.sessionId));
+      } catch {
+        // keep the previous request list when polling fails
+      }
+    };
+
+    void loadPendingWorkspaceRequests();
+    const intervalId = window.setInterval(() => {
+      void loadPendingWorkspaceRequests();
+    }, 5_000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [user?.id]);
 
   const handleNotificationClick = () => {
     setIsNotificationsOpen((prev) => {
@@ -854,8 +1037,44 @@ export default function Layout({ children }: LayoutProps) {
     );
   };
 
+  const activeWorkspaceRequest = pendingWorkspaceRequests[0] || null;
+
+  const handleWorkspaceRequestDecision = async (
+    sessionId: string,
+    action: "approve" | "deny"
+  ) => {
+    setWorkspaceRequestAction(`${action}:${sessionId}`);
+    try {
+      const response = await fetch(
+        `${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/${encodeURIComponent(sessionId)}/${action}`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({}),
+        }
+      );
+      if (!response.ok) {
+        return;
+      }
+      setPendingWorkspaceRequests((current) =>
+        current.filter((request) => request.sessionId !== sessionId)
+      );
+    } catch {
+      // keep the request visible and let the next poll reconcile the state
+    } finally {
+      setWorkspaceRequestAction("");
+    }
+  };
+
   return (
-    <div className="h-screen bg-gray-950 flex overflow-hidden">
+    <div className="relative h-screen bg-gray-950 flex overflow-hidden">
+      {isRemoteWorkspace ? (
+        <div className="pointer-events-none fixed inset-0 z-[120] border border-red-500/80 shadow-[inset_0_0_0_1px_rgba(239,68,68,0.22)]" />
+      ) : null}
+
       {/* Mobile backdrop overlay */}
       {isSidebarOpen && (
         <div
@@ -1074,28 +1293,49 @@ export default function Layout({ children }: LayoutProps) {
                 className={`rounded-full bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center text-white font-semibold ${
                   isSidebarCollapsed ? "w-9 h-9 text-sm" : "w-10 h-10"
                 }`}
-                title={isSidebarCollapsed ? (user?.google_user_data?.name || user?.email) : undefined}
+                title={
+                  isSidebarCollapsed
+                    ? sidebarProfilePrimaryLabel || sidebarProfileSecondaryLabel || undefined
+                    : undefined
+                }
               >
-                {user?.email?.charAt(0).toUpperCase() || "U"}
+                {sidebarProfileAvatarSeed.charAt(0).toUpperCase() || "U"}
               </div>
               {!isSidebarCollapsed && (
                 <div className="ml-3 flex-1 min-w-0">
+                  {isRemoteWorkspace ? (
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-300/80">
+                      Remote workspace owner
+                    </p>
+                  ) : null}
                   <p className="text-sm font-medium text-gray-200 truncate">
-                    {user?.google_user_data?.name || user?.email}
+                    {sidebarProfilePrimaryLabel || "Unknown user"}
                   </p>
-                  <p className="text-xs text-gray-500 truncate">{user?.email}</p>
+                  {sidebarProfileSecondaryLabel ? (
+                    <p className="text-xs text-gray-500 truncate">
+                      {sidebarProfileSecondaryLabel}
+                    </p>
+                  ) : null}
                 </div>
               )}
             </div>
             <button
-              onClick={logout}
-              title={isSidebarCollapsed ? t("nav.logout") : undefined}
+              onClick={() => {
+                if (isRemoteWorkspace) {
+                  void endRemoteWorkspaceSession();
+                  return;
+                }
+                void logout();
+              }}
+              title={
+                isSidebarCollapsed ? (isRemoteWorkspace ? "End session" : t("nav.logout")) : undefined
+              }
               className={`w-full flex items-center justify-center px-4 py-2 text-sm text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors ${
                 isSidebarCollapsed ? "px-2" : ""
               }`}
             >
               <LogOut className={`w-4 h-4 ${isSidebarCollapsed ? "" : "mr-2"}`} />
-              {!isSidebarCollapsed && t("nav.logout")}
+              {!isSidebarCollapsed && (isRemoteWorkspace ? "End session" : t("nav.logout"))}
             </button>
           </div>
         </div>
@@ -1118,7 +1358,26 @@ export default function Layout({ children }: LayoutProps) {
       {/* Main content */}
       <div className="flex-1 min-h-0 flex flex-col min-w-0">
         {/* Top bar */}
-        <header className="h-16 bg-gray-900/50 backdrop-blur-xl border-b border-gray-800/50 flex items-center justify-between px-4 md:px-6 sticky top-0 z-10">
+        <header className="relative h-16 bg-gray-900/50 backdrop-blur-xl border-b border-gray-800/50 flex items-center justify-between px-4 md:px-6 sticky top-0 z-10">
+          {isRemoteWorkspace ? (
+            <div className="pointer-events-none absolute left-1/2 top-1/2 z-[5] flex max-w-[min(34rem,52vw)] min-w-0 -translate-x-1/2 -translate-y-1/2 items-center gap-3 rounded-full border border-red-400/35 bg-[linear-gradient(135deg,rgba(127,29,29,0.92),rgba(69,10,10,0.86))] px-4 py-2 shadow-[0_18px_40px_-24px_rgba(239,68,68,0.72)] backdrop-blur-md">
+              <span className="inline-flex h-2.5 w-2.5 flex-shrink-0 rounded-full bg-red-300 shadow-[0_0_16px_rgba(252,165,165,0.95)]" />
+              <div className="min-w-0 text-center">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.24em] text-red-100/75">
+                  Workspace remoto
+                </p>
+                <p className="truncate text-sm font-semibold text-white">
+                  {remoteWindowOwnerLabel}
+                </p>
+                {remoteWindowOwnerMetaLabel ? (
+                  <p className="truncate text-[11px] text-red-100/70">
+                    {remoteWindowOwnerMetaLabel}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
           <button
             onClick={handleSidebarToggle}
             title={
@@ -1241,7 +1500,7 @@ export default function Layout({ children }: LayoutProps) {
               {isTutorialMenuOpen ? (
                 <div
                   role="menu"
-                  className="absolute right-0 top-full z-50 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-blue-400/20 bg-slate-950/96 p-1.5 shadow-2xl shadow-blue-950/50 backdrop-blur-xl"
+                  className="absolute right-0 top-full z-50 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-blue-300/20 bg-[rgba(8,12,24,0.98)] p-2 shadow-2xl shadow-blue-950/60 backdrop-blur-md"
                 >
                   {tutorialMenuItems.map((item) => (
                     <button
@@ -1249,16 +1508,16 @@ export default function Layout({ children }: LayoutProps) {
                       type="button"
                       role="menuitem"
                       onClick={() => handleTutorialMenuSelect(item.kind)}
-                      className="group flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left transition-colors hover:bg-blue-500/10"
+                      className="group flex w-full items-start gap-3 rounded-xl border border-white/5 bg-slate-900/70 px-3 py-3 text-left transition-colors hover:border-blue-300/20 hover:bg-blue-500/12"
                     >
-                      <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06] text-blue-100 transition-colors group-hover:border-blue-300/35 group-hover:bg-blue-500/15">
+                      <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-white/10 bg-slate-900/90 text-blue-100 transition-colors group-hover:border-blue-300/35 group-hover:bg-blue-500/15">
                         <Sparkles className="h-4 w-4" />
                       </span>
                       <span className="min-w-0">
                         <span className="block text-sm font-semibold text-slate-100">
                           {item.label}
                         </span>
-                        <span className="mt-1 block text-xs leading-5 text-slate-400">
+                        <span className="mt-1 block text-xs leading-5 text-slate-300/90">
                           {item.description}
                         </span>
                       </span>
@@ -1290,9 +1549,107 @@ export default function Layout({ children }: LayoutProps) {
           </div>
         </header>
 
+        {isRemoteWorkspace ? (
+          <div
+            className={`border-b px-4 py-3 md:px-6 ${
+              remoteWorkspaceSession?.owner_online === false || remoteWorkspaceError
+                ? "border-red-500/20 bg-red-500/10"
+                : "border-cyan-500/20 bg-cyan-500/10"
+            }`}
+          >
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-start gap-3">
+                <div className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-cyan-100">
+                  <MonitorSmartphone className="h-5 w-5" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-gray-100">
+                    Workspace remoto de{" "}
+                    {ownerDisplayLabel ||
+                      remoteWorkspaceSession?.owner_handle ||
+                      remoteWorkspaceSession?.owner_email ||
+                      "outro usuario"}
+                  </p>
+                  <p className="mt-1 text-sm text-gray-300">
+                    Voce esta operando como{" "}
+                    {operatorDisplayLabel ||
+                      remoteWorkspaceSession?.operator_handle ||
+                      remoteWorkspaceSession?.operator_email ||
+                      "sua conta"}
+                    . Status:{" "}
+                    {remoteWorkspaceError
+                      ? remoteWorkspaceError
+                      : remoteWorkspaceSession?.owner_online === false
+                      ? "owner offline"
+                      : remoteWorkspaceSession?.status || "conectado"}
+                    .
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void endRemoteWorkspaceSession()}
+                className="inline-flex min-h-[40px] items-center justify-center rounded-xl border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-gray-100 transition-colors hover:bg-white/[0.09]"
+              >
+                Encerrar sessao
+              </button>
+            </div>
+          </div>
+        ) : null}
+
         {/* Page content */}
         <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-8">{children}</main>
       </div>
+
+      {activeWorkspaceRequest ? (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-3xl border border-cyan-500/20 bg-slate-950/96 p-6 shadow-2xl shadow-cyan-950/40">
+            <div className="flex items-start gap-3">
+              <div className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-cyan-400/20 bg-cyan-500/10 text-cyan-100">
+                <CheckCircle2 className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-gray-100">
+                  Solicitação de acesso remoto
+                </h3>
+                <p className="mt-1 text-sm text-gray-300">
+                  {activeWorkspaceRequest.operatorDisplayLabel || "Outro usuario"} quer abrir seu
+                  workspace enquanto este app estiver aberto.
+                </p>
+                <p className="mt-2 text-xs uppercase tracking-[0.18em] text-cyan-200/80">
+                  {activeWorkspaceRequest.permissionProfile === "full_access"
+                    ? "Acesso total"
+                    : activeWorkspaceRequest.permissionProfile}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-6 grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={() =>
+                  void handleWorkspaceRequestDecision(activeWorkspaceRequest.sessionId, "approve")
+                }
+                disabled={workspaceRequestAction.length > 0}
+                className="inline-flex min-h-[44px] items-center justify-center rounded-2xl bg-emerald-500 px-4 text-sm font-semibold text-white transition-colors hover:bg-emerald-400 disabled:opacity-60"
+              >
+                Permitir agora
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void handleWorkspaceRequestDecision(activeWorkspaceRequest.sessionId, "deny")
+                }
+                disabled={workspaceRequestAction.length > 0}
+                className="inline-flex min-h-[44px] items-center justify-center rounded-2xl border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-gray-100 transition-colors hover:bg-white/[0.09] disabled:opacity-60"
+              >
+                Negar
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Floating chat button and overlay */}
       <FloatingChatButton />

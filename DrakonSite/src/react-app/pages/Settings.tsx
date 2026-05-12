@@ -6,6 +6,8 @@ import Layout from "@/react-app/components/Layout";
 import SettingsTabs, {
   type SettingsTabView,
 } from "@/react-app/components/settings/SettingsTabs";
+import WorkspaceAccessPanel from "@/react-app/components/settings/WorkspaceAccessPanel";
+import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { brand } from "@/shared/brand";
@@ -120,6 +122,8 @@ export default function Settings() {
   const zAiKeysUrl = "https://z.ai/manage-apikey/apikey-list";
   const { t, i18n } = useTranslation();
   const { user } = useAuth();
+  const { isRemote: isRemoteWorkspace, session: remoteWorkspaceSession, remoteUser } =
+    useRemoteWorkspace();
   const {
     startTutorial,
     status: onboardingStatus,
@@ -181,10 +185,54 @@ export default function Settings() {
   const [deletingAccount, setDeletingAccount] = useState(false);
   const [isDeleteAccountModalOpen, setIsDeleteAccountModalOpen] = useState(false);
   const [showDeleteAccountDetails, setShowDeleteAccountDetails] = useState(false);
+  const remoteProfileEmail =
+    (typeof remoteUser?.email === "string" && remoteUser.email.trim()) ||
+    (typeof remoteWorkspaceSession?.owner_email === "string"
+      ? remoteWorkspaceSession.owner_email.trim()
+      : "") ||
+    "";
+  const remoteProfileHandle =
+    (typeof remoteUser?.handle === "string" && remoteUser.handle.trim()
+      ? remoteUser.handle.trim().replace(/^@+/, "")
+      : "") ||
+    (typeof remoteWorkspaceSession?.owner_handle === "string" &&
+    remoteWorkspaceSession.owner_handle.trim()
+      ? remoteWorkspaceSession.owner_handle.trim().replace(/^@+/, "")
+      : "") ||
+    deriveHandleFromEmail(remoteProfileEmail);
+  const profileEmail = isRemoteWorkspace
+    ? remoteProfileEmail
+    : typeof user?.email === "string"
+    ? user.email.trim()
+    : "";
+  const profileHandle = isRemoteWorkspace
+    ? remoteProfileHandle
+    : (typeof user?.handle === "string" && user.handle.trim()) || deriveHandleFromEmail(profileEmail);
+  const profileName = isRemoteWorkspace
+    ? typeof remoteUser?.google_user_data?.name === "string"
+      ? remoteUser.google_user_data.name
+      : ""
+    : typeof user?.google_user_data?.name === "string"
+    ? user.google_user_data.name
+    : "";
+  const accountCreatedRaw = isRemoteWorkspace
+    ? typeof remoteUser?.created_at === "string"
+      ? remoteUser.created_at
+      : ""
+    : (user as { created_at?: string } | null)?.created_at || "";
+  const operatorSessionLabel =
+    (typeof user?.google_user_data?.name === "string" && user.google_user_data.name.trim()) ||
+    (typeof user?.email === "string" ? user.email.trim() : "") ||
+    "your operator session";
 
   const selectSettingsTab = (tab: SettingsTabView) => {
     setActiveTab(tab);
-    const nextPath = tab === "alerts" ? "/settings/alerts" : "/settings";
+    const nextPath =
+      tab === "alerts"
+        ? "/settings/alerts"
+        : tab === "workspace-access"
+        ? "/settings?tab=workspace-access"
+        : "/settings";
     navigate(nextPath);
   };
 
@@ -492,6 +540,12 @@ export default function Settings() {
   const saveUserHandle = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    if (isRemoteWorkspace) {
+      setHandleMessageType("error");
+      setHandleMessage("Profile changes are only available in the owner's direct session.");
+      return;
+    }
+
     const normalizedHandle = normalizeHandleInput(handleInput);
     if (!normalizedHandle) {
       setHandleMessageType("error");
@@ -537,7 +591,7 @@ export default function Settings() {
   };
 
   const fetchAccountDeletionPreview = async () => {
-    if (!user?.email) {
+    if (!profileEmail) {
       setAccountDeletionPreview(null);
       setAccountDeletionError("");
       return;
@@ -653,10 +707,10 @@ export default function Settings() {
   }, []);
 
   useEffect(() => {
-    if (isDeleteAccountModalOpen && user?.email) {
+    if (isDeleteAccountModalOpen && profileEmail) {
       fetchAccountDeletionPreview();
     }
-  }, [isDeleteAccountModalOpen, user?.email]);
+  }, [isDeleteAccountModalOpen, profileEmail]);
 
   useEffect(() => {
     if (!isDeleteAccountModalOpen) {
@@ -680,9 +734,7 @@ export default function Settings() {
   }, [isDeleteAccountModalOpen, deletingAccount]);
 
   useEffect(() => {
-    const initialHandle =
-      (typeof user?.handle === "string" && user.handle.trim()) ||
-      deriveHandleFromEmail(user?.email);
+    const initialHandle = profileHandle;
     setSavedHandle(initialHandle);
     setHandleInput(initialHandle);
     setHandleMessage("");
@@ -696,9 +748,8 @@ export default function Settings() {
     setShowDeleteAccountDetails(false);
     setAccountDeletionPreview(null);
     setAccountDeletionError("");
-  }, [user?.email, user?.handle]);
+  }, [isRemoteWorkspace, profileEmail, profileHandle]);
 
-  const accountCreatedRaw = (user as { created_at?: string } | null)?.created_at || "";
   const accountCreatedValue = (() => {
     if (!accountCreatedRaw) return "";
     const parsedDate = new Date(accountCreatedRaw);
@@ -723,7 +774,7 @@ export default function Settings() {
   const normalizedDeleteConfirmEmail = deleteConfirmEmail.trim().toLowerCase();
   const expectedDeleteEmail =
     accountDeletionPreview?.confirmation_email?.trim().toLowerCase() ||
-    (typeof user?.email === "string" ? user.email.trim().toLowerCase() : "");
+    (profileEmail ? profileEmail.toLowerCase() : "");
   const deletePhraseMatches = deleteConfirmationText.trim().toUpperCase() === "DELETE";
   const deleteEmailMatches =
     !!expectedDeleteEmail && normalizedDeleteConfirmEmail === expectedDeleteEmail;
@@ -787,6 +838,10 @@ export default function Settings() {
     const focus = params.get("focus");
     if (location.pathname === "/settings/alerts" || params.get("tab") === "alerts") {
       setActiveTab("alerts");
+      return;
+    }
+    if (params.get("tab") === "workspace-access") {
+      setActiveTab("workspace-access");
       return;
     }
     if (focus === "openai") {
@@ -874,6 +929,8 @@ export default function Settings() {
               onSelectApiKeys={() => selectSettingsTab("api-keys")}
               onSelectAlerts={() => selectSettingsTab("alerts")}
               onSelectConnectivity={() => selectSettingsTab("connectivity")}
+              onSelectWorkspaceAccess={() => selectSettingsTab("workspace-access")}
+              showWorkspaceAccess={brand.features.workspaceAccessEnabled}
             />
           </div>
           <div className="hidden xl:block" />
@@ -911,6 +968,19 @@ export default function Settings() {
               </h2>
             </div>
 
+            {isRemoteWorkspace ? (
+              <div className="mb-6 rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4">
+                <p className="text-sm text-cyan-50">
+                  Viewing the remote workspace owner's account snapshot while connected as{" "}
+                  {operatorSessionLabel}.
+                </p>
+                <p className="mt-1 text-xs text-cyan-100/80">
+                  Profile edits and account deletion stay available only in the owner's direct
+                  session.
+                </p>
+              </div>
+            ) : null}
+
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
@@ -918,7 +988,7 @@ export default function Settings() {
                 </label>
                 <input
                   type="text"
-                  value={user?.google_user_data?.name || ""}
+                  value={profileName}
                   disabled
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
                 />
@@ -930,7 +1000,7 @@ export default function Settings() {
                 </label>
                 <input
                   type="email"
-                  value={user?.email || ""}
+                  value={profileEmail}
                   disabled
                   className="w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all disabled:opacity-50"
                 />
@@ -952,13 +1022,13 @@ export default function Settings() {
                       setHandleMessageType(null);
                     }}
                     placeholder={t("settings.handlePlaceholder")}
-                    disabled={handleSaving}
+                    disabled={handleSaving || isRemoteWorkspace}
                     className="w-full bg-transparent py-2.5 pr-4 text-gray-100 placeholder-gray-500 focus:outline-none disabled:opacity-50"
                   />
                 </div>
                 <button
                   type="submit"
-                  disabled={handleSaving || !isHandleDirty || !isHandleValid}
+                  disabled={isRemoteWorkspace || handleSaving || !isHandleDirty || !isHandleValid}
                   className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 font-medium text-white transition-colors hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500"
                 >
                   {handleSaving ? (
@@ -972,6 +1042,11 @@ export default function Settings() {
                 </button>
               </div>
               <p className="text-xs text-gray-500">{t("settings.handleHelp")}</p>
+              {isRemoteWorkspace ? (
+                <p className="text-xs text-cyan-200/80">
+                  Handle updates are disabled during remote workspace sessions.
+                </p>
+              ) : null}
               {handleMessage ? (
                 <p
                   className={`text-xs ${
@@ -1001,14 +1076,21 @@ export default function Settings() {
                   <p className="text-sm text-gray-400">
                     {t("settings.deleteAccount.inlineTitle")}
                   </p>
-                  <p className="mt-1 text-xs text-gray-500">
-                    {t("settings.deleteAccount.inlineHint")}
+                  <p
+                    className={`mt-1 text-xs ${
+                      isRemoteWorkspace ? "text-cyan-200/80" : "text-gray-500"
+                    }`}
+                  >
+                    {isRemoteWorkspace
+                      ? "Account deletion is unavailable inside a remote workspace session."
+                      : t("settings.deleteAccount.inlineHint")}
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={openDeleteAccountModal}
-                  className="inline-flex min-h-[36px] items-center justify-center self-start rounded-lg px-2 py-2 text-sm font-medium text-gray-500 transition-colors hover:text-rose-300 sm:self-auto"
+                  disabled={isRemoteWorkspace}
+                  className="inline-flex min-h-[36px] items-center justify-center self-start rounded-lg px-2 py-2 text-sm font-medium text-gray-500 transition-colors hover:text-rose-300 disabled:cursor-not-allowed disabled:text-gray-600 sm:self-auto"
                 >
                   {t("settings.deleteAccount.open")}
                 </button>
@@ -1308,8 +1390,14 @@ export default function Settings() {
               </div>
             ) : null}
           </div>
-          </div>
-        )}
+            </div>
+          )}
+
+          {activeTab === "workspace-access" && brand.features.workspaceAccessEnabled && (
+            <div className="mb-4 md:mb-6">
+              <WorkspaceAccessPanel />
+            </div>
+          )}
 
         {/* Connect EXE */}
         {activeTab === "connectivity" && (

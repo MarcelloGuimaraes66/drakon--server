@@ -10,6 +10,7 @@
 #include "../camera/PortalCounter.h"
 #include "../comm/TelegramNotifier.h"
 #include "../generated/Branding.h"
+#include "../orchestrator/ConfigUtils.h"
 
 
 #include <algorithm>
@@ -617,6 +618,641 @@ static std::string ensureDataUrlBase64_(const std::string& rawBase64OrDataUrl, c
     return "data:" + mimeType + ";base64," + sanitizeBase64_(rawBase64OrDataUrl);
 }
 
+struct DailyReportDatePartsJob_ {
+    std::string compactToken;
+    std::string dashedToken;
+    std::string year;
+    std::string month;
+    std::string day;
+    std::string localTimestampToken;
+    std::string localSampleLineTimestamp;
+    std::string sampleBucketToken;
+};
+
+static DailyReportDatePartsJob_ localDatePartsForJobDailyReport_()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    const unsigned sampleBucketMinute = static_cast<unsigned>((st.wMinute / 10) * 10);
+
+    char compact[16];
+    char dashed[16];
+    char year[8];
+    char month[4];
+    char day[4];
+    char localTs[32];
+    char lineTs[32];
+    char bucketTs[24];
+
+    std::snprintf(
+        compact,
+        sizeof(compact),
+        "%04u%02u%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(
+        dashed,
+        sizeof(dashed),
+        "%04u-%02u-%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(year, sizeof(year), "%04u", static_cast<unsigned>(st.wYear));
+    std::snprintf(month, sizeof(month), "%02u", static_cast<unsigned>(st.wMonth));
+    std::snprintf(day, sizeof(day), "%02u", static_cast<unsigned>(st.wDay));
+    std::snprintf(
+        localTs,
+        sizeof(localTs),
+        "%04u%02u%02u_%02u%02u%02u_%03u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned>(st.wMilliseconds)
+    );
+    std::snprintf(
+        lineTs,
+        sizeof(lineTs),
+        "%04u-%02u-%02u %02u:%02u:%02u.%03u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        static_cast<unsigned>(st.wMinute),
+        static_cast<unsigned>(st.wSecond),
+        static_cast<unsigned>(st.wMilliseconds)
+    );
+    std::snprintf(
+        bucketTs,
+        sizeof(bucketTs),
+        "%04u-%02u-%02u %02u:%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay),
+        static_cast<unsigned>(st.wHour),
+        sampleBucketMinute
+    );
+
+    return DailyReportDatePartsJob_{
+        std::string(compact),
+        std::string(dashed),
+        std::string(year),
+        std::string(month),
+        std::string(day),
+        std::string(localTs),
+        std::string(lineTs),
+        std::string(bucketTs)
+    };
+}
+
+static bool dailyReportJobsEnabled_()
+{
+    static const bool enabled = [] {
+        return chatv2::parseBoolValue(
+            chatv2::loadConfigValue("DAILY_REPORTS", { "daily_reports_enabled.txt" }),
+            false
+        );
+    }();
+    return enabled;
+}
+
+static std::string sanitizeDailyReportToken_(
+    const std::string& rawValue,
+    const std::string& fallback)
+{
+    const std::string trimmed = trimCopyRuntime_(rawValue);
+    const std::string source = trimmed.empty() ? fallback : trimmed;
+    const std::string safeFallback = fallback.empty() ? std::string("item") : fallback;
+
+    std::string out;
+    out.reserve(source.size());
+
+    bool prevSeparator = false;
+    for (unsigned char ch : source) {
+        const bool allowed =
+            std::isalnum(ch) ||
+            ch == '-' ||
+            ch == '_';
+
+        if (allowed) {
+            out.push_back(static_cast<char>(ch));
+            prevSeparator = false;
+            continue;
+        }
+
+        if (std::isspace(ch) || ch == '.' || ch == '/' || ch == '\\' || ch == ':') {
+            if (!prevSeparator && !out.empty()) {
+                out.push_back('_');
+                prevSeparator = true;
+            }
+        }
+    }
+
+    while (!out.empty() && (out.front() == '_' || out.front() == '-')) out.erase(out.begin());
+    while (!out.empty() && (out.back() == '_' || out.back() == '-')) out.pop_back();
+
+    if (!out.empty()) {
+        return out;
+    }
+
+    if (source != safeFallback) {
+        return sanitizeDailyReportToken_(safeFallback, "item");
+    }
+
+    return "item";
+}
+
+static std::string resolveDailyReportCameraName_(
+    const JobStartPayload& payload,
+    const JobStepDef& step,
+    int cameraId)
+{
+    std::string cameraName;
+
+    auto it = payload.camera_start_payload_by_id.find(cameraId);
+    if (it != payload.camera_start_payload_by_id.end()) {
+        try {
+            cameraName = trimCopyRuntime_(it->second.value("name", std::string()));
+        }
+        catch (...) {
+            cameraName.clear();
+        }
+    }
+
+    if (cameraName.empty()) {
+        for (const auto& target : step.targets) {
+            if (target.camera_id != cameraId) continue;
+            cameraName = trimCopyRuntime_(target.camera_name);
+            if (!cameraName.empty()) break;
+        }
+    }
+
+    if (!cameraName.empty()) {
+        return cameraName;
+    }
+
+    return "camera_" + std::to_string(cameraId > 0 ? cameraId : 0);
+}
+
+static std::string dailyReportAgentToken_(const JobAgentDef& agent)
+{
+    if (!trimCopyRuntime_(agent.agent_key).empty()) {
+        return sanitizeDailyReportToken_(agent.agent_key, "agent");
+    }
+    if (agent.id > 0) {
+        return "agent_" + std::to_string(agent.id);
+    }
+    return "agent";
+}
+
+static fs::path buildDailyReportCameraDirJob_(
+    int cameraId,
+    const DailyReportDatePartsJob_& dateParts)
+{
+    fs::path dir("C:\\daily_reports");
+    dir /= dateParts.year;
+    dir /= dateParts.month;
+    dir /= dateParts.day;
+    dir /= "camera_" + std::to_string(cameraId > 0 ? cameraId : 0);
+    return dir;
+}
+
+static fs::path buildDailyReportStepDirJob_(
+    const JobStartPayload& payload,
+    const JobStepDef& step,
+    int cameraId,
+    const DailyReportDatePartsJob_& dateParts)
+{
+    fs::path dir = buildDailyReportCameraDirJob_(cameraId, dateParts);
+    dir /=
+        "job_" + std::to_string(payload.job.id > 0 ? payload.job.id : 0) +
+        "__" + sanitizeDailyReportToken_(payload.job.name, "job");
+    dir /=
+        "step_" + std::to_string(step.id > 0 ? step.id : 0) +
+        "__" + sanitizeDailyReportToken_(step.name, "step");
+    return dir;
+}
+
+static bool writeDailyReportBytesAtomic_(
+    const std::string& logKey,
+    const fs::path& finalPath,
+    const std::vector<unsigned char>& bytes,
+    const std::string& context)
+{
+    try {
+        if (bytes.empty()) return false;
+
+        std::error_code ec;
+        fs::create_directories(finalPath.parent_path(), ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                logKey,
+                context + ": create_directories failed: " + ec.message() +
+                " dir=" + finalPath.parent_path().string()
+            );
+            return false;
+        }
+
+        fs::path tmpPath = finalPath;
+        tmpPath += ".tmp";
+
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    logKey,
+                    context + ": failed opening temp path: " + tmpPath.string()
+                );
+                return false;
+            }
+            ofs.write(
+                reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size())
+            );
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    logKey,
+                    context + ": failed writing temp path: " + tmpPath.string()
+                );
+                ofs.close();
+                fs::remove(tmpPath, ec);
+                return false;
+            }
+        }
+
+        bool moved = false;
+#ifdef _WIN32
+        const std::wstring tmpWide = utf8ToWide(tmpPath.string());
+        const std::wstring finalWide = utf8ToWide(finalPath.string());
+        if (MoveFileExW(
+                tmpWide.c_str(),
+                finalWide.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+        {
+            moved = true;
+        }
+        else {
+            const DWORD moveErr = GetLastError();
+            Logger::instance().logDebug(
+                logKey,
+                context + ": MoveFileExW failed: " + std::to_string(static_cast<unsigned long>(moveErr)) +
+                " tmp=" + tmpPath.string() + " final=" + finalPath.string()
+            );
+        }
+#else
+        fs::rename(tmpPath, finalPath, ec);
+        moved = !ec;
+#endif
+        if (!moved) {
+            fs::remove(tmpPath, ec);
+            return false;
+        }
+
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            logKey,
+            context + ": exception writing file: " + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            logKey,
+            context + ": unknown exception writing file"
+        );
+    }
+
+    return false;
+}
+
+static bool writeDailyReportTextAtomic_(
+    const std::string& logKey,
+    const fs::path& finalPath,
+    const std::string& text,
+    const std::string& context)
+{
+    const std::vector<unsigned char> bytes(text.begin(), text.end());
+    return writeDailyReportBytesAtomic_(logKey, finalPath, bytes, context);
+}
+
+static bool appendDailyReportSampleLineIfMissingBucket_(
+    const std::string& logKey,
+    const fs::path& filePath,
+    const std::string& bucketToken,
+    const std::string& line)
+{
+    static std::mutex appendMu;
+    const std::string marker = "[bucket=" + bucketToken + "]";
+
+    try {
+        std::lock_guard<std::mutex> lock(appendMu);
+
+        std::error_code ec;
+        fs::create_directories(filePath.parent_path(), ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                logKey,
+                "daily_reports: failed to create sample directory: " + ec.message() +
+                " dir=" + filePath.parent_path().string()
+            );
+            return false;
+        }
+
+        {
+            std::ifstream existing(filePath, std::ios::binary);
+            if (existing) {
+                std::string contents(
+                    (std::istreambuf_iterator<char>(existing)),
+                    std::istreambuf_iterator<char>()
+                );
+                if (contents.find(marker) != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+
+        std::ofstream ofs(filePath, std::ios::app | std::ios::binary);
+        if (!ofs) {
+            Logger::instance().logDebug(
+                logKey,
+                "daily_reports: failed opening sample file: " + filePath.string()
+            );
+            return false;
+        }
+
+        ofs << line;
+        if (line.empty() || line.back() != '\n') {
+            ofs << '\n';
+        }
+
+        if (!ofs) {
+            Logger::instance().logDebug(
+                logKey,
+                "daily_reports: failed appending sample file: " + filePath.string()
+            );
+            return false;
+        }
+
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            logKey,
+            std::string("daily_reports: exception appending sample file: ") + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            logKey,
+            "daily_reports: unknown exception appending sample file"
+        );
+    }
+
+    return false;
+}
+
+static void stripInlineMediaForDailyReportJson_(json& node)
+{
+    if (node.is_object()) {
+        node.erase("image_jpeg_b64");
+        node.erase("frame_jpeg_base64");
+        node.erase("temp_clip_cleanup_paths");
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            stripInlineMediaForDailyReportJson_(it.value());
+        }
+        return;
+    }
+
+    if (node.is_array()) {
+        for (auto& item : node) {
+            stripInlineMediaForDailyReportJson_(item);
+        }
+    }
+}
+
+static std::string bestDailyReportImageDataUrlFromJson_(const json& node)
+{
+    if (!node.is_object()) return "";
+
+    if (node.contains("image_jpeg_b64") && node["image_jpeg_b64"].is_string()) {
+        const std::string value = ensureDataUrlBase64_(node["image_jpeg_b64"].get<std::string>(), "image/jpeg");
+        if (!value.empty()) return value;
+    }
+
+    if (node.contains("frame_jpeg_base64") && node["frame_jpeg_base64"].is_string()) {
+        const std::string value = ensureDataUrlBase64_(node["frame_jpeg_base64"].get<std::string>(), "image/jpeg");
+        if (!value.empty()) return value;
+    }
+
+    if (node.contains("group_images") && node["group_images"].is_array()) {
+        for (const auto& item : node["group_images"]) {
+            if (!item.is_object()) continue;
+            if (item.contains("is_offline_placeholder") &&
+                item["is_offline_placeholder"].is_boolean() &&
+                item["is_offline_placeholder"].get<bool>())
+            {
+                continue;
+            }
+
+            if (item.contains("image_jpeg_b64") && item["image_jpeg_b64"].is_string()) {
+                const std::string value = ensureDataUrlBase64_(item["image_jpeg_b64"].get<std::string>(), "image/jpeg");
+                if (!value.empty()) return value;
+            }
+            if (item.contains("frame_jpeg_base64") && item["frame_jpeg_base64"].is_string()) {
+                const std::string value = ensureDataUrlBase64_(item["frame_jpeg_base64"].get<std::string>(), "image/jpeg");
+                if (!value.empty()) return value;
+            }
+        }
+    }
+
+    return "";
+}
+
+static bool writeDailyReportImageFromDataUrl_(
+    const std::string& logKey,
+    const fs::path& finalPath,
+    const std::string& rawBase64OrDataUrl,
+    const std::string& context)
+{
+    if (rawBase64OrDataUrl.empty()) return false;
+
+    std::vector<unsigned char> bytes;
+    std::string err;
+    if (!decodeBase64ToBytes_(rawBase64OrDataUrl, bytes, &err) || bytes.empty()) {
+        Logger::instance().logDebug(
+            logKey,
+            context + ": failed decoding image data for daily report: " + err
+        );
+        return false;
+    }
+
+    return writeDailyReportBytesAtomic_(logKey, finalPath, bytes, context);
+}
+
+static std::string singleLineDailyReportText_(const std::string& rawValue)
+{
+    std::string out;
+    out.reserve(rawValue.size());
+
+    bool prevSpace = false;
+    for (unsigned char ch : rawValue) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            if (!prevSpace && !out.empty()) {
+                out.push_back(' ');
+                prevSpace = true;
+            }
+            continue;
+        }
+
+        if (std::isspace(ch)) {
+            if (!prevSpace && !out.empty()) {
+                out.push_back(' ');
+                prevSpace = true;
+            }
+            continue;
+        }
+
+        out.push_back(static_cast<char>(ch));
+        prevSpace = false;
+    }
+
+    return trimCopyRuntime_(out);
+}
+
+static void persistDailyReportExecutionArtifacts_(
+    AgentCore* owner,
+    const JobStartPayload& payload,
+    const JobStepDef& step,
+    int cameraId,
+    const JobAgentDef& agent,
+    const std::string& inferenceOutput,
+    const std::string& fallbackImageDataUrl,
+    bool allowSampleAppend)
+{
+    if (!dailyReportJobsEnabled_() || inferenceOutput.empty()) {
+        return;
+    }
+
+    json parsed;
+    try {
+        parsed = json::parse(inferenceOutput);
+    }
+    catch (...) {
+        return;
+    }
+
+    if (!parsed.is_object()) {
+        return;
+    }
+
+    const DailyReportDatePartsJob_ dateParts = localDatePartsForJobDailyReport_();
+    const std::string logKey = cameraId > 0 ? std::to_string(cameraId) : std::string("job");
+    const std::string cameraName = resolveDailyReportCameraName_(payload, step, cameraId);
+    const std::string agentToken = dailyReportAgentToken_(agent);
+    const fs::path stepDir = buildDailyReportStepDirJob_(payload, step, cameraId, dateParts);
+
+    std::string executionImageDataUrl = bestDailyReportImageDataUrlFromJson_(parsed);
+    if (executionImageDataUrl.empty() && !fallbackImageDataUrl.empty()) {
+        executionImageDataUrl = ensureDataUrlBase64_(fallbackImageDataUrl, "image/jpeg");
+    }
+    if (executionImageDataUrl.empty() && owner) {
+        if (CameraSession* session = owner->getCameraSession(cameraId)) {
+            executionImageDataUrl = ensureDataUrlBase64_(session->getLastJobStillJpegBase64(), "image/jpeg");
+        }
+    }
+
+    const fs::path imagePath = stepDir / ("execution_latest__agent_" + agentToken + ".jpg");
+    if (!executionImageDataUrl.empty()) {
+        (void)writeDailyReportImageFromDataUrl_(
+            logKey,
+            imagePath,
+            executionImageDataUrl,
+            "daily_reports: write execution image"
+        );
+    }
+
+    json metadata = parsed;
+    stripInlineMediaForDailyReportJson_(metadata);
+    metadata["daily_report_type"] = "job_execution";
+    metadata["camera_id"] = cameraId;
+    metadata["camera_name"] = cameraName;
+    metadata["job_id"] = payload.job.id;
+    metadata["job_name"] = payload.job.name;
+    if (!payload.job_run_id.empty()) {
+        metadata["job_run_id"] = payload.job_run_id;
+    }
+    metadata["step_id"] = step.id;
+    metadata["step_name"] = step.name;
+    metadata["step_order"] = step.step_order;
+    if (!step.step_run_id.empty()) {
+        metadata["step_run_id"] = step.step_run_id;
+    }
+    metadata["agent_id"] = agent.id;
+    metadata["agent_key"] = agent.agent_key;
+    if (!agent.agent_run_id.empty()) {
+        metadata["agent_run_id"] = agent.agent_run_id;
+    }
+    metadata["daily_report_generated_local"] = dateParts.localSampleLineTimestamp;
+    if (!executionImageDataUrl.empty()) {
+        metadata["execution_image_file"] = imagePath.filename().string();
+    }
+
+    const fs::path metadataPath = stepDir / ("execution_latest__agent_" + agentToken + ".json");
+    (void)writeDailyReportTextAtomic_(
+        logKey,
+        metadataPath,
+        metadata.dump(2),
+        "daily_reports: write execution metadata"
+    );
+
+    const std::string provider = trimCopyRuntime_(parsed.value("provider", std::string()));
+    const std::string executionBackend = trimCopyRuntime_(parsed.value("execution_backend", std::string()));
+    const std::string decisionSource = trimCopyRuntime_(parsed.value("decision_source", std::string()));
+    const std::string answer = trimCopyRuntime_(parsed.value("answer", std::string()));
+
+    if (!allowSampleAppend ||
+        answer.empty() ||
+        provider == "native" ||
+        executionBackend == "opencv_portal_counter" ||
+        decisionSource == "temporal_engine")
+    {
+        return;
+    }
+
+    const fs::path samplePath = stepDir / ("llm_samples__agent_" + agentToken + ".txt");
+    std::ostringstream line;
+    line
+        << "[bucket=" << dateParts.sampleBucketToken << "] "
+        << "ts_local=" << dateParts.localSampleLineTimestamp
+        << " camera_id=" << cameraId
+        << " camera_name=\"" << singleLineDailyReportText_(cameraName) << "\""
+        << " job_id=" << payload.job.id
+        << " step_id=" << step.id
+        << " agent_key=\"" << singleLineDailyReportText_(agent.agent_key) << "\"";
+
+    if (!provider.empty()) {
+        line << " provider=" << provider;
+    }
+    if (parsed.contains("model") && parsed["model"].is_string()) {
+        line << " model=\"" << singleLineDailyReportText_(parsed["model"].get<std::string>()) << "\"";
+    }
+    line << " answer=\"" << singleLineDailyReportText_(answer) << "\"";
+
+    (void)appendDailyReportSampleLineIfMissingBucket_(
+        logKey,
+        samplePath,
+        dateParts.sampleBucketToken,
+        line.str()
+    );
+}
+
 static std::vector<FaceReferenceImage> resolveFaceReferenceImagesForJob_(
     AgentCore* owner,
     const std::vector<JobFaceTarget>& faceTargets)
@@ -947,8 +1583,6 @@ static bool allowTelegramAlert_(
     s.cooldownUntil = now + cooldown;
     return false;
 }
-
-
 
 static std::optional<std::string> getNewestImageInDir(const fs::path& dir)
 {
@@ -1944,7 +2578,10 @@ static int normalizeCoreRunningResolution_(int runningResolution) {
 }
 
 static int normalizeRunEverySeconds_(int seconds) {
-    return (seconds <= 10) ? 10 : 60;
+    if (seconds <= 10) return 10;
+    if (seconds == 300) return 300;
+    if (seconds == 600) return 600;
+    return 60;
 }
 
 static bool parseCoverageTimePoint_(const std::string& rawIsoUtc, std::chrono::system_clock::time_point& out) {
@@ -6358,6 +6995,22 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
 
                                     const std::string one = r.dump();
 
+                                    std::string fallbackImageDataUrl;
+                                    auto liveImageIt = jpegByCam.find(camId);
+                                    if (liveImageIt != jpegByCam.end()) {
+                                        fallbackImageDataUrl = liveImageIt->second;
+                                    }
+                                    persistDailyReportExecutionArtifacts_(
+                                        owner_,
+                                        job->payload,
+                                        step,
+                                        camId,
+                                        virtAgent,
+                                        one,
+                                        fallbackImageDataUrl,
+                                        true
+                                    );
+
                                     {
                                         std::lock_guard<std::mutex> lk(job->outputsMu);
                                         StepOutput& so = job->outputs[step.id];
@@ -6573,6 +7226,47 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                                             }
                                         }
 
+                                        if (normResults.is_array()) {
+                                            for (const auto& item : normResults) {
+                                                if (!item.is_object()) continue;
+
+                                                const int alertCamId = item.value("camera_id", -1);
+                                                if (alertCamId <= 0) continue;
+                                                if (!item.value("alert_condition", false)) continue;
+
+                                                json localAlert = item;
+                                                if ((!localAlert.contains("image_jpeg_b64") ||
+                                                     !localAlert["image_jpeg_b64"].is_string() ||
+                                                     trimCopyRuntime_(localAlert["image_jpeg_b64"].get<std::string>()).empty()))
+                                                {
+                                                    auto imgIt = jpegByCam.find(alertCamId);
+                                                    if (imgIt != jpegByCam.end() && !imgIt->second.empty()) {
+                                                        localAlert["image_jpeg_b64"] = imgIt->second;
+                                                    }
+                                                }
+
+                                                if ((!localAlert.contains("camera_name") ||
+                                                     !localAlert["camera_name"].is_string() ||
+                                                     trimCopyRuntime_(localAlert["camera_name"].get<std::string>()).empty()))
+                                                {
+                                                    const std::string localCameraName = cameraNameById(alertCamId);
+                                                    if (!localCameraName.empty()) {
+                                                        localAlert["camera_name"] = localCameraName;
+                                                    }
+                                                }
+
+                                                maybeFireAlerts_(
+                                                    job->payload,
+                                                    step,
+                                                    alertCamId,
+                                                    virtAgent,
+                                                    localAlert.dump(),
+                                                    true
+                                                );
+                                            }
+                                        }
+
+                                        groupAlert["daily_report_skip_local_alert_artifacts"] = true;
                                         maybeFireAlerts_(job->payload, step, primaryCameraId, virtAgent, groupAlert.dump());
                                     }
                                 }
@@ -6871,6 +7565,16 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                             }
 
                             maybeFireAlerts_(job->payload, step, cameraId, *agent, completedOutput);
+                            persistDailyReportExecutionArtifacts_(
+                                owner_,
+                                job->payload,
+                                step,
+                                cameraId,
+                                *agent,
+                                completedOutput,
+                                std::string(),
+                                true
+                            );
 
                             try {
                                 if (isLikelyJson_(completedOutput)) {
@@ -13819,11 +14523,13 @@ void JobRuntime::maybeFireAlerts_(
     const JobStepDef& step,
     int cameraId,
     const JobAgentDef& agent,
-    const std::string& inferenceOutput
+    const std::string& inferenceOutput,
+    bool suppressDelivery
 )
 {
     if (inferenceOutput.empty() || !isLikelyJson_(inferenceOutput)) return;
 
+    json parsedOutput = json::object();
     bool shouldAlert = false;
     std::string clipPath;
     std::string answer;
@@ -13859,7 +14565,8 @@ void JobRuntime::maybeFireAlerts_(
     json temporalOperatorResults = json::array();
 
     try {
-        json j = json::parse(inferenceOutput);
+        parsedOutput = json::parse(inferenceOutput);
+        const json& j = parsedOutput;
         shouldAlert = j.value("alert_condition", false);
         clipPath = j.value("clip_path", "");
         answer = j.value("answer", "");
@@ -13980,68 +14687,6 @@ void JobRuntime::maybeFireAlerts_(
         "|agent:" + agent.agent_key;
     if (!groupId.empty()) {
         limiterKey += "|group:" + groupId;
-    }
-
-    
-    // allow 1, then pause 45s
-    if (!allowTelegramAlert_(limiterKey, /*burstMax*/ 1, std::chrono::seconds(60))) {
-        // IMPORTANT: we return before copying clip, so no extra temp files,
-        // and the caller will still delete the original .processing clip after this.
-        return;
-    }
-    
-    std::filesystem::path preparedClipPath;
-    bool preparedClipOwned = false;
-    bool preparedClipAvailable = false;
-    std::string preparedClipError;
-    AgentCore::JobAlertVideoUploadResult uploadedVideo;
-
-    if (!existingVideoKey.empty()) {
-        uploadedVideo.ok = true;
-        uploadedVideo.videoKey = existingVideoKey;
-        uploadedVideo.videoUrl = existingVideoUrl;
-    }
-    else if (!clipPath.empty()) {
-        std::error_code ec;
-        const std::filesystem::path src(clipPath);
-
-        if (std::filesystem::exists(src, ec) && !ec) {
-            preparedClipPath = makeTelegramUploadCopyPath_(cameraId);
-
-            std::string err;
-            (void)transcodeToWebMp4_(src, preparedClipPath, &err);
-
-            std::error_code preparedEc;
-            preparedClipAvailable = std::filesystem::exists(preparedClipPath, preparedEc) && !preparedEc;
-            if (preparedClipAvailable) {
-                preparedClipOwned = true;
-            }
-            else {
-                preparedClipPath.clear();
-                preparedClipError = err.empty() ? "failed to prepare compatible alert clip" : err;
-                Logger::instance().logDebug("job", "Failed to prepare alert clip: " + preparedClipError);
-            }
-
-            if (owner_) {
-                const std::string uploadSourcePath =
-                    preparedClipAvailable ? preparedClipPath.string() : src.string();
-                uploadedVideo = owner_->uploadJobAlertVideo(cameraId, payload.job.id, step.id, uploadSourcePath);
-                if (!uploadedVideo.ok) {
-                    const std::string uploadState = uploadedVideo.skippedByBudget ? "skipped_by_budget" : "failed";
-                    Logger::instance().logDebug(
-                        "job",
-                        "Job alert video upload " + uploadState +
-                        " cam=" + std::to_string(cameraId) +
-                        " job=" + std::to_string(payload.job.id) +
-                        " step=" + std::to_string(step.id) +
-                        " err=" + uploadedVideo.error
-                    );
-                }
-            }
-        }
-        else {
-            preparedClipError = "clip path does not exist: " + clipPath;
-        }
     }
 
     std::string imageDataUrl = ensureDataUrlBase64_(imageJpegB64, "image/jpeg");
@@ -14172,6 +14817,159 @@ void JobRuntime::maybeFireAlerts_(
             : (nativePortalAlert
                    ? "opencv_portal_counter"
                    : openAIModelNameForInferenceModel_(normalizedAlertInferenceModel));
+    const bool skipLocalAlertArtifacts =
+        parsedOutput.contains("daily_report_skip_local_alert_artifacts") &&
+        parsedOutput["daily_report_skip_local_alert_artifacts"].is_boolean() &&
+        parsedOutput["daily_report_skip_local_alert_artifacts"].get<bool>();
+
+    if (!skipLocalAlertArtifacts && dailyReportJobsEnabled_()) {
+        const DailyReportDatePartsJob_ dateParts = localDatePartsForJobDailyReport_();
+        const std::string logKey = cameraId > 0 ? std::to_string(cameraId) : std::string("job");
+        const fs::path stepDir = buildDailyReportStepDirJob_(payload, step, cameraId, dateParts);
+        const fs::path alertDir =
+            stepDir /
+            "alerts" /
+            ("alert_" + dateParts.localTimestampToken + "__agent_" + dailyReportAgentToken_(agent));
+
+        std::error_code alertDirEc;
+        fs::create_directories(alertDir, alertDirEc);
+        if (alertDirEc) {
+            Logger::instance().logDebug(
+                logKey,
+                "daily_reports: failed to create alert directory: " + alertDirEc.message() +
+                " dir=" + alertDir.string()
+            );
+        }
+
+        json alertMetadata = parsedOutput;
+        stripInlineMediaForDailyReportJson_(alertMetadata);
+        alertMetadata.erase("daily_report_skip_local_alert_artifacts");
+        alertMetadata["daily_report_type"] = "job_alert";
+        alertMetadata["camera_id"] = cameraId;
+        alertMetadata["camera_name"] = cameraName;
+        alertMetadata["job_id"] = payload.job.id;
+        alertMetadata["job_name"] = payload.job.name;
+        if (!payload.job_run_id.empty()) {
+            alertMetadata["job_run_id"] = payload.job_run_id;
+        }
+        alertMetadata["step_id"] = step.id;
+        alertMetadata["step_name"] = step.name;
+        alertMetadata["step_order"] = step.step_order;
+        if (!step.step_run_id.empty()) {
+            alertMetadata["step_run_id"] = step.step_run_id;
+        }
+        alertMetadata["agent_id"] = agent.id;
+        alertMetadata["agent_key"] = agent.agent_key;
+        if (!agent.agent_run_id.empty()) {
+            alertMetadata["agent_run_id"] = agent.agent_run_id;
+        }
+        if (!cameraSessionId.empty()) {
+            alertMetadata["camera_session_id"] = cameraSessionId;
+        }
+        alertMetadata["provider"] = alertProvider;
+        alertMetadata["model"] = alertModel;
+        alertMetadata["inference_model"] = normalizedAlertInferenceModel;
+        alertMetadata["answer"] = answer;
+        alertMetadata["daily_report_generated_local"] = dateParts.localSampleLineTimestamp;
+
+        bool alertMediaSaved = false;
+        if (!clipPath.empty()) {
+            const fs::path alertVideoPath = alertDir / "alert.mp4";
+            std::string videoErr;
+            if (transcodeToWebMp4_(fs::path(clipPath), alertVideoPath, &videoErr)) {
+                alertMediaSaved = true;
+                alertMetadata["alert_media_type"] = "video";
+                alertMetadata["alert_media_file"] = alertVideoPath.filename().string();
+            }
+            else if (!videoErr.empty()) {
+                alertMetadata["alert_media_error"] = videoErr;
+            }
+        }
+
+        if (!alertMediaSaved && !imageDataUrl.empty()) {
+            const fs::path alertImagePath = alertDir / "alert.jpg";
+            if (writeDailyReportImageFromDataUrl_(
+                    logKey,
+                    alertImagePath,
+                    imageDataUrl,
+                    "daily_reports: write alert image"))
+            {
+                alertMediaSaved = true;
+                alertMetadata["alert_media_type"] = "image";
+                alertMetadata["alert_media_file"] = alertImagePath.filename().string();
+            }
+        }
+
+        (void)writeDailyReportTextAtomic_(
+            logKey,
+            alertDir / "metadata.json",
+            alertMetadata.dump(2),
+            "daily_reports: write alert metadata"
+        );
+    }
+
+    if (suppressDelivery) {
+        return;
+    }
+
+    // allow 1, then pause 60s for external delivery
+    if (!allowTelegramAlert_(limiterKey, /*burstMax*/ 1, std::chrono::seconds(60))) {
+        return;
+    }
+
+    std::filesystem::path preparedClipPath;
+    bool preparedClipOwned = false;
+    bool preparedClipAvailable = false;
+    std::string preparedClipError;
+    AgentCore::JobAlertVideoUploadResult uploadedVideo;
+
+    if (!existingVideoKey.empty()) {
+        uploadedVideo.ok = true;
+        uploadedVideo.videoKey = existingVideoKey;
+        uploadedVideo.videoUrl = existingVideoUrl;
+    }
+    else if (!clipPath.empty()) {
+        std::error_code ec;
+        const std::filesystem::path src(clipPath);
+
+        if (std::filesystem::exists(src, ec) && !ec) {
+            preparedClipPath = makeTelegramUploadCopyPath_(cameraId);
+
+            std::string err;
+            (void)transcodeToWebMp4_(src, preparedClipPath, &err);
+
+            std::error_code preparedEc;
+            preparedClipAvailable = std::filesystem::exists(preparedClipPath, preparedEc) && !preparedEc;
+            if (preparedClipAvailable) {
+                preparedClipOwned = true;
+            }
+            else {
+                preparedClipPath.clear();
+                preparedClipError = err.empty() ? "failed to prepare compatible alert clip" : err;
+                Logger::instance().logDebug("job", "Failed to prepare alert clip: " + preparedClipError);
+            }
+
+            if (owner_) {
+                const std::string uploadSourcePath =
+                    preparedClipAvailable ? preparedClipPath.string() : src.string();
+                uploadedVideo = owner_->uploadJobAlertVideo(cameraId, payload.job.id, step.id, uploadSourcePath);
+                if (!uploadedVideo.ok) {
+                    const std::string uploadState = uploadedVideo.skippedByBudget ? "skipped_by_budget" : "failed";
+                    Logger::instance().logDebug(
+                        "job",
+                        "Job alert video upload " + uploadState +
+                        " cam=" + std::to_string(cameraId) +
+                        " job=" + std::to_string(payload.job.id) +
+                        " step=" + std::to_string(step.id) +
+                        " err=" + uploadedVideo.error
+                    );
+                }
+            }
+        }
+        else {
+            preparedClipError = "clip path does not exist: " + clipPath;
+        }
+    }
 
     auto buildAlertDetails = [&](bool includeInlineImages) {
         json details = {

@@ -5,7 +5,6 @@ import path from "path";
 import { webcrypto } from "node:crypto";
 import { Pool } from "pg";
 import { WebSocketServer } from "ws";
-import worker from "../src/worker/index";
 import {
   resolveActiveBrandRuntime,
   resolveDatabaseBackend,
@@ -19,6 +18,11 @@ import {
   routeSharedFindRelayClientMessage,
   unregisterSharedFindRelayConnection,
 } from "../src/worker/sharedFindRelayState";
+import {
+  registerWorkspaceRelayConnection,
+  routeWorkspaceRelayClientMessage,
+  unregisterWorkspaceRelayConnection,
+} from "../src/worker/workspaceRelayState";
 
 if (!(globalThis as any).crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -87,6 +91,7 @@ async function createDatabase() {
 }
 
 async function startServer() {
+  const { default: worker } = await import("../src/worker/index");
   const DB = await createDatabase();
   const centralAuthPublicKey = resolveSecretValue(
     process.env.CENTRAL_AUTH_PUBLIC_KEY,
@@ -122,6 +127,7 @@ async function startServer() {
     CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };
   const relayWss = new WebSocketServer({ noServer: true });
+  const workspaceRelayWss = new WebSocketServer({ noServer: true });
 
   const server = createServer(async (req, res) => {
     if (!req.url) {
@@ -250,6 +256,63 @@ async function startServer() {
     });
   });
 
+  workspaceRelayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerWorkspaceRelayConnection(token, ws as any);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload: unknown = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeWorkspaceRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterWorkspaceRelayConnection(publicId, ws as any);
+    });
+  });
+
   server.on("upgrade", (req, socket, head) => {
     if (!req.url) {
       socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -258,15 +321,25 @@ async function startServer() {
     }
 
     const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (requestUrl.pathname === "/ws/find-relay") {
+      relayWss.handleUpgrade(req, socket, head, (ws) => {
+        relayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    if (requestUrl.pathname === "/ws/workspace-relay") {
+      workspaceRelayWss.handleUpgrade(req, socket, head, (ws) => {
+        workspaceRelayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
     if (requestUrl.pathname !== "/ws/find-relay") {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       socket.destroy();
       return;
     }
-
-    relayWss.handleUpgrade(req, socket, head, (ws) => {
-      relayWss.emit("connection", ws, req);
-    });
   });
 
   server.listen(port, () => {

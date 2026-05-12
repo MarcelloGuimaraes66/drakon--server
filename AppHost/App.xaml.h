@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "winrt/Microsoft.UI.Xaml.h"
 #include "XamlMetaDataProvider.h"
@@ -29,6 +30,10 @@ namespace DrakonDesktop::platform
         winrt::hstring const& exeToken,
         winrt::hstring const& timezoneIana);
     DesktopShellRequestResult ScheduleLocalAppDataCleanupAfterAccountDeletionFromWeb(bool clearStorageRoot);
+    DesktopShellRequestResult OpenRemoteWorkspaceWindowFromWeb(
+        winrt::hstring const& sessionId,
+        winrt::hstring const& ownerDisplayLabel,
+        winrt::hstring const& operatorDisplayLabel);
     bool IsRuntimeAlreadyProvisioned();
 }
 
@@ -44,6 +49,10 @@ namespace winrt::DrakonDesktop::implementation
         winrt::Microsoft::UI::Xaml::Markup::IXamlType GetXamlType(winrt::hstring const& fullName);
         winrt::com_array<winrt::Microsoft::UI::Xaml::Markup::XmlnsDefinition> GetXmlnsDefinitions();
         void OnLaunched(Microsoft::UI::Xaml::LaunchActivatedEventArgs const&);
+        ::DrakonDesktop::platform::DesktopShellRequestResult OpenRemoteWorkspaceWindow(
+            winrt::hstring const& sessionId,
+            winrt::hstring const& ownerDisplayLabel,
+            winrt::hstring const& operatorDisplayLabel);
 
     private:
         winrt::com_ptr<XamlMetaDataProvider> AppProvider();
@@ -51,6 +60,7 @@ namespace winrt::DrakonDesktop::implementation
         bool m_resourcesInitialized{ false };
         winrt::com_ptr<XamlMetaDataProvider> m_appProvider;
         winrt::Microsoft::UI::Xaml::Window m_window{ nullptr };
+        std::vector<winrt::Microsoft::UI::Xaml::Window> m_auxWindows;
         std::unique_ptr<::DrakonDesktop::platform::LocalBackendHost> m_backendHost;
         std::unique_ptr<::DrakonDesktop::platform::PerceptrumRuntimeHost> m_runtimeHost;
         std::unique_ptr<::DrakonDesktop::platform::TrayIconHost> m_trayIconHost;

@@ -7,6 +7,7 @@ import {
   ShieldAlert,
   AlertTriangle,
   WifiOff,
+  Wifi,
   CirclePlay,
   Cpu,
   Clock3,
@@ -124,6 +125,9 @@ export default function NotificationsDropdown({
     if (type === "camera_connection_failed") {
       return <WifiOff className="w-5 h-5 text-orange-300" />;
     }
+    if (type === "camera_online") {
+      return <Wifi className="w-5 h-5 text-emerald-300" />;
+    }
     if (type === "job_staled") {
       return <AlertTriangle className="w-5 h-5 text-amber-400" />;
     }
@@ -145,6 +149,7 @@ export default function NotificationsDropdown({
   const getNotificationRowClass = (type: string) => {
     if (type === "ai_detection") return "bg-red-500/5";
     if (type === "camera_connection_failed") return "bg-orange-500/5";
+    if (type === "camera_online") return "bg-emerald-500/5";
     if (type === "job_staled" || type === "job_start_blocked") return "bg-amber-500/5";
     if (type === "job_started") return "bg-emerald-500/5";
     if (type === "agent_api_error") return "bg-rose-500/5";
@@ -165,6 +170,12 @@ export default function NotificationsDropdown({
       return {
         label: "Camera",
         className: "bg-orange-500/20 text-orange-300",
+      };
+    }
+    if (type === "camera_online") {
+      return {
+        label: "Camera",
+        className: "bg-emerald-500/20 text-emerald-300",
       };
     }
     if (
@@ -199,7 +210,10 @@ export default function NotificationsDropdown({
     if (notification.type === "ai_detection" && notification.event_id) {
       return `/events?type=detection&eventId=${notification.event_id}`;
     }
-    if (notification.type === "camera_connection_failed") {
+    if (
+      notification.type === "camera_connection_failed" ||
+      notification.type === "camera_online"
+    ) {
       return "/cameras";
     }
     if (

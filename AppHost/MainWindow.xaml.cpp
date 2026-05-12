@@ -6,6 +6,7 @@
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Windows.UI.h>
 #include <algorithm>
+#include <vector>
 #if __has_include("MainWindow.g.cpp")
 #include "MainWindow.g.cpp"
 #endif
@@ -18,7 +19,7 @@ using namespace Windows::UI;
 
 namespace
 {
-    winrt::DrakonDesktop::implementation::MainWindow* g_activeMainWindow = nullptr;
+    std::vector<winrt::DrakonDesktop::implementation::MainWindow*> g_mainWindows;
 
     Color MakeColor(std::uint8_t a, std::uint8_t r, std::uint8_t g, std::uint8_t b)
     {
@@ -39,8 +40,14 @@ namespace
 namespace winrt::DrakonDesktop::implementation
 {
     MainWindow::MainWindow()
+        : MainWindow(winrt::hstring{})
     {
-        g_activeMainWindow = this;
+    }
+
+    MainWindow::MainWindow(winrt::hstring const& initialNavigationUrl)
+    {
+        m_initialNavigationUrl = initialNavigationUrl;
+        g_mainWindows.push_back(this);
         AppendBootstrapTrace("window: ctor");
         try
         {
@@ -55,10 +62,9 @@ namespace winrt::DrakonDesktop::implementation
 
     MainWindow::~MainWindow()
     {
-        if (g_activeMainWindow == this)
-        {
-            g_activeMainWindow = nullptr;
-        }
+        g_mainWindows.erase(
+            std::remove(g_mainWindows.begin(), g_mainWindows.end(), this),
+            g_mainWindows.end());
     }
 
     void MainWindow::InitializeComponent()
@@ -75,7 +81,12 @@ namespace winrt::DrakonDesktop::implementation
             Windows::Foundation::Uri{ L"ms-appx:///MainWindow.xaml" });
 
         auto const root = Content().as<FrameworkElement>();
-        root.FindName(L"WindowContentHost").as<Controls::Border>().Child(make<DrakonDesktop::implementation::SiteHostPage>());
+        auto const enableResidentRuntimeBridge = m_initialNavigationUrl.empty();
+        root.FindName(L"WindowContentHost")
+            .as<Controls::Border>()
+            .Child(make<DrakonDesktop::implementation::SiteHostPage>(
+                m_initialNavigationUrl,
+                enableResidentRuntimeBridge));
         m_initialized = true;
         ApplyHostTheme(m_currentTheme);
         AppendBootstrapTrace("window: InitializeComponent exit");
@@ -86,14 +97,33 @@ namespace winrt::DrakonDesktop::implementation
         try
         {
             auto const appWindow = AppWindow();
+            if (!appWindow)
+            {
+                AppendBootstrapTrace("window: AppWindow unavailable during chrome configuration");
+                return;
+            }
+
             auto const titleBar = appWindow.TitleBar();
             titleBar.ExtendsContentIntoTitleBar(true);
             titleBar.IconShowOptions(IconShowOptions::HideIconAndSystemMenu);
             titleBar.PreferredHeightOption(TitleBarHeightOption::Standard);
 
             ExtendsContentIntoTitleBar(true);
-            auto const root = Content().as<FrameworkElement>();
-            SetTitleBar(root.FindName(L"AppTitleBar").as<UIElement>());
+            auto const root = Content().try_as<FrameworkElement>();
+            if (!root)
+            {
+                AppendBootstrapTrace("window: root unavailable during chrome configuration");
+                return;
+            }
+
+            auto const appTitleBar = root.FindName(L"AppTitleBar").try_as<UIElement>();
+            if (!appTitleBar)
+            {
+                AppendBootstrapTrace("window: AppTitleBar unavailable during chrome configuration");
+                return;
+            }
+
+            SetTitleBar(appTitleBar);
 
             ApplyChromeSurfaceColors(m_currentTheme);
             ApplyCaptionButtonColors(titleBar, m_currentTheme);
@@ -205,17 +235,23 @@ namespace DrakonDesktop::platform
 {
     void ConfigureMainWindowChrome()
     {
-        if (g_activeMainWindow != nullptr)
+        for (auto* window : g_mainWindows)
         {
-            g_activeMainWindow->ConfigureWindowChrome();
+            if (window != nullptr)
+            {
+                window->ConfigureWindowChrome();
+            }
         }
     }
 
     void UpdateMainWindowTheme(bool useLightTheme)
     {
-        if (g_activeMainWindow != nullptr)
+        for (auto* window : g_mainWindows)
         {
-            g_activeMainWindow->ApplyHostTheme(useLightTheme ? ElementTheme::Light : ElementTheme::Dark);
+            if (window != nullptr)
+            {
+                window->ApplyHostTheme(useLightTheme ? ElementTheme::Light : ElementTheme::Dark);
+            }
         }
     }
 }

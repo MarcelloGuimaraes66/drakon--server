@@ -2033,6 +2033,7 @@ const enPageExtensions: Record<string, string> = {
   "jobs.closeClonePicker": "Close clone picker",
   "jobs.priority": "Priority",
   "jobs.runEvery": "Run Every",
+  "jobs.groupRunEvery": "Group Run Every",
   "jobs.runInterval": "Run interval",
   "jobs.runEveryOption.video60": "60 frames every 60 seconds (alert every 60 seconds)",
   "jobs.runEveryOption.video10": "10 frames every 10 seconds (alert every 10 seconds)",
@@ -2040,6 +2041,8 @@ const enPageExtensions: Record<string, string> = {
   "jobs.runEveryOption.image10": "1 frame every 10 seconds (alert every 10 seconds)",
   "jobs.runEveryOption.seconds60": "Every 60 seconds",
   "jobs.runEveryOption.seconds10": "Every 10 seconds",
+  "jobs.runEveryOption.seconds300": "Every 5 minutes",
+  "jobs.runEveryOption.seconds600": "Every 10 minutes",
   "jobs.runningResolution": "Running Resolution",
   "jobs.runningResolutionOption.640": "640 (1 frame per second) - fast detections",
   "jobs.runningResolutionOption.1024": "1024 (1 frame every 3 seconds) - higher detail",
@@ -2401,6 +2404,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Cerrar selector de clones",
     "jobs.priority": "Prioridad",
     "jobs.runEvery": "Ejecutar cada",
+    "jobs.groupRunEvery": "Ejecutar grupo cada",
     "jobs.runInterval": "Intervalo de ejecución",
     "jobs.runEveryOption.video60": "60 fotogramas cada 60 segundos (alerta cada 60 segundos)",
     "jobs.runEveryOption.video10": "10 fotogramas cada 10 segundos (alerta cada 10 segundos)",
@@ -2408,6 +2412,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 fotograma cada 10 segundos (alerta cada 10 segundos)",
     "jobs.runEveryOption.seconds60": "Cada 60 segundos",
     "jobs.runEveryOption.seconds10": "Cada 10 segundos",
+    "jobs.runEveryOption.seconds300": "Cada 5 minutos",
+    "jobs.runEveryOption.seconds600": "Cada 10 minutos",
     "jobs.runningResolution": "Resolución de ejecución",
     "jobs.runningResolutionOption.640": "640 (1 fotograma por segundo) - detecciones rápidas",
     "jobs.runningResolutionOption.1024": "1024 (1 fotograma cada 3 segundos) - mayor detalle",
@@ -2756,6 +2762,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Fechar seletor de clones",
     "jobs.priority": "Prioridade",
     "jobs.runEvery": "Executar a cada",
+    "jobs.groupRunEvery": "Executar grupo a cada",
     "jobs.runInterval": "Intervalo de execução",
     "jobs.runEveryOption.video60": "60 frames a cada 60 segundos (alerta a cada 60 segundos)",
     "jobs.runEveryOption.video10": "10 frames a cada 10 segundos (alerta a cada 10 segundos)",
@@ -2763,6 +2770,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 frame a cada 10 segundos (alerta a cada 10 segundos)",
     "jobs.runEveryOption.seconds60": "A cada 60 segundos",
     "jobs.runEveryOption.seconds10": "A cada 10 segundos",
+    "jobs.runEveryOption.seconds300": "A cada 5 minutos",
+    "jobs.runEveryOption.seconds600": "A cada 10 minutos",
     "jobs.runningResolution": "Resolução de execução",
     "jobs.runningResolutionOption.640": "640 (1 frame por segundo) - detecções rápidas",
     "jobs.runningResolutionOption.1024": "1024 (1 frame a cada 3 segundos) - maior detalhe",
@@ -3108,6 +3117,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Fermer le sélecteur de clones",
     "jobs.priority": "Priorité",
     "jobs.runEvery": "Exécuter tous les",
+    "jobs.groupRunEvery": "Exécuter le groupe toutes les",
     "jobs.runInterval": "Intervalle d'exécution",
     "jobs.runEveryOption.video60": "60 images toutes les 60 secondes (alerte toutes les 60 secondes)",
     "jobs.runEveryOption.video10": "10 images toutes les 10 secondes (alerte toutes les 10 secondes)",
@@ -3115,6 +3125,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 image toutes les 10 secondes (alerte toutes les 10 secondes)",
     "jobs.runEveryOption.seconds60": "Toutes les 60 secondes",
     "jobs.runEveryOption.seconds10": "Toutes les 10 secondes",
+    "jobs.runEveryOption.seconds300": "Toutes les 5 minutes",
+    "jobs.runEveryOption.seconds600": "Toutes les 10 minutes",
     "jobs.runningResolution": "Résolution d'exécution",
     "jobs.runningResolutionOption.640": "640 (1 image par seconde) - détections rapides",
     "jobs.runningResolutionOption.1024": "1024 (1 image toutes les 3 secondes) - plus de détail",
@@ -4132,6 +4144,629 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
     "common.registerCamera": "\u062a\u0633\u062c\u064a\u0644 \u0643\u0627\u0645\u064a\u0631\u0627",
   },
 };
+
+const workspaceAccessTranslations: Record<string, Record<string, string>> = {
+  en: {
+    "settings.tabs.user": "User",
+    "settings.tabs.apiKeys": "API Keys",
+    "settings.tabs.alerts": "Alerts",
+    "settings.tabs.connectivity": "EXE Connectivity",
+    "settings.tabs.workspaceAccess": "Workspace Access",
+    "settings.workspaceAccess.title": "Share your {{brand}} workspace by @handle",
+    "settings.workspaceAccess.description":
+      "Another user can only open your workspace while your app is open and online. The new connection opens a separate window with the remote app.",
+    "settings.workspaceAccess.loading": "Loading Workspace Access...",
+    "settings.workspaceAccess.browserNotice":
+      "Remote sharing was designed for the desktop app. In a regular browser, opening the remote window uses a new tab.",
+    "settings.workspaceAccess.myApp.title": "My app",
+    "settings.workspaceAccess.myApp.description":
+      "Your workspace is available only while this app is open.",
+    "settings.workspaceAccess.policy.confirm.title": "Ask for confirmation on every connection",
+    "settings.workspaceAccess.policy.confirm.description":
+      "The other user can only enter after you approve the session.",
+    "settings.workspaceAccess.policy.allow.title": "Allow while my app is open",
+    "settings.workspaceAccess.policy.allow.description":
+      "An accepted invite stays directly connectable while this app instance is online.",
+    "settings.workspaceAccess.share.title": "Give access to my workspace",
+    "settings.workspaceAccess.share.description":
+      "Invite another user by @handle or email to open your app in a new window.",
+    "settings.workspaceAccess.share.placeholder": "@handle or email",
+    "settings.workspaceAccess.sections.incoming": "Incoming invites",
+    "settings.workspaceAccess.sections.outgoing": "Sent invites",
+    "settings.workspaceAccess.sections.available": "Available workspaces",
+    "settings.workspaceAccess.empty.incoming": "No incoming invites.",
+    "settings.workspaceAccess.empty.outgoing": "No sent invites.",
+    "settings.workspaceAccess.empty.available": "No workspace has been shared with you.",
+    "settings.workspaceAccess.permission.fullAccess": "Full access",
+    "settings.workspaceAccess.status.accepted": "Accepted",
+    "settings.workspaceAccess.status.pending": "Pending",
+    "settings.workspaceAccess.status.denied": "Denied",
+    "settings.workspaceAccess.status.revoked": "Revoked",
+    "settings.workspaceAccess.status.approved": "Approved",
+    "settings.workspaceAccess.status.active": "Active",
+    "settings.workspaceAccess.status.ended": "Ended",
+    "settings.workspaceAccess.availability.online": "Online",
+    "settings.workspaceAccess.availability.offline": "Offline",
+    "settings.workspaceAccess.actions.refresh": "Refresh",
+    "settings.workspaceAccess.actions.sendInvite": "Send invite",
+    "settings.workspaceAccess.actions.accept": "Accept",
+    "settings.workspaceAccess.actions.deny": "Decline",
+    "settings.workspaceAccess.actions.revoke": "Revoke",
+    "settings.workspaceAccess.actions.open": "Open workspace",
+    "settings.workspaceAccess.actions.waiting": "Waiting...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "{{owner}}'s remote workspace is ready to open.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "The remote session did not become available.",
+    "settings.workspaceAccess.messages.policySaved": "Connection policy saved.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Enter an @handle or email to send the invite.",
+    "settings.workspaceAccess.messages.inviteSent": "Invite sent successfully.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Invite accepted.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invite declined.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Invite revoked.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "This workspace is offline right now.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Opening {{owner}}'s remote workspace.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Requesting approval from {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "Failed to load workspace access settings.",
+    "settings.workspaceAccess.errors.loadIncoming": "Failed to load incoming invites.",
+    "settings.workspaceAccess.errors.loadOutgoing": "Failed to load sent invites.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "Failed to load available workspaces.",
+    "settings.workspaceAccess.errors.loadData": "Failed to load workspace access data.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "Failed to refresh the remote workspace session.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "Failed to save the connection policy.",
+    "settings.workspaceAccess.errors.createInvite": "Failed to create the invite.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "Failed to accept the workspace access invite.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "Failed to decline the workspace access invite.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "Failed to revoke the workspace access invite.",
+    "settings.workspaceAccess.errors.createSession":
+      "Failed to create the remote workspace session.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "The remote workspace session response was invalid.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "Failed to open the remote workspace.",
+  },
+  es: {
+    "settings.tabs.user": "Usuario",
+    "settings.tabs.apiKeys": "Claves de API",
+    "settings.tabs.alerts": "Alertas",
+    "settings.tabs.connectivity": "Conectividad EXE",
+    "settings.tabs.workspaceAccess": "Acceso al workspace",
+    "settings.workspaceAccess.title": "Comparte el workspace de {{brand}} por @handle",
+    "settings.workspaceAccess.description":
+      "Otro usuario solo puede abrir tu workspace mientras tu app est\u00e9 abierta y en l\u00ednea. La nueva conexi\u00f3n abre una ventana separada con la app remota.",
+    "settings.workspaceAccess.loading": "Cargando acceso al workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "El uso compartido remoto fue pensado para la app de escritorio. En un navegador com\u00fan, la ventana remota se abre en una nueva pesta\u00f1a.",
+    "settings.workspaceAccess.myApp.title": "Mi app",
+    "settings.workspaceAccess.myApp.description":
+      "Tu workspace est\u00e1 disponible solo mientras esta app est\u00e1 abierta.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Pedir confirmaci\u00f3n en cada conexi\u00f3n",
+    "settings.workspaceAccess.policy.confirm.description":
+      "La otra persona solo entra cuando apruebas la sesi\u00f3n.",
+    "settings.workspaceAccess.policy.allow.title": "Permitir mientras mi app est\u00e9 abierta",
+    "settings.workspaceAccess.policy.allow.description":
+      "Una invitaci\u00f3n aceptada queda disponible para conexi\u00f3n directa mientras esta instancia de la app est\u00e9 en l\u00ednea.",
+    "settings.workspaceAccess.share.title": "Dar acceso a mi workspace",
+    "settings.workspaceAccess.share.description":
+      "Invita a otro usuario por @handle o correo para abrir tu app en una nueva ventana.",
+    "settings.workspaceAccess.share.placeholder": "@handle o correo",
+    "settings.workspaceAccess.sections.incoming": "Invitaciones recibidas",
+    "settings.workspaceAccess.sections.outgoing": "Invitaciones enviadas",
+    "settings.workspaceAccess.sections.available": "Workspaces disponibles",
+    "settings.workspaceAccess.empty.incoming": "No hay invitaciones recibidas.",
+    "settings.workspaceAccess.empty.outgoing": "No hay invitaciones enviadas.",
+    "settings.workspaceAccess.empty.available":
+      "No hay ning\u00fan workspace compartido contigo.",
+    "settings.workspaceAccess.permission.fullAccess": "Acceso total",
+    "settings.workspaceAccess.status.accepted": "Aceptada",
+    "settings.workspaceAccess.status.pending": "Pendiente",
+    "settings.workspaceAccess.status.denied": "Rechazada",
+    "settings.workspaceAccess.status.revoked": "Revocada",
+    "settings.workspaceAccess.status.approved": "Aprobada",
+    "settings.workspaceAccess.status.active": "Activa",
+    "settings.workspaceAccess.status.ended": "Finalizada",
+    "settings.workspaceAccess.availability.online": "En l\u00ednea",
+    "settings.workspaceAccess.availability.offline": "Fuera de l\u00ednea",
+    "settings.workspaceAccess.actions.refresh": "Actualizar",
+    "settings.workspaceAccess.actions.sendInvite": "Enviar invitaci\u00f3n",
+    "settings.workspaceAccess.actions.accept": "Aceptar",
+    "settings.workspaceAccess.actions.deny": "Rechazar",
+    "settings.workspaceAccess.actions.revoke": "Revocar",
+    "settings.workspaceAccess.actions.open": "Abrir workspace",
+    "settings.workspaceAccess.actions.waiting": "Esperando...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "El workspace remoto de {{owner}} est\u00e1 listo para abrirse.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "La sesi\u00f3n remota no qued\u00f3 disponible.",
+    "settings.workspaceAccess.messages.policySaved":
+      "Pol\u00edtica de conexi\u00f3n guardada.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Ingresa un @handle o correo para enviar la invitaci\u00f3n.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Invitaci\u00f3n enviada con \u00e9xito.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Invitaci\u00f3n aceptada.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invitaci\u00f3n rechazada.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Invitaci\u00f3n revocada.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Ese workspace est\u00e1 offline en este momento.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Abriendo el workspace remoto de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Solicitando aprobaci\u00f3n de {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "No se pudo cargar la configuraci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "No se pudieron cargar las invitaciones recibidas.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "No se pudieron cargar las invitaciones enviadas.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "No se pudieron cargar los workspaces disponibles.",
+    "settings.workspaceAccess.errors.loadData":
+      "No se pudieron cargar los datos de acceso al workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "No se pudo actualizar la sesi\u00f3n remota del workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "No se pudo guardar la pol\u00edtica de conexi\u00f3n.",
+    "settings.workspaceAccess.errors.createInvite":
+      "No se pudo crear la invitaci\u00f3n.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "No se pudo aceptar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "No se pudo rechazar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "No se pudo revocar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "No se pudo crear la sesi\u00f3n remota del workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "La respuesta de la sesi\u00f3n remota del workspace no fue v\u00e1lida.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "No se pudo abrir el workspace remoto.",
+  },
+  pt: {
+    "settings.tabs.user": "Usu\u00e1rio",
+    "settings.tabs.apiKeys": "Chaves de API",
+    "settings.tabs.alerts": "Alertas",
+    "settings.tabs.connectivity": "Conectividade EXE",
+    "settings.tabs.workspaceAccess": "Acesso ao workspace",
+    "settings.workspaceAccess.title":
+      "Compartilhe o workspace do {{brand}} por @handle",
+    "settings.workspaceAccess.description":
+      "Outro usu\u00e1rio s\u00f3 pode abrir seu workspace enquanto seu app estiver aberto e online. A nova conex\u00e3o abre uma janela separada com o app remoto.",
+    "settings.workspaceAccess.loading": "Carregando acesso ao workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "O compartilhamento remoto foi pensado para o app desktop. Em um navegador comum, a janela remota abre em uma nova aba.",
+    "settings.workspaceAccess.myApp.title": "Meu app",
+    "settings.workspaceAccess.myApp.description":
+      "Seu workspace fica dispon\u00edvel somente enquanto este app estiver aberto.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Pedir confirma\u00e7\u00e3o a cada conex\u00e3o",
+    "settings.workspaceAccess.policy.confirm.description":
+      "O outro usu\u00e1rio s\u00f3 entra quando voc\u00ea aprovar a sess\u00e3o.",
+    "settings.workspaceAccess.policy.allow.title":
+      "Permitir enquanto meu app estiver aberto",
+    "settings.workspaceAccess.policy.allow.description":
+      "Um convite aceito fica conect\u00e1vel diretamente enquanto esta inst\u00e2ncia do app estiver online.",
+    "settings.workspaceAccess.share.title": "Dar acesso ao meu workspace",
+    "settings.workspaceAccess.share.description":
+      "Convide outro usu\u00e1rio por @handle ou e-mail para abrir seu app em uma nova janela.",
+    "settings.workspaceAccess.share.placeholder": "@handle ou e-mail",
+    "settings.workspaceAccess.sections.incoming": "Convites recebidos",
+    "settings.workspaceAccess.sections.outgoing": "Convites enviados",
+    "settings.workspaceAccess.sections.available": "Workspaces dispon\u00edveis",
+    "settings.workspaceAccess.empty.incoming": "Nenhum convite recebido.",
+    "settings.workspaceAccess.empty.outgoing": "Nenhum convite enviado.",
+    "settings.workspaceAccess.empty.available":
+      "Nenhum workspace compartilhado com voc\u00ea.",
+    "settings.workspaceAccess.permission.fullAccess": "Acesso total",
+    "settings.workspaceAccess.status.accepted": "Aceito",
+    "settings.workspaceAccess.status.pending": "Pendente",
+    "settings.workspaceAccess.status.denied": "Recusado",
+    "settings.workspaceAccess.status.revoked": "Revogado",
+    "settings.workspaceAccess.status.approved": "Aprovado",
+    "settings.workspaceAccess.status.active": "Ativo",
+    "settings.workspaceAccess.status.ended": "Encerrado",
+    "settings.workspaceAccess.availability.online": "Online",
+    "settings.workspaceAccess.availability.offline": "Offline",
+    "settings.workspaceAccess.actions.refresh": "Atualizar",
+    "settings.workspaceAccess.actions.sendInvite": "Enviar convite",
+    "settings.workspaceAccess.actions.accept": "Aceitar",
+    "settings.workspaceAccess.actions.deny": "Recusar",
+    "settings.workspaceAccess.actions.revoke": "Revogar",
+    "settings.workspaceAccess.actions.open": "Abrir workspace",
+    "settings.workspaceAccess.actions.waiting": "Aguardando...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "O workspace remoto de {{owner}} est\u00e1 pronto para abrir.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "A sess\u00e3o remota n\u00e3o ficou dispon\u00edvel.",
+    "settings.workspaceAccess.messages.policySaved":
+      "Pol\u00edtica de conex\u00e3o salva.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Informe um @handle ou e-mail para enviar o convite.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Convite enviado com sucesso.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Convite aceito.",
+    "settings.workspaceAccess.messages.inviteDenied": "Convite recusado.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Convite revogado.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Esse workspace est\u00e1 offline no momento.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Abrindo o workspace remoto de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Solicitando aprova\u00e7\u00e3o de {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "N\u00e3o foi poss\u00edvel carregar as configura\u00e7\u00f5es de acesso ao workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "N\u00e3o foi poss\u00edvel carregar os convites recebidos.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "N\u00e3o foi poss\u00edvel carregar os convites enviados.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "N\u00e3o foi poss\u00edvel carregar os workspaces dispon\u00edveis.",
+    "settings.workspaceAccess.errors.loadData":
+      "N\u00e3o foi poss\u00edvel carregar os dados de acesso ao workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "N\u00e3o foi poss\u00edvel atualizar a sess\u00e3o remota do workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "N\u00e3o foi poss\u00edvel salvar a pol\u00edtica de conex\u00e3o.",
+    "settings.workspaceAccess.errors.createInvite":
+      "N\u00e3o foi poss\u00edvel criar o convite.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "N\u00e3o foi poss\u00edvel aceitar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "N\u00e3o foi poss\u00edvel recusar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "N\u00e3o foi poss\u00edvel revogar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "N\u00e3o foi poss\u00edvel criar a sess\u00e3o remota do workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "A resposta da sess\u00e3o remota do workspace foi inv\u00e1lida.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "N\u00e3o foi poss\u00edvel abrir o workspace remoto.",
+  },
+  fr: {
+    "settings.tabs.user": "Utilisateur",
+    "settings.tabs.apiKeys": "Cl\u00e9s API",
+    "settings.tabs.alerts": "Alertes",
+    "settings.tabs.connectivity": "Connectivit\u00e9 EXE",
+    "settings.tabs.workspaceAccess": "Acc\u00e8s workspace",
+    "settings.workspaceAccess.title":
+      "Partagez le workspace {{brand}} via @handle",
+    "settings.workspaceAccess.description":
+      "Un autre utilisateur ne peut ouvrir votre workspace que lorsque votre app est ouverte et en ligne. La nouvelle connexion ouvre une fen\u00eatre s\u00e9par\u00e9e avec l'app distante.",
+    "settings.workspaceAccess.loading": "Chargement de l'acc\u00e8s workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "Le partage \u00e0 distance a \u00e9t\u00e9 pens\u00e9 pour l'app desktop. Dans un navigateur classique, la fen\u00eatre distante s'ouvre dans un nouvel onglet.",
+    "settings.workspaceAccess.myApp.title": "Mon app",
+    "settings.workspaceAccess.myApp.description":
+      "Votre workspace est disponible uniquement tant que cette app reste ouverte.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Demander une confirmation \u00e0 chaque connexion",
+    "settings.workspaceAccess.policy.confirm.description":
+      "L'autre utilisateur n'entre que lorsque vous approuvez la session.",
+    "settings.workspaceAccess.policy.allow.title":
+      "Autoriser tant que mon app est ouverte",
+    "settings.workspaceAccess.policy.allow.description":
+      "Une invitation accept\u00e9e reste accessible directement tant que cette instance de l'app est en ligne.",
+    "settings.workspaceAccess.share.title": "Donner acc\u00e8s \u00e0 mon workspace",
+    "settings.workspaceAccess.share.description":
+      "Invitez un autre utilisateur via @handle ou e-mail pour ouvrir votre app dans une nouvelle fen\u00eatre.",
+    "settings.workspaceAccess.share.placeholder": "@handle ou e-mail",
+    "settings.workspaceAccess.sections.incoming": "Invitations re\u00e7ues",
+    "settings.workspaceAccess.sections.outgoing": "Invitations envoy\u00e9es",
+    "settings.workspaceAccess.sections.available": "Workspaces disponibles",
+    "settings.workspaceAccess.empty.incoming": "Aucune invitation re\u00e7ue.",
+    "settings.workspaceAccess.empty.outgoing": "Aucune invitation envoy\u00e9e.",
+    "settings.workspaceAccess.empty.available":
+      "Aucun workspace partag\u00e9 avec vous.",
+    "settings.workspaceAccess.permission.fullAccess": "Acc\u00e8s complet",
+    "settings.workspaceAccess.status.accepted": "Accept\u00e9e",
+    "settings.workspaceAccess.status.pending": "En attente",
+    "settings.workspaceAccess.status.denied": "Refus\u00e9e",
+    "settings.workspaceAccess.status.revoked": "R\u00e9voqu\u00e9e",
+    "settings.workspaceAccess.status.approved": "Approuv\u00e9e",
+    "settings.workspaceAccess.status.active": "Active",
+    "settings.workspaceAccess.status.ended": "Termin\u00e9e",
+    "settings.workspaceAccess.availability.online": "En ligne",
+    "settings.workspaceAccess.availability.offline": "Hors ligne",
+    "settings.workspaceAccess.actions.refresh": "Actualiser",
+    "settings.workspaceAccess.actions.sendInvite": "Envoyer l'invitation",
+    "settings.workspaceAccess.actions.accept": "Accepter",
+    "settings.workspaceAccess.actions.deny": "Refuser",
+    "settings.workspaceAccess.actions.revoke": "R\u00e9voquer",
+    "settings.workspaceAccess.actions.open": "Ouvrir le workspace",
+    "settings.workspaceAccess.actions.waiting": "En attente...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "Le workspace distant de {{owner}} est pr\u00eat \u00e0 s'ouvrir.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "La session distante n'est pas devenue disponible.",
+    "settings.workspaceAccess.messages.policySaved":
+      "La politique de connexion a \u00e9t\u00e9 enregistr\u00e9e.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Saisissez un @handle ou un e-mail pour envoyer l'invitation.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Invitation envoy\u00e9e avec succ\u00e8s.",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "Invitation accept\u00e9e.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invitation refus\u00e9e.",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "Invitation r\u00e9voqu\u00e9e.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Ce workspace est hors ligne pour le moment.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Ouverture du workspace distant de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Demande d'approbation \u00e0 {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "Impossible de charger les param\u00e8tres d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "Impossible de charger les invitations re\u00e7ues.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "Impossible de charger les invitations envoy\u00e9es.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "Impossible de charger les workspaces disponibles.",
+    "settings.workspaceAccess.errors.loadData":
+      "Impossible de charger les donn\u00e9es d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "Impossible d'actualiser la session distante du workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "Impossible d'enregistrer la politique de connexion.",
+    "settings.workspaceAccess.errors.createInvite":
+      "Impossible de cr\u00e9er l'invitation.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "Impossible d'accepter l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "Impossible de refuser l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "Impossible de r\u00e9voquer l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "Impossible de cr\u00e9er la session distante du workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "La r\u00e9ponse de la session distante du workspace est invalide.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "Impossible d'ouvrir le workspace distant.",
+  },
+  zh: {
+    "settings.tabs.user": "\u7528\u6237",
+    "settings.tabs.apiKeys": "API \u5bc6\u94a5",
+    "settings.tabs.alerts": "\u63d0\u9192",
+    "settings.tabs.connectivity": "EXE \u8fde\u63a5",
+    "settings.tabs.workspaceAccess": "\u5de5\u4f5c\u533a\u8bbf\u95ee",
+    "settings.workspaceAccess.title":
+      "\u901a\u8fc7 @handle \u5206\u4eab\u4f60\u7684 {{brand}} \u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.description":
+      "\u53ea\u6709\u5f53\u4f60\u7684 app \u4fdd\u6301\u6253\u5f00\u5e76\u5728\u7ebf\u65f6\uff0c\u5176\u4ed6\u7528\u6237\u624d\u80fd\u6253\u5f00\u4f60\u7684\u5de5\u4f5c\u533a\u3002\u65b0\u8fde\u63a5\u4f1a\u5728\u5355\u72ec\u7a97\u53e3\u4e2d\u6253\u5f00\u8fdc\u7a0b app\u3002",
+    "settings.workspaceAccess.loading":
+      "\u6b63\u5728\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee...",
+    "settings.workspaceAccess.browserNotice":
+      "\u8fdc\u7a0b\u5171\u4eab\u662f\u4e3a\u684c\u9762 app \u8bbe\u8ba1\u7684\u3002\u5728\u666e\u901a\u6d4f\u89c8\u5668\u4e2d\uff0c\u8fdc\u7a0b\u7a97\u53e3\u4f1a\u5728\u65b0\u6807\u7b7e\u9875\u4e2d\u6253\u5f00\u3002",
+    "settings.workspaceAccess.myApp.title": "\u6211\u7684 app",
+    "settings.workspaceAccess.myApp.description":
+      "\u53ea\u6709\u5f53\u6b64 app \u4fdd\u6301\u6253\u5f00\u65f6\uff0c\u4f60\u7684\u5de5\u4f5c\u533a\u624d\u53ef\u7528\u3002",
+    "settings.workspaceAccess.policy.confirm.title":
+      "\u6bcf\u6b21\u8fde\u63a5\u90fd\u8bf7\u6c42\u786e\u8ba4",
+    "settings.workspaceAccess.policy.confirm.description":
+      "\u53ea\u6709\u5728\u4f60\u6279\u51c6\u4f1a\u8bdd\u540e\uff0c\u53e6\u4e00\u4f4d\u7528\u6237\u624d\u80fd\u8fdb\u5165\u3002",
+    "settings.workspaceAccess.policy.allow.title":
+      "\u5f53\u6211\u7684 app \u6253\u5f00\u65f6\u5141\u8bb8\u8bbf\u95ee",
+    "settings.workspaceAccess.policy.allow.description":
+      "\u5df2\u63a5\u53d7\u7684\u9080\u8bf7\u4f1a\u5728\u6b64 app \u5b9e\u4f8b\u5728\u7ebf\u671f\u95f4\u4fdd\u6301\u53ef\u76f4\u63a5\u8fde\u63a5\u3002",
+    "settings.workspaceAccess.share.title":
+      "\u5411\u6211\u7684\u5de5\u4f5c\u533a\u6388\u4e88\u8bbf\u95ee\u6743\u9650",
+    "settings.workspaceAccess.share.description":
+      "\u901a\u8fc7 @handle \u6216\u90ae\u7bb1\u9080\u8bf7\u5176\u4ed6\u7528\u6237\uff0c\u5728\u65b0\u7a97\u53e3\u4e2d\u6253\u5f00\u4f60\u7684 app\u3002",
+    "settings.workspaceAccess.share.placeholder": "@handle \u6216\u90ae\u7bb1",
+    "settings.workspaceAccess.sections.incoming": "\u6536\u5230\u7684\u9080\u8bf7",
+    "settings.workspaceAccess.sections.outgoing": "\u5df2\u53d1\u9001\u7684\u9080\u8bf7",
+    "settings.workspaceAccess.sections.available": "\u53ef\u7528\u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.empty.incoming":
+      "\u6682\u65e0\u6536\u5230\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.empty.outgoing":
+      "\u6682\u65e0\u5df2\u53d1\u9001\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.empty.available":
+      "\u6682\u65e0\u5171\u4eab\u7ed9\u4f60\u7684\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.permission.fullAccess": "\u5b8c\u5168\u8bbf\u95ee",
+    "settings.workspaceAccess.status.accepted": "\u5df2\u63a5\u53d7",
+    "settings.workspaceAccess.status.pending": "\u5f85\u5904\u7406",
+    "settings.workspaceAccess.status.denied": "\u5df2\u62d2\u7edd",
+    "settings.workspaceAccess.status.revoked": "\u5df2\u64a4\u9500",
+    "settings.workspaceAccess.status.approved": "\u5df2\u6279\u51c6",
+    "settings.workspaceAccess.status.active": "\u8fdb\u884c\u4e2d",
+    "settings.workspaceAccess.status.ended": "\u5df2\u7ed3\u675f",
+    "settings.workspaceAccess.availability.online": "\u5728\u7ebf",
+    "settings.workspaceAccess.availability.offline":
+      "\u79bb\u7ebf",
+    "settings.workspaceAccess.actions.refresh": "\u5237\u65b0",
+    "settings.workspaceAccess.actions.sendInvite": "\u53d1\u9001\u9080\u8bf7",
+    "settings.workspaceAccess.actions.accept": "\u63a5\u53d7",
+    "settings.workspaceAccess.actions.deny": "\u62d2\u7edd",
+    "settings.workspaceAccess.actions.revoke": "\u64a4\u9500",
+    "settings.workspaceAccess.actions.open": "\u6253\u5f00\u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.actions.waiting": "\u7b49\u5f85\u4e2d...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "{{owner}} \u7684\u8fdc\u7a0b\u5de5\u4f5c\u533a\u5df2\u53ef\u6253\u5f00\u3002",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "\u8fdc\u7a0b\u4f1a\u8bdd\u672a\u80fd\u53d8\u4e3a\u53ef\u7528\u72b6\u6001\u3002",
+    "settings.workspaceAccess.messages.policySaved":
+      "\u8fde\u63a5\u7b56\u7565\u5df2\u4fdd\u5b58\u3002",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "\u8bf7\u8f93\u5165 @handle \u6216\u90ae\u7bb1\u4ee5\u53d1\u9001\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.messages.inviteSent":
+      "\u9080\u8bf7\u5df2\u6210\u529f\u53d1\u9001\u3002",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "\u9080\u8bf7\u5df2\u63a5\u53d7\u3002",
+    "settings.workspaceAccess.messages.inviteDenied":
+      "\u9080\u8bf7\u5df2\u62d2\u7edd\u3002",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "\u9080\u8bf7\u5df2\u64a4\u9500\u3002",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "\u8be5\u5de5\u4f5c\u533a\u5f53\u524d\u79bb\u7ebf\u3002",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "\u6b63\u5728\u6253\u5f00 {{owner}} \u7684\u8fdc\u7a0b\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "\u6b63\u5728\u5411 {{owner}} \u8bf7\u6c42\u6279\u51c6\u3002",
+    "settings.workspaceAccess.errors.loadSettings":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee\u8bbe\u7f6e\u3002",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "\u65e0\u6cd5\u52a0\u8f7d\u6536\u5230\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5df2\u53d1\u9001\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "\u65e0\u6cd5\u52a0\u8f7d\u53ef\u7528\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.errors.loadData":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee\u6570\u636e\u3002",
+    "settings.workspaceAccess.errors.refreshSession":
+      "\u65e0\u6cd5\u5237\u65b0\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u3002",
+    "settings.workspaceAccess.errors.savePolicy":
+      "\u65e0\u6cd5\u4fdd\u5b58\u8fde\u63a5\u7b56\u7565\u3002",
+    "settings.workspaceAccess.errors.createInvite":
+      "\u65e0\u6cd5\u521b\u5efa\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "\u65e0\u6cd5\u63a5\u53d7\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.denyInvite":
+      "\u65e0\u6cd5\u62d2\u7edd\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "\u65e0\u6cd5\u64a4\u9500\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.createSession":
+      "\u65e0\u6cd5\u521b\u5efa\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u3002",
+    "settings.workspaceAccess.errors.invalidSession":
+      "\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u54cd\u5e94\u65e0\u6548\u3002",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "\u65e0\u6cd5\u6253\u5f00\u8fdc\u7a0b\u5de5\u4f5c\u533a\u3002",
+  },
+  ar: {
+    "settings.tabs.user": "\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645",
+    "settings.tabs.apiKeys": "\u0645\u0641\u0627\u062a\u064a\u062d API",
+    "settings.tabs.alerts": "\u0627\u0644\u062a\u0646\u0628\u064a\u0647\u0627\u062a",
+    "settings.tabs.connectivity": "\u0627\u062a\u0635\u0627\u0644 EXE",
+    "settings.tabs.workspaceAccess": "\u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644",
+    "settings.workspaceAccess.title":
+      "\u0634\u0627\u0631\u0643 \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 {{brand}} \u0639\u0628\u0631 @handle",
+    "settings.workspaceAccess.description":
+      "\u0644\u0627 \u064a\u0645\u0643\u0646 \u0644\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0622\u062e\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644\u0643 \u0625\u0644\u0627 \u0639\u0646\u062f\u0645\u0627 \u064a\u0643\u0648\u0646 \u062a\u0637\u0628\u064a\u0642\u0643 \u0645\u0641\u062a\u0648\u062d\u0627 \u0648\u0645\u062a\u0635\u0644\u0627. \u064a\u0641\u062a\u062d \u0627\u0644\u0627\u062a\u0635\u0627\u0644 \u0627\u0644\u062c\u062f\u064a\u062f \u0646\u0627\u0641\u0630\u0629 \u0645\u0646\u0641\u0635\u0644\u0629 \u0628\u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0627\u0644\u0628\u0639\u064a\u062f.",
+    "settings.workspaceAccess.loading":
+      "\u062c\u0627\u0631 \u062a\u062d\u0645\u064a\u0644 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644...",
+    "settings.workspaceAccess.browserNotice":
+      "\u062a\u0645 \u062a\u0635\u0645\u064a\u0645 \u0627\u0644\u0645\u0634\u0627\u0631\u0643\u0629 \u0639\u0646 \u0628\u0639\u062f \u0644\u062a\u0637\u0628\u064a\u0642 \u0633\u0637\u062d \u0627\u0644\u0645\u0643\u062a\u0628. \u0641\u064a \u0627\u0644\u0645\u062a\u0635\u0641\u062d \u0627\u0644\u0639\u0627\u062f\u064a\u060c \u062a\u0641\u062a\u062d \u0627\u0644\u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0641\u064a \u0639\u0644\u0627\u0645\u0629 \u062a\u0628\u0648\u064a\u0628 \u062c\u062f\u064a\u062f\u0629.",
+    "settings.workspaceAccess.myApp.title": "\u062a\u0637\u0628\u064a\u0642\u064a",
+    "settings.workspaceAccess.myApp.description":
+      "\u062a\u0643\u0648\u0646 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0645\u062a\u0627\u062d\u0629 \u0641\u0642\u0637 \u0639\u0646\u062f\u0645\u0627 \u064a\u0643\u0648\u0646 \u0647\u0630\u0627 \u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0645\u0641\u062a\u0648\u062d\u0627.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "\u0627\u0637\u0644\u0628 \u0627\u0644\u062a\u0623\u0643\u064a\u062f \u0639\u0646\u062f \u0643\u0644 \u0627\u062a\u0635\u0627\u0644",
+    "settings.workspaceAccess.policy.confirm.description":
+      "\u0644\u0627 \u064a\u062f\u062e\u0644 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0622\u062e\u0631 \u0625\u0644\u0627 \u0628\u0639\u062f \u0645\u0648\u0627\u0641\u0642\u062a\u0643 \u0639\u0644\u0649 \u0627\u0644\u062c\u0644\u0633\u0629.",
+    "settings.workspaceAccess.policy.allow.title":
+      "\u0627\u0633\u0645\u062d \u0645\u0627 \u062f\u0627\u0645 \u062a\u0637\u0628\u064a\u0642\u064a \u0645\u0641\u062a\u0648\u062d\u0627",
+    "settings.workspaceAccess.policy.allow.description":
+      "\u062a\u0628\u0642\u0649 \u0627\u0644\u062f\u0639\u0648\u0629 \u0627\u0644\u0645\u0642\u0628\u0648\u0644\u0629 \u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u0627\u062a\u0635\u0627\u0644 \u0627\u0644\u0645\u0628\u0627\u0634\u0631 \u0645\u0627 \u062f\u0627\u0645\u062a \u0647\u0630\u0647 \u0627\u0644\u0646\u0633\u062e\u0629 \u0645\u0646 \u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0645\u062a\u0635\u0644\u0629.",
+    "settings.workspaceAccess.share.title":
+      "\u0645\u0646\u062d \u0648\u0635\u0648\u0644 \u0625\u0644\u0649 \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644\u064a",
+    "settings.workspaceAccess.share.description":
+      "\u0627\u062f\u0639 \u0645\u0633\u062a\u062e\u062f\u0645\u0627 \u0622\u062e\u0631 \u0639\u0628\u0631 @handle \u0623\u0648 \u0627\u0644\u0628\u0631\u064a\u062f \u0627\u0644\u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a \u0644\u0641\u062a\u062d \u062a\u0637\u0628\u064a\u0642\u0643 \u0641\u064a \u0646\u0627\u0641\u0630\u0629 \u062c\u062f\u064a\u062f\u0629.",
+    "settings.workspaceAccess.share.placeholder":
+      "@handle \u0623\u0648 \u0627\u0644\u0628\u0631\u064a\u062f \u0627\u0644\u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a",
+    "settings.workspaceAccess.sections.incoming":
+      "\u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0648\u0627\u0631\u062f\u0629",
+    "settings.workspaceAccess.sections.outgoing":
+      "\u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0631\u0633\u0644\u0629",
+    "settings.workspaceAccess.sections.available":
+      "\u0645\u0633\u0627\u062d\u0627\u062a \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629",
+    "settings.workspaceAccess.empty.incoming":
+      "\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0639\u0648\u0627\u062a \u0648\u0627\u0631\u062f\u0629.",
+    "settings.workspaceAccess.empty.outgoing":
+      "\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0639\u0648\u0627\u062a \u0645\u0631\u0633\u0644\u0629.",
+    "settings.workspaceAccess.empty.available":
+      "\u0644\u0645 \u062a\u062a\u0645 \u0645\u0634\u0627\u0631\u0643\u0629 \u0623\u064a \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 \u0645\u0639\u0643.",
+    "settings.workspaceAccess.permission.fullAccess":
+      "\u0648\u0635\u0648\u0644 \u0643\u0627\u0645\u0644",
+    "settings.workspaceAccess.status.accepted": "\u0645\u0642\u0628\u0648\u0644\u0629",
+    "settings.workspaceAccess.status.pending":
+      "\u0642\u064a\u062f \u0627\u0644\u0627\u0646\u062a\u0638\u0627\u0631",
+    "settings.workspaceAccess.status.denied": "\u0645\u0631\u0641\u0648\u0636\u0629",
+    "settings.workspaceAccess.status.revoked": "\u0645\u0644\u063a\u0627\u0629",
+    "settings.workspaceAccess.status.approved":
+      "\u0645\u0648\u0627\u0641\u0642 \u0639\u0644\u064a\u0647\u0627",
+    "settings.workspaceAccess.status.active": "\u0646\u0634\u0637\u0629",
+    "settings.workspaceAccess.status.ended": "\u0645\u0646\u062a\u0647\u064a\u0629",
+    "settings.workspaceAccess.availability.online": "\u0645\u062a\u0635\u0644",
+    "settings.workspaceAccess.availability.offline":
+      "\u063a\u064a\u0631 \u0645\u062a\u0635\u0644",
+    "settings.workspaceAccess.actions.refresh": "\u062a\u062d\u062f\u064a\u062b",
+    "settings.workspaceAccess.actions.sendInvite":
+      "\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629",
+    "settings.workspaceAccess.actions.accept": "\u0642\u0628\u0648\u0644",
+    "settings.workspaceAccess.actions.deny": "\u0631\u0641\u0636",
+    "settings.workspaceAccess.actions.revoke": "\u0625\u0644\u063a\u0627\u0621",
+    "settings.workspaceAccess.actions.open":
+      "\u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644",
+    "settings.workspaceAccess.actions.waiting":
+      "\u0628\u0627\u0646\u062a\u0638\u0627\u0631...",
+    "settings.workspaceAccess.messages.sessionReady":
+      "\u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0640 {{owner}} \u062c\u0627\u0647\u0632\u0629 \u0644\u0644\u0641\u062a\u062d.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "\u0644\u0645 \u062a\u0635\u0628\u062d \u0627\u0644\u062c\u0644\u0633\u0629 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0645\u062a\u0627\u062d\u0629.",
+    "settings.workspaceAccess.messages.policySaved":
+      "\u062a\u0645 \u062d\u0641\u0638 \u0633\u064a\u0627\u0633\u0629 \u0627\u0644\u0627\u062a\u0635\u0627\u0644.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "\u0623\u062f\u062e\u0644 @handle \u0623\u0648 \u0628\u0631\u064a\u062f\u0627 \u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0627 \u0644\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629 \u0628\u0646\u062c\u0627\u062d.",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "\u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.inviteDenied":
+      "\u062a\u0645 \u0631\u0641\u0636 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "\u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "\u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0647\u0630\u0647 \u063a\u064a\u0631 \u0645\u062a\u0635\u0644\u0629 \u062d\u0627\u0644\u064a\u0627.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "\u062c\u0627\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0640 {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "\u062c\u0627\u0631 \u0637\u0644\u0628 \u0627\u0644\u0645\u0648\u0627\u0641\u0642\u0629 \u0645\u0646 {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0648\u0627\u0631\u062f\u0629.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0645\u0633\u0627\u062d\u0627\u062a \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629.",
+    "settings.workspaceAccess.errors.loadData":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u062f\u064a\u062b \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "\u062a\u0639\u0630\u0631 \u062d\u0641\u0638 \u0633\u064a\u0627\u0633\u0629 \u0627\u0644\u0627\u062a\u0635\u0627\u0644.",
+    "settings.workspaceAccess.errors.createInvite":
+      "\u062a\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "\u062a\u0639\u0630\u0631 \u0642\u0628\u0648\u0644 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "\u062a\u0639\u0630\u0631 \u0631\u0641\u0636 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "\u062a\u0639\u0630\u0631 \u0625\u0644\u063a\u0627\u0621 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.createSession":
+      "\u062a\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "\u0627\u0633\u062a\u062c\u0627\u0628\u0629 \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u063a\u064a\u0631 \u0635\u0627\u0644\u062d\u0629.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "\u062a\u0639\u0630\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+  },
+};
+
+for (const [lang, entries] of Object.entries(workspaceAccessTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
 
 for (const [lang, entries] of Object.entries(drakonFindOverrides)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);

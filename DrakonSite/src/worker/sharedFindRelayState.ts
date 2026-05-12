@@ -53,6 +53,15 @@ function clampInteger(value: unknown): number {
   return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
 }
 
+function generateRelaySessionToken() {
+  const cryptoApi = (globalThis as any).crypto;
+  if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 function getSharedFindRelayState(): SharedFindRelayState {
   const globalKey = "__sharedFindRelayState";
   const root = globalThis as any;
@@ -196,7 +205,7 @@ export function issueSharedFindRelaySession(publicId: string, ttlMs = 60_000) {
   const state = getSharedFindRelayState();
   pruneExpiredSessions(state);
 
-  const token = crypto.randomUUID();
+  const token = generateRelaySessionToken();
   const expiresAtMs = Date.now() + Math.max(10_000, ttlMs);
   state.sessions.set(token, {
     token,

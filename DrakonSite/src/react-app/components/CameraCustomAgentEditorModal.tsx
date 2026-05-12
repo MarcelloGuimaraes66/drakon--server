@@ -449,6 +449,14 @@ const buildBaseFrameWindowForViewport = (
   };
 };
 
+const getFrameWindowZoom = (
+  value: FrameWindowNorm | null | undefined
+): number => {
+  const normalized = normalizeFrameWindowFromUnknown(value);
+  const dominantSpan = Math.max(normalized.width, normalized.height, 0.000001);
+  return Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, 1 / dominantSpan));
+};
+
 const areFrameWindowsClose = (
   a: FrameWindowNorm | null | undefined,
   b: FrameWindowNorm | null | undefined,
@@ -474,10 +482,7 @@ const constrainFrameWindow = (
   const base = buildBaseFrameWindowForViewport(metrics);
   const rawWidth = clamp01(normalizedCandidate.width) || base.width;
   const rawHeight = clamp01(normalizedCandidate.height) || base.height;
-  const zoom = Math.min(
-    FRAME_WINDOW_MAX_ZOOM,
-    Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
-  );
+  const zoom = getFrameWindowZoom(normalizedCandidate);
   const width = base.width / zoom;
   const height = base.height / zoom;
   const centerX = clamp01(normalizedCandidate.x + rawWidth / 2);
@@ -1871,11 +1876,7 @@ export default function CameraCustomAgentEditorModal({
     if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
     event.preventDefault();
     const anchor = { x: localX / bounds.width, y: localY / bounds.height };
-    const baseFrameWindow = buildBaseFrameWindowForViewport(bounds);
-    const currentZoom = Math.min(
-      FRAME_WINDOW_MAX_ZOOM,
-      Math.max(1, baseFrameWindow.width / Math.max(frameWindow.width, 0.000001))
-    );
+    const currentZoom = getFrameWindowZoom(frameWindow);
     const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
     applyFrameWindowZoom(nextZoom, anchor);
   };
@@ -2059,14 +2060,8 @@ export default function CameraCustomAgentEditorModal({
   };
 
   const currentZoom = useMemo(
-    () => {
-      const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);
-      return Math.min(
-        FRAME_WINDOW_MAX_ZOOM,
-        Math.max(1, baseFrameWindow.width / Math.max(frameWindow.width, 0.000001))
-      );
-    },
-    [frameWindow.width, previewViewportMetrics]
+    () => getFrameWindowZoom(frameWindow),
+    [frameWindow]
   );
   const hasViewportAdjustments = useMemo(() => {
     const baseFrameWindow = buildBaseFrameWindowForViewport(previewViewportMetrics);

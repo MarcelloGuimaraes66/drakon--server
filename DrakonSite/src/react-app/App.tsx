@@ -19,6 +19,7 @@ import SettingsPage from "@/react-app/pages/Settings";
 import DrakonFindPage from "@/react-app/pages/DrakonFind";
 import HubPage from "@/react-app/pages/Hub";
 import SecretRecoverySetupOverlay from "@/react-app/components/SecretRecoverySetupOverlay";
+import { RemoteWorkspaceProvider } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { brand } from "@/shared/brand";
 import { Loader2 } from "lucide-react";
 
@@ -165,15 +166,17 @@ export default function App() {
   return (
     <I18nextProvider i18n={i18n}>
       <AuthProvider>
-        <ThemeProvider>
-          <QuickChatProvider>
-            <Router>
-              <OnboardingProvider>
-                <AppRoutes />
-              </OnboardingProvider>
-            </Router>
-          </QuickChatProvider>
-        </ThemeProvider>
+        <RemoteWorkspaceProvider>
+          <ThemeProvider>
+            <QuickChatProvider>
+              <Router>
+                <OnboardingProvider>
+                  <AppRoutes />
+                </OnboardingProvider>
+              </Router>
+            </QuickChatProvider>
+          </ThemeProvider>
+        </RemoteWorkspaceProvider>
       </AuthProvider>
     </I18nextProvider>
   );

@@ -961,9 +961,9 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
     const requestedModelFps = normalizeAgentModelFps(
       typeof row?.model_fps === "number" ? row.model_fps : row?.modelFps
     );
-    const requestedRunEvery = normalizeAgentRunEverySeconds(
+    const requestedRunEvery = normalizeGroupRunEverySeconds(
       row?.run_every ?? row?.runEvery,
-      FIXED_AGENT_RUN_EVERY_SECONDS
+      FIXED_GROUP_RUN_EVERY_SECONDS
     );
     const requestedRunningResolution =
       normalizeAgentInferenceModel(
@@ -974,7 +974,7 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
             DEFAULT_CORE_RUNNING_RESOLUTION
           )
         : null;
-    const execution = applyAgentExecutionConstraints(
+    const execution = applyGroupExecutionConstraints(
       inputType,
       inferenceModel,
       requestedRunEvery,
@@ -1158,9 +1158,11 @@ interface Target {
 type TargetInputType = "video" | "image";
 type AgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type AgentRunEverySeconds = 10 | 60;
+type GroupRunEverySeconds = 10 | 60 | 300 | 600;
 type AgentRunningResolution = 640 | 1024;
 type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
+const FIXED_GROUP_RUN_EVERY_SECONDS: GroupRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
@@ -1246,7 +1248,7 @@ interface InferenceGroup {
   priority_level?: AgentPriority | null;
   inference_model?: AgentInferenceModel;
   model_fps?: number;
-  run_every: AgentRunEverySeconds;
+  run_every: GroupRunEverySeconds;
   running_resolution?: AgentRunningResolution | null;
   only_capture_on_motion?: boolean;
   source_target_id?: number | null;
@@ -1282,6 +1284,7 @@ interface GroupAgentSourceOption {
 }
 
 const AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<AgentRunEverySeconds> = [60, 10];
+const GROUP_RUN_EVERY_OPTIONS: ReadonlyArray<GroupRunEverySeconds> = [10, 60, 300, 600];
 
 const normalizeAgentRunEverySeconds = (
   value: unknown,
@@ -1303,6 +1306,31 @@ const normalizeAgentRunEverySeconds = (
     return parsed <= 10 ? 10 : 60;
   };
   return normalizeSeconds(value) ?? normalizeSeconds(fallback) ?? FIXED_AGENT_RUN_EVERY_SECONDS;
+};
+
+const normalizeGroupRunEverySeconds = (
+  value: unknown,
+  fallback: GroupRunEverySeconds = FIXED_GROUP_RUN_EVERY_SECONDS
+): GroupRunEverySeconds => {
+  const parseSeconds = (candidate: unknown): number | null => {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return Math.round(candidate);
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const parsed = Number.parseInt(candidate.trim(), 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const normalizeSeconds = (candidate: unknown): GroupRunEverySeconds | null => {
+    const parsed = parseSeconds(candidate);
+    if (parsed === null || parsed <= 0) return null;
+    if (parsed <= 10) return 10;
+    if (parsed === 300) return 300;
+    if (parsed === 600) return 600;
+    return 60;
+  };
+  return normalizeSeconds(value) ?? normalizeSeconds(fallback) ?? FIXED_GROUP_RUN_EVERY_SECONDS;
 };
 
 const normalizeAgentModelFps = (
@@ -1419,6 +1447,45 @@ const applyAgentExecutionConstraints = (
         ? normalizeAgentModelFps(modelFps)
         : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
     };
+};
+
+const applyGroupExecutionConstraints = (
+  inputType: TargetInputType,
+  inferenceModel: AgentInferenceModel,
+  runEvery: GroupRunEverySeconds,
+  runningResolution: AgentRunningResolution | null | undefined,
+  modelFps: number | null | undefined
+): {
+  inputType: TargetInputType;
+  inferenceModel: AgentInferenceModel;
+  runEvery: GroupRunEverySeconds;
+  runningResolution: AgentRunningResolution | null;
+  modelFps: number;
+} => {
+  if (inferenceModel === "core") {
+    return {
+      inputType: "video",
+      inferenceModel,
+      runEvery: 60,
+      runningResolution: normalizeAgentRunningResolution(
+        runningResolution,
+        DEFAULT_CORE_RUNNING_RESOLUTION
+      ),
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+    };
+  }
+
+  const normalizedInputType = inputType === "image" ? "image" : "video";
+  return {
+    inputType: normalizedInputType,
+    inferenceModel,
+    runEvery: normalizeGroupRunEverySeconds(runEvery, FIXED_GROUP_RUN_EVERY_SECONDS),
+    runningResolution: null,
+    modelFps:
+      supportsAdjustableAgentVideoFps(inferenceModel) && normalizedInputType === "video"
+        ? normalizeAgentModelFps(modelFps)
+        : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  };
 };
 
 const normalizeAgentPriority = (value: unknown): AgentPriority => {
@@ -1857,6 +1924,14 @@ const buildBaseFrameWindowForViewport = (
   };
 };
 
+const getFrameWindowZoom = (
+  value: FrameWindowNorm | null | undefined
+): number => {
+  const normalized = normalizeFrameWindowFromUnknown(value);
+  const dominantSpan = Math.max(normalized.width, normalized.height, 0.000001);
+  return Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, 1 / dominantSpan));
+};
+
 const areFrameWindowsClose = (
   a: FrameWindowNorm | null | undefined,
   b: FrameWindowNorm | null | undefined,
@@ -1882,10 +1957,7 @@ const constrainFrameWindow = (
   const base = buildBaseFrameWindowForViewport(metrics);
   const rawWidth = clamp01(normalizedCandidate.width) || base.width;
   const rawHeight = clamp01(normalizedCandidate.height) || base.height;
-  const zoom = Math.min(
-    FRAME_WINDOW_MAX_ZOOM,
-    Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
-  );
+  const zoom = getFrameWindowZoom(normalizedCandidate);
   const width = base.width / zoom;
   const height = base.height / zoom;
   const centerX = clamp01(normalizedCandidate.x + rawWidth / 2);
@@ -4561,6 +4633,9 @@ function StepCard({
   const [groupName, setGroupName] = useState("");
   const [groupAgentKey, setGroupAgentKey] = useState("");
   const [groupAgentSourceTargetId, setGroupAgentSourceTargetId] = useState<number | null>(null);
+  const [groupRunEvery, setGroupRunEvery] = useState<GroupRunEverySeconds>(
+    FIXED_GROUP_RUN_EVERY_SECONDS
+  );
   const [inferenceGroups, setInferenceGroups] = useState<InferenceGroup[]>([]);
   const [savingInferenceGroups, setSavingInferenceGroups] = useState(false);
   const groupedTargetIds = new Set(inferenceGroups.flatMap((group) => group.targetIds));
@@ -4746,6 +4821,7 @@ function StepCard({
     setGroupName("");
     setGroupAgentKey("");
     setGroupAgentSourceTargetId(null);
+    setGroupRunEvery(FIXED_GROUP_RUN_EVERY_SECONDS);
   };
 
   const openGroupModal = () => {
@@ -4772,9 +4848,20 @@ function StepCard({
           return effectiveAgent?.agent_key === preselectedAgentKey;
         })?.id ?? null
       : null;
+    const preselectedSourceOption = preselectedSourceTargetId
+      ? groupAgentSourceOptions.find((option) => option.targetId === preselectedSourceTargetId) || null
+      : preselectedAgentKey
+      ? groupAgentSourceOptions.find((option) => option.agentKey === preselectedAgentKey) || null
+      : null;
     setGroupName("");
     setGroupAgentKey(preselectedAgentKey);
     setGroupAgentSourceTargetId(preselectedSourceTargetId);
+    setGroupRunEvery(
+      normalizeGroupRunEverySeconds(
+        preselectedSourceOption?.runEvery,
+        FIXED_GROUP_RUN_EVERY_SECONDS
+      )
+    );
     setEditingGroupId(null);
     setShowGroupModal(true);
   };
@@ -4782,10 +4869,10 @@ function StepCard({
   const handleSaveGroup = async () => {
     if (!selectedGroupSourceOption) return;
     const selectedSource = selectedGroupSourceOption;
-    const sourceExecution = applyAgentExecutionConstraints(
+    const sourceExecution = applyGroupExecutionConstraints(
       selectedSource.inferenceModel === "core" ? "video" : "image",
       selectedSource.inferenceModel,
-      selectedSource.runEvery,
+      groupRunEvery,
       selectedSource.runningResolution,
       selectedSource.modelFps
     );
@@ -7786,11 +7873,7 @@ function StepCard({
     if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
     event.preventDefault();
     const anchor = { x: localX / bounds.width, y: localY / bounds.height };
-    const baseFrameWindow = buildBaseFrameWindowForViewport(bounds);
-    const currentZoom = Math.min(
-      FRAME_WINDOW_MAX_ZOOM,
-      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
-    );
+    const currentZoom = getFrameWindowZoom(promptEditorFrameWindow);
     const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
     applyPromptEditorFrameZoom(nextZoom, anchor);
   };
@@ -8612,12 +8695,8 @@ function StepCard({
     promptEditorSnapshotRefreshInFlightRef.current ||
     promptEditorSnapshotRefreshCooldownActive;
   const promptEditorCurrentZoom = useMemo(() => {
-    const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
-    return Math.min(
-      FRAME_WINDOW_MAX_ZOOM,
-      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
-    );
-  }, [promptEditorFrameWindow.width, promptEditorViewportMetrics]);
+    return getFrameWindowZoom(promptEditorFrameWindow);
+  }, [promptEditorFrameWindow]);
   const promptEditorHasViewportAdjustments = useMemo(() => {
     const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
     return !areFrameWindowsClose(promptEditorFrameWindow, baseFrameWindow);
@@ -8807,6 +8886,19 @@ function StepCard({
       FIXED_AGENT_RUN_EVERY_SECONDS
     );
     return getRunEveryOptionLabel(normalized);
+  };
+  const getGroupRunEveryOptionLabel = (seconds: GroupRunEverySeconds): string => {
+    if (seconds === 10) return t("jobs.runEveryOption.seconds10");
+    if (seconds === 300) return t("jobs.runEveryOption.seconds300");
+    if (seconds === 600) return t("jobs.runEveryOption.seconds600");
+    return t("jobs.runEveryOption.seconds60");
+  };
+  const formatGroupRunEveryLabel = (seconds: number | null | undefined): string => {
+    const normalized = normalizeGroupRunEverySeconds(
+      seconds ?? undefined,
+      FIXED_GROUP_RUN_EVERY_SECONDS
+    );
+    return getGroupRunEveryOptionLabel(normalized);
   };
 
   const updatePromptEditorPromptCore = (value: string) => {
@@ -10088,6 +10180,12 @@ function StepCard({
                                   setGroupName(group.name);
                                   setGroupAgentKey(group.agentKey);
                                   setGroupAgentSourceTargetId(inferredSourceTargetId);
+                                  setGroupRunEvery(
+                                    normalizeGroupRunEverySeconds(
+                                      group.run_every,
+                                      FIXED_GROUP_RUN_EVERY_SECONDS
+                                    )
+                                  );
                                   setShowGroupModal(true);
                                 }}
                               >
@@ -10136,6 +10234,12 @@ function StepCard({
                           </div>
                           <div className="text-sm text-blue-100">
                             {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
+                          </div>
+                          <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
+                            {t("jobs.groupRunEvery")}
+                          </div>
+                          <div className="text-sm text-blue-100">
+                            {formatGroupRunEveryLabel(group.run_every)}
                           </div>
                         </div>
                       ))}
@@ -12180,8 +12284,46 @@ function StepCard({
                       {t("jobs.inputType")}
                     </label>
                     <div className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-gray-200 text-sm">
-                      {t("jobs.image")}
+                      {selectedGroupSourceOption?.inferenceModel === "core"
+                        ? t("jobs.video")
+                        : t("jobs.image")}
                     </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs uppercase tracking-widest text-gray-400 mb-2">
+                      {t("jobs.groupRunEvery")}
+                    </label>
+                    <select
+                      value={
+                        selectedGroupSourceOption?.inferenceModel === "core" ? 60 : groupRunEvery
+                      }
+                      onChange={(e) =>
+                        setGroupRunEvery(
+                          normalizeGroupRunEverySeconds(
+                            Number(e.target.value),
+                            FIXED_GROUP_RUN_EVERY_SECONDS
+                          )
+                        )
+                      }
+                      disabled={
+                        !selectedGroupSourceOption ||
+                        selectedGroupSourceOption.inferenceModel === "core"
+                      }
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60"
+                    >
+                      {GROUP_RUN_EVERY_OPTIONS.map((seconds) => (
+                        <option key={seconds} value={seconds}>
+                          {getGroupRunEveryOptionLabel(seconds)}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedGroupSourceOption?.inferenceModel === "core" ? (
+                      <p className="mt-2 text-xs text-amber-300">
+                        {t("jobs.coreGroupRunEveryFixed", {
+                          defaultValue: "Core groups currently use a fixed 60-second cadence.",
+                        })}
+                      </p>
+                    ) : null}
                   </div>
                   <div>
                     <label className="block text-xs uppercase tracking-widest text-gray-400 mb-2">

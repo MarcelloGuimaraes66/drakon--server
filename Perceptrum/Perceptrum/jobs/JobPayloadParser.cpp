@@ -228,9 +228,16 @@ static int readModelFpsField(
 }
 
 static int normalizeRunEverySecondsValue(int raw, int fallback) {
-    const int normalizedFallback = (fallback <= 10) ? 10 : 60;
+    const int normalizedFallback =
+        (fallback <= 10) ? 10 :
+        (fallback == 300) ? 300 :
+        (fallback == 600) ? 600 :
+        60;
     if (raw <= 0) return normalizedFallback;
-    return (raw <= 10) ? 10 : 60;
+    if (raw <= 10) return 10;
+    if (raw == 300) return 300;
+    if (raw == 600) return 600;
+    return 60;
 }
 
 static int readRunEverySecondsField(const json& j, int fallback) {

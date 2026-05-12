@@ -32,10 +32,22 @@ if [ ! -f "$SERVICE_TEMPLATE" ]; then
   exit 1
 fi
 
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
 cd "$BACKEND_DIR"
 
-echo "[central-auth] installing backend dependencies"
-npm ci --include=dev
+NPM_CI_ARGS=(--include=dev)
+if [ "${APP_RUNTIME_ENV:-}" = "server" ]; then
+  echo "[central-auth] server runtime detected; installing dependencies with --ignore-scripts"
+  NPM_CI_ARGS+=(--ignore-scripts)
+else
+  echo "[central-auth] installing backend dependencies"
+fi
+
+npm ci "${NPM_CI_ARGS[@]}"
 
 echo "[central-auth] installing systemd unit -> $SERVICE_TARGET"
 sed \

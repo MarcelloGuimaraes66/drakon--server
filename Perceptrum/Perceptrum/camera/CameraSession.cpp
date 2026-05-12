@@ -3088,6 +3088,23 @@ void CameraSession::maybeWriteDailyReport_(
         return;
     }
 
+    int camId = 0;
+    try {
+        camId = std::stoi(config_.id);
+    }
+    catch (...) {
+        camId = 0;
+    }
+
+    if (!owner_ || camId <= 0) {
+        return;
+    }
+
+    const auto activeJobIds = owner_->getActiveJobIdsForCamera(camId);
+    if (activeJobIds.empty()) {
+        return;
+    }
+
     const DailyReportDateParts_ dateParts = localDatePartsForDailyReport_();
     const std::string& dateToken = dateParts.compactToken;
     if (!lastDailyReportDateToken_.empty() && lastDailyReportDateToken_ == dateToken) {
