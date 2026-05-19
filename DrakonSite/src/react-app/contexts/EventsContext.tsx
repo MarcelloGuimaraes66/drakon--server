@@ -630,6 +630,46 @@ export function EventsProvider({
   );
 }
 
+export function PassiveEventsProvider({ children }: { children: ReactNode }) {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const syntheticToastIdRef = useRef(-1);
+
+  const dismissToast = (id: number) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id));
+  };
+
+  const pushToast = (toast: Omit<Toast, "id"> & { id?: number }) => {
+    const toastId =
+      Number.isInteger(toast.id) && Number(toast.id) !== 0
+        ? Number(toast.id)
+        : syntheticToastIdRef.current--;
+
+    setToasts((prev) => [...prev, { ...toast, id: toastId }]);
+
+    if (typeof window !== "undefined") {
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((entry) => entry.id !== toastId));
+      }, AUTO_DISMISS_MS);
+    }
+
+    return toastId;
+  };
+
+  return (
+    <EventsContext.Provider
+      value={{
+        toasts,
+        dismissToast,
+        pushToast,
+        lastEventId: 0,
+        refreshCameras: () => undefined,
+      }}
+    >
+      {children}
+    </EventsContext.Provider>
+  );
+}
+
 export function useEvents() {
   const context = useContext(EventsContext);
   if (!context) {

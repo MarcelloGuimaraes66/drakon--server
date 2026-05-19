@@ -32,6 +32,81 @@ namespace winrt::DrakonDesktop::services
         std::string countryCode;
         std::string createdAt;
         std::string displayName;
+        struct AccountPermissions
+        {
+            bool viewCameras{ false };
+            bool executeCameras{ false };
+            bool viewTasks{ false };
+            bool executeTasks{ false };
+            bool viewAgents{ false };
+            bool executeAgents{ false };
+            bool chat{ false };
+        } permissions;
+        std::string accountUserId;
+        std::string actorUserId;
+        std::string accountRole;
+        std::string accountStatus;
+        bool isAccountOwner{ false };
+        bool isAccountAdmin{ false };
+        bool canManageSettings{ false };
+        bool hasFullAccess{ false };
+        bool managedPassword{ false };
+    };
+
+    struct AccountUserRecord
+    {
+        std::string memberUserId;
+        std::string accountUserId;
+        std::string email;
+        std::string role;
+        std::string status;
+        bool isOwner{ false };
+        bool isAdmin{ false };
+        bool canManageSettings{ false };
+        bool fullAccess{ false };
+        bool viewCameras{ false };
+        bool executeCameras{ false };
+        bool viewTasks{ false };
+        bool executeTasks{ false };
+        bool viewAgents{ false };
+        bool executeAgents{ false };
+        bool chat{ false };
+        std::string updatedAt;
+    };
+
+    struct AccountUserCreateRequest
+    {
+        std::string email;
+        std::string password;
+        std::string role{ "member" };
+        bool fullAccess{ false };
+        bool viewCameras{ false };
+        bool executeCameras{ false };
+        bool viewTasks{ false };
+        bool executeTasks{ false };
+        bool viewAgents{ false };
+        bool executeAgents{ false };
+        bool chat{ false };
+    };
+
+    struct AccountUserUpdateRequest
+    {
+        std::string role{ "member" };
+        std::string status{ "active" };
+        bool fullAccess{ false };
+        bool viewCameras{ false };
+        bool executeCameras{ false };
+        bool viewTasks{ false };
+        bool executeTasks{ false };
+        bool viewAgents{ false };
+        bool executeAgents{ false };
+        bool chat{ false };
+    };
+
+    struct AccountUsersSnapshot
+    {
+        bool canAssignAdmin{ false };
+        std::vector<AccountUserRecord> users;
     };
 
     struct BillingStatus
@@ -476,6 +551,14 @@ namespace winrt::DrakonDesktop::services
         ServiceValueResponse<ApiKeySettings> SaveZAiSettings(std::optional<std::string> const& apiKey, bool clear);
         ServiceValueResponse<TelegramSettings> GetTelegramSettings();
         ServiceValueResponse<TelegramSettings> SaveTelegramSettings(TelegramSettings const& settings);
+        ServiceValueResponse<AccountUsersSnapshot> GetAccountUsers();
+        ServiceValueResponse<AccountUserRecord> CreateAccountUser(AccountUserCreateRequest const& request);
+        ServiceValueResponse<AccountUserRecord> UpdateAccountUser(
+            std::string const& memberUserId,
+            AccountUserUpdateRequest const& request);
+        ServiceResponse ResetAccountUserPassword(
+            std::string const& memberUserId,
+            std::string const& password);
         ServiceValueResponse<PairCodeSnapshot> GeneratePairCode();
         ServiceValueResponse<PairingStatusSnapshot> GetPairingStatus();
         ServiceResponse DisconnectPairing();

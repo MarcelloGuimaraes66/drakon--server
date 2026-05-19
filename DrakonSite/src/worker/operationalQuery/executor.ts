@@ -263,6 +263,7 @@ function primaryRowsForPlan(
 } {
   const datasets = {
     identity_cards: readContextArray(context, ["details", "identity_cards"], ["history", "recent_identity_cards"]),
+    cameras: readContextArray(context, ["details", "step_targets"]),
     job_runs: readContextArray(context, ["details", "job_runs"], ["history", "recent_job_runs"]),
     step_runs: readContextArray(context, ["details", "step_runs"], ["history", "recent_step_runs"]),
     agent_runs: readContextArray(context, ["details", "agent_runs"], ["history", "recent_agent_runs"]),
@@ -359,6 +360,74 @@ function buildIdentityCardsAnswer(
     plan.resolved.time_window.label
   );
   return [header, "", intro, "", ...lines].join("\n");
+}
+
+function buildCamerasAnswer(
+  rows: Array<Record<string, unknown>>,
+  plan: ResolvedOperationalPlan
+): string {
+  const isPt = normalizePlannerLanguage(plan.intent.output.language, "en").startsWith("pt");
+  if (rows.length === 0) {
+    return isPt
+      ? "Nao encontrei cameras cadastradas nesse recorte operacional."
+      : "I did not find cameras in that operational window.";
+  }
+
+  const uniqueStepNames = Array.from(
+    new Set(
+      rows
+        .map((row) => normalizeText(row.step_name, 160))
+        .filter((entry) => entry.length > 0)
+    )
+  );
+  const uniqueJobNames = Array.from(
+    new Set(
+      rows
+        .map((row) => normalizeText(row.job_name, 160))
+        .filter((entry) => entry.length > 0)
+    )
+  );
+  const totalCount = rows.reduce((maxCount, row) => {
+    const candidate = Number(row.total_count || 0);
+    return Number.isFinite(candidate) && candidate > maxCount ? candidate : maxCount;
+  }, rows.length);
+
+  const intro = isPt
+    ? [
+        `- Encontrei ${totalCount} camera(s)`,
+        uniqueStepNames.length === 1 ? ` cadastrada(s) no step "${uniqueStepNames[0]}"` : "",
+        uniqueJobNames.length === 1 ? ` do job "${uniqueJobNames[0]}"` : "",
+        ".",
+      ].join("")
+    : [
+        `- I found ${totalCount} camera(s)`,
+        uniqueStepNames.length === 1 ? ` assigned to step "${uniqueStepNames[0]}"` : "",
+        uniqueJobNames.length === 1 ? ` in job "${uniqueJobNames[0]}"` : "",
+        ".",
+      ].join("");
+
+  const lines = rows.slice(0, plan.intent.filters.limit).map((row, index) => {
+    const cameraName =
+      normalizeText(row.camera_name, 160) ||
+      normalizeText(row.slot_label, 160) ||
+      normalizeText(row.slot_key, 160) ||
+      (isPt ? `Camera ${index + 1}` : `Camera ${index + 1}`);
+    const extras = [
+      normalizeText(row.slot_label, 160),
+      normalizeText(row.slot_key, 160),
+      normalizeText(row.input_type, 80),
+    ].filter((entry) => entry.length > 0 && entry.toLowerCase() !== cameraName.toLowerCase());
+    return `${index + 1}. ${cameraName}${extras.length > 0 ? ` | ${extras.join(" | ")}` : ""}`;
+  });
+
+  const truncationNote =
+    totalCount > lines.length
+      ? isPt
+        ? ` Mostrando ${lines.length} nesta resposta.`
+        : ` Showing ${lines.length} in this response.`
+      : "";
+
+  return ["## Cameras", "", `${intro}${truncationNote}`, "", ...lines].join("\n");
 }
 
 function buildRunsAnswer(
@@ -480,6 +549,8 @@ function buildDraftAnswer(
   switch (primarySource) {
     case "identity_cards":
       return buildIdentityCardsAnswer(rows, plan);
+    case "cameras":
+      return buildCamerasAnswer(rows, plan);
     case "job_runs":
       return buildRunsAnswer(
         rows,

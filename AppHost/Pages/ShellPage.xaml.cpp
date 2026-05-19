@@ -126,6 +126,7 @@ namespace winrt::DrakonDesktop::implementation
         AppendBootstrapTrace("shell: ctor");
         InitializeComponent();
         WireUpNavigation();
+        ApplyNavigationPermissions();
         SizeChanged({ this, &ShellPage::OnShellSizeChanged });
         UpdateResponsiveState(ActualWidth());
         m_headerRefreshTimer = DispatcherTimer();
@@ -207,6 +208,114 @@ namespace winrt::DrakonDesktop::implementation
         setState(L"NavSettingsButton", destination == L"settings");
     }
 
+    bool ShellPage::CanAccessDestination(hstring const& destination) const
+    {
+        if (destination == L"login")
+        {
+            return true;
+        }
+
+        if (!m_authState.isAuthenticated)
+        {
+            return false;
+        }
+
+        if (destination == L"dashboard" || destination == L"events")
+        {
+            return m_authState.hasFullAccess;
+        }
+
+        if (destination == L"ai-agents" || destination == L"drakon-find")
+        {
+            return m_authState.hasFullAccess || m_authState.permissions.viewAgents;
+        }
+
+        if (destination == L"jobs")
+        {
+            return m_authState.hasFullAccess || m_authState.permissions.viewTasks;
+        }
+
+        if (destination == L"chat")
+        {
+            return m_authState.hasFullAccess || m_authState.permissions.chat;
+        }
+
+        if (destination == L"cameras")
+        {
+            return m_authState.hasFullAccess || m_authState.permissions.viewCameras;
+        }
+
+        if (destination == L"billing")
+        {
+            return m_authState.isAccountOwner;
+        }
+
+        if (destination == L"settings")
+        {
+            return m_authState.canManageSettings;
+        }
+
+        return true;
+    }
+
+    hstring ShellPage::PreferredDestination() const
+    {
+        if (!m_authState.isAuthenticated)
+        {
+            return L"login";
+        }
+
+        if (m_authState.hasFullAccess)
+        {
+            return L"dashboard";
+        }
+        if (m_authState.permissions.viewAgents)
+        {
+            return L"ai-agents";
+        }
+        if (m_authState.permissions.viewCameras)
+        {
+            return L"cameras";
+        }
+        if (m_authState.permissions.viewTasks)
+        {
+            return L"jobs";
+        }
+        if (m_authState.permissions.chat)
+        {
+            return L"chat";
+        }
+        if (m_authState.canManageSettings)
+        {
+            return L"settings";
+        }
+
+        return L"login";
+    }
+
+    void ShellPage::ApplyNavigationPermissions()
+    {
+        auto setVisibility = [&](hstring const& elementName, bool visible)
+            {
+                if (auto element = FindName(elementName).try_as<FrameworkElement>())
+                {
+                    element.Visibility(visible ? Visibility::Visible : Visibility::Collapsed);
+                }
+            };
+
+        setVisibility(L"NavDashboardButton", CanAccessDestination(L"dashboard"));
+        setVisibility(L"NavAIAgentsButton", CanAccessDestination(L"ai-agents"));
+        setVisibility(L"NavDrakonFindButton", CanAccessDestination(L"drakon-find"));
+        setVisibility(L"NavJobsButton", CanAccessDestination(L"jobs"));
+        setVisibility(L"NavChatButton", CanAccessDestination(L"chat"));
+        setVisibility(L"NavCamerasButton", CanAccessDestination(L"cameras"));
+        setVisibility(L"NavEventsButton", CanAccessDestination(L"events"));
+        setVisibility(L"NavSettingsButton", CanAccessDestination(L"settings"));
+        setVisibility(L"TokenBalanceButton", CanAccessDestination(L"billing"));
+        setVisibility(L"SystemActivityButton", CanAccessDestination(L"events"));
+        setVisibility(L"NotificationsButton", CanAccessDestination(L"events"));
+    }
+
     void ShellPage::ApplySidebarState(bool collapsed)
     {
         m_effectiveSidebarCollapsed = collapsed;
@@ -278,7 +387,10 @@ namespace winrt::DrakonDesktop::implementation
 
         if (auto tokenButton = FindName(L"TokenBalanceButton").try_as<FrameworkElement>())
         {
-            tokenButton.Visibility(compactHeader ? Visibility::Collapsed : Visibility::Visible);
+            tokenButton.Visibility(
+                !compactHeader && CanAccessDestination(L"billing")
+                    ? Visibility::Visible
+                    : Visibility::Collapsed);
         }
 
         if (auto systemActivityText = FindName(L"SystemActivityText").try_as<FrameworkElement>())
@@ -306,66 +418,72 @@ namespace winrt::DrakonDesktop::implementation
             return;
         }
 
-        m_currentDestination = destination;
-        UpdateNavigationSelection(destination);
+        auto resolvedDestination = destination;
+        if (!CanAccessDestination(resolvedDestination))
+        {
+            resolvedDestination = PreferredDestination();
+        }
 
-        if (destination == L"dashboard")
+        m_currentDestination = resolvedDestination;
+        UpdateNavigationSelection(resolvedDestination);
+
+        if (resolvedDestination == L"dashboard")
         {
             m_contentFrame.Content(make<DashboardPage>());
             SetNamedText(L"CurrentPageTitleText", L"Dashboard");
             return;
         }
 
-        if (destination == L"cameras")
+        if (resolvedDestination == L"cameras")
         {
             m_contentFrame.Content(make<CamerasPage>());
             SetNamedText(L"CurrentPageTitleText", L"Cameras");
             return;
         }
 
-        if (destination == L"ai-agents")
+        if (resolvedDestination == L"ai-agents")
         {
             m_contentFrame.Content(make<AIAgentsPage>());
             SetNamedText(L"CurrentPageTitleText", L"AI Agents");
             return;
         }
 
-        if (destination == L"chat")
+        if (resolvedDestination == L"chat")
         {
             m_contentFrame.Content(make<ChatPage>());
             SetNamedText(L"CurrentPageTitleText", L"Drakon Chat");
             return;
         }
 
-        if (destination == L"jobs")
+        if (resolvedDestination == L"jobs")
         {
             m_contentFrame.Content(make<JobsPage>());
             SetNamedText(L"CurrentPageTitleText", L"Jobs");
             return;
         }
 
-        if (destination == L"drakon-find")
+        if (resolvedDestination == L"drakon-find")
         {
             m_contentFrame.Content(make<DrakonFindPage>());
             SetNamedText(L"CurrentPageTitleText", L"Drakon Find");
             return;
         }
 
-        if (destination == L"billing")
+        if (resolvedDestination == L"billing")
         {
             m_contentFrame.Content(make<BillingPage>());
             SetNamedText(L"CurrentPageTitleText", L"Billing");
             return;
         }
 
-        if (destination == L"login")
+        if (resolvedDestination == L"login")
         {
             m_contentFrame.Content(make<LoginPage>());
             SetNamedText(L"CurrentPageTitleText", L"Login");
             return;
         }
 
-        if (destination == L"settings")
+        if (resolvedDestination == L"settings")
         {
             m_contentFrame.Content(make<SettingsPage>());
             SetNamedText(L"CurrentPageTitleText", L"Settings");
@@ -373,7 +491,7 @@ namespace winrt::DrakonDesktop::implementation
         }
 
         auto placeholder = winrt::make_self<ModulePlaceholderPage>();
-        auto spec = GetModuleSpec(destination);
+        auto spec = GetModuleSpec(resolvedDestination);
         placeholder->Configure(spec.title, spec.subtitle, spec.source);
         m_contentFrame.Content(*placeholder);
         SetNamedText(L"CurrentPageTitleText", spec.title);
@@ -399,6 +517,8 @@ namespace winrt::DrakonDesktop::implementation
 
         if (auth.success && auth.value.isAuthenticated)
         {
+            m_authState = auth.value;
+            ApplyNavigationPermissions();
             auto displayName = auth.value.displayName.empty() ? auth.value.email : auth.value.displayName;
             SetNamedText(L"CurrentUserNameText", to_hstring(displayName));
             SetNamedText(L"CurrentUserEmailText", to_hstring(auth.value.email));
@@ -406,16 +526,22 @@ namespace winrt::DrakonDesktop::implementation
             auto initial = displayName.empty() ? std::string("D") : std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(displayName.front()))));
             SetNamedText(L"CurrentUserInitialText", to_hstring(initial));
 
-            if (m_currentDestination == L"login")
+            if (m_currentDestination == L"login" || !CanAccessDestination(m_currentDestination))
             {
-                NavigateTo(L"dashboard");
+                NavigateTo(PreferredDestination());
             }
         }
         else
         {
+            m_authState = {};
+            ApplyNavigationPermissions();
             SetNamedText(L"CurrentUserNameText", L"Local Session");
             SetNamedText(L"CurrentUserEmailText", L"Faça login para carregar dados do backend");
             SetNamedText(L"CurrentUserInitialText", L"D");
+            if (m_currentDestination != L"login")
+            {
+                NavigateTo(L"login");
+            }
         }
 
         if (monthlyUsage.success)
@@ -463,6 +589,8 @@ namespace winrt::DrakonDesktop::implementation
         RoutedEventArgs const&)
     {
         services::DrakonApiClient::Instance().LocalLogout();
+        m_authState = {};
+        ApplyNavigationPermissions();
         SetNamedText(L"CurrentUserNameText", L"Local Session");
         SetNamedText(L"CurrentUserEmailText", L"Faça login para carregar dados do backend");
         SetNamedText(L"CurrentUserInitialText", L"D");

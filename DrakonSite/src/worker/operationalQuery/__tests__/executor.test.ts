@@ -159,3 +159,79 @@ test("composeOperationalExecutionResult renders a rich text identity card withou
   assert.match(result.draft_answer, /- Crop: nao/);
   assert.match(result.draft_answer, /- Zona: porta_a/);
 });
+
+test("composeOperationalExecutionResult renders real step cameras instead of state snapshot counts", () => {
+  const plan = makePlan();
+  plan.intent.subject.entity = "camera";
+  plan.intent.subject.view = "table";
+  plan.intent.filters.limit = 20;
+  plan.execution = [
+    {
+      source: "cameras",
+      strategy: "filter_join_sort_limit",
+      joins: ["job_runs", "step_runs"],
+      order_by: "camera_name_asc",
+      limit: 20,
+    },
+  ];
+  plan.resolved.jobs = [
+    {
+      entity_type: "job",
+      id: 4,
+      name: "Analise Acidente",
+      label: "Analise Acidente",
+      confidence: 0.98,
+    },
+  ];
+  plan.resolved.steps = [
+    {
+      entity_type: "step",
+      id: 12,
+      name: "All Cameras - Accident Det",
+      label: "All Cameras - Accident Det",
+      confidence: 0.98,
+      job_id: 4,
+      job_name: "Analise Acidente",
+    },
+  ];
+  plan.intent.scope.jobs = [4];
+  plan.intent.scope.steps = [12];
+
+  const result = composeOperationalExecutionResult({
+    plan,
+    context: makeContext(),
+    source: "cameras",
+    rows: [
+      {
+        camera_id: 101,
+        camera_name: "BV_EQT_AT_01",
+        step_id: 12,
+        step_name: "All Cameras - Accident Det",
+        job_id: 4,
+        job_name: "Analise Acidente",
+        slot_key: "bv_eqt_at_01",
+        input_type: "image",
+      },
+      {
+        camera_id: 102,
+        camera_name: "BV_SAT_GOI_02",
+        step_id: 12,
+        step_name: "All Cameras - Accident Det",
+        job_id: 4,
+        job_name: "Analise Acidente",
+        slot_key: "bv_sat_goi_02",
+        input_type: "image",
+      },
+    ],
+    datasets: {
+      cameras: [],
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.draft_answer, /## Cameras/);
+  assert.match(result.draft_answer, /step "All Cameras - Accident Det"/);
+  assert.match(result.draft_answer, /job "Analise Acidente"/);
+  assert.match(result.draft_answer, /1\. BV_EQT_AT_01/);
+  assert.match(result.draft_answer, /2\. BV_SAT_GOI_02/);
+});

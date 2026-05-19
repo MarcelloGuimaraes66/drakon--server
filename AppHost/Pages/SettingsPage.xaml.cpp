@@ -77,6 +77,46 @@ namespace
         }
         return 0;
     }
+
+    std::string ReadComboTag(ComboBox const& comboBox, std::string const& fallback = {})
+    {
+        if (auto item = comboBox.SelectedItem().try_as<ComboBoxItem>())
+        {
+            auto tag = unbox_value_or<hstring>(item.Tag(), L"");
+            if (!tag.empty())
+            {
+                return winrt::to_string(tag);
+            }
+        }
+        return fallback;
+    }
+
+    void SetComboSelectionByTag(ComboBox const& comboBox, std::string const& tagValue)
+    {
+        auto items = comboBox.Items();
+        for (uint32_t index = 0; index < items.Size(); ++index)
+        {
+            if (auto item = items.GetAt(index).try_as<ComboBoxItem>())
+            {
+                auto itemTag = winrt::to_string(unbox_value_or<hstring>(item.Tag(), L""));
+                if (itemTag == tagValue)
+                {
+                    comboBox.SelectedIndex(static_cast<int32_t>(index));
+                    return;
+                }
+            }
+        }
+    }
+
+    bool ReadCheckBox(CheckBox const& checkBox)
+    {
+        return checkBox.IsChecked().Value();
+    }
+
+    void SetCheckBox(CheckBox const& checkBox, bool value)
+    {
+        checkBox.IsChecked(box_value(value));
+    }
 }
 
 namespace winrt::DrakonDesktop::implementation
@@ -111,6 +151,7 @@ namespace winrt::DrakonDesktop::implementation
     {
         FindName(L"SettingsRefreshButton").as<Button>().Click({ this, &SettingsPage::OnRefreshClick });
         FindName(L"UserTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
+        FindName(L"UsersTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
         FindName(L"ApiKeysTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
         FindName(L"AlertsTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
         FindName(L"ConnectivityTabButton").as<Button>().Click({ this, &SettingsPage::OnTabClick });
@@ -127,6 +168,10 @@ namespace winrt::DrakonDesktop::implementation
         FindName(L"SaveZAiButton").as<Button>().Click({ this, &SettingsPage::OnSaveZAiClick });
         FindName(L"RemoveZAiButton").as<Button>().Click({ this, &SettingsPage::OnRemoveZAiClick });
         FindName(L"SaveTelegramButton").as<Button>().Click({ this, &SettingsPage::OnSaveTelegramClick });
+        FindName(L"CreateAccountUserButton").as<Button>().Click({ this, &SettingsPage::OnCreateAccountUserClick });
+        FindName(L"ManagedUsersComboBox").as<ComboBox>().SelectionChanged({ this, &SettingsPage::OnManagedUserSelectionChanged });
+        FindName(L"SaveManagedUserButton").as<Button>().Click({ this, &SettingsPage::OnSaveManagedUserClick });
+        FindName(L"ResetManagedUserPasswordButton").as<Button>().Click({ this, &SettingsPage::OnResetManagedUserPasswordClick });
     }
 
     void SettingsPage::ApplyActiveTab()
@@ -136,12 +181,15 @@ namespace winrt::DrakonDesktop::implementation
         auto inactiveStyle = styles.Lookup(box_value(L"SettingsTabButtonStyle")).as<Style>();
 
         FindName(L"UserTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::User ? activeStyle : inactiveStyle);
+        FindName(L"UsersTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::Users ? activeStyle : inactiveStyle);
         FindName(L"ApiKeysTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::ApiKeys ? activeStyle : inactiveStyle);
         FindName(L"AlertsTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::Alerts ? activeStyle : inactiveStyle);
         FindName(L"ConnectivityTabButton").as<Button>().Style(m_activeTab == SettingsSectionTab::Connectivity ? activeStyle : inactiveStyle);
 
         FindName(L"UserSettingsSection").as<FrameworkElement>().Visibility(
             m_activeTab == SettingsSectionTab::User ? Visibility::Visible : Visibility::Collapsed);
+        FindName(L"UsersSettingsSection").as<FrameworkElement>().Visibility(
+            m_activeTab == SettingsSectionTab::Users ? Visibility::Visible : Visibility::Collapsed);
         FindName(L"ApiKeysSettingsSection").as<FrameworkElement>().Visibility(
             m_activeTab == SettingsSectionTab::ApiKeys ? Visibility::Visible : Visibility::Collapsed);
         FindName(L"AlertsSettingsSection").as<FrameworkElement>().Visibility(
@@ -262,7 +310,148 @@ namespace winrt::DrakonDesktop::implementation
         SetText(L"TelegramChatIdTextBox", to_hstring(m_telegramSettings.chatId));
         FindName(L"TelegramBotTokenPasswordBox").as<PasswordBox>().Password(to_hstring(m_telegramSettings.botToken));
 
+        auto usersTabButton = FindName(L"UsersTabButton").as<FrameworkElement>();
+        usersTabButton.Visibility(m_authState.canManageSettings ? Visibility::Visible : Visibility::Collapsed);
+        if (!m_authState.canManageSettings && m_activeTab == SettingsSectionTab::Users)
+        {
+            m_activeTab = SettingsSectionTab::User;
+        }
+
+        RenderAccountUsersSection();
+
         ApplyActiveTab();
+    }
+
+    void SettingsPage::RenderAccountUsersSection()
+    {
+        auto usersSection = FindName(L"UsersSettingsSection").as<FrameworkElement>();
+        usersSection.Visibility(
+            m_activeTab == SettingsSectionTab::Users && m_authState.canManageSettings
+                ? Visibility::Visible
+                : Visibility::Collapsed);
+
+        auto createRoleCombo = FindName(L"CreateAccountRoleComboBox").as<ComboBox>();
+        if (createRoleCombo.Items().Size() > 1)
+        {
+            auto adminItem = createRoleCombo.Items().GetAt(1).as<ComboBoxItem>();
+            adminItem.Visibility(m_accountUsers.canAssignAdmin ? Visibility::Visible : Visibility::Collapsed);
+            if (!m_accountUsers.canAssignAdmin && ReadComboTag(createRoleCombo, "member") == "admin")
+            {
+                createRoleCombo.SelectedIndex(0);
+            }
+        }
+
+        auto managedUsersCombo = FindName(L"ManagedUsersComboBox").as<ComboBox>();
+        auto emptyStateText = FindName(L"ManagedUserEmptyStateText").as<TextBlock>();
+        auto editorGrid = FindName(L"ManagedUserEditorGrid").as<FrameworkElement>();
+        auto managedStatusText = FindName(L"ManagedUserStatusText").as<TextBlock>();
+
+        auto currentSelection = ReadComboTag(managedUsersCombo, m_selectedManagedUserId);
+        managedUsersCombo.Items().Clear();
+        for (auto const& user : m_accountUsers.users)
+        {
+            ComboBoxItem item;
+            auto roleLabel = user.isOwner ? std::string("owner") : user.role;
+            item.Content(box_value(to_hstring(user.email + " (" + roleLabel + ")")));
+            item.Tag(box_value(to_hstring(user.memberUserId)));
+            managedUsersCombo.Items().Append(item);
+        }
+
+        if (m_selectedManagedUserId.empty())
+        {
+            m_selectedManagedUserId = currentSelection;
+        }
+
+        if (!m_selectedManagedUserId.empty())
+        {
+            SetComboSelectionByTag(managedUsersCombo, m_selectedManagedUserId);
+        }
+        else if (!m_accountUsers.users.empty())
+        {
+            m_selectedManagedUserId = m_accountUsers.users.front().memberUserId;
+            SetComboSelectionByTag(managedUsersCombo, m_selectedManagedUserId);
+        }
+
+        auto selectedIterator = std::find_if(
+            m_accountUsers.users.begin(),
+            m_accountUsers.users.end(),
+            [&](services::AccountUserRecord const& user)
+            {
+                return user.memberUserId == m_selectedManagedUserId;
+            });
+
+        if (selectedIterator == m_accountUsers.users.end())
+        {
+            emptyStateText.Visibility(Visibility::Visible);
+            editorGrid.Visibility(Visibility::Collapsed);
+            managedStatusText.Text(L"No subaccounts available yet.");
+            SetText(L"ManagedUserEmailTextBox", L"");
+            FindName(L"ManagedUserPasswordBox").as<PasswordBox>().Password(L"");
+            return;
+        }
+
+        emptyStateText.Visibility(Visibility::Collapsed);
+        editorGrid.Visibility(Visibility::Visible);
+
+        auto const& selectedUser = *selectedIterator;
+        SetText(L"ManagedUserEmailTextBox", to_hstring(selectedUser.email));
+        SetComboSelectionByTag(
+            FindName(L"ManagedUserRoleComboBox").as<ComboBox>(),
+            selectedUser.isAdmin ? "admin" : "member");
+        SetComboSelectionByTag(
+            FindName(L"ManagedUserStatusComboBox").as<ComboBox>(),
+            selectedUser.status.empty() ? "active" : selectedUser.status);
+
+        SetCheckBox(FindName(L"ManagedUserFullAccessCheckBox").as<CheckBox>(), selectedUser.fullAccess);
+        SetCheckBox(FindName(L"ManagedUserViewCamerasCheckBox").as<CheckBox>(), selectedUser.viewCameras);
+        SetCheckBox(FindName(L"ManagedUserExecuteCamerasCheckBox").as<CheckBox>(), selectedUser.executeCameras);
+        SetCheckBox(FindName(L"ManagedUserViewTasksCheckBox").as<CheckBox>(), selectedUser.viewTasks);
+        SetCheckBox(FindName(L"ManagedUserExecuteTasksCheckBox").as<CheckBox>(), selectedUser.executeTasks);
+        SetCheckBox(FindName(L"ManagedUserViewAgentsCheckBox").as<CheckBox>(), selectedUser.viewAgents);
+        SetCheckBox(FindName(L"ManagedUserExecuteAgentsCheckBox").as<CheckBox>(), selectedUser.executeAgents);
+        SetCheckBox(FindName(L"ManagedUserChatCheckBox").as<CheckBox>(), selectedUser.chat);
+        FindName(L"ManagedUserPasswordBox").as<PasswordBox>().Password(L"");
+
+        auto canEditAdminRows = m_accountUsers.canAssignAdmin;
+        auto canEditSelectedUser = !selectedUser.isOwner && (canEditAdminRows || !selectedUser.isAdmin);
+        auto forceFullAccess = selectedUser.isAdmin;
+        auto permissionControlsEnabled = canEditSelectedUser && !selectedUser.fullAccess && !forceFullAccess;
+
+        auto roleCombo = FindName(L"ManagedUserRoleComboBox").as<ComboBox>();
+        if (roleCombo.Items().Size() > 1)
+        {
+            auto adminItem = roleCombo.Items().GetAt(1).as<ComboBoxItem>();
+            adminItem.Visibility(canEditAdminRows || selectedUser.isAdmin ? Visibility::Visible : Visibility::Collapsed);
+        }
+        roleCombo.IsEnabled(canEditSelectedUser && canEditAdminRows);
+        FindName(L"ManagedUserStatusComboBox").as<ComboBox>().IsEnabled(!selectedUser.isOwner);
+        FindName(L"ManagedUserFullAccessCheckBox").as<CheckBox>().IsEnabled(canEditSelectedUser && !forceFullAccess);
+        FindName(L"ManagedUserViewCamerasCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserExecuteCamerasCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserViewTasksCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserExecuteTasksCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserViewAgentsCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserExecuteAgentsCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"ManagedUserChatCheckBox").as<CheckBox>().IsEnabled(permissionControlsEnabled);
+        FindName(L"SaveManagedUserButton").as<Button>().IsEnabled(!selectedUser.isOwner);
+        FindName(L"ManagedUserPasswordBox").as<PasswordBox>().IsEnabled(canEditSelectedUser);
+        FindName(L"ResetManagedUserPasswordButton").as<Button>().IsEnabled(canEditSelectedUser);
+
+        if (selectedUser.isOwner)
+        {
+            managedStatusText.Text(L"The main owner is view-only in this panel.");
+        }
+        else if (selectedUser.isAdmin && !canEditAdminRows)
+        {
+            managedStatusText.Text(L"Only the main owner can edit admin subaccounts.");
+        }
+        else
+        {
+            managedStatusText.Text(to_hstring(
+                selectedUser.updatedAt.empty()
+                    ? std::string("Passwords for subaccounts are managed here.")
+                    : std::string("Last update: ") + selectedUser.updatedAt));
+        }
     }
 
     fire_and_forget SettingsPage::RefreshSettingsAsync(bool announceResult)
@@ -281,6 +470,7 @@ namespace winrt::DrakonDesktop::implementation
         decltype(services::DrakonApiClient::Instance().GetOpenAiSettings()) openAi{};
         decltype(services::DrakonApiClient::Instance().GetZAiSettings()) zAi{};
         decltype(services::DrakonApiClient::Instance().GetTelegramSettings()) telegram{};
+        decltype(services::DrakonApiClient::Instance().GetAccountUsers()) accountUsers{};
 
         if (auth.success && auth.value.isAuthenticated)
         {
@@ -288,6 +478,10 @@ namespace winrt::DrakonDesktop::implementation
             openAi = services::DrakonApiClient::Instance().GetOpenAiSettings();
             zAi = services::DrakonApiClient::Instance().GetZAiSettings();
             telegram = services::DrakonApiClient::Instance().GetTelegramSettings();
+            if (auth.value.canManageSettings)
+            {
+                accountUsers = services::DrakonApiClient::Instance().GetAccountUsers();
+            }
         }
 
         co_await uiThread;
@@ -303,6 +497,35 @@ namespace winrt::DrakonDesktop::implementation
             if (openAi.success) m_openAiSettings = openAi.value;
             if (zAi.success) m_zAiSettings = zAi.value;
             if (telegram.success) m_telegramSettings = telegram.value;
+            if (accountUsers.success)
+            {
+                m_accountUsers = accountUsers.value;
+                if (m_selectedManagedUserId.empty() && !m_accountUsers.users.empty())
+                {
+                    m_selectedManagedUserId = m_accountUsers.users.front().memberUserId;
+                }
+                else if (!m_selectedManagedUserId.empty())
+                {
+                    auto found = std::find_if(
+                        m_accountUsers.users.begin(),
+                        m_accountUsers.users.end(),
+                        [&](services::AccountUserRecord const& user)
+                        {
+                            return user.memberUserId == m_selectedManagedUserId;
+                        });
+                    if (found == m_accountUsers.users.end())
+                    {
+                        m_selectedManagedUserId = m_accountUsers.users.empty()
+                            ? std::string{}
+                            : m_accountUsers.users.front().memberUserId;
+                    }
+                }
+            }
+            else if (!auth.value.canManageSettings)
+            {
+                m_accountUsers = {};
+                m_selectedManagedUserId.clear();
+            }
             RenderState();
 
             if (announceResult)
@@ -586,6 +809,200 @@ namespace winrt::DrakonDesktop::implementation
         ShowStatus(L"Telegram settings saved.", InfoBarSeverity::Success);
     }
 
+    fire_and_forget SettingsPage::OnCreateAccountUserClick(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto lifetime = get_strong();
+        winrt::apartment_context uiThread;
+
+        if (!m_authState.canManageSettings)
+        {
+            ShowStatus(L"Only owner or admin sessions can create subaccounts.", InfoBarSeverity::Warning);
+            co_return;
+        }
+
+        auto email = winrt::to_string(FindName(L"CreateAccountUserEmailTextBox").as<TextBox>().Text());
+        auto password = winrt::to_string(FindName(L"CreateAccountUserPasswordBox").as<PasswordBox>().Password());
+        if (TrimAscii(email).empty())
+        {
+            ShowStatus(L"Enter an email for the new subaccount.", InfoBarSeverity::Warning);
+            co_return;
+        }
+        if (password.size() < 8)
+        {
+            ShowStatus(L"Subaccount passwords must be at least 8 characters.", InfoBarSeverity::Warning);
+            co_return;
+        }
+
+        services::AccountUserCreateRequest request;
+        request.email = TrimAscii(email);
+        request.password = password;
+        request.role = ReadComboTag(FindName(L"CreateAccountRoleComboBox").as<ComboBox>(), "member");
+        request.fullAccess = ReadCheckBox(FindName(L"CreateAccountFullAccessCheckBox").as<CheckBox>());
+        request.viewCameras = ReadCheckBox(FindName(L"CreateAccountViewCamerasCheckBox").as<CheckBox>());
+        request.executeCameras = ReadCheckBox(FindName(L"CreateAccountExecuteCamerasCheckBox").as<CheckBox>());
+        request.viewTasks = ReadCheckBox(FindName(L"CreateAccountViewTasksCheckBox").as<CheckBox>());
+        request.executeTasks = ReadCheckBox(FindName(L"CreateAccountExecuteTasksCheckBox").as<CheckBox>());
+        request.viewAgents = ReadCheckBox(FindName(L"CreateAccountViewAgentsCheckBox").as<CheckBox>());
+        request.executeAgents = ReadCheckBox(FindName(L"CreateAccountExecuteAgentsCheckBox").as<CheckBox>());
+        request.chat = ReadCheckBox(FindName(L"CreateAccountChatCheckBox").as<CheckBox>());
+
+        if (request.role == "admin" || request.fullAccess)
+        {
+            request.fullAccess = true;
+            request.viewCameras = true;
+            request.executeCameras = true;
+            request.viewTasks = true;
+            request.executeTasks = true;
+            request.viewAgents = true;
+            request.executeAgents = true;
+            request.chat = true;
+        }
+
+        ShowStatus(L"Creating subaccount...", InfoBarSeverity::Informational);
+
+        co_await winrt::resume_background();
+        auto createResponse = services::DrakonApiClient::Instance().CreateAccountUser(request);
+        auto usersResponse = createResponse.success
+            ? services::DrakonApiClient::Instance().GetAccountUsers()
+            : services::ServiceValueResponse<services::AccountUsersSnapshot>{};
+        co_await uiThread;
+
+        if (!createResponse.success)
+        {
+            ShowStatus(to_hstring(createResponse.error), createResponse.statusCode == 0 ? InfoBarSeverity::Warning : InfoBarSeverity::Error);
+            co_return;
+        }
+
+        if (usersResponse.success)
+        {
+            m_accountUsers = usersResponse.value;
+        }
+        m_selectedManagedUserId = createResponse.value.memberUserId;
+        FindName(L"CreateAccountUserEmailTextBox").as<TextBox>().Text(L"");
+        FindName(L"CreateAccountUserPasswordBox").as<PasswordBox>().Password(L"");
+        FindName(L"CreateAccountRoleComboBox").as<ComboBox>().SelectedIndex(0);
+        SetCheckBox(FindName(L"CreateAccountFullAccessCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountViewCamerasCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountExecuteCamerasCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountViewTasksCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountExecuteTasksCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountViewAgentsCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountExecuteAgentsCheckBox").as<CheckBox>(), false);
+        SetCheckBox(FindName(L"CreateAccountChatCheckBox").as<CheckBox>(), false);
+        SetText(L"CreateAccountUserStatusText", L"Subaccount created.");
+        RenderState();
+        ShowStatus(L"Subaccount created successfully.", InfoBarSeverity::Success);
+    }
+
+    void SettingsPage::OnManagedUserSelectionChanged(
+        IInspectable const& sender,
+        SelectionChangedEventArgs const&)
+    {
+        if (auto combo = sender.try_as<ComboBox>())
+        {
+            m_selectedManagedUserId = ReadComboTag(combo, "");
+            RenderAccountUsersSection();
+        }
+    }
+
+    fire_and_forget SettingsPage::OnSaveManagedUserClick(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto lifetime = get_strong();
+        winrt::apartment_context uiThread;
+
+        if (m_selectedManagedUserId.empty())
+        {
+            ShowStatus(L"Select a subaccount first.", InfoBarSeverity::Warning);
+            co_return;
+        }
+
+        services::AccountUserUpdateRequest request;
+        request.role = ReadComboTag(FindName(L"ManagedUserRoleComboBox").as<ComboBox>(), "member");
+        request.status = ReadComboTag(FindName(L"ManagedUserStatusComboBox").as<ComboBox>(), "active");
+        request.fullAccess = ReadCheckBox(FindName(L"ManagedUserFullAccessCheckBox").as<CheckBox>());
+        request.viewCameras = ReadCheckBox(FindName(L"ManagedUserViewCamerasCheckBox").as<CheckBox>());
+        request.executeCameras = ReadCheckBox(FindName(L"ManagedUserExecuteCamerasCheckBox").as<CheckBox>());
+        request.viewTasks = ReadCheckBox(FindName(L"ManagedUserViewTasksCheckBox").as<CheckBox>());
+        request.executeTasks = ReadCheckBox(FindName(L"ManagedUserExecuteTasksCheckBox").as<CheckBox>());
+        request.viewAgents = ReadCheckBox(FindName(L"ManagedUserViewAgentsCheckBox").as<CheckBox>());
+        request.executeAgents = ReadCheckBox(FindName(L"ManagedUserExecuteAgentsCheckBox").as<CheckBox>());
+        request.chat = ReadCheckBox(FindName(L"ManagedUserChatCheckBox").as<CheckBox>());
+
+        if (request.role == "admin" || request.fullAccess)
+        {
+            request.fullAccess = true;
+            request.viewCameras = true;
+            request.executeCameras = true;
+            request.viewTasks = true;
+            request.executeTasks = true;
+            request.viewAgents = true;
+            request.executeAgents = true;
+            request.chat = true;
+        }
+
+        ShowStatus(L"Saving subaccount changes...", InfoBarSeverity::Informational);
+
+        co_await winrt::resume_background();
+        auto updateResponse = services::DrakonApiClient::Instance().UpdateAccountUser(
+            m_selectedManagedUserId,
+            request);
+        auto usersResponse = updateResponse.success
+            ? services::DrakonApiClient::Instance().GetAccountUsers()
+            : services::ServiceValueResponse<services::AccountUsersSnapshot>{};
+        co_await uiThread;
+
+        if (!updateResponse.success)
+        {
+            ShowStatus(to_hstring(updateResponse.error), updateResponse.statusCode == 0 ? InfoBarSeverity::Warning : InfoBarSeverity::Error);
+            co_return;
+        }
+
+        if (usersResponse.success)
+        {
+            m_accountUsers = usersResponse.value;
+        }
+        SetText(L"ManagedUserStatusText", L"Changes saved.");
+        RenderState();
+        ShowStatus(L"Subaccount permissions updated.", InfoBarSeverity::Success);
+    }
+
+    fire_and_forget SettingsPage::OnResetManagedUserPasswordClick(IInspectable const&, RoutedEventArgs const&)
+    {
+        auto lifetime = get_strong();
+        winrt::apartment_context uiThread;
+
+        if (m_selectedManagedUserId.empty())
+        {
+            ShowStatus(L"Select a subaccount first.", InfoBarSeverity::Warning);
+            co_return;
+        }
+
+        auto password = winrt::to_string(FindName(L"ManagedUserPasswordBox").as<PasswordBox>().Password());
+        if (password.size() < 8)
+        {
+            ShowStatus(L"Passwords must be at least 8 characters.", InfoBarSeverity::Warning);
+            co_return;
+        }
+
+        ShowStatus(L"Updating subaccount password...", InfoBarSeverity::Informational);
+
+        co_await winrt::resume_background();
+        auto response = services::DrakonApiClient::Instance().ResetAccountUserPassword(
+            m_selectedManagedUserId,
+            password);
+        co_await uiThread;
+
+        if (!response.success)
+        {
+            ShowStatus(to_hstring(response.error), response.statusCode == 0 ? InfoBarSeverity::Warning : InfoBarSeverity::Error);
+            co_return;
+        }
+
+        FindName(L"ManagedUserPasswordBox").as<PasswordBox>().Password(L"");
+        SetText(L"ManagedUserStatusText", L"Password updated.");
+        ShowStatus(L"Subaccount password updated.", InfoBarSeverity::Success);
+    }
+
     void SettingsPage::OnRefreshClick(IInspectable const&, RoutedEventArgs const&)
     {
         RefreshSettingsAsync(true);
@@ -596,12 +1013,15 @@ namespace winrt::DrakonDesktop::implementation
         switch (ReadTaggedInt32(sender))
         {
         case 1:
-            m_activeTab = SettingsSectionTab::ApiKeys;
+            m_activeTab = SettingsSectionTab::Users;
             break;
         case 2:
-            m_activeTab = SettingsSectionTab::Alerts;
+            m_activeTab = SettingsSectionTab::ApiKeys;
             break;
         case 3:
+            m_activeTab = SettingsSectionTab::Alerts;
+            break;
+        case 4:
             m_activeTab = SettingsSectionTab::Connectivity;
             break;
         case 0:
@@ -616,7 +1036,8 @@ namespace winrt::DrakonDesktop::implementation
     void SettingsPage::OnPollTimerTick(IInspectable const&, IInspectable const&)
     {
         UpdatePairCodeCountdown();
-        if (!m_pairCode.empty() || m_pairingStatus.status == "connected")
+        if (m_activeTab == SettingsSectionTab::Connectivity &&
+            (!m_pairCode.empty() || m_pairingStatus.status == "connected"))
         {
             PollPairingAsync();
         }

@@ -6,9 +6,11 @@ import Layout from "@/react-app/components/Layout";
 import SettingsTabs, {
   type SettingsTabView,
 } from "@/react-app/components/settings/SettingsTabs";
+import AccountUsersPanel from "@/react-app/components/settings/AccountUsersPanel";
 import WorkspaceAccessPanel from "@/react-app/components/settings/WorkspaceAccessPanel";
 import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import { isAccountOwner } from "@/react-app/lib/accountAccess";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { brand } from "@/shared/brand";
 import {
@@ -137,7 +139,6 @@ export default function Settings() {
   const [expiresAt, setExpiresAt] = useState("");
   const [copied, setCopied] = useState(false);
   const [copiedConnectionField, setCopiedConnectionField] = useState<"client" | "exe" | null>(null);
-  const [isQuickInstructionsOpen, setIsQuickInstructionsOpen] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [pairingStatus, setPairingStatus] = useState<PairingStatus>({ status: "not_connected" });
   const [loadingStatus, setLoadingStatus] = useState(true);
@@ -224,12 +225,17 @@ export default function Settings() {
     (typeof user?.google_user_data?.name === "string" && user.google_user_data.name.trim()) ||
     (typeof user?.email === "string" ? user.email.trim() : "") ||
     "your operator session";
+  const isAccountOwnerSession = isAccountOwner(user);
+  const canEditPrimaryAccount = !isRemoteWorkspace && isAccountOwnerSession;
+  const showAccountUsersTab = !isRemoteWorkspace;
 
   const selectSettingsTab = (tab: SettingsTabView) => {
     setActiveTab(tab);
     const nextPath =
       tab === "alerts"
         ? "/settings/alerts"
+        : tab === "users"
+        ? "/settings?tab=users"
         : tab === "workspace-access"
         ? "/settings?tab=workspace-access"
         : "/settings";
@@ -844,6 +850,10 @@ export default function Settings() {
       setActiveTab("workspace-access");
       return;
     }
+    if (params.get("tab") === "users" && showAccountUsersTab) {
+      setActiveTab("users");
+      return;
+    }
     if (focus === "openai") {
       setActiveTab("api-keys");
       setHighlightOpenAiCard(true);
@@ -872,7 +882,7 @@ export default function Settings() {
         window.clearTimeout(timeoutId);
       };
     }
-  }, [location.pathname, location.search]);
+  }, [location.pathname, location.search, showAccountUsersTab]);
 
   useEffect(() => {
     if (
@@ -926,10 +936,12 @@ export default function Settings() {
             <SettingsTabs
               activeView={activeTab}
               onSelectUser={() => selectSettingsTab("user")}
+              onSelectUsers={() => selectSettingsTab("users")}
               onSelectApiKeys={() => selectSettingsTab("api-keys")}
               onSelectAlerts={() => selectSettingsTab("alerts")}
               onSelectConnectivity={() => selectSettingsTab("connectivity")}
               onSelectWorkspaceAccess={() => selectSettingsTab("workspace-access")}
+              showAccountUsers={showAccountUsersTab}
               showWorkspaceAccess={brand.features.workspaceAccessEnabled}
             />
           </div>
@@ -1022,13 +1034,13 @@ export default function Settings() {
                       setHandleMessageType(null);
                     }}
                     placeholder={t("settings.handlePlaceholder")}
-                    disabled={handleSaving || isRemoteWorkspace}
+                    disabled={handleSaving || !canEditPrimaryAccount}
                     className="w-full bg-transparent py-2.5 pr-4 text-gray-100 placeholder-gray-500 focus:outline-none disabled:opacity-50"
                   />
                 </div>
                 <button
                   type="submit"
-                  disabled={isRemoteWorkspace || handleSaving || !isHandleDirty || !isHandleValid}
+                  disabled={!canEditPrimaryAccount || handleSaving || !isHandleDirty || !isHandleValid}
                   className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 font-medium text-white transition-colors hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500"
                 >
                   {handleSaving ? (
@@ -1045,6 +1057,10 @@ export default function Settings() {
               {isRemoteWorkspace ? (
                 <p className="text-xs text-cyan-200/80">
                   Handle updates are disabled during remote workspace sessions.
+                </p>
+              ) : !canEditPrimaryAccount ? (
+                <p className="text-xs text-amber-200/80">
+                  Profile changes for the main account are available only to the primary owner.
                 </p>
               ) : null}
               {handleMessage ? (
@@ -1078,18 +1094,20 @@ export default function Settings() {
                   </p>
                   <p
                     className={`mt-1 text-xs ${
-                      isRemoteWorkspace ? "text-cyan-200/80" : "text-gray-500"
+                      !canEditPrimaryAccount ? "text-amber-200/80" : "text-gray-500"
                     }`}
                   >
-                    {isRemoteWorkspace
+                    {!canEditPrimaryAccount
+                      ? isRemoteWorkspace
                       ? "Account deletion is unavailable inside a remote workspace session."
+                      : "Only the main account owner can delete this account."
                       : t("settings.deleteAccount.inlineHint")}
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={openDeleteAccountModal}
-                  disabled={isRemoteWorkspace}
+                  disabled={!canEditPrimaryAccount}
                   className="inline-flex min-h-[36px] items-center justify-center self-start rounded-lg px-2 py-2 text-sm font-medium text-gray-500 transition-colors hover:text-rose-300 disabled:cursor-not-allowed disabled:text-gray-600 sm:self-auto"
                 >
                   {t("settings.deleteAccount.open")}
@@ -1393,6 +1411,12 @@ export default function Settings() {
             </div>
           )}
 
+          {activeTab === "users" && showAccountUsersTab && (
+            <div className="mb-4 md:mb-6">
+              <AccountUsersPanel />
+            </div>
+          )}
+
           {activeTab === "workspace-access" && brand.features.workspaceAccessEnabled && (
             <div className="mb-4 md:mb-6">
               <WorkspaceAccessPanel />
@@ -1550,64 +1574,6 @@ export default function Settings() {
                 )}
               </div>
             )}
-
-            <div className="rounded-xl border border-gray-700/50 bg-gray-800/50">
-              <button
-                type="button"
-                onClick={() => setIsQuickInstructionsOpen((prev) => !prev)}
-                className="w-full flex items-center gap-3 px-4 py-4 text-left"
-              >
-                {isQuickInstructionsOpen ? (
-                  <ChevronDown className="w-5 h-5 text-gray-300" />
-                ) : (
-                  <ChevronRight className="w-5 h-5 text-gray-300" />
-                )}
-                <span className="text-base font-semibold text-gray-100">
-                  {t("settings.quickInstructions")}
-                </span>
-              </button>
-
-              {isQuickInstructionsOpen && (
-                <div className="border-t border-gray-800 px-4 pb-4 pt-3 space-y-3">
-                  <div className="flex items-center gap-3">
-                    <span className="h-8 w-8 rounded-full bg-blue-500/20 text-blue-300 flex items-center justify-center text-sm font-semibold">
-                      1
-                    </span>
-                    <span className="text-sm text-gray-300">{t("settings.step1")}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="h-8 w-8 rounded-full bg-blue-500/20 text-blue-300 flex items-center justify-center text-sm font-semibold">
-                      2
-                    </span>
-                    <span className="text-sm text-gray-300">{t("settings.step2")}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="h-8 w-8 rounded-full bg-blue-500/20 text-blue-300 flex items-center justify-center text-sm font-semibold">
-                      3
-                    </span>
-                    <span className="text-sm text-gray-300">{t("settings.step3")}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={`h-8 w-8 rounded-full flex items-center justify-center text-sm font-semibold ${
-                        pairingStatus.status === "connected"
-                          ? "bg-emerald-500/20 text-emerald-400"
-                          : "bg-gray-700 text-gray-300"
-                      }`}
-                    >
-                      {pairingStatus.status === "connected" ? <CheckCircle className="w-5 h-5" /> : "4"}
-                    </span>
-                    <span
-                      className={`text-sm ${
-                        pairingStatus.status === "connected" ? "text-emerald-400" : "text-gray-400"
-                      }`}
-                    >
-                      {t("settings.step4")}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
 
             {pairingStatus.status === "connected" && (
               <button

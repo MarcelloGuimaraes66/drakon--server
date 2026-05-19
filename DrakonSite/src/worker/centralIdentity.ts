@@ -437,6 +437,7 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
         owner_public_id UUID NOT NULL REFERENCES server_users(public_id) ON DELETE CASCADE,
         invitee_public_id UUID NOT NULL REFERENCES server_users(public_id) ON DELETE CASCADE,
         permission_profile TEXT NOT NULL DEFAULT 'full_access',
+        access_config_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending',
         created_at TEXT NOT NULL,
         accepted_at TEXT,
@@ -451,6 +452,7 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
         owner_public_id TEXT NOT NULL,
         invitee_public_id TEXT NOT NULL,
         permission_profile TEXT NOT NULL DEFAULT 'full_access',
+        access_config_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending',
         created_at TEXT NOT NULL,
         accepted_at TEXT,
@@ -495,6 +497,7 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
         owner_public_id UUID NOT NULL REFERENCES server_users(public_id) ON DELETE CASCADE,
         operator_public_id UUID NOT NULL REFERENCES server_users(public_id) ON DELETE CASCADE,
         permission_profile TEXT NOT NULL DEFAULT 'full_access',
+        access_config_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending_owner',
         requested_by_policy TEXT NOT NULL DEFAULT 'allow_while_open',
         requested_at TEXT NOT NULL,
@@ -512,6 +515,7 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
         owner_public_id TEXT NOT NULL,
         operator_public_id TEXT NOT NULL,
         permission_profile TEXT NOT NULL DEFAULT 'full_access',
+        access_config_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending_owner',
         requested_by_policy TEXT NOT NULL DEFAULT 'allow_while_open',
         requested_at TEXT NOT NULL,
@@ -665,6 +669,9 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
       `ALTER TABLE workspace_access_invites ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'full_access'`
     );
     await addColumnIfMissing(
+      `ALTER TABLE workspace_access_invites ADD COLUMN access_config_json TEXT NOT NULL DEFAULT '{}'`
+    );
+    await addColumnIfMissing(
       `ALTER TABLE workspace_access_invites ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`
     );
     await addColumnIfMissing(`ALTER TABLE workspace_access_invites ADD COLUMN created_at TEXT`);
@@ -698,6 +705,9 @@ export async function ensureCentralIdentitySchema(db: D1Database): Promise<void>
     }
     await addColumnIfMissing(
       `ALTER TABLE workspace_access_sessions ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'full_access'`
+    );
+    await addColumnIfMissing(
+      `ALTER TABLE workspace_access_sessions ADD COLUMN access_config_json TEXT NOT NULL DEFAULT '{}'`
     );
     await addColumnIfMissing(
       `ALTER TABLE workspace_access_sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'pending_owner'`

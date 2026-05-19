@@ -4663,6 +4663,9 @@ function StepCard({
   const [targetCameraDraft, setTargetCameraDraft] = useState("");
   const [assigningTargetIds, setAssigningTargetIds] = useState<Set<number>>(new Set());
   const [showAllTargets, setShowAllTargets] = useState(false);
+  const [expandedInferenceGroupIds, setExpandedInferenceGroupIds] = useState<Set<string>>(
+    new Set()
+  );
   const [confirmCloneAgent, setConfirmCloneAgent] = useState<{
     isOpen: boolean;
     targetId: number | null;
@@ -4737,6 +4740,7 @@ function StepCard({
     setShowTargetSelect(false);
     setTargetPickerQuery("");
   };
+  const collapsedTargetPreviewLimit = 3;
 
   const toggleTargetPicker = () => {
     setShowTargetSelect((current) => {
@@ -4783,6 +4787,18 @@ function StepCard({
         next.delete(targetId);
       } else {
         next.add(targetId);
+      }
+      return next;
+    });
+  };
+
+  const toggleInferenceGroupTargets = (groupId: string) => {
+    setExpandedInferenceGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
       }
       return next;
     });
@@ -5147,6 +5163,7 @@ function StepCard({
   useEffect(() => {
     setExpandedTargetId(null);
     setShowAllTargets(false);
+    setExpandedInferenceGroupIds(new Set());
     setStepDataLoaded(false);
     handledAgentDeepLinkKeyRef.current = null;
   }, [step.id]);
@@ -5162,6 +5179,20 @@ function StepCard({
   useEffect(() => {
     setInferenceGroups(parseInferenceGroups(step.inference_groups));
   }, [step.id, step.inference_groups]);
+
+  useEffect(() => {
+    setExpandedInferenceGroupIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validGroupIds = new Set(inferenceGroups.map((group) => group.id));
+      const next = new Set<string>();
+      prev.forEach((groupId) => {
+        if (validGroupIds.has(groupId)) {
+          next.add(groupId);
+        }
+      });
+      return next.size === prev.size ? prev : next;
+    });
+  }, [inferenceGroups]);
 
   useEffect(() => {
     const pipelines = parsePipelinesFromStep(step);
@@ -9412,7 +9443,9 @@ function StepCard({
 
   const forceAllTargetsVisible = showTargetSelect || isTargetMultiSelect;
   const visibleTargets =
-    forceAllTargetsVisible || showAllTargets ? targets : targets.slice(0, 3);
+    forceAllTargetsVisible || showAllTargets
+      ? targets
+      : targets.slice(0, collapsedTargetPreviewLimit);
   const hiddenTargetsCount = Math.max(0, targets.length - visibleTargets.length);
   const isCompactFlow = density === "compact";
   const stepActionBaseClass =
@@ -9984,7 +10017,7 @@ function StepCard({
                   <span className="text-[11px] text-gray-500">
                     {visibleTargets.length} / {targets.length} {targets.length === 1 ? "camera" : "cameras"}
                   </span>
-                  {targets.length > 3 && !forceAllTargetsVisible ? (
+                  {targets.length > collapsedTargetPreviewLimit && !forceAllTargetsVisible ? (
                     <button
                       type="button"
                       onClick={() => setShowAllTargets((current) => !current)}
@@ -10147,102 +10180,136 @@ function StepCard({
                       </span>
                     </div>
                     <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      {inferenceGroups.map((group) => (
-                        <div
-                          key={group.id}
-                          className="rounded-xl border border-blue-500/30 bg-blue-600/15 p-4"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="text-sm font-medium text-blue-100">
-                              {group.name}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
-                                title={t("jobs.editGroup")}
-                                onClick={() => {
-                                  const inferredSourceTargetId =
-                                    group.source_target_id ??
-                                    group.targetIds.find((targetId) => {
-                                      const target = targets.find((t) => t.id === targetId);
-                                      if (!target) return false;
-                                      const targetAgent = agents.find(
-                                        (agent) =>
-                                          agent.is_active === 1 &&
-                                          agent.camera_id === target.camera_id
-                                      );
-                                      const effectiveAgent = targetAgent || defaultAgent;
-                                      return effectiveAgent?.agent_key === group.agentKey;
-                                    }) ??
-                                    null;
-                                  setEditingGroupId(group.id);
-                                  setGroupName(group.name);
-                                  setGroupAgentKey(group.agentKey);
-                                  setGroupAgentSourceTargetId(inferredSourceTargetId);
-                                  setGroupRunEvery(
-                                    normalizeGroupRunEverySeconds(
-                                      group.run_every,
-                                      FIXED_GROUP_RUN_EVERY_SECONDS
-                                    )
-                                  );
-                                  setShowGroupModal(true);
-                                }}
-                              >
-                                <Edit2 className="w-4 h-4" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveGroup(group.id)}
-                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
-                                title={t("jobs.deleteGroup")}
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            </div>
-                          </div>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            {group.targetIds.map((targetId) => {
-                              const target = targets.find((t) => t.id === targetId);
-                              if (!target) return null;
-                              const targetLabel =
-                                target.camera_name || `Camera ${target.camera_id}`;
-                              return (
-                                <span
-                                  key={targetId}
-                                  title={targetLabel}
-                                  className="inline-flex min-w-0 max-w-full items-center rounded-full border border-blue-400/20 bg-blue-900/40 px-3 py-1.5 text-xs font-medium text-blue-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
-                                >
-                                  <span className="min-w-0 truncate whitespace-nowrap">
-                                    {targetLabel}
-                                  </span>
-                                </span>
-                              );
-                            })}
-                          </div>
-                          <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
-                            {t("jobs.unifiedAgent")}
-                          </div>
+                      {inferenceGroups.map((group) => {
+                        const showAllGroupTargets = expandedInferenceGroupIds.has(group.id);
+                        const visibleGroupTargetIds = showAllGroupTargets
+                          ? group.targetIds
+                          : group.targetIds.slice(0, collapsedTargetPreviewLimit);
+                        const hiddenGroupTargetCount = Math.max(
+                          0,
+                          group.targetIds.length - visibleGroupTargetIds.length
+                        );
+
+                        return (
                           <div
-                            title={group.agentKey}
-                            className="min-w-0 text-sm leading-6 text-blue-100 break-words [overflow-wrap:anywhere]"
+                            key={group.id}
+                            className="rounded-xl border border-blue-500/30 bg-blue-600/15 p-4"
                           >
-                            {group.agentKey}
+                            <div className="flex items-center justify-between">
+                              <div className="text-sm font-medium text-blue-100">
+                                {group.name}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
+                                  title={t("jobs.editGroup")}
+                                  onClick={() => {
+                                    const inferredSourceTargetId =
+                                      group.source_target_id ??
+                                      group.targetIds.find((targetId) => {
+                                        const target = targets.find((t) => t.id === targetId);
+                                        if (!target) return false;
+                                        const targetAgent = agents.find(
+                                          (agent) =>
+                                            agent.is_active === 1 &&
+                                            agent.camera_id === target.camera_id
+                                        );
+                                        const effectiveAgent = targetAgent || defaultAgent;
+                                        return effectiveAgent?.agent_key === group.agentKey;
+                                      }) ??
+                                      null;
+                                    setEditingGroupId(group.id);
+                                    setGroupName(group.name);
+                                    setGroupAgentKey(group.agentKey);
+                                    setGroupAgentSourceTargetId(inferredSourceTargetId);
+                                    setGroupRunEvery(
+                                      normalizeGroupRunEverySeconds(
+                                        group.run_every,
+                                        FIXED_GROUP_RUN_EVERY_SECONDS
+                                      )
+                                    );
+                                    setShowGroupModal(true);
+                                  }}
+                                >
+                                  <Edit2 className="w-4 h-4" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveGroup(group.id)}
+                                  className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
+                                  title={t("jobs.deleteGroup")}
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="mt-3 space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[11px] text-blue-100/70">
+                                  {visibleGroupTargetIds.length} / {group.targetIds.length}{" "}
+                                  {group.targetIds.length === 1 ? "camera" : "cameras"}
+                                </span>
+                                {group.targetIds.length > collapsedTargetPreviewLimit ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleInferenceGroupTargets(group.id)}
+                                    className="rounded-full border border-blue-400/20 bg-blue-900/30 px-2.5 py-1 text-[11px] text-blue-100 transition-colors hover:border-blue-300/30 hover:bg-blue-900/45"
+                                  >
+                                    {showAllGroupTargets
+                                      ? t("jobs.showFewerCameras", {
+                                          defaultValue: "Show fewer",
+                                        })
+                                      : t("jobs.showMoreCameras", {
+                                          defaultValue: `Show ${hiddenGroupTargetCount} more`,
+                                        })}
+                                  </button>
+                                ) : null}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {visibleGroupTargetIds.map((targetId) => {
+                                  const target = targets.find((t) => t.id === targetId);
+                                  if (!target) return null;
+                                  const targetLabel =
+                                    target.camera_name || `Camera ${target.camera_id}`;
+                                  return (
+                                    <span
+                                      key={targetId}
+                                      title={targetLabel}
+                                      className="inline-flex min-w-0 max-w-full items-center rounded-full border border-blue-400/20 bg-blue-900/40 px-3 py-1.5 text-xs font-medium text-blue-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+                                    >
+                                      <span className="min-w-0 truncate whitespace-nowrap">
+                                        {targetLabel}
+                                      </span>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.unifiedAgent")}
+                            </div>
+                            <div
+                              title={group.agentKey}
+                              className="min-w-0 text-sm leading-6 text-blue-100 break-words [overflow-wrap:anywhere]"
+                            >
+                              {group.agentKey}
+                            </div>
+                            <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.inputType")}
+                            </div>
+                            <div className="text-sm text-blue-100">
+                              {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
+                            </div>
+                            <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.groupRunEvery")}
+                            </div>
+                            <div className="text-sm text-blue-100">
+                              {formatGroupRunEveryLabel(group.run_every)}
+                            </div>
                           </div>
-                          <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
-                            {t("jobs.inputType")}
-                          </div>
-                          <div className="text-sm text-blue-100">
-                            {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
-                          </div>
-                          <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
-                            {t("jobs.groupRunEvery")}
-                          </div>
-                          <div className="text-sm text-blue-100">
-                            {formatGroupRunEveryLabel(group.run_every)}
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 )}

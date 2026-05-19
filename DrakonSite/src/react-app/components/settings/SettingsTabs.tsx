@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 
 export type SettingsTabView =
   | "user"
+  | "users"
   | "api-keys"
   | "alerts"
   | "connectivity"
@@ -10,20 +11,24 @@ export type SettingsTabView =
 interface SettingsTabsProps {
   activeView: SettingsTabView;
   onSelectUser: () => void;
+  onSelectUsers: () => void;
   onSelectApiKeys: () => void;
   onSelectAlerts: () => void;
   onSelectConnectivity: () => void;
   onSelectWorkspaceAccess: () => void;
+  showAccountUsers?: boolean;
   showWorkspaceAccess?: boolean;
 }
 
 export default function SettingsTabs({
   activeView,
   onSelectUser,
+  onSelectUsers,
   onSelectApiKeys,
   onSelectAlerts,
   onSelectConnectivity,
   onSelectWorkspaceAccess,
+  showAccountUsers = false,
   showWorkspaceAccess = true,
 }: SettingsTabsProps) {
   const { t } = useTranslation();
@@ -38,6 +43,15 @@ export default function SettingsTabs({
       label: t("settings.tabs.user"),
       onClick: onSelectUser,
     },
+    ...(showAccountUsers
+      ? [
+          {
+            id: "users" as const,
+            label: t("settings.tabs.usersRights", { defaultValue: "Users & Rights" }),
+            onClick: onSelectUsers,
+          },
+        ]
+      : []),
     {
       id: "api-keys",
       label: t("settings.tabs.apiKeys"),

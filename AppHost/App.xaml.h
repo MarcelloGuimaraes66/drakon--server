@@ -34,6 +34,7 @@ namespace DrakonDesktop::platform
         winrt::hstring const& sessionId,
         winrt::hstring const& ownerDisplayLabel,
         winrt::hstring const& operatorDisplayLabel);
+    void CloseRemoteWorkspaceWindowsForAppExit();
     bool IsRuntimeAlreadyProvisioned();
 }
 
@@ -53,6 +54,7 @@ namespace winrt::DrakonDesktop::implementation
             winrt::hstring const& sessionId,
             winrt::hstring const& ownerDisplayLabel,
             winrt::hstring const& operatorDisplayLabel);
+        void CloseRemoteWorkspaceWindows();
 
     private:
         winrt::com_ptr<XamlMetaDataProvider> AppProvider();

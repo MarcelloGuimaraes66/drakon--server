@@ -37,6 +37,7 @@ type RemoteWorkspaceUser = {
     name?: string | null;
     email?: string | null;
   } | null;
+  account_access?: Record<string, unknown> | null;
 };
 
 type RemoteWorkspaceContextValue = {
@@ -95,42 +96,6 @@ function readInitialRemoteWorkspaceState() {
     ownerDisplayLabel: searchParams.get(REMOTE_WORKSPACE_OWNER_QUERY_KEY) || "",
     operatorDisplayLabel: searchParams.get(REMOTE_WORKSPACE_OPERATOR_QUERY_KEY) || "",
   };
-}
-
-async function fetchRemoteWorkspaceUserSnapshot(
-  sessionId: string
-): Promise<RemoteWorkspaceUser | null> {
-  const response = await fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/remote-proxy`, {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      session_id: sessionId,
-      path: "/api/auth/me",
-      method: "GET",
-      headers: {
-        accept: "application/json",
-      },
-      body_base64: "",
-    }),
-  });
-
-  const payload = (await response.json().catch(() => ({}))) as {
-    isAuthenticated?: unknown;
-    user?: unknown;
-  };
-
-  if (!response.ok || payload?.isAuthenticated !== true) {
-    return null;
-  }
-
-  if (!payload?.user || typeof payload.user !== "object") {
-    return null;
-  }
-
-  return payload.user as RemoteWorkspaceUser;
 }
 
 function arrayBufferToBase64(value: ArrayBuffer): string {
@@ -246,23 +211,24 @@ export function RemoteWorkspaceProvider({ children }: { children: ReactNode }) {
     }
 
     try {
-      const [response, remoteUserSnapshot] = await Promise.all([
-        fetch(
-          `${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/${encodeURIComponent(sessionId)}/bootstrap`,
-          {
-            credentials: "include",
-            cache: "no-store",
-          }
-        ),
-        fetchRemoteWorkspaceUserSnapshot(sessionId).catch(() => null),
-      ]);
+      const response = await fetch(
+        `${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/${encodeURIComponent(sessionId)}/bootstrap`,
+        {
+          credentials: "include",
+          cache: "no-store",
+        }
+      );
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(String(payload?.error || "Failed to load the remote workspace session."));
       }
 
       setSession((payload?.session || null) as RemoteWorkspaceSession | null);
-      setRemoteUser(remoteUserSnapshot);
+      setRemoteUser(
+        payload?.permission_user && typeof payload.permission_user === "object"
+          ? (payload.permission_user as RemoteWorkspaceUser)
+          : null
+      );
       setOwnerDisplayLabel(
         String(payload?.remote_context?.owner_display_label || ownerDisplayLabel || "")
       );

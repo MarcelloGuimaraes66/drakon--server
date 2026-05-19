@@ -4,6 +4,8 @@
 #include "winrt/Microsoft.UI.Xaml.h"
 #include "winrt/Microsoft.UI.Xaml.Navigation.h"
 
+#include "../Services/DrakonApiClient.h"
+
 namespace winrt::DrakonDesktop::implementation
 {
     struct ShellPage : winrt::Microsoft::UI::Xaml::Controls::PageT<ShellPage>
@@ -18,7 +20,10 @@ namespace winrt::DrakonDesktop::implementation
         void NavigateTo(winrt::hstring const& destination);
         void SetNamedText(winrt::hstring const& elementName, winrt::hstring const& value);
         void UpdateNavigationSelection(winrt::hstring const& destination);
+        void ApplyNavigationPermissions();
         void ApplySidebarState(bool collapsed);
+        bool CanAccessDestination(winrt::hstring const& destination) const;
+        winrt::hstring PreferredDestination() const;
         void UpdateResponsiveState(double width);
         winrt::fire_and_forget LoadShellChromeAsync();
         void OnHeaderRefreshTick(
@@ -42,6 +47,7 @@ namespace winrt::DrakonDesktop::implementation
         bool m_effectiveSidebarCollapsed{ false };
         bool m_shellChromeRefreshInFlight{ false };
         winrt::hstring m_currentDestination{ L"dashboard" };
+        services::AuthState m_authState{};
         winrt::Microsoft::UI::Xaml::Controls::Frame m_contentFrame{ nullptr };
         winrt::Microsoft::UI::Xaml::DispatcherTimer m_headerRefreshTimer{ nullptr };
     };

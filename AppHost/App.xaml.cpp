@@ -364,6 +364,14 @@ namespace DrakonDesktop::platform
             ownerDisplayLabel,
             operatorDisplayLabel);
     }
+
+    void CloseRemoteWorkspaceWindowsForAppExit()
+    {
+        if (g_appInstance != nullptr)
+        {
+            g_appInstance->CloseRemoteWorkspaceWindows();
+        }
+    }
 }
 
 namespace winrt::DrakonDesktop::implementation
@@ -528,6 +536,33 @@ namespace winrt::DrakonDesktop::implementation
         }
 
         return { true, L"Remote workspace window opened." };
+    }
+
+    void App::CloseRemoteWorkspaceWindows()
+    {
+        if (m_auxWindows.empty())
+        {
+            return;
+        }
+
+        AppendBootstrapTrace("app: closing remote workspace windows before exit");
+        auto const windowsToClose = m_auxWindows;
+        for (auto const& window : windowsToClose)
+        {
+            if (!window)
+            {
+                continue;
+            }
+
+            try
+            {
+                window.Close();
+            }
+            catch (...)
+            {
+                AppendBootstrapTrace("app: failed to close remote workspace window before exit");
+            }
+        }
     }
 
     winrt::com_ptr<XamlMetaDataProvider> App::AppProvider()

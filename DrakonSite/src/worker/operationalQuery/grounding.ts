@@ -250,6 +250,18 @@ export function detectOperationalSubjectEntity(
   ) {
     return "connectivity_incident";
   }
+  if (
+    plannerQueryIncludesAny(query, [
+      "camera",
+      "cameras",
+      "camara",
+      "camaras",
+      "câmera",
+      "câmeras",
+    ])
+  ) {
+    return "camera";
+  }
   const focus = Array.isArray(context.scope?.focus) ? context.scope.focus : [];
   if (focus.includes("jobs")) return "job_run";
   if (focus.includes("agents")) return "agent_run";
@@ -277,6 +289,22 @@ export function buildOperationalAmbiguities(
 ): string[] {
   const query = queryInput.toLowerCase();
   const ambiguities: string[] = [];
+  const asksToEnumerateCameras =
+    plannerQueryIncludesAny(query, ["camera", "cameras", "cam", "camara", "camaras"]) &&
+    plannerQueryIncludesAny(query, [
+      "list",
+      "lista",
+      "which",
+      "quais",
+      "show",
+      "mostrar",
+      "me traga",
+      "quantos",
+      "quantas",
+      "how many",
+      "count",
+      "total",
+    ]);
   if (
     plannerQueryIncludesAny(query, ["job", "jobs", "tarefa", "tarefas", "workflow"]) &&
     resolved.jobs.length === 0
@@ -297,6 +325,7 @@ export function buildOperationalAmbiguities(
   }
   if (
     plannerQueryIncludesAny(query, ["camera", "cameras", "cam", "camara", "camaras"]) &&
+    !asksToEnumerateCameras &&
     resolved.cameras.length === 0
   ) {
     ambiguities.push("camera_reference_unresolved");

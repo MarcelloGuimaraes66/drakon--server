@@ -13,8 +13,20 @@ import SystemActivityModal from "@/react-app/components/SystemActivityModal";
 import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import { useEffectiveUser } from "@/react-app/hooks/useEffectiveUser";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import { useTheme } from "@/react-app/hooks/useTheme";
+import {
+  canAccessBilling,
+  canAccessHub,
+  canManageSettings,
+  canUseChat,
+  canViewAgents,
+  canViewCameras,
+  canViewDashboard,
+  canViewEvents,
+  canViewTasks,
+} from "@/react-app/lib/accountAccess";
 import type { OnboardingTutorialKind } from "@/react-app/lib/onboarding";
 import { brand, getBrandStorageKey, getBrandWindowEventName } from "@/shared/brand";
 import {
@@ -127,6 +139,14 @@ type PendingWorkspaceAccessRequest = {
   requestedAt: string;
 };
 
+type ActiveWorkspaceAccessSession = {
+  sessionId: string;
+  operatorDisplayLabel: string;
+  permissionProfile: string;
+  connectedAt: string | null;
+  updatedAt: string;
+};
+
 type DesktopShellWindow = Window & {
   chrome?: {
     webview?: {
@@ -146,6 +166,33 @@ function isDesktopShellWindow(): boolean {
     desktopWindow.__drakonDesktopShell === true ||
     Boolean(desktopWindow.chrome?.webview)
   );
+}
+
+function describeWorkspacePermissionProfile(
+  permissionProfile: string,
+  translate: (key: string) => string
+) {
+  if (permissionProfile === "full_access") {
+    return translate("settings.workspaceAccess.permission.fullAccess");
+  }
+  if (permissionProfile === "scoped_access") {
+    return translate("settings.workspaceAccess.permission.scopedAccess");
+  }
+  return permissionProfile || translate("settings.workspaceAccess.permission.remoteAccess");
+}
+
+function formatWorkspaceAccessStartedAt(value: string | null | undefined) {
+  const parsedAt = Date.parse(String(value || "").trim());
+  if (!Number.isFinite(parsedAt)) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(parsedAt));
 }
 
 async function readApiKeyPromptStatus(): Promise<ApiKeyPromptStatus | null> {
@@ -190,6 +237,7 @@ async function readApiKeyPromptStatus(): Promise<ApiKeyPromptStatus | null> {
 export default function Layout({ children }: LayoutProps) {
   const { t, i18n } = useTranslation();
   const { user, logout } = useAuth();
+  const { effectiveUser } = useEffectiveUser();
   const {
     isRemote: isRemoteWorkspace,
     session: remoteWorkspaceSession,
@@ -224,7 +272,12 @@ export default function Layout({ children }: LayoutProps) {
   const [pendingWorkspaceRequests, setPendingWorkspaceRequests] = useState<
     PendingWorkspaceAccessRequest[]
   >([]);
+  const [activeWorkspaceSessions, setActiveWorkspaceSessions] = useState<
+    ActiveWorkspaceAccessSession[]
+  >([]);
   const [workspaceRequestAction, setWorkspaceRequestAction] = useState("");
+  const [activeWorkspaceSessionAction, setActiveWorkspaceSessionAction] = useState("");
+  const [isRemoteAccessIndicatorOpen, setIsRemoteAccessIndicatorOpen] = useState(false);
   const previousPathnameRef = useRef("");
   const collapseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearCueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -236,6 +289,7 @@ export default function Layout({ children }: LayoutProps) {
   );
   const notificationsContainerRef = useRef<HTMLDivElement>(null);
   const tutorialMenuRef = useRef<HTMLDivElement>(null);
+  const remoteAccessIndicatorRef = useRef<HTMLDivElement>(null);
   const isSettingsRoute = /(^|\/)settings(\/|$)/.test(location.pathname);
   const isSidebarCollapsed = isDesktop && (isSidebarCollapsedDesktop || isChatAutoCollapsedDesktop);
   const currentBrandId = brand.id.toLowerCase();
@@ -243,6 +297,16 @@ export default function Layout({ children }: LayoutProps) {
   const isDrakonBrand = currentBrandId === "drakon";
   const billingEnabled = brand.features.billingEnabled;
   const drakonFindEnabled = brand.features.drakonFindEnabled;
+  const canOpenDashboard = canViewDashboard(effectiveUser);
+  const canOpenAgents = canViewAgents(effectiveUser);
+  const canOpenHub = canAccessHub(effectiveUser);
+  const canOpenDrakonFind = drakonFindEnabled && canViewAgents(effectiveUser);
+  const canOpenJobs = canViewTasks(effectiveUser);
+  const canOpenChat = canUseChat(effectiveUser);
+  const canOpenCameras = canViewCameras(effectiveUser);
+  const canOpenEvents = canViewEvents(effectiveUser);
+  const canOpenBilling = billingEnabled && canAccessBilling(effectiveUser);
+  const canOpenSettings = canManageSettings(effectiveUser);
   const collapsedBrandIconClassName =
     isPerceptrumBrand
       ? "h-10 w-14 object-contain"
@@ -371,6 +435,7 @@ export default function Layout({ children }: LayoutProps) {
     setIsSidebarOpen(false);
     setSidebarHoverHint(null);
     setIsTutorialMenuOpen(false);
+    setIsRemoteAccessIndicatorOpen(false);
   }, [location.pathname]);
 
   useEffect(() => {
@@ -514,6 +579,37 @@ export default function Layout({ children }: LayoutProps) {
   }, [isTutorialMenuOpen]);
 
   useEffect(() => {
+    if (activeWorkspaceSessions.length === 0) {
+      setIsRemoteAccessIndicatorOpen(false);
+    }
+  }, [activeWorkspaceSessions.length]);
+
+  useEffect(() => {
+    if (!isRemoteAccessIndicatorOpen) return;
+
+    const closeRemoteAccessIndicator = () => setIsRemoteAccessIndicatorOpen(false);
+    const handlePointerDown = (event: PointerEvent) => {
+      if (remoteAccessIndicatorRef.current?.contains(event.target as Node)) {
+        return;
+      }
+
+      closeRemoteAccessIndicator();
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeRemoteAccessIndicator();
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [isRemoteAccessIndicatorOpen]);
+
+  useEffect(() => {
     if (typeof document === "undefined") return;
     const previousBodyOverflow = document.body.style.overflow;
     const previousHtmlOverflow = document.documentElement.style.overflow;
@@ -526,7 +622,7 @@ export default function Layout({ children }: LayoutProps) {
   }, []);
 
   useEffect(() => {
-    if (isSettingsRoute) {
+    if (isSettingsRoute || !canOpenSettings) {
       setShowOpenAiKeyPrompt(false);
       setShowZAiKeyPrompt(false);
       return;
@@ -557,13 +653,13 @@ export default function Layout({ children }: LayoutProps) {
     return () => {
       cancelled = true;
     };
-  }, [isSettingsRoute, user?.id]);
+  }, [canOpenSettings, isSettingsRoute, user?.id]);
 
   useEffect(() => {
     let cancelled = false;
 
     const syncPromptForMissingProvider = async (provider: "openai" | "zai") => {
-      if (isSettingsRoute) {
+      if (isSettingsRoute || !canOpenSettings) {
         setShowOpenAiKeyPrompt(false);
         setShowZAiKeyPrompt(false);
         return;
@@ -593,7 +689,7 @@ export default function Layout({ children }: LayoutProps) {
     };
 
     const onOpenAiKeyRequired = () => {
-      if (isSettingsRoute) {
+      if (isSettingsRoute || !canOpenSettings) {
         setShowOpenAiKeyPrompt(false);
         setShowZAiKeyPrompt(false);
         return;
@@ -601,7 +697,7 @@ export default function Layout({ children }: LayoutProps) {
       void syncPromptForMissingProvider("openai");
     };
     const onZAiKeyRequired = () => {
-      if (isSettingsRoute) {
+      if (isSettingsRoute || !canOpenSettings) {
         setShowOpenAiKeyPrompt(false);
         setShowZAiKeyPrompt(false);
         return;
@@ -627,12 +723,13 @@ export default function Layout({ children }: LayoutProps) {
         onZAiKeyRequired as EventListener
       );
     };
-  }, [isSettingsRoute]);
+  }, [canOpenSettings, isSettingsRoute]);
 
   useEffect(() => {
     if (
       !brand.features.workspaceAccessEnabled ||
       !user?.id ||
+      !canOpenSettings ||
       !isDesktopShellWindow() ||
       isRemoteWorkspace
     ) {
@@ -660,51 +757,95 @@ export default function Layout({ children }: LayoutProps) {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isRemoteWorkspace, user?.id]);
+  }, [canOpenSettings, isRemoteWorkspace, user?.id]);
 
   useEffect(() => {
-    if (!brand.features.workspaceAccessEnabled || !user?.id || !isDesktopShellWindow()) {
+    if (
+      !brand.features.workspaceAccessEnabled ||
+      !user?.id ||
+      !canOpenSettings ||
+      !isDesktopShellWindow()
+    ) {
       return;
     }
 
-    const loadPendingWorkspaceRequests = async () => {
-      try {
-        const response = await fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/pending-requests`, {
+    const loadWorkspaceAccessState = async () => {
+      const [pendingResult, activeResult] = await Promise.allSettled([
+        fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/pending-requests`, {
           credentials: "include",
           cache: "no-store",
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          return;
-        }
+        }),
+        fetch(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/active-sessions`, {
+          credentials: "include",
+          cache: "no-store",
+        }),
+      ]);
 
-        const requests = Array.isArray((payload as any)?.requests)
-          ? ((payload as any).requests as Array<Record<string, unknown>>).map((request) => ({
-              sessionId: String(request.sessionId || request.session_id || ""),
-              operatorDisplayLabel: String(
-                request.operatorDisplayLabel || request.operator_display_label || ""
-              ),
-              permissionProfile: String(
-                request.permissionProfile || request.permission_profile || "full_access"
-              ),
-              requestedAt: String(request.requestedAt || request.requested_at || ""),
-            }))
-          : [];
-        setPendingWorkspaceRequests(requests.filter((request) => request.sessionId));
-      } catch {
-        // keep the previous request list when polling fails
+      if (pendingResult.status === "fulfilled") {
+        try {
+          const payload = await pendingResult.value.json().catch(() => ({}));
+          if (pendingResult.value.ok) {
+            const requests = Array.isArray((payload as any)?.requests)
+              ? ((payload as any).requests as Array<Record<string, unknown>>).map((request) => ({
+                  sessionId: String(request.sessionId || request.session_id || ""),
+                  operatorDisplayLabel: String(
+                    request.operatorDisplayLabel || request.operator_display_label || ""
+                  ),
+                  permissionProfile: String(
+                    request.permissionProfile || request.permission_profile || "full_access"
+                  ),
+                  requestedAt: String(request.requestedAt || request.requested_at || ""),
+                }))
+              : [];
+            setPendingWorkspaceRequests(requests.filter((request) => request.sessionId));
+          }
+        } catch {
+          // keep the previous request list when polling fails
+        }
+      }
+
+      if (activeResult.status === "fulfilled") {
+        try {
+          const payload = await activeResult.value.json().catch(() => ({}));
+          if (activeResult.value.ok) {
+            const sessions = Array.isArray((payload as any)?.sessions)
+              ? ((payload as any).sessions as Array<Record<string, unknown>>).map((session) => ({
+                  sessionId: String(session.sessionId || session.session_id || ""),
+                  operatorDisplayLabel: String(
+                    session.operatorDisplayLabel || session.operator_display_label || ""
+                  ),
+                  permissionProfile: String(
+                    session.permissionProfile || session.permission_profile || "full_access"
+                  ),
+                  connectedAt:
+                    typeof (session.connectedAt || session.connected_at) === "string"
+                      ? String(session.connectedAt || session.connected_at)
+                      : null,
+                  updatedAt: String(session.updatedAt || session.updated_at || ""),
+                }))
+              : [];
+            setActiveWorkspaceSessions(
+              sessions.filter(
+                (session): session is ActiveWorkspaceAccessSession =>
+                  Boolean(session.sessionId)
+              )
+            );
+          }
+        } catch {
+          // keep the previous active session list when polling fails
+        }
       }
     };
 
-    void loadPendingWorkspaceRequests();
+    void loadWorkspaceAccessState();
     const intervalId = window.setInterval(() => {
-      void loadPendingWorkspaceRequests();
+      void loadWorkspaceAccessState();
     }, 5_000);
 
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [user?.id]);
+  }, [canOpenSettings, user?.id]);
 
   const handleNotificationClick = () => {
     setIsNotificationsOpen((prev) => {
@@ -793,26 +934,38 @@ export default function Layout({ children }: LayoutProps) {
   const navigationGroups = useMemo<SidebarNavGroup[]>(
     () => {
       const primaryItems: SidebarNavItem[] = [
-        {
-          name: t("nav.dashboard"),
-          href: "/dashboard",
-          icon: LayoutDashboard,
-          description: t("dashboard.pageSubtitle", { defaultValue: t("dashboard.subtitle") }),
-          badgeCount: unreadAlertsBadgeCount,
-        },
-        {
-          name: t("nav.aiAgents"),
-          href: "/ai-agents",
-          icon: Bot,
-          description: t("aiAgents.subtitle"),
-        },
-        {
-          name: "Hub",
-          href: "/hub",
-          icon: Sparkles,
-          description: "Reusable agents and task templates",
-        },
-        ...(drakonFindEnabled
+        ...(canOpenDashboard
+          ? [
+              {
+                name: t("nav.dashboard"),
+                href: "/dashboard",
+                icon: LayoutDashboard,
+                description: t("dashboard.pageSubtitle", { defaultValue: t("dashboard.subtitle") }),
+                badgeCount: unreadAlertsBadgeCount,
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenAgents
+          ? [
+              {
+                name: t("nav.aiAgents"),
+                href: "/ai-agents",
+                icon: Bot,
+                description: t("aiAgents.subtitle"),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenHub
+          ? [
+              {
+                name: "Hub",
+                href: "/hub",
+                icon: Sparkles,
+                description: "Reusable agents and task templates",
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenDrakonFind
           ? [
               {
                 name: "Drakon Find",
@@ -824,34 +977,50 @@ export default function Layout({ children }: LayoutProps) {
               } satisfies SidebarNavItem,
             ]
           : []),
-        {
-          name: t("nav.jobs"),
-          href: "/jobs",
-          icon: Briefcase,
-          description: t("jobs.subtitle"),
-          badgeCount: runningJobsBadgeCount,
-        },
-        {
-          name: t("nav.aiAssistant"),
-          href: "/chat",
-          icon: MessageSquare,
-          description: t("quickChat.subtitle", { defaultValue: t("chat.subtitle") }),
-        },
+        ...(canOpenJobs
+          ? [
+              {
+                name: t("nav.jobs"),
+                href: "/jobs",
+                icon: Briefcase,
+                description: t("jobs.subtitle"),
+                badgeCount: runningJobsBadgeCount,
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenChat
+          ? [
+              {
+                name: t("nav.aiAssistant"),
+                href: "/chat",
+                icon: MessageSquare,
+                description: t("quickChat.subtitle", { defaultValue: t("chat.subtitle") }),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
       ];
       const systemItems: SidebarNavItem[] = [
-        {
-          name: t("nav.cameras"),
-          href: "/cameras",
-          icon: Camera,
-          description: t("cameras.subtitle"),
-        },
-        {
-          name: t("nav.logsEvents"),
-          href: "/events",
-          icon: FileText,
-          description: t("events.subtitle"),
-        },
-        ...(billingEnabled
+        ...(canOpenCameras
+          ? [
+              {
+                name: t("nav.cameras"),
+                href: "/cameras",
+                icon: Camera,
+                description: t("cameras.subtitle"),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenEvents
+          ? [
+              {
+                name: t("nav.logsEvents"),
+                href: "/events",
+                icon: FileText,
+                description: t("events.subtitle"),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
+        ...(canOpenBilling
           ? [
               {
                 name: t("nav.billing"),
@@ -861,22 +1030,34 @@ export default function Layout({ children }: LayoutProps) {
               } satisfies SidebarNavItem,
             ]
           : []),
-        {
-          name: t("nav.settings"),
-          href: "/settings",
-          icon: Settings,
-          description: t("settings.subtitle"),
-        },
+        ...(canOpenSettings
+          ? [
+              {
+                name: t("nav.settings"),
+                href: "/settings",
+                icon: Settings,
+                description: t("settings.subtitle"),
+              } satisfies SidebarNavItem,
+            ]
+          : []),
       ];
 
       return [
         { id: "primary", label: sidebarSectionLabels.primary, items: primaryItems },
         { id: "system", label: sidebarSectionLabels.system, items: systemItems },
-      ];
+      ].filter((group): group is SidebarNavGroup => group.items.length > 0);
     },
     [
-      billingEnabled,
-      drakonFindEnabled,
+      canOpenAgents,
+      canOpenBilling,
+      canOpenCameras,
+      canOpenChat,
+      canOpenDashboard,
+      canOpenDrakonFind,
+      canOpenEvents,
+      canOpenHub,
+      canOpenJobs,
+      canOpenSettings,
       runningJobsBadgeCount,
       sidebarSectionLabels.primary,
       sidebarSectionLabels.system,
@@ -1038,6 +1219,18 @@ export default function Layout({ children }: LayoutProps) {
   };
 
   const activeWorkspaceRequest = pendingWorkspaceRequests[0] || null;
+  const showRemoteAccessIndicator =
+    !isRemoteWorkspace &&
+    brand.features.workspaceAccessEnabled &&
+    isDesktopShellWindow() &&
+    activeWorkspaceSessions.length > 0;
+  const primaryActiveWorkspaceSession = activeWorkspaceSessions[0] || null;
+  const primaryActiveWorkspaceOperatorLabel =
+    primaryActiveWorkspaceSession?.operatorDisplayLabel || "Outro usuario";
+  const remoteAccessIndicatorSummaryLabel =
+    activeWorkspaceSessions.length > 1
+      ? `${primaryActiveWorkspaceOperatorLabel} +${activeWorkspaceSessions.length - 1}`
+      : primaryActiveWorkspaceOperatorLabel;
 
   const handleWorkspaceRequestDecision = async (
     sessionId: string,
@@ -1066,6 +1259,36 @@ export default function Layout({ children }: LayoutProps) {
       // keep the request visible and let the next poll reconcile the state
     } finally {
       setWorkspaceRequestAction("");
+    }
+  };
+
+  const handleEndActiveWorkspaceSession = async (sessionId: string) => {
+    setActiveWorkspaceSessionAction(sessionId);
+    try {
+      const response = await fetch(
+        `${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/${encodeURIComponent(sessionId)}/end`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            reason: "closed_by_owner",
+          }),
+        }
+      );
+      if (!response.ok) {
+        return;
+      }
+
+      setActiveWorkspaceSessions((current) =>
+        current.filter((session) => session.sessionId !== sessionId)
+      );
+    } catch {
+      // keep the active session visible and let the next poll reconcile the state
+    } finally {
+      setActiveWorkspaceSessionAction("");
     }
   };
 
@@ -1469,15 +1692,101 @@ export default function Layout({ children }: LayoutProps) {
               </div>
             )}
 
-            <button
-              type="button"
-              onClick={() => setIsSystemActivityOpen(true)}
-              className="inline-flex items-center gap-2 rounded-lg border border-gray-700/60 bg-gray-800/50 px-3 py-1.5 text-sm font-medium text-gray-200 transition-colors hover:border-gray-500 hover:bg-gray-800 hover:text-white"
-              aria-label="Open system activity"
-            >
-              <Activity className="h-4 w-4 text-cyan-300" />
-              <span className="hidden sm:inline">System Activity</span>
-            </button>
+            {showRemoteAccessIndicator ? (
+              <div ref={remoteAccessIndicatorRef} className="relative">
+                <button
+                  type="button"
+                  onClick={() => setIsRemoteAccessIndicatorOpen((open) => !open)}
+                  className="inline-flex items-center gap-2 rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-sm font-medium text-rose-50 transition-colors hover:border-rose-400/45 hover:bg-rose-500/15 hover:text-white"
+                  aria-haspopup="dialog"
+                  aria-expanded={isRemoteAccessIndicatorOpen}
+                  aria-label={`Conta em acesso remoto por ${primaryActiveWorkspaceOperatorLabel}`}
+                >
+                  <span className="relative flex h-2.5 w-2.5">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-300 opacity-70" />
+                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-rose-200" />
+                  </span>
+                  <span className="hidden xl:inline">Acesso remoto</span>
+                  <span className="max-w-[9rem] truncate text-sm font-semibold">
+                    {remoteAccessIndicatorSummaryLabel}
+                  </span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 text-rose-200 transition-transform ${
+                      isRemoteAccessIndicatorOpen ? "rotate-180" : ""
+                    }`}
+                  />
+                </button>
+
+                {isRemoteAccessIndicatorOpen ? (
+                  <div
+                    role="dialog"
+                    aria-label="Sessoes remotas ativas"
+                    className="absolute right-0 top-full z-50 mt-2 w-[min(24rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-rose-400/20 bg-[rgba(20,12,14,0.98)] p-2 shadow-2xl shadow-black/60 backdrop-blur-md"
+                  >
+                    <div className="px-3 pb-2 pt-1">
+                      <p className="text-sm font-semibold text-gray-100">
+                        Sua conta esta sendo acessada remotamente
+                      </p>
+                      <p className="mt-1 text-xs leading-5 text-gray-400">
+                        {activeWorkspaceSessions.length > 1
+                          ? `${activeWorkspaceSessions.length} sessoes ativas agora.`
+                          : "1 sessao ativa agora."}
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      {activeWorkspaceSessions.map((session) => {
+                        const startedAtLabel = formatWorkspaceAccessStartedAt(
+                          session.connectedAt || session.updatedAt
+                        );
+                        const isEndingSession =
+                          activeWorkspaceSessionAction === session.sessionId;
+
+                        return (
+                          <div
+                            key={session.sessionId}
+                            className="flex items-start gap-3 rounded-xl border border-white/8 bg-white/[0.03] px-3 py-3"
+                          >
+                            <div className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-rose-400/20 bg-rose-500/10 text-rose-100">
+                              <MonitorSmartphone className="h-4 w-4" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-semibold text-gray-100">
+                                {session.operatorDisplayLabel || "Outro usuario"}
+                              </p>
+                              <p className="mt-1 text-xs leading-5 text-gray-400">
+                                {describeWorkspacePermissionProfile(session.permissionProfile, t)}
+                                {startedAtLabel ? ` • Desde ${startedAtLabel}` : ""}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void handleEndActiveWorkspaceSession(session.sessionId)}
+                              disabled={isEndingSession}
+                              className="inline-flex min-h-[34px] items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] px-3 text-xs font-semibold text-gray-100 transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {isEndingSession ? "Encerrando..." : "Encerrar"}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {canOpenDashboard ? (
+              <button
+                type="button"
+                onClick={() => setIsSystemActivityOpen(true)}
+                className="inline-flex items-center gap-2 rounded-lg border border-gray-700/60 bg-gray-800/50 px-3 py-1.5 text-sm font-medium text-gray-200 transition-colors hover:border-gray-500 hover:bg-gray-800 hover:text-white"
+                aria-label="Open system activity"
+              >
+                <Activity className="h-4 w-4 text-cyan-300" />
+                <span className="hidden sm:inline">System Activity</span>
+              </button>
+            ) : null}
 
             <div ref={tutorialMenuRef} className="relative">
               <button
@@ -1529,23 +1838,25 @@ export default function Layout({ children }: LayoutProps) {
 
             <LanguageSelector />
             
-            <div ref={notificationsContainerRef} className="relative">
-              <button
-                onClick={handleNotificationClick}
-                className="p-2 text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors relative"
-              >
-                <Bell className="w-5 h-5" />
-                {hasUnreadNotifications && (
-                  <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full"></span>
-                )}
-              </button>
+            {canOpenEvents ? (
+              <div ref={notificationsContainerRef} className="relative">
+                <button
+                  onClick={handleNotificationClick}
+                  className="p-2 text-gray-400 hover:text-gray-200 hover:bg-gray-800 rounded-lg transition-colors relative"
+                >
+                  <Bell className="w-5 h-5" />
+                  {hasUnreadNotifications && (
+                    <span className="absolute top-1 right-1 w-2 h-2 bg-red-500 rounded-full"></span>
+                  )}
+                </button>
 
-              <NotificationsDropdown
-                isOpen={isNotificationsOpen}
-                onClose={handleNotificationsClose}
-                anchorRef={notificationsContainerRef}
-              />
-            </div>
+                <NotificationsDropdown
+                  isOpen={isNotificationsOpen}
+                  onClose={handleNotificationsClose}
+                  anchorRef={notificationsContainerRef}
+                />
+              </div>
+            ) : null}
           </div>
         </header>
 
@@ -1618,9 +1929,7 @@ export default function Layout({ children }: LayoutProps) {
                   workspace enquanto este app estiver aberto.
                 </p>
                 <p className="mt-2 text-xs uppercase tracking-[0.18em] text-cyan-200/80">
-                  {activeWorkspaceRequest.permissionProfile === "full_access"
-                    ? "Acesso total"
-                    : activeWorkspaceRequest.permissionProfile}
+                  {describeWorkspacePermissionProfile(activeWorkspaceRequest.permissionProfile, t)}
                 </p>
               </div>
             </div>
@@ -1652,18 +1961,24 @@ export default function Layout({ children }: LayoutProps) {
       ) : null}
 
       {/* Floating chat button and overlay */}
-      <FloatingChatButton />
-      <QuickChatOverlay />
-      <MinimizedChatTabs />
-      <SystemActivityModal
-        isOpen={isSystemActivityOpen}
-        onClose={() => setIsSystemActivityOpen(false)}
-        cameras={cameras}
-        dashboard={dashboard}
-      />
+      {canOpenChat ? (
+        <>
+          <FloatingChatButton />
+          <QuickChatOverlay />
+          <MinimizedChatTabs />
+        </>
+      ) : null}
+      {canOpenDashboard ? (
+        <SystemActivityModal
+          isOpen={isSystemActivityOpen}
+          onClose={() => setIsSystemActivityOpen(false)}
+          cameras={cameras}
+          dashboard={dashboard}
+        />
+      ) : null}
       <TutorialOverlay />
 
-      {showOpenAiKeyPrompt && !isSettingsRoute && (
+      {showOpenAiKeyPrompt && canOpenSettings && !isSettingsRoute && (
         <div className="fixed bottom-4 right-4 z-40 max-w-md pointer-events-none">
           <div className="bg-gradient-to-br from-slate-900/95 to-slate-950/95 backdrop-blur-xl border border-blue-600/45 rounded-xl shadow-2xl shadow-blue-500/20 p-4 pointer-events-auto">
             <div className="flex items-start gap-3">
@@ -1699,7 +2014,7 @@ export default function Layout({ children }: LayoutProps) {
           </div>
         </div>
       )}
-      {showZAiKeyPrompt && !isSettingsRoute && (
+      {showZAiKeyPrompt && canOpenSettings && !isSettingsRoute && (
         <div className="fixed bottom-4 right-4 z-40 max-w-md pointer-events-none">
           <div className="bg-gradient-to-br from-slate-900/95 to-slate-950/95 backdrop-blur-xl border border-cyan-600/45 rounded-xl shadow-2xl shadow-cyan-500/20 p-4 pointer-events-auto">
             <div className="flex items-start gap-3">

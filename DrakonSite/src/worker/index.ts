@@ -124,6 +124,34 @@ import {
   resolvePairingClientIdFromLocalUserRow,
 } from "./localIdentity";
 import {
+  buildAccountAccessPayload,
+  buildAccountMembershipResourceGrantPayload,
+  buildFullAccountPermissions,
+  buildAllAccountResourceScopes,
+  buildEmptyAccountMembershipResourceGrantPayload,
+  createAccountMembership,
+  findAccountMembershipByEmail,
+  getAccountMembership,
+  listAccountMembershipResourceGrants,
+  listGrantedAccountResourceIds,
+  listAccountMemberships,
+  normalizeAccountMembershipStatus,
+  normalizeAccountMembershipResourceGrantPayload,
+  normalizeAccountPermissions,
+  normalizeAccountResourceScopes,
+  resolveAccountAccessContext,
+  replaceAccountMembershipResourceGrants,
+  serializeAccountAgentGrantKey,
+  updateAccountMembership,
+  type AccountAccessContext,
+  type AccountMembershipResourceGrantPayload,
+  type AccountRole,
+  type AccountResourceScopes,
+  type AccountScopedAction,
+  type AccountScopedModule,
+  type AccountScopedResourceType,
+} from "./accountAccess";
+import {
   buildHandleCandidate,
   deriveHandleFromEmail,
   normalizeUserHandleInput,
@@ -7173,6 +7201,90 @@ async function ensureSchema(db: D1Database): Promise<void> {
       `).run();
 
       await db.prepare(`
+        CREATE TABLE IF NOT EXISTS account_memberships (
+          member_user_id TEXT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+          account_user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+          role TEXT NOT NULL DEFAULT 'owner',
+          status TEXT NOT NULL DEFAULT 'active',
+          password_management_mode TEXT NOT NULL DEFAULT 'self_service',
+          can_view_cameras INTEGER NOT NULL DEFAULT 0,
+          can_execute_cameras INTEGER NOT NULL DEFAULT 0,
+          can_view_tasks INTEGER NOT NULL DEFAULT 0,
+          can_execute_tasks INTEGER NOT NULL DEFAULT 0,
+          can_view_agents INTEGER NOT NULL DEFAULT 0,
+          can_execute_agents INTEGER NOT NULL DEFAULT 0,
+          can_use_chat INTEGER NOT NULL DEFAULT 0,
+          camera_view_scope TEXT NOT NULL DEFAULT 'all',
+          camera_execute_scope TEXT NOT NULL DEFAULT 'all',
+          task_view_scope TEXT NOT NULL DEFAULT 'all',
+          task_execute_scope TEXT NOT NULL DEFAULT 'all',
+          agent_view_scope TEXT NOT NULL DEFAULT 'all',
+          agent_execute_scope TEXT NOT NULL DEFAULT 'all',
+          created_by_user_id TEXT REFERENCES app_users(id) ON DELETE SET NULL,
+          updated_by_user_id TEXT REFERENCES app_users(id) ON DELETE SET NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN account_user_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN password_management_mode TEXT NOT NULL DEFAULT 'self_service'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_view_cameras INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_execute_cameras INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_view_tasks INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_execute_tasks INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_view_agents INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_execute_agents INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN can_use_chat INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN camera_view_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN camera_execute_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN task_view_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN task_execute_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN agent_view_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN agent_execute_scope TEXT NOT NULL DEFAULT 'all'`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN created_by_user_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN updated_by_user_id TEXT`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`);
+      await addColumnIfMissing(`ALTER TABLE account_memberships ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`);
+      await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_account_memberships_member
+        ON account_memberships(member_user_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_account_memberships_account
+        ON account_memberships(account_user_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_account_memberships_status
+        ON account_memberships(status)
+      `).run();
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS account_membership_resource_grants (
+          member_user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+          resource_type TEXT NOT NULL,
+          resource_id INTEGER NOT NULL,
+          can_view INTEGER NOT NULL DEFAULT 0,
+          can_execute INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (member_user_id, resource_type, resource_id)
+        )
+      `).run();
+      await addColumnIfMissing(`ALTER TABLE account_membership_resource_grants ADD COLUMN can_view INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_membership_resource_grants ADD COLUMN can_execute INTEGER NOT NULL DEFAULT 0`);
+      await addColumnIfMissing(`ALTER TABLE account_membership_resource_grants ADD COLUMN created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`);
+      await addColumnIfMissing(`ALTER TABLE account_membership_resource_grants ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`);
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_account_membership_resource_grants_member_type
+        ON account_membership_resource_grants(member_user_id, resource_type)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_account_membership_resource_grants_type_resource
+        ON account_membership_resource_grants(resource_type, resource_id)
+      `).run();
+
+      await db.prepare(`
         CREATE TABLE IF NOT EXISTS user_secret_recovery (
           app_user_id TEXT PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
           storage_scope TEXT NOT NULL DEFAULT 'local',
@@ -7433,9 +7545,26 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await addColumnIfMissing(
         `ALTER TABLE chat_session_contexts ADD COLUMN agent_temporal_state_json TEXT NOT NULL DEFAULT '{}'`
       );
+      const chatSessionContextsCreatedAtType = await getPgColumnDataType(
+        "chat_session_contexts",
+        "created_at"
+      );
       await db.prepare(
-        `UPDATE chat_session_contexts
-         SET created_at = COALESCE(created_at, updated_at, compacted_at, CURRENT_TIMESTAMP)
+        isPgLike
+          ? isPgTextLikeType(chatSessionContextsCreatedAtType)
+            ? `UPDATE chat_session_contexts
+         SET created_at = COALESCE(
+               NULLIF(BTRIM(created_at::text), ''),
+               NULLIF(BTRIM(updated_at::text), ''),
+               NULLIF(BTRIM(compacted_at::text), ''),
+               CURRENT_TIMESTAMP::text
+             )
+         WHERE created_at IS NULL OR BTRIM(created_at::text) = ''`
+            : `UPDATE chat_session_contexts
+         SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)
+         WHERE created_at IS NULL`
+          : `UPDATE chat_session_contexts
+         SET created_at = COALESCE(NULLIF(TRIM(created_at), ''), updated_at, compacted_at, CURRENT_TIMESTAMP)
          WHERE created_at IS NULL OR TRIM(created_at) = ''`
       ).run();
 
@@ -10064,7 +10193,10 @@ async function buildAuthenticatedUserPayload(
     hasPassword?: boolean;
   }
 ): Promise<Record<string, unknown>> {
+  const accountAccess = await resolveAccountAccessContext(db, input.id);
   const secretRecovery = await getSecretRecoveryAuthState(db, input.id);
+  const isAdminManagedPassword =
+    accountAccess.passwordManagementMode === "admin_managed" && !accountAccess.isOwner;
 
   return {
     id: input.id,
@@ -10073,11 +10205,20 @@ async function buildAuthenticatedUserPayload(
     country_code: input.countryCode || null,
     created_at: input.createdAt || null,
     handle: normalizeUserHandleInput(input.handle) || null,
-    requires_secret_recovery_setup: secretRecovery.requiresSecretRecoverySetup,
-    secret_recovery_configured: secretRecovery.secretRecoveryConfigured,
-    secret_recovery_question_key: secretRecovery.secretRecoveryQuestionKey,
-    secret_recovery_storage_scope: secretRecovery.secretRecoveryStorageScope,
+    requires_secret_recovery_setup: isAdminManagedPassword
+      ? false
+      : secretRecovery.requiresSecretRecoverySetup,
+    secret_recovery_configured: isAdminManagedPassword
+      ? false
+      : secretRecovery.secretRecoveryConfigured,
+    secret_recovery_question_key: isAdminManagedPassword
+      ? null
+      : secretRecovery.secretRecoveryQuestionKey,
+    secret_recovery_storage_scope: isAdminManagedPassword
+      ? null
+      : secretRecovery.secretRecoveryStorageScope,
     has_password: Boolean(input.hasPassword),
+    account_access: buildAccountAccessPayload(accountAccess),
     ...(input.googleUserData ? { google_user_data: input.googleUserData } : {}),
   };
 }
@@ -15577,7 +15718,7 @@ type CentralCameraFindShareRow = {
 };
 
 type WorkspaceConnectionPolicy = "allow_while_open" | "confirm_each_time";
-type WorkspacePermissionProfile = "full_access";
+type WorkspacePermissionProfile = "full_access" | "scoped_access";
 type WorkspaceInviteStatus = "pending" | "accepted" | "denied" | "revoked";
 type WorkspaceSessionStatus =
   | "pending_owner"
@@ -15587,12 +15728,52 @@ type WorkspaceSessionStatus =
   | "ended"
   | "revoked";
 
+type WorkspaceAccessPermissionPayload = {
+  view_cameras: boolean;
+  execute_cameras: boolean;
+  view_tasks: boolean;
+  execute_tasks: boolean;
+  view_agents: boolean;
+  execute_agents: boolean;
+};
+
+type WorkspaceAccessPayload = {
+  full_access: boolean;
+  permissions: WorkspaceAccessPermissionPayload;
+  resource_scopes: {
+    cameras: {
+      view: "all" | "selected";
+      execute: "all" | "selected";
+    };
+    jobs: {
+      view: "all" | "selected";
+      execute: "all" | "selected";
+    };
+    agents: {
+      view: "all" | "selected";
+      execute: "all" | "selected";
+    };
+  };
+  resource_grants: AccountMembershipResourceGrantPayload;
+};
+
+type WorkspaceAccessConfiguration = {
+  fullAccess: boolean;
+  permissions: ReturnType<typeof buildFullAccountPermissions>;
+  resourceScopes: AccountResourceScopes;
+  resourceGrants: AccountMembershipResourceGrantPayload;
+};
+
 type CentralWorkspaceAccessInviteRow = {
   id: number;
   brand_id: string;
   owner_public_id: string;
   invitee_public_id: string;
   permission_profile: WorkspacePermissionProfile;
+  full_access: boolean;
+  permissions: WorkspaceAccessPermissionPayload;
+  resource_scopes: WorkspaceAccessPayload["resource_scopes"];
+  resource_grants: AccountMembershipResourceGrantPayload;
   status: WorkspaceInviteStatus;
   created_at: string;
   accepted_at: string | null;
@@ -15619,6 +15800,10 @@ type CentralWorkspaceAccessSessionRow = {
   owner_public_id: string;
   operator_public_id: string;
   permission_profile: WorkspacePermissionProfile;
+  full_access: boolean;
+  permissions: WorkspaceAccessPermissionPayload;
+  resource_scopes: WorkspaceAccessPayload["resource_scopes"];
+  resource_grants: AccountMembershipResourceGrantPayload;
   status: WorkspaceSessionStatus;
   requested_by_policy: WorkspaceConnectionPolicy;
   requested_at: string;
@@ -15660,8 +15845,163 @@ function normalizeWorkspaceConnectionPolicy(value: unknown): WorkspaceConnection
     : "allow_while_open";
 }
 
-function normalizeWorkspacePermissionProfile(_value: unknown): WorkspacePermissionProfile {
+function normalizeWorkspacePermissionProfile(value: unknown): WorkspacePermissionProfile {
+  const normalized = normalizeText(value).toLowerCase();
+  if (
+    normalized === "scoped_access" ||
+    normalized === "limited_access" ||
+    normalized === "restricted_access"
+  ) {
+    return "scoped_access";
+  }
   return "full_access";
+}
+
+function buildFullWorkspaceAccessConfiguration(): WorkspaceAccessConfiguration {
+  return {
+    fullAccess: true,
+    permissions: buildFullAccountPermissions(),
+    resourceScopes: buildAllAccountResourceScopes(),
+    resourceGrants: buildEmptyAccountMembershipResourceGrantPayload(),
+  };
+}
+
+function parseWorkspaceAccessConfigurationSource(
+  value: unknown
+): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(normalized);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeWorkspaceAccessConfiguration(
+  value: unknown,
+  fallback: WorkspaceAccessConfiguration = buildFullWorkspaceAccessConfiguration(),
+  profileFallback: WorkspacePermissionProfile = "full_access"
+): WorkspaceAccessConfiguration {
+  const source = parseWorkspaceAccessConfigurationSource(value) || {};
+  const permissionsSource =
+    source.permissions && typeof source.permissions === "object"
+      ? (source.permissions as Record<string, unknown>)
+      : {};
+  const scopesSource =
+    source.resource_scopes && typeof source.resource_scopes === "object"
+      ? (source.resource_scopes as Record<string, unknown>)
+      : {};
+  const grantsSource =
+    source.resource_grants && typeof source.resource_grants === "object"
+      ? (source.resource_grants as Record<string, unknown>)
+      : {};
+  const fullAccess = normalizeDbBoolean(
+    source.full_access ?? source.fullAccess,
+    profileFallback === "full_access" ? true : fallback.fullAccess
+  );
+
+  if (fullAccess) {
+    return buildFullWorkspaceAccessConfiguration();
+  }
+
+  const permissions = normalizeAccountPermissions(
+    {
+      can_view_cameras:
+        permissionsSource.view_cameras ??
+        permissionsSource.can_view_cameras ??
+        source.can_view_cameras ??
+        fallback.permissions.can_view_cameras,
+      can_execute_cameras:
+        permissionsSource.execute_cameras ??
+        permissionsSource.can_execute_cameras ??
+        source.can_execute_cameras ??
+        fallback.permissions.can_execute_cameras,
+      can_view_tasks:
+        permissionsSource.view_tasks ??
+        permissionsSource.can_view_tasks ??
+        source.can_view_tasks ??
+        fallback.permissions.can_view_tasks,
+      can_execute_tasks:
+        permissionsSource.execute_tasks ??
+        permissionsSource.can_execute_tasks ??
+        source.can_execute_tasks ??
+        fallback.permissions.can_execute_tasks,
+      can_view_agents:
+        permissionsSource.view_agents ??
+        permissionsSource.can_view_agents ??
+        source.can_view_agents ??
+        fallback.permissions.can_view_agents,
+      can_execute_agents:
+        permissionsSource.execute_agents ??
+        permissionsSource.can_execute_agents ??
+        source.can_execute_agents ??
+        fallback.permissions.can_execute_agents,
+      can_use_chat: false,
+    },
+    "member"
+  );
+  permissions.can_use_chat = false;
+
+  return {
+    fullAccess: false,
+    permissions,
+    resourceScopes: normalizeAccountResourceScopes(
+      scopesSource,
+      "member",
+      permissions,
+      fallback.resourceScopes
+    ),
+    resourceGrants: normalizeAccountMembershipResourceGrantPayload(
+      grantsSource,
+      fallback.resourceGrants
+    ),
+  };
+}
+
+function buildWorkspaceAccessPayload(
+  config: WorkspaceAccessConfiguration
+): WorkspaceAccessPayload {
+  return {
+    full_access: config.fullAccess,
+    permissions: {
+      view_cameras: config.permissions.can_view_cameras,
+      execute_cameras: config.permissions.can_execute_cameras,
+      view_tasks: config.permissions.can_view_tasks,
+      execute_tasks: config.permissions.can_execute_tasks,
+      view_agents: config.permissions.can_view_agents,
+      execute_agents: config.permissions.can_execute_agents,
+    },
+    resource_scopes: {
+      cameras: {
+        view: config.resourceScopes.cameras.view,
+        execute: config.resourceScopes.cameras.execute,
+      },
+      jobs: {
+        view: config.resourceScopes.jobs.view,
+        execute: config.resourceScopes.jobs.execute,
+      },
+      agents: {
+        view: config.resourceScopes.agents.view,
+        execute: config.resourceScopes.agents.execute,
+      },
+    },
+    resource_grants: config.resourceGrants,
+  };
+}
+
+function serializeWorkspaceAccessConfiguration(config: WorkspaceAccessConfiguration): string {
+  return JSON.stringify(buildWorkspaceAccessPayload(config));
 }
 
 function normalizeWorkspaceInviteStatus(value: unknown): WorkspaceInviteStatus {
@@ -15692,6 +16032,30 @@ function normalizeWorkspaceSessionStatus(value: unknown): WorkspaceSessionStatus
     default:
       return "pending_owner";
   }
+}
+
+function normalizeWorkspaceSessionStatusFilters(value: unknown): WorkspaceSessionStatus[] {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return [];
+  }
+
+  const allowedStatuses = new Set<WorkspaceSessionStatus>([
+    "pending_owner",
+    "approved",
+    "active",
+    "denied",
+    "ended",
+    "revoked",
+  ]);
+
+  return normalized
+    .split(",")
+    .map((entry) => normalizeText(entry))
+    .filter(
+      (entry): entry is WorkspaceSessionStatus =>
+        allowedStatuses.has(entry as WorkspaceSessionStatus)
+    );
 }
 
 function isWorkspacePresenceFresh(lastSeenAt: unknown, nowMs = Date.now()) {
@@ -16366,12 +16730,24 @@ function normalizeWorkspaceAccessInviteRow(
     return null;
   }
 
+  const permissionProfile = normalizeWorkspacePermissionProfile((row as any)?.permission_profile);
+  const accessConfig = normalizeWorkspaceAccessConfiguration(
+    (row as any)?.access_config_json,
+    buildFullWorkspaceAccessConfiguration(),
+    permissionProfile
+  );
+  const accessPayload = buildWorkspaceAccessPayload(accessConfig);
+
   return {
     id,
     brand_id: brandId,
     owner_public_id: ownerPublicId,
     invitee_public_id: inviteePublicId,
-    permission_profile: normalizeWorkspacePermissionProfile((row as any)?.permission_profile),
+    permission_profile: permissionProfile,
+    full_access: accessPayload.full_access,
+    permissions: accessPayload.permissions,
+    resource_scopes: accessPayload.resource_scopes,
+    resource_grants: accessPayload.resource_grants,
     status: normalizeWorkspaceInviteStatus((row as any)?.status),
     created_at: normalizeText((row as any)?.created_at) || new Date().toISOString(),
     accepted_at: normalizeOptionalText((row as any)?.accepted_at),
@@ -16420,13 +16796,24 @@ function normalizeWorkspaceAccessSessionRow(
   }
 
   const ownerLastSeenAt = normalizeOptionalText((row as any)?.owner_last_seen_at);
+  const permissionProfile = normalizeWorkspacePermissionProfile((row as any)?.permission_profile);
+  const accessConfig = normalizeWorkspaceAccessConfiguration(
+    (row as any)?.access_config_json,
+    buildFullWorkspaceAccessConfiguration(),
+    permissionProfile
+  );
+  const accessPayload = buildWorkspaceAccessPayload(accessConfig);
 
   return {
     session_id: sessionId,
     brand_id: brandId,
     owner_public_id: ownerPublicId,
     operator_public_id: operatorPublicId,
-    permission_profile: normalizeWorkspacePermissionProfile((row as any)?.permission_profile),
+    permission_profile: permissionProfile,
+    full_access: accessPayload.full_access,
+    permissions: accessPayload.permissions,
+    resource_scopes: accessPayload.resource_scopes,
+    resource_grants: accessPayload.resource_grants,
     status: normalizeWorkspaceSessionStatus((row as any)?.status),
     requested_by_policy: normalizeWorkspaceConnectionPolicy((row as any)?.requested_by_policy),
     requested_at: normalizeText((row as any)?.requested_at) || new Date().toISOString(),
@@ -16809,6 +17196,7 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
     ownerPublicId: string;
     inviteePublicId: string;
     permissionProfile: WorkspacePermissionProfile;
+    accessConfig: WorkspaceAccessConfiguration;
   }
 ) {
   const brandId = normalizeText(input.brandId);
@@ -16822,6 +17210,17 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
   }
 
   const now = new Date().toISOString();
+  const normalizedPermissionProfile =
+    input.accessConfig.fullAccess || input.permissionProfile === "full_access"
+      ? "full_access"
+      : "scoped_access";
+  const serializedAccessConfig = serializeWorkspaceAccessConfiguration(
+    normalizeWorkspaceAccessConfiguration(
+      buildWorkspaceAccessPayload(input.accessConfig),
+      buildFullWorkspaceAccessConfiguration(),
+      normalizedPermissionProfile
+    )
+  );
   const existing = await db
     .prepare(
       `SELECT id
@@ -16839,6 +17238,7 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
       .prepare(
         `UPDATE workspace_access_invites
          SET permission_profile = ?,
+             access_config_json = ?,
              status = 'pending',
              accepted_at = NULL,
              revoked_at = NULL,
@@ -16846,7 +17246,8 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
          WHERE id = ?`
       )
       .bind(
-        normalizeWorkspacePermissionProfile(input.permissionProfile),
+        normalizedPermissionProfile,
+        serializedAccessConfig,
         now,
         Number((existing as any)?.id || 0)
       )
@@ -16864,6 +17265,9 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
         operatorPublicId: inviteePublicId,
         actorPublicId: ownerPublicId,
         action: "invite_resent",
+        details: {
+          permission_profile: normalizedPermissionProfile,
+        },
       });
     }
     return invite;
@@ -16876,17 +17280,19 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
          owner_public_id,
          invitee_public_id,
          permission_profile,
+         access_config_json,
          status,
          created_at,
          updated_at
        )
-       VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`
     )
     .bind(
       brandId,
       ownerPublicId,
       inviteePublicId,
-      normalizeWorkspacePermissionProfile(input.permissionProfile),
+      normalizedPermissionProfile,
+      serializedAccessConfig,
       now,
       now
     )
@@ -16904,6 +17310,9 @@ async function createOrUpdateCentralWorkspaceAccessInvite(
       operatorPublicId: inviteePublicId,
       actorPublicId: ownerPublicId,
       action: "invite_created",
+      details: {
+        permission_profile: normalizedPermissionProfile,
+      },
     });
   }
   return invite;
@@ -17135,6 +17544,75 @@ async function getCentralWorkspaceAccessSessionById(
   return session;
 }
 
+async function listCentralWorkspaceAccessSessions(
+  db: D1Database,
+  input: {
+    brandId: string;
+    role: "owner" | "operator";
+    publicId: string;
+    statuses?: WorkspaceSessionStatus[];
+  }
+) {
+  const brandId = normalizeText(input.brandId);
+  const publicId = normalizeText(input.publicId);
+  if (!brandId || !publicId) {
+    return [] as CentralWorkspaceAccessSessionRow[];
+  }
+
+  const roleColumn =
+    input.role === "operator" ? "s.operator_public_id" : "s.owner_public_id";
+  const statusFilters = Array.isArray(input.statuses)
+    ? input.statuses.filter((status): status is WorkspaceSessionStatus => Boolean(status))
+    : [];
+  const bindings: Array<string> = [brandId, publicId];
+  const statusClause =
+    statusFilters.length > 0
+      ? ` AND s.status IN (${statusFilters.map(() => "?").join(", ")})`
+      : "";
+
+  if (statusFilters.length > 0) {
+    bindings.push(...statusFilters);
+  }
+
+  const { results } = await db
+    .prepare(
+      `SELECT s.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email,
+              operator_user.handle AS operator_handle,
+              operator_user.email AS operator_email,
+              presence.last_seen_at AS owner_last_seen_at,
+              presence.connection_policy AS owner_connection_policy
+       FROM workspace_access_sessions s
+       LEFT JOIN server_users owner
+         ON owner.public_id = s.owner_public_id
+       LEFT JOIN server_users operator_user
+         ON operator_user.public_id = s.operator_public_id
+       LEFT JOIN workspace_host_presence presence
+         ON presence.brand_id = s.brand_id
+        AND presence.owner_public_id = s.owner_public_id
+       WHERE s.brand_id = ?
+         AND ${roleColumn} = ?${statusClause}
+       ORDER BY COALESCE(s.connected_at, s.approved_at, s.requested_at) DESC,
+                s.updated_at DESC,
+                s.session_id DESC`
+    )
+    .bind(...bindings)
+    .all();
+
+  return (results || [])
+    .map((row: any) => normalizeWorkspaceAccessSessionRow(row))
+    .filter(
+      (session: CentralWorkspaceAccessSessionRow | null): session is CentralWorkspaceAccessSessionRow =>
+        Boolean(session)
+    )
+    .map((session: CentralWorkspaceAccessSessionRow) => ({
+      ...session,
+      owner_online:
+        session.owner_online && countWorkspaceRelayConnections(session.owner_public_id) > 0,
+    }));
+}
+
 async function createCentralWorkspaceAccessSession(
   db: D1Database,
   input: {
@@ -17142,11 +17620,23 @@ async function createCentralWorkspaceAccessSession(
     ownerPublicId: string;
     operatorPublicId: string;
     permissionProfile: WorkspacePermissionProfile;
+    accessConfig: WorkspaceAccessConfiguration;
     requestedByPolicy: WorkspaceConnectionPolicy;
   }
 ) {
   const now = new Date().toISOString();
   const sessionId = generateUUID();
+  const normalizedPermissionProfile =
+    input.accessConfig.fullAccess || input.permissionProfile === "full_access"
+      ? "full_access"
+      : "scoped_access";
+  const serializedAccessConfig = serializeWorkspaceAccessConfiguration(
+    normalizeWorkspaceAccessConfiguration(
+      buildWorkspaceAccessPayload(input.accessConfig),
+      buildFullWorkspaceAccessConfiguration(),
+      normalizedPermissionProfile
+    )
+  );
   const initialStatus: WorkspaceSessionStatus =
     normalizeWorkspaceConnectionPolicy(input.requestedByPolicy) === "allow_while_open"
       ? "approved"
@@ -17160,20 +17650,22 @@ async function createCentralWorkspaceAccessSession(
          owner_public_id,
          operator_public_id,
          permission_profile,
+         access_config_json,
          status,
          requested_by_policy,
          requested_at,
          approved_at,
          updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
       normalizeText(input.brandId),
       normalizeText(input.ownerPublicId),
       normalizeText(input.operatorPublicId),
-      normalizeWorkspacePermissionProfile(input.permissionProfile),
+      normalizedPermissionProfile,
+      serializedAccessConfig,
       initialStatus,
       normalizeWorkspaceConnectionPolicy(input.requestedByPolicy),
       now,
@@ -17192,6 +17684,7 @@ async function createCentralWorkspaceAccessSession(
       actorPublicId: session.operator_public_id,
       action: "session_requested",
       details: {
+        permission_profile: normalizedPermissionProfile,
         requested_by_policy: session.requested_by_policy,
       },
     });
@@ -21541,8 +22034,697 @@ async function clearGoogleSession(c: any) {
   clearGoogleSessionCookie(c);
 }
 
+type AccountPermissionField = keyof ReturnType<typeof buildFullAccountPermissions>;
+
+function getAccountAccessForRequest(c: any): AccountAccessContext {
+  const access = c.get("accountAccess") as AccountAccessContext | undefined;
+  if (!access) {
+    throw new Error("Account access context is missing from the request.");
+  }
+  return access;
+}
+
+function getActorUserIdForRequest(c: any): string {
+  const actorUserId = normalizeText(c.get("actorUserId"));
+  if (actorUserId) {
+    return actorUserId;
+  }
+  const user = c.get("user") as { actor_user_id?: string; id?: string } | undefined;
+  return normalizeText(user?.actor_user_id) || normalizeText(user?.id);
+}
+
+function getAccountUserIdForRequest(c: any): string {
+  return getAccountAccessForRequest(c).accountUserId;
+}
+
+function buildForbiddenAccountResponse(
+  c: any,
+  message = "This account does not have permission to perform this action."
+) {
+  return c.json({ error: message }, 403);
+}
+
+function requireActiveAccountAccess(c: any): AccountAccessContext | Response {
+  const access = getAccountAccessForRequest(c);
+  if (access.status !== "active") {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount is disabled. Contact the account owner or an administrator."
+    );
+  }
+  return access;
+}
+
+function requireOwnerAccountAccess(c: any): AccountAccessContext | Response {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  if (!access.isOwner) {
+    return buildForbiddenAccountResponse(
+      c,
+      "Only the main account owner can perform this action."
+    );
+  }
+  return access;
+}
+
+function requireSettingsAccess(c: any): AccountAccessContext | Response {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  if (!access.canManageSettings) {
+    return buildForbiddenAccountResponse(
+      c,
+      "Only the main account owner or an admin subaccount can access settings."
+    );
+  }
+  return access;
+}
+
+function requireAccountPermission(
+  c: any,
+  permission: AccountPermissionField,
+  message?: string
+): AccountAccessContext | Response {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  if (!access.permissions[permission]) {
+    return buildForbiddenAccountResponse(
+      c,
+      message || "This account does not have permission to access this area."
+    );
+  }
+  return access;
+}
+
+function requireAnyAccountPermission(
+  c: any,
+  permissions: AccountPermissionField[],
+  message?: string
+): AccountAccessContext | Response {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  if (permissions.some((permission) => access.permissions[permission])) {
+    return access;
+  }
+  return buildForbiddenAccountResponse(
+    c,
+    message || "This account does not have permission to access this area."
+  );
+}
+
+function getResourceModuleScope(
+  access: AccountAccessContext,
+  module: AccountScopedModule,
+  action: AccountScopedAction
+) {
+  const scopeSet =
+    module === "cameras"
+      ? access.resourceScopes.cameras
+      : module === "jobs"
+      ? access.resourceScopes.jobs
+      : access.resourceScopes.agents;
+  return action === "execute" ? scopeSet.execute : scopeSet.view;
+}
+
+function getPermissionFieldForScopedModule(
+  module: AccountScopedModule,
+  action: AccountScopedAction
+): AccountPermissionField {
+  if (module === "cameras") {
+    return action === "execute" ? "can_execute_cameras" : "can_view_cameras";
+  }
+  if (module === "jobs") {
+    return action === "execute" ? "can_execute_tasks" : "can_view_tasks";
+  }
+  return action === "execute" ? "can_execute_agents" : "can_view_agents";
+}
+
+function getScopedModuleForResourceType(resourceType: AccountScopedResourceType): AccountScopedModule {
+  if (resourceType === "camera") {
+    return "cameras";
+  }
+  if (resourceType === "job") {
+    return "jobs";
+  }
+  return "agents";
+}
+
+function listWorkspaceGrantedResourceIds(
+  grants: AccountMembershipResourceGrantPayload,
+  resourceType: AccountScopedResourceType,
+  action: AccountScopedAction
+): number[] {
+  if (resourceType === "camera") {
+    return action === "execute"
+      ? grants.cameras.executeIds
+      : grants.cameras.viewIds;
+  }
+  if (resourceType === "job") {
+    return action === "execute"
+      ? grants.jobs.executeIds
+      : grants.jobs.viewIds;
+  }
+
+  const agentKeys = action === "execute" ? grants.agents.executeIds : grants.agents.viewIds;
+  const prefix = `${resourceType}:`;
+  return agentKeys
+    .filter((value) => typeof value === "string" && value.startsWith(prefix))
+    .map((value) => Number(value.slice(prefix.length)))
+    .filter((value) => Number.isInteger(value) && value > 0);
+}
+
+async function getGrantedResourceIdSetForRequest(
+  c: any,
+  resourceType: AccountScopedResourceType,
+  action: AccountScopedAction
+): Promise<Set<number> | null> {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return null;
+  }
+  if (access.isOwner || access.isAdmin || access.isFullAccess) {
+    return null;
+  }
+
+  const module = getScopedModuleForResourceType(resourceType);
+  const permission = getPermissionFieldForScopedModule(module, action);
+  if (!access.permissions[permission]) {
+    return new Set<number>();
+  }
+
+  if (getResourceModuleScope(access, module, action) === "all") {
+    return null;
+  }
+
+  const cacheKey = `accountResourceGrant:${resourceType}:${action}`;
+  const cached = c.get(cacheKey) as Set<number> | undefined;
+  if (cached instanceof Set) {
+    return cached;
+  }
+
+  const workspaceGrants = c.get("workspaceAccessResourceGrantPayload") as
+    | AccountMembershipResourceGrantPayload
+    | undefined;
+  const ids = workspaceGrants
+    ? listWorkspaceGrantedResourceIds(workspaceGrants, resourceType, action)
+    : await listGrantedAccountResourceIds(
+        c.env.DB,
+        access.actorUserId,
+        resourceType,
+        action
+      );
+  const granted = new Set(ids);
+  c.set(cacheKey, granted as any);
+  return granted;
+}
+
+async function isGrantedResourceForRequest(
+  c: any,
+  resourceType: AccountScopedResourceType,
+  resourceId: number,
+  action: AccountScopedAction
+): Promise<boolean> {
+  const granted = await getGrantedResourceIdSetForRequest(c, resourceType, action);
+  return granted === null ? true : granted.has(resourceId);
+}
+
+async function requireGrantedResourceForRequest(
+  c: any,
+  resourceType: AccountScopedResourceType,
+  resourceId: number,
+  action: AccountScopedAction,
+  deniedMessage: string
+): Promise<AccountAccessContext | Response> {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  const granted = await isGrantedResourceForRequest(c, resourceType, resourceId, action);
+  if (!granted) {
+    return buildForbiddenAccountResponse(c, deniedMessage);
+  }
+  return access;
+}
+
+function canCreateScopedResource(access: AccountAccessContext, module: AccountScopedModule): boolean {
+  if (access.isOwner || access.isAdmin || access.isFullAccess) {
+    return true;
+  }
+  const permission = getPermissionFieldForScopedModule(module, "execute");
+  if (!access.permissions[permission]) {
+    return false;
+  }
+  return getResourceModuleScope(access, module, "execute") === "all";
+}
+
+function canCreateScopedResourceForRequest(c: any, module: AccountScopedModule): boolean {
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return false;
+  }
+  return canCreateScopedResource(access, module);
+}
+
+function buildAccountUserResponsePayload(
+  membership: Awaited<ReturnType<typeof getAccountMembership>>,
+  options?: {
+    resourceGrants?: AccountMembershipResourceGrantPayload | null;
+  }
+) {
+  if (!membership) {
+    return null;
+  }
+
+  return {
+    member_user_id: membership.actorUserId,
+    account_user_id: membership.accountUserId,
+    email: membership.memberEmail,
+    handle: membership.memberHandle,
+    member_created_at: membership.memberCreatedAt,
+    role: membership.role,
+    status: membership.status,
+    password_management_mode: membership.passwordManagementMode,
+    is_owner: membership.isOwner,
+    is_admin: membership.isAdmin,
+    can_manage_settings: membership.canManageSettings,
+    full_access: membership.isFullAccess,
+    permissions: {
+      view_cameras: membership.permissions.can_view_cameras,
+      execute_cameras: membership.permissions.can_execute_cameras,
+      view_tasks: membership.permissions.can_view_tasks,
+      execute_tasks: membership.permissions.can_execute_tasks,
+      view_agents: membership.permissions.can_view_agents,
+      execute_agents: membership.permissions.can_execute_agents,
+      chat: membership.permissions.can_use_chat,
+    },
+    resource_scopes: {
+      cameras: {
+        view: membership.resourceScopes.cameras.view,
+        execute: membership.resourceScopes.cameras.execute,
+      },
+      jobs: {
+        view: membership.resourceScopes.jobs.view,
+        execute: membership.resourceScopes.jobs.execute,
+      },
+      agents: {
+        view: membership.resourceScopes.agents.view,
+        execute: membership.resourceScopes.agents.execute,
+      },
+    },
+    resource_grants:
+      options?.resourceGrants || buildEmptyAccountMembershipResourceGrantPayload(),
+    created_at: membership.createdAt,
+    updated_at: membership.updatedAt,
+    created_by_user_id: membership.createdByUserId,
+    updated_by_user_id: membership.updatedByUserId,
+  };
+}
+
+async function loadAccountMembershipResourceGrantPayload(
+  db: D1Database,
+  memberUserId: string
+): Promise<AccountMembershipResourceGrantPayload> {
+  const rows = await listAccountMembershipResourceGrants(db, memberUserId);
+  return buildAccountMembershipResourceGrantPayload(rows);
+}
+
+async function loadAccountUsersResourceCatalog(db: D1Database, accountUserId: string) {
+  const [cameraResults, jobResults, cameraAgentResults, jobStepAgentResults] = await Promise.all([
+    db
+      .prepare(
+        `SELECT id, name, description, is_service_running, is_online, updated_at
+         FROM cameras
+         WHERE user_id = ?
+         ORDER BY created_at DESC, id DESC`
+      )
+      .bind(accountUserId)
+      .all(),
+    db
+      .prepare(
+        `SELECT j.id,
+                j.name,
+                j.status,
+                j.schedule_mode,
+                j.updated_at,
+                COUNT(js.id) AS step_count
+         FROM jobs j
+         LEFT JOIN job_steps js ON js.job_id = j.id
+         WHERE j.user_id = ?
+         GROUP BY j.id, j.name, j.status, j.schedule_mode, j.updated_at
+         ORDER BY j.created_at DESC, j.id DESC`
+      )
+      .bind(accountUserId)
+      .all(),
+    db
+      .prepare(
+        `SELECT ca.*,
+                c.name AS camera_name
+         FROM camera_algorithms ca
+         JOIN cameras c ON c.id = ca.camera_id
+         WHERE c.user_id = ?
+         ORDER BY c.name ASC, ca.updated_at DESC, ca.id DESC`
+      )
+      .bind(accountUserId)
+      .all(),
+    db
+      .prepare(
+        `SELECT jsa.*,
+                js.job_id,
+                js.name AS step_name,
+                j.name AS job_name,
+                c.name AS camera_name
+         FROM job_step_agents jsa
+         JOIN job_steps js ON js.id = jsa.step_id
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN cameras c ON c.id = jsa.camera_id
+         WHERE j.user_id = ?
+         ORDER BY j.name ASC, js.step_order ASC, jsa.is_active DESC, jsa.updated_at DESC, jsa.id DESC`
+      )
+      .bind(accountUserId)
+      .all(),
+  ]);
+
+  return {
+    cameras: ((cameraResults.results || []) as Array<Record<string, unknown>>).map((row) => ({
+      id: Number(row.id || 0),
+      name: normalizeText(row.name) || `Camera ${row.id ?? ""}`.trim(),
+      description: normalizeOptionalText(row.description),
+      is_service_running: normalizeDbBoolean(row.is_service_running, false),
+      is_online: normalizeDbBoolean(row.is_online, false),
+      updated_at: normalizeOptionalText(row.updated_at),
+    })),
+    jobs: ((jobResults.results || []) as Array<Record<string, unknown>>).map((row) => ({
+      id: Number(row.id || 0),
+      name: normalizeText(row.name) || `Job ${row.id ?? ""}`.trim(),
+      status: normalizeOptionalText(row.status),
+      schedule_mode: normalizeOptionalText(row.schedule_mode),
+      step_count: Number(row.step_count || 0),
+      updated_at: normalizeOptionalText(row.updated_at),
+    })),
+    agents: [
+      ...((cameraAgentResults.results || []) as Array<Record<string, unknown>>).map((row) => ({
+        key: serializeAccountAgentGrantKey("camera_algorithm", Number(row.id || 0)),
+        agent_kind: "camera_algorithm",
+        agent_id: Number(row.id || 0),
+        display_name: getCustomCameraAgentDisplayName(row),
+        summary: getCustomCameraAgentSummary(row),
+        agent_key: normalizeText(row.algorithm_type),
+        parent_camera_id: Number(row.camera_id || 0),
+        parent_camera_name: normalizeText(row.camera_name),
+        parent_job_id: null,
+        parent_job_name: null,
+        parent_step_id: null,
+        parent_step_name: null,
+        is_active: normalizeDbBoolean(row.is_enabled, false),
+        updated_at: normalizeOptionalText(row.updated_at),
+      })),
+      ...((jobStepAgentResults.results || []) as Array<Record<string, unknown>>).map((row) => ({
+        key: serializeAccountAgentGrantKey("job_step_agent", Number(row.id || 0)),
+        agent_kind: "job_step_agent",
+        agent_id: Number(row.id || 0),
+        display_name: getStoredJobStepAgentDisplayName(row),
+        summary: getStoredJobStepAgentSummary(row),
+        agent_key: normalizeText(row.agent_key),
+        parent_camera_id:
+          Number.isInteger(Number(row.camera_id)) && Number(row.camera_id) > 0
+            ? Number(row.camera_id)
+            : null,
+        parent_camera_name: normalizeOptionalText(row.camera_name),
+        parent_job_id: Number(row.job_id || 0),
+        parent_job_name: normalizeText(row.job_name),
+        parent_step_id: Number(row.step_id || 0),
+        parent_step_name: normalizeText(row.step_name),
+        is_active: normalizeDbBoolean(row.is_active, true),
+        updated_at: normalizeOptionalText(row.updated_at),
+      })),
+    ].filter((row) => Number.isInteger(row.agent_id) && row.agent_id > 0),
+  };
+}
+
+async function getLocalUserByCanonicalAppUserId(db: D1Database, appUserId: string) {
+  const normalizedAppUserId = normalizeText(appUserId);
+  if (!normalizedAppUserId) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM local_users
+       WHERE server_public_id = ?
+          OR ('local:' || CAST(id AS TEXT)) = ?
+       LIMIT 1`
+    )
+    .bind(normalizedAppUserId, normalizedAppUserId)
+    .first();
+
+  return (row as any) || null;
+}
+
+function normalizeRequestedAccountRole(value: unknown, fallback: AccountRole = "member"): AccountRole {
+  const normalized = normalizeText(value).toLowerCase();
+  if (normalized === "admin") return "admin";
+  if (normalized === "member") return "member";
+  if (normalized === "owner") return "owner";
+  return fallback;
+}
+
+function resolveRequestedAccountPermissions(
+  body: any,
+  fallback: ReturnType<typeof buildFullAccountPermissions>,
+  role: AccountRole
+) {
+  const permissionsBody =
+    body?.permissions && typeof body.permissions === "object" ? body.permissions : {};
+  const requestedFullAccess = normalizeDbBoolean(
+    body?.full_access ?? body?.fullAccess,
+    false
+  );
+
+  if (requestedFullAccess || role === "admin" || role === "owner") {
+    return buildFullAccountPermissions();
+  }
+
+  return normalizeAccountPermissions(
+    {
+      can_view_cameras:
+        permissionsBody?.view_cameras ?? body?.can_view_cameras ?? fallback.can_view_cameras,
+      can_execute_cameras:
+        permissionsBody?.execute_cameras ??
+        body?.can_execute_cameras ??
+        fallback.can_execute_cameras,
+      can_view_tasks:
+        permissionsBody?.view_tasks ?? body?.can_view_tasks ?? fallback.can_view_tasks,
+      can_execute_tasks:
+        permissionsBody?.execute_tasks ?? body?.can_execute_tasks ?? fallback.can_execute_tasks,
+      can_view_agents:
+        permissionsBody?.view_agents ?? body?.can_view_agents ?? fallback.can_view_agents,
+      can_execute_agents:
+        permissionsBody?.execute_agents ??
+        body?.can_execute_agents ??
+        fallback.can_execute_agents,
+      can_use_chat: permissionsBody?.chat ?? body?.can_use_chat ?? fallback.can_use_chat,
+    },
+    role
+  );
+}
+
+function resolveRequestedAccountResourceConfiguration(
+  body: any,
+  fallbackScopes: AccountResourceScopes,
+  fallbackGrants: AccountMembershipResourceGrantPayload,
+  role: AccountRole,
+  permissions: ReturnType<typeof buildFullAccountPermissions>
+) {
+  const scopesBody =
+    body?.resource_scopes && typeof body.resource_scopes === "object" ? body.resource_scopes : {};
+  const grantsBody =
+    body?.resource_grants && typeof body.resource_grants === "object" ? body.resource_grants : {};
+
+  const resourceScopes = normalizeAccountResourceScopes(
+    scopesBody,
+    role,
+    permissions,
+    fallbackScopes
+  );
+  const resourceGrants = normalizeAccountMembershipResourceGrantPayload(
+    grantsBody,
+    fallbackGrants
+  );
+
+  return {
+    resourceScopes,
+    resourceGrants,
+  };
+}
+
+function resolveRequestedWorkspaceAccessConfiguration(
+  body: any,
+  fallback: WorkspaceAccessConfiguration = buildFullWorkspaceAccessConfiguration()
+): WorkspaceAccessConfiguration {
+  const requestedFullAccess = normalizeDbBoolean(
+    body?.full_access ?? body?.fullAccess,
+    normalizeWorkspacePermissionProfile(body?.permission_profile) === "full_access" ||
+      fallback.fullAccess
+  );
+
+  if (requestedFullAccess) {
+    return buildFullWorkspaceAccessConfiguration();
+  }
+
+  const permissionsBody =
+    body?.permissions && typeof body.permissions === "object" ? body.permissions : {};
+  const permissions = normalizeAccountPermissions(
+    {
+      can_view_cameras:
+        permissionsBody?.view_cameras ??
+        permissionsBody?.can_view_cameras ??
+        body?.can_view_cameras ??
+        fallback.permissions.can_view_cameras,
+      can_execute_cameras:
+        permissionsBody?.execute_cameras ??
+        permissionsBody?.can_execute_cameras ??
+        body?.can_execute_cameras ??
+        fallback.permissions.can_execute_cameras,
+      can_view_tasks:
+        permissionsBody?.view_tasks ??
+        permissionsBody?.can_view_tasks ??
+        body?.can_view_tasks ??
+        fallback.permissions.can_view_tasks,
+      can_execute_tasks:
+        permissionsBody?.execute_tasks ??
+        permissionsBody?.can_execute_tasks ??
+        body?.can_execute_tasks ??
+        fallback.permissions.can_execute_tasks,
+      can_view_agents:
+        permissionsBody?.view_agents ??
+        permissionsBody?.can_view_agents ??
+        body?.can_view_agents ??
+        fallback.permissions.can_view_agents,
+      can_execute_agents:
+        permissionsBody?.execute_agents ??
+        permissionsBody?.can_execute_agents ??
+        body?.can_execute_agents ??
+        fallback.permissions.can_execute_agents,
+      can_use_chat: false,
+    },
+    "member"
+  );
+  permissions.can_use_chat = false;
+
+  const { resourceScopes, resourceGrants } = resolveRequestedAccountResourceConfiguration(
+    body,
+    fallback.resourceScopes,
+    fallback.resourceGrants,
+    "member",
+    permissions
+  );
+
+  return {
+    fullAccess: false,
+    permissions,
+    resourceScopes,
+    resourceGrants,
+  };
+}
+
+function buildScopedRequestUser(
+  authenticatedUser: Record<string, any>,
+  accountAccess: AccountAccessContext
+) {
+  return {
+    ...authenticatedUser,
+    id: accountAccess.accountUserId,
+    actor_user_id: authenticatedUser.id,
+    account_access: buildAccountAccessPayload(accountAccess),
+  };
+}
+
+function buildWorkspaceSessionAccountAccess(
+  session: CentralWorkspaceAccessSessionRow,
+  accountUserId: string
+): {
+  access: AccountAccessContext;
+  resourceGrants: AccountMembershipResourceGrantPayload;
+} {
+  const configuration = normalizeWorkspaceAccessConfiguration(
+    {
+      full_access: session.full_access,
+      permissions: session.permissions,
+      resource_scopes: session.resource_scopes,
+      resource_grants: session.resource_grants,
+    },
+    buildFullWorkspaceAccessConfiguration(),
+    session.permission_profile
+  );
+
+  return {
+    access: {
+      actorUserId: normalizeText(session.operator_public_id) || `workspace:${session.session_id}`,
+      accountUserId: normalizeText(accountUserId),
+      role: configuration.fullAccess ? "admin" : "member",
+      status: "active",
+      passwordManagementMode: "self_service",
+      permissions: configuration.permissions,
+      resourceScopes: configuration.resourceScopes,
+      canManageSettings: configuration.fullAccess,
+      isOwner: false,
+      isAdmin: configuration.fullAccess,
+      isFullAccess: configuration.fullAccess,
+    },
+    resourceGrants: configuration.resourceGrants,
+  };
+}
+
+function buildWorkspaceScopedRequestUser(
+  ownerUser: Record<string, any>,
+  accountAccess: AccountAccessContext
+) {
+  return {
+    ...ownerUser,
+    id: accountAccess.accountUserId,
+    actor_user_id: accountAccess.actorUserId,
+    account_access: buildAccountAccessPayload(accountAccess),
+  };
+}
+
+function buildWorkspacePermissionUserPayload(
+  session: CentralWorkspaceAccessSessionRow
+): Record<string, unknown> {
+  const workspaceSessionAccess = buildWorkspaceSessionAccountAccess(
+    session,
+    normalizeText(session.owner_public_id) || `remote:${session.session_id}`
+  );
+
+  return {
+    id: normalizeText(session.owner_public_id) || `remote:${session.session_id}`,
+    email: session.owner_email,
+    auth_provider: "local",
+    country_code: null,
+    created_at: null,
+    handle: session.owner_handle,
+    requires_secret_recovery_setup: false,
+    secret_recovery_configured: false,
+    secret_recovery_question_key: null,
+    secret_recovery_storage_scope: null,
+    has_password: false,
+    account_access: buildAccountAccessPayload(workspaceSessionAccess.access),
+  };
+}
+
 // Unified auth middleware that accepts both Local and Google OAuth
 const anyAuthMiddleware = async (c: any, next: any) => {
+  if (c.get("accountAccess")) {
+    return next();
+  }
+
   if (AUTH_DEBUG) {
     console.log("[AUTH] origin=", c.req.header("origin"));
     console.log("[AUTH] cookieHeaderLen=", (c.req.header("cookie") || "").length);
@@ -21556,6 +22738,9 @@ const anyAuthMiddleware = async (c: any, next: any) => {
   );
   if (internalRemoteWorkspaceAuth && internalRemoteWorkspaceAuth === INTERNAL_REMOTE_WORKSPACE_AUTH_SECRET) {
     const internalAppUserId = normalizeText(c.req.header(INTERNAL_REMOTE_WORKSPACE_USER_HEADER));
+    const internalWorkspaceSessionId = normalizeText(
+      c.req.header(INTERNAL_REMOTE_WORKSPACE_SESSION_HEADER)
+    );
     if (internalAppUserId) {
       const appUserRow = await c.env.DB
         .prepare(
@@ -21568,12 +22753,67 @@ const anyAuthMiddleware = async (c: any, next: any) => {
         .first();
 
       if (appUserRow) {
-        c.set("user", {
+        const internalUser = {
           id: String((appUserRow as any)?.id || ""),
           email: String((appUserRow as any)?.email || ""),
           auth_provider: normalizeText((appUserRow as any)?.auth_provider) || "local",
           country_code: normalizeOptionalText((appUserRow as any)?.country_code),
-        });
+        };
+        const baseAccountAccess = await resolveAccountAccessContext(c.env.DB, internalUser.id);
+        if (baseAccountAccess.status !== "active") {
+          return buildForbiddenAccountResponse(
+            c,
+            "This subaccount is disabled. Contact the account owner or an administrator."
+          );
+        }
+
+        if (internalWorkspaceSessionId) {
+          try {
+            const { session, centralContext } = await fetchCentralWorkspaceSessionByIdForAppUser(
+              c.env,
+              internalUser.id,
+              internalWorkspaceSessionId
+            );
+            if (
+              session.owner_public_id !== normalizeText(centralContext.publicId) ||
+              !["approved", "active"].includes(session.status)
+            ) {
+              return c.json({ error: "The remote workspace session is not available anymore." }, 409);
+            }
+
+            const workspaceSessionAccess = buildWorkspaceSessionAccountAccess(
+              session,
+              baseAccountAccess.accountUserId
+            );
+            c.set(
+              "user",
+              buildWorkspaceScopedRequestUser(internalUser, workspaceSessionAccess.access)
+            );
+            c.set("accountAccess", workspaceSessionAccess.access as any);
+            c.set(
+              "workspaceAccessResourceGrantPayload",
+              workspaceSessionAccess.resourceGrants as any
+            );
+            c.set("actorUserId", workspaceSessionAccess.access.actorUserId);
+            c.set("accountUserId", workspaceSessionAccess.access.accountUserId);
+            return next();
+          } catch (error) {
+            return c.json(
+              {
+                error:
+                  error instanceof Error && error.message
+                    ? error.message
+                    : "Failed to load the remote workspace session.",
+              },
+              409
+            );
+          }
+        }
+
+        c.set("user", buildScopedRequestUser(internalUser, baseAccountAccess));
+        c.set("accountAccess", baseAccountAccess as any);
+        c.set("actorUserId", internalUser.id);
+        c.set("accountUserId", baseAccountAccess.accountUserId);
         return next();
       }
     }
@@ -21587,13 +22827,24 @@ const anyAuthMiddleware = async (c: any, next: any) => {
       const user = await getGoogleSessionUser(c.env.DB, googleSessionToken);
 
       if (user) {
-        c.set("user", {
+        const authenticatedUser = {
           id: user.id,
           email: user.email,
           auth_provider: "google",
           country_code: user.country_code || null,
           google_user_data: user.google_user_data || null,
-        });
+        };
+        const accountAccess = await resolveAccountAccessContext(c.env.DB, authenticatedUser.id);
+        if (accountAccess.status !== "active") {
+          return buildForbiddenAccountResponse(
+            c,
+            "This subaccount is disabled. Contact the account owner or an administrator."
+          );
+        }
+        c.set("user", buildScopedRequestUser(authenticatedUser, accountAccess));
+        c.set("accountAccess", accountAccess as any);
+        c.set("actorUserId", authenticatedUser.id);
+        c.set("accountUserId", accountAccess.accountUserId);
         return next();
       }
     } catch (error) {
@@ -21622,19 +22873,534 @@ const anyAuthMiddleware = async (c: any, next: any) => {
         country_code: sessionData.country_code || null,
         locale: sessionData.locale || null,
       });
-
-      c.set("user", {
+      const authenticatedUser = {
         id: userId,
         email: sessionData.email,
         auth_provider: "local",
         country_code: sessionData.country_code || null,
-      });
+      };
+      const accountAccess = await resolveAccountAccessContext(c.env.DB, userId);
+      if (accountAccess.status !== "active") {
+        return buildForbiddenAccountResponse(
+          c,
+          "This subaccount is disabled. Contact the account owner or an administrator."
+        );
+      }
+      c.set("user", buildScopedRequestUser(authenticatedUser, accountAccess));
+      c.set("accountAccess", accountAccess as any);
+      c.set("actorUserId", authenticatedUser.id);
+      c.set("accountUserId", accountAccess.accountUserId);
       return next();
     }
   }
 
   return c.json({ error: "Not authenticated" }, 401);
 };
+
+async function ensureAccountContext(c: any): Promise<Response | null> {
+  if (c.get("accountAccess")) {
+    return null;
+  }
+  const result = await anyAuthMiddleware(c, async () => undefined);
+  return result instanceof Response ? result : null;
+}
+
+function isReadOnlyRequestMethod(method: string): boolean {
+  const normalizedMethod = normalizeText(method).toUpperCase();
+  return normalizedMethod === "GET" || normalizedMethod === "HEAD" || normalizedMethod === "OPTIONS";
+}
+
+function isAgentScopedCameraPath(pathname: string): boolean {
+  return /\/api\/cameras\/[^/]+\/(algorithms|custom-agents|faceid-targets|reid-targets)(\/|$)/i.test(
+    pathname
+  );
+}
+
+function buildScopedPermissionGuard(
+  viewPermission: AccountPermissionField,
+  executePermission: AccountPermissionField,
+  deniedMessage: string,
+  options?: {
+    skipPath?: (pathname: string) => boolean;
+  }
+) {
+  return async (c: any, next: any) => {
+    const authResponse = await ensureAccountContext(c);
+    if (authResponse) {
+      return authResponse;
+    }
+
+    const pathname = new URL(c.req.url).pathname;
+    if (options?.skipPath?.(pathname)) {
+      return next();
+    }
+
+    const access = isReadOnlyRequestMethod(c.req.method)
+      ? requireAccountPermission(c, viewPermission, deniedMessage)
+      : requireAccountPermission(c, executePermission, deniedMessage);
+
+    if (access instanceof Response) {
+      return access;
+    }
+
+    return next();
+  };
+}
+
+function buildSinglePermissionGuard(
+  permission: AccountPermissionField,
+  deniedMessage: string
+) {
+  return async (c: any, next: any) => {
+    const authResponse = await ensureAccountContext(c);
+    if (authResponse) {
+      return authResponse;
+    }
+
+    const access = requireAccountPermission(c, permission, deniedMessage);
+    if (access instanceof Response) {
+      return access;
+    }
+
+    return next();
+  };
+}
+
+function buildOwnerOnlyGuard(deniedMessage: string) {
+  return async (c: any, next: any) => {
+    const authResponse = await ensureAccountContext(c);
+    if (authResponse) {
+      return authResponse;
+    }
+
+    const access = requireOwnerAccountAccess(c);
+    if (access instanceof Response) {
+      return buildForbiddenAccountResponse(c, deniedMessage);
+    }
+
+    return next();
+  };
+}
+
+function buildFullAccessGuard(deniedMessage: string) {
+  return async (c: any, next: any) => {
+    const authResponse = await ensureAccountContext(c);
+    if (authResponse) {
+      return authResponse;
+    }
+
+    const access = requireActiveAccountAccess(c);
+    if (access instanceof Response) {
+      return access;
+    }
+    if (!access.isFullAccess) {
+      return buildForbiddenAccountResponse(c, deniedMessage);
+    }
+
+    return next();
+  };
+}
+
+const cameraAreaGuard = buildScopedPermissionGuard(
+  "can_view_cameras",
+  "can_execute_cameras",
+  "This subaccount does not have permission to access cameras.",
+  { skipPath: isAgentScopedCameraPath }
+);
+const taskAreaGuard = buildScopedPermissionGuard(
+  "can_view_tasks",
+  "can_execute_tasks",
+  "This subaccount does not have permission to access tasks."
+);
+const agentAreaGuard = buildScopedPermissionGuard(
+  "can_view_agents",
+  "can_execute_agents",
+  "This subaccount does not have permission to access agents."
+);
+const chatAreaGuard = buildSinglePermissionGuard(
+  "can_use_chat",
+  "This subaccount does not have permission to access chat."
+);
+const ownerOnlyBillingGuard = buildOwnerOnlyGuard(
+  "Only the main account owner can access billing."
+);
+const dashboardFullAccessGuard = buildFullAccessGuard(
+  "This area requires full account access."
+);
+const cameraExecuteOnlyGuard = buildSinglePermissionGuard(
+  "can_execute_cameras",
+  "This subaccount does not have permission to change cameras."
+);
+const agentExecuteOnlyGuard = buildSinglePermissionGuard(
+  "can_execute_agents",
+  "This subaccount does not have permission to change agents."
+);
+const taskAndAgentAreaGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const taskAccess = isReadOnlyRequestMethod(c.req.method)
+    ? requireAccountPermission(c, "can_view_tasks", "This subaccount does not have permission to access tasks.")
+    : requireAccountPermission(c, "can_execute_tasks", "This subaccount does not have permission to change tasks.");
+  if (taskAccess instanceof Response) {
+    return taskAccess;
+  }
+
+  const agentAccess = isReadOnlyRequestMethod(c.req.method)
+    ? requireAccountPermission(c, "can_view_agents", "This subaccount does not have permission to access agents.")
+    : requireAccountPermission(c, "can_execute_agents", "This subaccount does not have permission to change agents.");
+  if (agentAccess instanceof Response) {
+    return agentAccess;
+  }
+
+  return next();
+};
+
+const cameraResourceGrantGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const pathname = new URL(c.req.url).pathname;
+  if (isAgentScopedCameraPath(pathname)) {
+    return next();
+  }
+
+  const rawCameraId = c.req.param("cameraId") || c.req.param("id");
+  const cameraId = Number(rawCameraId);
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return next();
+  }
+
+  const action: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+    ? "view"
+    : "execute";
+  const access = await requireGrantedResourceForRequest(
+    c,
+    "camera",
+    cameraId,
+    action,
+    action === "view"
+      ? "This subaccount does not have access to this camera."
+      : "This subaccount does not have permission to change this camera."
+  );
+  if (access instanceof Response) {
+    return access;
+  }
+
+  return next();
+};
+
+async function resolveOwnedCameraAlgorithmIdForRequestByType(
+  c: any,
+  cameraId: number,
+  algorithmType: string
+): Promise<number> {
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return 0;
+  }
+
+  const row = await c.env.DB
+    .prepare(
+      `SELECT ca.id
+       FROM camera_algorithms ca
+       JOIN cameras cam ON cam.id = ca.camera_id
+       WHERE ca.camera_id = ?
+         AND ca.algorithm_type = ?
+         AND cam.user_id = ?
+       LIMIT 1`
+    )
+    .bind(cameraId, algorithmType, getAccountUserIdForRequest(c))
+    .first();
+
+  return Number((row as any)?.id || 0);
+}
+
+const cameraAlgorithmIdGrantGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const algorithmId = Number(c.req.param("algorithmId"));
+  if (!Number.isInteger(algorithmId) || algorithmId <= 0) {
+    return next();
+  }
+
+  const action: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+    ? "view"
+    : "execute";
+  const access = await requireGrantedResourceForRequest(
+    c,
+    "camera_algorithm",
+    algorithmId,
+    action,
+    action === "view"
+      ? "This subaccount does not have access to this agent."
+      : "This subaccount does not have permission to change this agent."
+  );
+  if (access instanceof Response) {
+    return access;
+  }
+
+  return next();
+};
+
+function buildCameraAlgorithmTypeGrantGuard(algorithmType: string) {
+  return async (c: any, next: any) => {
+    const authResponse = await ensureAccountContext(c);
+    if (authResponse) {
+      return authResponse;
+    }
+
+    const cameraId = Number(c.req.param("cameraId"));
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      return next();
+    }
+
+    const action: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+      ? "view"
+      : "execute";
+    const algorithmId = await resolveOwnedCameraAlgorithmIdForRequestByType(
+      c,
+      cameraId,
+      algorithmType
+    );
+
+    if (Number.isInteger(algorithmId) && algorithmId > 0) {
+      const access = await requireGrantedResourceForRequest(
+        c,
+        "camera_algorithm",
+        algorithmId,
+        action,
+        action === "view"
+          ? "This subaccount does not have access to this agent."
+          : "This subaccount does not have permission to change this agent."
+      );
+      if (access instanceof Response) {
+        return access;
+      }
+      return next();
+    }
+
+    if (action === "execute" && !canCreateScopedResourceForRequest(c, "agents")) {
+      return buildForbiddenAccountResponse(
+        c,
+        "This subaccount can only change the specific agents that were granted."
+      );
+    }
+
+    return next();
+  };
+}
+
+const faceIdCameraAlgorithmGrantGuard = buildCameraAlgorithmTypeGrantGuard("faceid");
+const reIdCameraAlgorithmGrantGuard = buildCameraAlgorithmTypeGrantGuard("reid");
+
+const jobResourceGrantGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const rawJobId = c.req.param("jobId") || c.req.param("id");
+  const jobId = Number(rawJobId);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return next();
+  }
+
+  const action: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+    ? "view"
+    : "execute";
+  const access = await requireGrantedResourceForRequest(
+    c,
+    "job",
+    jobId,
+    action,
+    action === "view"
+      ? "This subaccount does not have access to this job."
+      : "This subaccount does not have permission to change this job."
+  );
+  if (access instanceof Response) {
+    return access;
+  }
+
+  return next();
+};
+
+const jobStepTaskGrantGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const stepId = Number(c.req.param("stepId"));
+  if (!Number.isInteger(stepId) || stepId <= 0) {
+    return next();
+  }
+
+  const step = await c.env.DB
+    .prepare(
+      `SELECT js.job_id
+       FROM job_steps js
+       JOIN jobs j ON j.id = js.job_id
+       WHERE js.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+    .bind(stepId, getAccountUserIdForRequest(c))
+    .first();
+  const jobId = Number((step as any)?.job_id || 0);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return next();
+  }
+
+  const action: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+    ? "view"
+    : "execute";
+  const access = await requireGrantedResourceForRequest(
+    c,
+    "job",
+    jobId,
+    action,
+    action === "view"
+      ? "This subaccount does not have access to this job."
+      : "This subaccount does not have permission to change this job."
+  );
+  if (access instanceof Response) {
+    return access;
+  }
+
+  return next();
+};
+
+const jobStepAgentGrantGuard = async (c: any, next: any) => {
+  const authResponse = await ensureAccountContext(c);
+  if (authResponse) {
+    return authResponse;
+  }
+
+  const agentId = Number(c.req.param("agentId"));
+  if (!Number.isInteger(agentId) || agentId <= 0) {
+    return next();
+  }
+
+  const row = await c.env.DB
+    .prepare(
+      `SELECT jsa.id, js.job_id
+       FROM job_step_agents jsa
+       JOIN job_steps js ON js.id = jsa.step_id
+       JOIN jobs j ON j.id = js.job_id
+       WHERE jsa.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+    .bind(agentId, getAccountUserIdForRequest(c))
+    .first();
+  const jobId = Number((row as any)?.job_id || 0);
+  if (Number.isInteger(jobId) && jobId > 0) {
+    const taskAction: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+      ? "view"
+      : "execute";
+    const taskAccess = await requireGrantedResourceForRequest(
+      c,
+      "job",
+      jobId,
+      taskAction,
+      taskAction === "view"
+        ? "This subaccount does not have access to this job."
+        : "This subaccount does not have permission to change this job."
+    );
+    if (taskAccess instanceof Response) {
+      return taskAccess;
+    }
+  }
+
+  const agentAction: AccountScopedAction = isReadOnlyRequestMethod(c.req.method)
+    ? "view"
+    : "execute";
+  const agentAccess = await requireGrantedResourceForRequest(
+    c,
+    "job_step_agent",
+    agentId,
+    agentAction,
+    agentAction === "view"
+      ? "This subaccount does not have access to this agent."
+      : "This subaccount does not have permission to change this agent."
+  );
+  if (agentAccess instanceof Response) {
+    return agentAccess;
+  }
+
+  return next();
+};
+
+app.use("/api/dashboard", dashboardFullAccessGuard);
+app.use("/api/dashboard-alerts", dashboardFullAccessGuard);
+app.use("/api/open-monitor", dashboardFullAccessGuard);
+app.use("/api/events", dashboardFullAccessGuard);
+app.use("/api/events/*", dashboardFullAccessGuard);
+app.use("/api/agent-camera-directory", agentAreaGuard);
+app.use("/api/address-lookup", cameraExecuteOnlyGuard);
+app.use("/api/camera-recordings/*", cameraAreaGuard);
+app.use("/api/camera-thumbnails", cameraAreaGuard);
+app.use("/api/camera-imports/*", cameraAreaGuard);
+app.use("/api/cameras", cameraAreaGuard);
+app.use("/api/cameras/*", cameraAreaGuard);
+app.use("/api/cameras/:id", cameraResourceGrantGuard);
+app.use("/api/cameras/:id/*", cameraResourceGrantGuard);
+app.use("/api/cameras/:cameraId/*", cameraResourceGrantGuard);
+app.use("/api/cameras/:cameraId/algorithms", agentAreaGuard);
+app.use("/api/cameras/:cameraId/algorithms/*", agentAreaGuard);
+app.use("/api/cameras/:cameraId/custom-agents", agentAreaGuard);
+app.use("/api/cameras/:cameraId/custom-agents/*", agentAreaGuard);
+app.use("/api/cameras/:cameraId/custom-agents/:algorithmId", cameraAlgorithmIdGrantGuard);
+app.use("/api/cameras/:cameraId/custom-agents/:algorithmId/*", cameraAlgorithmIdGrantGuard);
+app.use("/api/cameras/:cameraId/faceid-targets", agentAreaGuard);
+app.use("/api/cameras/:cameraId/faceid-targets/*", agentAreaGuard);
+app.use("/api/cameras/:cameraId/reid-targets", agentAreaGuard);
+app.use("/api/cameras/:cameraId/reid-targets/*", agentAreaGuard);
+app.use("/api/camera-algorithms/*", agentAreaGuard);
+app.use("/api/camera-algorithms/:algorithmId", cameraAlgorithmIdGrantGuard);
+app.use("/api/camera-algorithms/:algorithmId/*", cameraAlgorithmIdGrantGuard);
+app.use("/api/cameras/:cameraId/faceid-targets", faceIdCameraAlgorithmGrantGuard);
+app.use("/api/cameras/:cameraId/faceid-targets/*", faceIdCameraAlgorithmGrantGuard);
+app.use("/api/cameras/:cameraId/reid-targets", reIdCameraAlgorithmGrantGuard);
+app.use("/api/cameras/:cameraId/reid-targets/*", reIdCameraAlgorithmGrantGuard);
+app.use("/api/custom-agents/*", agentAreaGuard);
+app.use("/api/face-targets", agentAreaGuard);
+app.use("/api/face-targets/*", agentAreaGuard);
+app.use("/api/drakon-find/*", agentAreaGuard);
+app.use("/api/drakon-find-target-images/*", agentAreaGuard);
+app.use("/api/drakon-find-hit-images/*", agentAreaGuard);
+app.use("/api/drakon-find-hit-videos/*", agentAreaGuard);
+app.use("/api/jobs", taskAreaGuard);
+app.use("/api/jobs/*", taskAreaGuard);
+app.use("/api/jobs/:id", jobResourceGrantGuard);
+app.use("/api/jobs/:id/*", jobResourceGrantGuard);
+app.use("/api/jobs/:jobId/*", jobResourceGrantGuard);
+app.use("/api/job-steps/*", taskAreaGuard);
+app.use("/api/job-steps/*", jobStepTaskGrantGuard);
+app.use("/api/job-steps/:stepId/agents", taskAndAgentAreaGuard);
+app.use("/api/job-steps/:stepId/agents/*", taskAndAgentAreaGuard);
+app.use("/api/job-step-agents/*", jobStepAgentGrantGuard);
+app.use("/api/video-uploads", chatAreaGuard);
+app.use("/api/video-uploads/*", chatAreaGuard);
+app.use("/api/chat/*", chatAreaGuard);
+app.use("/api/chat/sessions/:id/camera-registration/confirm", cameraExecuteOnlyGuard);
+app.use("/api/chat/sessions/:id/camera-batch-registration/confirm", cameraExecuteOnlyGuard);
+app.use("/api/chat/sessions/:id/camera-batch-edit/confirm", cameraExecuteOnlyGuard);
+app.use("/api/chat/sessions/:sessionId/identity-cards/upsert", agentExecuteOnlyGuard);
+app.use("/ws/chat/*", chatAreaGuard);
+app.use("/api/token-balance", ownerOnlyBillingGuard);
+app.use("/api/token-usage-summary", ownerOnlyBillingGuard);
+app.use("/api/stripe/create-checkout-session", ownerOnlyBillingGuard);
+app.use("/api/stripe/confirm-session", ownerOnlyBillingGuard);
+app.use("/api/payments", ownerOnlyBillingGuard);
+app.use("/api/payments/*", ownerOnlyBillingGuard);
+app.use("/api/subscriptions/*", ownerOnlyBillingGuard);
+app.use("/api/billing/*", ownerOnlyBillingGuard);
 
 const OPEN_MONITOR_STALE_AFTER_MS = 90_000;
 const DASHBOARD_PAIRING_AUTH_LOST_PROCESS_GRACE_MS = 5 * 60_000;
@@ -22688,6 +24454,19 @@ app.post("/api/account-security/setup", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
   const user = c.get("user")!;
+  const access = requireActiveAccountAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  if (access.passwordManagementMode === "admin_managed" && !access.isOwner) {
+    return c.json(
+      {
+        error:
+          "Password for this subaccount is managed by the account administrator.",
+      },
+      403
+    );
+  }
   const body = await c.req
     .json<{
       question_key?: string;
@@ -22819,6 +24598,21 @@ app.post("/api/auth/recovery/question", async (c) => {
     return c.json({ error: "Invalid email format" }, 400);
   }
 
+  const managedMembership = await findAccountMembershipByEmail(c.env.DB, email);
+  if (
+    managedMembership &&
+    managedMembership.passwordManagementMode === "admin_managed" &&
+    !managedMembership.isOwner
+  ) {
+    return c.json(
+      {
+        error:
+          "Password for this subaccount is managed by the account administrator.",
+      },
+      403
+    );
+  }
+
   const localMirror = await getLocalSecretRecoveryMirrorRowByEmail(c.env.DB, email);
   if (
     isConfiguredSecretRecoveryMirrorRow(localMirror) &&
@@ -22912,6 +24706,20 @@ app.post("/api/auth/recovery/reset", async (c) => {
 
   if (!isValidEmail(email)) {
     return c.json({ error: "Invalid email format" }, 400);
+  }
+  const managedMembership = await findAccountMembershipByEmail(c.env.DB, email);
+  if (
+    managedMembership &&
+    managedMembership.passwordManagementMode === "admin_managed" &&
+    !managedMembership.isOwner
+  ) {
+    return c.json(
+      {
+        error:
+          "Password for this subaccount is managed by the account administrator.",
+      },
+      403
+    );
   }
   if (!questionKey || !isValidSecretRecoveryAnswer(answer)) {
     return c.json({ error: "Invalid secret recovery question or answer." }, 400);
@@ -24015,6 +25823,10 @@ app.post("/api/workspace-access/invites", async (c) => {
       invitee_public_id?: string;
       query?: string;
       permission_profile?: string;
+      full_access?: boolean;
+      permissions?: Record<string, unknown>;
+      resource_scopes?: Record<string, unknown>;
+      resource_grants?: Record<string, unknown>;
     }>()
     .catch(() => null);
   if (!body) {
@@ -24030,11 +25842,15 @@ app.post("/api/workspace-access/invites", async (c) => {
   }
 
   try {
+    const accessConfig = resolveRequestedWorkspaceAccessConfiguration(body);
     const invite = await createOrUpdateCentralWorkspaceAccessInvite(c.env.DB, {
       brandId: brand.id,
       ownerPublicId: verified.claims.public_id,
       inviteePublicId: resolvedInvitee.public_id,
-      permissionProfile: normalizeWorkspacePermissionProfile(body.permission_profile),
+      permissionProfile: accessConfig.fullAccess
+        ? "full_access"
+        : normalizeWorkspacePermissionProfile(body.permission_profile),
+      accessConfig,
     });
     if (!invite) {
       return c.json({ error: "Failed to create the workspace access invite." }, 500);
@@ -24237,6 +26053,16 @@ app.post("/api/workspace-access/sessions", async (c) => {
     ownerPublicId: invite.owner_public_id,
     operatorPublicId: invite.invitee_public_id,
     permissionProfile: invite.permission_profile,
+    accessConfig: normalizeWorkspaceAccessConfiguration(
+      {
+        full_access: invite.full_access,
+        permissions: invite.permissions,
+        resource_scopes: invite.resource_scopes,
+        resource_grants: invite.resource_grants,
+      },
+      buildFullWorkspaceAccessConfiguration(),
+      invite.permission_profile
+    ),
     requestedByPolicy: presence.connection_policy,
   });
   if (!session) {
@@ -24244,6 +26070,27 @@ app.post("/api/workspace-access/sessions", async (c) => {
   }
 
   return c.json({ session }, 201);
+});
+
+app.get("/api/workspace-access/sessions", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const role = normalizeText(c.req.query("role")) === "operator" ? "operator" : "owner";
+  const statuses = normalizeWorkspaceSessionStatusFilters(c.req.query("status"));
+  const sessions = await listCentralWorkspaceAccessSessions(c.env.DB, {
+    brandId: brand.id,
+    role,
+    publicId: verified.claims.public_id,
+    statuses,
+  });
+
+  return c.json({ sessions });
 });
 
 app.get("/api/workspace-access/sessions/:sessionId", async (c) => {
@@ -24927,9 +26774,67 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/pending-requests`, anyAuthMiddlewa
   });
 });
 
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/active-sessions`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const user = c.get("user")!;
+  if (!isCentralIdentityClientConfigured(c.env)) {
+    return c.json({ error: "Central identity server is not configured." }, 503);
+  }
+
+  const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const remote = await callCentralIdentityAuthorizedEndpoint(
+    c.env,
+    "/api/workspace-access/sessions?role=owner&status=active",
+    {
+      method: "GET",
+      token: centralContext.grantToken,
+    }
+  );
+
+  if (!remote.response.ok) {
+    return c.json(
+      remote.data || {
+        error: "Failed to load active remote workspace sessions.",
+      },
+      (remote.response.status || 502) as any
+    );
+  }
+
+  const sessions = Array.isArray((remote.data as any)?.sessions)
+    ? ((remote.data as any).sessions as Array<Record<string, unknown>>)
+        .map((session) => normalizeWorkspaceAccessSessionRow(session))
+        .filter(
+          (session): session is CentralWorkspaceAccessSessionRow => Boolean(session)
+        )
+        .map((session) => ({
+          session_id: session.session_id,
+          permission_profile: session.permission_profile,
+          status: session.status,
+          connected_at: session.connected_at,
+          updated_at: session.updated_at,
+          operator_handle: session.operator_handle,
+          operator_email: session.operator_email,
+          operator_display_label: buildSharedFindDisplayLabel({
+            handle: session.operator_handle,
+            email: session.operator_email,
+          }),
+        }))
+    : [];
+
+  return c.json({ sessions });
+});
+
 app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/users/resolve`, anyAuthMiddleware, async (c) => {
   if (!brand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
   }
 
   const user = c.get("user")!;
@@ -24966,9 +26871,35 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/users/resolve`, anyAuthMiddleware
   );
 });
 
+app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/resource-catalog`, anyAuthMiddleware, async (c) => {
+  if (!brand.features.workspaceAccessEnabled) {
+    return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+
+  try {
+    const catalog = await loadAccountUsersResourceCatalog(
+      c.env.DB,
+      getAccountUserIdForRequest(c)
+    );
+    return c.json({ resource_catalog: catalog });
+  } catch {
+    return c.json({ error: "Failed to load the workspace access resource catalog." }, 500);
+  }
+});
+
 app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites`, anyAuthMiddleware, async (c) => {
   if (!brand.features.workspaceAccessEnabled) {
     return c.json({ error: "Workspace access is not enabled for this brand." }, 404);
+  }
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
   }
 
   const user = c.get("user")!;
@@ -24981,6 +26912,10 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites`, anyAuthMiddleware, asyn
       query?: string;
       invitee_public_id?: string;
       permission_profile?: string;
+      full_access?: boolean;
+      permissions?: Record<string, unknown>;
+      resource_scopes?: Record<string, unknown>;
+      resource_grants?: Record<string, unknown>;
     }>()
     .catch(() => null);
   if (!body) {
@@ -24988,13 +26923,21 @@ app.post(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/invites`, anyAuthMiddleware, asyn
   }
 
   const centralContext = await resolveCurrentUserCentralRelayContext(c.env, user);
+  const accessConfig = resolveRequestedWorkspaceAccessConfiguration(body);
+  const accessPayload = buildWorkspaceAccessPayload(accessConfig);
   const remote = await callCentralIdentityAuthorizedEndpoint(c.env, "/api/workspace-access/invites", {
     method: "POST",
     token: centralContext.grantToken,
     body: {
       query: body.query,
       invitee_public_id: normalizeText(body.invitee_public_id),
-      permission_profile: normalizeWorkspacePermissionProfile(body.permission_profile),
+      permission_profile: accessConfig.fullAccess
+        ? "full_access"
+        : normalizeWorkspacePermissionProfile(body.permission_profile),
+      full_access: accessPayload.full_access,
+      permissions: accessPayload.permissions,
+      resource_scopes: accessPayload.resource_scopes,
+      resource_grants: accessPayload.resource_grants,
     },
   });
 
@@ -25178,6 +27121,7 @@ app.get(`${LOCAL_WORKSPACE_ACCESS_API_PREFIX}/sessions/:sessionId/bootstrap`, an
     );
     return c.json({
       session,
+      permission_user: buildWorkspacePermissionUserPayload(session),
       remote_context: {
         owner_display_label: buildSharedFindDisplayLabel({
           handle: session.owner_handle,
@@ -25617,7 +27561,34 @@ app.post("/api/auth/local/login", async (c) => {
       }
 
       effectiveLocalUser = refreshedLocalUser as any;
-      if (isCentralIdentityClientConfigured(c.env)) {
+      const refreshedAppUserId = resolveCanonicalAppUserIdFromLocalUserRow(
+        refreshedLocalUser as any
+      );
+      await ensureAppUserRow(c.env.DB, {
+        id: refreshedAppUserId,
+        email: String((refreshedLocalUser as any).email || ""),
+        auth_provider: "local",
+        country_code: (refreshedLocalUser as any).country_code || null,
+        locale: (refreshedLocalUser as any).locale || null,
+      });
+      const refreshedAccountAccess = await resolveAccountAccessContext(
+        c.env.DB,
+        refreshedAppUserId
+      );
+      if (refreshedAccountAccess.status !== "active") {
+        return c.json(
+          {
+            error:
+              "This subaccount is disabled. Contact the account owner or an administrator.",
+          },
+          403
+        );
+      }
+      const shouldSkipCentralSyncForManagedSubaccount =
+        refreshedAccountAccess.passwordManagementMode === "admin_managed" &&
+        !refreshedAccountAccess.isOwner;
+
+      if (!shouldSkipCentralSyncForManagedSubaccount && isCentralIdentityClientConfigured(c.env)) {
         let centralResult: Awaited<ReturnType<typeof callCentralIdentityEndpoint>> | null = null;
         try {
           centralResult = await callCentralIdentityEndpoint(c.env, "/api/identity/migrate-login", {
@@ -25675,6 +27646,15 @@ app.post("/api/auth/local/login", async (c) => {
       auth_provider: "local",
       country_code: (effectiveLocalUser as any).country_code || null,
     });
+    const accountAccess = await resolveAccountAccessContext(c.env.DB, appUserId);
+    if (accountAccess.status !== "active") {
+      return c.json(
+        {
+          error: "This subaccount is disabled. Contact the account owner or an administrator.",
+        },
+        403
+      );
+    }
 
     await createLocalAuthSession(c, Number((effectiveLocalUser as any).id || 0));
     const profile = await getAppUserProfile(c.env.DB, appUserId);
@@ -25761,6 +27741,14 @@ app.get("/api/auth/me", async (c) => {
               serverUserHasRealPasswordHash((localIdentity as any)?.password_hash)
           ),
         });
+        if (normalizeText((authUser as any)?.account_access?.status) === "disabled") {
+          clearGoogleSessionCookie(c);
+          return c.json({
+            isAuthenticated: false,
+            authProvider: null,
+            user: null,
+          });
+        }
         void maybeEnsureSharedFindRelayForUser(c.env, {
           id: user.id,
           email: user.email,
@@ -25810,6 +27798,14 @@ app.get("/api/auth/me", async (c) => {
         handle: profile.handle,
         hasPassword: true,
       });
+      if (normalizeText((authUser as any)?.account_access?.status) === "disabled") {
+        await clearLocalSession(c);
+        return c.json({
+          isAuthenticated: false,
+          authProvider: null,
+          user: null,
+        });
+      }
       void maybeEnsureSharedFindRelayForUser(c.env, {
         id: appUserId,
         email: sessionData.email,
@@ -25834,6 +27830,10 @@ app.get("/api/auth/me", async (c) => {
 app.get("/api/account/deletion-preview", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
+  const ownerAccess = requireOwnerAccountAccess(c);
+  if (ownerAccess instanceof Response) {
+    return ownerAccess;
+  }
   const user = c.get("user")!;
   const localIdentity =
     user.auth_provider === "local"
@@ -25910,6 +27910,10 @@ app.get("/api/account/deletion-preview", anyAuthMiddleware, async (c) => {
 app.delete("/api/account", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
+  const ownerAccess = requireOwnerAccountAccess(c);
+  if (ownerAccess instanceof Response) {
+    return ownerAccess;
+  }
   const user = c.get("user")!;
   const body = await c.req
     .json<{
@@ -26056,6 +28060,10 @@ app.delete("/api/account", anyAuthMiddleware, async (c) => {
 app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
+  const ownerAccess = requireOwnerAccountAccess(c);
+  if (ownerAccess instanceof Response) {
+    return ownerAccess;
+  }
   const user = c.get("user")!;
   const body = await c.req
     .json<{
@@ -26146,6 +28154,371 @@ app.patch("/api/user-profile", anyAuthMiddleware, async (c) => {
   return c.json({
     success: true,
     handle: normalizedHandle,
+  });
+});
+
+app.get("/api/account-users", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+
+  const memberships = await listAccountMemberships(c.env.DB, access.accountUserId);
+  const users = await Promise.all(
+    memberships.map(async (membership) =>
+      buildAccountUserResponsePayload(membership, {
+        resourceGrants: await loadAccountMembershipResourceGrantPayload(
+          c.env.DB,
+          membership.actorUserId
+        ),
+      })
+    )
+  );
+  const resourceCatalog = await loadAccountUsersResourceCatalog(c.env.DB, access.accountUserId);
+  return c.json({
+    success: true,
+    actor_user_id: getActorUserIdForRequest(c),
+    account_user_id: access.accountUserId,
+    role: access.role,
+    users: users.filter(Boolean),
+    can_assign_admin: access.isOwner,
+    resource_catalog: resourceCatalog,
+  });
+});
+
+app.post("/api/account-users", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+
+  const actor = c.get("user")!;
+  const body = await c.req
+    .json<{
+      email?: string;
+      password?: string;
+      role?: string;
+      full_access?: boolean;
+      permissions?: Record<string, unknown>;
+      resource_scopes?: Record<string, unknown>;
+      resource_grants?: Record<string, unknown>;
+    }>()
+    .catch(() => null);
+
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const email = normalizeEmail(body.email || "");
+  const password = typeof body.password === "string" ? body.password : "";
+  const role = normalizeRequestedAccountRole(body.role, "member");
+  if (!isValidEmail(email)) {
+    return c.json({ error: "Invalid email format" }, 400);
+  }
+  if (!isValidPassword(password)) {
+    return c.json({ error: "Password must be at least 8 characters" }, 400);
+  }
+  if (role === "owner") {
+    return c.json({ error: "Subaccounts cannot use the owner role." }, 400);
+  }
+  if (role === "admin" && !access.isOwner) {
+    return c.json(
+      { error: "Only the main account owner can create admin subaccounts." },
+      403
+    );
+  }
+  if (normalizeEmail(actor.email || "") === email) {
+    return c.json({ error: "Use a different email for the subaccount." }, 409);
+  }
+
+  const existingLocalUser = await findLocalUserIdentityCache(c.env.DB, { email });
+  const existingAppUser = await getAppUserRowByEmail(c.env.DB, email);
+  if (existingLocalUser || existingAppUser) {
+    return c.json({ error: "Email already registered." }, 409);
+  }
+
+  const nowIso = new Date().toISOString();
+  const passwordHash = await bcrypt.hash(password, 10);
+  const insertResult = await c.env.DB
+    .prepare(
+      `INSERT INTO local_users (
+         email,
+         password_hash,
+         country_code,
+         locale,
+         is_active,
+         identity_source,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, 1, 'local', ?, ?)`
+    )
+    .bind(
+      email,
+      passwordHash,
+      normalizeCountryCode(actor.country_code, null),
+      null,
+      nowIso,
+      nowIso
+    )
+    .run();
+
+  const localUserId = Number(insertResult.meta?.last_row_id || 0);
+  if (!Number.isFinite(localUserId) || localUserId <= 0) {
+    return c.json({ error: "Failed to create the subaccount." }, 500);
+  }
+
+  await c.env.DB
+    .prepare(
+      `UPDATE local_users
+       SET pairing_client_id = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(`local:${localUserId}`, nowIso, localUserId)
+    .run();
+
+  const localUser = await c.env.DB
+    .prepare(`SELECT * FROM local_users WHERE id = ? LIMIT 1`)
+    .bind(localUserId)
+    .first();
+  if (!localUser) {
+    return c.json({ error: "Failed to reload the created subaccount." }, 500);
+  }
+
+  const memberUserId = resolveCanonicalAppUserIdFromLocalUserRow(localUser as any);
+  await ensureAppUserRow(c.env.DB, {
+    id: memberUserId,
+    email,
+    auth_provider: "local",
+    country_code: normalizeCountryCode(actor.country_code, null),
+    locale: null,
+    handle: deriveHandleFromEmail(email),
+  });
+
+  const requestedPermissions = resolveRequestedAccountPermissions(
+    body,
+    buildFullAccountPermissions(),
+    role
+  );
+  const requestedResourceConfiguration = resolveRequestedAccountResourceConfiguration(
+    body,
+    buildAllAccountResourceScopes(),
+    buildEmptyAccountMembershipResourceGrantPayload(),
+    role,
+    requestedPermissions
+  );
+
+  await createAccountMembership(c.env.DB, {
+    memberUserId,
+    accountUserId: access.accountUserId,
+    role,
+    status: "active",
+    passwordManagementMode: "admin_managed",
+    permissions: requestedPermissions,
+    resourceScopes: requestedResourceConfiguration.resourceScopes,
+    createdByUserId: getActorUserIdForRequest(c),
+    updatedByUserId: getActorUserIdForRequest(c),
+  });
+  await replaceAccountMembershipResourceGrants(c.env.DB, {
+    memberUserId,
+    resourceScopes: requestedResourceConfiguration.resourceScopes,
+    grants: requestedResourceConfiguration.resourceGrants,
+  });
+
+  const createdMembership = await getAccountMembership(c.env.DB, memberUserId);
+  return c.json(
+    {
+      success: true,
+      user: buildAccountUserResponsePayload(createdMembership, {
+        resourceGrants: await loadAccountMembershipResourceGrantPayload(c.env.DB, memberUserId),
+      }),
+    },
+    201
+  );
+});
+
+app.patch("/api/account-users/:memberId", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+
+  const memberId = decodeURIComponent(c.req.param("memberId") || "");
+  const targetMembership = await getAccountMembership(c.env.DB, memberId);
+  if (!targetMembership || targetMembership.accountUserId !== access.accountUserId) {
+    return c.json({ error: "Subaccount not found." }, 404);
+  }
+  if (targetMembership.isOwner) {
+    return c.json({ error: "The main account owner cannot be edited here." }, 403);
+  }
+
+  const body = await c.req
+    .json<{
+      role?: string;
+      status?: string;
+      full_access?: boolean;
+      permissions?: Record<string, unknown>;
+      resource_scopes?: Record<string, unknown>;
+      resource_grants?: Record<string, unknown>;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const nextRole = normalizeRequestedAccountRole(body.role, targetMembership.role);
+  const nextStatus = normalizeAccountMembershipStatus(body.status || targetMembership.status);
+  if (nextRole === "owner") {
+    return c.json({ error: "Subaccounts cannot use the owner role." }, 400);
+  }
+
+  if (!access.isOwner) {
+    if (targetMembership.role !== "member") {
+      return c.json(
+        { error: "Only the main account owner can edit admin subaccounts." },
+        403
+      );
+    }
+    if (nextRole === "admin") {
+      return c.json(
+        { error: "Only the main account owner can grant the admin role." },
+        403
+      );
+    }
+  }
+
+  const nextPermissions = resolveRequestedAccountPermissions(
+    body,
+    targetMembership.permissions,
+    nextRole
+  );
+  const currentGrantPayload = await loadAccountMembershipResourceGrantPayload(
+    c.env.DB,
+    targetMembership.actorUserId
+  );
+  const requestedResourceConfiguration = resolveRequestedAccountResourceConfiguration(
+    body,
+    targetMembership.resourceScopes,
+    currentGrantPayload,
+    nextRole,
+    nextPermissions
+  );
+
+  await updateAccountMembership(c.env.DB, {
+    memberUserId: targetMembership.actorUserId,
+    role: nextRole,
+    status: nextStatus,
+    passwordManagementMode: targetMembership.passwordManagementMode,
+    permissions: nextPermissions,
+    resourceScopes: requestedResourceConfiguration.resourceScopes,
+    updatedByUserId: getActorUserIdForRequest(c),
+  });
+  await replaceAccountMembershipResourceGrants(c.env.DB, {
+    memberUserId: targetMembership.actorUserId,
+    resourceScopes: requestedResourceConfiguration.resourceScopes,
+    grants: requestedResourceConfiguration.resourceGrants,
+  });
+
+  const localUser = await getLocalUserByCanonicalAppUserId(c.env.DB, targetMembership.actorUserId);
+  if (localUser) {
+    await c.env.DB
+      .prepare(
+        `UPDATE local_users
+         SET is_active = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .bind(nextStatus === "active" ? 1 : 0, new Date().toISOString(), (localUser as any).id)
+      .run();
+
+    if (nextStatus !== "active") {
+      await deleteLocalSessionsByLocalUserId(c.env.DB, Number((localUser as any).id || 0));
+    }
+  }
+
+  if (nextStatus !== "active") {
+    await deleteGoogleSessionsByAppUserId(c.env.DB, targetMembership.actorUserId);
+  }
+
+  const updatedMembership = await getAccountMembership(c.env.DB, targetMembership.actorUserId);
+  return c.json({
+    success: true,
+    user: buildAccountUserResponsePayload(updatedMembership, {
+      resourceGrants: await loadAccountMembershipResourceGrantPayload(
+        c.env.DB,
+        targetMembership.actorUserId
+      ),
+    }),
+  });
+});
+
+app.post("/api/account-users/:memberId/password", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+
+  const memberId = decodeURIComponent(c.req.param("memberId") || "");
+  const targetMembership = await getAccountMembership(c.env.DB, memberId);
+  if (!targetMembership || targetMembership.accountUserId !== access.accountUserId) {
+    return c.json({ error: "Subaccount not found." }, 404);
+  }
+  if (targetMembership.isOwner) {
+    return c.json({ error: "The main account owner password cannot be changed here." }, 403);
+  }
+  if (!access.isOwner && targetMembership.role !== "member") {
+    return c.json(
+      { error: "Only the main account owner can change an admin subaccount password." },
+      403
+    );
+  }
+
+  const body = await c.req
+    .json<{
+      password?: string;
+    }>()
+    .catch(() => null);
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const password = typeof body.password === "string" ? body.password : "";
+  if (!isValidPassword(password)) {
+    return c.json({ error: "Password must be at least 8 characters" }, 400);
+  }
+
+  const localUser = await getLocalUserByCanonicalAppUserId(c.env.DB, targetMembership.actorUserId);
+  if (!localUser) {
+    return c.json({ error: "This subaccount does not have a local password identity." }, 404);
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const nowIso = new Date().toISOString();
+  await c.env.DB
+    .prepare(
+      `UPDATE local_users
+       SET password_hash = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(passwordHash, nowIso, (localUser as any).id)
+    .run();
+
+  await deleteLocalSessionsByLocalUserId(c.env.DB, Number((localUser as any).id || 0));
+  await deleteGoogleSessionsByAppUserId(c.env.DB, targetMembership.actorUserId);
+
+  return c.json({
+    success: true,
+    member_user_id: targetMembership.actorUserId,
   });
 });
 
@@ -26422,6 +28795,10 @@ app.get("/api/users/me", async (c) => {
         handle: profile.handle,
         hasPassword: true,
       });
+      if (normalizeText((authUser as any)?.account_access?.status) === "disabled") {
+        await clearLocalSession(c);
+        return c.json({ error: "Subaccount disabled" }, 403);
+      }
       return c.json(authUser);
     }
   }
@@ -26454,6 +28831,10 @@ app.get("/api/users/me", async (c) => {
           googleUserData: user.google_user_data,
           hasPassword: serverUserHasRealPasswordHash((localIdentity as any)?.password_hash),
         });
+        if (normalizeText((authUser as any)?.account_access?.status) === "disabled") {
+          clearGoogleSessionCookie(c);
+          return c.json({ error: "Subaccount disabled" }, 403);
+        }
         return c.json(authUser);
       }
     } catch (error) {
@@ -30077,9 +32458,88 @@ app.get("/api/camera-thumbnails", anyAuthMiddleware, async (c) => {
   );
 });
 
+app.get("/api/agent-camera-directory", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const accountAccess = (c as any).get("accountAccess") as any;
+  const canViewCameraDetails =
+    accountAccess?.isFullAccess === true ||
+    accountAccess?.isOwner === true ||
+    accountAccess?.isAdmin === true ||
+    accountAccess?.permissions?.can_view_cameras === true;
+
+  const selectSql = canViewCameraDetails
+    ? `SELECT id,
+              name,
+              ip_address,
+              description,
+              thumbnail_url,
+              last_thumbnail_update,
+              is_service_running,
+              is_online,
+              store_frames,
+              retention_days,
+              connection_method,
+              capture_acceleration_mode
+       FROM cameras
+       WHERE user_id = ?
+       ORDER BY created_at DESC`
+    : `SELECT id,
+              name,
+              thumbnail_url,
+              last_thumbnail_update,
+              is_service_running,
+              is_online
+       FROM cameras
+       WHERE user_id = ?
+       ORDER BY created_at DESC`;
+
+  const { results } = await c.env.DB.prepare(selectSql).bind(user.id).all();
+  let rawCameras = (results || []) as Array<Record<string, any>>;
+  const grantedCameraAlgorithmIds = await getGrantedResourceIdSetForRequest(
+    c,
+    "camera_algorithm",
+    "view"
+  );
+  if (grantedCameraAlgorithmIds !== null) {
+    if (grantedCameraAlgorithmIds.size === 0) {
+      return c.json([]);
+    }
+
+    const placeholders = Array.from(grantedCameraAlgorithmIds).map(() => "?").join(", ");
+    const { results: cameraRows } = await c.env.DB
+      .prepare(
+        `SELECT DISTINCT ca.camera_id
+         FROM camera_algorithms ca
+         JOIN cameras c ON c.id = ca.camera_id
+         WHERE c.user_id = ?
+           AND ca.id IN (${placeholders})`
+      )
+      .bind(user.id, ...Array.from(grantedCameraAlgorithmIds))
+      .all();
+    const grantedCameraIds = new Set(
+      ((cameraRows || []) as Array<Record<string, unknown>>)
+        .map((row) => Number(row.camera_id || 0))
+        .filter((row) => Number.isInteger(row) && row > 0)
+    );
+    rawCameras = rawCameras.filter((camera) => grantedCameraIds.has(Number(camera.id || 0)));
+  }
+  const desktopRuntime = await buildDashboardDesktopRuntimeSummary(
+    c.env.DB,
+    user.id,
+    rawCameras
+  );
+
+  const cameras = rawCameras.map((camera) =>
+    applyDashboardDesktopRuntimeCameraHints(camera, desktopRuntime)
+  );
+
+  return c.json(cameras);
+});
+
 // Camera endpoints
 app.get("/api/cameras", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const grantedCameraIds = await getGrantedResourceIdSetForRequest(c, "camera", "view");
 
   const { results } = await c.env.DB.prepare(
     "SELECT * FROM cameras WHERE user_id = ? ORDER BY created_at DESC"
@@ -30087,7 +32547,12 @@ app.get("/api/cameras", anyAuthMiddleware, async (c) => {
     .bind(user.id)
     .all();
 
-  const camerasWithOffset = results || [];
+  const camerasWithOffset =
+    grantedCameraIds === null
+      ? results || []
+      : ((results || []) as Array<Record<string, unknown>>).filter((row) =>
+          grantedCameraIds.has(Number(row.id || 0))
+        );
 
   return c.json(camerasWithOffset);
 });
@@ -30247,6 +32712,13 @@ app.post("/api/cameras", anyAuthMiddleware, zValidator("json", CreateCameraSchem
 }), async (c) => {
   const user = c.get("user")!;
   const data = c.req.valid("json");
+
+  if (!canCreateScopedResourceForRequest(c, "cameras")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific cameras that were granted."
+    );
+  }
   
   console.log("[POST /api/cameras] Received payload:", JSON.stringify(data, null, 2));
   try {
@@ -30426,6 +32898,13 @@ app.get("/api/camera-imports/:commandId", anyAuthMiddleware, async (c) => {
 app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const commandId = Number(c.req.param("commandId"));
+
+  if (!canCreateScopedResourceForRequest(c, "cameras")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific cameras that were granted."
+    );
+  }
 
   if (!Number.isInteger(commandId) || commandId <= 0) {
     return c.json({ error: "Invalid command id" }, 400);
@@ -32290,6 +34769,11 @@ app.get("/api/agent/frame-retention-policies", async (c) => {
 app.get("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const cameraId = c.req.param("cameraId");
+  const grantedCameraAlgorithmIds = await getGrantedResourceIdSetForRequest(
+    c,
+    "camera_algorithm",
+    "view"
+  );
 
   // Verify camera ownership
   const camera = await c.env.DB.prepare(
@@ -32315,7 +34799,11 @@ app.get("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, async (c) => {
     String(row?.algorithm_type || "").startsWith("custom_")
   );
   if (!hasCustom) {
-    return c.json(rows);
+    const filteredRows =
+      grantedCameraAlgorithmIds === null
+        ? rows
+        : rows.filter((row: any) => grantedCameraAlgorithmIds.has(Number(row?.id || 0)));
+    return c.json(filteredRows);
   }
 
   const customAgents = await listCustomCameraAgents(
@@ -32337,7 +34825,12 @@ app.get("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, async (c) => {
     return enriched ? attachAlertChannelsToCameraAlgorithmRow({ ...row, ...enriched }) : row;
   });
 
-  return c.json(merged);
+  const filtered =
+    grantedCameraAlgorithmIds === null
+      ? merged
+      : merged.filter((row: any) => grantedCameraAlgorithmIds.has(Number(row?.id || 0)));
+
+  return c.json(filtered);
 });
 
 app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("json", CreateAlgorithmSchema), async (c) => {
@@ -32516,6 +35009,24 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
     )
       .bind(cameraId, algorithmType)
       .first();
+    const existingAlgorithmId = Number((existing as any)?.id || 0);
+    if (existing) {
+      const access = await requireGrantedResourceForRequest(
+        c,
+        "camera_algorithm",
+        existingAlgorithmId,
+        "execute",
+        "This subaccount does not have permission to change this agent."
+      );
+      if (access instanceof Response) {
+        return access;
+      }
+    } else if (!canCreateScopedResourceForRequest(c, "agents")) {
+      return buildForbiddenAccountResponse(
+        c,
+        "This subaccount can only change the specific agents that were granted."
+      );
+    }
     const storedAlertChannelsJson =
       data.alert_channels === undefined
         ? typeof (existing as any)?.alert_channels_json === "string" &&
@@ -32529,7 +35040,6 @@ app.post("/api/cameras/:cameraId/algorithms", anyAuthMiddleware, zValidator("jso
       Number(data.is_enabled || 0) !== 0 &&
       executionSettings?.inferenceModel === "core";
     if (willEnableCoreCustomAgent) {
-      const existingAlgorithmId = Number((existing as any)?.id || 0);
       const existingInferenceModel =
         normalizeJobStepInferenceModel((existing as any)?.inference_model) ||
         FIXED_JOB_STEP_INFERENCE_MODEL;
@@ -32844,6 +35354,18 @@ app.delete("/api/cameras/:cameraId/algorithms/:algorithmType", anyAuthMiddleware
 
     const algorithmId = Number((existingAlgorithm as any)?.id || 0);
     if (Number.isInteger(algorithmId) && algorithmId > 0) {
+      const access = await requireGrantedResourceForRequest(
+        c,
+        "camera_algorithm",
+        algorithmId,
+        "execute",
+        "This subaccount does not have permission to change this agent."
+      );
+      if (access instanceof Response) {
+        return access;
+      }
+    }
+    if (Number.isInteger(algorithmId) && algorithmId > 0) {
       const { results: imageRows } = await c.env.DB
         .prepare(
           "SELECT id, image_url FROM camera_algorithm_negative_images WHERE algorithm_id = ?"
@@ -32902,6 +35424,11 @@ app.delete("/api/cameras/:cameraId/algorithms/:algorithmType", anyAuthMiddleware
 app.get("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const cameraId = Number(c.req.param("cameraId"));
+  const grantedCameraAlgorithmIds = await getGrantedResourceIdSetForRequest(
+    c,
+    "camera_algorithm",
+    "view"
+  );
   if (!Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid camera id" }, 400);
   }
@@ -32917,15 +35444,34 @@ app.get("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) => 
   }
 
   const agents = await listCustomCameraAgents(c.env.DB, user.id, cameraId);
-  return c.json({ agents });
+  const filteredAgents =
+    grantedCameraAlgorithmIds === null
+      ? agents
+      : agents.filter((agent: any) => grantedCameraAlgorithmIds.has(Number(agent?.id || 0)));
+  return c.json({ agents: filteredAgents });
 });
 
 app.get("/api/custom-agents/library", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const [grantedCameraAlgorithmIds, grantedJobStepAgentIds] = await Promise.all([
+    getGrantedResourceIdSetForRequest(c, "camera_algorithm", "view"),
+    getGrantedResourceIdSetForRequest(c, "job_step_agent", "view"),
+  ]);
 
   try {
     const inventory = await listEditableAgentInventoryForUser(c.env.DB, user.id);
-    const agents = inventory.map((entry) => {
+    const agents = inventory
+      .filter((entry) => {
+        const agentId = Number(entry.agent_id || 0);
+        if (!Number.isInteger(agentId) || agentId <= 0) {
+          return false;
+        }
+        if (entry.location_type === "camera") {
+          return grantedCameraAlgorithmIds === null || grantedCameraAlgorithmIds.has(agentId);
+        }
+        return grantedJobStepAgentIds === null || grantedJobStepAgentIds.has(agentId);
+      })
+      .map((entry) => {
       const locationLabel =
         entry.location_type === "camera"
           ? entry.camera_name || (entry.camera_id ? `Camera #${entry.camera_id}` : "AI Agent")
@@ -33003,6 +35549,13 @@ app.post("/api/cameras/:cameraId/custom-agents", anyAuthMiddleware, async (c) =>
   const cameraId = Number(c.req.param("cameraId"));
   if (!Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid camera id" }, 400);
+  }
+
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
   }
 
   const camera = await c.env.DB
@@ -34213,6 +36766,12 @@ app.put("/api/camera-algorithms/:algorithmId/face-targets", anyAuthMiddleware, a
 app.post("/api/cameras/:cameraId/custom-agents/enhance-prompt", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const cameraId = Number(c.req.param("cameraId"));
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
+  }
   if (!Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid camera id" }, 400);
   }
@@ -44982,8 +47541,11 @@ app.patch("/api/preferences", anyAuthMiddleware, zValidator("json", UpdatePrefer
 app.get("/api/openai-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
-  const user = c.get("user")!;
-  const apiKey = await getUserOpenAIApiKey(c.env.DB, user.id);
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  const apiKey = await getUserOpenAIApiKey(c.env.DB, access.accountUserId);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -44994,7 +47556,10 @@ app.get("/api/openai-settings", anyAuthMiddleware, async (c) => {
 app.post("/api/openai-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
-  const user = c.get("user")!;
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
   const body = await c.req
     .json<{
       api_key?: string;
@@ -45011,7 +47576,7 @@ app.post("/api/openai-settings", anyAuthMiddleware, async (c) => {
   if (!clear && !apiKey) {
     return c.json({ error: "api_key is required" }, 400);
   }
-  await upsertUserOpenAIApiKey(c.env.DB, user.id, apiKey);
+  await upsertUserOpenAIApiKey(c.env.DB, access.accountUserId, apiKey);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -45023,8 +47588,11 @@ app.post("/api/openai-settings", anyAuthMiddleware, async (c) => {
 app.get("/api/zai-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
-  const user = c.get("user")!;
-  const apiKey = await getUserZAIApiKey(c.env.DB, user.id);
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
+  const apiKey = await getUserZAIApiKey(c.env.DB, access.accountUserId);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -45035,7 +47603,10 @@ app.get("/api/zai-settings", anyAuthMiddleware, async (c) => {
 app.post("/api/zai-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
 
-  const user = c.get("user")!;
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
   const body = await c.req
     .json<{
       api_key?: string;
@@ -45052,7 +47623,7 @@ app.post("/api/zai-settings", anyAuthMiddleware, async (c) => {
   if (!clear && !apiKey) {
     return c.json({ error: "api_key is required" }, 400);
   }
-  await upsertUserZAIApiKey(c.env.DB, user.id, apiKey);
+  await upsertUserZAIApiKey(c.env.DB, access.accountUserId, apiKey);
 
   return c.json({
     has_key: apiKey.length > 0,
@@ -45063,13 +47634,16 @@ app.post("/api/zai-settings", anyAuthMiddleware, async (c) => {
 // Telegram settings endpoints
 app.get("/api/telegram-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
-  
-  const user = c.get("user")!;
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
 
   const settings = await c.env.DB.prepare(
     "SELECT * FROM telegram_settings WHERE user_id = ?"
   )
-    .bind(user.id)
+    .bind(access.accountUserId)
     .first();
 
   if (!settings) {
@@ -45091,8 +47665,11 @@ app.get("/api/telegram-settings", anyAuthMiddleware, async (c) => {
 
 app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
-  
-  const user = c.get("user")!;
+
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
   const body = await c.req.json<{
     enabled: boolean;
     chat_id: string;
@@ -45108,7 +47685,7 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
   const existing = await c.env.DB.prepare(
     "SELECT * FROM telegram_settings WHERE user_id = ?"
   )
-    .bind(user.id)
+    .bind(access.accountUserId)
     .first();
 
   if (existing) {
@@ -45118,7 +47695,7 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
        SET enabled = ?, chat_id = ?, bot_token = ?, updated_at = ?
        WHERE user_id = ?`
     )
-      .bind(enabled, chatId, botToken, now, user.id)
+      .bind(enabled, chatId, botToken, now, access.accountUserId)
       .run();
   } else {
     // Insert new settings
@@ -45127,7 +47704,7 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
       `INSERT INTO telegram_settings (id, user_id, enabled, profile, chat_id, bot_token, created_at, updated_at)
        VALUES (?, ?, ?, '', ?, ?, ?, ?)`
     )
-      .bind(id, user.id, enabled, chatId, botToken, now, now)
+      .bind(id, access.accountUserId, enabled, chatId, botToken, now, now)
       .run();
   }
 
@@ -45138,13 +47715,17 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
        WHERE user_id = ?
          AND is_service_running = 1`
     )
-    .bind(user.id)
+    .bind(access.accountUserId)
     .all();
 
   for (const row of runningCameraRows || []) {
     const runningCameraId = Number((row as any)?.id);
     if (!Number.isInteger(runningCameraId) || runningCameraId <= 0) continue;
-    await enqueueUpdateAlgorithmsIfCameraRunning(c.env.DB, user.id, runningCameraId);
+    await enqueueUpdateAlgorithmsIfCameraRunning(
+      c.env.DB,
+      access.accountUserId,
+      runningCameraId
+    );
   }
 
   // Return the saved settings
@@ -45157,28 +47738,31 @@ app.post("/api/telegram-settings", anyAuthMiddleware, async (c) => {
 
 // Billing status endpoint
 app.get("/api/billing/status", anyAuthMiddleware, async (c) => {
-  const user = c.get("user")!;
-  const chatAccess = await getPerceptrumChatAccessStatus(c.env.DB, user.id);
+  const ownerAccess = requireOwnerAccountAccess(c);
+  if (ownerAccess instanceof Response) {
+    return ownerAccess;
+  }
+  const chatAccess = await getPerceptrumChatAccessStatus(c.env.DB, ownerAccess.accountUserId);
 
   // Check for active subscription
   const activeSubscription = await c.env.DB.prepare(
     "SELECT * FROM subscriptions WHERE user_id = ? AND is_active = 1 LIMIT 1"
   )
-    .bind(user.id)
+    .bind(ownerAccess.accountUserId)
     .first();
 
   // Check for active card
   const activeCard = await c.env.DB.prepare(
     "SELECT * FROM active_cards WHERE user_id = ? LIMIT 1"
   )
-    .bind(user.id)
+    .bind(ownerAccess.accountUserId)
     .first();
 
   // Count currently running cameras
   const activeCountRow = await c.env.DB.prepare(
     "SELECT COUNT(*) as count FROM cameras WHERE user_id = ? AND is_service_running = 1"
   )
-    .bind(user.id)
+    .bind(ownerAccess.accountUserId)
     .first();
 
   const activeCamerasCount = activeCountRow ? Number((activeCountRow as any).count ?? 0) : 0;
@@ -48700,26 +51284,27 @@ app.post("/api/billing/remove-card", anyAuthMiddleware, async (c) => {
 // EXE Pairing endpoints
 app.post("/api/pairing/generate", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
-  const user = c.get("user")!;
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
   
   // Delete any existing pending pair codes for this user
   await c.env.DB.prepare(
     `DELETE FROM pair_codes WHERE user_id = ?`
   )
-    .bind(user.id)
+    .bind(access.accountUserId)
     .run();
 
   const pairCode = generatePairCode();
   const pairingId = generateUUID();
-  let clientId = String(user.id || "").trim();
-  if (user.auth_provider === "local") {
-    const localIdentity = await findLocalUserIdentityCache(c.env.DB, {
-      email: user.email,
-      serverPublicId: typeof user.id === "string" && !user.id.startsWith("local:") ? user.id : null,
-    });
-    if (localIdentity) {
-      clientId = resolvePairingClientIdFromLocalUserRow(localIdentity as any);
-    }
+  let clientId = String(access.accountUserId || "").trim();
+  const accountLocalIdentity = await getLocalUserByCanonicalAppUserId(
+    c.env.DB,
+    access.accountUserId
+  );
+  if (accountLocalIdentity) {
+    clientId = resolvePairingClientIdFromLocalUserRow(accountLocalIdentity as any);
   }
   if (!clientId) {
     return c.json({ error: "Unable to resolve client id for current account" }, 400);
@@ -48731,7 +51316,15 @@ app.post("/api/pairing/generate", anyAuthMiddleware, async (c) => {
     `INSERT INTO pair_codes (id, user_id, client_id, pair_code, code, expires_at, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(pairingId, user.id, clientId, pairCode, pairCode, expiresAt, createdAt)
+    .bind(
+      pairingId,
+      access.accountUserId,
+      clientId,
+      pairCode,
+      pairCode,
+      expiresAt,
+      createdAt
+    )
     .run();
 
   return c.json({
@@ -48910,7 +51503,7 @@ app.post("/api/pairing/pair", zValidator("json", ClaimPairingSchema), async (c) 
 
 app.get("/api/pairing/status", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
-  const user = c.get("user")!;
+  const accountUserId = getAccountUserIdForRequest(c);
 
   const pairingsResult = await c.env.DB.prepare(
     `SELECT *
@@ -48918,24 +51511,24 @@ app.get("/api/pairing/status", anyAuthMiddleware, async (c) => {
      WHERE user_id = ? AND status = 'connected'
      ORDER BY COALESCE(last_seen_at, paired_at) DESC`
   )
-    .bind(user.id)
+    .bind(accountUserId)
     .all();
   const connectedPairings = (pairingsResult.results || []) as any[];
   const pairing = connectedPairings.length > 0 ? connectedPairings[0] : null;
 
   if (pairing && pairing.client_id) {
     await syncTimezoneFromExeSignal(c.env.DB, {
-      userId: user.id,
+      userId: accountUserId,
       clientId: (pairing as any).client_id,
       timezoneInput: (pairing as any).timezone_iana,
     });
   }
 
-  const timezoneIana = await resolveUserGlobalTimezone(c.env.DB, user.id);
+  const timezoneIana = await resolveUserGlobalTimezone(c.env.DB, accountUserId);
   const timezoneMeta = await c.env.DB.prepare(
     "SELECT timezone_source, timezone_updated_at FROM app_users WHERE id = ? LIMIT 1"
   )
-    .bind(user.id)
+    .bind(accountUserId)
     .first();
 
   if (!pairing) {
@@ -48986,6 +51579,10 @@ app.get("/api/pairing/status", anyAuthMiddleware, async (c) => {
 
 app.post("/api/pairing/disconnect", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
+  const access = requireSettingsAccess(c);
+  if (access instanceof Response) {
+    return access;
+  }
   const user = c.get("user")!;
   const revokedAt = new Date().toISOString();
   const { results: pairingsToDisconnectRaw } = await c.env.DB.prepare(
@@ -48993,7 +51590,7 @@ app.post("/api/pairing/disconnect", anyAuthMiddleware, async (c) => {
      FROM exe_pairings
      WHERE user_id = ? AND status = 'connected'`
   )
-    .bind(user.id)
+    .bind(access.accountUserId)
     .all();
   const pairingsToDisconnect = (pairingsToDisconnectRaw || []) as any[];
 
@@ -49001,7 +51598,7 @@ app.post("/api/pairing/disconnect", anyAuthMiddleware, async (c) => {
     `UPDATE exe_pairings SET status = 'revoked', exe_token_hash = '', last_seen_at = ?
      WHERE user_id = ? AND status = 'connected'`
   )
-    .bind(revokedAt, user.id)
+    .bind(revokedAt, access.accountUserId)
     .run();
 
   const actor = await resolveExePairingAuditActor(c.env.DB, {
@@ -49017,7 +51614,7 @@ app.post("/api/pairing/disconnect", anyAuthMiddleware, async (c) => {
     await createExePairingAuditLog(c.env.DB, {
       ...actor,
       actionType: "pairing_revoked",
-      targetUserId: String(revokedPairing.user_id || user.id || ""),
+      targetUserId: String(revokedPairing.user_id || access.accountUserId || ""),
       targetClientId: normalizeText(revokedPairing.client_id) || null,
       targetExeId: normalizeText(revokedPairing.exe_id) || null,
       previousStatus: normalizeText(revokedPairing.status) || "connected",
@@ -58318,7 +60915,12 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
 
 
 app.get("/api/hub/items", anyAuthMiddleware, async (c) => {
-  const itemType = normalizeHubItemType(c.req.query("type"));
+  let itemType = normalizeHubItemType(c.req.query("type"));
+  const scopedItemType = resolveHubItemTypeForCurrentSession(c, itemType, "view");
+  if (scopedItemType instanceof Response) {
+    return scopedItemType;
+  }
+  itemType = scopedItemType;
   const items = await listHubCatalogItems(c.env.DB, {
     source: "hub",
     itemType,
@@ -58341,6 +60943,10 @@ app.get("/api/hub/items/:itemId", anyAuthMiddleware, async (c) => {
     (await getHubCatalogItemById(c.env.DB, itemId, "hub", { includeNonPublished: false }));
   if (!item) {
     return c.json({ error: "Hub item not found" }, 404);
+  }
+  const accessResponse = requireHubPermissionForCurrentSession(c, item.item_type, "view");
+  if (accessResponse) {
+    return accessResponse;
   }
 
   return c.json({
@@ -58368,6 +60974,15 @@ app.delete("/api/hub/items/:itemId", async (c) => {
     c.req.header("authorization") || c.req.header("Authorization") || "";
 
   try {
+    const existingItem =
+      (await getHubCatalogItemById(c.env.DB, itemId, source, { includeNonPublished: true })) ||
+      (source === "cache"
+        ? await getHubCatalogItemById(c.env.DB, itemId, "hub", { includeNonPublished: true })
+        : null);
+    if (!existingItem) {
+      return c.json({ error: "Hub item not found" }, 404);
+    }
+
     if (authorizationHeader.startsWith("Bearer ") && isCentralIdentityServerConfigured(c.env)) {
       const actorResult = await resolveHubCatalogActor(c);
       if ("error" in actorResult) {
@@ -58384,6 +60999,10 @@ app.delete("/api/hub/items/:itemId", async (c) => {
       return auth.error;
     }
     const user = auth.user;
+    const accessResponse = requireHubPermissionForCurrentSession(c, existingItem.item_type, "execute");
+    if (accessResponse) {
+      return accessResponse;
+    }
 
     if (
       source === "cache" &&
@@ -58459,7 +61078,12 @@ app.delete("/api/hub/items/:itemId", async (c) => {
 
 app.get("/api/hub/my-items", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  const itemType = normalizeHubItemType(c.req.query("type"));
+  let itemType = normalizeHubItemType(c.req.query("type"));
+  const scopedItemType = resolveHubItemTypeForCurrentSession(c, itemType, "view");
+  if (scopedItemType instanceof Response) {
+    return scopedItemType;
+  }
+  itemType = scopedItemType;
   const items = await listHubCatalogItems(c.env.DB, {
     source: "hub",
     itemType,
@@ -58515,6 +61139,10 @@ app.post("/api/hub/items", async (c) => {
   if (!itemType) {
     return c.json({ error: "item_type must be agent or task" }, 400);
   }
+  const accessResponse = requireHubPermissionForCurrentSession(c, itemType, "execute");
+  if (accessResponse) {
+    return accessResponse;
+  }
   const schemaVersion = normalizeText(body.schema_version);
   if (!schemaVersion) {
     return c.json({ error: "schema_version is required" }, 400);
@@ -58567,7 +61195,12 @@ app.get("/api/hub/sync", async (c) => {
     return actorResult.error;
   }
 
-  const itemType = normalizeHubItemType(c.req.query("type"));
+  let itemType = normalizeHubItemType(c.req.query("type"));
+  const scopedItemType = resolveHubItemTypeForCurrentSession(c, itemType, "view");
+  if (scopedItemType instanceof Response) {
+    return scopedItemType;
+  }
+  itemType = scopedItemType;
   const payload = await listPublishedHubSyncRows(c.env.DB, {
     cursor: c.req.query("cursor"),
     itemType,
@@ -58582,7 +61215,12 @@ app.get("/api/hub/sync", async (c) => {
 
 app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  const itemType = normalizeHubItemType(c.req.query("type"));
+  let itemType = normalizeHubItemType(c.req.query("type"));
+  const scopedItemType = resolveHubItemTypeForCurrentSession(c, itemType, "view");
+  if (scopedItemType instanceof Response) {
+    return scopedItemType;
+  }
+  itemType = scopedItemType;
   let source: HubCatalogSource = "cache";
   let items = await listHubCatalogItems(c.env.DB, {
     source: "cache",
@@ -58614,7 +61252,12 @@ app.get("/api/hub/cache/items", anyAuthMiddleware, async (c) => {
 
 app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
-  const itemType = normalizeHubItemType(c.req.query("type"));
+  let itemType = normalizeHubItemType(c.req.query("type"));
+  const scopedItemType = resolveHubItemTypeForCurrentSession(c, itemType, "view");
+  if (scopedItemType instanceof Response) {
+    return scopedItemType;
+  }
+  itemType = scopedItemType;
   const syncStateKey = getHubSyncStateKey(itemType);
   const syncState = await c.env.DB
     .prepare(`SELECT * FROM hub_sync_state WHERE sync_key = ? LIMIT 1`)
@@ -58709,6 +61352,10 @@ app.post("/api/hub/cache/sync", anyAuthMiddleware, async (c) => {
 
 app.post("/api/hub/agents/publish-from-camera/:algorithmId", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const agentPermission = requireHubPermissionForCurrentSession(c, "agent", "execute");
+  if (agentPermission) {
+    return agentPermission;
+  }
   const algorithmId = Number(c.req.param("algorithmId"));
   if (!Number.isInteger(algorithmId) || algorithmId <= 0) {
     return c.json({ error: "Invalid algorithm id" }, 400);
@@ -58823,6 +61470,10 @@ app.post("/api/hub/agents/publish-from-camera/:algorithmId", anyAuthMiddleware, 
 
 app.post("/api/hub/tasks/publish-from-job/:jobId", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const taskPermission = requireHubPermissionForCurrentSession(c, "task", "execute");
+  if (taskPermission) {
+    return taskPermission;
+  }
   const jobId = Number(c.req.param("jobId"));
   if (!Number.isInteger(jobId) || jobId <= 0) {
     return c.json({ error: "Invalid job id" }, 400);
@@ -58933,10 +61584,42 @@ app.post("/api/hub/tasks/publish-from-job/:jobId", anyAuthMiddleware, async (c) 
 
 app.post("/api/hub/items/:itemId/install-agent-to-camera/:cameraId", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const agentPermission = requireAccountPermission(
+    c,
+    "can_execute_agents",
+    "This subaccount does not have permission to install Hub agents."
+  );
+  if (agentPermission instanceof Response) {
+    return agentPermission;
+  }
+  const cameraPermission = requireAccountPermission(
+    c,
+    "can_execute_cameras",
+    "This subaccount does not have permission to change cameras."
+  );
+  if (cameraPermission instanceof Response) {
+    return cameraPermission;
+  }
   const itemId = Number(c.req.param("itemId"));
   const cameraId = Number(c.req.param("cameraId"));
   if (!Number.isInteger(itemId) || itemId <= 0 || !Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid installation target" }, 400);
+  }
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
+  }
+  const cameraGrant = await requireGrantedResourceForRequest(
+    c,
+    "camera",
+    cameraId,
+    "execute",
+    "This subaccount does not have permission to change this camera."
+  );
+  if (cameraGrant instanceof Response) {
+    return cameraGrant;
   }
 
   const item = await resolveHubInstallItem(c.env.DB, itemId);
@@ -58981,6 +61664,22 @@ app.post("/api/hub/items/:itemId/install-agent-to-camera/:cameraId", anyAuthMidd
 
 app.post("/api/hub/items/:itemId/install-agent-to-step-target", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const agentPermission = requireAccountPermission(
+    c,
+    "can_execute_agents",
+    "This subaccount does not have permission to install Hub agents."
+  );
+  if (agentPermission instanceof Response) {
+    return agentPermission;
+  }
+  const taskPermission = requireAccountPermission(
+    c,
+    "can_execute_tasks",
+    "This subaccount does not have permission to change tasks."
+  );
+  if (taskPermission instanceof Response) {
+    return taskPermission;
+  }
   const itemId = Number(c.req.param("itemId"));
   if (!Number.isInteger(itemId) || itemId <= 0) {
     return c.json({ error: "Invalid Hub item id" }, 400);
@@ -59003,6 +61702,49 @@ app.post("/api/hub/items/:itemId/install-agent-to-step-target", anyAuthMiddlewar
   }
   if (cameraId !== null && (!Number.isInteger(cameraId) || cameraId === 0)) {
     return c.json({ error: "Invalid camera_id" }, 400);
+  }
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
+  }
+
+  const step = await c.env.DB
+    .prepare(
+      `SELECT js.job_id
+       FROM job_steps js
+       JOIN jobs j ON j.id = js.job_id
+       WHERE js.id = ? AND j.user_id = ?
+       LIMIT 1`
+    )
+    .bind(stepId, user.id)
+    .first();
+  const jobId = Number((step as any)?.job_id || 0);
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return c.json({ error: "Step not found" }, 404);
+  }
+  const taskGrant = await requireGrantedResourceForRequest(
+    c,
+    "job",
+    jobId,
+    "execute",
+    "This subaccount does not have permission to change this job."
+  );
+  if (taskGrant instanceof Response) {
+    return taskGrant;
+  }
+  if (cameraId !== null) {
+    const cameraGrant = await requireGrantedResourceForRequest(
+      c,
+      "camera",
+      cameraId,
+      "execute",
+      "This subaccount does not have permission to change this camera."
+    );
+    if (cameraGrant instanceof Response) {
+      return cameraGrant;
+    }
   }
 
   const item = await resolveHubInstallItem(c.env.DB, itemId);
@@ -59051,6 +61793,16 @@ app.post("/api/hub/items/:itemId/install-agent-to-step-target", anyAuthMiddlewar
 
 app.post("/api/hub/items/:itemId/install-task", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const taskPermission = requireHubPermissionForCurrentSession(c, "task", "execute");
+  if (taskPermission) {
+    return taskPermission;
+  }
+  if (!canCreateScopedResourceForRequest(c, "jobs")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific jobs that were granted."
+    );
+  }
   const itemId = Number(c.req.param("itemId"));
   if (!Number.isInteger(itemId) || itemId <= 0) {
     return c.json({ error: "Invalid Hub item id" }, 400);
@@ -59104,6 +61856,7 @@ app.post("/api/hub/items/:itemId/install-task", anyAuthMiddleware, async (c) => 
 // Jobs endpoints
 app.get("/api/jobs", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  const grantedJobIds = await getGrantedResourceIdSetForRequest(c, "job", "view");
 
   const { results } = await c.env.DB.prepare(
     `SELECT 
@@ -59119,7 +61872,14 @@ app.get("/api/jobs", anyAuthMiddleware, async (c) => {
     .bind(user.id)
     .all();
 
-  const jobRows = Array.isArray(results) ? results : [];
+  const jobRows =
+    grantedJobIds === null
+      ? Array.isArray(results)
+        ? results
+        : []
+      : (Array.isArray(results) ? results : []).filter((row: any) =>
+          grantedJobIds.has(Number(row?.id || 0))
+        );
   const jobIds = jobRows
     .map((row: any) => Number(row?.id))
     .filter((value: number) => Number.isInteger(value) && value > 0);
@@ -59227,6 +61987,12 @@ app.get("/api/jobs", anyAuthMiddleware, async (c) => {
 
 app.post("/api/jobs", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
+  if (!canCreateScopedResourceForRequest(c, "jobs")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific jobs that were granted."
+    );
+  }
   const body = await c.req.json<{
     name: string;
     description?: string;
@@ -61542,6 +64308,71 @@ function normalizeHubItemType(value: unknown): HubItemType | null {
   const normalized = normalizeText(value).toLowerCase();
   if (normalized === "agent" || normalized === "task") return normalized;
   return null;
+}
+
+function requireHubPermissionForCurrentSession(
+  c: any,
+  itemType: HubItemType | null,
+  action: "view" | "execute"
+): Response | null {
+  if (!c.get("accountAccess")) {
+    return null;
+  }
+  if (!itemType) {
+    return buildForbiddenAccountResponse(c, "Hub item permissions could not be resolved.");
+  }
+  const permission: AccountPermissionField =
+    itemType === "agent"
+      ? action === "view"
+        ? "can_view_agents"
+        : "can_execute_agents"
+      : action === "view"
+        ? "can_view_tasks"
+        : "can_execute_tasks";
+  const itemLabel = itemType === "agent" ? "agents" : "tasks";
+  const access = requireAccountPermission(
+    c,
+    permission,
+    action === "view"
+      ? `This subaccount does not have permission to access Hub ${itemLabel}.`
+      : `This subaccount does not have permission to change Hub ${itemLabel}.`
+  );
+  return access instanceof Response ? access : null;
+}
+
+function resolveHubItemTypeForCurrentSession(
+  c: any,
+  requestedType: HubItemType | null,
+  action: "view" | "execute"
+): HubItemType | null | Response {
+  if (!c.get("accountAccess")) {
+    return requestedType;
+  }
+  if (requestedType) {
+    const accessResponse = requireHubPermissionForCurrentSession(c, requestedType, action);
+    return accessResponse instanceof Response ? accessResponse : requestedType;
+  }
+  const agentPermission: AccountPermissionField =
+    action === "view" ? "can_view_agents" : "can_execute_agents";
+  const taskPermission: AccountPermissionField =
+    action === "view" ? "can_view_tasks" : "can_execute_tasks";
+  const access = requireAnyAccountPermission(
+    c,
+    [agentPermission, taskPermission],
+    action === "view"
+      ? "This subaccount does not have permission to access the Hub."
+      : "This subaccount does not have permission to change Hub items."
+  );
+  if (access instanceof Response) {
+    return access;
+  }
+  if (access.permissions[agentPermission] && !access.permissions[taskPermission]) {
+    return "agent";
+  }
+  if (access.permissions[taskPermission] && !access.permissions[agentPermission]) {
+    return "task";
+  }
+  return requestedType;
 }
 
 function normalizeHubStatus(value: unknown, fallback: HubItemStatus = "draft"): HubItemStatus {
@@ -66747,6 +69578,11 @@ app.delete(
 app.get("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const stepId = parseInt(c.req.param("stepId"), 10);
+  const grantedJobStepAgentIds = await getGrantedResourceIdSetForRequest(
+    c,
+    "job_step_agent",
+    "view"
+  );
 
   const step = await c.env.DB.prepare(
     `SELECT js.* FROM job_steps js
@@ -66842,7 +69678,14 @@ app.get("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     };
   });
 
-  return c.json({ agents: agentsWithFaceTargets });
+  const filteredAgents =
+    grantedJobStepAgentIds === null
+      ? agentsWithFaceTargets
+      : agentsWithFaceTargets.filter((agent: any) =>
+          grantedJobStepAgentIds.has(Number(agent?.id || 0))
+        );
+
+  return c.json({ agents: filteredAgents });
 });
 
 app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
@@ -67043,7 +69886,20 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
   }
 
   if (existingAgent) {
-    const existingAgentId = Number((existingAgent as any)?.id);
+    const existingAgentId = Number((existingAgent as any)?.id || 0);
+    if (Number.isInteger(existingAgentId) && existingAgentId > 0) {
+      const access = await requireGrantedResourceForRequest(
+        c,
+        "job_step_agent",
+        existingAgentId,
+        "execute",
+        "This subaccount does not have permission to change this agent."
+      );
+      if (access instanceof Response) {
+        return access;
+      }
+    }
+
     let effectiveFaceTargetIds = requestedFaceTargetIds;
     if (
       effectiveFaceTargetIds === null &&
@@ -67525,6 +70381,13 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
     return c.json({ agent: responseAgent }, 200);
   }
 
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
+  }
+
   const portalCounterEnabled =
     requestedExecutionBackend === PORTAL_COUNTER_EXECUTION_BACKEND;
   const effectivePortalCounter = portalCounterEnabled ? requestedPortalCounter : null;
@@ -67848,6 +70711,14 @@ app.post("/api/job-steps/:stepId/agents", anyAuthMiddleware, async (c) => {
 app.post("/api/job-steps/:stepId/agents/enhance-prompt", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const stepId = parseInt(c.req.param("stepId"), 10);
+
+  if (!canCreateScopedResourceForRequest(c, "agents")) {
+    return buildForbiddenAccountResponse(
+      c,
+      "This subaccount can only change the specific agents that were granted."
+    );
+  }
+
   const body = await c.req
     .json<{
       camera_id?: number | string;
