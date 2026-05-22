@@ -22,11 +22,14 @@ import { createWebSocketHandler } from "./websocket";
 import bcrypt from "bcryptjs";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
 import {
+  executeJobStopPlan,
   enqueueManualJobStart,
   loadJobInferenceProviderRequirements,
   runJobSchedulerTick,
+  type JobSharedExecutionOptions,
 } from "./jobScheduler";
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
+import { buildCameraRuntimeResourceEstimate } from "./cameraResourceAdmission";
 import {
   buildCameraRecordingSegments,
   buildCameraRecordingSummary,
@@ -42,6 +45,7 @@ import {
 import type {
   CameraImportApplyResult,
   CameraImportCandidate,
+  CameraImportGpuBatchSummary,
   CameraImportPreview,
   CameraImportSharedDefaults,
 } from "@/shared/cameraImport";
@@ -94,12 +98,25 @@ import {
   type SharedFindRelayClientContext,
 } from "./sharedFindRelayClient";
 import {
+  cancelSharedJobRelayAckWait,
   cancelSharedFindRelayDispatchAckWait,
   countSharedFindRelayConnections,
   issueSharedFindRelaySession,
   sendSharedFindRelayMessage,
+  waitForSharedJobRelayAck,
   waitForSharedFindRelayDispatchAck,
 } from "./sharedFindRelayState";
+import {
+  buildDefaultSharedCameraAccessConfiguration,
+  buildSharedCameraAccessPayload,
+  buildSharedCameraExecutionDescriptor,
+  canExecuteSharedCamera,
+  normalizeSharedCameraAccessConfiguration,
+  normalizeSharedCameraPermissionProfile,
+  serializeSharedCameraAccessConfiguration,
+  type SharedCameraAccessConfiguration,
+  type SharedCameraPermissionProfile,
+} from "./sharedCameraAccess";
 import {
   clearPendingWorkspaceApproval,
   listPendingWorkspaceApprovals,
@@ -177,6 +194,18 @@ import {
   type OperationalCorrelationIds,
   upsertStructuredAgentErrorLog,
 } from "./operationalPersistence";
+import {
+  buildLocalAgentReplayRequestPath,
+  enqueueLocalAgentCaptureMetricsRequest,
+  enqueueLocalAgentEventRequest,
+  enqueueLocalAgentOpenMonitorRequest,
+  enqueueLocalAgentThumbnailRequest,
+  ensureLocalAgentIngressSchema,
+  isLocalAgentIngressQueueEnabled,
+  localAgentReplayHeaders,
+  readLocalAgentReplayContext,
+} from "./localAgentIngress";
+import { extractSharedSegmentIdFromScopedRunId } from "./sharedJobPlan";
 import {
   executeOperationalPlanDbFirst,
   resolveOperationalPlanAgainstDb,
@@ -567,6 +596,7 @@ const OPENAI_KEY_REQUIRED_MESSAGE =
 const ZAI_KEY_REQUIRED_ERROR = "ZAI_KEY_REQUIRED";
 const ZAI_KEY_REQUIRED_MESSAGE =
   "Z.ai API key is not configured. Add it in Settings or paste it here in chat.";
+const CAMERA_START_MEMORY_BLOCKED_ERROR = "insufficient_memory";
 const enforcePerceptrumLicenseRules = brand.id === "perceptrum";
 const PERCEPTRUM_CHAT_TRIAL_DAYS = 30;
 const PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR = "PERCEPTRUM_CHAT_TRIAL_EXPIRED";
@@ -6922,6 +6952,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
         );
       };
 
+      await ensureLocalAgentIngressSchema(db, isPgLike);
+
       if (await tableExists("chat_messages")) {
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN progress_json TEXT`);
         await addColumnIfMissing(`ALTER TABLE chat_messages ADD COLUMN usage_recorded_at TEXT`);
@@ -7949,6 +7981,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(
           `ALTER TABLE cameras ADD COLUMN description_first_check_success_at TEXT`
         );
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN thumbnail_hash TEXT`);
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN state_code TEXT`);
         await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN country_code TEXT`);
         await addColumnIfMissing(
@@ -7957,7 +7990,45 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(
           `ALTER TABLE cameras ADD COLUMN capture_acceleration_mode TEXT NOT NULL DEFAULT 'cpu'`
         );
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN origin_type TEXT NOT NULL DEFAULT 'local'`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_share_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_owner_public_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_owner_local_camera_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_owner_handle TEXT`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_owner_email TEXT`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_owner_display_label TEXT`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_origin_brand_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE cameras ADD COLUMN shared_status TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE cameras ADD COLUMN shared_permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE cameras ADD COLUMN shared_access_config_json TEXT NOT NULL DEFAULT '{}'`
+        );
       }
+
+      await db.prepare(
+        `
+        CREATE TABLE IF NOT EXISTS media_objects (
+          user_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          storage_key TEXT NOT NULL,
+          content_type TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, kind, sha256)
+        )
+      `
+      ).run();
+      await addColumnIfMissing(`ALTER TABLE media_objects ADD COLUMN storage_key TEXT`);
+      await addColumnIfMissing(`ALTER TABLE media_objects ADD COLUMN content_type TEXT`);
+      await addColumnIfMissing(`ALTER TABLE media_objects ADD COLUMN created_at TEXT`);
+      await addColumnIfMissing(`ALTER TABLE media_objects ADD COLUMN updated_at TEXT`);
+      await db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_media_objects_storage_key
+         ON media_objects(user_id, storage_key)`
+      ).run();
 
       await db.prepare(
         `
@@ -8648,6 +8719,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
           status TEXT NOT NULL DEFAULT 'queued',
           trigger_type TEXT,
           trigger_json TEXT,
+          execution_domain TEXT NOT NULL DEFAULT 'local',
+          remote_owner_public_id TEXT,
           started_at_utc TEXT,
           completed_at_utc TEXT,
           stopped_at_utc TEXT,
@@ -8658,6 +8731,118 @@ async function ensureSchema(db: D1Database): Promise<void> {
           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
       `).run();
+
+      await db.prepare(
+        isPgLike
+          ? `
+        CREATE TABLE IF NOT EXISTS shared_job_segments (
+          segment_id TEXT PRIMARY KEY,
+          role TEXT NOT NULL DEFAULT 'operator',
+          user_id TEXT NOT NULL,
+          job_id INTEGER,
+          job_run_id TEXT NOT NULL,
+          execution_domain TEXT NOT NULL DEFAULT 'local',
+          owner_public_id TEXT,
+          operator_public_id TEXT,
+          current_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          remote_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          camera_id_map_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'queued',
+          request_id TEXT,
+          source_command_id INTEGER,
+          trigger_type TEXT,
+          trigger_json TEXT,
+          cross_camera_federation_required INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          started_at TEXT,
+          completed_at TEXT,
+          stopped_at TEXT
+        )
+      `
+          : `
+        CREATE TABLE IF NOT EXISTS shared_job_segments (
+          segment_id TEXT PRIMARY KEY,
+          role TEXT NOT NULL DEFAULT 'operator',
+          user_id TEXT NOT NULL,
+          job_id INTEGER,
+          job_run_id TEXT NOT NULL,
+          execution_domain TEXT NOT NULL DEFAULT 'local',
+          owner_public_id TEXT,
+          operator_public_id TEXT,
+          current_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          remote_camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          camera_id_map_json TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'queued',
+          request_id TEXT,
+          source_command_id INTEGER,
+          trigger_type TEXT,
+          trigger_json TEXT,
+          cross_camera_federation_required INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          started_at TEXT,
+          completed_at TEXT,
+          stopped_at TEXT
+        )
+      `
+      ).run();
+
+      await db.prepare(
+        isPgLike
+          ? `
+        CREATE TABLE IF NOT EXISTS camera_import_gpu_jobs (
+          id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          import_command_id INTEGER NOT NULL,
+          requested_mode TEXT NOT NULL DEFAULT 'nvidia',
+          restart_if_running INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'queued',
+          camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          total_count INTEGER NOT NULL DEFAULT 0,
+          next_index INTEGER NOT NULL DEFAULT 0,
+          processed_count INTEGER NOT NULL DEFAULT 0,
+          enabled_gpu_count INTEGER NOT NULL DEFAULT 0,
+          kept_cpu_count INTEGER NOT NULL DEFAULT 0,
+          failed_count INTEGER NOT NULL DEFAULT 0,
+          active_camera_id INTEGER,
+          active_probe_command_id INTEGER,
+          active_probe_started_at TEXT,
+          outcomes_json TEXT NOT NULL DEFAULT '{}',
+          last_error TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          completed_at TEXT
+        )
+      `
+          : `
+        CREATE TABLE IF NOT EXISTS camera_import_gpu_jobs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          import_command_id INTEGER NOT NULL,
+          requested_mode TEXT NOT NULL DEFAULT 'nvidia',
+          restart_if_running INTEGER NOT NULL DEFAULT 1,
+          status TEXT NOT NULL DEFAULT 'queued',
+          camera_ids_json TEXT NOT NULL DEFAULT '[]',
+          total_count INTEGER NOT NULL DEFAULT 0,
+          next_index INTEGER NOT NULL DEFAULT 0,
+          processed_count INTEGER NOT NULL DEFAULT 0,
+          enabled_gpu_count INTEGER NOT NULL DEFAULT 0,
+          kept_cpu_count INTEGER NOT NULL DEFAULT 0,
+          failed_count INTEGER NOT NULL DEFAULT 0,
+          active_camera_id INTEGER,
+          active_probe_command_id INTEGER,
+          active_probe_started_at TEXT,
+          outcomes_json TEXT NOT NULL DEFAULT '{}',
+          last_error TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          completed_at TEXT
+        )
+      `
+      ).run();
 
       await db.prepare(`
         CREATE TABLE IF NOT EXISTS job_step_agent_runs (
@@ -9062,6 +9247,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON job_runs(user_id, job_id, created_at)
       `).run();
       await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_camera_import_gpu_jobs_user_command
+        ON camera_import_gpu_jobs(user_id, import_command_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_camera_import_gpu_jobs_status_updated
+        ON camera_import_gpu_jobs(status, updated_at)
+      `).run();
+      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_job_runs_status_last_event
         ON job_runs(status, last_event_at_utc)
       `).run();
@@ -9415,14 +9608,19 @@ async function ensureSchema(db: D1Database): Promise<void> {
           user_id TEXT NOT NULL,
           share_id INTEGER NOT NULL,
           owner_public_id TEXT NOT NULL,
+          origin_brand_id TEXT NOT NULL DEFAULT '',
           owner_local_camera_id INTEGER NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
           state_code TEXT,
           country_code TEXT NOT NULL DEFAULT 'BR',
           status TEXT NOT NULL DEFAULT 'accepted',
+          permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution',
+          access_config_json TEXT NOT NULL DEFAULT '{}',
           accepted_at TEXT,
           updated_at TEXT NOT NULL,
+          owner_handle TEXT,
+          owner_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, share_id)
         )
       `
@@ -9432,14 +9630,19 @@ async function ensureSchema(db: D1Database): Promise<void> {
           user_id TEXT NOT NULL,
           share_id INTEGER NOT NULL,
           owner_public_id TEXT NOT NULL,
+          origin_brand_id TEXT NOT NULL DEFAULT '',
           owner_local_camera_id INTEGER NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
           state_code TEXT,
           country_code TEXT NOT NULL DEFAULT 'BR',
           status TEXT NOT NULL DEFAULT 'accepted',
+          permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution',
+          access_config_json TEXT NOT NULL DEFAULT '{}',
           accepted_at TEXT,
           updated_at TEXT NOT NULL,
+          owner_handle TEXT,
+          owner_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, share_id)
         )
       `
@@ -9455,16 +9658,21 @@ async function ensureSchema(db: D1Database): Promise<void> {
           share_id INTEGER NOT NULL,
           owner_public_id TEXT NOT NULL,
           invitee_public_id TEXT NOT NULL,
+          origin_brand_id TEXT NOT NULL DEFAULT '',
           owner_local_camera_id INTEGER NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
           state_code TEXT,
           country_code TEXT NOT NULL DEFAULT 'BR',
           status TEXT NOT NULL DEFAULT 'pending',
+          permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution',
+          access_config_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL,
           accepted_at TEXT,
           revoked_at TEXT,
           updated_at TEXT NOT NULL,
+          owner_handle TEXT,
+          owner_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, direction, share_id)
         )
       `
@@ -9476,16 +9684,21 @@ async function ensureSchema(db: D1Database): Promise<void> {
           share_id INTEGER NOT NULL,
           owner_public_id TEXT NOT NULL,
           invitee_public_id TEXT NOT NULL,
+          origin_brand_id TEXT NOT NULL DEFAULT '',
           owner_local_camera_id INTEGER NOT NULL,
           camera_name TEXT NOT NULL,
           city TEXT,
           state_code TEXT,
           country_code TEXT NOT NULL DEFAULT 'BR',
           status TEXT NOT NULL DEFAULT 'pending',
+          permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution',
+          access_config_json TEXT NOT NULL DEFAULT '{}',
           created_at TEXT NOT NULL,
           accepted_at TEXT,
           revoked_at TEXT,
           updated_at TEXT NOT NULL,
+          owner_handle TEXT,
+          owner_email TEXT NOT NULL DEFAULT '',
           UNIQUE(user_id, direction, share_id)
         )
       `
@@ -9828,6 +10041,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
         ON cameras(allowpublicaccess, country_code, state_code)
       `).run();
       await db.prepare(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_shared_find_share
+        ON cameras(user_id, shared_share_id)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_cameras_origin_shared_status
+        ON cameras(user_id, origin_type, shared_status, created_at)
+      `).run();
+      await db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_shared_find_cameras_cache_user_scope
         ON shared_find_cameras_cache(user_id, country_code, state_code, status)
       `).run();
@@ -9943,6 +10164,13 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN share_id INTEGER NOT NULL DEFAULT 0`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_public_id TEXT NOT NULL DEFAULT ''`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN invitee_public_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN origin_brand_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(
+          `ALTER TABLE shared_find_invitations_cache ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_find_invitations_cache ADD COLUMN access_config_json TEXT NOT NULL DEFAULT '{}'`
+        );
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_local_camera_id INTEGER NOT NULL DEFAULT 0`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN camera_name TEXT NOT NULL DEFAULT ''`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN city TEXT`);
@@ -9953,21 +10181,110 @@ async function ensureSchema(db: D1Database): Promise<void> {
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN accepted_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN revoked_at TEXT`);
         await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN updated_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_handle TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_invitations_cache ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''`);
+      }
+
+      if (await tableExists("shared_find_cameras_cache")) {
+        await addColumnIfMissing(`ALTER TABLE shared_find_cameras_cache ADD COLUMN origin_brand_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(
+          `ALTER TABLE shared_find_cameras_cache ADD COLUMN permission_profile TEXT NOT NULL DEFAULT 'shared_job_execution'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_find_cameras_cache ADD COLUMN access_config_json TEXT NOT NULL DEFAULT '{}'`
+        );
+        await addColumnIfMissing(`ALTER TABLE shared_find_cameras_cache ADD COLUMN owner_handle TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_find_cameras_cache ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''`);
       }
 
       if (await tableExists("commands")) {
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN target_client_id TEXT`);
         await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN target_exe_id TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE commands ADD COLUMN execution_domain TEXT NOT NULL DEFAULT 'local'`
+        );
+        await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN remote_owner_public_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE commands ADD COLUMN shared_segment_id TEXT`);
       }
 
       if (await tableExists("job_step_targets")) {
         await addColumnIfMissing(`ALTER TABLE job_step_targets ADD COLUMN slot_key TEXT`);
         await addColumnIfMissing(`ALTER TABLE job_step_targets ADD COLUMN slot_label TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE job_step_targets ADD COLUMN execution_domain TEXT NOT NULL DEFAULT 'local'`
+        );
+        await addColumnIfMissing(`ALTER TABLE job_step_targets ADD COLUMN execution_owner_public_id TEXT`);
         await db.prepare(`
           CREATE INDEX IF NOT EXISTS idx_job_step_targets_step_slot_key
           ON job_step_targets(step_id, slot_key)
         `).run();
       }
+
+      if (await tableExists("job_runs")) {
+        await addColumnIfMissing(
+          `ALTER TABLE job_runs ADD COLUMN execution_domain TEXT NOT NULL DEFAULT 'local'`
+        );
+        await addColumnIfMissing(`ALTER TABLE job_runs ADD COLUMN remote_owner_public_id TEXT`);
+      }
+
+      if (await tableExists("job_runtime_states")) {
+        await addColumnIfMissing(
+          `ALTER TABLE job_runtime_states ADD COLUMN execution_domain TEXT NOT NULL DEFAULT 'local'`
+        );
+        await addColumnIfMissing(`ALTER TABLE job_runtime_states ADD COLUMN remote_owner_public_id TEXT`);
+      }
+
+      if (await tableExists("shared_job_segments")) {
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN role TEXT NOT NULL DEFAULT 'operator'`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN job_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN job_run_id TEXT NOT NULL DEFAULT ''`);
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN execution_domain TEXT NOT NULL DEFAULT 'local'`
+        );
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN owner_public_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN operator_public_id TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN current_camera_ids_json TEXT NOT NULL DEFAULT '[]'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN remote_camera_ids_json TEXT NOT NULL DEFAULT '[]'`
+        );
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN camera_id_map_json TEXT NOT NULL DEFAULT '{}'`
+        );
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN request_id TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN source_command_id INTEGER`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN trigger_type TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN trigger_json TEXT`);
+        await addColumnIfMissing(
+          `ALTER TABLE shared_job_segments ADD COLUMN cross_camera_federation_required INTEGER NOT NULL DEFAULT 0`
+        );
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN last_error TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN created_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN updated_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN started_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN completed_at TEXT`);
+        await addColumnIfMissing(`ALTER TABLE shared_job_segments ADD COLUMN stopped_at TEXT`);
+      }
+
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_job_runs_execution_domain
+        ON job_runs(user_id, execution_domain, updated_at)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_job_segments_user_job_run
+        ON shared_job_segments(user_id, job_run_id, role, execution_domain)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_job_segments_status_updated
+        ON shared_job_segments(status, updated_at)
+      `).run();
+      await db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_shared_job_segments_request_id
+        ON shared_job_segments(request_id, updated_at)
+      `).run();
 
       if (await tableExists("cameras")) {
         const { results: cameraGeoRows } = await db
@@ -15046,6 +15363,13 @@ async function sha256Base64Url(input: string): Promise<string> {
   return base64UrlEncodeBytes(new Uint8Array(digest));
 }
 
+async function sha256BytesBase64Url(input: ArrayBuffer | Uint8Array): Promise<string> {
+  const cryptoApi = getWebCrypto();
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const digest = await cryptoApi.subtle.digest("SHA-256", bytes);
+  return base64UrlEncodeBytes(new Uint8Array(digest));
+}
+
 async function buildConditionalJsonResponse(
   c: any,
   etagPrefix: string,
@@ -15670,6 +15994,9 @@ type SharedFindCacheRow = {
   share_id: number;
   user_id: string;
   owner_public_id: string;
+  origin_brand_id: string;
+  permission_profile: string;
+  access_config_json: string;
   owner_local_camera_id: number;
   camera_name: string;
   city: string | null;
@@ -15678,6 +16005,8 @@ type SharedFindCacheRow = {
   status: string;
   accepted_at: string | null;
   updated_at: string;
+  owner_handle: string | null;
+  owner_email: string;
 };
 
 type SharedFindInvitationDirection = "incoming" | "outgoing";
@@ -15689,6 +16018,9 @@ type SharedFindInvitationCacheRow = {
   share_id: number;
   owner_public_id: string;
   invitee_public_id: string;
+  origin_brand_id: string;
+  permission_profile: string;
+  access_config_json: string;
   owner_local_camera_id: number;
   camera_name: string;
   city: string | null;
@@ -15699,12 +16031,17 @@ type SharedFindInvitationCacheRow = {
   accepted_at: string | null;
   revoked_at: string | null;
   updated_at: string;
+  owner_handle: string | null;
+  owner_email: string;
 };
 
 type CentralCameraFindShareRow = {
   id: number;
   owner_public_id: string;
   invitee_public_id: string;
+  origin_brand_id: string;
+  permission_profile: string;
+  access_config_json: string;
   owner_local_camera_id: number;
   camera_name: string;
   city: string | null;
@@ -15715,6 +16052,8 @@ type CentralCameraFindShareRow = {
   accepted_at: string | null;
   revoked_at: string | null;
   updated_at: string;
+  owner_handle: string | null;
+  owner_email: string;
 };
 
 type WorkspaceConnectionPolicy = "allow_while_open" | "confirm_each_time";
@@ -16221,10 +16560,21 @@ function normalizeCentralCameraFindShareRow(value: unknown): CentralCameraFindSh
   const row = value as Record<string, unknown>;
   const id = clampInteger(row.id);
   if (id <= 0) return null;
+  const permissionProfile = normalizeSharedCameraPermissionProfile(
+    row.permission_profile,
+    "shared_job_execution"
+  );
+  const accessConfig = normalizeSharedCameraAccessConfiguration(
+    row.access_config_json,
+    permissionProfile
+  );
   return {
     id,
     owner_public_id: normalizeText(row.owner_public_id),
     invitee_public_id: normalizeText(row.invitee_public_id),
+    origin_brand_id: normalizeText(row.origin_brand_id).toLowerCase(),
+    permission_profile: permissionProfile,
+    access_config_json: serializeSharedCameraAccessConfiguration(accessConfig),
     owner_local_camera_id: clampInteger(row.owner_local_camera_id),
     camera_name: normalizeText(row.camera_name),
     city: normalizeOptionalText(row.city),
@@ -16235,6 +16585,8 @@ function normalizeCentralCameraFindShareRow(value: unknown): CentralCameraFindSh
     accepted_at: normalizeOptionalText(row.accepted_at),
     revoked_at: normalizeOptionalText(row.revoked_at),
     updated_at: normalizeText(row.updated_at),
+    owner_handle: normalizeUserHandleInput(row.owner_handle),
+    owner_email: normalizeEmail(String(row.owner_email || "")),
   };
 }
 
@@ -16245,6 +16597,14 @@ function normalizeSharedFindInvitationCacheRow(
   const row = value as Record<string, unknown>;
   const shareId = clampInteger(row.share_id);
   if (shareId <= 0) return null;
+  const permissionProfile = normalizeSharedCameraPermissionProfile(
+    row.permission_profile,
+    "shared_job_execution"
+  );
+  const accessConfig = normalizeSharedCameraAccessConfiguration(
+    row.access_config_json,
+    permissionProfile
+  );
   return {
     id: clampInteger(row.id),
     user_id: normalizeText(row.user_id),
@@ -16252,6 +16612,9 @@ function normalizeSharedFindInvitationCacheRow(
     share_id: shareId,
     owner_public_id: normalizeText(row.owner_public_id),
     invitee_public_id: normalizeText(row.invitee_public_id),
+    origin_brand_id: normalizeText(row.origin_brand_id).toLowerCase(),
+    permission_profile: permissionProfile,
+    access_config_json: serializeSharedCameraAccessConfiguration(accessConfig),
     owner_local_camera_id: clampInteger(row.owner_local_camera_id),
     camera_name: normalizeText(row.camera_name),
     city: normalizeOptionalText(row.city),
@@ -16262,6 +16625,8 @@ function normalizeSharedFindInvitationCacheRow(
     accepted_at: normalizeOptionalText(row.accepted_at),
     revoked_at: normalizeOptionalText(row.revoked_at),
     updated_at: normalizeText(row.updated_at),
+    owner_handle: normalizeUserHandleInput(row.owner_handle),
+    owner_email: normalizeEmail(String(row.owner_email || "")),
   };
 }
 
@@ -16272,6 +16637,9 @@ function mapSharedFindInvitationCacheRowToShare(
     id: row.share_id,
     owner_public_id: row.owner_public_id,
     invitee_public_id: row.invitee_public_id,
+    origin_brand_id: row.origin_brand_id,
+    permission_profile: row.permission_profile,
+    access_config_json: row.access_config_json,
     owner_local_camera_id: row.owner_local_camera_id,
     camera_name: row.camera_name,
     city: row.city,
@@ -16282,6 +16650,8 @@ function mapSharedFindInvitationCacheRowToShare(
     accepted_at: row.accepted_at,
     revoked_at: row.revoked_at,
     updated_at: row.updated_at,
+    owner_handle: row.owner_handle,
+    owner_email: row.owner_email,
   };
 }
 
@@ -16301,6 +16671,20 @@ async function listSharedFindCameraCacheForUser(db: D1Database, userId: string) 
     share_id: clampInteger(row?.share_id),
     user_id: normalizeText(row?.user_id),
     owner_public_id: normalizeText(row?.owner_public_id),
+    origin_brand_id: normalizeText((row as any)?.origin_brand_id).toLowerCase(),
+    permission_profile: normalizeSharedCameraPermissionProfile(
+      (row as any)?.permission_profile,
+      "shared_job_execution"
+    ),
+    access_config_json: serializeSharedCameraAccessConfiguration(
+      normalizeSharedCameraAccessConfiguration(
+        (row as any)?.access_config_json,
+        normalizeSharedCameraPermissionProfile(
+          (row as any)?.permission_profile,
+          "shared_job_execution"
+        )
+      )
+    ),
     owner_local_camera_id: clampInteger(row?.owner_local_camera_id),
     camera_name: normalizeText(row?.camera_name),
     city: normalizeOptionalText(row?.city),
@@ -16309,6 +16693,8 @@ async function listSharedFindCameraCacheForUser(db: D1Database, userId: string) 
     status: normalizeText(row?.status) || "accepted",
     accepted_at: normalizeOptionalText(row?.accepted_at),
     updated_at: normalizeText(row?.updated_at),
+    owner_handle: normalizeUserHandleInput((row as any)?.owner_handle),
+    owner_email: normalizeEmail(String((row as any)?.owner_email || "")),
   }));
 }
 
@@ -16366,6 +16752,9 @@ async function replaceSharedFindCameraCacheForUser(
            user_id,
            share_id,
            owner_public_id,
+           origin_brand_id,
+           permission_profile,
+           access_config_json,
            owner_local_camera_id,
            camera_name,
            city,
@@ -16373,14 +16762,24 @@ async function replaceSharedFindCameraCacheForUser(
            country_code,
            status,
            accepted_at,
-           updated_at
+           updated_at,
+           owner_handle,
+           owner_email
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         userId,
         row.id,
         row.owner_public_id,
+        row.origin_brand_id || "",
+        normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution"),
+        serializeSharedCameraAccessConfiguration(
+          normalizeSharedCameraAccessConfiguration(
+            row.access_config_json,
+            normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution")
+          )
+        ),
         row.owner_local_camera_id,
         row.camera_name,
         row.city,
@@ -16388,7 +16787,9 @@ async function replaceSharedFindCameraCacheForUser(
         row.country_code,
         row.status || "accepted",
         row.accepted_at,
-        row.updated_at || now
+        row.updated_at || now,
+        row.owner_handle,
+        row.owner_email || ""
       )
       .run();
   }
@@ -16415,6 +16816,9 @@ async function replaceSharedFindInvitationCacheForUser(
            share_id,
            owner_public_id,
            invitee_public_id,
+           origin_brand_id,
+           permission_profile,
+           access_config_json,
            owner_local_camera_id,
            camera_name,
            city,
@@ -16422,11 +16826,13 @@ async function replaceSharedFindInvitationCacheForUser(
            country_code,
            status,
            created_at,
-           accepted_at,
+         accepted_at,
            revoked_at,
-           updated_at
+           updated_at,
+           owner_handle,
+           owner_email
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         userId,
@@ -16434,6 +16840,14 @@ async function replaceSharedFindInvitationCacheForUser(
         row.id,
         row.owner_public_id,
         row.invitee_public_id,
+        row.origin_brand_id || "",
+        normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution"),
+        serializeSharedCameraAccessConfiguration(
+          normalizeSharedCameraAccessConfiguration(
+            row.access_config_json,
+            normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution")
+          )
+        ),
         row.owner_local_camera_id,
         row.camera_name,
         row.city,
@@ -16443,7 +16857,202 @@ async function replaceSharedFindInvitationCacheForUser(
         row.created_at || now,
         row.accepted_at,
         row.revoked_at,
-        row.updated_at || now
+        row.updated_at || now,
+        row.owner_handle,
+        row.owner_email || ""
+      )
+      .run();
+  }
+}
+
+async function syncSharedFindShadowCamerasForUser(
+  db: D1Database,
+  userId: string,
+  rows: CentralCameraFindShareRow[]
+) {
+  const { results: existingRows } = await db
+    .prepare(
+      `SELECT id, shared_share_id
+       FROM cameras
+       WHERE user_id = ?
+         AND COALESCE(origin_type, 'local') = 'shared_find'`
+    )
+    .bind(userId)
+    .all();
+
+  const existingByShareId = new Map<number, number>();
+  for (const row of existingRows || []) {
+    const shareId = clampInteger((row as any)?.shared_share_id);
+    const cameraId = clampInteger((row as any)?.id);
+    if (shareId > 0 && cameraId > 0) {
+      existingByShareId.set(shareId, cameraId);
+    }
+  }
+
+  const activeShareIds = new Set<number>();
+  for (const row of rows) {
+    if (clampInteger(row.id) > 0) {
+      activeShareIds.add(clampInteger(row.id));
+    }
+  }
+
+  for (const [shareId, cameraId] of existingByShareId.entries()) {
+    if (activeShareIds.has(shareId)) {
+      continue;
+    }
+    await db
+      .prepare(
+        `UPDATE cameras
+         SET shared_status = 'revoked',
+             is_service_running = 0,
+             is_online = 0,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?
+           AND user_id = ?`
+      )
+      .bind(cameraId, userId)
+      .run();
+  }
+
+  for (const row of rows) {
+    const shareId = clampInteger(row.id);
+    if (shareId <= 0) {
+      continue;
+    }
+
+    const ownerDisplayLabel =
+      buildSharedFindDisplayLabel({
+        handle: row.owner_handle,
+        email: row.owner_email,
+      }) || row.owner_public_id;
+    const programLabel = resolveSharedCameraProgramLabel(row.origin_brand_id);
+    const stateCode = normalizeOptionalText(row.state_code)?.toUpperCase() || null;
+    const stateText = resolveSharedCameraStateText(row.country_code, stateCode);
+    const countryCode = normalizeCountryCode(row.country_code, null) || "BR";
+    const countryText = resolveCountryDisplayName(countryCode) || "";
+    const cameraName = normalizeText(row.camera_name) || `Shared Camera #${shareId}`;
+    const description = buildSharedCameraShadowDescription(row);
+    const manufacturer = `Shared via ${programLabel}`;
+    const existingCameraId = existingByShareId.get(shareId) || 0;
+
+    if (existingCameraId > 0) {
+      await db
+        .prepare(
+          `UPDATE cameras
+          SET name = ?,
+               manufacturer = ?,
+               description = ?,
+               city = ?,
+               state = ?,
+               state_code = ?,
+               country = ?,
+               country_code = ?,
+               is_online = 0,
+               is_service_running = 0,
+               origin_type = 'shared_find',
+               shared_share_id = ?,
+               shared_owner_public_id = ?,
+               shared_owner_local_camera_id = ?,
+               shared_owner_handle = ?,
+               shared_owner_email = ?,
+               shared_owner_display_label = ?,
+               shared_origin_brand_id = ?,
+               shared_status = 'accepted',
+               shared_permission_profile = ?,
+               shared_access_config_json = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?
+             AND user_id = ?`
+        )
+        .bind(
+          cameraName,
+          manufacturer,
+          description,
+          normalizeOptionalText(row.city),
+          stateText,
+          stateCode,
+          countryText,
+          countryCode,
+          shareId,
+          row.owner_public_id,
+          row.owner_local_camera_id,
+          row.owner_handle,
+          row.owner_email || "",
+          ownerDisplayLabel,
+          normalizeText(row.origin_brand_id).toLowerCase(),
+          normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution"),
+          serializeSharedCameraAccessConfiguration(
+            normalizeSharedCameraAccessConfiguration(
+              row.access_config_json,
+              normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution")
+            )
+          ),
+          existingCameraId,
+          userId
+        )
+        .run();
+      continue;
+    }
+
+    await db
+      .prepare(
+        `INSERT INTO cameras (
+           user_id,
+           name,
+           ip_address,
+           manufacturer,
+           connection_method,
+           is_online,
+           is_service_running,
+           store_frames,
+           description,
+           city,
+           state,
+           state_code,
+           country,
+           country_code,
+           allowpublicaccess,
+           capture_acceleration_mode,
+           origin_type,
+           shared_share_id,
+           shared_owner_public_id,
+           shared_owner_local_camera_id,
+           shared_owner_handle,
+           shared_owner_email,
+           shared_owner_display_label,
+           shared_origin_brand_id,
+           shared_status,
+           shared_permission_profile,
+           shared_access_config_json,
+           created_at,
+           updated_at
+         )
+         VALUES (?, ?, '', ?, 'RTSP', 0, 0, 0, ?, ?, ?, ?, ?, ?, 0, 'cpu', 'shared_find', ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      )
+      .bind(
+        userId,
+        cameraName,
+        manufacturer,
+        description,
+        normalizeOptionalText(row.city),
+        stateText,
+        stateCode,
+        countryText,
+        countryCode,
+        shareId,
+        row.owner_public_id,
+        row.owner_local_camera_id,
+        row.owner_handle,
+        row.owner_email || "",
+        ownerDisplayLabel,
+        normalizeText(row.origin_brand_id).toLowerCase(),
+        normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution"),
+        serializeSharedCameraAccessConfiguration(
+          normalizeSharedCameraAccessConfiguration(
+            row.access_config_json,
+            normalizeSharedCameraPermissionProfile(row.permission_profile, "shared_job_execution")
+          )
+        )
       )
       .run();
   }
@@ -16560,6 +17169,7 @@ async function loadSharedFindCachedStateForUser(db: D1Database, userId: string) 
     id: row.share_id,
     owner_public_id: row.owner_public_id,
     invitee_public_id: "",
+    origin_brand_id: row.origin_brand_id,
     owner_local_camera_id: row.owner_local_camera_id,
     camera_name: row.camera_name,
     city: row.city,
@@ -16570,6 +17180,8 @@ async function loadSharedFindCachedStateForUser(db: D1Database, userId: string) 
     accepted_at: row.accepted_at,
     revoked_at: null,
     updated_at: row.updated_at,
+    owner_handle: row.owner_handle,
+    owner_email: row.owner_email,
   }));
 
   return {
@@ -16608,6 +17220,7 @@ async function fetchCentralSharedFindRows(
 
 async function syncSharedFindCameraCacheForUser(env: Env, user: WorkerAuthenticatedUser) {
   const cached = await loadSharedFindCachedStateForUser(env.DB, user.id);
+  await syncSharedFindShadowCamerasForUser(env.DB, user.id, cached.available);
   if (!isCentralIdentityClientConfigured(env)) {
     return {
       ...cached,
@@ -16633,6 +17246,7 @@ async function syncSharedFindCameraCacheForUser(env: Env, user: WorkerAuthentica
     await syncSharedFindInvitationNotifications(env.DB, user.id, incoming);
 
     const nextCached = await loadSharedFindCachedStateForUser(env.DB, user.id);
+    await syncSharedFindShadowCamerasForUser(env.DB, user.id, nextCached.available);
     return {
       ...nextCached,
       sync_error: null as string | null,
@@ -16674,6 +17288,65 @@ function buildSharedFindDisplayLabel(user: {
   if (handle) return `@${handle}`;
   const email = normalizeEmail(String(user.email || ""));
   return email || "";
+}
+
+function resolveSharedCameraProgramLabel(originBrandId: unknown) {
+  const normalized = normalizeText(originBrandId).toLowerCase();
+  if (normalized === "perceptrum") {
+    return "Perceptrum";
+  }
+  if (normalized === "drakon") {
+    return "Drakon";
+  }
+  return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : "Drakon";
+}
+
+function resolveSharedCameraStateText(countryCode: string, stateCode: string | null) {
+  const normalizedCountryCode = normalizeCountryCode(countryCode, null) || "BR";
+  const normalizedStateCode = normalizeOptionalText(stateCode)?.toUpperCase() || null;
+  if (!normalizedStateCode) {
+    return "";
+  }
+  if (normalizedCountryCode === "BR") {
+    return (
+      BRAZIL_STATE_NAME_BY_CODE[normalizedStateCode as keyof typeof BRAZIL_STATE_NAME_BY_CODE] ||
+      normalizedStateCode
+    );
+  }
+  return normalizedStateCode;
+}
+
+function buildSharedCameraShadowDescription(row: Pick<
+  CentralCameraFindShareRow,
+  "owner_handle" | "owner_email" | "origin_brand_id" | "camera_name"
+>) {
+  const ownerLabel =
+    buildSharedFindDisplayLabel({
+      handle: row.owner_handle,
+      email: row.owner_email,
+    }) || "another workspace";
+  const programLabel = resolveSharedCameraProgramLabel(row.origin_brand_id);
+  const cameraName = normalizeText(row.camera_name) || "camera";
+  return `Shared camera reference for ${cameraName}. Shared by ${ownerLabel} via ${programLabel}.`;
+}
+
+function isSharedFindShadowCameraRow(value: unknown) {
+  return normalizeText((value as any)?.origin_type).toLowerCase() === "shared_find";
+}
+
+function buildVisibleCameraWhereClause(alias = "") {
+  const prefix = alias ? `${alias}.` : "";
+  return `${prefix}user_id = ? AND (COALESCE(${prefix}origin_type, 'local') <> 'shared_find' OR COALESCE(${prefix}shared_status, 'accepted') = 'accepted')`;
+}
+
+function buildSharedCameraStreamAccessMessage(camera: Record<string, unknown> | null | undefined) {
+  const ownerLabel =
+    buildSharedFindDisplayLabel({
+      handle: normalizeUserHandleInput((camera as any)?.shared_owner_handle),
+      email: normalizeEmail(String((camera as any)?.shared_owner_email || "")),
+    }) || "the owner";
+  const programLabel = resolveSharedCameraProgramLabel((camera as any)?.shared_origin_brand_id);
+  return `This shared camera was provided by ${ownerLabel} via ${programLabel}. Local stream controls are unavailable on this workspace.`;
 }
 
 async function resolveCentralFindShareUserByQuery(
@@ -16881,7 +17554,16 @@ async function getCentralCameraFindShareById(db: D1Database, shareId: number) {
   }
 
   const row = await db
-    .prepare(`SELECT * FROM camera_find_shares WHERE id = ? LIMIT 1`)
+    .prepare(
+      `SELECT s.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email
+       FROM camera_find_shares s
+       LEFT JOIN server_users owner
+         ON owner.public_id = s.owner_public_id
+       WHERE s.id = ?
+       LIMIT 1`
+    )
     .bind(shareId)
     .first();
 
@@ -16913,10 +17595,16 @@ async function listCentralCameraFindShares(
 
   const { results } = await db
     .prepare(
-      `SELECT *
-       FROM camera_find_shares
-       WHERE ${clauses.join(" AND ")}
-       ORDER BY updated_at DESC, id DESC`
+      `SELECT s.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email
+       FROM camera_find_shares s
+       LEFT JOIN server_users owner
+         ON owner.public_id = s.owner_public_id
+       WHERE ${clauses
+         .map((clause) => clause.replace(/owner_public_id/g, "s.owner_public_id").replace(/invitee_public_id/g, "s.invitee_public_id").replace(/owner_local_camera_id/g, "s.owner_local_camera_id"))
+         .join(" AND ")}
+       ORDER BY s.updated_at DESC, s.id DESC`
     )
     .bind(...bindings)
     .all();
@@ -16932,11 +17620,15 @@ async function listCentralAvailableCameraFindShares(db: D1Database, inviteePubli
 
   const { results } = await db
     .prepare(
-      `SELECT *
-       FROM camera_find_shares
-       WHERE invitee_public_id = ?
-         AND status = 'accepted'
-       ORDER BY state_code ASC, city ASC, camera_name ASC, id ASC`
+      `SELECT s.*,
+              owner.handle AS owner_handle,
+              owner.email AS owner_email
+       FROM camera_find_shares s
+       LEFT JOIN server_users owner
+         ON owner.public_id = s.owner_public_id
+       WHERE s.invitee_public_id = ?
+         AND s.status = 'accepted'
+       ORDER BY s.state_code ASC, s.city ASC, s.camera_name ASC, s.id ASC`
     )
     .bind(publicId)
     .all();
@@ -16951,6 +17643,9 @@ async function createOrUpdateCentralCameraFindShare(
   input: {
     ownerPublicId: string;
     inviteePublicId: string;
+    originBrandId?: string | null;
+    permissionProfile?: SharedCameraPermissionProfile | string | null;
+    accessConfig?: SharedCameraAccessConfiguration | Record<string, unknown> | null;
     ownerLocalCameraId: number;
     cameraName: string;
     city?: string | null;
@@ -16969,6 +17664,16 @@ async function createOrUpdateCentralCameraFindShare(
   }
 
   const now = new Date().toISOString();
+  const originBrandId = normalizeText(input.originBrandId).toLowerCase();
+  const normalizedPermissionProfile = normalizeSharedCameraPermissionProfile(
+    input.permissionProfile,
+    "shared_job_execution"
+  );
+  const normalizedAccessConfig = normalizeSharedCameraAccessConfiguration(
+    input.accessConfig,
+    normalizedPermissionProfile
+  );
+  const serializedAccessConfig = serializeSharedCameraAccessConfiguration(normalizedAccessConfig);
   const existing = await db
     .prepare(
       `SELECT *
@@ -16990,7 +17695,10 @@ async function createOrUpdateCentralCameraFindShare(
     await db
       .prepare(
         `UPDATE camera_find_shares
-         SET camera_name = ?,
+         SET origin_brand_id = ?,
+             permission_profile = ?,
+             access_config_json = ?,
+             camera_name = ?,
              city = ?,
              state_code = ?,
              country_code = ?,
@@ -17000,7 +17708,17 @@ async function createOrUpdateCentralCameraFindShare(
              updated_at = ?
          WHERE id = ?`
       )
-      .bind(cameraName, city, stateCode, countryCode, now, Number((existing as any)?.id || 0))
+      .bind(
+        originBrandId,
+        normalizedPermissionProfile,
+        serializedAccessConfig,
+        cameraName,
+        city,
+        stateCode,
+        countryCode,
+        now,
+        Number((existing as any)?.id || 0)
+      )
       .run();
 
     return getCentralCameraFindShareById(db, Number((existing as any)?.id || 0));
@@ -17011,6 +17729,9 @@ async function createOrUpdateCentralCameraFindShare(
       `INSERT INTO camera_find_shares (
          owner_public_id,
          invitee_public_id,
+         origin_brand_id,
+         permission_profile,
+         access_config_json,
          owner_local_camera_id,
          camera_name,
          city,
@@ -17020,11 +17741,14 @@ async function createOrUpdateCentralCameraFindShare(
          created_at,
          updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
     )
     .bind(
       ownerPublicId,
       inviteePublicId,
+      originBrandId,
+      normalizedPermissionProfile,
+      serializedAccessConfig,
       ownerLocalCameraId,
       cameraName,
       city,
@@ -17856,6 +18580,569 @@ async function maybeEnsureSharedFindRelayForUser(
   } catch {
     return null;
   }
+}
+
+type SharedJobSegmentRow = {
+  segment_id: string;
+  role: string;
+  user_id: string;
+  job_id: number | null;
+  job_run_id: string;
+  execution_domain: string;
+  owner_public_id: string | null;
+  operator_public_id: string | null;
+  current_camera_ids_json: string | null;
+  remote_camera_ids_json: string | null;
+  camera_id_map_json: string | null;
+  status: string;
+  request_id: string | null;
+  source_command_id: number | null;
+  trigger_type: string | null;
+  trigger_json: string | null;
+  cross_camera_federation_required: number | null;
+  last_error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  stopped_at: string | null;
+};
+
+const SHARED_JOB_CAMERA_ID_SCALAR_KEYS = new Set([
+  "camera_id",
+  "cameraId",
+  "target_camera_id",
+  "targetCameraId",
+  "source_camera_id",
+  "sourceCameraId",
+  "matched_camera_id",
+  "matchedCameraId",
+]);
+
+const SHARED_JOB_CAMERA_ID_ARRAY_KEYS = new Set([
+  "all_camera_ids",
+  "allCameraIds",
+  "camera_ids",
+  "cameraIds",
+]);
+
+const SHARED_JOB_LIFECYCLE_EVENT_TYPES = new Set([
+  "job_started",
+  "job_stop_requested",
+  "job_stopped",
+  "job_staled",
+  "job_completed",
+  "job_failed",
+]);
+
+function parsePositiveIntegerArrayJson(value: unknown): number[] {
+  const parsed = Array.isArray(value)
+    ? value
+    : (() => {
+        const obj = parseJsonObject(value);
+        return Array.isArray(obj) ? obj : (() => {
+          try {
+            const maybe = typeof value === "string" ? JSON.parse(value) : null;
+            return Array.isArray(maybe) ? maybe : [];
+          } catch {
+            return [];
+          }
+        })();
+      })();
+  return parsed
+    .map((entry) => clampInteger(entry))
+    .filter((entry, index, source): entry is number => entry > 0 && source.indexOf(entry) === index);
+}
+
+function parseSharedJobCameraIdMap(value: unknown): Record<string, number> {
+  const parsed = parseJsonObject(value) || {};
+  const entries = Object.entries(parsed)
+    .map(([key, rawValue]) => [normalizeText(key), clampInteger(rawValue)] as const)
+    .filter(([key, cameraId]) => !!key && cameraId > 0);
+  return Object.fromEntries(entries);
+}
+
+function buildReverseSharedJobCameraIdMap(
+  cameraIdMap: Record<string, number>
+): Record<string, number> {
+  const reverse: Record<string, number> = {};
+  for (const [operatorCameraId, ownerCameraId] of Object.entries(cameraIdMap)) {
+    const normalizedOperatorCameraId = clampInteger(operatorCameraId);
+    if (normalizedOperatorCameraId <= 0 || ownerCameraId <= 0) continue;
+    reverse[String(ownerCameraId)] = normalizedOperatorCameraId;
+  }
+  return reverse;
+}
+
+function remapSharedJobCameraIdScalarValue(
+  value: unknown,
+  cameraIdMap: Record<string, number>
+): unknown {
+  const cameraId = clampInteger(value);
+  if (cameraId <= 0) {
+    return value;
+  }
+  return cameraIdMap[String(cameraId)] || cameraId;
+}
+
+function remapSharedJobCameraIds(
+  value: unknown,
+  cameraIdMap: Record<string, number>,
+  parentKey = ""
+): unknown {
+  if (Array.isArray(value)) {
+    if (SHARED_JOB_CAMERA_ID_ARRAY_KEYS.has(parentKey)) {
+      return value.map((entry) => remapSharedJobCameraIdScalarValue(entry, cameraIdMap));
+    }
+    return value.map((entry) => remapSharedJobCameraIds(entry, cameraIdMap, parentKey));
+  }
+  if (!value || typeof value !== "object") {
+    if (SHARED_JOB_CAMERA_ID_SCALAR_KEYS.has(parentKey)) {
+      return remapSharedJobCameraIdScalarValue(value, cameraIdMap);
+    }
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, nestedValue]) => [
+      key,
+      remapSharedJobCameraIds(nestedValue, cameraIdMap, key),
+    ])
+  );
+}
+
+function normalizeSharedJobSegmentStatus(value: unknown): string {
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return "queued";
+  return normalized;
+}
+
+function isTerminalSharedJobSegmentStatus(value: unknown): boolean {
+  const normalized = normalizeSharedJobSegmentStatus(value);
+  return (
+    normalized === "completed" ||
+    normalized === "failed" ||
+    normalized === "stopped" ||
+    normalized === "cancelled"
+  );
+}
+
+function buildSyntheticSharedOwnerJobId(segmentId: string, operatorJobId: number): number {
+  const seed = `${normalizeText(segmentId)}:${Math.max(1, clampInteger(operatorJobId))}`;
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  const normalized = Math.abs(hash >>> 0) % 900_000_000;
+  return 1_000_000_000 + normalized;
+}
+
+function buildSharedJobReplayClientId(segmentId: string, ownerPublicId?: string | null): string {
+  return `shared-job:${normalizeText(ownerPublicId) || "local"}:${normalizeText(segmentId) || "segment"}`;
+}
+
+function stripSharedJobEventMedia(details: Record<string, unknown>) {
+  const mediaKeys = [
+    "video_mp4_base64",
+    "video_key",
+    "videoKey",
+    "video_url",
+    "videoUrl",
+    "frame_jpeg_base64",
+    "image_jpeg_b64",
+    "image_key",
+    "imageKey",
+    "image_url",
+    "imageUrl",
+    "snapshot_image_data_url",
+    "image_data_url",
+  ];
+  for (const mediaKey of mediaKeys) {
+    delete (details as any)[mediaKey];
+  }
+
+  if (Array.isArray((details as any).group_images)) {
+    (details as any).group_images = (details as any).group_images.map((entry: unknown) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return entry;
+      }
+      const nextEntry = { ...(entry as Record<string, unknown>) };
+      delete (nextEntry as any).image_jpeg_b64;
+      delete (nextEntry as any).frame_jpeg_base64;
+      delete (nextEntry as any).image_key;
+      delete (nextEntry as any).imageKey;
+      delete (nextEntry as any).image_url;
+      delete (nextEntry as any).imageUrl;
+      return nextEntry;
+    });
+  }
+}
+
+function allowsSharedJobRelayEventMedia(details: Record<string, unknown>): boolean {
+  const raw =
+    details.shared_allow_event_media ??
+    details.sharedAllowEventMedia ??
+    details.allow_event_media ??
+    details.allowEventMedia;
+  return normalizeDbBoolean(raw, false);
+}
+
+async function listSharedJobSegmentsForUserJobRun(
+  db: D1Database,
+  userId: string,
+  jobRunId: string,
+  role: "operator" | "owner"
+): Promise<SharedJobSegmentRow[]> {
+  const normalizedJobRunId = normalizeText(jobRunId);
+  if (!normalizedJobRunId) return [];
+  const { results } = await db
+    .prepare(
+      `SELECT *
+       FROM shared_job_segments
+       WHERE user_id = ?
+         AND job_run_id = ?
+         AND role = ?
+       ORDER BY created_at ASC`
+    )
+    .bind(userId, normalizedJobRunId, role)
+    .all();
+  return Array.isArray(results) ? (results as SharedJobSegmentRow[]) : [];
+}
+
+async function getSharedJobSegmentByIdForUser(
+  db: D1Database,
+  userId: string,
+  segmentId: string,
+  role?: "operator" | "owner"
+): Promise<SharedJobSegmentRow | null> {
+  const normalizedSegmentId = normalizeText(segmentId);
+  if (!normalizedSegmentId) return null;
+  const row = role
+    ? await db
+        .prepare(
+          `SELECT *
+           FROM shared_job_segments
+           WHERE user_id = ?
+             AND segment_id = ?
+             AND role = ?
+           LIMIT 1`
+        )
+        .bind(userId, normalizedSegmentId, role)
+        .first()
+    : await db
+        .prepare(
+          `SELECT *
+           FROM shared_job_segments
+           WHERE user_id = ?
+             AND segment_id = ?
+           LIMIT 1`
+        )
+        .bind(userId, normalizedSegmentId)
+        .first();
+  return (row as SharedJobSegmentRow | null) || null;
+}
+
+async function findSharedOwnerJobSegmentForRelay(
+  db: D1Database,
+  userId: string,
+  input: {
+    operatorPublicId: string;
+    jobRunId: string;
+    segmentId?: string | null;
+  }
+): Promise<SharedJobSegmentRow | null> {
+  const normalizedOperatorPublicId = normalizeText(input.operatorPublicId);
+  const normalizedJobRunId = normalizeText(input.jobRunId);
+  const normalizedSegmentId = normalizeText(input.segmentId);
+  if (!normalizedOperatorPublicId || !normalizedJobRunId) return null;
+  const row = normalizedSegmentId
+    ? await db
+        .prepare(
+          `SELECT *
+           FROM shared_job_segments
+           WHERE role = 'owner'
+             AND user_id = ?
+             AND operator_public_id = ?
+             AND job_run_id = ?
+             AND segment_id = ?
+           LIMIT 1`
+        )
+        .bind(userId, normalizedOperatorPublicId, normalizedJobRunId, normalizedSegmentId)
+        .first()
+    : await db
+        .prepare(
+          `SELECT *
+           FROM shared_job_segments
+           WHERE role = 'owner'
+             AND user_id = ?
+             AND operator_public_id = ?
+             AND job_run_id = ?
+           ORDER BY created_at DESC
+           LIMIT 1`
+        )
+        .bind(userId, normalizedOperatorPublicId, normalizedJobRunId)
+        .first();
+  return (row as SharedJobSegmentRow | null) || null;
+}
+
+async function updateSharedJobSegmentRow(
+  db: D1Database,
+  input: {
+    segmentId: string;
+    status?: string | null;
+    requestId?: string | null;
+    sourceCommandId?: number | null;
+    lastError?: string | null;
+    nowIso?: string;
+  }
+) {
+  const nowIso = normalizeText(input.nowIso) || new Date().toISOString();
+  const nextStatus = normalizeText(input.status);
+  await db.prepare(
+    `UPDATE shared_job_segments
+     SET status = COALESCE(NULLIF(?, ''), status),
+         request_id = COALESCE(NULLIF(?, ''), request_id),
+         source_command_id = COALESCE(?, source_command_id),
+         last_error = COALESCE(NULLIF(?, ''), last_error),
+         started_at = CASE
+           WHEN COALESCE(NULLIF(?, ''), status) = 'running' THEN COALESCE(started_at, ?)
+           ELSE started_at
+         END,
+         completed_at = CASE
+           WHEN COALESCE(NULLIF(?, ''), status) IN ('completed', 'failed', 'stopped', 'cancelled')
+             THEN COALESCE(completed_at, ?)
+           ELSE completed_at
+         END,
+         stopped_at = CASE
+           WHEN COALESCE(NULLIF(?, ''), status) IN ('stopped', 'cancelled')
+             THEN COALESCE(stopped_at, ?)
+           ELSE stopped_at
+         END,
+         updated_at = ?
+     WHERE segment_id = ?`
+  )
+    .bind(
+      nextStatus || null,
+      normalizeText(input.requestId) || null,
+      Number.isInteger(Number(input.sourceCommandId)) && Number(input.sourceCommandId) > 0
+        ? Number(input.sourceCommandId)
+        : null,
+      normalizeText(input.lastError) || null,
+      nextStatus || null,
+      nowIso,
+      nextStatus || null,
+      nowIso,
+      nextStatus || null,
+      nowIso,
+      nowIso,
+      normalizeText(input.segmentId)
+    )
+    .run();
+}
+
+async function ensureSharedFindRelayClientForAppUser(
+  env: Env,
+  appUserId: string
+): Promise<CentralUserRelayContext> {
+  const centralContext = await resolveCurrentUserCentralRelayContextById(env, appUserId);
+  await ensureSharedFindRelayClientConnected({
+    env,
+    publicId: centralContext.publicId,
+    appUserId: centralContext.appUserId,
+    grantToken: centralContext.grantToken,
+    onMessage: async (context, message) => {
+      await handleSharedFindRelayInboundMessage(context, message);
+    },
+  });
+  return centralContext;
+}
+
+async function replaySharedJobEventOnOperator(
+  env: Env,
+  input: {
+    userId: string;
+    clientId: string;
+    cameraId: number | null;
+    eventType: string;
+    message: string;
+    details: Record<string, unknown>;
+    jobRunId?: string | null;
+    stepRunId?: string | null;
+    agentRunId?: string | null;
+    externalEventId?: string | null;
+  }
+) {
+  const replayHeaders = localAgentReplayHeaders();
+  const requestBody = {
+    camera_id: input.cameraId,
+    event_type: input.eventType,
+    message: input.message,
+    details: input.details,
+    job_run_id: normalizeText(input.jobRunId) || undefined,
+    step_run_id: normalizeText(input.stepRunId) || undefined,
+    agent_run_id: normalizeText(input.agentRunId) || undefined,
+    external_event_id: normalizeText(input.externalEventId) || undefined,
+  };
+
+  const response = await app.fetch(
+    new Request(`http://internal/api/agent/events?client_id=${encodeURIComponent(input.clientId)}`, {
+      method: "POST",
+      headers: new Headers({
+        "content-type": "application/json",
+        [replayHeaders.replay]: "1",
+        [replayHeaders.userId]: input.userId,
+        [replayHeaders.clientId]: input.clientId,
+        [replayHeaders.exeId]: "relay",
+        [replayHeaders.queue]: "events",
+      }),
+      body: JSON.stringify(requestBody),
+    }),
+    env,
+    { waitUntil: () => {} } as any
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(
+      errorText || `Shared job relay replay failed with HTTP ${response.status}.`
+    );
+  }
+}
+
+function buildSharedJobExecutionOptions(): JobSharedExecutionOptions {
+  return {
+    dispatchRemoteSegment: async (input) => {
+      try {
+        const centralContext = await ensureSharedFindRelayClientForAppUser(input.env, input.userId);
+        const response = await callCentralIdentityAuthorizedEndpoint(
+          input.env,
+          "/api/find-relay/jobs/start",
+          {
+            method: "POST",
+            token: centralContext.grantToken,
+            body: {
+              operator_job_run_id: input.jobRunId,
+              job_id: input.jobId,
+              trigger_type: input.triggerType,
+              trigger: input.trigger,
+              request_id: generateUUID(),
+              segment_id: input.segment.segment_id,
+              execution_domain: input.segment.execution_domain,
+              owner_public_id: input.segment.owner_public_id,
+              share_ids: input.segment.share_ids,
+              share_id_by_operator_camera_id: input.segment.share_id_by_operator_camera_id,
+              operator_camera_ids: input.segment.operator_camera_ids,
+              owner_camera_ids: input.segment.owner_camera_ids,
+              camera_id_map: input.segment.camera_id_map,
+              allow_event_media: false,
+              federated_cross_camera: input.federatedCrossCamera,
+              payload: input.segment.payload,
+            },
+          }
+        );
+        if (!response.response.ok) {
+          return {
+            ok: false,
+            error:
+              normalizeResponseErrorMessage(
+                response.data,
+                "Failed to dispatch the shared job segment."
+              ) || "Failed to dispatch the shared job segment.",
+            requestId: normalizeText(response.data?.request_id) || null,
+          };
+        }
+        return {
+          ok: true,
+          requestId: normalizeText(response.data?.request_id) || generateUUID(),
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          error:
+            error instanceof Error && error.message
+              ? error.message
+              : "Failed to dispatch the shared job segment.",
+        };
+      }
+    },
+    cancelRemoteSegment: async (input) => {
+      const ownerPublicId = normalizeText(input.segment.owner_public_id);
+      if (!ownerPublicId) return;
+      const centralContext = await ensureSharedFindRelayClientForAppUser(input.env, input.userId);
+      await callCentralIdentityAuthorizedEndpoint(
+        input.env,
+        `/api/find-relay/jobs/${encodeURIComponent(input.jobRunId)}/stop`,
+        {
+          method: "POST",
+          token: centralContext.grantToken,
+          body: {
+            owner_public_id: ownerPublicId,
+            request_id: normalizeText(input.requestId) || null,
+            segment_ids: [input.segment.segment_id],
+            reason: input.reason,
+          },
+        }
+      );
+    },
+    stopRemoteSegments: async (input) => {
+      const latestRunRow = await input.env.DB
+        .prepare(
+          `SELECT job_run_id
+           FROM shared_job_segments
+           WHERE role = 'operator'
+             AND user_id = ?
+             AND job_id = ?
+             AND status NOT IN ('completed', 'failed', 'stopped', 'cancelled')
+           ORDER BY created_at DESC
+           LIMIT 1`
+        )
+        .bind(input.userId, input.jobId)
+        .first();
+      const activeJobRunId = normalizeText((latestRunRow as any)?.job_run_id);
+      const activeSegments = await listSharedJobSegmentsForUserJobRun(
+        input.env.DB,
+        input.userId,
+        activeJobRunId,
+        "operator"
+      );
+      if (activeSegments.length === 0) {
+        return;
+      }
+      const segmentsByOwner = new Map<string, SharedJobSegmentRow[]>();
+      for (const segment of activeSegments) {
+        const executionDomain = normalizeText(segment.execution_domain);
+        if (!executionDomain || executionDomain === "local") {
+          continue;
+        }
+        const ownerPublicId = normalizeText(segment.owner_public_id);
+        if (!ownerPublicId) continue;
+        const bucket = segmentsByOwner.get(ownerPublicId) || [];
+        bucket.push(segment);
+        segmentsByOwner.set(ownerPublicId, bucket);
+      }
+      if (segmentsByOwner.size === 0) return;
+
+      const centralContext = await ensureSharedFindRelayClientForAppUser(input.env, input.userId);
+      for (const [ownerPublicId, segments] of segmentsByOwner.entries()) {
+        const jobRunId = normalizeText(segments[0]?.job_run_id);
+        if (!jobRunId) continue;
+        await callCentralIdentityAuthorizedEndpoint(
+          input.env,
+          `/api/find-relay/jobs/${encodeURIComponent(jobRunId)}/stop`,
+          {
+            method: "POST",
+            token: centralContext.grantToken,
+            body: {
+              owner_public_id: ownerPublicId,
+              segment_ids: segments.map((segment) => segment.segment_id),
+              request_id: generateUUID(),
+              reason: input.reason,
+            },
+          }
+        );
+      }
+    },
+  };
 }
 
 function getSharedFindRelayBackgroundLogState() {
@@ -18842,12 +20129,969 @@ async function relaySharedOwnerRuntimeEvent(
   });
 }
 
+async function handleSharedJobStartRelayMessage(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const operatorPublicId = normalizeText(message.operator_public_id);
+  const operatorJobRunId = normalizeText(message.operator_job_run_id);
+  const requestId = normalizeText(message.request_id) || generateUUID();
+  const segmentId = normalizeText(message.segment_id) || generateUUID();
+  const operatorJobId = clampInteger(message.job_id);
+  const payloadRaw =
+    message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+      ? (message.payload as Record<string, unknown>)
+      : null;
+  if (!operatorPublicId || !operatorJobRunId || !payloadRaw || operatorJobId <= 0) {
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_error",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      segment_id: segmentId,
+      ack_kind: "start",
+      error: "The shared job start payload is missing required fields.",
+    });
+    return;
+  }
+
+  try {
+    const payload = JSON.parse(JSON.stringify(payloadRaw)) as Record<string, unknown>;
+    const ownerJobId = buildSyntheticSharedOwnerJobId(segmentId, operatorJobId);
+    const allowEventMedia = normalizeDbBoolean(message.allow_event_media, false);
+    const federatedCrossCamera = normalizeDbBoolean(message.federated_cross_camera, false);
+    const now = new Date().toISOString();
+    const runtimeExecutionDomain = `shared_operator:${operatorPublicId}`;
+    const sharedExecutionDomain =
+      normalizeText(message.execution_domain) || `shared_owner:${context.publicId}`;
+    const ownerCameraIds = parsePositiveIntegerArrayJson(message.owner_camera_ids);
+    const operatorCameraIds = parsePositiveIntegerArrayJson(message.operator_camera_ids);
+    const cameraIdMap = parseSharedJobCameraIdMap(message.camera_id_map);
+    const payloadJob =
+      payload.job && typeof payload.job === "object" && !Array.isArray(payload.job)
+        ? ({ ...(payload.job as Record<string, unknown>) } as Record<string, unknown>)
+        : {};
+    payloadJob.id = ownerJobId;
+    payload.job = payloadJob;
+    payload.job_run_id = operatorJobRunId;
+    payload.shared_segment_id = segmentId;
+    payload.shared_execution_domain = sharedExecutionDomain;
+    payload.shared_owner_public_id = context.publicId;
+    payload.shared_operator_public_id = operatorPublicId;
+    payload.shared_operator_job_id = operatorJobId;
+    payload.shared_allow_event_media = allowEventMedia;
+    payload.shared_cross_camera_federation_required = federatedCrossCamera;
+
+    await context.env.DB.prepare(
+      `INSERT INTO shared_job_segments (
+         segment_id,
+         role,
+         user_id,
+         job_id,
+         job_run_id,
+         execution_domain,
+         owner_public_id,
+         operator_public_id,
+         current_camera_ids_json,
+         remote_camera_ids_json,
+         camera_id_map_json,
+         status,
+         request_id,
+         trigger_type,
+         trigger_json,
+         cross_camera_federation_required,
+         created_at,
+         updated_at,
+         started_at
+       ) VALUES (?, 'owner', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(segment_id) DO UPDATE SET
+         job_id = excluded.job_id,
+         job_run_id = excluded.job_run_id,
+         execution_domain = excluded.execution_domain,
+         owner_public_id = excluded.owner_public_id,
+         operator_public_id = excluded.operator_public_id,
+         current_camera_ids_json = excluded.current_camera_ids_json,
+         remote_camera_ids_json = excluded.remote_camera_ids_json,
+         camera_id_map_json = excluded.camera_id_map_json,
+         status = 'running',
+         request_id = excluded.request_id,
+         trigger_type = excluded.trigger_type,
+         trigger_json = excluded.trigger_json,
+         cross_camera_federation_required = excluded.cross_camera_federation_required,
+         started_at = COALESCE(shared_job_segments.started_at, excluded.started_at),
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        segmentId,
+        context.appUserId,
+        ownerJobId,
+        operatorJobRunId,
+        runtimeExecutionDomain,
+        context.publicId,
+        operatorPublicId,
+        JSON.stringify(ownerCameraIds),
+        JSON.stringify(operatorCameraIds),
+        JSON.stringify(cameraIdMap),
+        requestId,
+        normalizeText(message.trigger_type) || "manual",
+        JSON.stringify({
+          trigger: parseJsonObject(message.trigger) || {},
+          operator_job_id: operatorJobId,
+          allow_event_media: allowEventMedia,
+          federated_cross_camera: federatedCrossCamera,
+        }),
+        federatedCrossCamera ? 1 : 0,
+        now,
+        now,
+        now
+      )
+      .run();
+
+    const commandResult = await context.env.DB.prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         job_run_id,
+         execution_domain,
+         remote_owner_public_id,
+         shared_segment_id
+       )
+       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        context.appUserId,
+        JSON.stringify(payload),
+        now,
+        now,
+        operatorJobRunId,
+        runtimeExecutionDomain,
+        operatorPublicId,
+        segmentId
+      )
+      .run();
+
+    await updateSharedJobSegmentRow(context.env.DB, {
+      segmentId,
+      status: "running",
+      requestId,
+      sourceCommandId: Number((commandResult as any)?.meta?.last_row_id || 0),
+      nowIso: now,
+    });
+
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_start_ack",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      segment_id: segmentId,
+      accepted: true,
+    });
+  } catch (error) {
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_error",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      segment_id: segmentId,
+      ack_kind: "start",
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "Failed to enqueue the shared job segment on the owner runtime.",
+    });
+  }
+}
+
+async function handleSharedJobStopRelayMessage(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const operatorPublicId = normalizeText(message.operator_public_id);
+  const operatorJobRunId = normalizeText(message.operator_job_run_id);
+  const requestId = normalizeText(message.request_id) || generateUUID();
+  const requestedSegmentIds = Array.from(
+    new Set(
+      (Array.isArray(message.segment_ids) ? message.segment_ids : [])
+        .map((value) => normalizeText(value))
+        .filter(Boolean)
+    )
+  );
+  if (!operatorPublicId || !operatorJobRunId) {
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_error",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      ack_kind: "stop",
+      error: "The shared job stop request is missing operator context.",
+    });
+    return;
+  }
+
+  const rows =
+    requestedSegmentIds.length > 0
+      ? (
+          await Promise.all(
+            requestedSegmentIds.map((segmentId) =>
+              findSharedOwnerJobSegmentForRelay(context.env.DB, context.appUserId, {
+                operatorPublicId,
+                jobRunId: operatorJobRunId,
+                segmentId,
+              })
+            )
+          )
+        ).filter((row): row is SharedJobSegmentRow => !!row)
+      : await listSharedJobSegmentsForUserJobRun(
+          context.env.DB,
+          context.appUserId,
+          operatorJobRunId,
+          "owner"
+        );
+
+  if (rows.length === 0) {
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_error",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      ack_kind: "stop",
+      error: "The shared job segment is no longer active on the owner runtime.",
+    });
+    return;
+  }
+
+  try {
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      if (isTerminalSharedJobSegmentStatus(row.status)) {
+        continue;
+      }
+      await context.env.DB.prepare(
+        `INSERT INTO commands (
+           user_id,
+           camera_id,
+           command_type,
+           payload,
+           status,
+           created_at,
+           updated_at,
+           job_run_id,
+           execution_domain,
+           remote_owner_public_id,
+           shared_segment_id
+         )
+         VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(
+          context.appUserId,
+          JSON.stringify({
+            job: {
+              id: clampInteger(row.job_id),
+              name: "Shared job segment",
+            },
+            requested_at_utc: now,
+            reason: normalizeText(message.reason) || "operator_stop_requested",
+          }),
+          now,
+          now,
+          operatorJobRunId,
+          normalizeText(row.execution_domain) || `shared_operator:${operatorPublicId}`,
+          operatorPublicId,
+          row.segment_id
+        )
+        .run();
+      await updateSharedJobSegmentRow(context.env.DB, {
+        segmentId: row.segment_id,
+        status: "stopping",
+        requestId,
+        nowIso: now,
+      });
+    }
+
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_stop_ack",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      segment_ids: rows.map((row) => row.segment_id),
+      accepted: true,
+    });
+  } catch (error) {
+    sendSharedFindRelayClientMessage(context.publicId, {
+      type: "shared_job_error",
+      operator_public_id: operatorPublicId,
+      operator_job_run_id: operatorJobRunId,
+      request_id: requestId,
+      ack_kind: "stop",
+      error:
+        error instanceof Error && error.message
+          ? error.message
+          : "Failed to stop the shared job segment on the owner runtime.",
+    });
+  }
+}
+
+async function handleSharedJobCrossCameraRelayMessage(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const operatorPublicId =
+    normalizeText(message.shared_operator_public_id) ||
+    normalizeText(message.sender_public_id) ||
+    normalizeText(message.operator_public_id);
+  const operatorJobRunId = normalizeText(message.operator_job_run_id);
+  const segmentId = normalizeText(message.segment_id);
+  const stepId = clampInteger(message.step_id);
+  const publishedCrossCameraHunts = Array.isArray(message.published_cross_camera_hunts)
+    ? message.published_cross_camera_hunts
+    : [];
+  if (!operatorPublicId || !operatorJobRunId || !segmentId || stepId <= 0 || publishedCrossCameraHunts.length === 0) {
+    return;
+  }
+
+  const row = await findSharedOwnerJobSegmentForRelay(context.env.DB, context.appUserId, {
+    operatorPublicId,
+    jobRunId: operatorJobRunId,
+    segmentId,
+  });
+  if (!row || isTerminalSharedJobSegmentStatus(row.status)) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+  await context.env.DB.prepare(
+    `INSERT INTO commands (
+       user_id,
+       camera_id,
+       command_type,
+       payload,
+       status,
+       created_at,
+       updated_at,
+       job_run_id,
+       execution_domain,
+       remote_owner_public_id,
+       shared_segment_id
+     )
+     VALUES (?, NULL, 'job_cross_camera_update', ?, 'pending', ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      context.appUserId,
+      JSON.stringify({
+        job_id: clampInteger(row.job_id),
+        step_id: stepId,
+        shared_segment_id: row.segment_id,
+        published_cross_camera_hunts: publishedCrossCameraHunts,
+      }),
+      now,
+      now,
+      operatorJobRunId,
+      normalizeText(row.execution_domain) || `shared_operator:${operatorPublicId}`,
+      operatorPublicId,
+      row.segment_id
+    )
+    .run();
+}
+
+async function materializeSharedJobRelayEvent(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const operatorJobRunId = normalizeText(message.operator_job_run_id);
+  const senderPublicId = normalizeText(message.sender_public_id);
+  const incomingDetails =
+    message.details && typeof message.details === "object" && !Array.isArray(message.details)
+      ? ({ ...(message.details as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const segmentId =
+    normalizeText(message.segment_id) ||
+    normalizeText(incomingDetails.shared_segment_id ?? incomingDetails.sharedSegmentId) ||
+    extractSharedSegmentIdFromScopedRunId(
+      incomingDetails.step_run_id ?? incomingDetails.stepRunId ?? message.step_run_id
+    ) ||
+    extractSharedSegmentIdFromScopedRunId(
+      incomingDetails.agent_run_id ?? incomingDetails.agentRunId ?? message.agent_run_id
+    ) ||
+    "";
+  const segmentRow =
+    (segmentId
+      ? await getSharedJobSegmentByIdForUser(context.env.DB, context.appUserId, segmentId, "operator")
+      : null) ||
+    (
+      await listSharedJobSegmentsForUserJobRun(
+        context.env.DB,
+        context.appUserId,
+        operatorJobRunId,
+        "operator"
+      )
+    ).find(
+      (row) =>
+        normalizeText(row.owner_public_id) === senderPublicId &&
+        !isTerminalSharedJobSegmentStatus(row.status)
+    ) ||
+    null;
+  if (!segmentRow) {
+    return;
+  }
+
+  const reverseCameraIdMap = buildReverseSharedJobCameraIdMap(
+    parseSharedJobCameraIdMap(segmentRow.camera_id_map_json)
+  );
+  const relayDetails = remapSharedJobCameraIds(
+    incomingDetails,
+    reverseCameraIdMap
+  ) as Record<string, unknown>;
+  const ownerCameraId = clampInteger(
+    message.camera_id ?? relayDetails.camera_id ?? relayDetails.cameraId
+  );
+  const operatorCameraId =
+    ownerCameraId > 0
+      ? clampInteger(reverseCameraIdMap[String(ownerCameraId)] || ownerCameraId)
+      : 0;
+  relayDetails.job_id = clampInteger(segmentRow.job_id);
+  relayDetails.job_run_id = segmentRow.job_run_id;
+  relayDetails.shared_segment_id = segmentRow.segment_id;
+  relayDetails.shared_execution_domain = segmentRow.execution_domain;
+  relayDetails.shared_owner_public_id =
+    normalizeText(segmentRow.owner_public_id) || senderPublicId || null;
+  if (operatorCameraId > 0) {
+    relayDetails.camera_id = operatorCameraId;
+    relayDetails.operator_camera_id = operatorCameraId;
+  }
+  if (!allowsSharedJobRelayEventMedia(relayDetails)) {
+    stripSharedJobEventMedia(relayDetails);
+  }
+
+  await replaySharedJobEventOnOperator(context.env, {
+    userId: context.appUserId,
+    clientId: buildSharedJobReplayClientId(
+      segmentRow.segment_id,
+      normalizeText(segmentRow.owner_public_id) || senderPublicId
+    ),
+    cameraId: operatorCameraId > 0 ? operatorCameraId : null,
+    eventType: normalizeText(message.event_type) || normalizeText(relayDetails.event_type) || "agent_event",
+    message: normalizeText(message.message),
+    details: relayDetails,
+    jobRunId: segmentRow.job_run_id,
+    stepRunId: normalizeText(
+      message.step_run_id ?? relayDetails.step_run_id ?? relayDetails.stepRunId
+    ),
+    agentRunId: normalizeText(
+      message.agent_run_id ?? relayDetails.agent_run_id ?? relayDetails.agentRunId
+    ),
+    externalEventId: normalizeText(
+      message.external_event_id ??
+        relayDetails.external_event_id ??
+        relayDetails.externalEventId
+    ),
+  });
+}
+
+async function handleSharedJobCommandResultRelayMessage(
+  context: SharedFindRelayClientContext,
+  message: Record<string, unknown>
+) {
+  const segmentId = normalizeText(message.segment_id);
+  if (!segmentId) return;
+  const segmentRow = await getSharedJobSegmentByIdForUser(
+    context.env.DB,
+    context.appUserId,
+    segmentId,
+    "operator"
+  );
+  if (!segmentRow) return;
+
+  const now = new Date().toISOString();
+  const commandType = normalizeText(message.command_type);
+  const status = normalizeText(message.status).toLowerCase();
+  const errorText = normalizeText(message.error);
+
+  if (commandType === "job_start" && status === "failed") {
+    await updateSharedJobSegmentRow(context.env.DB, {
+      segmentId,
+      status: "failed",
+      lastError: errorText || "The owner runtime failed to start the shared job segment.",
+      nowIso: now,
+    });
+    await maybeFinalizeSharedJobRunFromSegments(context.env, {
+      userId: context.appUserId,
+      jobRunId: normalizeText(segmentRow.job_run_id),
+      nowIso: now,
+    });
+    return;
+  }
+
+  if (commandType === "job_stop" && status === "completed") {
+    await updateSharedJobSegmentRow(context.env.DB, {
+      segmentId,
+      status: "stopped",
+      nowIso: now,
+    });
+    await maybeFinalizeSharedJobRunFromSegments(context.env, {
+      userId: context.appUserId,
+      jobRunId: normalizeText(segmentRow.job_run_id),
+      nowIso: now,
+    });
+  }
+}
+
+function resolveSharedJobSegmentFromRows(
+  rows: SharedJobSegmentRow[],
+  input: {
+    segmentId?: string | null;
+    cameraId?: number | null;
+  }
+): SharedJobSegmentRow | null {
+  const normalizedSegmentId = normalizeText(input.segmentId);
+  if (normalizedSegmentId) {
+    return rows.find((row) => normalizeText(row.segment_id) === normalizedSegmentId) || null;
+  }
+
+  const cameraId = clampInteger(input.cameraId);
+  if (cameraId > 0) {
+    for (const row of rows) {
+      const cameraIds = parsePositiveIntegerArrayJson(row.current_camera_ids_json);
+      if (cameraIds.includes(cameraId)) {
+        return row;
+      }
+    }
+  }
+
+  if (rows.length === 1) {
+    return rows[0];
+  }
+
+  const localRow = rows.find((row) => normalizeText(row.execution_domain) === "local") || null;
+  return localRow;
+}
+
+async function relaySharedJobEventFromOwner(
+  env: Env,
+  input: {
+    userId: string;
+    eventType: string;
+    cameraId: number | null;
+    message: string;
+    details: Record<string, unknown>;
+    correlationIds: OperationalCorrelationIds;
+  }
+): Promise<boolean> {
+  const jobRunId = normalizeText(input.correlationIds.jobRunId ?? input.details.job_run_id);
+  if (!jobRunId) return false;
+
+  const ownerSegments = await listSharedJobSegmentsForUserJobRun(env.DB, input.userId, jobRunId, "owner");
+  if (ownerSegments.length === 0) return false;
+
+  const segmentId =
+    normalizeText(input.details.shared_segment_id ?? input.details.sharedSegmentId) ||
+    extractSharedSegmentIdFromScopedRunId(
+      input.correlationIds.stepRunId ??
+        input.details.step_run_id ??
+        input.details.stepRunId
+    ) ||
+    extractSharedSegmentIdFromScopedRunId(
+      input.correlationIds.agentRunId ??
+        input.details.agent_run_id ??
+        input.details.agentRunId
+    ) ||
+    "";
+  const segmentRow = resolveSharedJobSegmentFromRows(ownerSegments, {
+    segmentId,
+    cameraId: input.cameraId,
+  });
+  if (!segmentRow || !normalizeText(segmentRow.operator_public_id)) {
+    return false;
+  }
+
+  const centralContext = await ensureSharedFindRelayClientForAppUser(env, input.userId);
+  const relayDetails = JSON.parse(JSON.stringify(input.details || {})) as Record<string, unknown>;
+  relayDetails.shared_segment_id = segmentRow.segment_id;
+  relayDetails.shared_execution_domain = segmentRow.execution_domain;
+  relayDetails.shared_owner_public_id = centralContext.publicId;
+
+  if (!allowsSharedJobRelayEventMedia(relayDetails)) {
+    stripSharedJobEventMedia(relayDetails);
+  }
+
+  const sent = sendSharedFindRelayClientMessage(centralContext.publicId, {
+    type: "shared_job_event",
+    operator_public_id: normalizeText(segmentRow.operator_public_id),
+    operator_job_run_id: segmentRow.job_run_id,
+    request_id: normalizeText(segmentRow.request_id) || null,
+    segment_id: segmentRow.segment_id,
+    event_type: input.eventType,
+    message: input.message,
+    camera_id: input.cameraId,
+    step_run_id: input.correlationIds.stepRunId || null,
+    agent_run_id: input.correlationIds.agentRunId || null,
+    external_event_id: input.correlationIds.externalEventId || null,
+    details: relayDetails,
+  });
+  return sent;
+}
+
+async function maybeFinalizeSharedJobRunFromSegments(
+  env: Env,
+  input: {
+    userId: string;
+    jobRunId: string;
+    nowIso: string;
+  }
+) {
+  const segments = await listSharedJobSegmentsForUserJobRun(
+    env.DB,
+    input.userId,
+    input.jobRunId,
+    "operator"
+  );
+  if (segments.length === 0) return;
+
+  const jobRunRow = await env.DB
+    .prepare(
+      `SELECT job_id, job_name, status
+       FROM job_runs
+       WHERE job_run_id = ?
+       LIMIT 1`
+    )
+    .bind(input.jobRunId)
+    .first();
+  const currentStatus = normalizeText((jobRunRow as any)?.status).toLowerCase();
+  if (["completed", "failed", "stopped"].includes(currentStatus)) {
+    return;
+  }
+
+  const statuses = segments.map((segment) => normalizeSharedJobSegmentStatus(segment.status));
+  const allTerminal = statuses.every((status) => isTerminalSharedJobSegmentStatus(status));
+  const firstFailed = segments.find(
+    (segment) => normalizeSharedJobSegmentStatus(segment.status) === "failed"
+  );
+  let finalEventType = "";
+  let finalMessage = "";
+  if (firstFailed) {
+    finalEventType = "job_failed";
+    finalMessage = normalizeText(firstFailed.last_error) || "A shared job segment failed.";
+  } else if (allTerminal) {
+    const completedCount = statuses.filter((status) => status === "completed").length;
+    if (completedCount === statuses.length) {
+      finalEventType = "job_completed";
+      finalMessage = "Shared job completed successfully.";
+    } else {
+      finalEventType = "job_stopped";
+      finalMessage = "Shared job stopped.";
+    }
+  }
+  if (!finalEventType) return;
+
+  const jobId = clampInteger((jobRunRow as any)?.job_id);
+  const jobName = normalizeText((jobRunRow as any)?.job_name) || "Job";
+  const details = {
+    job_id: jobId > 0 ? jobId : undefined,
+    job_run_id: input.jobRunId,
+    job_name: jobName,
+    shared_execution_domain: "federated",
+    shared_segment_count: segments.length,
+    shared_segment_statuses: segments.map((segment) => ({
+      segment_id: segment.segment_id,
+      execution_domain: segment.execution_domain,
+      owner_public_id: segment.owner_public_id,
+      status: segment.status,
+      last_error: segment.last_error,
+    })),
+  };
+  const correlationIds = extractOperationalCorrelationIds({
+    jobRunId: input.jobRunId,
+    details,
+    fallbackExternalEventId: `sharedjob_${input.jobRunId}_${finalEventType}`,
+  });
+
+  await persistStructuredAgentEvent({
+    db: env.DB,
+    eventDbId: 0,
+    userId: input.userId,
+    eventType: finalEventType,
+    cameraId: null,
+    message:
+      finalEventType === "job_failed"
+        ? `${jobName} failed: ${finalMessage}`
+        : finalEventType === "job_completed"
+          ? `${jobName} completed successfully.`
+          : `${jobName} stopped.`,
+    details,
+    correlationIds,
+    nowIso: input.nowIso,
+  });
+
+  if (jobId > 0) {
+    await env.DB.prepare(
+      `INSERT INTO job_runtime_states (
+         job_id,
+         user_id,
+         job_name,
+         status,
+         last_event_at_utc,
+         created_at,
+         updated_at,
+         completed_at_utc,
+         stopped_at_utc,
+         failed_at_utc
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(job_id) DO UPDATE SET
+         status = excluded.status,
+         last_event_at_utc = excluded.last_event_at_utc,
+         completed_at_utc = COALESCE(excluded.completed_at_utc, job_runtime_states.completed_at_utc),
+         stopped_at_utc = COALESCE(excluded.stopped_at_utc, job_runtime_states.stopped_at_utc),
+         failed_at_utc = COALESCE(excluded.failed_at_utc, job_runtime_states.failed_at_utc),
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        jobId,
+        input.userId,
+        jobName,
+        finalEventType === "job_failed"
+          ? "failed"
+          : finalEventType === "job_completed"
+            ? "completed"
+            : "stopped",
+        input.nowIso,
+        input.nowIso,
+        input.nowIso,
+        finalEventType === "job_completed" ? input.nowIso : null,
+        finalEventType === "job_stopped" ? input.nowIso : null,
+        finalEventType === "job_failed" ? input.nowIso : null
+      )
+      .run();
+  }
+}
+
+async function maybeHandleSharedJobLifecycleEvent(
+  env: Env,
+  input: {
+    userId: string;
+    eventType: string;
+    cameraId: number | null;
+    message: string;
+    details: Record<string, unknown>;
+    correlationIds: OperationalCorrelationIds;
+    nowIso: string;
+  }
+): Promise<boolean> {
+  if (!SHARED_JOB_LIFECYCLE_EVENT_TYPES.has(input.eventType)) {
+    return false;
+  }
+
+  const jobRunId = normalizeText(input.correlationIds.jobRunId ?? input.details.job_run_id);
+  if (!jobRunId) return false;
+  const segments = await listSharedJobSegmentsForUserJobRun(env.DB, input.userId, jobRunId, "operator");
+  if (segments.length === 0) return false;
+
+  const segmentId =
+    normalizeText(input.details.shared_segment_id ?? input.details.sharedSegmentId) ||
+    extractSharedSegmentIdFromScopedRunId(
+      input.correlationIds.stepRunId ?? input.details.step_run_id ?? input.details.stepRunId
+    ) ||
+    extractSharedSegmentIdFromScopedRunId(
+      input.correlationIds.agentRunId ?? input.details.agent_run_id ?? input.details.agentRunId
+    ) ||
+    "";
+  const segmentRow = resolveSharedJobSegmentFromRows(segments, {
+    segmentId,
+    cameraId: input.cameraId,
+  });
+  if (!segmentRow) return false;
+
+  const nextStatus =
+    input.eventType === "job_started"
+      ? "running"
+      : input.eventType === "job_stop_requested"
+        ? "stopping"
+        : input.eventType === "job_completed"
+          ? "completed"
+          : input.eventType === "job_failed"
+            ? "failed"
+            : "stopped";
+
+  await updateSharedJobSegmentRow(env.DB, {
+    segmentId: segmentRow.segment_id,
+    status: nextStatus,
+    requestId: normalizeText(segmentRow.request_id) || null,
+    lastError:
+      nextStatus === "failed"
+        ? normalizeText(
+            input.details.error_message ??
+              input.details.error ??
+              input.message
+          ) || null
+        : null,
+    nowIso: input.nowIso,
+  });
+
+  await maybeFinalizeSharedJobRunFromSegments(env, {
+    userId: input.userId,
+    jobRunId,
+    nowIso: input.nowIso,
+  });
+  return true;
+}
+
+async function fanOutSharedCrossCameraUpdate(
+  env: Env,
+  input: {
+    userId: string;
+    jobRunId: string;
+    originSegmentId: string;
+    stepId: number;
+    publishedCrossCameraHunts: unknown[];
+  }
+) {
+  if (!Array.isArray(input.publishedCrossCameraHunts) || input.publishedCrossCameraHunts.length === 0) {
+    return;
+  }
+  const segments = await listSharedJobSegmentsForUserJobRun(
+    env.DB,
+    input.userId,
+    input.jobRunId,
+    "operator"
+  );
+  const targetSegments = segments.filter(
+    (segment) =>
+      normalizeText(segment.segment_id) !== normalizeText(input.originSegmentId) &&
+      !isTerminalSharedJobSegmentStatus(segment.status)
+  );
+  if (targetSegments.length === 0) {
+    return;
+  }
+
+  const now = new Date().toISOString();
+  let centralContext: CentralUserRelayContext | null = null;
+  for (const segment of targetSegments) {
+    if (normalizeText(segment.execution_domain) === "local") {
+      await env.DB.prepare(
+        `INSERT INTO commands (
+           user_id,
+           camera_id,
+           command_type,
+           payload,
+           status,
+           created_at,
+           updated_at,
+           job_run_id,
+           execution_domain,
+           shared_segment_id
+         )
+         VALUES (?, NULL, 'job_cross_camera_update', ?, 'pending', ?, ?, ?, 'local', ?)`
+      )
+        .bind(
+          input.userId,
+          JSON.stringify({
+            job_id: clampInteger(segment.job_id),
+            step_id: input.stepId,
+            shared_segment_id: segment.segment_id,
+            published_cross_camera_hunts: input.publishedCrossCameraHunts,
+          }),
+          now,
+          now,
+          input.jobRunId,
+          segment.segment_id
+        )
+        .run();
+      continue;
+    }
+
+    const ownerPublicId = normalizeText(segment.owner_public_id);
+    if (!ownerPublicId) continue;
+    if (!centralContext) {
+      centralContext = await ensureSharedFindRelayClientForAppUser(env, input.userId);
+    }
+    sendSharedFindRelayClientMessage(centralContext.publicId, {
+      type: "shared_job_cross_camera_update",
+      operator_public_id: ownerPublicId,
+      shared_operator_public_id: centralContext.publicId,
+      operator_job_run_id: input.jobRunId,
+      segment_id: segment.segment_id,
+      step_id: input.stepId,
+      published_cross_camera_hunts: input.publishedCrossCameraHunts,
+    });
+  }
+}
+
 async function handleSharedFindRelayInboundMessage(
   context: SharedFindRelayClientContext,
   message: Record<string, unknown>
 ) {
   const type = normalizeText(message.type);
   if (!type || type === "relay_ready" || type === "pong") {
+    return;
+  }
+
+  if (type === "shared_job_start") {
+    await handleSharedJobStartRelayMessage(context, message);
+    return;
+  }
+
+  if (type === "shared_job_stop") {
+    await handleSharedJobStopRelayMessage(context, message);
+    return;
+  }
+
+  if (type === "shared_job_cross_camera_update") {
+    await handleSharedJobCrossCameraRelayMessage(context, message);
+    return;
+  }
+
+  if (type === "shared_job_event") {
+    await materializeSharedJobRelayEvent(context, message);
+    return;
+  }
+
+  if (type === "shared_job_command_result") {
+    await handleSharedJobCommandResultRelayMessage(context, message);
+    return;
+  }
+
+  if (type === "shared_job_start_ack" || type === "shared_job_stop_ack") {
+    const segmentId = normalizeText(message.segment_id);
+    if (segmentId) {
+      await updateSharedJobSegmentRow(context.env.DB, {
+        segmentId,
+        status: type === "shared_job_stop_ack" ? "stopping" : "running",
+        requestId: normalizeText(message.request_id) || null,
+        nowIso: new Date().toISOString(),
+      });
+    }
+    return;
+  }
+
+  if (type === "shared_job_error") {
+    const segmentId = normalizeText(message.segment_id);
+    if (segmentId) {
+      await updateSharedJobSegmentRow(context.env.DB, {
+        segmentId,
+        status:
+          normalizeText(message.ack_kind).toLowerCase() === "stop" ? "stopping" : "failed",
+        requestId: normalizeText(message.request_id) || null,
+        lastError:
+          normalizeText(message.error) || "The shared job relay request failed on the owner runtime.",
+        nowIso: new Date().toISOString(),
+      });
+      const segmentRow = await getSharedJobSegmentByIdForUser(
+        context.env.DB,
+        context.appUserId,
+        segmentId,
+        "operator"
+      );
+      if (segmentRow) {
+        await maybeFinalizeSharedJobRunFromSegments(context.env, {
+          userId: context.appUserId,
+          jobRunId: normalizeText(segmentRow.job_run_id),
+          nowIso: new Date().toISOString(),
+        });
+      }
+    }
     return;
   }
 
@@ -20868,7 +23112,12 @@ async function getCameraForUser(
   cameraId: number | string
 ) {
   return db
-    .prepare("SELECT * FROM cameras WHERE id = ? AND user_id = ?")
+    .prepare(
+      `SELECT *
+       FROM cameras
+       WHERE id = ?
+         AND ${buildVisibleCameraWhereClause()}`
+    )
     .bind(cameraId, userId)
     .first();
 }
@@ -20921,6 +23170,9 @@ async function updateCameraForUser(
   const camera = await getCameraForUser(db, userId, cameraId);
   if (!camera) {
     throw new Error("Camera not found");
+  }
+  if (isSharedFindShadowCameraRow(camera)) {
+    throw new Error("Shared cameras are managed by the owner and cannot be edited here.");
   }
 
   const data: any = { ...input };
@@ -21668,6 +23920,306 @@ type CameraImportApplyFailure = {
   reason: string;
 };
 
+type CameraImportGpuJobStatus =
+  | "queued"
+  | "waiting_for_exe"
+  | "probing"
+  | "completed"
+  | "failed";
+
+type CameraImportGpuJobOutcomeStatus =
+  | "enabled_gpu"
+  | "kept_cpu"
+  | "failed";
+
+type CameraImportGpuJobOutcome = {
+  camera_id: number;
+  status: CameraImportGpuJobOutcomeStatus;
+  reason_code: string;
+  reason: string;
+  persisted_mode: CameraCaptureAccelerationMode;
+  restart_enqueued: boolean;
+  restart_error: string | null;
+  processed_at: string;
+};
+
+type CameraImportGpuJobRecord = {
+  id: number;
+  userId: string;
+  importCommandId: number;
+  requestedMode: CameraCaptureAccelerationMode;
+  restartIfRunning: boolean;
+  status: CameraImportGpuJobStatus;
+  cameraIds: number[];
+  totalCount: number;
+  nextIndex: number;
+  processedCount: number;
+  enabledGpuCount: number;
+  keptCpuCount: number;
+  failedCount: number;
+  activeCameraId: number | null;
+  activeProbeCommandId: number | null;
+  activeProbeStartedAt: string | null;
+  outcomes: Record<string, CameraImportGpuJobOutcome>;
+  lastError: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  completedAt: string | null;
+};
+
+const CAMERA_IMPORT_GPU_JOB_DISPATCH_LIMIT = 20;
+const CAMERA_IMPORT_GPU_PROBE_TIMEOUT_MS = 20_000;
+
+function normalizeCameraImportGpuJobStatus(value: unknown): CameraImportGpuJobStatus {
+  const normalized = normalizeText(value).toLowerCase();
+  if (
+    normalized === "queued" ||
+    normalized === "waiting_for_exe" ||
+    normalized === "probing" ||
+    normalized === "completed" ||
+    normalized === "failed"
+  ) {
+    return normalized;
+  }
+  return "queued";
+}
+
+function normalizeCameraImportGpuJobOutcomeStatus(value: unknown): CameraImportGpuJobOutcomeStatus {
+  const normalized = normalizeText(value).toLowerCase();
+  if (normalized === "enabled_gpu" || normalized === "kept_cpu" || normalized === "failed") {
+    return normalized;
+  }
+  return "failed";
+}
+
+function parseCameraImportGpuJobOutcomes(
+  value: unknown
+): Record<string, CameraImportGpuJobOutcome> {
+  const source = parseJsonObject(value);
+  const normalized: Record<string, CameraImportGpuJobOutcome> = {};
+
+  Object.entries(source).forEach(([key, rawValue]) => {
+    if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue)) {
+      return;
+    }
+
+    const outcome = rawValue as Record<string, unknown>;
+    const cameraId = clampInteger(outcome.camera_id ?? key);
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      return;
+    }
+
+    normalized[String(cameraId)] = {
+      camera_id: cameraId,
+      status: normalizeCameraImportGpuJobOutcomeStatus(outcome.status),
+      reason_code: normalizeText(outcome.reason_code) || "unknown",
+      reason: normalizeText(outcome.reason) || "Unknown GPU validation result.",
+      persisted_mode: normalizeCameraCaptureAccelerationMode(
+        outcome.persisted_mode,
+        "cpu"
+      ),
+      restart_enqueued: outcome.restart_enqueued === true || outcome.restart_enqueued === 1,
+      restart_error: normalizeText(outcome.restart_error) || null,
+      processed_at: normalizeText(outcome.processed_at) || new Date().toISOString(),
+    };
+  });
+
+  return normalized;
+}
+
+function hydrateCameraImportGpuJobRow(row: unknown): CameraImportGpuJobRecord | null {
+  if (!row || typeof row !== "object" || Array.isArray(row)) {
+    return null;
+  }
+
+  const source = row as Record<string, unknown>;
+  const id = clampInteger(source.id);
+  const userId = normalizeText(source.user_id);
+  const importCommandId = clampInteger(source.import_command_id);
+  if (!Number.isInteger(id) || id <= 0 || !userId || !Number.isInteger(importCommandId) || importCommandId <= 0) {
+    return null;
+  }
+
+  const cameraIds = normalizePositiveIntegerArray(source.camera_ids_json, 1000);
+  const totalCount = Math.max(clampInteger(source.total_count), cameraIds.length);
+
+  return {
+    id,
+    userId,
+    importCommandId,
+    requestedMode: normalizeCameraCaptureAccelerationMode(source.requested_mode, "nvidia"),
+    restartIfRunning:
+      source.restart_if_running === true ||
+      source.restart_if_running === 1 ||
+      source.restart_if_running === "1" ||
+      normalizeText(source.restart_if_running).toLowerCase() === "true",
+    status: normalizeCameraImportGpuJobStatus(source.status),
+    cameraIds,
+    totalCount,
+    nextIndex: Math.min(cameraIds.length, clampInteger(source.next_index)),
+    processedCount: clampInteger(source.processed_count),
+    enabledGpuCount: clampInteger(source.enabled_gpu_count),
+    keptCpuCount: clampInteger(source.kept_cpu_count),
+    failedCount: clampInteger(source.failed_count),
+    activeCameraId: (() => {
+      const value = clampInteger(source.active_camera_id);
+      return value > 0 ? value : null;
+    })(),
+    activeProbeCommandId: (() => {
+      const value = clampInteger(source.active_probe_command_id);
+      return value > 0 ? value : null;
+    })(),
+    activeProbeStartedAt: normalizeText(source.active_probe_started_at) || null,
+    outcomes: parseCameraImportGpuJobOutcomes(source.outcomes_json),
+    lastError: normalizeText(source.last_error) || null,
+    createdAt: normalizeText(source.created_at) || null,
+    updatedAt: normalizeText(source.updated_at) || null,
+    completedAt: normalizeText(source.completed_at) || null,
+  };
+}
+
+function buildCameraImportGpuBatchMessage(summary: CameraImportGpuBatchSummary): string {
+  const progress = `${summary.processed_count}/${summary.total_count}`;
+
+  if (summary.status === "completed") {
+    const failureTail =
+      summary.failed_count > 0
+        ? ` ${summary.failed_count} camera(s) failed to validate and stayed on CPU.`
+        : "";
+    return `GPU validation finished. ${summary.enabled_gpu_count} camera(s) switched to GPU, ${summary.kept_cpu_count} stayed on CPU.${failureTail}`;
+  }
+
+  if (summary.status === "failed") {
+    return summary.last_error
+      ? `GPU validation stopped: ${summary.last_error}`
+      : "GPU validation stopped due to an internal error.";
+  }
+
+  if (summary.status === "waiting_for_exe") {
+    return `Camera import finished. GPU validation is waiting for a connected desktop runtime on this machine.`;
+  }
+
+  if (summary.status === "probing") {
+    return `GPU validation is running in background (${progress} camera(s) processed).`;
+  }
+
+  return `GPU validation queued for ${summary.total_count} camera(s). It will continue in background on this machine.`;
+}
+
+function buildCameraImportGpuBatchSummary(
+  job: CameraImportGpuJobRecord
+): CameraImportGpuBatchSummary {
+  const summary: CameraImportGpuBatchSummary = {
+    job_id: job.id,
+    status: job.status,
+    requested_mode: job.requestedMode,
+    total_count: job.totalCount,
+    processed_count: Math.min(job.totalCount, job.processedCount),
+    enabled_gpu_count: job.enabledGpuCount,
+    kept_cpu_count: job.keptCpuCount,
+    failed_count: job.failedCount,
+    active_camera_id: job.activeCameraId,
+    waiting_for_exe: job.status === "waiting_for_exe",
+    last_error: job.lastError,
+    message: "",
+  };
+  summary.message = buildCameraImportGpuBatchMessage(summary);
+  return summary;
+}
+
+async function loadCameraImportGpuJobById(
+  db: D1Database,
+  userId: string,
+  jobId: number
+): Promise<CameraImportGpuJobRecord | null> {
+  if (!Number.isInteger(jobId) || jobId <= 0) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM camera_import_gpu_jobs
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`
+    )
+    .bind(jobId, userId)
+    .first();
+
+  return hydrateCameraImportGpuJobRow(row);
+}
+
+async function loadCameraImportGpuJobByImportCommandId(
+  db: D1Database,
+  userId: string,
+  importCommandId: number
+): Promise<CameraImportGpuJobRecord | null> {
+  if (!Number.isInteger(importCommandId) || importCommandId <= 0) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM camera_import_gpu_jobs
+       WHERE user_id = ? AND import_command_id = ?
+       LIMIT 1`
+    )
+    .bind(userId, importCommandId)
+    .first();
+
+  return hydrateCameraImportGpuJobRow(row);
+}
+
+async function syncCameraImportGpuBatchSummaryToCommandResult(
+  db: D1Database,
+  userId: string,
+  importCommandId: number,
+  summary: CameraImportGpuBatchSummary | null
+): Promise<void> {
+  if (!Number.isInteger(importCommandId) || importCommandId <= 0) {
+    return;
+  }
+
+  const command = await db
+    .prepare(
+      `SELECT result
+       FROM commands
+       WHERE id = ? AND user_id = ? AND command_type = 'camera_import_preview'
+       LIMIT 1`
+    )
+    .bind(importCommandId, userId)
+    .first();
+
+  if (!command) {
+    return;
+  }
+
+  const resultObject = parseJsonObject((command as any)?.result);
+  const nextApply =
+    resultObject.apply && typeof resultObject.apply === "object" && !Array.isArray(resultObject.apply)
+      ? { ...(resultObject.apply as Record<string, unknown>) }
+      : {};
+
+  nextApply.gpu_batch = summary;
+
+  await db
+    .prepare(
+      `UPDATE commands
+       SET result = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ? AND command_type = 'camera_import_preview'`
+    )
+    .bind(
+      JSON.stringify({
+        ...resultObject,
+        apply: nextApply,
+      }),
+      importCommandId,
+      userId
+    )
+    .run();
+}
+
 function normalizeChatBatchCameraCount(value: unknown): number {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) {
@@ -22004,6 +24556,563 @@ async function applyNormalizedCameraImportPreviewForUser(
     duplicate_source_indexes: [],
     failed_candidates: failedCandidates,
   };
+}
+
+async function createCameraImportGpuJob(
+  db: D1Database,
+  input: {
+    userId: string;
+    importCommandId: number;
+    cameraIds: number[];
+    requestedMode?: CameraCaptureAccelerationMode;
+    restartIfRunning?: boolean;
+  }
+): Promise<CameraImportGpuBatchSummary | null> {
+  const userId = normalizeText(input.userId);
+  const importCommandId = clampInteger(input.importCommandId);
+  const cameraIds = normalizePositiveIntegerArray(input.cameraIds, 1000);
+  if (!userId || !Number.isInteger(importCommandId) || importCommandId <= 0 || cameraIds.length === 0) {
+    return null;
+  }
+
+  const existing = await loadCameraImportGpuJobByImportCommandId(db, userId, importCommandId);
+  if (existing) {
+    const target = await resolveLatestConnectedExeTarget(db, userId);
+    if (existing.status === "waiting_for_exe" && target) {
+      await db
+        .prepare(
+          `UPDATE camera_import_gpu_jobs
+           SET status = 'queued',
+               last_error = NULL,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND user_id = ?`
+        )
+        .bind(existing.id, userId)
+        .run();
+      const refreshed = await loadCameraImportGpuJobById(db, userId, existing.id);
+      const summary = refreshed ? buildCameraImportGpuBatchSummary(refreshed) : buildCameraImportGpuBatchSummary(existing);
+      await syncCameraImportGpuBatchSummaryToCommandResult(db, userId, importCommandId, summary);
+      return summary;
+    }
+
+    const summary = buildCameraImportGpuBatchSummary(existing);
+    await syncCameraImportGpuBatchSummaryToCommandResult(db, userId, importCommandId, summary);
+    return summary;
+  }
+
+  const connectedTarget = await resolveLatestConnectedExeTarget(db, userId);
+  const initialStatus: CameraImportGpuJobStatus = connectedTarget ? "queued" : "waiting_for_exe";
+  const now = new Date().toISOString();
+  const requestedMode = normalizeCameraCaptureAccelerationMode(input.requestedMode, "nvidia");
+  const restartIfRunning = input.restartIfRunning !== false;
+
+  await db
+    .prepare(
+      `INSERT INTO camera_import_gpu_jobs (
+         user_id,
+         import_command_id,
+         requested_mode,
+         restart_if_running,
+         status,
+         camera_ids_json,
+         total_count,
+         next_index,
+         processed_count,
+         enabled_gpu_count,
+         kept_cpu_count,
+         failed_count,
+         outcomes_json,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?)`
+    )
+    .bind(
+      userId,
+      importCommandId,
+      requestedMode,
+      restartIfRunning ? 1 : 0,
+      initialStatus,
+      JSON.stringify(cameraIds),
+      cameraIds.length,
+      JSON.stringify({}),
+      now,
+      now
+    )
+    .run();
+
+  const createdJob = await loadCameraImportGpuJobByImportCommandId(db, userId, importCommandId);
+  if (!createdJob) {
+    return null;
+  }
+
+  const summary = buildCameraImportGpuBatchSummary(createdJob);
+  await syncCameraImportGpuBatchSummaryToCommandResult(db, userId, importCommandId, summary);
+  return summary;
+}
+
+function sanitizeCameraImportGpuJobRecord(
+  input: CameraImportGpuJobRecord
+): CameraImportGpuJobRecord {
+  const cameraIds = normalizePositiveIntegerArray(input.cameraIds, 1000);
+  const totalCount = cameraIds.length > 0 ? cameraIds.length : clampInteger(input.totalCount);
+  const nextIndex = Math.min(cameraIds.length, clampInteger(input.nextIndex));
+  const processedCount = Math.min(totalCount, clampInteger(input.processedCount));
+
+  return {
+    ...input,
+    cameraIds,
+    totalCount,
+    nextIndex,
+    processedCount,
+    enabledGpuCount: clampInteger(input.enabledGpuCount),
+    keptCpuCount: clampInteger(input.keptCpuCount),
+    failedCount: clampInteger(input.failedCount),
+    activeCameraId:
+      Number.isInteger(input.activeCameraId) && Number(input.activeCameraId) > 0
+        ? Number(input.activeCameraId)
+        : null,
+    activeProbeCommandId:
+      Number.isInteger(input.activeProbeCommandId) && Number(input.activeProbeCommandId) > 0
+        ? Number(input.activeProbeCommandId)
+        : null,
+    activeProbeStartedAt: normalizeText(input.activeProbeStartedAt) || null,
+    lastError: normalizeText(input.lastError) || null,
+    createdAt: normalizeText(input.createdAt) || null,
+    updatedAt: normalizeText(input.updatedAt) || null,
+    completedAt: normalizeText(input.completedAt) || null,
+  };
+}
+
+async function saveCameraImportGpuJobRecord(
+  db: D1Database,
+  input: CameraImportGpuJobRecord
+): Promise<CameraImportGpuJobRecord | null> {
+  const job = sanitizeCameraImportGpuJobRecord(input);
+
+  await db
+    .prepare(
+      `UPDATE camera_import_gpu_jobs
+       SET requested_mode = ?,
+           restart_if_running = ?,
+           status = ?,
+           camera_ids_json = ?,
+           total_count = ?,
+           next_index = ?,
+           processed_count = ?,
+           enabled_gpu_count = ?,
+           kept_cpu_count = ?,
+           failed_count = ?,
+           active_camera_id = ?,
+           active_probe_command_id = ?,
+           active_probe_started_at = ?,
+           outcomes_json = ?,
+           last_error = ?,
+           completed_at = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`
+    )
+    .bind(
+      job.requestedMode,
+      job.restartIfRunning ? 1 : 0,
+      job.status,
+      JSON.stringify(job.cameraIds),
+      job.totalCount,
+      job.nextIndex,
+      job.processedCount,
+      job.enabledGpuCount,
+      job.keptCpuCount,
+      job.failedCount,
+      job.activeCameraId,
+      job.activeProbeCommandId,
+      job.activeProbeStartedAt,
+      JSON.stringify(job.outcomes),
+      job.lastError,
+      job.completedAt,
+      job.id,
+      job.userId
+    )
+    .run();
+
+  const refreshed = await loadCameraImportGpuJobById(db, job.userId, job.id);
+  await syncCameraImportGpuBatchSummaryToCommandResult(
+    db,
+    job.userId,
+    job.importCommandId,
+    refreshed ? buildCameraImportGpuBatchSummary(refreshed) : null
+  );
+  return refreshed;
+}
+
+function createCameraImportGpuJobOutcome(
+  input: {
+    cameraId: number;
+    status: CameraImportGpuJobOutcomeStatus;
+    reasonCode: string;
+    reason: string;
+    persistedMode?: CameraCaptureAccelerationMode;
+    restartEnqueued?: boolean;
+    restartError?: string | null;
+  }
+): CameraImportGpuJobOutcome {
+  return {
+    camera_id: input.cameraId,
+    status: input.status,
+    reason_code: normalizeText(input.reasonCode) || "unknown",
+    reason: normalizeText(input.reason) || "GPU validation result unavailable.",
+    persisted_mode: normalizeCameraCaptureAccelerationMode(input.persistedMode, "cpu"),
+    restart_enqueued: input.restartEnqueued === true,
+    restart_error: normalizeText(input.restartError) || null,
+    processed_at: new Date().toISOString(),
+  };
+}
+
+function classifyImmediateCameraImportGpuProbeFailure(
+  probe: {
+    status: "supported" | "unsupported" | "unavailable";
+    reasonCode: string;
+    reason: string;
+  }
+): CameraImportGpuJobOutcomeStatus | "waiting_for_exe" {
+  if (probe.reasonCode === "no_connected_exe") {
+    return "waiting_for_exe";
+  }
+  if (
+    probe.reasonCode === "camera_not_found" ||
+    probe.reasonCode === "invalid_camera_id" ||
+    probe.reasonCode === "command_enqueue_failed"
+  ) {
+    return "failed";
+  }
+  return "kept_cpu";
+}
+
+function classifyTerminalCameraImportGpuProbeResult(result: {
+  status: "supported" | "unsupported" | "unavailable";
+  reasonCode: string;
+  reason: string;
+}): CameraImportGpuJobOutcomeStatus {
+  if (result.status === "supported") {
+    return "enabled_gpu";
+  }
+  if (result.reasonCode === "probe_failed" || result.reasonCode === "probe_timed_out") {
+    return "failed";
+  }
+  return "kept_cpu";
+}
+
+async function dispatchSingleCameraImportGpuJob(
+  env: Env,
+  input: CameraImportGpuJobRecord
+): Promise<void> {
+  let job = sanitizeCameraImportGpuJobRecord(input);
+
+  const persistJob = async () => {
+    const refreshed = await saveCameraImportGpuJobRecord(env.DB, job);
+    if (refreshed) {
+      job = refreshed;
+    }
+  };
+
+  const persistOutcome = async (outcome: CameraImportGpuJobOutcome) => {
+    job.outcomes = {
+      ...job.outcomes,
+      [String(outcome.camera_id)]: outcome,
+    };
+    if (outcome.status === "enabled_gpu") {
+      job.enabledGpuCount += 1;
+    } else if (outcome.status === "kept_cpu") {
+      job.keptCpuCount += 1;
+    } else {
+      job.failedCount += 1;
+    }
+    job.processedCount = Math.min(job.totalCount, job.processedCount + 1);
+    job.nextIndex = Math.min(job.cameraIds.length, job.nextIndex + 1);
+    job.activeCameraId = null;
+    job.activeProbeCommandId = null;
+    job.activeProbeStartedAt = null;
+    job.lastError = null;
+    if (job.nextIndex >= job.cameraIds.length || job.processedCount >= job.totalCount) {
+      job.status = "completed";
+      job.completedAt = new Date().toISOString();
+    } else {
+      job.status = "queued";
+      job.completedAt = null;
+    }
+    await persistJob();
+  };
+
+  if (job.status === "completed" || job.status === "failed") {
+    return;
+  }
+
+  if (job.nextIndex >= job.cameraIds.length || job.processedCount >= job.totalCount) {
+    job.status = "completed";
+    job.completedAt = new Date().toISOString();
+    job.activeCameraId = null;
+    job.activeProbeCommandId = null;
+    job.activeProbeStartedAt = null;
+    job.lastError = null;
+    await persistJob();
+    return;
+  }
+
+  if (job.status === "waiting_for_exe") {
+    const target = await resolveLatestConnectedExeTarget(env.DB, job.userId);
+    if (!target) {
+      return;
+    }
+    job.status = "queued";
+    job.lastError = null;
+    job.completedAt = null;
+    await persistJob();
+  }
+
+  if (job.status === "probing") {
+    if (!job.activeProbeCommandId || !job.activeCameraId) {
+      job.status = "queued";
+      job.activeCameraId = null;
+      job.activeProbeCommandId = null;
+      job.activeProbeStartedAt = null;
+      await persistJob();
+      return;
+    }
+
+    const commandRow = await env.DB
+      .prepare(
+        `SELECT status, result
+         FROM commands
+         WHERE id = ? AND user_id = ?
+         LIMIT 1`
+      )
+      .bind(job.activeProbeCommandId, job.userId)
+      .first();
+
+    if (!commandRow) {
+      await persistOutcome(
+        createCameraImportGpuJobOutcome({
+          cameraId: job.activeCameraId,
+          status: "failed",
+          reasonCode: "probe_command_missing",
+          reason: "The GPU probe command was not found.",
+        })
+      );
+      return;
+    }
+
+    const commandStatus = normalizeText((commandRow as any)?.status).toLowerCase();
+    if (commandStatus === "pending" || commandStatus === "sent") {
+      const startedAtMs = job.activeProbeStartedAt ? Date.parse(job.activeProbeStartedAt) : NaN;
+      const timedOut =
+        Number.isFinite(startedAtMs) &&
+        Date.now() - startedAtMs >= CAMERA_IMPORT_GPU_PROBE_TIMEOUT_MS;
+
+      if (!timedOut) {
+        return;
+      }
+
+      const timeoutAt = new Date().toISOString();
+      await env.DB
+        .prepare(
+          `UPDATE commands
+           SET status = 'failed', result = ?, updated_at = ?
+           WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
+        )
+        .bind(
+          JSON.stringify({
+            status: "failed",
+            result: {
+              status: "unavailable",
+              reason_code: "probe_timed_out",
+              reason: "GPU probe timed out.",
+            },
+            error: "camera capture acceleration probe timed out",
+            reported_at: timeoutAt,
+          }),
+          timeoutAt,
+          job.activeProbeCommandId,
+          job.userId
+        )
+        .run();
+
+      await persistOutcome(
+        createCameraImportGpuJobOutcome({
+          cameraId: job.activeCameraId,
+          status: "failed",
+          reasonCode: "probe_timed_out",
+          reason: "GPU probe timed out.",
+        })
+      );
+      return;
+    }
+
+    if (commandStatus !== "completed" && commandStatus !== "failed") {
+      await persistOutcome(
+        createCameraImportGpuJobOutcome({
+          cameraId: job.activeCameraId,
+          status: "failed",
+          reasonCode: "probe_unknown_status",
+          reason: `GPU probe ended in unexpected status "${commandStatus || "unknown"}".`,
+        })
+      );
+      return;
+    }
+
+    const normalizedProbeResult = normalizeCameraCaptureAccelerationProbeCommandResult({
+      status: commandStatus === "completed" ? "completed" : "failed",
+      envelope: parseJsonObject((commandRow as any)?.result),
+    });
+
+    if (normalizedProbeResult.status === "supported") {
+      try {
+        const persisted = await persistCameraCaptureAccelerationModeForUser(
+          env,
+          job.userId,
+          job.activeCameraId,
+          job.requestedMode,
+          job.restartIfRunning
+        );
+        await persistOutcome(
+          createCameraImportGpuJobOutcome({
+            cameraId: job.activeCameraId,
+            status: "enabled_gpu",
+            reasonCode: normalizedProbeResult.reasonCode,
+            reason: normalizedProbeResult.reason,
+            persistedMode: persisted.persistedMode,
+            restartEnqueued: persisted.restartEnqueued,
+            restartError: persisted.restartError,
+          })
+        );
+      } catch (error) {
+        await persistOutcome(
+          createCameraImportGpuJobOutcome({
+            cameraId: job.activeCameraId,
+            status: "failed",
+            reasonCode: "persist_failed",
+            reason:
+              error instanceof Error && error.message.trim()
+                ? error.message
+                : "Failed to save the GPU preference for this camera.",
+          })
+        );
+      }
+      return;
+    }
+
+    await persistOutcome(
+      createCameraImportGpuJobOutcome({
+        cameraId: job.activeCameraId,
+        status: classifyTerminalCameraImportGpuProbeResult(normalizedProbeResult),
+        reasonCode: normalizedProbeResult.reasonCode,
+        reason: normalizedProbeResult.reason,
+      })
+    );
+    return;
+  }
+
+  const cameraId = job.cameraIds[job.nextIndex];
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    job.status = "completed";
+    job.completedAt = new Date().toISOString();
+    job.activeCameraId = null;
+    job.activeProbeCommandId = null;
+    job.activeProbeStartedAt = null;
+    job.lastError = null;
+    await persistJob();
+    return;
+  }
+
+  const target = await resolveCameraCommandTarget(env.DB, job.userId, cameraId);
+  if (!target) {
+    job.status = "waiting_for_exe";
+    job.activeCameraId = null;
+    job.activeProbeCommandId = null;
+    job.activeProbeStartedAt = null;
+    job.lastError = null;
+    job.completedAt = null;
+    await persistJob();
+    return;
+  }
+
+  const probeRequest = await enqueueCameraCaptureAccelerationProbeCommandRequest(
+    env,
+    job.userId,
+    cameraId,
+    target,
+    job.requestedMode
+  );
+
+  if (!probeRequest.commandId) {
+    const classification = classifyImmediateCameraImportGpuProbeFailure(probeRequest);
+    if (classification === "waiting_for_exe") {
+      job.status = "waiting_for_exe";
+      job.activeCameraId = null;
+      job.activeProbeCommandId = null;
+      job.activeProbeStartedAt = null;
+      job.lastError = null;
+      job.completedAt = null;
+      await persistJob();
+      return;
+    }
+
+    await persistOutcome(
+      createCameraImportGpuJobOutcome({
+        cameraId,
+        status: classification,
+        reasonCode: probeRequest.reasonCode,
+        reason: probeRequest.reason,
+      })
+    );
+    return;
+  }
+
+  job.status = "probing";
+  job.activeCameraId = cameraId;
+  job.activeProbeCommandId = probeRequest.commandId;
+  job.activeProbeStartedAt = new Date().toISOString();
+  job.lastError = null;
+  job.completedAt = null;
+  await persistJob();
+}
+
+async function dispatchQueuedCameraImportGpuJobs(env: Env): Promise<void> {
+  await ensureRuntimeSchema(env);
+
+  const { results } = await env.DB
+    .prepare(
+      `SELECT *
+       FROM camera_import_gpu_jobs
+       WHERE status IN ('queued', 'waiting_for_exe', 'probing')
+       ORDER BY updated_at ASC
+       LIMIT ?`
+    )
+    .bind(CAMERA_IMPORT_GPU_JOB_DISPATCH_LIMIT)
+    .all();
+
+  for (const row of results || []) {
+    const job = hydrateCameraImportGpuJobRow(row);
+    if (!job) {
+      continue;
+    }
+
+    try {
+      await dispatchSingleCameraImportGpuJob(env, job);
+    } catch (error) {
+      const failedJob: CameraImportGpuJobRecord = {
+        ...job,
+        status: "failed",
+        activeCameraId: null,
+        activeProbeCommandId: null,
+        activeProbeStartedAt: null,
+        completedAt: new Date().toISOString(),
+        lastError:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "GPU batch validation failed.",
+      };
+      await saveCameraImportGpuJobRecord(env.DB, failedJob);
+    }
+  }
 }
 
 // Helper to clear local session
@@ -23930,6 +27039,23 @@ async function resolveAgentPairingForClient(
   };
 }
 
+function resolveLocalAgentReplayPairingForRequest(
+  requestHeaders: Headers,
+  clientId: string
+): { userId: string; clientId: string; exeId: string } | null {
+  const replayContext = readLocalAgentReplayContext(requestHeaders);
+  if (!replayContext) return null;
+  if (replayContext.clientId !== clientId) return null;
+  return replayContext;
+}
+
+function shouldQueueLocalAgentIngress(env: Env, requestHeaders: Headers): boolean {
+  if (!isLocalAgentIngressQueueEnabled(env)) {
+    return false;
+  }
+  return !readLocalAgentReplayContext(requestHeaders);
+}
+
 function readAgentActivityText(...values: unknown[]): string {
   for (const value of values) {
     if (typeof value !== "string") continue;
@@ -25643,6 +28769,10 @@ app.post("/api/find-shares", async (c) => {
     .json<{
       invitee_public_id?: string;
       query?: string;
+      origin_brand_id?: string;
+      permission_profile?: string;
+      access_config_json?: string | Record<string, unknown>;
+      access_config?: Record<string, unknown>;
       owner_local_camera_id?: number;
       camera_name?: string;
       city?: string;
@@ -25665,9 +28795,21 @@ app.post("/api/find-shares", async (c) => {
   }
 
   try {
+    const normalizedPermissionProfile = normalizeSharedCameraPermissionProfile(
+      body.permission_profile,
+      "shared_job_execution"
+    );
     const share = await createOrUpdateCentralCameraFindShare(c.env.DB, {
       ownerPublicId: verified.claims.public_id,
       inviteePublicId: resolvedInvitee.public_id,
+      originBrandId: normalizeText(body.origin_brand_id),
+      permissionProfile: normalizedPermissionProfile,
+      accessConfig: normalizeSharedCameraAccessConfiguration(
+        body.access_config && typeof body.access_config === "object"
+          ? body.access_config
+          : body.access_config_json,
+        normalizedPermissionProfile
+      ),
       ownerLocalCameraId: clampInteger(body.owner_local_camera_id),
       cameraName: normalizeText(body.camera_name),
       city: normalizeOptionalText(body.city),
@@ -26460,6 +29602,426 @@ app.post("/api/find-relay/searches/:operatorSearchId/cancel", async (c) => {
   });
 });
 
+app.post("/api/find-relay/jobs/start", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const body =
+    (await c.req
+      .json<{
+        request_id?: string;
+        operator_job_run_id?: string;
+        job_id?: number;
+        trigger_type?: string;
+        trigger?: Record<string, unknown>;
+        segment_id?: string;
+        execution_domain?: string;
+        owner_public_id?: string;
+        share_ids?: number[];
+        share_id_by_operator_camera_id?: Record<string, number>;
+        operator_camera_ids?: number[];
+        owner_camera_ids?: number[];
+        camera_id_map?: Record<string, number>;
+        payload?: Record<string, unknown>;
+        allow_event_media?: boolean;
+        federated_cross_camera?: boolean;
+      }>()
+      .catch(() => null)) || null;
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const requestId = normalizeText(body.request_id) || generateUUID();
+  const operatorJobRunId = normalizeText(body.operator_job_run_id);
+  const segmentId = normalizeText(body.segment_id);
+  const ownerPublicId = normalizeText(body.owner_public_id);
+  const shareIds = Array.from(
+    new Set(
+      (Array.isArray(body.share_ids) ? body.share_ids : [])
+        .map((value) => clampInteger(value))
+        .filter((value) => value > 0)
+    )
+  );
+  const payload =
+    body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+      ? body.payload
+      : null;
+  if (!operatorJobRunId || !segmentId || !ownerPublicId || shareIds.length === 0 || !payload) {
+    return c.json(
+      {
+        error:
+          "operator_job_run_id, segment_id, owner_public_id, share_ids and payload are required.",
+      },
+      400
+    );
+  }
+
+  const validatedOwnerCameraIds = new Set<number>();
+  for (const shareId of shareIds) {
+    const share = await getCentralCameraFindShareById(c.env.DB, shareId);
+    if (!share) {
+      return c.json({ error: `Shared camera #${shareId} was not found.` }, 404);
+    }
+    if (share.invitee_public_id !== verified.claims.public_id || share.status !== "accepted") {
+      return c.json({ error: `Shared camera #${shareId} is not available for this account.` }, 403);
+    }
+    if (share.owner_public_id !== ownerPublicId) {
+      return c.json({ error: "Each shared job dispatch must target a single owner runtime." }, 400);
+    }
+    const permissionProfile = normalizeSharedCameraPermissionProfile(
+      share.permission_profile,
+      "shared_job_execution"
+    );
+    if (
+      !canExecuteSharedCamera(
+        permissionProfile,
+        normalizeSharedCameraAccessConfiguration(
+          share.access_config_json,
+          permissionProfile
+        )
+      )
+    ) {
+      return c.json(
+        { error: `Shared camera #${shareId} does not allow task execution.` },
+        403
+      );
+    }
+    validatedOwnerCameraIds.add(share.owner_local_camera_id);
+  }
+
+  const ownerCameraIds = Array.from(
+    new Set(
+      (Array.isArray(body.owner_camera_ids) ? body.owner_camera_ids : [])
+        .map((value) => clampInteger(value))
+        .filter((value) => value > 0)
+    )
+  );
+  if (
+    ownerCameraIds.length > 0 &&
+    ownerCameraIds.some((cameraId) => !validatedOwnerCameraIds.has(cameraId))
+  ) {
+    return c.json(
+      { error: "The shared job segment references owner cameras outside the accepted shares." },
+      403
+    );
+  }
+
+  if (countSharedFindRelayConnections(ownerPublicId) <= 0) {
+    return c.json({ error: "The owner runtime is offline for this shared job segment." }, 409);
+  }
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO shared_job_dispatches (
+       request_id,
+       operator_public_id,
+       owner_public_id,
+       operator_job_run_id,
+       segment_id,
+       job_id,
+       trigger_type,
+       trigger_json,
+       status,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)
+     ON CONFLICT(request_id) DO UPDATE SET
+       operator_public_id = excluded.operator_public_id,
+       owner_public_id = excluded.owner_public_id,
+       operator_job_run_id = excluded.operator_job_run_id,
+       segment_id = excluded.segment_id,
+       job_id = excluded.job_id,
+       trigger_type = excluded.trigger_type,
+       trigger_json = excluded.trigger_json,
+       status = 'dispatching',
+       last_error = NULL,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      requestId,
+      verified.claims.public_id,
+      ownerPublicId,
+      operatorJobRunId,
+      segmentId,
+      clampInteger(body.job_id) || null,
+      normalizeText(body.trigger_type) || "manual",
+      JSON.stringify(parseJsonObject(body.trigger) || {}),
+      now,
+      now
+    )
+    .run();
+
+  const ackPromise = waitForSharedJobRelayAck({
+    ownerPublicId,
+    operatorPublicId: verified.claims.public_id,
+    operatorJobRunId,
+    requestId,
+    action: "start",
+  });
+  const forwarded = sendSharedFindRelayMessage(ownerPublicId, {
+    type: "shared_job_start",
+    request_id: requestId,
+    operator_public_id: verified.claims.public_id,
+    operator_job_run_id: operatorJobRunId,
+    job_id: clampInteger(body.job_id) || null,
+    trigger_type: normalizeText(body.trigger_type) || "manual",
+    trigger: parseJsonObject(body.trigger) || {},
+    segment_id: segmentId,
+    execution_domain: normalizeText(body.execution_domain) || `shared_owner:${ownerPublicId}`,
+    owner_public_id: ownerPublicId,
+    share_ids: shareIds,
+    share_id_by_operator_camera_id:
+      parseJsonObject(body.share_id_by_operator_camera_id) || {},
+    operator_camera_ids: Array.isArray(body.operator_camera_ids) ? body.operator_camera_ids : [],
+    owner_camera_ids: ownerCameraIds,
+    camera_id_map: parseJsonObject(body.camera_id_map) || {},
+    allow_event_media: normalizeDbBoolean(body.allow_event_media, false),
+    federated_cross_camera: normalizeDbBoolean(body.federated_cross_camera, false),
+    payload,
+  });
+
+  if (forwarded <= 0) {
+    cancelSharedJobRelayAckWait({
+      ownerPublicId,
+      operatorPublicId: verified.claims.public_id,
+      operatorJobRunId,
+      requestId,
+      action: "start",
+    });
+    await c.env.DB.prepare(
+      `UPDATE shared_job_dispatches
+       SET status = 'failed',
+           last_error = ?,
+           updated_at = ?
+       WHERE request_id = ?`
+    )
+      .bind(
+        "Failed to forward the shared job segment to the owner runtime.",
+        now,
+        requestId
+      )
+      .run();
+    return c.json(
+      { error: "Failed to forward the shared job segment to the owner runtime." },
+      409
+    );
+  }
+
+  const ackResult = await ackPromise;
+  if (!ackResult.ok) {
+    await c.env.DB.prepare(
+      `UPDATE shared_job_dispatches
+       SET status = 'failed',
+           last_error = ?,
+           updated_at = ?
+       WHERE request_id = ?`
+    )
+      .bind(
+        normalizeText(ackResult.error) || "The owner runtime did not acknowledge the shared job dispatch.",
+        new Date().toISOString(),
+        requestId
+      )
+      .run();
+    return c.json(
+      {
+        error:
+          ackResult.error ||
+          "The owner runtime did not acknowledge the shared job dispatch.",
+        request_id: requestId,
+      },
+      409
+    );
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE shared_job_dispatches
+     SET status = 'running',
+         acknowledged_at = ?,
+         updated_at = ?
+     WHERE request_id = ?`
+  )
+    .bind(new Date().toISOString(), new Date().toISOString(), requestId)
+    .run();
+
+  return c.json({
+    success: true,
+    request_id: requestId,
+    owner_public_id: ownerPublicId,
+    operator_job_run_id: operatorJobRunId,
+    forwarded,
+  });
+});
+
+app.post("/api/find-relay/jobs/:operatorJobRunId/stop", async (c) => {
+  await ensureCentralIdentitySchema(c.env.DB);
+  const verified = await requireVerifiedCentralGrantUser(c);
+  if ("error" in verified) return verified.error;
+
+  const operatorJobRunId = normalizeText(c.req.param("operatorJobRunId"));
+  if (!operatorJobRunId) {
+    return c.json({ error: "Invalid operator job run id." }, 400);
+  }
+
+  const body =
+    (await c.req
+      .json<{
+        owner_public_id?: string;
+        request_id?: string;
+        segment_ids?: string[];
+        reason?: string;
+      }>()
+      .catch(() => null)) || null;
+  if (!body) {
+    return c.json({ error: "Invalid request body" }, 400);
+  }
+
+  const ownerPublicId = normalizeText(body.owner_public_id);
+  const requestId = normalizeText(body.request_id) || generateUUID();
+  const segmentIds = Array.from(
+    new Set(
+      (Array.isArray(body.segment_ids) ? body.segment_ids : [])
+        .map((value) => normalizeText(value))
+        .filter(Boolean)
+    )
+  );
+  if (!ownerPublicId || segmentIds.length === 0) {
+    return c.json({ error: "owner_public_id and segment_ids are required." }, 400);
+  }
+
+  if (countSharedFindRelayConnections(ownerPublicId) <= 0) {
+    return c.json({ error: "The owner runtime is offline for this shared job stop request." }, 409);
+  }
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO shared_job_dispatches (
+       request_id,
+       operator_public_id,
+       owner_public_id,
+       operator_job_run_id,
+       segment_id,
+       job_id,
+       trigger_type,
+       trigger_json,
+       status,
+       created_at,
+       updated_at
+     ) VALUES (?, ?, ?, ?, ?, NULL, 'stop', ?, 'stopping', ?, ?)
+     ON CONFLICT(request_id) DO UPDATE SET
+       operator_public_id = excluded.operator_public_id,
+       owner_public_id = excluded.owner_public_id,
+       operator_job_run_id = excluded.operator_job_run_id,
+       segment_id = excluded.segment_id,
+       trigger_type = 'stop',
+       trigger_json = excluded.trigger_json,
+       status = 'stopping',
+       last_error = NULL,
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      requestId,
+      verified.claims.public_id,
+      ownerPublicId,
+      operatorJobRunId,
+      segmentIds.join(","),
+      JSON.stringify({
+        segment_ids: segmentIds,
+        reason: normalizeText(body.reason) || "operator_stop_requested",
+      }),
+      now,
+      now
+    )
+    .run();
+
+  const ackPromise = waitForSharedJobRelayAck({
+    ownerPublicId,
+    operatorPublicId: verified.claims.public_id,
+    operatorJobRunId,
+    requestId,
+    action: "stop",
+  });
+  const forwarded = sendSharedFindRelayMessage(ownerPublicId, {
+    type: "shared_job_stop",
+    request_id: requestId,
+    operator_public_id: verified.claims.public_id,
+    operator_job_run_id: operatorJobRunId,
+    segment_ids: segmentIds,
+    reason: normalizeText(body.reason) || "operator_stop_requested",
+  });
+
+  if (forwarded <= 0) {
+    cancelSharedJobRelayAckWait({
+      ownerPublicId,
+      operatorPublicId: verified.claims.public_id,
+      operatorJobRunId,
+      requestId,
+      action: "stop",
+    });
+    await c.env.DB.prepare(
+      `UPDATE shared_job_dispatches
+       SET status = 'failed',
+           last_error = ?,
+           updated_at = ?
+       WHERE request_id = ?`
+    )
+      .bind(
+        "Failed to forward the shared job stop request to the owner runtime.",
+        now,
+        requestId
+      )
+      .run();
+    return c.json(
+      { error: "Failed to forward the shared job stop request to the owner runtime." },
+      409
+    );
+  }
+
+  const ackResult = await ackPromise;
+  if (!ackResult.ok) {
+    await c.env.DB.prepare(
+      `UPDATE shared_job_dispatches
+       SET status = 'failed',
+           last_error = ?,
+           updated_at = ?
+       WHERE request_id = ?`
+    )
+      .bind(
+        normalizeText(ackResult.error) || "The owner runtime did not acknowledge the shared job stop request.",
+        new Date().toISOString(),
+        requestId
+      )
+      .run();
+    return c.json(
+      {
+        error:
+          ackResult.error ||
+          "The owner runtime did not acknowledge the shared job stop request.",
+        request_id: requestId,
+      },
+      409
+    );
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE shared_job_dispatches
+     SET status = 'stopping',
+         acknowledged_at = ?,
+         updated_at = ?
+     WHERE request_id = ?`
+  )
+    .bind(new Date().toISOString(), new Date().toISOString(), requestId)
+    .run();
+
+  return c.json({
+    success: true,
+    request_id: requestId,
+    owner_public_id: ownerPublicId,
+    operator_job_run_id: operatorJobRunId,
+    forwarded,
+  });
+});
+
 app.post("/api/shared-find/users/resolve", anyAuthMiddleware, async (c) => {
   const user = c.get("user")!;
   const body = await c.req
@@ -26546,6 +30108,8 @@ async function createSharedFindInvitationForOwnedCamera(
   body: {
     query?: unknown;
     invitee_public_id?: unknown;
+    permission_profile?: unknown;
+    access_config?: Record<string, unknown> | null;
   }
 ) {
   if (!isCentralIdentityClientConfigured(env)) {
@@ -26572,6 +30136,17 @@ async function createSharedFindInvitationForOwnedCamera(
     body: {
       query: body.query,
       invitee_public_id: normalizeText(body.invitee_public_id),
+      origin_brand_id: brand.id,
+      permission_profile: normalizeSharedCameraPermissionProfile(
+        body.permission_profile,
+        "shared_job_execution"
+      ),
+      access_config:
+        (body.access_config && typeof body.access_config === "object"
+          ? body.access_config
+          : buildSharedCameraAccessPayload(
+              buildDefaultSharedCameraAccessConfiguration("shared_job_execution")
+            )) || {},
       owner_local_camera_id: cameraId,
       camera_name: normalizeText(cameraRow.name),
       city: normalizeOptionalText(cameraRow.city),
@@ -30865,10 +34440,20 @@ const buildCoreModelChatContentionWarning = (
 app.get("/api/dashboard", anyAuthMiddleware, async (c) => {
   await ensureSchema(c.env.DB);
   const user = c.get("user")!;
+  if (brand.features.drakonFindEnabled && isCentralIdentityClientConfigured(c.env)) {
+    try {
+      await syncSharedFindCameraCacheForUser(c.env, user);
+    } catch (error) {
+      console.warn("[SHARED FIND] dashboard sync failed", { userId: user.id, error });
+    }
+  }
 
   // Fetch cameras
   const { results: cameras } = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE user_id = ? ORDER BY created_at DESC"
+    `SELECT *
+     FROM cameras
+     WHERE ${buildVisibleCameraWhereClause()}
+     ORDER BY created_at DESC`
   )
     .bind(user.id)
     .all();
@@ -32157,7 +35742,7 @@ app.get("/api/open-monitor", anyAuthMiddleware, async (c) => {
         ? "warning"
         : "healthy";
 
-    return c.json({
+    const payload = {
       summary: {
         system_status: systemStatus,
         dominant_bottleneck: bottleneckCandidates[0]?.label || "Unknown",
@@ -32189,7 +35774,8 @@ app.get("/api/open-monitor", anyAuthMiddleware, async (c) => {
         thread_rows: threads.length,
         sampled_at: host?.sampled_at || process?.sampled_at || null,
       },
-    });
+    };
+    return await buildConditionalJsonResponse(c, `open-monitor-${user.id}`, payload);
   }
 
   const hostRows = (hostRowsResult.results || []) as any[];
@@ -32340,7 +35926,7 @@ app.get("/api/open-monitor", anyAuthMiddleware, async (c) => {
       ? "warning"
       : "healthy";
 
-  return c.json({
+  const payload = {
     summary: {
       system_status: systemStatus,
       dominant_bottleneck: bottleneckCandidates[0]?.label || "Unknown",
@@ -32370,7 +35956,8 @@ app.get("/api/open-monitor", anyAuthMiddleware, async (c) => {
       sampled_at:
         host?.sampled_at || process?.sampled_at || camerasResponse.find((camera) => camera.sampled_at)?.sampled_at || null,
     },
-  });
+  };
+  return await buildConditionalJsonResponse(c, `open-monitor-${user.id}`, payload);
   } catch (error: any) {
     console.error("[OPEN MONITOR] Failed to build response:", error);
     return c.text("Open monitor failed", 500);
@@ -32459,7 +36046,18 @@ app.get("/api/camera-thumbnails", anyAuthMiddleware, async (c) => {
 });
 
 app.get("/api/agent-camera-directory", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
+  if (brand.features.drakonFindEnabled && isCentralIdentityClientConfigured(c.env)) {
+    try {
+      await syncSharedFindCameraCacheForUser(c.env, user);
+    } catch (error) {
+      console.warn("[SHARED FIND] agent camera directory sync failed", {
+        userId: user.id,
+        error,
+      });
+    }
+  }
   const accountAccess = (c as any).get("accountAccess") as any;
   const canViewCameraDetails =
     accountAccess?.isFullAccess === true ||
@@ -32479,18 +36077,36 @@ app.get("/api/agent-camera-directory", anyAuthMiddleware, async (c) => {
               store_frames,
               retention_days,
               connection_method,
-              capture_acceleration_mode
+              capture_acceleration_mode,
+              origin_type,
+              shared_share_id,
+              shared_owner_public_id,
+              shared_owner_local_camera_id,
+              shared_owner_handle,
+              shared_owner_email,
+              shared_owner_display_label,
+              shared_origin_brand_id,
+              shared_status
        FROM cameras
-       WHERE user_id = ?
+       WHERE ${buildVisibleCameraWhereClause()}
        ORDER BY created_at DESC`
     : `SELECT id,
               name,
               thumbnail_url,
               last_thumbnail_update,
               is_service_running,
-              is_online
+              is_online,
+              origin_type,
+              shared_share_id,
+              shared_owner_public_id,
+              shared_owner_local_camera_id,
+              shared_owner_handle,
+              shared_owner_email,
+              shared_owner_display_label,
+              shared_origin_brand_id,
+              shared_status
        FROM cameras
-       WHERE user_id = ?
+       WHERE ${buildVisibleCameraWhereClause()}
        ORDER BY created_at DESC`;
 
   const { results } = await c.env.DB.prepare(selectSql).bind(user.id).all();
@@ -32538,11 +36154,22 @@ app.get("/api/agent-camera-directory", anyAuthMiddleware, async (c) => {
 
 // Camera endpoints
 app.get("/api/cameras", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
+  if (brand.features.drakonFindEnabled && isCentralIdentityClientConfigured(c.env)) {
+    try {
+      await syncSharedFindCameraCacheForUser(c.env, user);
+    } catch (error) {
+      console.warn("[SHARED FIND] camera list sync failed", { userId: user.id, error });
+    }
+  }
   const grantedCameraIds = await getGrantedResourceIdSetForRequest(c, "camera", "view");
 
   const { results } = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE user_id = ? ORDER BY created_at DESC"
+    `SELECT *
+     FROM cameras
+     WHERE ${buildVisibleCameraWhereClause()}
+     ORDER BY created_at DESC`
   )
     .bind(user.id)
     .all();
@@ -32948,6 +36575,11 @@ app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) =>
       .includes("application/json")
     ? ((await c.req.json().catch(() => null)) as {
         shared_defaults?: CameraImportSharedDefaults;
+        gpu_batch?: {
+          enabled?: boolean;
+          requested_mode?: CameraCaptureAccelerationMode | string;
+          restart_if_running?: boolean;
+        } | null;
       } | null)
     : null;
   const sharedDefaults = normalizeCameraImportSharedDefaults(
@@ -32964,6 +36596,11 @@ app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) =>
     normalizedPreview,
     { commandId }
   );
+  const commandResultPayload = {
+    ...(result && typeof result === "object" ? result : {}),
+    preview: normalizedPreview,
+    apply: applyResult,
+  };
 
   await c.env.DB
     .prepare(
@@ -32972,28 +36609,108 @@ app.post("/api/camera-imports/:commandId/apply", anyAuthMiddleware, async (c) =>
        WHERE id = ? AND user_id = ?`
     )
     .bind(
-      JSON.stringify({
-        ...(result && typeof result === "object" ? result : {}),
-        preview: normalizedPreview,
-        apply: applyResult,
-      }),
+      JSON.stringify(commandResultPayload),
       commandId,
       user.id
     )
     .run();
 
+  const gpuBatchRequested =
+    requestBody?.gpu_batch &&
+    typeof requestBody.gpu_batch === "object" &&
+    requestBody.gpu_batch.enabled === true;
+  const requestedGpuMode = normalizeCameraCaptureAccelerationMode(
+    requestBody?.gpu_batch?.requested_mode,
+    "nvidia"
+  );
+  const restartIfRunning =
+    !requestBody?.gpu_batch ||
+    typeof requestBody.gpu_batch !== "object" ||
+    requestBody.gpu_batch.restart_if_running !== false;
+
+  if (
+    gpuBatchRequested &&
+    requestedGpuMode === "nvidia" &&
+    applyResult.created_camera_ids.length > 0
+  ) {
+    try {
+      const initialSummary = await createCameraImportGpuJob(c.env.DB, {
+        userId: user.id,
+        importCommandId: commandId,
+        cameraIds: applyResult.created_camera_ids,
+        requestedMode: requestedGpuMode,
+        restartIfRunning,
+      });
+
+      if (initialSummary) {
+        applyResult.gpu_batch = initialSummary;
+        try {
+          await dispatchQueuedCameraImportGpuJobs(c.env);
+        } catch (dispatchError) {
+          console.error("[CAMERA IMPORT GPU] Failed to kick off batch dispatch:", dispatchError);
+        }
+        const refreshedGpuJob = await loadCameraImportGpuJobByImportCommandId(
+          c.env.DB,
+          user.id,
+          commandId
+        );
+        if (refreshedGpuJob) {
+          applyResult.gpu_batch = buildCameraImportGpuBatchSummary(refreshedGpuJob);
+        }
+      }
+    } catch (gpuBatchError) {
+      const gpuBatchMessage =
+        gpuBatchError instanceof Error && gpuBatchError.message.trim()
+          ? gpuBatchError.message
+          : "Failed to queue GPU validation for this import.";
+      console.error("[CAMERA IMPORT GPU] Failed to create import GPU batch:", gpuBatchError);
+      applyResult.gpu_batch = {
+        status: "failed",
+        requested_mode: requestedGpuMode,
+        total_count: applyResult.created_camera_ids.length,
+        processed_count: 0,
+        enabled_gpu_count: 0,
+        kept_cpu_count: 0,
+        failed_count: 0,
+        active_camera_id: null,
+        waiting_for_exe: false,
+        last_error: gpuBatchMessage,
+        message: `GPU validation stopped: ${gpuBatchMessage}`,
+      };
+      await syncCameraImportGpuBatchSummaryToCommandResult(
+        c.env.DB,
+        user.id,
+        commandId,
+        applyResult.gpu_batch
+      );
+    }
+  }
+
   return c.json(applyResult);
 });
 
+app.get("/api/camera-imports/:commandId/gpu-batch", anyAuthMiddleware, async (c) => {
+  const user = c.get("user")!;
+  const commandId = Number(c.req.param("commandId"));
+
+  if (!Number.isInteger(commandId) || commandId <= 0) {
+    return c.json({ error: "Invalid command id" }, 400);
+  }
+
+  const job = await loadCameraImportGpuJobByImportCommandId(c.env.DB, user.id, commandId);
+  if (!job) {
+    return c.json({ error: "GPU validation batch not found" }, 404);
+  }
+
+  return c.json(buildCameraImportGpuBatchSummary(job));
+});
+
 app.get("/api/cameras/:id", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const id = c.req.param("id");
 
-  const camera = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .first();
+  const camera = await getCameraForUser(c.env.DB, user.id, id);
 
   if (!camera) {
     return c.json({ error: "Camera not found" }, 404);
@@ -33003,11 +36720,25 @@ app.get("/api/cameras/:id", anyAuthMiddleware, async (c) => {
 });
 
 app.get("/api/cameras/:cameraId/recordings/summary", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
 
   if (!Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid camera id" }, 400);
+  }
+  const camera = await getCameraForUser(c.env.DB, user.id, cameraId);
+  if (!camera) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+  if (isSharedFindShadowCameraRow(camera)) {
+    return c.json(
+      {
+        error: buildSharedCameraStreamAccessMessage(camera as Record<string, unknown>),
+        error_code: "shared_camera_stream_unavailable",
+      },
+      409
+    );
   }
 
   const cameraState = await loadOwnedCameraRecordingState(c, user.id, cameraId);
@@ -33036,11 +36767,25 @@ app.get("/api/cameras/:cameraId/recordings/summary", anyAuthMiddleware, async (c
 });
 
 app.get("/api/cameras/:cameraId/recordings/segments", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
 
   if (!Number.isInteger(cameraId) || cameraId <= 0) {
     return c.json({ error: "Invalid camera id" }, 400);
+  }
+  const camera = await getCameraForUser(c.env.DB, user.id, cameraId);
+  if (!camera) {
+    return c.json({ error: "Camera not found" }, 404);
+  }
+  if (isSharedFindShadowCameraRow(camera)) {
+    return c.json(
+      {
+        error: buildSharedCameraStreamAccessMessage(camera as Record<string, unknown>),
+        error_code: "shared_camera_stream_unavailable",
+      },
+      409
+    );
   }
 
   const cameraState = await loadOwnedCameraRecordingState(c, user.id, cameraId);
@@ -33067,6 +36812,7 @@ app.get("/api/cameras/:cameraId/recordings/segments", anyAuthMiddleware, async (
 });
 
 app.post("/api/cameras/:cameraId/refresh-thumbnail", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = parseInt(c.req.param("cameraId"), 10);
 
@@ -33075,13 +36821,26 @@ app.post("/api/cameras/:cameraId/refresh-thumbnail", anyAuthMiddleware, async (c
   }
 
   const camera = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE id = ? AND user_id = ?"
+    `SELECT *
+     FROM cameras
+     WHERE id = ?
+       AND ${buildVisibleCameraWhereClause()}`
   )
     .bind(cameraId, user.id)
     .first();
 
   if (!camera) {
     return c.json({ error: "Camera not found" }, 404);
+  }
+
+  if (isSharedFindShadowCameraRow(camera)) {
+    return c.json(
+      {
+        error: buildSharedCameraStreamAccessMessage(camera as Record<string, unknown>),
+        error_code: "shared_camera_stream_unavailable",
+      },
+      409
+    );
   }
 
   const existingPending = await c.env.DB.prepare(
@@ -33164,6 +36923,7 @@ app.patch("/api/cameras/:id", anyAuthMiddleware, zValidator("json", UpdateCamera
     }, 400);
   }
 }), async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const id = c.req.param("id");
   const dataRaw = c.req.valid("json");
@@ -33179,6 +36939,9 @@ app.patch("/api/cameras/:id", anyAuthMiddleware, zValidator("json", UpdateCamera
     const message = error instanceof Error ? error.message : "Failed to update camera";
     if (message === "Camera not found") {
       return c.json({ error: message }, 404);
+    }
+    if (message === "Shared cameras are managed by the owner and cannot be edited here.") {
+      return c.json({ error: message }, 409);
     }
     if (message.startsWith("Missing required RTSP fields:")) {
       const missingFields = message
@@ -33201,17 +36964,23 @@ app.patch("/api/cameras/:id", anyAuthMiddleware, zValidator("json", UpdateCamera
 });
 
 app.delete("/api/cameras/:id", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const id = c.req.param("id");
 
-  const camera = await c.env.DB.prepare(
-    "SELECT * FROM cameras WHERE id = ? AND user_id = ?"
-  )
-    .bind(id, user.id)
-    .first();
+  const camera = await getCameraForUser(c.env.DB, user.id, id);
 
   if (!camera) {
     return c.json({ error: "Camera not found" }, 404);
+  }
+
+  if (isSharedFindShadowCameraRow(camera)) {
+    return c.json(
+      {
+        error: "Shared cameras are managed by the owner and cannot be deleted here.",
+      },
+      409
+    );
   }
 
   await c.env.DB.prepare("DELETE FROM cameras WHERE id = ? AND user_id = ?")
@@ -33240,6 +37009,7 @@ async function enqueueStartCameraCommand(
   options?: {
     targetClientId?: string | null;
     targetExeId?: string | null;
+    waitForTerminalResult?: boolean;
   }
 ): Promise<{
   success: boolean;
@@ -33248,6 +37018,8 @@ async function enqueueStartCameraCommand(
   running_analytics?: string[];
   error?: string;
   error_code?: string;
+  http_status?: number;
+  failure_details?: Record<string, unknown>;
 }> {
   try {
     if (!Number.isInteger(cameraId) || cameraId <= 0) {
@@ -33262,6 +37034,7 @@ async function enqueueStartCameraCommand(
       typeof options?.targetExeId === "string" && options.targetExeId.trim()
         ? options.targetExeId.trim()
         : null;
+    const waitForTerminalResult = options?.waitForTerminalResult === true;
 
     let pairingQuery =
       `SELECT *
@@ -33298,6 +37071,14 @@ async function enqueueStartCameraCommand(
 
     // Check camera license limit (only if camera is not already running)
     const cam: any = camera;
+    if (isSharedFindShadowCameraRow(cam)) {
+      return {
+        success: false,
+        error: buildSharedCameraStreamAccessMessage(cam),
+        error_code: "shared_camera_stream_unavailable",
+        http_status: 409,
+      };
+    }
     
     // Fetch active subscription early - we'll need it for multiple checks
     const activeSubscription = enforcePerceptrumLicenseRules
@@ -33415,6 +37196,12 @@ async function enqueueStartCameraCommand(
       cam.capture_acceleration_mode,
       "cpu"
     );
+    const resourceEstimate = await buildCameraRuntimeResourceEstimate(
+      env.DB,
+      userId,
+      cameraId,
+      captureAccelerationMode === "nvidia" ? "nvidia" : "cpu"
+    );
 
     console.log(
       enforcePerceptrumLicenseRules
@@ -33450,6 +37237,7 @@ async function enqueueStartCameraCommand(
       webcam_index: cam.webcam_index,
       capture_acceleration_mode: captureAccelerationMode,
       use_gpu: captureAccelerationMode === "nvidia",
+      resource_estimate: resourceEstimate,
       analysis_speed: effectiveAnalysisSpeed,
       model_tier: effectiveModelTier,
       telegram_enabled: telegram.enabled,
@@ -33462,6 +37250,7 @@ async function enqueueStartCameraCommand(
     const now = new Date().toISOString();
     const cameraName =
       normalizeCameraStartSummaryText(cam.name) || `Camera #${cameraId}`;
+    const wasRunningBefore = Number(cam.is_service_running) === 1;
 
     // Mark the service as running immediately, but keep camera offline until the agent
     // confirms the stream is actually online via camera_started/camera_online/camera_recovered.
@@ -33511,7 +37300,7 @@ async function enqueueStartCameraCommand(
       .run();
 
     // Send start_camera command to EXE
-    await env.DB.prepare(
+    const commandInsert = await env.DB.prepare(
       `INSERT INTO commands 
          (
            user_id,
@@ -33541,10 +37330,61 @@ async function enqueueStartCameraCommand(
       )
       .run();
 
+    const commandId = Number(commandInsert.meta.last_row_id || 0);
+
     console.log(
       `[START CAMERA] Command enqueued with payload:`,
       JSON.stringify(redactSensitiveForLog(payload), null, 2)
     );
+
+    if (waitForTerminalResult && Number.isInteger(commandId) && commandId > 0) {
+      const terminalResult = await waitForCommandTerminalResult(env.DB, userId, commandId, 5000, 250);
+      if (terminalResult && terminalResult.status === "failed") {
+        const resultPayload = parseJsonObject(terminalResult.envelope.result);
+        const failureMessage =
+          normalizeText(resultPayload.error) ||
+          normalizeText(terminalResult.envelope.error) ||
+          "Failed to start camera";
+        const failureCode =
+          normalizeText(resultPayload.error_code) || "camera_start_failed";
+        const failureStatus = isCameraStartMemoryBlockedPayload(resultPayload) ? "blocked" : "failed";
+
+        if (failureStatus === "blocked") {
+          const blockedStates = normalizeBlockedCameraStartStates(
+            resultPayload,
+            cameraId,
+            cameraSessionId,
+            wasRunningBefore
+          );
+          for (const state of blockedStates) {
+            await persistImmediateCameraStartFailureState(env.DB, userId, {
+              cameraId: state.cameraId,
+              cameraSessionId: state.cameraSessionId,
+              wasRunningBefore: state.wasRunningBefore,
+              status: "blocked",
+              nowIso: new Date().toISOString(),
+            });
+          }
+        } else {
+          await persistImmediateCameraStartFailureState(env.DB, userId, {
+            cameraId,
+            cameraSessionId,
+            wasRunningBefore,
+            status: "failed",
+            nowIso: new Date().toISOString(),
+          });
+        }
+
+        return {
+          success: false,
+          error: failureMessage,
+          error_code:
+            failureStatus === "blocked" ? CAMERA_START_MEMORY_BLOCKED_ERROR : failureCode,
+          http_status: failureStatus === "blocked" ? 409 : 400,
+          failure_details: resultPayload,
+        };
+      }
+    }
 
     return { 
       success: true,
@@ -33568,6 +37408,8 @@ async function enqueueStopCameraCommand(
   already_stopped?: boolean;
   camera_name?: string;
   error?: string;
+  error_code?: string;
+  http_status?: number;
 }> {
   try {
     if (!Number.isInteger(cameraId) || cameraId <= 0) {
@@ -33575,7 +37417,7 @@ async function enqueueStopCameraCommand(
     }
 
     const camera = await env.DB.prepare(
-      "SELECT id, user_id, name, is_service_running FROM cameras WHERE id = ? AND user_id = ?"
+      "SELECT id, user_id, name, is_service_running, origin_type, shared_owner_handle, shared_owner_email, shared_origin_brand_id FROM cameras WHERE id = ? AND user_id = ?"
     )
       .bind(cameraId, userId)
       .first();
@@ -33585,6 +37427,14 @@ async function enqueueStopCameraCommand(
     }
 
     const cameraRow = camera as any;
+    if (isSharedFindShadowCameraRow(cameraRow)) {
+      return {
+        success: false,
+        error: buildSharedCameraStreamAccessMessage(cameraRow),
+        error_code: "shared_camera_stream_unavailable",
+        http_status: 409,
+      };
+    }
     const cameraName =
       normalizeCameraStartSummaryText(cameraRow.name) || `Camera #${cameraId}`;
 
@@ -33832,7 +37682,11 @@ async function startJobForUser(
       }
     }
 
-    const startResult = await enqueueManualJobStart(env, jobData);
+    const startResult = await enqueueManualJobStart(
+      env,
+      jobData,
+      buildSharedJobExecutionOptions()
+    );
     if (!startResult.ok) {
       return { statusCode: 500, body: { error: startResult.error || "Failed to start job" } };
     }
@@ -33866,22 +37720,14 @@ async function stopJobForUser(
 
   const jobData = job as any;
   const now = new Date().toISOString();
-
-  await env.DB.prepare(
-    `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-     VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?)`
-  )
-    .bind(
-      userId,
-      JSON.stringify({
-        job: { id: jobData.id, name: jobData.name },
-        requested_at_utc: now,
-        reason: "user_stop_from_dashboard",
-      }),
-      now,
-      now
-    )
-    .run();
+  await executeJobStopPlan(env, {
+    userId,
+    jobId: Number(jobData.id),
+    jobName: typeof jobData.name === "string" ? jobData.name : `Job #${jobData.id}`,
+    nowIso: now,
+    reason: "user_stop_from_dashboard",
+    sharedExecutionOptions: buildSharedJobExecutionOptions(),
+  });
 
   await env.DB.prepare(
     `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, last_event_at_utc, created_at, updated_at)
@@ -33977,6 +37823,138 @@ async function waitForCommandTerminalResult(
   return null;
 }
 
+type BlockedCameraStartState = {
+  cameraId: number;
+  cameraSessionId: string | null;
+  wasRunningBefore: boolean;
+};
+
+function normalizeBlockedCameraStartStates(
+  payload: Record<string, unknown>,
+  fallbackCameraId?: number | null,
+  fallbackCameraSessionId?: string | null,
+  fallbackWasRunningBefore = false
+): BlockedCameraStartState[] {
+  const entries: BlockedCameraStartState[] = [];
+  const blockedCameras = Array.isArray(payload.blocked_cameras) ? payload.blocked_cameras : [];
+
+  for (const rawEntry of blockedCameras) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      continue;
+    }
+
+    const entry = rawEntry as Record<string, unknown>;
+    const cameraId = Number(entry.camera_id);
+    if (!Number.isInteger(cameraId) || cameraId <= 0) {
+      continue;
+    }
+
+    entries.push({
+      cameraId,
+      cameraSessionId: normalizeText(entry.camera_session_id) || null,
+      wasRunningBefore:
+        entry.was_running_before === true ||
+        entry.was_running_before === 1 ||
+        entry.was_running_before === "1" ||
+        entry.was_running_before === "true",
+    });
+  }
+
+  if (entries.length > 0) {
+    return entries;
+  }
+
+  if (Number.isInteger(fallbackCameraId) && Number(fallbackCameraId) > 0) {
+    return [
+      {
+        cameraId: Number(fallbackCameraId),
+        cameraSessionId: normalizeText(fallbackCameraSessionId) || null,
+        wasRunningBefore: fallbackWasRunningBefore,
+      },
+    ];
+  }
+
+  return [];
+}
+
+async function persistImmediateCameraStartFailureState(
+  db: D1Database,
+  userId: string,
+  input: {
+    cameraId: number;
+    cameraSessionId?: string | null;
+    wasRunningBefore: boolean;
+    status: "failed" | "blocked";
+    nowIso: string;
+  }
+) {
+  if (!input.wasRunningBefore) {
+    await db.prepare(
+      `UPDATE cameras
+       SET is_service_running = 0,
+           is_online = 0,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`
+    )
+      .bind(input.cameraId, userId)
+      .run();
+  }
+
+  if (normalizeText(input.cameraSessionId)) {
+    await db.prepare(
+      `UPDATE camera_runtime_sessions
+       SET status = ?,
+           stopped_at = CASE WHEN ? = 1 THEN stopped_at ELSE COALESCE(stopped_at, ?) END,
+           last_event_at = ?,
+           updated_at = ?
+       WHERE camera_session_id = ?
+         AND user_id = ?`
+    )
+      .bind(
+        input.status,
+        input.wasRunningBefore ? 1 : 0,
+        input.nowIso,
+        input.nowIso,
+        input.nowIso,
+        input.cameraSessionId,
+        userId
+      )
+      .run();
+    return;
+  }
+
+  await db.prepare(
+    `UPDATE camera_runtime_sessions
+     SET status = ?,
+         stopped_at = CASE WHEN ? = 1 THEN stopped_at ELSE COALESCE(stopped_at, ?) END,
+         last_event_at = ?,
+         updated_at = ?
+     WHERE user_id = ?
+       AND camera_id = ?
+       AND status = 'starting'`
+  )
+    .bind(
+      input.status,
+      input.wasRunningBefore ? 1 : 0,
+      input.nowIso,
+      input.nowIso,
+      input.nowIso,
+      userId,
+      input.cameraId
+    )
+    .run();
+}
+
+function isCameraStartMemoryBlockedPayload(payload: Record<string, unknown>): boolean {
+  const errorCode = normalizeText(payload.error_code).toLowerCase();
+  const reasonCode = normalizeText(payload.reason_code).toLowerCase();
+  return (
+    errorCode === CAMERA_START_MEMORY_BLOCKED_ERROR ||
+    errorCode.includes("memory") ||
+    reasonCode.includes("memory")
+  );
+}
+
 type CameraCommandTarget = {
   clientId: string;
   exeId: string | null;
@@ -34068,9 +38046,82 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
   reason?: string;
   requestedMode?: CameraCaptureAccelerationMode;
 }> {
-  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+  const probeRequest = await enqueueCameraCaptureAccelerationProbeCommandRequest(
+    env,
+    userId,
+    cameraId,
+    target,
+    requestedMode
+  );
+
+  if (!probeRequest.commandId) {
+    return {
+      success: probeRequest.status === "supported",
+      status: probeRequest.status,
+      requestedMode: probeRequest.requestedMode,
+      reasonCode: probeRequest.reasonCode,
+      reason: probeRequest.reason,
+    };
+  }
+
+  const terminalResult = await waitForCommandTerminalResult(env.DB, userId, probeRequest.commandId);
+  if (!terminalResult) {
+    const timeoutAt = new Date().toISOString();
+    await env.DB.prepare(
+      `UPDATE commands
+       SET status = 'failed', result = ?, updated_at = ?
+       WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
+    )
+      .bind(
+        JSON.stringify({
+          status: "failed",
+          result: null,
+          error: "camera capture acceleration probe timed out",
+          reported_at: timeoutAt,
+        }),
+        timeoutAt,
+        probeRequest.commandId,
+        userId
+      )
+      .run();
+
     return {
       success: false,
+      status: "unavailable",
+      requestedMode,
+      reasonCode: "probe_timed_out",
+      reason: "GPU probe timed out",
+    };
+  }
+
+  const normalizedProbeResult =
+    normalizeCameraCaptureAccelerationProbeCommandResult(terminalResult);
+
+  return {
+    success: normalizedProbeResult.status === "supported",
+    status: normalizedProbeResult.status,
+    requestedMode,
+    reasonCode: normalizedProbeResult.reasonCode,
+    reason: normalizedProbeResult.reason,
+  };
+}
+
+async function enqueueCameraCaptureAccelerationProbeCommandRequest(
+  env: Env,
+  userId: string,
+  cameraId: number,
+  target: CameraCommandTarget,
+  requestedMode: CameraCaptureAccelerationMode
+): Promise<{
+  commandId: number | null;
+  status: "supported" | "unsupported" | "unavailable";
+  reasonCode: string;
+  reason: string;
+  requestedMode: CameraCaptureAccelerationMode;
+}> {
+  if (!Number.isInteger(cameraId) || cameraId <= 0) {
+    return {
+      commandId: null,
       status: "unavailable",
       requestedMode,
       reasonCode: "invalid_camera_id",
@@ -34080,7 +38131,7 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
 
   if (!target?.clientId) {
     return {
-      success: false,
+      commandId: null,
       status: "unavailable",
       requestedMode,
       reasonCode: "no_connected_exe",
@@ -34091,7 +38142,7 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
   const camera = await getCameraForUser(env.DB, userId, cameraId);
   if (!camera) {
     return {
-      success: false,
+      commandId: null,
       status: "unavailable",
       requestedMode,
       reasonCode: "camera_not_found",
@@ -34103,7 +38154,7 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
   const connectionMethod = normalizeCameraTransportField(cam.connection_method) ?? "";
   if (String(connectionMethod).trim().toUpperCase() === "WEBCAM") {
     return {
-      success: true,
+      commandId: null,
       status: "unsupported",
       requestedMode,
       reasonCode: "not_rtsp",
@@ -34159,7 +38210,7 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
   const commandId = Number(insertResult.meta.last_row_id || 0);
   if (!Number.isInteger(commandId) || commandId <= 0) {
     return {
-      success: false,
+      commandId: null,
       status: "unavailable",
       requestedMode,
       reasonCode: "command_enqueue_failed",
@@ -34167,49 +38218,36 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
     };
   }
 
-  const terminalResult = await waitForCommandTerminalResult(env.DB, userId, commandId);
-  if (!terminalResult) {
-    const timeoutAt = new Date().toISOString();
-    await env.DB.prepare(
-      `UPDATE commands
-       SET status = 'failed', result = ?, updated_at = ?
-       WHERE id = ? AND user_id = ? AND (status IS NULL OR status IN ('pending', 'sent'))`
-    )
-      .bind(
-        JSON.stringify({
-          status: "failed",
-          result: null,
-          error: "camera capture acceleration probe timed out",
-          reported_at: timeoutAt,
-        }),
-        timeoutAt,
-        commandId,
-        userId
-      )
-      .run();
+  return {
+    commandId,
+    status: "unavailable",
+    requestedMode,
+    reasonCode: "queued",
+    reason: "GPU probe queued",
+  };
+}
 
-    return {
-      success: false,
-      status: "unavailable",
-      requestedMode,
-      reasonCode: "probe_timed_out",
-      reason: "GPU probe timed out",
-    };
-  }
-
-  const resultObject = parseJsonObject(terminalResult.envelope.result);
+function normalizeCameraCaptureAccelerationProbeCommandResult(input: {
+  status: "completed" | "failed";
+  envelope: Record<string, unknown>;
+}): {
+  status: "supported" | "unsupported" | "unavailable";
+  reasonCode: string;
+  reason: string;
+} {
+  const resultObject = parseJsonObject(input.envelope.result);
   const statusRaw =
     typeof resultObject.status === "string" ? resultObject.status.trim().toLowerCase() : "";
   const normalizedStatus =
     statusRaw === "supported" || statusRaw === "unsupported" || statusRaw === "unavailable"
       ? statusRaw
-      : terminalResult.status === "failed"
+      : input.status === "failed"
       ? "unavailable"
       : "unsupported";
   const reasonCode =
     typeof resultObject.reason_code === "string" && resultObject.reason_code.trim()
       ? resultObject.reason_code.trim()
-      : terminalResult.status === "failed"
+      : input.status === "failed"
       ? "probe_failed"
       : normalizedStatus === "supported"
       ? "ok"
@@ -34217,18 +38255,86 @@ async function enqueueCameraCaptureAccelerationProbeCommand(
   const reason =
     typeof resultObject.reason === "string" && resultObject.reason.trim()
       ? resultObject.reason.trim()
-      : typeof terminalResult.envelope.error === "string" && terminalResult.envelope.error.trim()
-      ? terminalResult.envelope.error.trim()
+      : typeof input.envelope.error === "string" && input.envelope.error.trim()
+      ? input.envelope.error.trim()
       : normalizedStatus === "supported"
       ? "GPU decode is available on this machine."
       : "GPU decode is not available for this camera on this machine.";
 
   return {
-    success: normalizedStatus === "supported",
     status: normalizedStatus,
-    requestedMode,
     reasonCode,
     reason,
+  };
+}
+
+async function persistCameraCaptureAccelerationModeForUser(
+  env: Env,
+  userId: string,
+  cameraId: number,
+  requestedMode: CameraCaptureAccelerationMode,
+  restartIfRunning: boolean,
+  options?: {
+    target?: CameraCommandTarget | null;
+    waitForTerminalResult?: boolean;
+  }
+): Promise<{
+  persistedMode: CameraCaptureAccelerationMode;
+  runningBeforeApply: boolean;
+  restartEnqueued: boolean;
+  restartError: string | null;
+}> {
+  const existingCamera = await getCameraForUser(env.DB, userId, cameraId);
+  if (!existingCamera) {
+    throw new Error("Camera not found");
+  }
+
+  const camera = existingCamera as any;
+  const currentMode = normalizeCameraCaptureAccelerationMode(
+    camera.capture_acceleration_mode,
+    "cpu"
+  );
+  const runningBeforeApply = Number(camera.is_service_running) === 1;
+
+  if (currentMode !== requestedMode) {
+    await updateCameraForUser(env.DB, userId, cameraId, {
+      capture_acceleration_mode: requestedMode,
+    });
+  }
+
+  let restartEnqueued = false;
+  let restartError: string | null = null;
+  const waitForTerminalResult = options?.waitForTerminalResult === true;
+  let resolvedTarget = options?.target || null;
+
+  if (runningBeforeApply && restartIfRunning) {
+    resolvedTarget = resolvedTarget || (await resolveCameraCommandTarget(env.DB, userId, cameraId));
+    if (resolvedTarget) {
+      const restartResult = await enqueueStartCameraCommand(env, userId, cameraId, {
+        targetClientId: resolvedTarget.clientId,
+        targetExeId: resolvedTarget.exeId,
+        waitForTerminalResult,
+      });
+      restartEnqueued = restartResult.success;
+      if (!restartResult.success) {
+        restartError = restartResult.error || "Failed to enqueue camera restart";
+      }
+    } else {
+      restartError = "Saved the capture mode, but no EXE is connected to restart this camera.";
+    }
+  }
+
+  const updatedCamera = await getCameraForUser(env.DB, userId, cameraId);
+  const persistedMode = normalizeCameraCaptureAccelerationMode(
+    (updatedCamera as any)?.capture_acceleration_mode,
+    requestedMode
+  );
+
+  return {
+    persistedMode,
+    runningBeforeApply,
+    restartEnqueued,
+    restartError,
   };
 }
 
@@ -34446,20 +38552,27 @@ async function enqueueUpdateAlgorithmsIfCameraRunning(
 
 // Start camera: enqueue command with full camera config
 app.post("/api/cameras/:cameraId/start", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = c.req.param("cameraId");
 
-  const result = await enqueueStartCameraCommand(c.env, user.id, Number(cameraId));
+  const result = await enqueueStartCameraCommand(c.env, user.id, Number(cameraId), {
+    waitForTerminalResult: true,
+  });
   
   if (!result.success) {
-    return c.json(
+    const responseBody =
       result.error_code === OPENAI_KEY_REQUIRED_ERROR
         ? buildOpenAiKeyRequiredErrorBody()
         : result.error_code === ZAI_KEY_REQUIRED_ERROR
         ? buildZAiKeyRequiredErrorBody()
-        : { error: result.error || "Unable to start camera" },
-      400
-    );
+        : {
+            ...(result.failure_details || {}),
+            error: result.error || "Unable to start camera",
+            error_code: result.error_code || null,
+          };
+    const responseStatus = result.http_status === 409 ? 409 : 400;
+    return c.json(responseBody, responseStatus);
   }
   
   return c.json({ 
@@ -34471,12 +38584,19 @@ app.post("/api/cameras/:cameraId/start", anyAuthMiddleware, async (c) => {
 });
 
 app.post("/api/cameras/:cameraId/stop", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = c.req.param("cameraId");
 
   const result = await enqueueStopCameraCommand(c.env, user.id, Number(cameraId));
   if (!result.success) {
-    return c.json({ error: result.error || "Unable to stop camera" }, 400);
+    return c.json(
+      {
+        error: result.error || "Unable to stop camera",
+        error_code: result.error_code || null,
+      },
+      result.http_status === 409 ? 409 : 400
+    );
   }
 
   return c.json({
@@ -34487,6 +38607,7 @@ app.post("/api/cameras/:cameraId/stop", anyAuthMiddleware, async (c) => {
 });
 
 app.post("/api/cameras/:cameraId/capture-acceleration/apply", anyAuthMiddleware, async (c) => {
+  await ensureSchema(c.env.DB);
   const user = c.get("user")!;
   const cameraId = Number.parseInt(c.req.param("cameraId"), 10);
 
@@ -34513,6 +38634,15 @@ app.post("/api/cameras/:cameraId/capture-acceleration/apply", anyAuthMiddleware,
   const existingCamera = await getCameraForUser(c.env.DB, user.id, cameraId);
   if (!existingCamera) {
     return c.json({ error: "Camera not found" }, 404);
+  }
+  if (isSharedFindShadowCameraRow(existingCamera)) {
+    return c.json(
+      {
+        error: buildSharedCameraStreamAccessMessage(existingCamera as Record<string, unknown>),
+        error_code: "shared_camera_stream_unavailable",
+      },
+      409
+    );
   }
 
   const camera = existingCamera as any;
@@ -34573,43 +38703,24 @@ app.post("/api/cameras/:cameraId/capture-acceleration/apply", anyAuthMiddleware,
     };
   }
 
-  if (currentMode !== requestedMode) {
-    await updateCameraForUser(c.env.DB, user.id, cameraId, {
-      capture_acceleration_mode: requestedMode,
-    });
-  }
-
-  let restartEnqueued = false;
-  let restartError: string | null = null;
-
-  if (runningBeforeApply && restartIfRunning) {
-    target = target || (await resolveCameraCommandTarget(c.env.DB, user.id, cameraId));
-    if (target) {
-      const restartResult = await enqueueStartCameraCommand(c.env, user.id, cameraId, {
-        targetClientId: target.clientId,
-        targetExeId: target.exeId,
-      });
-      restartEnqueued = restartResult.success;
-      if (!restartResult.success) {
-        restartError = restartResult.error || "Failed to enqueue camera restart";
-      }
-    } else {
-      restartError = "Saved the capture mode, but no EXE is connected to restart this camera.";
+  const persisted = await persistCameraCaptureAccelerationModeForUser(
+    c.env,
+    user.id,
+    cameraId,
+    requestedMode,
+    restartIfRunning,
+    {
+      target,
+      waitForTerminalResult: true,
     }
-  }
-
-  const updatedCamera = await getCameraForUser(c.env.DB, user.id, cameraId);
-  const persistedMode = normalizeCameraCaptureAccelerationMode(
-    (updatedCamera as any)?.capture_acceleration_mode,
-    requestedMode
   );
 
   return c.json({
     status: "applied",
-    persisted_mode: persistedMode,
-    running_before_apply: runningBeforeApply,
-    restart_enqueued: restartEnqueued,
-    restart_error: restartError,
+    persisted_mode: persisted.persistedMode,
+    running_before_apply: persisted.runningBeforeApply,
+    restart_enqueued: persisted.restartEnqueued,
+    restart_error: persisted.restartError,
     scan,
   });
 });
@@ -34677,7 +38788,9 @@ app.post("/api/agent/bootstrap-cameras", async (c) => {
   // Get all cameras that should be running
   const { results: cameras } = await c.env.DB.prepare(
     `SELECT id FROM cameras 
-     WHERE user_id = ? AND is_service_running = 1 
+     WHERE user_id = ?
+       AND is_service_running = 1
+       AND COALESCE(origin_type, 'local') <> 'shared_find'
      ORDER BY created_at ASC`
   )
     .bind(userId)
@@ -38259,6 +42372,15 @@ function buildMediaDownloadPathFromStorageKey(storageKey: string): string {
   return `/api/media-download/${encoded}`;
 }
 
+function buildMediaPublicUrl(env: Pick<Env, "R2_PUBLIC_BASE_URL">, storageKey: string): string {
+  const mediaPublicBase = String(env.R2_PUBLIC_BASE_URL || "/media").replace(/\/+$/, "");
+  const encodedKey = storageKey
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `${mediaPublicBase}/${encodedKey}`;
+}
+
 function buildReportDownloadPath(reportId: string): string {
   return `/api/reports/${encodeURIComponent(reportId)}/download`;
 }
@@ -38276,6 +42398,55 @@ function normalizeDetectionStorageKey(kind: "image" | "video", value: unknown): 
   if (!raw) return "";
   if (raw.includes("/")) return raw;
   return kind === "video" ? `detections_videos/${raw}` : `detections/${raw}`;
+}
+
+function normalizeDetectionMediaStorageKey(kind: "image" | "video", value: unknown): string {
+  const rawValue = typeof value === "string" ? value.trim() : "";
+  if (!rawValue) return "";
+
+  let candidate = rawValue;
+  try {
+    candidate = new URL(rawValue, "http://local").pathname || rawValue;
+  } catch {
+    candidate = rawValue;
+  }
+
+  candidate = candidate.split("?")[0]?.split("#")[0] || candidate;
+  candidate = candidate.replace(/^\/+/, "");
+  candidate = candidate
+    .split("/")
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join("/");
+
+  const expectedPrefix = kind === "video" ? "detections_videos/" : "detections/";
+  const prefixIndex = candidate.indexOf(expectedPrefix);
+  if (prefixIndex >= 0) {
+    return candidate.slice(prefixIndex);
+  }
+
+  if (candidate.startsWith("media/")) {
+    const withoutMediaPrefix = candidate.slice("media/".length);
+    const nestedIndex = withoutMediaPrefix.indexOf(expectedPrefix);
+    if (nestedIndex >= 0) {
+      return withoutMediaPrefix.slice(nestedIndex);
+    }
+  }
+
+  if (candidate.startsWith("api/media-download/")) {
+    return candidate.slice("api/media-download/".length);
+  }
+
+  if (!candidate.includes("/")) {
+    return normalizeDetectionStorageKey(kind, candidate);
+  }
+
+  return "";
 }
 
 function inferReportEvidenceKind(
@@ -46891,6 +51062,105 @@ app.get("/api/events", anyAuthMiddleware, async (c) => {
   return c.json(eventsWithDetails);
 });
 
+async function countDetectionMediaReferences(
+  db: D1Database,
+  userId: number | string,
+  storageKey: string,
+  excludeEventId?: number
+): Promise<number> {
+  const normalizedStorageKey = typeof storageKey === "string" ? storageKey.trim() : "";
+  if (!normalizedStorageKey) {
+    return 0;
+  }
+
+  const likeNeedle = `%${normalizedStorageKey}%`;
+  const [detectionRow, notificationRow, eventRow] = await Promise.all([
+    db.prepare(
+      `SELECT COUNT(*) AS count
+         FROM detections
+        WHERE user_id = ?
+          AND (image_key = ? OR video_key = ?)`
+    )
+      .bind(userId, normalizedStorageKey, normalizedStorageKey)
+      .first(),
+    db.prepare(
+      `SELECT COUNT(*) AS count
+         FROM notifications
+        WHERE user_id = ?
+          AND (image_key = ? OR video_key = ?)`
+    )
+      .bind(userId, normalizedStorageKey, normalizedStorageKey)
+      .first(),
+    Number.isInteger(excludeEventId) && Number(excludeEventId) > 0
+      ? db
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM events
+              WHERE user_id = ?
+                AND id != ?
+                AND details_json LIKE ?`
+          )
+          .bind(userId, excludeEventId, likeNeedle)
+          .first()
+      : db
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM events
+              WHERE user_id = ?
+                AND details_json LIKE ?`
+          )
+          .bind(userId, likeNeedle)
+          .first(),
+  ]);
+
+  return (
+    clampInteger((detectionRow as any)?.count) +
+    clampInteger((notificationRow as any)?.count) +
+    clampInteger((eventRow as any)?.count)
+  );
+}
+
+async function deleteDetectionMediaStorageKeyIfUnreferenced(
+  env: Env,
+  userId: number | string,
+  storageKey: string,
+  excludeEventId?: number
+): Promise<boolean> {
+  const normalizedStorageKey = typeof storageKey === "string" ? storageKey.trim() : "";
+  if (!normalizedStorageKey) {
+    return false;
+  }
+
+  const referenceCount = await countDetectionMediaReferences(
+    env.DB,
+    userId,
+    normalizedStorageKey,
+    excludeEventId
+  );
+  if (referenceCount > 0) {
+    return false;
+  }
+
+  try {
+    await env.R2_BUCKET.delete(normalizedStorageKey);
+  } catch (error) {
+    console.warn("[DELETE EVENT] Failed to delete unreferenced R2 object:", normalizedStorageKey, error);
+  }
+
+  try {
+    await env.DB.prepare(
+      `DELETE FROM media_objects
+        WHERE user_id = ? AND storage_key = ?`
+    )
+      .bind(userId, normalizedStorageKey)
+      .run();
+  } catch (error) {
+    console.warn("[DELETE EVENT] Failed to delete media_objects row:", normalizedStorageKey, error);
+  }
+
+  return true;
+}
+
 const deleteDashboardAlertEvent = async (
   env: any,
   userId: number | string,
@@ -46936,7 +51206,7 @@ const deleteDashboardAlertEvent = async (
     }
   }
 
-  if (eventType === "ai_detection") {
+  if (eventType === "ai_detection" || eventType === "job_alert_triggered") {
     const readString = (...values: any[]): string | null => {
       for (const value of values) {
         if (typeof value !== "string") continue;
@@ -46946,33 +51216,11 @@ const deleteDashboardAlertEvent = async (
       return null;
     };
 
-    const extractFilename = (value: string | null): string | null => {
-      if (!value) return null;
-      let raw = value.trim();
-      if (!raw) return null;
-      try {
-        if (/^https?:\/\//i.test(raw)) {
-          raw = new URL(raw).pathname || raw;
-        }
-      } catch {
-        // Keep raw path if URL parsing fails.
-      }
-      raw = raw.split("?")[0]?.split("#")[0] || raw;
-      const tokens = raw.split(/[\\/]/).filter(Boolean);
-      if (tokens.length === 0) return null;
-      const name = tokens[tokens.length - 1].trim();
-      return name || null;
-    };
-
     const r2DeleteKeys = new Set<string>();
     const addR2Key = (value: string | null, kind: "image" | "video") => {
-      const filename = extractFilename(value);
-      if (!filename) return;
-      if (kind === "video") {
-        r2DeleteKeys.add(`detections_videos/${filename}`);
-      } else {
-        r2DeleteKeys.add(`detections/${filename}`);
-      }
+      const storageKey = normalizeDetectionMediaStorageKey(kind, value);
+      if (!storageKey) return;
+      r2DeleteKeys.add(storageKey);
     };
 
     addR2Key(
@@ -47011,6 +51259,20 @@ const deleteDashboardAlertEvent = async (
         );
       }
     }
+    if (Array.isArray(details?.group_images)) {
+      for (const entry of details.group_images) {
+        if (!entry || typeof entry !== "object") continue;
+        addR2Key(
+          readString(
+            (entry as any)?.image_key,
+            (entry as any)?.imageKey,
+            (entry as any)?.image_url,
+            (entry as any)?.imageUrl
+          ),
+          "image"
+        );
+      }
+    }
 
     const { results: linkedDetections } = await env.DB.prepare(
       `SELECT id, image_key, video_key
@@ -47023,14 +51285,6 @@ const deleteDashboardAlertEvent = async (
     for (const row of linkedDetections || []) {
       addR2Key(readString((row as any)?.image_key), "image");
       addR2Key(readString((row as any)?.video_key), "video");
-    }
-
-    for (const key of r2DeleteKeys) {
-      try {
-        await env.R2_BUCKET.delete(key);
-      } catch (error) {
-        console.warn("[DELETE EVENT] Failed to delete R2 object:", key, error);
-      }
     }
 
     const localPathCandidates = new Set<string>();
@@ -47103,6 +51357,10 @@ const deleteDashboardAlertEvent = async (
     )
       .bind(eventId, userId)
       .run();
+
+    for (const key of r2DeleteKeys) {
+      await deleteDetectionMediaStorageKeyIfUnreferenced(env, userId, key, eventId);
+    }
   }
 
   const deleteResult = await env.DB.prepare(
@@ -52075,75 +56333,172 @@ app.post("/api/agent/thumbnails", async (c) => {
 
   const authHeader =
     c.req.header("authorization") || c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Authorization header" }, 401);
-  }
-
-  const exeToken = authHeader.slice("Bearer ".length).trim();
-  const exeTokenHash = await hashToken(exeToken);
-
-  const pairing = await c.env.DB.prepare(
-    `SELECT * FROM exe_pairings
-     WHERE client_id = ? AND exe_token_hash = ? AND status = 'connected'`
-  )
-    .bind(clientId, exeTokenHash)
-    .first();
-
+  const replayPairing = resolveLocalAgentReplayPairingForRequest(c.req.raw.headers, clientId);
+  const pairing =
+    replayPairing || (await resolveAgentPairingForClient(c.env.DB, clientId, authHeader));
   if (!pairing) {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const userId = (pairing as any).user_id;
+  const userId = pairing.userId;
+  await ensureSchema(c.env.DB);
+  const requestPath = buildLocalAgentReplayRequestPath(c.req.url);
+  const requestContentType = String(c.req.header("content-type") || "application/json").trim();
+  const normalizedContentType = requestContentType.toLowerCase();
+  const binaryContentType = normalizedContentType.split(";")[0] || "image/jpeg";
+  const rawCameraIdFromQuery = url.searchParams.get("camera_id");
 
-  const body = await c.req.json<{
-    camera_id: number;
-    jpeg_base64: string;
-  }>();
+  const normalizeCameraId = (value: unknown): number => {
+    if (typeof value === "number") {
+      return Number.isInteger(value) && value > 0 ? value : 0;
+    }
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value, 10);
+      return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+    }
+    return 0;
+  };
 
-  if (!body.camera_id || !body.jpeg_base64) {
-    return c.json({ error: "camera_id and jpeg_base64 are required" }, 400);
+  const normalizeThumbnailPayloadFromJson = (rawValue: unknown) => {
+    if (typeof rawValue !== "string") return null;
+    const trimmed = rawValue.trim();
+    if (!trimmed) return null;
+    try {
+      const parsedDataUrl = parseDataUrl(trimmed);
+      if (parsedDataUrl) {
+        return {
+          dataUrl: trimmed,
+          bytes: base64ToUint8Array(parsedDataUrl.base64),
+        };
+      }
+      return {
+        dataUrl: `data:image/jpeg;base64,${trimmed}`,
+        bytes: base64ToUint8Array(trimmed),
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  let queuedCameraId = 0;
+  let queuedRequestBody = "";
+  let queuedContentType = "application/json";
+  let thumbnailBytes = new Uint8Array();
+
+  if (binaryContentType.startsWith("image/")) {
+    queuedCameraId = normalizeCameraId(rawCameraIdFromQuery);
+    if (queuedCameraId <= 0) {
+      return c.json({ error: "camera_id is required" }, 400);
+    }
+
+    const arrayBuffer = await c.req.arrayBuffer();
+    thumbnailBytes = new Uint8Array(arrayBuffer);
+    if (!thumbnailBytes.byteLength) {
+      return c.json({ error: "thumbnail body is required" }, 400);
+    }
+
+    queuedRequestBody = JSON.stringify({
+      camera_id: queuedCameraId,
+      jpeg_base64: `data:${binaryContentType};base64,${arrayBufferToBase64(arrayBuffer)}`,
+    });
+  } else {
+    let body: {
+      camera_id?: number | string;
+      jpeg_base64?: string;
+    } = {};
+
+    try {
+      body = await c.req.json<{
+        camera_id?: number | string;
+        jpeg_base64?: string;
+      }>();
+    } catch {
+      return c.json({ error: "camera_id and jpeg_base64 are required" }, 400);
+    }
+
+    queuedCameraId = normalizeCameraId(body.camera_id);
+    const normalizedPayload = normalizeThumbnailPayloadFromJson(body.jpeg_base64);
+    if (queuedCameraId <= 0 || !normalizedPayload || !normalizedPayload.bytes.byteLength) {
+      return c.json({ error: "camera_id and jpeg_base64 are required" }, 400);
+    }
+
+    thumbnailBytes = normalizedPayload.bytes;
+    queuedRequestBody = JSON.stringify({
+      camera_id: queuedCameraId,
+      jpeg_base64: normalizedPayload.dataUrl,
+    });
+  }
+
+  if (shouldQueueLocalAgentIngress(c.env, c.req.raw.headers)) {
+    await enqueueLocalAgentThumbnailRequest({
+      db: c.env.DB,
+      userId: String(userId || ""),
+      clientId: pairing.clientId,
+      exeId: pairing.exeId,
+      cameraId: queuedCameraId,
+      requestPath,
+      requestBody: queuedRequestBody,
+      contentType: queuedContentType,
+    });
+
+    return c.json(
+      {
+        ok: true,
+        queued: true,
+        camera_id: queuedCameraId,
+      },
+      202
+    );
   }
 
   // Get old thumbnail URL to delete it
   const camera = await c.env.DB.prepare(
-    `SELECT thumbnail_url FROM cameras WHERE id = ? AND user_id = ?`
+    `SELECT thumbnail_url, thumbnail_hash FROM cameras WHERE id = ? AND user_id = ?`
   )
-    .bind(body.camera_id, userId)
+    .bind(queuedCameraId, userId)
     .first();
 
   const oldThumbnailUrl = camera ? (camera as any).thumbnail_url : null;
+  const oldThumbnailHash =
+    camera && typeof (camera as any).thumbnail_hash === "string"
+      ? String((camera as any).thumbnail_hash).trim()
+      : "";
+  const thumbnailHash = await sha256BytesBase64Url(thumbnailBytes);
+  const now = new Date().toISOString();
 
-  // Decode base64 to bytes
-  const base64Data = body.jpeg_base64.replace(/^data:image\/jpeg;base64,/, '');
-  const binaryString = atob(base64Data);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  if (oldThumbnailUrl && oldThumbnailHash && oldThumbnailHash === thumbnailHash) {
+    await c.env.DB.prepare(
+      `UPDATE cameras
+       SET is_online = 1, last_thumbnail_update = ?
+       WHERE id = ? AND user_id = ?`
+    )
+      .bind(now, queuedCameraId, userId)
+      .run();
+
+    return c.json({ ok: true, filename: oldThumbnailUrl, unchanged: true });
   }
 
   // Create unique filename with timestamp to avoid caching issues
   const timestamp = Date.now();
   const safeUserId = sanitizeStoragePathSegment(userId, "user");
-  const filename = `user_${safeUserId}_camera_${body.camera_id}_${timestamp}.jpg`;
+  const filename = `user_${safeUserId}_camera_${queuedCameraId}_${timestamp}.jpg`;
 
   // Upload new thumbnail to R2
-  await c.env.R2_BUCKET.put(`thumbs/${filename}`, bytes, {
+  await c.env.R2_BUCKET.put(`thumbs/${filename}`, thumbnailBytes, {
     httpMetadata: { contentType: "image/jpeg" },
   });
-
-  const now = new Date().toISOString();
 
   // Update camera table - also set is_online=1 as a heartbeat since we're receiving frames
   await c.env.DB.prepare(
     `UPDATE cameras
-     SET thumbnail_url = ?, is_online = 1, last_thumbnail_update = ?, updated_at = ?
+     SET thumbnail_url = ?, thumbnail_hash = ?, is_online = 1, last_thumbnail_update = ?, updated_at = ?
      WHERE id = ? AND user_id = ?`
   )
-    .bind(filename, now, now, body.camera_id, userId)
+    .bind(filename, thumbnailHash, now, now, queuedCameraId, userId)
     .run();
 
   // Delete old thumbnail from R2 to avoid unbounded storage
-  if (oldThumbnailUrl) {
+  if (oldThumbnailUrl && oldThumbnailUrl !== filename) {
     try {
       await c.env.R2_BUCKET.delete(`thumbs/${oldThumbnailUrl}`);
     } catch (err) {
@@ -52152,6 +56507,147 @@ app.post("/api/agent/thumbnails", async (c) => {
   }
 
   return c.json({ ok: true, filename });
+});
+
+app.post("/api/agent/event-media", async (c) => {
+  const url = new URL(c.req.url);
+  const clientId = String(url.searchParams.get("client_id") || "").trim();
+  const rawCameraId = Number(url.searchParams.get("camera_id"));
+  const kind = String(url.searchParams.get("kind") || "").trim().toLowerCase();
+
+  if (!clientId) {
+    return c.json({ error: "client_id is required" }, 400);
+  }
+  if (!Number.isInteger(rawCameraId) || rawCameraId <= 0) {
+    return c.json({ error: "camera_id is required" }, 400);
+  }
+  if (kind !== "image" && kind !== "video") {
+    return c.json({ error: "kind must be image or video" }, 400);
+  }
+
+  const authHeader = c.req.header("authorization") || c.req.header("Authorization");
+  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  if (!pairing) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await ensureSchema(c.env.DB);
+
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  if (bytes.byteLength === 0) {
+    return c.json({ error: "request body is required" }, 400);
+  }
+
+  const rawContentType = String(c.req.header("content-type") || "").trim().toLowerCase();
+  const imageType = rawContentType.startsWith("image/") ? rawContentType : "image/jpeg";
+  const videoType = rawContentType.startsWith("video/") ? rawContentType : "video/mp4";
+  const effectiveContentType = kind === "video" ? videoType : imageType;
+  const maxBytes =
+    kind === "video" ? JOB_ALERT_MEDIA_MAX_VIDEO_BYTES : 20 * 1024 * 1024;
+  if (bytes.byteLength > maxBytes) {
+    return c.json(
+      {
+        error: "media exceeds max upload budget",
+        max_bytes: maxBytes,
+        received_bytes: bytes.byteLength,
+      },
+      413
+    );
+  }
+
+  const imageExtensionByType: Record<string, string> = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+  };
+  const videoExtensionByType: Record<string, string> = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".avi",
+    "video/x-matroska": ".mkv",
+  };
+  const extension =
+    kind === "video"
+      ? videoExtensionByType[effectiveContentType] || ".mp4"
+      : imageExtensionByType[effectiveContentType] || ".jpg";
+  const safeUserId = sanitizeStoragePathSegment(pairing.userId, "user");
+  const mediaHash = await sha256BytesBase64Url(bytes);
+  const nowIso = new Date().toISOString();
+  const existingMediaObject = await c.env.DB.prepare(
+    `SELECT storage_key
+       FROM media_objects
+      WHERE user_id = ? AND kind = ? AND sha256 = ?
+      LIMIT 1`
+  )
+    .bind(pairing.userId, kind, mediaHash)
+    .first();
+
+  let storageKey =
+    existingMediaObject && typeof (existingMediaObject as any).storage_key === "string"
+      ? String((existingMediaObject as any).storage_key).trim()
+      : "";
+
+  if (storageKey) {
+    await c.env.DB.prepare(
+      `UPDATE media_objects
+          SET updated_at = ?, content_type = COALESCE(NULLIF(content_type, ''), ?)
+        WHERE user_id = ? AND kind = ? AND sha256 = ?`
+    )
+      .bind(nowIso, effectiveContentType, pairing.userId, kind, mediaHash)
+      .run();
+  } else {
+    storageKey =
+      kind === "video"
+        ? `detections_videos/${safeUserId}/cam_${rawCameraId}/${Date.now()}_${generateUUID()}${extension}`
+        : `detections/${safeUserId}/cam_${rawCameraId}/${Date.now()}_${generateUUID()}${extension}`;
+
+    await c.env.R2_BUCKET.put(storageKey, bytes, {
+      httpMetadata: { contentType: effectiveContentType },
+    });
+
+    await c.env.DB.prepare(
+      `INSERT INTO media_objects (
+         user_id,
+         kind,
+         sha256,
+         storage_key,
+         content_type,
+         created_at,
+         updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, kind, sha256) DO UPDATE SET
+         storage_key = excluded.storage_key,
+         content_type = excluded.content_type,
+         updated_at = excluded.updated_at`
+    )
+      .bind(
+        pairing.userId,
+        kind,
+        mediaHash,
+        storageKey,
+        effectiveContentType,
+        nowIso,
+        nowIso
+      )
+      .run();
+  }
+
+  const mediaUrl = buildMediaPublicUrl(c.env, storageKey);
+
+  return c.json({
+    ok: true,
+    kind,
+    storage_key: storageKey,
+    media_url: mediaUrl,
+    deduplicated: Boolean(existingMediaObject),
+    image_key: kind === "image" ? storageKey : null,
+    image_url: kind === "image" ? mediaUrl : null,
+    video_key: kind === "video" ? storageKey : null,
+    video_url: kind === "video" ? mediaUrl : null,
+  });
 });
 
 app.post("/api/agent/job-alert-media", async (c) => {
@@ -52271,31 +56767,34 @@ app.post("/api/agent/capture-thread-metrics", async (c) => {
   }
 
   const authHeader = c.req.header("authorization") || c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Authorization header" }, 401);
-  }
-
-  const exeToken = authHeader.slice("Bearer ".length).trim();
-  const exeTokenHash = await hashToken(exeToken);
-
-  const pairing = await c.env.DB.prepare(
-    `SELECT * FROM exe_pairings
-     WHERE client_id = ? AND exe_token_hash = ? AND status = 'connected'`
-  )
-    .bind(clientId, exeTokenHash)
-    .first();
-
+  const replayPairing = resolveLocalAgentReplayPairingForRequest(c.req.raw.headers, clientId);
+  const pairing =
+    replayPairing || (await resolveAgentPairingForClient(c.env.DB, clientId, authHeader));
   if (!pairing) {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
   await ensureSchema(c.env.DB);
 
-  const pairingRow = pairing as any;
-  const userId = String(pairingRow.user_id || "");
-  const resolvedClientId = String(pairingRow.client_id || clientId);
-  const resolvedExeId = String(pairingRow.exe_id || "unknown_exe");
+  const userId = String(pairing.userId || "");
+  const resolvedClientId = String(pairing.clientId || clientId);
+  const resolvedExeId = String(pairing.exeId || "unknown_exe");
   const now = new Date().toISOString();
+
+  if (shouldQueueLocalAgentIngress(c.env, c.req.raw.headers)) {
+    const requestBody = await c.req.text();
+    await enqueueLocalAgentCaptureMetricsRequest({
+      db: c.env.DB,
+      userId,
+      clientId: resolvedClientId,
+      exeId: resolvedExeId,
+      requestPath: buildLocalAgentReplayRequestPath(c.req.url),
+      requestBody,
+      contentType: c.req.header("content-type") || "application/json",
+      nowIso: now,
+    });
+    return c.json({ ok: true, queued: true }, 202);
+  }
 
   type CaptureThreadMetricsRequestBody = {
     samples?: Array<{
@@ -52442,7 +56941,9 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
   }
 
   const authHeader = c.req.header("authorization") || c.req.header("Authorization");
-  const pairing = await resolveAgentPairingForClient(c.env.DB, clientId, authHeader);
+  const replayPairing = resolveLocalAgentReplayPairingForRequest(c.req.raw.headers, clientId);
+  const pairing =
+    replayPairing || (await resolveAgentPairingForClient(c.env.DB, clientId, authHeader));
   if (!pairing) {
     return c.json({ error: "Unauthorized" }, 401);
   }
@@ -52460,6 +56961,21 @@ app.post("/api/agent/open-monitor-snapshot", async (c) => {
   };
 
   const now = openMonitorNowIso();
+  if (shouldQueueLocalAgentIngress(c.env, c.req.raw.headers)) {
+    const requestBody = await c.req.text();
+    await enqueueLocalAgentOpenMonitorRequest({
+      db: c.env.DB,
+      userId: pairing.userId,
+      clientId: pairing.clientId,
+      exeId: pairing.exeId,
+      requestPath: buildLocalAgentReplayRequestPath(c.req.url),
+      requestBody,
+      contentType: c.req.header("content-type") || "application/json",
+      nowIso: now,
+    });
+    return c.json({ ok: true, queued: true }, 202);
+  }
+
   const body: OpenMonitorSnapshotRequestBody =
     await c.req.json<OpenMonitorSnapshotRequestBody>().catch(() => ({}));
   const hasCamerasField = Array.isArray(body.cameras);
@@ -55760,28 +60276,29 @@ app.post("/api/agent/events", async (c) => {
   // Same auth logic as /api/agent/commands:
   const authHeader =
     c.req.header("authorization") || c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Authorization header" }, 401);
-  }
-
-  const exeToken = authHeader.slice("Bearer ".length).trim();
-  const exeTokenHash = await hashToken(exeToken);
-
-  // Look up the pairing to derive user_id
-  const pairing = await c.env.DB.prepare(
-    `SELECT * FROM exe_pairings
-     WHERE client_id = ? AND exe_token_hash = ? AND status = 'connected'`
-  )
-    .bind(clientId, exeTokenHash)
-    .first();
-
+  const replayPairing = resolveLocalAgentReplayPairingForRequest(c.req.raw.headers, clientId);
+  const pairing =
+    replayPairing || (await resolveAgentPairingForClient(c.env.DB, clientId, authHeader));
   if (!pairing) {
     // Unpaired or invalid token: reject
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const userId = (pairing as any).user_id;
-  const pairingExeId = String((pairing as any).exe_id || "");
+  const userId = pairing.userId;
+  const pairingExeId = pairing.exeId;
+  if (shouldQueueLocalAgentIngress(c.env, c.req.raw.headers)) {
+    const requestBody = await c.req.text();
+    await enqueueLocalAgentEventRequest({
+      db: c.env.DB,
+      userId: String(userId || ""),
+      clientId: pairing.clientId,
+      exeId: pairingExeId,
+      requestPath: buildLocalAgentReplayRequestPath(c.req.url),
+      requestBody,
+      contentType: c.req.header("content-type") || "application/json",
+    });
+    return c.json({ success: true, queued: true }, 202);
+  }
 
   const body = await c.req.json<{
     camera_id?: number | string | null;
@@ -56385,6 +60902,43 @@ app.post("/api/agent/events", async (c) => {
     fallbackExternalEventId,
   });
 
+  try {
+    const relayedSharedJobEvent = await relaySharedJobEventFromOwner(c.env, {
+      userId: String(userId),
+      eventType,
+      cameraId,
+      message: typeof message === "string" ? message : "",
+      details: detailsObject,
+      correlationIds,
+    });
+    if (relayedSharedJobEvent) {
+      return c.json({ success: true, relayed: true, shared_job: true });
+    }
+  } catch (relayError) {
+    console.error("[SHARED JOB] Failed to relay owner event to operator", {
+      userId,
+      eventType,
+      cameraId,
+      correlationIds,
+      error: relayError,
+    });
+    return c.json({ error: "Failed to relay shared job event to the operator." }, 500);
+  }
+
+  if (
+    await maybeHandleSharedJobLifecycleEvent(c.env, {
+      userId: String(userId),
+      eventType,
+      cameraId,
+      message: typeof message === "string" ? message : "",
+      details: detailsObject,
+      correlationIds,
+      nowIso: now,
+    })
+  ) {
+    return c.json({ success: true, shared_job_lifecycle: true });
+  }
+
   if (correlationIds.externalEventId) {
     const existingEvent = await c.env.DB.prepare(
       `SELECT id,
@@ -56520,6 +61074,26 @@ app.post("/api/agent/events", async (c) => {
     const rawGroupImages = Array.isArray(details.group_images) ? details.group_images : [];
     details.contributing_events_count = countTemporalContributingEvents(details);
     const prefersTemporalAlbum = hasTemporalContributingAlbum(details, rawGroupImages);
+    const providedVideoKey = normalizeDetectionStorageKey(
+      "video",
+      typeof details.video_key === "string" ? details.video_key.trim() : details.videoKey
+    );
+    const providedVideoUrl =
+      typeof details.video_url === "string"
+        ? details.video_url.trim()
+        : typeof details.videoUrl === "string"
+        ? details.videoUrl.trim()
+        : "";
+    const providedImageKey = normalizeDetectionStorageKey(
+      "image",
+      typeof details.image_key === "string" ? details.image_key.trim() : details.imageKey
+    );
+    const providedImageUrl =
+      typeof details.image_url === "string"
+        ? details.image_url.trim()
+        : typeof details.imageUrl === "string"
+        ? details.imageUrl.trim()
+        : "";
     const decodeBase64Image = (rawValue: string) => {
       let base64Data = rawValue;
       let contentType = "image/jpeg";
@@ -56557,6 +61131,22 @@ app.post("/api/agent/events", async (c) => {
     };
     let temporalAlbumWon = false;
     const safeUserId = sanitizeStoragePathSegment(userId, "user");
+
+    if (providedVideoKey && !prefersTemporalAlbum) {
+      videoKey = providedVideoKey;
+      mediaType = "video";
+      details.video_key = providedVideoKey;
+      details.video_url = providedVideoUrl || buildMediaUrl(providedVideoKey);
+      details.media_type = "video";
+    }
+
+    if (!videoKey && providedImageKey && !prefersTemporalAlbum) {
+      imageKey = providedImageKey;
+      mediaType = "image";
+      details.image_key = providedImageKey;
+      details.image_url = providedImageUrl || buildMediaUrl(providedImageKey);
+      details.media_type = "image";
+    }
 
     // Non-temporal detections keep the legacy video-first path.
     if (details.video_mp4_base64 && !prefersTemporalAlbum) {
@@ -56709,6 +61299,74 @@ app.post("/api/agent/events", async (c) => {
             : typeof entry.frame_jpeg_base64 === "string"
             ? entry.frame_jpeg_base64
             : "";
+        const providedEntryImageKey = normalizeDetectionStorageKey(
+          "image",
+          typeof entry.image_key === "string" ? entry.image_key.trim() : entry.imageKey
+        );
+        const providedEntryImageUrl =
+          typeof entry.image_url === "string"
+            ? entry.image_url.trim()
+            : typeof entry.imageUrl === "string"
+            ? entry.imageUrl.trim()
+            : "";
+        if (!entryImageBase64.trim() && providedEntryImageKey) {
+          uploadedGroupImages.push({
+            camera_id: entry.camera_id ?? entry.cameraId ?? cameraId ?? null,
+            camera_name:
+              typeof entry.camera_name === "string"
+                ? entry.camera_name
+                : typeof entry.cameraName === "string"
+                ? entry.cameraName
+                : details?.camera_name || null,
+            snapshot_ts_utc_iso:
+              typeof entry.snapshot_ts_utc_iso === "string"
+                ? entry.snapshot_ts_utc_iso
+                : typeof entry.snapshotTsUtcIso === "string"
+                ? entry.snapshotTsUtcIso
+                : null,
+            snapshot_ts_local_iso:
+              typeof entry.snapshot_ts_local_iso === "string"
+                ? entry.snapshot_ts_local_iso
+                : typeof entry.snapshotTsLocalIso === "string"
+                ? entry.snapshotTsLocalIso
+                : null,
+            timestamp_name:
+              typeof entry.timestamp_name === "string"
+                ? entry.timestamp_name
+                : typeof entry.timestampName === "string"
+                ? entry.timestampName
+                : null,
+            frame_index:
+              Number.isFinite(Number(entry.frame_index ?? entry.frameIndex))
+                ? Number(entry.frame_index ?? entry.frameIndex)
+                : null,
+            frame_timestamp_in_segment:
+              typeof entry.frame_timestamp_in_segment === "string"
+                ? entry.frame_timestamp_in_segment
+                : typeof entry.frameTimestampInSegment === "string"
+                ? entry.frameTimestampInSegment
+                : null,
+            event: typeof entry.event === "string" ? entry.event : null,
+            entity_id:
+              typeof entry.entity_id === "string"
+                ? entry.entity_id
+                : typeof entry.entityId === "string"
+                ? entry.entityId
+                : null,
+            reason: typeof entry.reason === "string" ? entry.reason : null,
+            zone: typeof entry.zone === "string" ? entry.zone : null,
+            temporal_evidence_key:
+              typeof entry.temporal_evidence_key === "string"
+                ? entry.temporal_evidence_key
+                : typeof entry.temporalEvidenceKey === "string"
+                ? entry.temporalEvidenceKey
+                : null,
+            image_key: providedEntryImageKey,
+            image_url:
+              providedEntryImageUrl || buildMediaUrl(providedEntryImageKey),
+          });
+          continue;
+        }
         if (!entryImageBase64.trim()) continue;
 
         try {
@@ -56808,6 +61466,22 @@ app.post("/api/agent/events", async (c) => {
           clearVideoMediaFields(details);
         }
       }
+    }
+
+    if (!temporalAlbumWon && prefersTemporalAlbum && providedVideoKey) {
+      videoKey = providedVideoKey;
+      mediaType = "video";
+      details.video_key = providedVideoKey;
+      details.video_url = providedVideoUrl || buildMediaUrl(providedVideoKey);
+      details.media_type = "video";
+    }
+
+    if (!videoKey && !temporalAlbumWon && prefersTemporalAlbum && providedImageKey) {
+      imageKey = providedImageKey;
+      mediaType = "image";
+      details.image_key = providedImageKey;
+      details.image_url = providedImageUrl || buildMediaUrl(providedImageKey);
+      details.media_type = "image";
     }
 
     if (!temporalAlbumWon && prefersTemporalAlbum && details.video_mp4_base64) {
@@ -56964,6 +61638,10 @@ app.post("/api/agent/events", async (c) => {
       typeof details.video_key === "string" ? details.video_key.trim() : "";
     const providedVideoUrl =
       typeof details.video_url === "string" ? details.video_url.trim() : "";
+    const providedImageKey =
+      typeof details.image_key === "string" ? details.image_key.trim() : "";
+    const providedImageUrl =
+      typeof details.image_url === "string" ? details.image_url.trim() : "";
     const rawVideoBase64 = typeof details.video_mp4_base64 === "string" ? details.video_mp4_base64 : "";
     const rawImageBase64 =
       typeof details.frame_jpeg_base64 === "string"
@@ -57027,7 +61705,7 @@ app.post("/api/agent/events", async (c) => {
     const prefersTemporalAlbum = hasTemporalContributingAlbum(details, rawGroupImages);
 
     let jobVideoKey: string | null = prefersTemporalAlbum ? null : (providedVideoKey || null);
-    let jobImageKey: string | null = null;
+    let jobImageKey: string | null = providedImageKey || null;
     let temporalAlbumWon = false;
     const uploadedGroupImages: Array<Record<string, any>> = [];
 
@@ -57134,6 +61812,30 @@ app.post("/api/agent/events", async (c) => {
             : typeof entry.frame_jpeg_base64 === "string"
             ? entry.frame_jpeg_base64
             : "";
+        const providedEntryImageKey =
+          typeof entry.image_key === "string" ? entry.image_key.trim() : "";
+        const providedEntryImageUrl =
+          typeof entry.image_url === "string" ? entry.image_url.trim() : "";
+        if (!entryImageBase64.trim() && providedEntryImageKey) {
+          uploadedGroupImages.push({
+            camera_id: entry.camera_id ?? entry.cameraId ?? null,
+            camera_name:
+              typeof entry.camera_name === "string"
+                ? entry.camera_name
+                : typeof entry.cameraName === "string"
+                ? entry.cameraName
+                : null,
+            snapshot_ts_utc_iso:
+              typeof entry.snapshot_ts_utc_iso === "string"
+                ? entry.snapshot_ts_utc_iso
+                : typeof entry.snapshotTsUtcIso === "string"
+                ? entry.snapshotTsUtcIso
+                : null,
+            image_key: providedEntryImageKey,
+            image_url: providedEntryImageUrl || buildMediaUrl(providedEntryImageKey),
+          });
+          continue;
+        }
         if (!entryImageBase64.trim()) continue;
 
         try {
@@ -57228,6 +61930,14 @@ app.post("/api/agent/events", async (c) => {
         } catch (err) {
           console.error("[JOB ALERT] Failed to process deferred video:", err);
         }
+      }
+    }
+
+    if (jobImageKey && uploadedGroupImages.length === 0) {
+      details.image_key = jobImageKey;
+      details.image_url = providedImageUrl || buildMediaUrl(jobImageKey);
+      if (!jobVideoKey) {
+        details.media_type = "image";
       }
     }
 
@@ -57428,6 +62138,49 @@ app.post("/api/agent/events", async (c) => {
     });
   }
 
+  const publishedCrossCameraHunts = Array.isArray(
+    detailsObject.published_cross_camera_hunts ?? detailsObject.publishedCrossCameraHunts
+  )
+    ? ((detailsObject.published_cross_camera_hunts ??
+        detailsObject.publishedCrossCameraHunts) as unknown[])
+    : [];
+  const originalEventType = normalizeText(
+    detailsObject.original_event_type ?? detailsObject.originalEventType
+  ).toLowerCase();
+  const originSegmentId =
+    normalizeText(detailsObject.shared_segment_id ?? detailsObject.sharedSegmentId) ||
+    extractSharedSegmentIdFromScopedRunId(correlationIds.stepRunId) ||
+    extractSharedSegmentIdFromScopedRunId(correlationIds.agentRunId) ||
+    "";
+  const stepIdForCrossCamera = clampInteger(
+    detailsObject.step_id ?? detailsObject.stepId
+  );
+  if (
+    publishedCrossCameraHunts.length > 0 &&
+    originalEventType === "temporal_report" &&
+    originSegmentId &&
+    correlationIds.jobRunId &&
+    stepIdForCrossCamera > 0
+  ) {
+    try {
+      await fanOutSharedCrossCameraUpdate(c.env, {
+        userId: String(userId),
+        jobRunId: correlationIds.jobRunId,
+        originSegmentId,
+        stepId: stepIdForCrossCamera,
+        publishedCrossCameraHunts,
+      });
+    } catch (crossCameraError) {
+      console.error("[SHARED JOB] Failed to fan out cross-camera watchlist update", {
+        userId,
+        jobRunId: correlationIds.jobRunId,
+        originSegmentId,
+        stepIdForCrossCamera,
+        error: crossCameraError,
+      });
+    }
+  }
+
   const readTrimmedString = (...values: unknown[]): string => {
     for (const value of values) {
       if (typeof value !== "string") continue;
@@ -57517,6 +62270,21 @@ app.post("/api/agent/events", async (c) => {
       jobName,
       hasJobId: jobId !== null,
     };
+  };
+
+  const readBlockedCameraNames = (): string[] => {
+    if (!Array.isArray(detailsObject.blocked_cameras)) {
+      return [];
+    }
+
+    return detailsObject.blocked_cameras
+      .map((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return "";
+        }
+        return readTrimmedString((entry as Record<string, unknown>).camera_name);
+      })
+      .filter((entry): entry is string => !!entry);
   };
 
   // Insert notification for AI detections
@@ -57615,6 +62383,23 @@ app.post("/api/agent/events", async (c) => {
     });
   }
 
+  if (eventType === "camera_start_blocked" && cameraId) {
+    const cameraName = await readNotificationCameraName();
+    const device = readTrimmedString(detailsObject.device).toUpperCase() || "CPU/GPU";
+    const title = cameraName ? `Camera Start Blocked - ${cameraName}` : "Camera Start Blocked";
+    const notificationMessage =
+      readTrimmedString(message) ||
+      (cameraName
+        ? `${cameraName} could not start because available ${device} memory is too low.`
+        : `A camera could not start because available ${device} memory is too low.`);
+
+    await insertBellNotification({
+      type: "camera_start_blocked",
+      title,
+      message: notificationMessage,
+    });
+  }
+
   if (eventType === "job_staled") {
     const { jobId, jobName, hasJobId } = readJobNotificationContext();
     const title = jobName ? `Job Stalled: ${jobName}` : "Job Stalled";
@@ -57646,6 +62431,33 @@ app.post("/api/agent/events", async (c) => {
 
     await insertBellNotification({
       type: "job_start_blocked",
+      title,
+      message: notificationMessage,
+    });
+  }
+
+  if (eventType === "job_step_start_blocked") {
+    const { jobName } = readJobNotificationContext();
+    const stepName = readTrimmedString(detailsObject.step_name);
+    const blockedCameraNames = readBlockedCameraNames();
+    const device = readTrimmedString(detailsObject.device).toUpperCase() || "CPU/GPU";
+    const title = jobName
+      ? `Step Start Blocked: ${jobName}`
+      : stepName
+      ? `Step Start Blocked: ${stepName}`
+      : "Step Start Blocked";
+    const fallbackMessage =
+      stepName && blockedCameraNames.length > 0
+        ? `Step "${stepName}" could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+        : stepName
+        ? `Step "${stepName}" could not start because available ${device} memory is too low.`
+        : blockedCameraNames.length > 0
+        ? `The step could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+        : `The step could not start because available ${device} memory is too low.`;
+    const notificationMessage = readTrimmedString(message) || fallbackMessage;
+
+    await insertBellNotification({
+      type: "job_step_start_blocked",
       title,
       message: notificationMessage,
     });
@@ -57683,6 +62495,37 @@ app.post("/api/agent/events", async (c) => {
       title: notification.title,
       message: notification.message,
     });
+  }
+
+  if (eventType === "camera_start_blocked") {
+    const blockedStates = normalizeBlockedCameraStartStates(
+      detailsObject,
+      cameraId,
+      readTrimmedString(detailsObject.camera_session_id),
+      false
+    );
+    for (const state of blockedStates) {
+      await persistImmediateCameraStartFailureState(c.env.DB, String(userId), {
+        cameraId: state.cameraId,
+        cameraSessionId: state.cameraSessionId,
+        wasRunningBefore: state.wasRunningBefore,
+        status: "blocked",
+        nowIso: now,
+      });
+    }
+  }
+
+  if (eventType === "job_step_start_blocked") {
+    const blockedStates = normalizeBlockedCameraStartStates(detailsObject);
+    for (const state of blockedStates) {
+      await persistImmediateCameraStartFailureState(c.env.DB, String(userId), {
+        cameraId: state.cameraId,
+        cameraSessionId: state.cameraSessionId,
+        wasRunningBefore: state.wasRunningBefore,
+        status: "blocked",
+        nowIso: now,
+      });
+    }
   }
 
   // Handle job runtime state updates based on event type
@@ -57821,7 +62664,7 @@ app.post("/api/agent/events", async (c) => {
     // Update camera status: set offline and clear stale thumbnail, but do not stop the service.
     await c.env.DB.prepare(
       `UPDATE cameras
-       SET is_online = 0, thumbnail_url = NULL, last_thumbnail_update = NULL, updated_at = CURRENT_TIMESTAMP
+       SET is_online = 0, thumbnail_url = NULL, thumbnail_hash = NULL, last_thumbnail_update = NULL, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND user_id = ?`
     )
       .bind(cameraId, userId)
@@ -58801,16 +63644,22 @@ app.post("/api/agent/cameras/:cameraId/start", async (c) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
-  const result = await enqueueStartCameraCommand(c.env, pairing.userId, numericCameraId);
+  const result = await enqueueStartCameraCommand(c.env, pairing.userId, numericCameraId, {
+    waitForTerminalResult: true,
+  });
   if (!result.success) {
-    return c.json(
+    const responseBody =
       result.error_code === OPENAI_KEY_REQUIRED_ERROR
         ? buildOpenAiKeyRequiredErrorBody()
         : result.error_code === ZAI_KEY_REQUIRED_ERROR
         ? buildZAiKeyRequiredErrorBody()
-        : { error: result.error || "Unable to start camera" },
-      400
-    );
+        : {
+            ...(result.failure_details || {}),
+            error: result.error || "Unable to start camera",
+            error_code: result.error_code || null,
+          };
+    const responseStatus = result.http_status === 409 ? 409 : 400;
+    return c.json(responseBody, responseStatus);
   }
 
   return c.json({
@@ -60570,6 +65419,7 @@ app.get("/api/agent/commands", async (c) => {
     command_type: string;
     camera_id: number | null;
     payload: any;
+    job_run_id?: string | null;
   }> = [];
   const deliverIds: number[] = [];
   const completionUpdates: Promise<unknown>[] = [];
@@ -60649,6 +65499,7 @@ app.get("/api/agent/commands", async (c) => {
       command_type: row.command_type,
       camera_id: row.camera_id,
       payload,
+      job_run_id: typeof row.job_run_id === "string" ? row.job_run_id : null,
     });
     if (Number.isInteger(commandId) && commandId > 0) {
       deliverIds.push(commandId);
@@ -60683,8 +65534,25 @@ app.get("/api/agent/commands", async (c) => {
     if (cmd.command_type === "job_stop" && cmd.payload) {
       const jobId = cmd.payload?.job?.id;
       const jobName = cmd.payload?.job?.name;
+      const jobRunId = normalizeText(cmd.job_run_id);
       
       if (jobId) {
+        if (jobRunId) {
+          const sharedSegments = await c.env.DB
+            .prepare(
+              `SELECT 1
+               FROM shared_job_segments
+               WHERE role = 'operator'
+                 AND user_id = ?
+                 AND job_run_id = ?
+               LIMIT 1`
+            )
+            .bind(userId, jobRunId)
+            .first();
+          if (sharedSegments) {
+            continue;
+          }
+        }
         // Upsert runtime state to stopped
         await c.env.DB.prepare(
           `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, stopped_at_utc, last_event_at_utc, created_at, updated_at)
@@ -60770,7 +65638,8 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
   }
 
   const existingCommand = await c.env.DB.prepare(
-    `SELECT id, command_type, payload, target_client_id, target_exe_id
+    `SELECT id, command_type, payload, target_client_id, target_exe_id,
+            execution_domain, remote_owner_public_id, shared_segment_id, job_run_id
      FROM commands
      WHERE id = ? AND user_id = ?`
   )
@@ -60905,6 +65774,45 @@ app.post("/api/agent/commands/:commandId/result", async (c) => {
   }
   if (commandType === "drakon_find_start" || commandType === "drakon_find_cancel") {
     await dispatchQueuedDrakonFindSearches(c.env);
+  }
+
+  const sharedSegmentId = normalizeText((existingCommand as any)?.shared_segment_id);
+  const executionDomain = normalizeText((existingCommand as any)?.execution_domain).toLowerCase();
+  if (
+    sharedSegmentId &&
+    executionDomain.startsWith("shared_operator:")
+  ) {
+    const ownerSegment = await getSharedJobSegmentByIdForUser(
+      c.env.DB,
+      userId,
+      sharedSegmentId,
+      "owner"
+    );
+    if (ownerSegment && normalizeText(ownerSegment.operator_public_id)) {
+      try {
+        const centralContext = await ensureSharedFindRelayClientForAppUser(c.env, userId);
+        sendSharedFindRelayClientMessage(centralContext.publicId, {
+          type: "shared_job_command_result",
+          operator_public_id: normalizeText(ownerSegment.operator_public_id),
+          operator_job_run_id:
+            normalizeText((existingCommand as any)?.job_run_id) ||
+            normalizeText(ownerSegment.job_run_id),
+          request_id: normalizeText(ownerSegment.request_id) || null,
+          segment_id: sharedSegmentId,
+          command_type: commandType,
+          status: normalizedStatus,
+          result: body.result ?? null,
+          error: typeof body.error === "string" ? body.error : null,
+          reported_at: now,
+        });
+      } catch (relayError) {
+        console.error("[SHARED JOB] Failed to relay command result to operator", {
+          commandId,
+          sharedSegmentId,
+          error: relayError,
+        });
+      }
+    }
   }
 
   return c.json({ success: true });
@@ -67667,12 +72575,46 @@ async function installHubTaskIntoRuntime(
         }
         usedPositiveCameraIds.add(cameraId);
       }
+      const cameraExecution =
+        cameraId > 0
+          ? buildSharedCameraExecutionDescriptor(
+              await db
+                .prepare(
+                  `SELECT id, name, origin_type, shared_share_id, shared_owner_public_id,
+                          shared_owner_local_camera_id, shared_status, shared_permission_profile,
+                          shared_access_config_json
+                   FROM cameras
+                   WHERE id = ? AND user_id = ?
+                   LIMIT 1`
+                )
+                .bind(cameraId, userId)
+                .first()
+            )
+          : null;
       const targetInsert = await db
         .prepare(
-          `INSERT INTO job_step_targets (step_id, camera_id, slot_key, slot_label, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
+          `INSERT INTO job_step_targets (
+             step_id,
+             camera_id,
+             slot_key,
+             slot_label,
+             execution_domain,
+             execution_owner_public_id,
+             created_at,
+             updated_at
+           )
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .bind(stepId, cameraId, slotKey, slotLabel || null, now, now)
+        .bind(
+          stepId,
+          cameraId,
+          slotKey,
+          slotLabel || null,
+          cameraExecution?.executionDomain || "local",
+          cameraExecution?.ownerPublicId || null,
+          now,
+          now
+        )
         .run();
       const targetId = Number(targetInsert.meta.last_row_id || 0);
       if (Number.isInteger(targetId) && targetId > 0) {
@@ -68917,13 +73859,18 @@ app.post("/api/job-steps/:stepId/targets", anyAuthMiddleware, async (c) => {
   }
 
   const camera = await c.env.DB.prepare(
-    `SELECT id, name FROM cameras WHERE id = ? AND user_id = ? LIMIT 1`
+    `SELECT id, name, origin_type, shared_share_id, shared_owner_public_id,
+            shared_owner_local_camera_id, shared_status, shared_permission_profile,
+            shared_access_config_json
+     FROM cameras
+     WHERE id = ? AND user_id = ? LIMIT 1`
   )
     .bind(cameraId, user.id)
     .first();
   if (!camera) {
     return c.json({ error: "Camera not found" }, 404);
   }
+  const cameraExecution = buildSharedCameraExecutionDescriptor(camera);
 
   const duplicateTarget = await c.env.DB.prepare(
     `SELECT 1 FROM job_step_targets WHERE step_id = ? AND camera_id = ? LIMIT 1`
@@ -68937,10 +73884,26 @@ app.post("/api/job-steps/:stepId/targets", anyAuthMiddleware, async (c) => {
   const now = new Date().toISOString();
 
   const result = await c.env.DB.prepare(
-    `INSERT INTO job_step_targets (step_id, camera_id, slot_key, slot_label, created_at, updated_at)
-     VALUES (?, ?, NULL, NULL, ?, ?)`
+    `INSERT INTO job_step_targets (
+       step_id,
+       camera_id,
+       slot_key,
+       slot_label,
+       execution_domain,
+       execution_owner_public_id,
+       created_at,
+       updated_at
+     )
+     VALUES (?, ?, NULL, NULL, ?, ?, ?, ?)`
   )
-    .bind(stepId, cameraId, now, now)
+    .bind(
+      stepId,
+      cameraId,
+      cameraExecution?.executionDomain || "local",
+      cameraExecution?.ownerPublicId || null,
+      now,
+      now
+    )
     .run();
 
   const target = await c.env.DB.prepare(
@@ -69006,13 +73969,18 @@ app.patch("/api/job-steps/:stepId/targets/:targetId", anyAuthMiddleware, async (
     }
 
     const camera = await c.env.DB.prepare(
-      `SELECT id, name FROM cameras WHERE id = ? AND user_id = ? LIMIT 1`
+      `SELECT id, name, origin_type, shared_share_id, shared_owner_public_id,
+              shared_owner_local_camera_id, shared_status, shared_permission_profile,
+              shared_access_config_json
+       FROM cameras
+       WHERE id = ? AND user_id = ? LIMIT 1`
     )
       .bind(nextCameraId, user.id)
       .first();
     if (!camera) {
       return c.json({ error: "Camera not found" }, 404);
     }
+    const cameraExecution = buildSharedCameraExecutionDescriptor(camera);
 
     if (existingCameraId !== nextCameraId) {
       const slotKey = normalizeText((existingTarget as any)?.slot_key);
@@ -69074,7 +74042,10 @@ app.patch("/api/job-steps/:stepId/targets/:targetId", anyAuthMiddleware, async (
       if (slotKey && Number.isInteger(jobId) && jobId > 0) {
         await c.env.DB.prepare(
           `UPDATE job_step_targets
-           SET camera_id = ?, updated_at = ?
+           SET camera_id = ?,
+               execution_domain = ?,
+               execution_owner_public_id = ?,
+               updated_at = ?
            WHERE id IN (
              SELECT jst.id
              FROM job_step_targets jst
@@ -69082,7 +74053,14 @@ app.patch("/api/job-steps/:stepId/targets/:targetId", anyAuthMiddleware, async (
              WHERE js.job_id = ? AND jst.slot_key = ?
            )`
         )
-          .bind(nextCameraId, now, jobId, slotKey)
+          .bind(
+            nextCameraId,
+            cameraExecution?.executionDomain || "local",
+            cameraExecution?.ownerPublicId || null,
+            now,
+            jobId,
+            slotKey
+          )
           .run();
 
         await c.env.DB.prepare(
@@ -69123,10 +74101,20 @@ app.patch("/api/job-steps/:stepId/targets/:targetId", anyAuthMiddleware, async (
 
         await c.env.DB.prepare(
           `UPDATE job_step_targets
-           SET camera_id = ?, updated_at = ?
+           SET camera_id = ?,
+               execution_domain = ?,
+               execution_owner_public_id = ?,
+               updated_at = ?
            WHERE id = ? AND step_id = ?`
         )
-          .bind(nextCameraId, now, targetId, stepId)
+          .bind(
+            nextCameraId,
+            cameraExecution?.executionDomain || "local",
+            cameraExecution?.ownerPublicId || null,
+            now,
+            targetId,
+            stepId
+          )
           .run();
 
         await c.env.DB.prepare(
@@ -71188,8 +76176,9 @@ app.post("/api/scheduler/tick", async (c) => {
     await runJobSchedulerTick(c.env, {
       lockDurationMs: 1800,
       slotLookbackSeconds: 2,
-    });
+    }, buildSharedJobExecutionOptions());
     await dispatchQueuedDrakonFindSearches(c.env);
+    await dispatchQueuedCameraImportGpuJobs(c.env);
     
     console.log("[SCHEDULER TICK HTTP] Scheduler tick completed successfully");
     return c.json({ 
@@ -71217,8 +76206,9 @@ export default {
         runJobSchedulerTick(env, {
           lockDurationMs: 1800,
           slotLookbackSeconds: 65,
-        }),
+        }, buildSharedJobExecutionOptions()),
         dispatchQueuedDrakonFindSearches(env),
+        dispatchQueuedCameraImportGpuJobs(env),
       ]).then(
         () => undefined
       )

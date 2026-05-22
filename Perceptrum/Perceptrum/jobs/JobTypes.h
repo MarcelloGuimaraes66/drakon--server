@@ -260,6 +260,13 @@ struct JobTriggerSnapshot {
 struct JobStartPayload {
     int version = 1;
     std::string job_run_id;
+    std::string shared_segment_id;
+    std::string shared_execution_domain;
+    std::string shared_owner_public_id;
+    std::string shared_operator_public_id;
+    int shared_operator_job_id = -1;
+    bool shared_allow_event_media = false;
+    bool shared_cross_camera_federation_required = false;
     // Optional global semantic end for the overall execution (ISO UTC).
     std::string execution_target_end_utc;
     JobDefSnapshot job;

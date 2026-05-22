@@ -83,3 +83,15 @@ inline std::string GetPerceptrumBaseUrl() {
 
     return "http://localhost:4000";
 }
+
+// Order of precedence:
+// 1) APP_AGENT_BASE_URL env var injected by the desktop host
+// 2) fall back to the regular Perceptrum base URL
+inline std::string GetPerceptrumAgentBaseUrl() {
+    std::string env = NormalizeBaseUrl(ReadEnvVar("APP_AGENT_BASE_URL"));
+    if (!env.empty()) {
+        return env;
+    }
+
+    return GetPerceptrumBaseUrl();
+}

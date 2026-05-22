@@ -252,6 +252,98 @@ export function normalizeTimeToHHMMSS(time: string): string | null {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
+export type RepeatedTimeUnit = 'minutes' | 'hours';
+
+export interface RepeatedTimeWindowInput {
+  start_time: string;
+  duration_value: number;
+  duration_unit: RepeatedTimeUnit;
+  repeat_value: number;
+  repeat_unit: RepeatedTimeUnit;
+  occurrence_count: number;
+}
+
+function normalizePositiveInteger(value: number): number | null {
+  if (!Number.isInteger(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
+function repeatedUnitToSeconds(value: number, unit: RepeatedTimeUnit): number | null {
+  const normalizedValue = normalizePositiveInteger(value);
+  if (normalizedValue === null) {
+    return null;
+  }
+  if (unit === 'hours') {
+    return normalizedValue * 3600;
+  }
+  if (unit === 'minutes') {
+    return normalizedValue * 60;
+  }
+  return null;
+}
+
+function formatSecondsToTimeString(totalSeconds: number): string | null {
+  if (!Number.isInteger(totalSeconds) || totalSeconds < 0 || totalSeconds >= 24 * 3600) {
+    return null;
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+export function buildRepeatedTimeWindows(
+  input: RepeatedTimeWindowInput
+): { windows: TimeWindow[]; first_start_time: string; last_end_time: string } | { error: string } {
+  const startSeconds = parseTimeToSeconds(input.start_time);
+  if (startSeconds === null) {
+    return { error: 'Invalid start time format' };
+  }
+
+  const durationSeconds = repeatedUnitToSeconds(input.duration_value, input.duration_unit);
+  if (durationSeconds === null) {
+    return { error: 'Duration must be a whole number greater than zero' };
+  }
+
+  const repeatSeconds = repeatedUnitToSeconds(input.repeat_value, input.repeat_unit);
+  if (repeatSeconds === null) {
+    return { error: 'Repeat interval must be a whole number greater than zero' };
+  }
+
+  const occurrenceCount = normalizePositiveInteger(input.occurrence_count);
+  if (occurrenceCount === null) {
+    return { error: 'Occurrences must be a whole number greater than zero' };
+  }
+
+  if (occurrenceCount > 1 && durationSeconds > repeatSeconds) {
+    return { error: 'Duration cannot be longer than the repeat interval' };
+  }
+
+  const windows: TimeWindow[] = [];
+  for (let index = 0; index < occurrenceCount; index += 1) {
+    const windowStartSeconds = startSeconds + repeatSeconds * index;
+    const windowEndSeconds = windowStartSeconds + durationSeconds;
+    const startTime = formatSecondsToTimeString(windowStartSeconds);
+    const endTime = formatSecondsToTimeString(windowEndSeconds);
+    if (!startTime || !endTime) {
+      return { error: 'The generated sequence must stay within the same day' };
+    }
+    windows.push({
+      start_time: startTime,
+      end_time: endTime,
+    });
+  }
+
+  return {
+    windows,
+    first_start_time: windows[0]?.start_time || '',
+    last_end_time: windows[windows.length - 1]?.end_time || '',
+  };
+}
+
 /**
  * Validate a single time window
  */

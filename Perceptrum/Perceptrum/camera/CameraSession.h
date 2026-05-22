@@ -71,6 +71,7 @@ public:
     ~CameraSession();
 
     const std::string& id() const { return config_.id; }
+    const CameraConfig& getConfig() const { return config_; }
 
     void start();
     void stop();
@@ -142,13 +143,13 @@ private:
     void sendThumbnail_(const cv::Mat& frame);
 
     void thumbnailLoop_();
-    void enqueueThumbnail_(std::string b64);
+    void enqueueThumbnail_(std::vector<unsigned char> jpegBytes);
 
     std::thread thumbnailThread_;
     std::atomic<bool> thumbnailStop_{ false };
     std::mutex thumbnailMutex_;
     std::condition_variable thumbnailCv_;
-    std::string pendingThumbnailB64_;
+    std::vector<unsigned char> pendingThumbnailBytes_;
     bool thumbnailPending_{ false };
 
 

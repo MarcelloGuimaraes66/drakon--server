@@ -152,7 +152,8 @@ namespace
         return ports;
     }
 
-    std::uint16_t ChooseDesktopBackendPort()
+    std::uint16_t ChooseDesktopBackendPort(
+        std::unordered_set<std::uint16_t> reservedPorts = {})
     {
         auto const occupiedPorts = ReadOccupiedTcpPorts();
         constexpr std::uint16_t kDynamicPortStart = 49152;
@@ -170,7 +171,8 @@ namespace
         for (int attempt = 0; attempt < 64; ++attempt)
         {
             auto const candidate = static_cast<std::uint16_t>(distribution(generator));
-            if (occupiedPorts.find(candidate) == occupiedPorts.end())
+            if (occupiedPorts.find(candidate) == occupiedPorts.end() &&
+                reservedPorts.find(candidate) == reservedPorts.end())
             {
                 return candidate;
             }
@@ -179,7 +181,8 @@ namespace
         for (std::uint32_t candidate = kDynamicPortStart; candidate <= kDynamicPortEnd; ++candidate)
         {
             auto const narrowedCandidate = static_cast<std::uint16_t>(candidate);
-            if (occupiedPorts.find(narrowedCandidate) == occupiedPorts.end())
+            if (occupiedPorts.find(narrowedCandidate) == occupiedPorts.end() &&
+                reservedPorts.find(narrowedCandidate) == reservedPorts.end())
             {
                 return narrowedCandidate;
             }
@@ -286,6 +289,7 @@ namespace
             // Use a random high port by default so the local desktop backend does not keep colliding on :4000.
             config.port = ChooseDesktopBackendPort();
         }
+        config.agentPort = ChooseDesktopBackendPort({ config.port });
 
         auto const envWorkspaceRoot = ReadEnvValue(L"DRAKON_WORKSPACE_ROOT");
         config.workspaceRoot = FirstExistingPath({
@@ -369,10 +373,12 @@ namespace
         });
 
         config.backendLogPath = config.serviceSessionDirectory / "backend-host.log";
+        config.agentBackendLogPath = config.serviceSessionDirectory / "agent-backend.log";
         config.serviceLogPath = config.serviceSessionDirectory / "service-cpp.log";
         config.systemActivityLogPath = config.serviceSessionDirectory / "logs" / "system-activity.jsonl";
         std::filesystem::create_directories(config.systemActivityLogPath.parent_path());
         config.uiBaseUrl = L"http://127.0.0.1:" + std::to_wstring(config.port);
+        config.agentBaseUrl = L"http://127.0.0.1:" + std::to_wstring(config.agentPort);
     }
 }
 

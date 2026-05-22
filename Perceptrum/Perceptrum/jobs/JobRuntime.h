@@ -24,6 +24,7 @@ public:
     // Called by AgentCore::processCommand_
     void onJobStartCommand(const json& cmd);
     void onJobStopCommand(const json& cmd);
+    void onCrossCameraUpdateCommand(const json& cmd);
 
 private:
     struct JobInstance {

@@ -134,8 +134,14 @@ export default function NotificationsDropdown({
     if (type === "job_start_blocked") {
       return <AlertCircle className="w-5 h-5 text-amber-300" />;
     }
+    if (type === "job_step_start_blocked") {
+      return <AlertCircle className="w-5 h-5 text-amber-300" />;
+    }
     if (type === "job_started") {
       return <CirclePlay className="w-5 h-5 text-emerald-400" />;
+    }
+    if (type === "camera_start_blocked") {
+      return <Cpu className="w-5 h-5 text-amber-300" />;
     }
     if (type === "agent_api_error") {
       return <Cpu className="w-5 h-5 text-rose-400" />;
@@ -150,7 +156,9 @@ export default function NotificationsDropdown({
     if (type === "ai_detection") return "bg-red-500/5";
     if (type === "camera_connection_failed") return "bg-orange-500/5";
     if (type === "camera_online") return "bg-emerald-500/5";
-    if (type === "job_staled" || type === "job_start_blocked") return "bg-amber-500/5";
+    if (type === "job_staled" || type === "job_start_blocked" || type === "job_step_start_blocked")
+      return "bg-amber-500/5";
+    if (type === "camera_start_blocked") return "bg-amber-500/5";
     if (type === "job_started") return "bg-emerald-500/5";
     if (type === "agent_api_error") return "bg-rose-500/5";
     if (type === "shared_find_invitation") return "bg-amber-500/5";
@@ -181,6 +189,7 @@ export default function NotificationsDropdown({
     if (
       type === "job_staled" ||
       type === "job_start_blocked" ||
+      type === "job_step_start_blocked" ||
       type === "job_started"
     ) {
       return {
@@ -189,6 +198,12 @@ export default function NotificationsDropdown({
           type === "job_started"
             ? "bg-emerald-500/20 text-emerald-300"
             : "bg-amber-500/20 text-amber-300",
+      };
+    }
+    if (type === "camera_start_blocked") {
+      return {
+        label: "Camera",
+        className: "bg-amber-500/20 text-amber-300",
       };
     }
     if (type === "agent_api_error") {
@@ -212,13 +227,15 @@ export default function NotificationsDropdown({
     }
     if (
       notification.type === "camera_connection_failed" ||
-      notification.type === "camera_online"
+      notification.type === "camera_online" ||
+      notification.type === "camera_start_blocked"
     ) {
       return "/cameras";
     }
     if (
       notification.type === "job_staled" ||
       notification.type === "job_start_blocked" ||
+      notification.type === "job_step_start_blocked" ||
       notification.type === "job_started"
     ) {
       return "/jobs";

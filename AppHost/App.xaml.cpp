@@ -74,6 +74,7 @@ namespace
         auto const powerShellPath = ResolvePowerShellPath();
         std::vector<std::filesystem::path> cleanupTargets{
             serviceSessionDirectory / "backend-host.log",
+            serviceSessionDirectory / "agent-backend.log",
             serviceSessionDirectory / "service-cpp.log",
             serviceSessionDirectory / "logs",
             serviceSessionDirectory / "webview2",
@@ -441,6 +442,7 @@ namespace winrt::DrakonDesktop::implementation
             SetCurrentProcessExplicitAppUserModelID(runtimeConfig.appUserModelId.c_str());
         }
         SetEnvironmentVariableW(L"APP_BASE_URL", runtimeConfig.uiBaseUrl.c_str());
+        SetEnvironmentVariableW(L"APP_AGENT_BASE_URL", runtimeConfig.agentBaseUrl.c_str());
         SetEnvironmentVariableW(L"DRAKON_UI_URL", (runtimeConfig.uiBaseUrl + L"/dashboard").c_str());
         SetEnvironmentVariableW(
             L"WEBVIEW2_USER_DATA_FOLDER",

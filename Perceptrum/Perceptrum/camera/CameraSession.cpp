@@ -2594,7 +2594,7 @@ static bool loadMochaAuth(std::string& baseUrl,
     std::string& clientId)
 {
     // Shared config for backend base URL
-    baseUrl = GetPerceptrumBaseUrl();
+    baseUrl = GetPerceptrumAgentBaseUrl();
 
     PairingClient pairing(baseUrl);
     bool ok = pairing.loadSavedToken(exeToken, clientId);
@@ -10578,13 +10578,13 @@ void CameraSession::inferenceLoop_() {
 
 
 
-void CameraSession::enqueueThumbnail_(std::string b64) {
+void CameraSession::enqueueThumbnail_(std::vector<unsigned char> jpegBytes) {
     if (thumbnailStop_.load()) return;
 
     // Keep only the most recent thumbnail (overwrite previous)
     {
         std::lock_guard<std::mutex> lock(thumbnailMutex_);
-        pendingThumbnailB64_ = std::move(b64);
+        pendingThumbnailBytes_ = std::move(jpegBytes);
         thumbnailPending_ = true;
     }
     thumbnailCv_.notify_one();
@@ -10594,7 +10594,7 @@ void CameraSession::thumbnailLoop_() {
     Logger::instance().logDebug(config_.id, "thumbnailLoop_: started");
 
     while (!thumbnailStop_.load()) {
-        std::string b64;
+        std::vector<unsigned char> jpegBytes;
 
         {
             std::unique_lock<std::mutex> lock(thumbnailMutex_);
@@ -10605,16 +10605,16 @@ void CameraSession::thumbnailLoop_() {
             if (thumbnailStop_.load()) break;
 
             // Take latest thumbnail and clear pending flag
-            b64 = std::move(pendingThumbnailB64_);
-            pendingThumbnailB64_.clear();
+            jpegBytes = std::move(pendingThumbnailBytes_);
+            pendingThumbnailBytes_.clear();
             thumbnailPending_ = false;
         }
 
         // Call owner outside the lock (never block enqueue/capture)
         try {
             AgentCore* owner = owner_;
-            if (owner && !b64.empty()) {
-                owner->sendThumbnail(config_.id, b64);
+            if (owner && !jpegBytes.empty()) {
+                owner->sendThumbnail(config_.id, jpegBytes);
             }
         }
         catch (...) {
@@ -10667,15 +10667,8 @@ void CameraSession::sendThumbnail_(const cv::Mat& frame) {
             return;
         }
 
-        // 3) Base64
-        std::string imgB64 = base64_encode(
-            reinterpret_cast<const unsigned char*>(jpgBuf.data()),
-            jpgBuf.size()
-        );
-
-        // 4) Delega para o AgentCore mandar para o Mocha
-        //owner_->sendThumbnail(config_.id, imgB64);
-        enqueueThumbnail_(std::move(imgB64));
+        // 3) Delega os bytes JPEG já comprimidos para o AgentCore.
+        enqueueThumbnail_(std::move(jpgBuf));
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug(

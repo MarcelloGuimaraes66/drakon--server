@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <opencv2/opencv.hpp>
 #include <functional>
 #include <vector>
@@ -54,6 +56,7 @@ public:
         int retentionDays = 0,
         bool hydrateExistingSegments = true
     );
+    ~FrameDiskWriter();
 
     void setEnabled(bool enabled);
     void setMinInterval(std::chrono::milliseconds interval);
@@ -171,7 +174,6 @@ private:
     // We write 10s and/or 60s directly depending on the active capture profiles.
     SegmentWriter writer10_;
     SegmentWriter writer60_;
-    SegmentWriter writer300_;
 
     int framesIn10_{ 0 };
     int framesIn60_{ 0 };
@@ -188,10 +190,6 @@ private:
     // Paths of short clips
     std::deque<std::string> tenSecondPaths_;   // ~10s clips
     std::deque<std::string> sixtySecondPaths_; // ~60s clips
-
-    // Legacy merge thresholds kept only for dormant compatibility helpers.
-    static constexpr int MAX_10S_CLIPS = 6;
-    static constexpr int MAX_60S_CLIPS = 5;
 
     bool canSaveNow_(std::chrono::steady_clock::time_point now) const;
     std::chrono::milliseconds activeMinInterval_() const;
@@ -295,8 +293,30 @@ private:
         bool shouldCopyInferenceVideo,
         const std::string& reason);
 
-    // merge helpers (re-encode from existing short clips)
-    bool mergeTenSecondClipsInto60_(const cv::Size& size);
-    bool mergeSixtySecondClipsInto300_(const cv::Size& size);
+    void saveLocked_(const cv::Mat& frame);
+    void flushVideoClipIfIdleLocked_(std::chrono::milliseconds idleThreshold);
+    MaterializeOpenClipResult materializeOpenClipThroughUtcLocked_(
+        const std::chrono::system_clock::time_point& targetUtc,
+        int preferredClipSeconds);
+    void forceFinalizeAllOpenClipsLocked_(const std::string& reason);
+
+    void workerLoop_();
+    void beginSynchronousWorkerBarrier_(bool dropAsyncSaves = true);
+    void endSynchronousWorkerBarrier_();
+
+    bool asyncWorkerEnabled_{ true };
+    mutable std::mutex workerStateMutex_;
+    std::condition_variable workerCv_;
+    std::condition_variable workerIdleCv_;
+    std::thread workerThread_;
+    cv::Mat pendingFrameBuffer_;
+    cv::Mat workerFrameBuffer_;
+    bool pendingFrameReady_{ false };
+    bool pendingFlushRequested_{ false };
+    std::chrono::milliseconds pendingFlushIdleThreshold_{ std::chrono::milliseconds(0) };
+    bool workerStopRequested_{ false };
+    bool workerPauseRequested_{ false };
+    bool dropAsyncSavesWhilePaused_{ false };
+    bool workerActive_{ false };
 
 };

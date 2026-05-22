@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Camera as DashboardCamera, DashboardPayload } from "@/react-app/lib/DashboardSummaryStore";
 import { brand } from "@/shared/brand";
 import {
@@ -205,6 +205,7 @@ export default function SystemActivityModal({
   const [openMonitorLoading, setOpenMonitorLoading] = useState(false);
   const [openMonitorError, setOpenMonitorError] = useState<string | null>(null);
   const [openMonitorLastSuccessAt, setOpenMonitorLastSuccessAt] = useState<string | null>(null);
+  const openMonitorEtagRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -221,18 +222,31 @@ export default function SystemActivityModal({
       activeController = controller;
       setOpenMonitorLoading(true);
       try {
+        const headers: Record<string, string> = {
+          Accept: "application/json",
+        };
+        if (openMonitorEtagRef.current) {
+          headers["If-None-Match"] = openMonitorEtagRef.current;
+        }
+
         const response = await fetch("/api/open-monitor", {
           credentials: "include",
-          headers: {
-            Accept: "application/json",
-          },
+          headers,
           signal: controller.signal,
         });
+        if (response.status === 304) {
+          if (!isDisposed) {
+            setOpenMonitorError(null);
+            setOpenMonitorLastSuccessAt(new Date().toISOString());
+          }
+          return;
+        }
         if (!response.ok) {
           const responseText = (await response.text()).trim();
           const details = responseText ? `: ${responseText.slice(0, 160)}` : "";
           throw new Error(`Open Monitor ${response.status}${details}`);
         }
+        openMonitorEtagRef.current = response.headers.get("etag");
         const payload = (await response.json()) as OpenMonitorResponse;
         if (!isDisposed) {
           setOpenMonitor(payload);

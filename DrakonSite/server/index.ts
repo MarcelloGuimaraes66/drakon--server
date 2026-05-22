@@ -23,6 +23,7 @@ import {
   routeWorkspaceRelayClientMessage,
   unregisterWorkspaceRelayConnection,
 } from "../src/worker/workspaceRelayState";
+import { startLocalAgentIngressPump } from "../src/worker/localAgentIngress";
 
 if (!(globalThis as any).crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -41,6 +42,9 @@ const storageRoot = process.env.STORAGE_ROOT
   : path.resolve(process.cwd(), "storage");
 const r2Root = path.join(storageRoot, "r2");
 const appBaseUrl = process.env.APP_BASE_URL || `http://localhost:${port}`;
+const agentBaseUrl = String(process.env.APP_AGENT_BASE_URL || "").trim().replace(/\/+$/, "");
+const serverRole = String(process.env.APP_SERVER_ROLE || "ui").trim().toLowerCase();
+const isAgentServer = serverRole === "agent";
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
 
@@ -90,6 +94,59 @@ async function createDatabase() {
   return new PgD1Database(pool);
 }
 
+function isAgentRequestPath(pathname: string) {
+  return pathname === "/api/agent" || pathname.startsWith("/api/agent/");
+}
+
+async function forwardHttpRequest(req: any, targetUrl: URL) {
+  const method = req.method || "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
+  const init: RequestInit & { duplex?: "half" } = {
+    method,
+    headers: req.headers as any,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return fetch(new Request(targetUrl.toString(), init));
+}
+
+async function writeForwardedResponse(res: any, response: Response) {
+  res.statusCode = response.status;
+
+  const getSetCookie =
+    typeof (response.headers as any).getSetCookie === "function"
+      ? (response.headers as any).getSetCookie()
+      : null;
+  const setCookieValues: string[] = Array.isArray(getSetCookie)
+    ? getSetCookie
+    : (() => {
+        const single = response.headers.get("set-cookie");
+        return single ? [single] : [];
+      })();
+
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === "set-cookie") return;
+    res.setHeader(key, value);
+  });
+
+  if (setCookieValues.length > 0) {
+    res.setHeader(
+      "set-cookie",
+      setCookieValues.map((value) => rewriteSetCookie(value))
+    );
+  }
+
+  if (response.body) {
+    Readable.fromWeb(response.body as any).pipe(res);
+  } else {
+    res.end();
+  }
+}
+
 async function startServer() {
   const { default: worker } = await import("../src/worker/index");
   const DB = await createDatabase();
@@ -117,8 +174,15 @@ async function startServer() {
     R2_PUBLIC_BASE_URL:
       process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
+    APP_AGENT_BASE_URL: process.env.APP_AGENT_BASE_URL || "",
+    APP_SERVER_ROLE: process.env.APP_SERVER_ROLE || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    LOCAL_AGENT_INGEST_MODE: process.env.LOCAL_AGENT_INGEST_MODE || "",
+    LOCAL_AGENT_INGEST_POLL_MS: process.env.LOCAL_AGENT_INGEST_POLL_MS || "",
+    LOCAL_AGENT_EVENT_BATCH_SIZE: process.env.LOCAL_AGENT_EVENT_BATCH_SIZE || "",
+    LOCAL_AGENT_LATEST_BATCH_SIZE: process.env.LOCAL_AGENT_LATEST_BATCH_SIZE || "",
+    LOCAL_AGENT_EVENT_MAX_ATTEMPTS: process.env.LOCAL_AGENT_EVENT_MAX_ATTEMPTS || "",
     APP_SCHEMA_SCOPE: process.env.APP_SCHEMA_SCOPE || "",
     CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
     CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
@@ -126,6 +190,13 @@ async function startServer() {
     CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
     CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };
+  if (isAgentServer) {
+    startLocalAgentIngressPump({
+      env: env as any,
+      dispatch: (request) =>
+        worker.fetch(request, env as any, { waitUntil: () => {} } as any),
+    });
+  }
   const relayWss = new WebSocketServer({ noServer: true });
   const workspaceRelayWss = new WebSocketServer({ noServer: true });
 
@@ -140,6 +211,24 @@ async function startServer() {
 
     if (url.pathname.startsWith("/media/")) {
       await serveMedia(res, url.pathname);
+      return;
+    }
+
+    if (isAgentServer && !isAgentRequestPath(url.pathname)) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return;
+    }
+
+    if (!isAgentServer && agentBaseUrl && isAgentRequestPath(url.pathname)) {
+      const forwarded = await forwardHttpRequest(
+        req,
+        new URL(
+          `${url.pathname}${url.search}`,
+          agentBaseUrl.endsWith("/") ? agentBaseUrl : `${agentBaseUrl}/`
+        )
+      );
+      await writeForwardedResponse(res, forwarded);
       return;
     }
 
@@ -167,36 +256,7 @@ async function startServer() {
       { waitUntil: () => {} } as any
     );
 
-    res.statusCode = response.status;
-
-    const getSetCookie =
-      typeof (response.headers as any).getSetCookie === "function"
-        ? (response.headers as any).getSetCookie()
-        : null;
-    const setCookieValues: string[] = Array.isArray(getSetCookie)
-      ? getSetCookie
-      : (() => {
-          const single = response.headers.get("set-cookie");
-          return single ? [single] : [];
-        })();
-
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() === "set-cookie") return;
-      res.setHeader(key, value);
-    });
-
-    if (setCookieValues.length > 0) {
-      res.setHeader(
-        "set-cookie",
-        setCookieValues.map((value) => rewriteSetCookie(value))
-      );
-    }
-
-    if (response.body) {
-      Readable.fromWeb(response.body as any).pipe(res);
-    } else {
-      res.end();
-    }
+    await writeForwardedResponse(res, response);
   });
 
   relayWss.on("connection", (ws, request) => {
@@ -344,7 +404,9 @@ async function startServer() {
 
   server.listen(port, () => {
     console.log(
-      `[local-server] brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://localhost:${port}`
+      `[local-server] role=${serverRole} brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://localhost:${port}${
+        !isAgentServer && agentBaseUrl ? ` agentProxy=${agentBaseUrl}` : ""
+      }`
     );
   });
 }

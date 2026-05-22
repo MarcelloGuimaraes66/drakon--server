@@ -653,6 +653,25 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
     JobStartPayload out;
     out.version = p.value("version", 1);
     out.job_run_id = safeString(p, "job_run_id");
+    out.shared_segment_id = safeString(p, "shared_segment_id");
+    out.shared_execution_domain = safeString(p, "shared_execution_domain");
+    out.shared_owner_public_id = safeString(p, "shared_owner_public_id");
+    out.shared_operator_public_id = safeString(p, "shared_operator_public_id");
+    out.shared_operator_job_id =
+        optInt(p, "shared_operator_job_id").value_or(-1);
+    out.shared_allow_event_media = readBoolLikeField(
+        p,
+        { "shared_allow_event_media", "sharedAllowEventMedia" },
+        false
+    );
+    out.shared_cross_camera_federation_required = readBoolLikeField(
+        p,
+        {
+            "shared_cross_camera_federation_required",
+            "sharedCrossCameraFederationRequired"
+        },
+        false
+    );
 
     if (!p.contains("job") || !p["job"].is_object()) {
         throw std::runtime_error("job_start payload missing job object");

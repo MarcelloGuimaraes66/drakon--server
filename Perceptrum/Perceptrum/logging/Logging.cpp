@@ -248,7 +248,7 @@ void Logger::enqueueErrorExport_(ErrorExportItem&& item) noexcept {
 bool Logger::flushErrorBatch_(const std::vector<ErrorExportItem>& batch) noexcept {
     if (batch.empty()) return true;
 
-    const std::string baseUrl = trimAscii(GetPerceptrumBaseUrl());
+    const std::string baseUrl = trimAscii(GetPerceptrumAgentBaseUrl());
     if (baseUrl.empty()) {
         safeCerr("[Logger] flushErrorBatch_: empty base URL");
         return false;

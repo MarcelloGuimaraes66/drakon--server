@@ -25,6 +25,7 @@ import {
   resolveDesktopSqliteEncryptionConfig,
 } from "../../DrakonSite/server/sqlite-encryption.ts";
 import worker from "../../DrakonSite/src/worker/index.ts";
+import { startLocalAgentIngressPump } from "../../DrakonSite/src/worker/localAgentIngress.ts";
 
 if (!globalThis.crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -58,6 +59,9 @@ const staticRoot = process.env.APP_STATIC_ROOT
   : "";
 const r2Root = path.join(storageRoot, "r2");
 const appBaseUrl = process.env.APP_BASE_URL || `http://${bindHost}:${port}`;
+const agentBaseUrl = String(process.env.APP_AGENT_BASE_URL || "").trim().replace(/\/+$/, "");
+const serverRole = String(process.env.APP_SERVER_ROLE || "ui").trim().toLowerCase();
+const isAgentServer = serverRole === "agent";
 const serviceSessionDir = process.env.APP_SERVICE_SESSION_DIR
   ? path.resolve(process.env.APP_SERVICE_SESSION_DIR)
   : path.resolve(storageRoot, "desktop-session");
@@ -260,8 +264,15 @@ function createWorkerEnv(DB) {
     R2_PUBLIC_BASE_URL:
       process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
+    APP_AGENT_BASE_URL: process.env.APP_AGENT_BASE_URL || "",
+    APP_SERVER_ROLE: process.env.APP_SERVER_ROLE || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    LOCAL_AGENT_INGEST_MODE: process.env.LOCAL_AGENT_INGEST_MODE || "",
+    LOCAL_AGENT_INGEST_POLL_MS: process.env.LOCAL_AGENT_INGEST_POLL_MS || "",
+    LOCAL_AGENT_EVENT_BATCH_SIZE: process.env.LOCAL_AGENT_EVENT_BATCH_SIZE || "",
+    LOCAL_AGENT_LATEST_BATCH_SIZE: process.env.LOCAL_AGENT_LATEST_BATCH_SIZE || "",
+    LOCAL_AGENT_EVENT_MAX_ATTEMPTS: process.env.LOCAL_AGENT_EVENT_MAX_ATTEMPTS || "",
     CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
     CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
     CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
@@ -725,6 +736,14 @@ async function startServer() {
     }
   }
 
+  if (isAgentServer && runtimeState.env) {
+    startLocalAgentIngressPump({
+      env: runtimeState.env,
+      dispatch: (request) =>
+        worker.fetch(request, runtimeState.env, { waitUntil: () => {} }),
+    });
+  }
+
   const server = createServer(async (req, res) => {
     if (!req.url) {
       res.statusCode = 400;
@@ -771,6 +790,24 @@ async function startServer() {
       return;
     }
 
+    if (isAgentServer && !isAgentRequestPath(url.pathname)) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return;
+    }
+
+    if (!isAgentServer && agentBaseUrl && isAgentRequestPath(url.pathname)) {
+      const forwarded = await forwardHttpRequest(
+        req,
+        new URL(
+          `${url.pathname}${url.search}`,
+          agentBaseUrl.endsWith("/") ? agentBaseUrl : `${agentBaseUrl}/`
+        )
+      );
+      await writeWorkerResponse(res, forwarded);
+      return;
+    }
+
     if (url.pathname.startsWith("/ws/")) {
       res.statusCode = 501;
       res.end("WebSocket not supported in local server");
@@ -797,7 +834,9 @@ async function startServer() {
 
   server.listen(port, bindHost, () => {
     console.log(
-      `[desktop-server] brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://${bindHost}:${port} static=${staticRoot || "<none>"} sessionDir=${serviceSessionDir} health=${runtimeState.ready ? "ready" : "error"}`
+      `[desktop-server] role=${serverRole} brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://${bindHost}:${port} static=${staticRoot || "<none>"} sessionDir=${serviceSessionDir} health=${runtimeState.ready ? "ready" : "error"}${
+        !isAgentServer && agentBaseUrl ? ` agentProxy=${agentBaseUrl}` : ""
+      }`
     );
   });
 }
@@ -927,6 +966,26 @@ function buildForwardHeaders(req, overrides = {}) {
   }
 
   return headers;
+}
+
+function isAgentRequestPath(pathname) {
+  return pathname === "/api/agent" || pathname.startsWith("/api/agent/");
+}
+
+async function forwardHttpRequest(req, targetUrl) {
+  const method = req.method || "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
+  const init = {
+    method,
+    headers: req.headers,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return fetch(new Request(targetUrl.toString(), init));
 }
 
 async function proxyWorkerRequest(req, url, env) {

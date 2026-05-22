@@ -2501,6 +2501,80 @@ void JobRuntime::onJobStopCommand(const json& cmd) {
     cleanupJobFolderAsync(jobId);
 }
 
+void JobRuntime::onCrossCameraUpdateCommand(const json& cmd) {
+    int jobId = -1;
+    int stepId = -1;
+    json publishedHunts = json::array();
+    try {
+        if (cmd.contains("payload") && cmd["payload"].is_object()) {
+            const json& payload = cmd["payload"];
+            jobId = payload.value("job_id", -1);
+            stepId = payload.value("step_id", -1);
+            if (payload.contains("published_cross_camera_hunts") &&
+                payload["published_cross_camera_hunts"].is_array())
+            {
+                publishedHunts = payload["published_cross_camera_hunts"];
+            }
+        }
+    }
+    catch (...) {
+        publishedHunts = json::array();
+    }
+
+    if (jobId <= 0 || stepId <= 0 || !publishedHunts.is_array() || publishedHunts.empty()) {
+        return;
+    }
+
+    const std::string crossCameraStepKey =
+        "job:" + std::to_string(jobId) + "|step:" + std::to_string(stepId);
+    const std::string nowIsoUtc = temporal::nowIso();
+    auto normalizeHunt = [&](const json& rawHunt) -> json {
+        if (!rawHunt.is_object()) {
+            return json::object();
+        }
+        json normalized = rawHunt;
+        if (!normalized.contains("created_at_utc") || !normalized["created_at_utc"].is_string()) {
+            normalized["created_at_utc"] = nowIsoUtc;
+        }
+        if (!normalized.contains("watch_ttl_seconds")) {
+            normalized["watch_ttl_seconds"] = 900;
+        }
+        return normalized;
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(crossCameraHuntsMu_);
+        json& hunts = crossCameraHuntsByStep_[crossCameraStepKey];
+        if (!hunts.is_array()) {
+            hunts = json::array();
+        }
+        for (const auto& rawHunt : publishedHunts) {
+            const json normalizedHunt = normalizeHunt(rawHunt);
+            if (!normalizedHunt.is_object() || normalizedHunt.empty()) {
+                continue;
+            }
+            const std::string huntId =
+                temporal::trim(temporal::strField(normalizedHunt, "hunt_id"));
+            bool duplicate = false;
+            if (!huntId.empty()) {
+                for (const auto& existingHunt : hunts) {
+                    if (!existingHunt.is_object()) continue;
+                    if (temporal::trim(temporal::strField(existingHunt, "hunt_id")) == huntId) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if (!duplicate) {
+                hunts.push_back(normalizedHunt);
+            }
+        }
+        if (hunts.size() > 128) {
+            hunts.erase(hunts.begin(), hunts.begin() + (hunts.size() - 128));
+        }
+    }
+}
+
 static std::vector<JobStepDef> sortSteps(std::vector<JobStepDef> steps) {
     std::sort(steps.begin(), steps.end(), [](const JobStepDef& a, const JobStepDef& b) {
         return a.step_order < b.step_order;
@@ -6029,6 +6103,174 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
             if (!step.analysis_completion_mode.empty()) {
                 run.analysisCompletionMode = trimCopyRuntime_(step.analysis_completion_mode);
             }
+
+            // Ensure target cameras are started using the enriched start_camera_payloads map
+            if (owner_) {
+                std::vector<std::pair<int, nlohmann::json>> stepCameraPayloads;
+                stepCameraPayloads.reserve(step.targets.size());
+                for (const auto& tgt : step.targets) {
+                    auto itP = job->payload.camera_start_payload_by_id.find(tgt.camera_id);
+                    if (itP == job->payload.camera_start_payload_by_id.end()) {
+                        continue;
+                    }
+                    stepCameraPayloads.push_back({ tgt.camera_id, itP->second });
+                }
+
+                AgentCore::ResourceAdmissionDecision admissionDecision;
+                AgentCore::JobStepCameraStartResult cameraStartResult = owner_->startJobStepCameras_(
+                    job->payload.job.id,
+                    step.id,
+                    stepCameraPayloads,
+                    admissionDecision
+                );
+                if (!cameraStartResult.ok) {
+                    run.state = JobInstance::StepState::Skipped;
+                    run.cancel = true;
+                    if (!admissionDecision.allowed) {
+                        nlohmann::json blockedDetails =
+                            owner_->resourceAdmissionDecisionToJson_(admissionDecision, "job");
+                        blockedDetails["job_run_id"] = job->payload.job_run_id;
+                        blockedDetails["job_id"] = J.id;
+                        blockedDetails["job_name"] = J.name;
+                        blockedDetails["step_id"] = step.id;
+                        blockedDetails["step_name"] = step.name;
+                        blockedDetails["step_order"] = step.step_order;
+                        blockedDetails["started_camera_ids"] = cameraStartResult.startedCameraIds;
+                        blockedDetails["started_count"] =
+                            static_cast<int>(cameraStartResult.startedCameraIds.size());
+                        blockedDetails["blocked_count"] =
+                            static_cast<int>(admissionDecision.blockedCameras.size());
+                        blockedDetails["partial_start"] = false;
+                        if (!step.step_run_id.empty()) {
+                            blockedDetails["step_run_id"] = step.step_run_id;
+                        }
+
+                        owner_->postAgentEvent(
+                            "job_step_start_blocked",
+                            std::nullopt,
+                            J.user_id,
+                            admissionDecision.message,
+                            blockedDetails
+                        );
+                        postStepEvent_("job_step_skipped", J, step, json{
+                            {"job_run_id", job->payload.job_run_id},
+                            {"reason", "resource_admission_blocked"},
+                            {"reason_code", admissionDecision.reasonCode},
+                            {"device", admissionDecision.device},
+                            {"blocked_cameras", blockedDetails["blocked_cameras"]}
+                        });
+                    }
+                    else {
+                        postStepEvent_("job_step_skipped", J, step, json{
+                            {"job_run_id", job->payload.job_run_id},
+                            {"reason", "camera_start_failed"},
+                            {"error", cameraStartResult.error}
+                        });
+                    }
+                    return;
+                }
+
+                std::unordered_set<int> startedCameraIds(
+                    cameraStartResult.startedCameraIds.begin(),
+                    cameraStartResult.startedCameraIds.end()
+                );
+                step.targets.erase(
+                    std::remove_if(
+                        step.targets.begin(),
+                        step.targets.end(),
+                        [&](const JobTarget& target) {
+                            return startedCameraIds.find(target.camera_id) == startedCameraIds.end();
+                        }
+                    ),
+                    step.targets.end()
+                );
+
+                std::unordered_set<int> activeTargetIds;
+                activeTargetIds.reserve(step.targets.size());
+                for (const auto& target : step.targets) {
+                    activeTargetIds.insert(target.id);
+                }
+
+                for (auto& group : step.inference_groups) {
+                    group.target_ids.erase(
+                        std::remove_if(
+                            group.target_ids.begin(),
+                            group.target_ids.end(),
+                            [&](int targetId) {
+                                return activeTargetIds.find(targetId) == activeTargetIds.end();
+                            }
+                        ),
+                        group.target_ids.end()
+                    );
+                }
+                step.inference_groups.erase(
+                    std::remove_if(
+                        step.inference_groups.begin(),
+                        step.inference_groups.end(),
+                        [](const JobInferenceGroup& group) {
+                            return group.target_ids.empty();
+                        }
+                    ),
+                    step.inference_groups.end()
+                );
+
+                if (!admissionDecision.allowed) {
+                    nlohmann::json blockedDetails =
+                        owner_->resourceAdmissionDecisionToJson_(admissionDecision, "job");
+                    blockedDetails["job_run_id"] = job->payload.job_run_id;
+                    blockedDetails["job_id"] = J.id;
+                    blockedDetails["job_name"] = J.name;
+                    blockedDetails["step_id"] = step.id;
+                    blockedDetails["step_name"] = step.name;
+                    blockedDetails["step_order"] = step.step_order;
+                    blockedDetails["started_camera_ids"] = cameraStartResult.startedCameraIds;
+                    blockedDetails["started_count"] =
+                        static_cast<int>(cameraStartResult.startedCameraIds.size());
+                    blockedDetails["blocked_count"] =
+                        static_cast<int>(admissionDecision.blockedCameras.size());
+                    blockedDetails["partial_start"] =
+                        !cameraStartResult.startedCameraIds.empty();
+                    if (!step.step_run_id.empty()) {
+                        blockedDetails["step_run_id"] = step.step_run_id;
+                    }
+
+                    owner_->postAgentEvent(
+                        "job_step_start_blocked",
+                        std::nullopt,
+                        J.user_id,
+                        admissionDecision.message,
+                        blockedDetails
+                    );
+                }
+
+                if (step.targets.empty()) {
+                    run.state = JobInstance::StepState::Skipped;
+                    run.cancel = true;
+                    if (!admissionDecision.allowed) {
+                        postStepEvent_("job_step_skipped", J, step, json{
+                            {"job_run_id", job->payload.job_run_id},
+                            {"reason", "resource_admission_blocked"},
+                            {"reason_code", admissionDecision.reasonCode},
+                            {"device", admissionDecision.device},
+                            {
+                                "blocked_cameras",
+                                owner_->resourceAdmissionDecisionToJson_(
+                                    admissionDecision,
+                                    "job"
+                                )["blocked_cameras"]
+                            }
+                        });
+                    }
+                    else {
+                        postStepEvent_("job_step_skipped", J, step, json{
+                            {"job_run_id", job->payload.job_run_id},
+                            {"reason", "no_startable_cameras"}
+                        });
+                    }
+                    return;
+                }
+            }
+
             {
                 std::lock_guard<std::mutex> coverageLock(run.coverageMu);
                 run.coverageByCamera.clear();
@@ -6075,21 +6317,6 @@ void JobRuntime::runJob_(std::shared_ptr<JobInstance> job) {
                         )
                     );
                     run.coverageDriven = true;
-                }
-            }
-
-            // Ensure target cameras are started using the enriched start_camera_payloads map
-            if (owner_) {
-                for (const auto& tgt : step.targets) {
-                    auto itP = job->payload.camera_start_payload_by_id.find(tgt.camera_id);
-                    if (itP != job->payload.camera_start_payload_by_id.end()) {
-                        owner_->ensureCameraStartedForJob(
-                            tgt.camera_id,
-                            job->payload.job.id,
-                            step.id,
-                            itP->second
-                        );
-                    }
                 }
             }
 
@@ -9306,7 +9533,37 @@ bool JobRuntime::isLikelyJson_(const std::string& s) {
 // --- Reporting via AgentCore (use your existing /api/agent/events plumbing) ---
 void JobRuntime::postJobEvent_(const std::string& eventType, const JobDefSnapshot& job, const json& details) {
     if (!owner_) return;
-    owner_->postAgentEvent(eventType, /*cameraId*/ std::nullopt, job.user_id, /*message*/"", details);
+    json enriched = details;
+    std::shared_ptr<JobInstance> inst;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = running_.find(job.id);
+        if (it != running_.end()) {
+            inst = it->second;
+        }
+    }
+    if (inst) {
+        const JobStartPayload& payload = inst->payload;
+        if (!payload.shared_segment_id.empty()) {
+            enriched["shared_segment_id"] = payload.shared_segment_id;
+        }
+        if (!payload.shared_execution_domain.empty()) {
+            enriched["shared_execution_domain"] = payload.shared_execution_domain;
+        }
+        if (!payload.shared_owner_public_id.empty()) {
+            enriched["shared_owner_public_id"] = payload.shared_owner_public_id;
+        }
+        if (!payload.shared_operator_public_id.empty()) {
+            enriched["shared_operator_public_id"] = payload.shared_operator_public_id;
+        }
+        if (payload.shared_operator_job_id > 0) {
+            enriched["shared_operator_job_id"] = payload.shared_operator_job_id;
+        }
+        enriched["shared_allow_event_media"] = payload.shared_allow_event_media;
+        enriched["shared_cross_camera_federation_required"] =
+            payload.shared_cross_camera_federation_required;
+    }
+    owner_->postAgentEvent(eventType, /*cameraId*/ std::nullopt, job.user_id, /*message*/"", enriched);
 }
 
 void JobRuntime::postStepEvent_(const std::string& eventType, const JobDefSnapshot& job, const JobStepDef& step, const json& extra) {
@@ -11504,6 +11761,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         const std::string localDecisionSource = decisionSource;
         std::vector<std::string> roundEvidenceKeys;
         TemporalEvidenceTrail temporalEvidenceTrailSnapshot;
+        json publishedCrossCameraHunts = json::array();
         if (temporalPlanActive) {
             temporal::applyRound(
                 temporalSlot.state,
@@ -11567,7 +11825,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
                 decisionSource = localDecisionSource;
                 temporalDecisionSummary = "Suppressed stale threat carry because the current batch has no visible threat evidence.";
             }
-            const json publishedCrossCameraHunts = maybePublishCrossCameraHunts(
+            publishedCrossCameraHunts = maybePublishCrossCameraHunts(
                 temporalSlot,
                 hit,
                 temporalOperatorResults,
@@ -11911,6 +12169,9 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
                 reportDetails["group_images"] = temporalGroupImages;
                 reportDetails["group_image_count"] = temporalGroupImages.size();
+            }
+            if (publishedCrossCameraHunts.is_array() && !publishedCrossCameraHunts.empty()) {
+                reportDetails["published_cross_camera_hunts"] = publishedCrossCameraHunts;
             }
             if (!temporalFallbackImageB64.empty()) {
                 reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;
@@ -12480,6 +12741,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
     const std::string localDecisionSource = decisionSource;
     std::vector<std::string> roundEvidenceKeys;
     TemporalEvidenceTrail temporalEvidenceTrailSnapshot;
+    json publishedCrossCameraHunts = json::array();
     if (temporalPlanActive) {
         temporal::applyRound(
             temporalSlot.state,
@@ -12543,7 +12805,7 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
             decisionSource = localDecisionSource;
             temporalDecisionSummary = "Suppressed stale threat carry because the current batch has no visible threat evidence.";
         }
-        const json publishedCrossCameraHunts = maybePublishCrossCameraHunts(
+        publishedCrossCameraHunts = maybePublishCrossCameraHunts(
             temporalSlot,
             hit,
             temporalOperatorResults,
@@ -12888,6 +13150,9 @@ std::string JobRuntime::runAgentInferenceOnCamera_(
         if (temporalGroupImages.is_array() && !temporalGroupImages.empty()) {
             reportDetails["group_images"] = temporalGroupImages;
             reportDetails["group_image_count"] = temporalGroupImages.size();
+        }
+        if (publishedCrossCameraHunts.is_array() && !publishedCrossCameraHunts.empty()) {
+            reportDetails["published_cross_camera_hunts"] = publishedCrossCameraHunts;
         }
         if (!temporalFallbackImageB64.empty()) {
             reportDetails["image_jpeg_b64"] = temporalFallbackImageB64;

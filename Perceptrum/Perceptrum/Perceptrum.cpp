@@ -73,8 +73,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     // 1) Try to load existing token
     std::string exeToken, clientId;
-    const std::string baseUrl = GetPerceptrumBaseUrl();
-    PairingClient pairing(baseUrl);
+    const std::string uiBaseUrl = GetPerceptrumBaseUrl();
+    const std::string agentBaseUrl = GetPerceptrumAgentBaseUrl();
+    PairingClient pairing(uiBaseUrl);
 
     bool alreadyPaired = pairing.loadSavedToken(exeToken, clientId);
 
@@ -200,7 +201,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 
     // 4) Start AgentCore in background
-    AgentCore agent(baseUrl, exeToken, clientId);
+    AgentCore agent(agentBaseUrl, exeToken, clientId);
     g_agent = &agent;
 
     agent.initTimeSync();

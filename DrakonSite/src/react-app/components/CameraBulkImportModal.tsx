@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Cpu,
   FileUp,
   Loader2,
   MapPin,
@@ -12,6 +13,7 @@ import {
 import type {
   CameraImportApplyResult,
   CameraImportCandidate,
+  CameraImportGpuBatchSummary,
   CameraImportPreview,
   CameraImportRequiredField,
   CameraImportSharedDefaults,
@@ -83,6 +85,7 @@ const REQUIRED_FIELD_LABELS: Record<CameraImportRequiredField, string> = {
 
 const CAMERA_IMPORT_POLL_INTERVAL_MS = 1800;
 const CAMERA_IMPORT_POLL_TIMEOUT_MS = 90_000;
+const CAMERA_IMPORT_GPU_BATCH_POLL_INTERVAL_MS = 2500;
 
 function humanizeFieldLabel(field: string) {
   if (field in REQUIRED_FIELD_LABELS) {
@@ -121,6 +124,36 @@ function normalizeCommandId(value: unknown) {
   const numericValue =
     typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isInteger(numericValue) && numericValue > 0 ? numericValue : null;
+}
+
+function isTerminalGpuBatchStatus(
+  status: CameraImportGpuBatchSummary["status"] | null | undefined
+) {
+  return status === "completed" || status === "failed";
+}
+
+function formatGpuBatchStatusLabel(status: CameraImportGpuBatchSummary["status"]) {
+  if (status === "queued") return "Queued";
+  if (status === "waiting_for_exe") return "Waiting for desktop runtime";
+  if (status === "probing") return "Validating camera by camera";
+  if (status === "completed") return "Finished";
+  return "Stopped";
+}
+
+function getGpuBatchStatusPanelClasses(status: CameraImportGpuBatchSummary["status"]) {
+  if (status === "completed") {
+    return "border-emerald-400/20 bg-emerald-500/10 text-emerald-50";
+  }
+  if (status === "failed") {
+    return "border-red-400/20 bg-red-500/10 text-red-50";
+  }
+  if (status === "waiting_for_exe") {
+    return "border-amber-400/20 bg-amber-500/10 text-amber-50";
+  }
+  if (status === "probing") {
+    return "border-sky-400/20 bg-sky-500/10 text-sky-50";
+  }
+  return "border-cyan-400/20 bg-cyan-500/10 text-cyan-50";
 }
 
 async function parseApiError(response: Response, fallback: string) {
@@ -216,6 +249,7 @@ export default function CameraBulkImportModal({
   const [preview, setPreview] = useState<CameraImportPreview | null>(null);
   const [applyResult, setApplyResult] = useState<CameraImportApplyResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [enableGpuBatch, setEnableGpuBatch] = useState(false);
   const [sharedDefaultsForm, setSharedDefaultsForm] = useState<SharedDefaultsFormState>({
     manufacturer: "",
     username: "",
@@ -231,6 +265,7 @@ export default function CameraBulkImportModal({
     setPreview(null);
     setApplyResult(null);
     setError(null);
+    setEnableGpuBatch(false);
     setSharedDefaultsForm({
       manufacturer: "",
       username: "",
@@ -330,6 +365,88 @@ export default function CameraBulkImportModal({
     };
   }, [isOpen, previewCommandId, stage]);
 
+  useEffect(() => {
+    const gpuBatchStatus = applyResult?.gpu_batch?.status;
+    if (
+      !isOpen ||
+      !previewCommandId ||
+      !applyResult?.gpu_batch ||
+      isTerminalGpuBatchStatus(gpuBatchStatus)
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const pollGpuBatchStatus = async () => {
+      try {
+        const response = await fetch(`/api/camera-imports/${previewCommandId}/gpu-batch`, {
+          credentials: "include",
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        if (response.status === 404) {
+          return;
+        }
+
+        if (!response.ok) {
+          throw new Error(
+            await parseApiError(response, "Failed to load the background GPU validation status.")
+          );
+        }
+
+        const data = (await response.json()) as CameraImportGpuBatchSummary;
+        if (cancelled) {
+          return;
+        }
+
+        setApplyResult((current) => {
+          if (!current) {
+            return current;
+          }
+
+          return {
+            ...current,
+            gpu_batch: data,
+          };
+        });
+
+        if (!isTerminalGpuBatchStatus(data.status)) {
+          timeoutId = window.setTimeout(() => {
+            void pollGpuBatchStatus();
+          }, CAMERA_IMPORT_GPU_BATCH_POLL_INTERVAL_MS);
+        }
+      } catch (gpuBatchError) {
+        if (cancelled) {
+          return;
+        }
+
+        console.error("[CameraBulkImportModal] GPU batch status polling failed:", gpuBatchError);
+        timeoutId = window.setTimeout(() => {
+          void pollGpuBatchStatus();
+        }, CAMERA_IMPORT_GPU_BATCH_POLL_INTERVAL_MS);
+      }
+    };
+
+    void pollGpuBatchStatus();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [
+    applyResult?.gpu_batch?.job_id,
+    applyResult?.gpu_batch?.status,
+    isOpen,
+    previewCommandId,
+  ]);
+
   const combinedGlobalWarnings = useMemo(() => {
     return Array.from(
       new Set([...(uploadMeta?.global_warnings || []), ...(preview?.global_warnings || [])])
@@ -376,6 +493,7 @@ export default function CameraBulkImportModal({
     setPreview(null);
     setApplyResult(null);
     setError(null);
+    setEnableGpuBatch(false);
     setSharedDefaultsForm({
       manufacturer: "",
       username: "",
@@ -485,6 +603,13 @@ export default function CameraBulkImportModal({
         },
         body: JSON.stringify({
           shared_defaults: sharedDefaults || undefined,
+          gpu_batch: enableGpuBatch
+            ? {
+                enabled: true,
+                requested_mode: "nvidia",
+                restart_if_running: true,
+              }
+            : undefined,
         }),
         credentials: "include",
       });
@@ -800,6 +925,57 @@ export default function CameraBulkImportModal({
                   </div>
                 </div>
 
+                <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/8 p-5">
+                  <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+                    <div className="flex items-start gap-3">
+                      <Cpu className="mt-0.5 h-5 w-5 flex-shrink-0 text-cyan-200" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-cyan-100">
+                          Background GPU validation
+                        </p>
+                        <p className="mt-1 text-sm text-cyan-50/85">
+                          Validate and enable GPU for every imported camera. The import finishes
+                          first, then the app runs the same compatibility scan used by the CPU/GPU
+                          button one camera at a time in the background.
+                        </p>
+                        <p className="mt-2 text-xs text-cyan-100/70">
+                          Cameras that pass switch to GPU automatically. Cameras that do not pass
+                          stay on CPU.
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setEnableGpuBatch((current) => !current)}
+                      aria-pressed={enableGpuBatch}
+                      disabled={stage === "applying" || Boolean(applyResult)}
+                      className={`inline-flex min-h-[52px] items-center justify-between gap-4 rounded-2xl border px-4 py-3 text-left text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                        enableGpuBatch
+                          ? "border-cyan-300/50 bg-cyan-400/18 text-cyan-50"
+                          : "border-gray-700 bg-gray-950/70 text-gray-200 hover:border-cyan-400/30 hover:text-gray-50"
+                      }`}
+                    >
+                      <span>
+                        {enableGpuBatch
+                          ? "GPU validation enabled for all cameras"
+                          : "GPU validation disabled"}
+                      </span>
+                      <span
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition ${
+                          enableGpuBatch ? "bg-cyan-200/90" : "bg-gray-700"
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 rounded-full bg-gray-950 transition-transform ${
+                            enableGpuBatch ? "translate-x-6" : "translate-x-1"
+                          }`}
+                        />
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
                 {incompleteCandidates.length > 0 && (
                   <div className="rounded-2xl border border-red-500/20 bg-red-500/10 p-5 text-sm text-red-100">
                     <p className="font-medium">
@@ -836,6 +1012,68 @@ export default function CameraBulkImportModal({
                               ))}
                             </ul>
                           )}
+                        {applyResult.gpu_batch && (
+                          <div
+                            className={`mt-4 rounded-2xl border p-4 ${getGpuBatchStatusPanelClasses(
+                              applyResult.gpu_batch.status
+                            )}`}
+                          >
+                            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                              <div className="min-w-0">
+                                <p className="text-xs uppercase tracking-wide text-current/70">
+                                  GPU validation
+                                </p>
+                                <p className="mt-1 text-sm font-semibold text-current">
+                                  {formatGpuBatchStatusLabel(applyResult.gpu_batch.status)}
+                                </p>
+                                <p className="mt-2 text-sm text-current/85">
+                                  {applyResult.gpu_batch.message}
+                                </p>
+                              </div>
+                              <div className="rounded-full border border-current/20 px-3 py-1 text-xs font-medium text-current/85">
+                                {applyResult.gpu_batch.processed_count}/
+                                {applyResult.gpu_batch.total_count} processed
+                              </div>
+                            </div>
+
+                            <div className="mt-4 grid gap-3 sm:grid-cols-3 xl:grid-cols-4">
+                              <div className="rounded-xl border border-current/10 bg-black/10 px-3 py-3">
+                                <p className="text-xs uppercase tracking-wide text-current/60">
+                                  Enabled on GPU
+                                </p>
+                                <p className="mt-1 text-lg font-semibold text-current">
+                                  {applyResult.gpu_batch.enabled_gpu_count}
+                                </p>
+                              </div>
+                              <div className="rounded-xl border border-current/10 bg-black/10 px-3 py-3">
+                                <p className="text-xs uppercase tracking-wide text-current/60">
+                                  Stayed on CPU
+                                </p>
+                                <p className="mt-1 text-lg font-semibold text-current">
+                                  {applyResult.gpu_batch.kept_cpu_count}
+                                </p>
+                              </div>
+                              <div className="rounded-xl border border-current/10 bg-black/10 px-3 py-3">
+                                <p className="text-xs uppercase tracking-wide text-current/60">
+                                  Failed
+                                </p>
+                                <p className="mt-1 text-lg font-semibold text-current">
+                                  {applyResult.gpu_batch.failed_count}
+                                </p>
+                              </div>
+                              <div className="rounded-xl border border-current/10 bg-black/10 px-3 py-3">
+                                <p className="text-xs uppercase tracking-wide text-current/60">
+                                  Requested mode
+                                </p>
+                                <p className="mt-1 text-lg font-semibold text-current">
+                                  {applyResult.gpu_batch.requested_mode === "nvidia"
+                                    ? "GPU"
+                                    : "CPU"}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>

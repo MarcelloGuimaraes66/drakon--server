@@ -18,8 +18,10 @@ interface Toast {
     | "offline"
     | "online"
     | "camera_started"
+    | "camera_start_blocked"
     | "job_staled"
     | "job_start_blocked"
+    | "job_step_start_blocked"
     | "job_started"
     | "agent_api_error";
 }
@@ -42,11 +44,17 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
         const toastType = toast.type || "offline";
         const isJobStaledToast = toastType === "job_staled";
         const isJobStartBlockedToast = toastType === "job_start_blocked";
+        const isJobStepStartBlockedToast = toastType === "job_step_start_blocked";
         const isJobStartedToast = toastType === "job_started";
         const isCameraStartedToast = toastType === "camera_started";
+        const isCameraStartBlockedToast = toastType === "camera_start_blocked";
         const isAgentApiErrorToast = toastType === "agent_api_error";
         const isOnlineToast = toast.type === "online";
-        const isAmberJobToast = isJobStaledToast || isJobStartBlockedToast;
+        const isAmberJobToast =
+          isJobStaledToast ||
+          isJobStartBlockedToast ||
+          isJobStepStartBlockedToast ||
+          isCameraStartBlockedToast;
         const isSuccessToast = isJobStartedToast || isOnlineToast || isCameraStartedToast;
         const hasStructuredOfflineFailure =
           toastType === "offline" &&
@@ -80,10 +88,14 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
           ? toast.title || "Job Stalled"
           : isJobStartBlockedToast
           ? toast.title || "Job Start Blocked"
+          : isJobStepStartBlockedToast
+          ? toast.title || "Step Start Blocked"
           : isJobStartedToast
           ? toast.title || "Job Started"
           : isCameraStartedToast
           ? toast.title || "Camera Started"
+          : isCameraStartBlockedToast
+          ? toast.title || "Camera Start Blocked"
           : isAgentApiErrorToast
           ? toast.title || "AI API Error"
           : isOnlineToast
@@ -115,7 +127,12 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
                   {safeToastTitle}
                 </h4>
                 <p className="text-sm text-gray-300 mb-2">
-                  {isJobStaledToast || isJobStartBlockedToast || isJobStartedToast || isAgentApiErrorToast ? (
+                  {isJobStaledToast ||
+                  isJobStartBlockedToast ||
+                  isJobStepStartBlockedToast ||
+                  isJobStartedToast ||
+                  isCameraStartBlockedToast ||
+                  isAgentApiErrorToast ? (
                     <>{safeToastMessage}</>
                   ) : isOnlineToast ? (
                     <>
@@ -169,7 +186,13 @@ export default function CameraEventToast({ toasts, onDismiss }: CameraEventToast
                   </p>
                 ) : null}
 
-                {!isJobStaledToast && !isJobStartBlockedToast && !isJobStartedToast && !isAgentApiErrorToast && !isCameraStartedToast && (
+                {!isJobStaledToast &&
+                  !isJobStartBlockedToast &&
+                  !isJobStepStartBlockedToast &&
+                  !isJobStartedToast &&
+                  !isCameraStartBlockedToast &&
+                  !isAgentApiErrorToast &&
+                  !isCameraStartedToast && (
                   hasStructuredOfflineFailure ? (
                     toast.technicalDetail ? (
                       <p className="text-xs text-gray-400">

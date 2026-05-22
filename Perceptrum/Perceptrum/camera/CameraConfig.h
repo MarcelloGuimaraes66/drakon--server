@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 
 struct AlgorithmConfig {
@@ -97,6 +98,8 @@ struct CameraConfig {
 
     std::string captureAccelerationMode{ "cpu" };
     bool useGpu{ false };
+    std::uint64_t resourceEstimateCpuBytes = 0;
+    std::uint64_t resourceEstimateGpuBytes = 0;
 
     // List of algorithm types that came from payload.enabled_algorithms
     std::vector<std::string> enabledAlgorithms;

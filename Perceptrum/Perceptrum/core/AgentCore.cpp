@@ -42,7 +42,9 @@
 
 #define NOMINMAX
 #include <Windows.h>
+#include <dxgi1_6.h>
 #include <wincrypt.h>
+#include <wrl/client.h>
 #ifdef min
 #undef min
 #endif
@@ -62,6 +64,7 @@ using json = nlohmann::json;
 
 
 using FrameHit = AgentCore::FrameHit;
+using Microsoft::WRL::ComPtr;
 
 
 namespace fs = std::filesystem;
@@ -113,6 +116,66 @@ static void logAgentUnknownException_(
 static std::string sourceIdForCamera_(int cameraId, const std::string& fallback = "agent")
 {
     return cameraId > 0 ? std::to_string(cameraId) : fallback;
+}
+
+static std::string narrowWideAscii_(const wchar_t* value)
+{
+    if (!value) {
+        return {};
+    }
+
+    std::string out;
+    for (const wchar_t* cursor = value; *cursor != L'\0'; ++cursor) {
+        const wchar_t ch = *cursor;
+        if (ch >= 32 && ch <= 126) {
+            out.push_back(static_cast<char>(ch));
+        }
+        else if (ch == L'\t' || ch == L'\r' || ch == L'\n') {
+            out.push_back(' ');
+        }
+        else {
+            out.push_back('?');
+        }
+    }
+    return out;
+}
+
+static std::string formatBytesCompact_(std::uint64_t bytes)
+{
+    constexpr double kKilobyte = 1024.0;
+    constexpr double kMegabyte = 1024.0 * 1024.0;
+    constexpr double kGigabyte = 1024.0 * 1024.0 * 1024.0;
+
+    char buffer[64];
+    if (bytes >= static_cast<std::uint64_t>(kGigabyte)) {
+        std::snprintf(buffer, sizeof(buffer), "%.2f GB", static_cast<double>(bytes) / kGigabyte);
+        return std::string(buffer);
+    }
+    if (bytes >= static_cast<std::uint64_t>(kMegabyte)) {
+        std::snprintf(buffer, sizeof(buffer), "%.0f MB", static_cast<double>(bytes) / kMegabyte);
+        return std::string(buffer);
+    }
+    if (bytes >= static_cast<std::uint64_t>(kKilobyte)) {
+        std::snprintf(buffer, sizeof(buffer), "%.0f KB", static_cast<double>(bytes) / kKilobyte);
+        return std::string(buffer);
+    }
+    return std::to_string(bytes) + " B";
+}
+
+static std::string joinCameraNames_(const std::vector<AgentCore::ResourceAdmissionCamera>& cameras)
+{
+    std::string out;
+    for (const auto& camera : cameras) {
+        const std::string label =
+            !camera.cameraName.empty()
+                ? camera.cameraName
+                : ("Camera #" + std::to_string(camera.cameraId));
+        if (!out.empty()) {
+            out += ", ";
+        }
+        out += label;
+    }
+    return out;
 }
 
 static std::string lowerAsciiCopy_(std::string value)
@@ -2863,6 +2926,42 @@ namespace {
             return dataUrl;  // already plain base64
         }
         return dataUrl.substr(pos + marker.size());
+    }
+
+    std::string trimAsciiEventMediaUpload_(std::string value)
+    {
+        auto isSpace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+            value.pop_back();
+        }
+        return value;
+    }
+
+    std::string detectContentTypeFromDataUrl_(
+        const std::string& rawBase64OrDataUrl,
+        const std::string& fallbackContentType)
+    {
+        const std::string trimmed = trimAsciiEventMediaUpload_(rawBase64OrDataUrl);
+        if (trimmed.rfind("data:", 0) != 0) {
+            return fallbackContentType;
+        }
+
+        const std::size_t typeStart = 5;
+        std::size_t typeEnd = trimmed.find(';', typeStart);
+        const std::size_t commaPos = trimmed.find(',', typeStart);
+        if (typeEnd == std::string::npos || (commaPos != std::string::npos && commaPos < typeEnd)) {
+            typeEnd = commaPos;
+        }
+        if (typeEnd == std::string::npos || typeEnd <= typeStart) {
+            return fallbackContentType;
+        }
+
+        const std::string detected = trimAsciiEventMediaUpload_(
+            trimmed.substr(typeStart, typeEnd - typeStart));
+        return detected.empty() ? fallbackContentType : detected;
     }
 
 
@@ -5928,7 +6027,54 @@ void AgentCore::processCommand_(const json& cmd) {
         }
 
         if (type == "start_camera") {
-            startCameraFromPayload_(cameraId, payload);
+            CameraStartOutcome outcome = startCameraFromPayload_(cameraId, payload);
+            if (commandId > 0) {
+                if (outcome.started || outcome.reused) {
+                    nlohmann::json result = nlohmann::json::object();
+                    result["camera_id"] = cameraId;
+                    result["reused"] = outcome.reused;
+                    if (payload.contains("camera_session_id") && payload["camera_session_id"].is_string()) {
+                        result["camera_session_id"] = payload["camera_session_id"].get<std::string>();
+                    }
+                    postCommandResult_(commandId, "completed", result);
+                }
+                else {
+                    const std::string startOrigin =
+                        payload.contains("start_origin") && payload["start_origin"].is_string()
+                            ? payload["start_origin"].get<std::string>()
+                            : std::string("direct");
+                    nlohmann::json err =
+                        outcome.blocked
+                            ? resourceAdmissionDecisionToJson_(outcome.admission, startOrigin)
+                            : nlohmann::json::object();
+                    if (payload.contains("camera_session_id") && payload["camera_session_id"].is_string()) {
+                        err["camera_session_id"] = payload["camera_session_id"].get<std::string>();
+                    }
+                    if (payload.contains("name") && payload["name"].is_string()) {
+                        err["camera_name"] = payload["name"].get<std::string>();
+                    }
+                    if (!err.contains("camera_id")) {
+                        err["camera_id"] = cameraId;
+                    }
+                    if (outcome.blocked) {
+                        postAgentEvent(
+                            "camera_start_blocked",
+                            cameraId,
+                            "",
+                            outcome.admission.message,
+                            err
+                        );
+                    }
+                    else {
+                        err["error"] =
+                            !outcome.error.empty()
+                                ? outcome.error
+                                : std::string("Failed to start camera");
+                        err["error_code"] = "camera_start_failed";
+                    }
+                    postCommandResult_(commandId, "failed", err);
+                }
+            }
         }
         else if (type == "stop_camera") {
             try {
@@ -6011,6 +6157,42 @@ void AgentCore::processCommand_(const json& cmd) {
             }
             catch (...) {
                 Logger::instance().logDebug("agent", "job_stop handler unknown exception");
+            }
+        }
+        else if (type == "job_cross_camera_update") {
+            try {
+                if (jobRuntime_) {
+                    jobRuntime_->onCrossCameraUpdateCommand(cmd);
+                }
+                if (commandId > 0) {
+                    json result = json::object();
+                    result["accepted"] = true;
+                    postCommandResult_(commandId, "completed", result);
+                }
+            }
+            catch (const std::exception& e) {
+                Logger::instance().logDebug(
+                    "agent",
+                    std::string("job_cross_camera_update handler exception: ") + e.what()
+                );
+                if (commandId > 0) {
+                    json result = json::object();
+                    result["accepted"] = false;
+                    result["error"] = e.what();
+                    postCommandResult_(commandId, "failed", result);
+                }
+            }
+            catch (...) {
+                Logger::instance().logDebug(
+                    "agent",
+                    "job_cross_camera_update handler unknown exception"
+                );
+                if (commandId > 0) {
+                    json result = json::object();
+                    result["accepted"] = false;
+                    result["error"] = "unknown_error";
+                    postCommandResult_(commandId, "failed", result);
+                }
             }
         }
         else if (type == "prompt_enhance") {
@@ -6545,6 +6727,30 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
         cfg.captureAccelerationMode = "cpu";
     }
     cfg.useGpu = cfg.captureAccelerationMode == "nvidia";
+    cfg.resourceEstimateCpuBytes = 0;
+    cfg.resourceEstimateGpuBytes = 0;
+    if (p.contains("resource_estimate") && p["resource_estimate"].is_object()) {
+        const auto& resourceEstimate = p["resource_estimate"];
+        if (resourceEstimate.contains("cpu_bytes") && resourceEstimate["cpu_bytes"].is_number_unsigned()) {
+            cfg.resourceEstimateCpuBytes = resourceEstimate["cpu_bytes"].get<std::uint64_t>();
+        }
+        else if (resourceEstimate.contains("cpu_bytes") && resourceEstimate["cpu_bytes"].is_number_integer()) {
+            const long long parsed = resourceEstimate["cpu_bytes"].get<long long>();
+            if (parsed > 0) {
+                cfg.resourceEstimateCpuBytes = static_cast<std::uint64_t>(parsed);
+            }
+        }
+
+        if (resourceEstimate.contains("gpu_bytes") && resourceEstimate["gpu_bytes"].is_number_unsigned()) {
+            cfg.resourceEstimateGpuBytes = resourceEstimate["gpu_bytes"].get<std::uint64_t>();
+        }
+        else if (resourceEstimate.contains("gpu_bytes") && resourceEstimate["gpu_bytes"].is_number_integer()) {
+            const long long parsed = resourceEstimate["gpu_bytes"].get<long long>();
+            if (parsed > 0) {
+                cfg.resourceEstimateGpuBytes = static_cast<std::uint64_t>(parsed);
+            }
+        }
+    }
 
     cfg.cameraSessionId.clear();
     if (p.contains("camera_session_id") && p["camera_session_id"].is_string()) {
@@ -6970,26 +7176,277 @@ CameraConfig AgentCore::buildCameraConfigFromPayload_(int cameraId, const json& 
     return cfg;
 }
 
-void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
-    Logger::instance().logDebug(
-        "agent",
-        "startCameraFromPayload_: ENTER cameraId=" + std::to_string(cameraId) +
-        " payload=" + p.dump()
-    );
+std::uint64_t AgentCore::estimateCpuBytesForConfig_(const CameraConfig& cfg) const
+{
+    const std::uint64_t fallback =
+        cfg.captureAccelerationMode == "nvidia"
+            ? 128ull * 1024ull * 1024ull
+            : 256ull * 1024ull * 1024ull;
+    return cfg.resourceEstimateCpuBytes > 0 ? cfg.resourceEstimateCpuBytes : fallback;
+}
 
-    CameraConfig cfg = buildCameraConfigFromPayload_(cameraId, p);
+std::uint64_t AgentCore::estimateGpuBytesForConfig_(const CameraConfig& cfg) const
+{
+    if (cfg.captureAccelerationMode != "nvidia") {
+        return 0;
+    }
+    const std::uint64_t fallback = 300ull * 1024ull * 1024ull;
+    return cfg.resourceEstimateGpuBytes > 0 ? cfg.resourceEstimateGpuBytes : fallback;
+}
+
+bool AgentCore::queryGpuMemorySnapshot_(GpuMemorySnapshot& out) const
+{
+#ifdef _WIN32
+    out = GpuMemorySnapshot{};
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    constexpr UINT kNvidiaVendorId = 0x10DE;
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT enumHr = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (enumHr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(enumHr) || !adapter) {
+            continue;
+        }
+
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc))) {
+            continue;
+        }
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 || desc.VendorId != kNvidiaVendorId) {
+            continue;
+        }
+
+        ComPtr<IDXGIAdapter3> adapter3;
+        if (FAILED(adapter.As(&adapter3)) || !adapter3) {
+            continue;
+        }
+
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            continue;
+        }
+
+        out.available = true;
+        out.adapterName = narrowWideAscii_(desc.Description);
+        out.totalBytes = static_cast<std::uint64_t>(desc.DedicatedVideoMemory);
+        out.budgetBytes = static_cast<std::uint64_t>(info.Budget);
+        out.currentUsageBytes = static_cast<std::uint64_t>(info.CurrentUsage);
+        const std::uint64_t budgetAvailableBytes =
+            out.budgetBytes > out.currentUsageBytes
+                ? out.budgetBytes - out.currentUsageBytes
+                : 0;
+        const std::uint64_t dedicatedAvailableBytes =
+            out.totalBytes > out.currentUsageBytes
+                ? out.totalBytes - out.currentUsageBytes
+                : 0;
+        out.availableBytes = (std::max)(budgetAvailableBytes, dedicatedAvailableBytes);
+        return true;
+    }
+#else
+    (void)out;
+#endif
+    return false;
+}
+
+AgentCore::ResourceAdmissionDecision AgentCore::evaluateCameraStartAdmissionLocked_(
+    const std::vector<ResourceAdmissionCamera>& requests,
+    const std::unordered_set<int>& replacedCameraIds) const
+{
+    ResourceAdmissionDecision decision;
+    if (requests.empty()) {
+        return decision;
+    }
+
+    MEMORYSTATUSEX memStatus{};
+    memStatus.dwLength = sizeof(memStatus);
+    const bool hasMemoryStatus = GlobalMemoryStatusEx(&memStatus) != FALSE;
+    decision.availableCpuBytes =
+        hasMemoryStatus ? static_cast<std::uint64_t>(memStatus.ullAvailPhys) : 0;
+
+    GpuMemorySnapshot gpuSnapshot;
+    const bool hasGpuSnapshot = queryGpuMemorySnapshot_(gpuSnapshot);
+    if (hasGpuSnapshot) {
+        decision.availableGpuBytes = gpuSnapshot.availableBytes;
+        decision.gpuTotalBytes = gpuSnapshot.totalBytes;
+        decision.gpuBudgetBytes = gpuSnapshot.budgetBytes;
+        decision.gpuAdapterName = gpuSnapshot.adapterName;
+    }
+
+    auto saturatingAdd = [](std::uint64_t left, std::uint64_t right) -> std::uint64_t {
+        const std::uint64_t maxValue = (std::numeric_limits<std::uint64_t>::max)();
+        if (right > maxValue - left) {
+            return maxValue;
+        }
+        return left + right;
+    };
+
+    if (!replacedCameraIds.empty()) {
+        std::lock_guard<std::mutex> lk(sessionsMu_);
+        for (int replacedCameraId : replacedCameraIds) {
+            auto it = sessions_.find(replacedCameraId);
+            if (it == sessions_.end() || !it->second) {
+                continue;
+            }
+            const CameraConfig& sessionCfg = it->second->getConfig();
+            decision.reclaimedCpuBytes =
+                saturatingAdd(decision.reclaimedCpuBytes, estimateCpuBytesForConfig_(sessionCfg));
+            decision.reclaimedGpuBytes =
+                saturatingAdd(decision.reclaimedGpuBytes, estimateGpuBytesForConfig_(sessionCfg));
+        }
+    }
+
+    for (const auto& request : requests) {
+        decision.requiredCpuBytes =
+            saturatingAdd(decision.requiredCpuBytes, request.requiredCpuBytes);
+        decision.requiredGpuBytes =
+            saturatingAdd(decision.requiredGpuBytes, request.requiredGpuBytes);
+    }
+
+    const std::uint64_t effectiveAvailableCpu =
+        saturatingAdd(decision.availableCpuBytes, decision.reclaimedCpuBytes);
+    const std::uint64_t effectiveAvailableGpu =
+        saturatingAdd(decision.availableGpuBytes, decision.reclaimedGpuBytes);
+
+    constexpr std::uint64_t kCpuReserveBytes = 256ull * 1024ull * 1024ull;
+    constexpr std::uint64_t kGpuReserveBytes = 128ull * 1024ull * 1024ull;
+    const std::uint64_t cpuHeadroom =
+        effectiveAvailableCpu > kCpuReserveBytes ? effectiveAvailableCpu - kCpuReserveBytes : 0;
+    const std::uint64_t gpuHeadroom =
+        effectiveAvailableGpu > kGpuReserveBytes ? effectiveAvailableGpu - kGpuReserveBytes : 0;
+
+    const bool cpuBlocked = decision.requiredCpuBytes > cpuHeadroom;
+    const bool gpuRequested = decision.requiredGpuBytes > 0;
+    const bool gpuBlocked =
+        gpuRequested &&
+        (!hasGpuSnapshot || decision.requiredGpuBytes > gpuHeadroom);
+
+    if (!cpuBlocked && !gpuBlocked) {
+        return decision;
+    }
+
+    decision.allowed = false;
+    decision.blockedCameras = requests;
+    if (cpuBlocked && gpuBlocked) {
+        decision.reasonCode = "cpu_gpu_memory_exhausted";
+        decision.device = "cpu+gpu";
+        decision.deviceSummary = "CPU/GPU";
+    }
+    else if (cpuBlocked) {
+        decision.reasonCode = "cpu_memory_exhausted";
+        decision.device = "cpu";
+        decision.deviceSummary = "CPU";
+    }
+    else if (!hasGpuSnapshot) {
+        decision.reasonCode = "gpu_memory_unavailable";
+        decision.device = "gpu";
+        decision.deviceSummary =
+            !gpuSnapshot.adapterName.empty() ? gpuSnapshot.adapterName : std::string("GPU");
+    }
+    else {
+        decision.reasonCode = "gpu_memory_exhausted";
+        decision.device = "gpu";
+        decision.deviceSummary =
+            !gpuSnapshot.adapterName.empty() ? gpuSnapshot.adapterName : std::string("GPU");
+    }
+
+    const std::string cameraLabels = joinCameraNames_(requests);
+    if (decision.reasonCode == "gpu_memory_unavailable") {
+        decision.message =
+            "Could not start " + cameraLabels +
+            " because the GPU memory budget could not be verified on this machine.";
+    }
+    else {
+        const std::string deviceLabel =
+            decision.device == "cpu+gpu"
+                ? "CPU/GPU"
+                : decision.device == "gpu"
+                ? "GPU"
+                : "CPU";
+        decision.message =
+            "Could not start " + cameraLabels +
+            " because available " + deviceLabel + " memory is too low.";
+    }
+
+    return decision;
+}
+
+nlohmann::json AgentCore::resourceAdmissionDecisionToJson_(
+    const ResourceAdmissionDecision& decision,
+    const std::string& startOrigin) const
+{
+    auto clampToI64 = [](std::uint64_t value) -> long long {
+        const std::uint64_t clamped = std::min<std::uint64_t>(
+            value,
+            static_cast<std::uint64_t>(std::numeric_limits<long long>::max())
+        );
+        return static_cast<long long>(clamped);
+    };
+
+    nlohmann::json blockedCameras = nlohmann::json::array();
+    for (const auto& camera : decision.blockedCameras) {
+        blockedCameras.push_back({
+            { "camera_id", camera.cameraId },
+            { "camera_name", camera.cameraName },
+            { "camera_session_id", camera.cameraSessionId },
+            { "mode", camera.captureMode },
+            { "required_cpu_bytes", clampToI64(camera.requiredCpuBytes) },
+            { "required_gpu_bytes", clampToI64(camera.requiredGpuBytes) },
+            { "was_running_before", camera.wasRunningBefore }
+        });
+    }
+
+    return nlohmann::json{
+        { "error", decision.message },
+        { "error_code", "insufficient_memory" },
+        { "reason_code", decision.reasonCode },
+        { "device", decision.device },
+        { "device_summary", decision.deviceSummary },
+        { "start_origin", startOrigin },
+        { "required_cpu_bytes", clampToI64(decision.requiredCpuBytes) },
+        { "required_gpu_bytes", clampToI64(decision.requiredGpuBytes) },
+        { "available_cpu_bytes", clampToI64(decision.availableCpuBytes) },
+        { "available_gpu_bytes", clampToI64(decision.availableGpuBytes) },
+        { "gpu_total_bytes", clampToI64(decision.gpuTotalBytes) },
+        { "gpu_budget_bytes", clampToI64(decision.gpuBudgetBytes) },
+        { "reclaimed_cpu_bytes", clampToI64(decision.reclaimedCpuBytes) },
+        { "reclaimed_gpu_bytes", clampToI64(decision.reclaimedGpuBytes) },
+        { "gpu_adapter_name", decision.gpuAdapterName },
+        { "blocked_cameras", blockedCameras }
+    };
+}
+
+AgentCore::CameraStartOutcome AgentCore::startCameraFromPayloadLocked_(
+    int cameraId,
+    const json& p,
+    const CameraConfig& cfg,
+    bool skipAdmissionCheck)
+{
+    (void)p;
+    CameraStartOutcome outcome;
+
     const bool directStart = isDirectServiceStart_(cfg);
+    const bool directServiceRequestedBefore =
+        directStart ? isDirectServiceRequested_(cameraId) : false;
 
     if (directStart) {
         setDirectServiceRequested_(cameraId, true);
     }
 
-    // Idempotent start: if camera is already running with equivalent runtime
-    // settings and same connection parameters, keep the current RTSP session.
+    bool hasExistingSession = false;
     {
         std::lock_guard<std::mutex> lk(sessionsMu_);
         auto it = sessions_.find(cameraId);
         if (it != sessions_.end() && it->second && it->second->matchesStartConfig(cfg)) {
+            outcome.started = true;
+            outcome.reused = true;
+            outcome.wasRunningBefore = true;
             if (directStart) {
                 it->second->setDirectServiceRequested(true);
             }
@@ -7008,12 +7465,42 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
                 "startCameraFromPayload_: reusing existing session for camera " +
                 std::to_string(cameraId) + " (idempotent start; no restart)"
             );
-            return;
+            return outcome;
+        }
+        if (it != sessions_.end() && it->second) {
+            hasExistingSession = true;
+        }
+    }
+    outcome.wasRunningBefore = hasExistingSession;
+
+    if (!skipAdmissionCheck) {
+        ResourceAdmissionCamera request;
+        request.cameraId = cameraId;
+        request.cameraName = cfg.name;
+        request.cameraSessionId = cfg.cameraSessionId;
+        request.captureMode = cfg.captureAccelerationMode;
+        request.requiredCpuBytes = estimateCpuBytesForConfig_(cfg);
+        request.requiredGpuBytes = estimateGpuBytesForConfig_(cfg);
+        request.wasRunningBefore = hasExistingSession;
+
+        std::unordered_set<int> replacedCameraIds;
+        if (hasExistingSession) {
+            replacedCameraIds.insert(cameraId);
+        }
+        outcome.admission = evaluateCameraStartAdmissionLocked_({ request }, replacedCameraIds);
+        if (!outcome.admission.allowed) {
+            outcome.blocked = true;
+            outcome.error = outcome.admission.message;
+            if (directStart && !directServiceRequestedBefore) {
+                setDirectServiceRequested_(cameraId, false);
+            }
+            if (directStart && !hasExistingSession) {
+                setCameraServiceRunning_(cameraId, false, "agentcore_start_blocked_by_memory", false);
+            }
+            return outcome;
         }
     }
 
-    // If already running with different runtime settings, stop & restart.
-    // Do NOT hold sessionsMu_ while stopping (stop may join threads / block).
     std::unique_ptr<CameraSession> oldSession;
     {
         std::lock_guard<std::mutex> lk(sessionsMu_);
@@ -7032,9 +7519,6 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         oldSession->stop();
     }
 
-
-
-
     Logger::instance().logDebug(
         "agent",
         "startCameraFromPayload_: built cfg for camera " + cfg.id +
@@ -7047,10 +7531,13 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         std::string(cfg.forceVideoRecordingWithoutInference ? "true" : "false") +
         " isVideoSearchTemporarySession=" +
         std::string(cfg.isVideoSearchTemporarySession ? "true" : "false") +
+        " resourceEstimateCpuBytes=" + std::to_string(estimateCpuBytesForConfig_(cfg)) +
+        " resourceEstimateGpuBytes=" + std::to_string(estimateGpuBytesForConfig_(cfg)) +
         " hydrateExistingSegments=" +
         std::string(cfg.storage.hydrateExistingSegments ? "true" : "false") +
         " descriptionModelName=" + cfg.descriptionModelName +
-        " descriptionModelApiKeyPresent=" + std::string(cfg.descriptionModelApiKey.empty() ? "false" : "true")
+        " descriptionModelApiKeyPresent=" +
+        std::string(cfg.descriptionModelApiKey.empty() ? "false" : "true")
     );
 
     try {
@@ -7083,10 +7570,15 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         if (directStart) {
             setCameraServiceRunning_(cameraId, true, "agentcore_start");
         }
+        outcome.started = true;
+        return outcome;
     }
     catch (const std::exception& e) {
-        if (directStart) {
+        outcome.error = e.what();
+        if (directStart && !directServiceRequestedBefore) {
             setDirectServiceRequested_(cameraId, false);
+        }
+        if (directStart && !hasExistingSession) {
             setCameraServiceRunning_(cameraId, false, "agentcore_start_failed");
         }
         Logger::instance().logDebug(
@@ -7096,8 +7588,11 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         );
     }
     catch (...) {
-        if (directStart) {
+        outcome.error = "Unknown camera start error";
+        if (directStart && !directServiceRequestedBefore) {
             setDirectServiceRequested_(cameraId, false);
+        }
+        if (directStart && !hasExistingSession) {
             setCameraServiceRunning_(cameraId, false, "agentcore_start_failed_unknown");
         }
         Logger::instance().logDebug(
@@ -7107,10 +7602,247 @@ void AgentCore::startCameraFromPayload_(int cameraId, const json& p) {
         );
     }
 
+    return outcome;
+}
+
+AgentCore::CameraStartOutcome AgentCore::startCameraFromPayload_(int cameraId, const json& p)
+{
     Logger::instance().logDebug(
         "agent",
-        "startCameraFromPayload_: EXIT cameraId=" + std::to_string(cameraId)
+        "startCameraFromPayload_: ENTER cameraId=" + std::to_string(cameraId) +
+        " payload=" + p.dump()
     );
+
+    CameraConfig cfg = buildCameraConfigFromPayload_(cameraId, p);
+    std::lock_guard<std::mutex> admissionLock(resourceAdmissionMu_);
+    CameraStartOutcome outcome = startCameraFromPayloadLocked_(cameraId, p, cfg, false);
+
+    Logger::instance().logDebug(
+        "agent",
+        "startCameraFromPayload_: EXIT cameraId=" + std::to_string(cameraId) +
+        " started=" + std::string(outcome.started ? "true" : "false") +
+        " reused=" + std::string(outcome.reused ? "true" : "false") +
+        " blocked=" + std::string(outcome.blocked ? "true" : "false")
+    );
+    return outcome;
+}
+
+AgentCore::JobStepCameraStartResult AgentCore::startJobStepCameras_(
+    int jobId,
+    int stepId,
+    const std::vector<std::pair<int, nlohmann::json>>& cameraPayloads,
+    ResourceAdmissionDecision& outDecision)
+{
+    JobStepCameraStartResult result;
+    outDecision = ResourceAdmissionDecision{};
+    if (cameraPayloads.empty()) {
+        return result;
+    }
+
+    struct PreparedStart {
+        int cameraId = -1;
+        nlohmann::json payload = nlohmann::json::object();
+        CameraConfig cfg;
+        bool hasExistingSession = false;
+        bool matchesExistingSession = false;
+        std::uint64_t reclaimedCpuBytes = 0;
+        std::uint64_t reclaimedGpuBytes = 0;
+        ResourceAdmissionCamera request;
+    };
+
+    std::vector<PreparedStart> preparedStarts;
+    preparedStarts.reserve(cameraPayloads.size());
+
+    std::lock_guard<std::mutex> admissionLock(resourceAdmissionMu_);
+
+    auto saturatingAdd = [](std::uint64_t left, std::uint64_t right) -> std::uint64_t {
+        const std::uint64_t maxValue = (std::numeric_limits<std::uint64_t>::max)();
+        if (right > maxValue - left) {
+            return maxValue;
+        }
+        return left + right;
+    };
+
+    MEMORYSTATUSEX memStatus{};
+    memStatus.dwLength = sizeof(memStatus);
+    const bool hasMemoryStatus = GlobalMemoryStatusEx(&memStatus) != FALSE;
+
+    GpuMemorySnapshot gpuSnapshot;
+    const bool hasGpuSnapshot = queryGpuMemorySnapshot_(gpuSnapshot);
+
+    ResourceAdmissionDecision blockedDecision;
+    blockedDecision.availableCpuBytes =
+        hasMemoryStatus ? static_cast<std::uint64_t>(memStatus.ullAvailPhys) : 0;
+    if (hasGpuSnapshot) {
+        blockedDecision.availableGpuBytes = gpuSnapshot.availableBytes;
+        blockedDecision.gpuTotalBytes = gpuSnapshot.totalBytes;
+        blockedDecision.gpuBudgetBytes = gpuSnapshot.budgetBytes;
+        blockedDecision.gpuAdapterName = gpuSnapshot.adapterName;
+    }
+
+    constexpr std::uint64_t kCpuReserveBytes = 256ull * 1024ull * 1024ull;
+    constexpr std::uint64_t kGpuReserveBytes = 128ull * 1024ull * 1024ull;
+    std::uint64_t remainingCpuBytes =
+        blockedDecision.availableCpuBytes > kCpuReserveBytes
+            ? blockedDecision.availableCpuBytes - kCpuReserveBytes
+            : 0;
+    std::uint64_t remainingGpuBytes =
+        blockedDecision.availableGpuBytes > kGpuReserveBytes
+            ? blockedDecision.availableGpuBytes - kGpuReserveBytes
+            : 0;
+
+    bool blockedByCpu = false;
+    bool blockedByGpuCapacity = false;
+    bool blockedByGpuUnavailable = false;
+
+    for (const auto& entry : cameraPayloads) {
+        const int cameraId = entry.first;
+        const nlohmann::json& payload = entry.second;
+        PreparedStart prepared;
+        prepared.cameraId = cameraId;
+        prepared.payload = payload;
+        prepared.cfg = buildCameraConfigFromPayload_(cameraId, payload);
+
+        {
+            std::lock_guard<std::mutex> lk(sessionsMu_);
+            auto it = sessions_.find(cameraId);
+            if (it != sessions_.end() && it->second) {
+                prepared.hasExistingSession = true;
+                prepared.matchesExistingSession = it->second->matchesStartConfig(prepared.cfg);
+                if (!prepared.matchesExistingSession) {
+                    const CameraConfig& existingCfg = it->second->getConfig();
+                    prepared.reclaimedCpuBytes = estimateCpuBytesForConfig_(existingCfg);
+                    prepared.reclaimedGpuBytes = estimateGpuBytesForConfig_(existingCfg);
+                }
+            }
+        }
+
+        if (!prepared.matchesExistingSession) {
+            prepared.request.cameraId = cameraId;
+            prepared.request.cameraName = prepared.cfg.name;
+            prepared.request.cameraSessionId = prepared.cfg.cameraSessionId;
+            prepared.request.captureMode = prepared.cfg.captureAccelerationMode;
+            prepared.request.requiredCpuBytes = estimateCpuBytesForConfig_(prepared.cfg);
+            prepared.request.requiredGpuBytes = estimateGpuBytesForConfig_(prepared.cfg);
+            prepared.request.wasRunningBefore = prepared.hasExistingSession;
+
+            const std::uint64_t effectiveAvailableCpu =
+                saturatingAdd(remainingCpuBytes, prepared.reclaimedCpuBytes);
+            const std::uint64_t effectiveAvailableGpu =
+                saturatingAdd(remainingGpuBytes, prepared.reclaimedGpuBytes);
+            const bool cpuWouldBlock =
+                prepared.request.requiredCpuBytes > effectiveAvailableCpu;
+            const bool gpuRequested = prepared.request.requiredGpuBytes > 0;
+            const bool gpuUnavailable = gpuRequested && !hasGpuSnapshot;
+            const bool gpuWouldBlock =
+                gpuRequested &&
+                (gpuUnavailable || prepared.request.requiredGpuBytes > effectiveAvailableGpu);
+
+            if (cpuWouldBlock || gpuWouldBlock) {
+                blockedDecision.allowed = false;
+                blockedDecision.requiredCpuBytes =
+                    saturatingAdd(blockedDecision.requiredCpuBytes, prepared.request.requiredCpuBytes);
+                blockedDecision.requiredGpuBytes =
+                    saturatingAdd(blockedDecision.requiredGpuBytes, prepared.request.requiredGpuBytes);
+                blockedDecision.reclaimedCpuBytes =
+                    saturatingAdd(blockedDecision.reclaimedCpuBytes, prepared.reclaimedCpuBytes);
+                blockedDecision.reclaimedGpuBytes =
+                    saturatingAdd(blockedDecision.reclaimedGpuBytes, prepared.reclaimedGpuBytes);
+                blockedDecision.blockedCameras.push_back(prepared.request);
+                blockedByCpu = blockedByCpu || cpuWouldBlock;
+                blockedByGpuCapacity = blockedByGpuCapacity || (gpuWouldBlock && !gpuUnavailable);
+                blockedByGpuUnavailable = blockedByGpuUnavailable || gpuUnavailable;
+                continue;
+            }
+
+            remainingCpuBytes =
+                effectiveAvailableCpu > prepared.request.requiredCpuBytes
+                    ? effectiveAvailableCpu - prepared.request.requiredCpuBytes
+                    : 0;
+            remainingGpuBytes =
+                effectiveAvailableGpu > prepared.request.requiredGpuBytes
+                    ? effectiveAvailableGpu - prepared.request.requiredGpuBytes
+                    : 0;
+        }
+
+        preparedStarts.push_back(std::move(prepared));
+    }
+
+    std::vector<int> acquiredCameraIds;
+    acquiredCameraIds.reserve(preparedStarts.size());
+    for (const auto& prepared : preparedStarts) {
+        CameraStartOutcome outcome =
+            startCameraFromPayloadLocked_(prepared.cameraId, prepared.payload, prepared.cfg, true);
+        if (!(outcome.started || outcome.reused)) {
+            result.ok = false;
+            result.error =
+                !outcome.error.empty()
+                    ? outcome.error
+                    : std::string("Failed to start camera #") + std::to_string(prepared.cameraId);
+            for (int acquiredCameraId : acquiredCameraIds) {
+                stopCameraForJob(acquiredCameraId, jobId, stepId);
+            }
+            outDecision = blockedDecision;
+            result.blockedDecision = blockedDecision;
+            return result;
+        }
+
+        jobsSessionAcquire_(prepared.cameraId, jobId, stepId);
+        acquiredCameraIds.push_back(prepared.cameraId);
+        result.startedCameraIds.push_back(prepared.cameraId);
+    }
+
+    if (!blockedDecision.allowed) {
+        if (blockedByCpu && (blockedByGpuCapacity || blockedByGpuUnavailable)) {
+            blockedDecision.reasonCode = "cpu_gpu_memory_exhausted";
+            blockedDecision.device = "cpu+gpu";
+            blockedDecision.deviceSummary = "CPU/GPU";
+        }
+        else if (blockedByCpu) {
+            blockedDecision.reasonCode = "cpu_memory_exhausted";
+            blockedDecision.device = "cpu";
+            blockedDecision.deviceSummary = "CPU";
+        }
+        else if (blockedByGpuUnavailable && !blockedByGpuCapacity) {
+            blockedDecision.reasonCode = "gpu_memory_unavailable";
+            blockedDecision.device = "gpu";
+            blockedDecision.deviceSummary =
+                !gpuSnapshot.adapterName.empty() ? gpuSnapshot.adapterName : std::string("GPU");
+        }
+        else {
+            blockedDecision.reasonCode = "gpu_memory_exhausted";
+            blockedDecision.device = "gpu";
+            blockedDecision.deviceSummary =
+                !gpuSnapshot.adapterName.empty() ? gpuSnapshot.adapterName : std::string("GPU");
+        }
+
+        const std::string cameraLabels = joinCameraNames_(blockedDecision.blockedCameras);
+        const std::string prefix =
+            result.startedCameraIds.empty()
+                ? std::string("Could not start ")
+                : std::string("Started ") + std::to_string(result.startedCameraIds.size()) +
+                    " camera(s), but could not start ";
+        if (blockedDecision.reasonCode == "gpu_memory_unavailable") {
+            blockedDecision.message =
+                prefix + cameraLabels +
+                " because the GPU memory budget could not be verified on this machine.";
+        }
+        else {
+            const std::string deviceLabel =
+                blockedDecision.device == "cpu+gpu"
+                    ? "CPU/GPU"
+                    : blockedDecision.device == "gpu"
+                    ? "GPU"
+                    : "CPU";
+            blockedDecision.message =
+                prefix + cameraLabels +
+                " because available " + deviceLabel + " memory is too low.";
+        }
+    }
+
+    outDecision = blockedDecision;
+    result.blockedDecision = blockedDecision;
+    return result;
 }
 
 
@@ -7749,21 +8481,39 @@ AgentCore::AgentEventPostResult AgentCore::postAgentEventWithResult(
         payload["event_type"] = eventType;
         payload["message"] = message;
 
-        const nlohmann::json effectiveDetails =
+        nlohmann::json effectiveDetails =
             details.is_null() ? nlohmann::json::object() : details;
+        int effectiveCameraId = -1;
 
         if (cameraId.has_value()) {
             payload["camera_id"] = cameraId.value();
+            effectiveCameraId = cameraId.value();
         }
         else if (effectiveDetails.is_object() &&
                  effectiveDetails.contains("camera_id") &&
                  effectiveDetails["camera_id"].is_number_integer())
         {
             payload["camera_id"] = effectiveDetails["camera_id"];
+            effectiveCameraId = effectiveDetails["camera_id"].get<int>();
+        }
+        else if (effectiveDetails.is_object() &&
+                 effectiveDetails.contains("camera_id") &&
+                 effectiveDetails["camera_id"].is_string())
+        {
+            try {
+                effectiveCameraId = std::stoi(effectiveDetails["camera_id"].get<std::string>());
+                payload["camera_id"] = effectiveCameraId;
+            }
+            catch (...) {
+            }
         }
 
         if (!userId.empty()) {
             payload["user_id"] = userId;
+        }
+
+        if (effectiveCameraId > 0) {
+            promotePrimaryEventMediaReferences_(effectiveCameraId, effectiveDetails);
         }
 
         if (effectiveDetails.is_object()) {
@@ -7804,6 +8554,7 @@ AgentCore::AgentEventPostResult AgentCore::postAgentEventWithResult(
                 if (node.is_object()) {
                     for (auto it = node.begin(); it != node.end(); ++it) {
                         if (it.key() == "frame_jpeg_base64" ||
+                            it.key() == "image_jpeg_b64" ||
                             it.key() == "video_mp4_base64" ||
                             it.key() == "snapshot_image_data_url" ||
                             it.key() == "image_data_url") {
@@ -7975,6 +8726,288 @@ AgentCore::JobAlertVideoUploadResult AgentCore::uploadJobAlertVideo(
     return result;
 }
 
+AgentCore::EventMediaUploadResult AgentCore::uploadEventMedia_(
+    int cameraId,
+    const std::string& kind,
+    const std::string& rawBase64OrDataUrl,
+    const std::string& contentTypeHint) const
+{
+    EventMediaUploadResult result;
+
+    try {
+        const std::string normalizedKind = lowerAsciiCopy_(trimAsciiEventMediaUpload_(kind));
+        if (cameraId <= 0) {
+            result.error = "invalid camera id";
+            return result;
+        }
+        if (normalizedKind != "image" && normalizedKind != "video") {
+            result.error = "unsupported media kind";
+            return result;
+        }
+        if (trimAsciiEventMediaUpload_(rawBase64OrDataUrl).empty()) {
+            result.error = "empty media payload";
+            return result;
+        }
+
+        std::vector<unsigned char> bytes;
+        std::string decodeError;
+        if (!decodeBase64ToBytesForPromptEnhance_(rawBase64OrDataUrl, bytes, &decodeError) ||
+            bytes.empty())
+        {
+            result.error = decodeError.empty() ? "failed to decode media" : decodeError;
+            return result;
+        }
+
+        const std::string fallbackContentType =
+            normalizedKind == "video" ? std::string("video/mp4") : std::string("image/jpeg");
+        const std::string contentType =
+            trimAsciiEventMediaUpload_(contentTypeHint).empty()
+                ? detectContentTypeFromDataUrl_(rawBase64OrDataUrl, fallbackContentType)
+                : trimAsciiEventMediaUpload_(contentTypeHint);
+
+        std::string url = baseUrl_ +
+            "/api/agent/event-media?client_id=" + clientId_ +
+            "&camera_id=" + urlEncodeForQuery_(std::to_string(cameraId)) +
+            "&kind=" + urlEncodeForQuery_(normalizedKind);
+
+        Logger::instance().logDebug(
+            "agent",
+            "uploadEventMedia_: POST " + url +
+            " bytes=" + std::to_string(bytes.size()) +
+            " contentType=" + contentType
+        );
+
+        result.httpCode = HttpPostBytes(url, exeToken_, bytes, contentType, result.response);
+        if (result.httpCode < 200 || result.httpCode >= 300) {
+            result.error =
+                "upload failed httpCode=" + std::to_string(result.httpCode) +
+                " response=" + result.response;
+            Logger::instance().logDebug("agent", "uploadEventMedia_: " + result.error);
+            return result;
+        }
+
+        const json parsed = json::parse(result.response, nullptr, false);
+        if (!parsed.is_object()) {
+            result.error = "upload response is not valid json";
+            return result;
+        }
+
+        result.storageKey = parsed.value("storage_key", "");
+        result.mediaUrl = parsed.value("media_url", "");
+
+        if (normalizedKind == "image") {
+            if (result.storageKey.empty()) {
+                result.storageKey = parsed.value("image_key", "");
+            }
+            if (result.mediaUrl.empty()) {
+                result.mediaUrl = parsed.value("image_url", "");
+            }
+        }
+        else {
+            if (result.storageKey.empty()) {
+                result.storageKey = parsed.value("video_key", "");
+            }
+            if (result.mediaUrl.empty()) {
+                result.mediaUrl = parsed.value("video_url", "");
+            }
+        }
+
+        if (result.storageKey.empty() || result.mediaUrl.empty()) {
+            result.error = "upload response missing storage key or media url";
+            return result;
+        }
+
+        result.ok = true;
+        Logger::instance().logDebug(
+            "agent",
+            "uploadEventMedia_: httpCode=" + std::to_string(result.httpCode) +
+            " storageKey=" + result.storageKey
+        );
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug("agent", std::string("uploadEventMedia_ exception: ") + e.what());
+        result.error = e.what();
+    }
+    catch (...) {
+        Logger::instance().logDebug("agent", "uploadEventMedia_ unknown exception");
+        result.error = "unknown exception";
+    }
+
+    return result;
+}
+
+void AgentCore::promotePrimaryEventMediaReferences_(int cameraId, nlohmann::json& details) const
+{
+    if (cameraId <= 0 || !details.is_object()) {
+        return;
+    }
+
+    auto readTrimmedString = [&](std::initializer_list<const char*> keys) -> std::string {
+        for (const char* key : keys) {
+            auto it = details.find(key);
+            if (it == details.end() || !it->is_string()) {
+                continue;
+            }
+            const std::string value = trimAsciiEventMediaUpload_(it->get<std::string>());
+            if (!value.empty()) {
+                return value;
+            }
+        }
+        return {};
+    };
+
+    auto eraseKeys = [&](std::initializer_list<const char*> keys) {
+        for (const char* key : keys) {
+            auto it = details.find(key);
+            if (it != details.end()) {
+                details.erase(it);
+            }
+        }
+    };
+
+    auto setMediaTypeIfMissing = [&](const char* mediaType) {
+        const std::string current = readTrimmedString({ "media_type" });
+        if (current.empty()) {
+            details["media_type"] = mediaType;
+        }
+    };
+
+    auto promoteGroupImageReferences = [&]() {
+        auto groupImagesIt = details.find("group_images");
+        if (groupImagesIt == details.end() || !groupImagesIt->is_array()) {
+            return;
+        }
+
+        for (auto& entry : *groupImagesIt) {
+            if (!entry.is_object()) {
+                continue;
+            }
+
+            auto readGroupTrimmedString = [&](std::initializer_list<const char*> keys) -> std::string {
+                for (const char* key : keys) {
+                    auto itemIt = entry.find(key);
+                    if (itemIt == entry.end() || !itemIt->is_string()) {
+                        continue;
+                    }
+                    const std::string value = trimAsciiEventMediaUpload_(itemIt->get<std::string>());
+                    if (!value.empty()) {
+                        return value;
+                    }
+                }
+                return {};
+            };
+
+            auto eraseGroupKeys = [&](std::initializer_list<const char*> keys) {
+                for (const char* key : keys) {
+                    auto itemIt = entry.find(key);
+                    if (itemIt != entry.end()) {
+                        entry.erase(itemIt);
+                    }
+                }
+            };
+
+            const std::string existingGroupImageKey = readGroupTrimmedString({ "image_key", "imageKey" });
+            if (!existingGroupImageKey.empty()) {
+                eraseGroupKeys({ "frame_jpeg_base64", "image_jpeg_b64", "snapshot_image_data_url", "image_data_url" });
+                continue;
+            }
+
+            const std::string rawGroupImage = readGroupTrimmedString({
+                "frame_jpeg_base64",
+                "image_jpeg_b64",
+                "snapshot_image_data_url",
+                "image_data_url"
+            });
+            if (rawGroupImage.empty()) {
+                continue;
+            }
+
+            auto groupUpload = uploadEventMedia_(
+                cameraId,
+                "image",
+                rawGroupImage,
+                detectContentTypeFromDataUrl_(rawGroupImage, "image/jpeg")
+            );
+            if (groupUpload.ok) {
+                entry["image_key"] = groupUpload.storageKey;
+                entry["image_url"] = groupUpload.mediaUrl;
+                eraseGroupKeys({ "frame_jpeg_base64", "image_jpeg_b64", "snapshot_image_data_url", "image_data_url" });
+                continue;
+            }
+
+            Logger::instance().logDebug(
+                "agent",
+                "promotePrimaryEventMediaReferences_: keeping inline group image payload for cameraId=" +
+                std::to_string(cameraId) +
+                " error=" + groupUpload.error
+            );
+        }
+    };
+
+    const std::string existingVideoKey = readTrimmedString({ "video_key", "videoKey" });
+    if (!existingVideoKey.empty()) {
+        setMediaTypeIfMissing("video");
+        eraseKeys({ "video_mp4_base64" });
+    }
+    else {
+        const std::string rawVideo = readTrimmedString({ "video_mp4_base64" });
+        if (!rawVideo.empty()) {
+            auto upload = uploadEventMedia_(cameraId, "video", rawVideo, "video/mp4");
+            if (upload.ok) {
+                details["video_key"] = upload.storageKey;
+                details["video_url"] = upload.mediaUrl;
+                details["media_type"] = "video";
+                eraseKeys({ "video_mp4_base64" });
+            }
+            else {
+                Logger::instance().logDebug(
+                    "agent",
+                    "promotePrimaryEventMediaReferences_: keeping inline video payload for cameraId=" +
+                    std::to_string(cameraId) +
+                    " error=" + upload.error
+                );
+            }
+        }
+    }
+
+    const std::string existingImageKey = readTrimmedString({ "image_key", "imageKey" });
+    if (!existingImageKey.empty()) {
+        setMediaTypeIfMissing("image");
+        eraseKeys({ "frame_jpeg_base64", "image_jpeg_b64", "snapshot_image_data_url", "image_data_url" });
+        promoteGroupImageReferences();
+        return;
+    }
+
+    const std::string rawImage = readTrimmedString({
+        "frame_jpeg_base64",
+        "image_jpeg_b64",
+        "snapshot_image_data_url",
+        "image_data_url"
+    });
+    if (rawImage.empty()) {
+        promoteGroupImageReferences();
+        return;
+    }
+
+    auto upload = uploadEventMedia_(cameraId, "image", rawImage, "image/jpeg");
+    if (upload.ok) {
+        details["image_key"] = upload.storageKey;
+        details["image_url"] = upload.mediaUrl;
+        setMediaTypeIfMissing("image");
+        eraseKeys({ "frame_jpeg_base64", "image_jpeg_b64", "snapshot_image_data_url", "image_data_url" });
+        promoteGroupImageReferences();
+        return;
+    }
+
+    Logger::instance().logDebug(
+        "agent",
+        "promotePrimaryEventMediaReferences_: keeping inline image payload for cameraId=" +
+        std::to_string(cameraId) +
+        " error=" + upload.error
+    );
+    promoteGroupImageReferences();
+}
+
 
 void AgentCore::setCameraServiceRunning_(
     int cameraId,
@@ -8108,7 +9141,8 @@ void AgentCore::ensureCameraStartedForJob(
     jobsSessionAcquire_(cameraId, jobId, stepId);
 
     if (getCameraSession(cameraId) == nullptr) {
-        startCameraFromPayload_(cameraId, startPayload);
+        CameraStartOutcome outcome = startCameraFromPayload_(cameraId, startPayload);
+        (void)outcome;
     }
 
     if (getCameraSession(cameraId) == nullptr) {
@@ -8309,25 +9343,23 @@ bool AgentCore::bootstrapCameras_()
 
 
 void AgentCore::sendThumbnail(const std::string& cameraId,
-    const std::string& jpegBase64) {
+    const std::vector<unsigned char>& jpegBytes) {
     try {
-        json payload;
-        payload["camera_id"] = std::stoi(cameraId);
-        payload["jpeg_base64"] = jpegBase64;
+        if (trimAsciiEventMediaUpload_(cameraId).empty() || jpegBytes.empty()) {
+            return;
+        }
 
-        std::string body = payload.dump();
-
-        // mesmo esquema de auth que /api/agent/events
-        std::string url = baseUrl_ + "/api/agent/thumbnails?client_id=" + clientId_;
+        std::string url = baseUrl_ + "/api/agent/thumbnails?client_id=" + clientId_ +
+            "&camera_id=" + urlEncodeForQuery_(cameraId);
 
         Logger::instance().logDebug(
             "agent",
             "sendThumbnail: POST " + url +
-            " bodySize=" + std::to_string(body.size())
+            " bytes=" + std::to_string(jpegBytes.size())
         );
 
         std::string response;
-        long code = HttpPostJson(url, exeToken_, body, response);
+        long code = HttpPostBytes(url, exeToken_, jpegBytes, "image/jpeg", response);
 
         
         Logger::instance().logDebug(
@@ -8336,6 +9368,58 @@ void AgentCore::sendThumbnail(const std::string& cameraId,
             " responseSize=" + std::to_string(response.size())
         );
         
+    }
+    catch (const std::exception& e) {
+        Logger::instance().logDebug(
+            "agent",
+            std::string("sendThumbnail std::exception: ") + e.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail unknown exception"
+        );
+    }
+}
+
+void AgentCore::sendThumbnail(const std::string& cameraId,
+    const std::string& jpegBase64) {
+    try {
+        std::vector<unsigned char> jpegBytes;
+        std::string decodeError;
+        if (decodeBase64ToBytesForPromptEnhance_(jpegBase64, jpegBytes, &decodeError) &&
+            !jpegBytes.empty())
+        {
+            sendThumbnail(cameraId, jpegBytes);
+            return;
+        }
+
+        json payload;
+        payload["camera_id"] = std::stoi(cameraId);
+        payload["jpeg_base64"] = jpegBase64;
+
+        std::string body = payload.dump();
+
+        std::string url = baseUrl_ + "/api/agent/thumbnails?client_id=" + clientId_;
+
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail: falling back to JSON payload POST " + url +
+            " bodySize=" + std::to_string(body.size()) +
+            (decodeError.empty() ? std::string() : " decodeError=" + decodeError)
+        );
+
+        std::string response;
+        long code = HttpPostJson(url, exeToken_, body, response);
+
+
+        Logger::instance().logDebug(
+            "agent",
+            "sendThumbnail: JSON fallback HTTP " + std::to_string(code) +
+            " responseSize=" + std::to_string(response.size())
+        );
+
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug(
@@ -8400,6 +9484,8 @@ void AgentCore::sendAlgoEvent(const std::string& cameraId,
                 details[it.key()] = it.value();
             }
         }
+
+        promotePrimaryEventMediaReferences_(std::stoi(cameraId), details);
 
         payload["details"] = details;
 

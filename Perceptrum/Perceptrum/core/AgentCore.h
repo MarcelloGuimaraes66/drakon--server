@@ -12,6 +12,8 @@
 #include <functional>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 #include "../camera/CameraSession.h"
 #include "TemporalEvidence.h"
@@ -185,6 +187,8 @@ public:
         const nlohmann::json& extraDetails = nlohmann::json::object());
 
     void sendThumbnail(const std::string& cameraId,
+        const std::vector<unsigned char>& jpegBytes);
+    void sendThumbnail(const std::string& cameraId,
         const std::string& jpegBase64);
 
 
@@ -305,6 +309,41 @@ public:
     bool isCameraStreamOnline(int cameraId) const;
     std::vector<CameraSession::OpenMonitorSnapshot> collectOpenMonitorCameraSnapshots() const;
 
+    struct ResourceAdmissionCamera {
+        int cameraId = -1;
+        std::string cameraName;
+        std::string cameraSessionId;
+        std::string captureMode = "cpu";
+        std::uint64_t requiredCpuBytes = 0;
+        std::uint64_t requiredGpuBytes = 0;
+        bool wasRunningBefore = false;
+    };
+
+    struct ResourceAdmissionDecision {
+        bool allowed = true;
+        std::string reasonCode;
+        std::string message;
+        std::string device = "cpu";
+        std::string deviceSummary;
+        std::uint64_t requiredCpuBytes = 0;
+        std::uint64_t requiredGpuBytes = 0;
+        std::uint64_t availableCpuBytes = 0;
+        std::uint64_t availableGpuBytes = 0;
+        std::uint64_t gpuTotalBytes = 0;
+        std::uint64_t gpuBudgetBytes = 0;
+        std::uint64_t reclaimedCpuBytes = 0;
+        std::uint64_t reclaimedGpuBytes = 0;
+        std::string gpuAdapterName;
+        std::vector<ResourceAdmissionCamera> blockedCameras;
+    };
+
+    struct JobStepCameraStartResult {
+        bool ok = true;
+        std::string error;
+        ResourceAdmissionDecision blockedDecision;
+        std::vector<int> startedCameraIds;
+    };
+
     // JobRuntime: start/stop cameras using the same transport session while
     // keeping direct runs isolated from job-owned leases.
     void ensureCameraStartedForJob(int cameraId, int jobId, int stepId, const nlohmann::json& startPayload);
@@ -361,6 +400,15 @@ public:
 
 
 private:
+    struct EventMediaUploadResult {
+        bool ok = false;
+        long httpCode = -1;
+        std::string response;
+        std::string storageKey;
+        std::string mediaUrl;
+        std::string error;
+    };
+
     struct DrakonFindTaskState {
         std::atomic<bool> cancelRequested{ false };
         std::atomic<bool> done{ false };
@@ -409,6 +457,13 @@ private:
     };
 
     struct ChatTemporalState;
+
+    EventMediaUploadResult uploadEventMedia_(
+        int cameraId,
+        const std::string& kind,
+        const std::string& rawBase64OrDataUrl,
+        const std::string& contentTypeHint = std::string()) const;
+    void promotePrimaryEventMediaReferences_(int cameraId, nlohmann::json& details) const;
 
     void workerLoop_();
     void processCommand_(const nlohmann::json& cmd);
@@ -466,7 +521,42 @@ private:
     bool loadPersistedChatTemporalState_(int chatSessionId, ChatTemporalState& outState);
     bool persistChatTemporalState_(int chatSessionId, const ChatTemporalState& state);
     CameraConfig buildCameraConfigFromPayload_(int cameraId, const nlohmann::json& payload);
-    void startCameraFromPayload_(int cameraId, const nlohmann::json& payload);
+    struct GpuMemorySnapshot {
+        bool available = false;
+        std::string adapterName;
+        std::uint64_t totalBytes = 0;
+        std::uint64_t budgetBytes = 0;
+        std::uint64_t currentUsageBytes = 0;
+        std::uint64_t availableBytes = 0;
+    };
+    struct CameraStartOutcome {
+        bool started = false;
+        bool reused = false;
+        bool blocked = false;
+        bool wasRunningBefore = false;
+        ResourceAdmissionDecision admission;
+        std::string error;
+    };
+    CameraStartOutcome startCameraFromPayload_(int cameraId, const nlohmann::json& payload);
+    JobStepCameraStartResult startJobStepCameras_(
+        int jobId,
+        int stepId,
+        const std::vector<std::pair<int, nlohmann::json>>& cameraPayloads,
+        ResourceAdmissionDecision& outDecision);
+    CameraStartOutcome startCameraFromPayloadLocked_(
+        int cameraId,
+        const nlohmann::json& payload,
+        const CameraConfig& cfg,
+        bool skipAdmissionCheck);
+    ResourceAdmissionDecision evaluateCameraStartAdmissionLocked_(
+        const std::vector<ResourceAdmissionCamera>& requests,
+        const std::unordered_set<int>& replacedCameraIds) const;
+    bool queryGpuMemorySnapshot_(GpuMemorySnapshot& out) const;
+    std::uint64_t estimateCpuBytesForConfig_(const CameraConfig& cfg) const;
+    std::uint64_t estimateGpuBytesForConfig_(const CameraConfig& cfg) const;
+    nlohmann::json resourceAdmissionDecisionToJson_(
+        const ResourceAdmissionDecision& decision,
+        const std::string& startOrigin) const;
     void stopCamera_(int cameraId);
 
     std::string baseUrl_;
@@ -482,6 +572,7 @@ private:
     std::map<int, std::unique_ptr<CameraSession>> sessions_;
     mutable std::mutex             directServiceMu_;
     std::unordered_map<int, bool>  directServiceRequestedByCamera_;
+    mutable std::mutex             resourceAdmissionMu_;
 
     //std::unordered_map<int, std::unordered_map<int, int>> jobsCaptureByCamera_;
     struct JobsCaptureState {

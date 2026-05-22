@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <fstream>
 #include <ctime>
+#include <cstdlib>
+#include <cctype>
 #include "../logging/Logging.h"
 #include "../generated/Branding.h"
 #include <mutex>
@@ -51,6 +53,27 @@ static std::string formatUtcIso_(
     std::ostringstream oss;
     oss << std::put_time(&tmUtc, "%Y-%m-%dT%H:%M:%SZ");
     return oss.str();
+}
+
+static bool readFrameDiskWriterAsyncModeEnabled_()
+{
+    char* rawMode = nullptr;
+    std::size_t rawModeLength = 0;
+    if (_dupenv_s(&rawMode, &rawModeLength, "FRAME_DISK_WRITER_MODE") != 0 || !rawMode) {
+        return true;
+    }
+
+    std::string mode = rawMode;
+    std::free(rawMode);
+    std::transform(
+        mode.begin(),
+        mode.end(),
+        mode.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+    return mode != "sync" && mode != "disabled" && mode != "off";
 }
 
 #ifdef _WIN32
@@ -821,6 +844,10 @@ static std::wstring utf8ToWide(const std::string& s)
 struct FrameDiskWriter::SegmentWriter::MfEncoder {
     ComPtr<IMFSinkWriter> sinkWriter;
     DWORD streamIndex{ 0 };
+    cv::Mat bgraScratch;
+    ComPtr<IMFMediaBuffer> mediaBuffer;
+    ComPtr<IMFSample> sample;
+    DWORD mediaBufferSize{ 0 };
 };
 
 #endif // _WIN32
@@ -842,7 +869,8 @@ FrameDiskWriter::FrameDiskWriter(
     timeOffset_(timeOffset),
     fps_(outputFps),
     retentionDays_(retentionDays > 0 ? retentionDays : 0),
-    hydrateExistingSegments_(hydrateExistingSegments)
+    hydrateExistingSegments_(hydrateExistingSegments),
+    asyncWorkerEnabled_(readFrameDiskWriterAsyncModeEnabled_())
 {
     lastSaved_ = Clock::now() - minInterval_;
     lastSaved10_ = lastSaved_;
@@ -857,7 +885,50 @@ FrameDiskWriter::FrameDiskWriter(
             "FrameDiskWriter: starting with a clean in-memory clip queue"
         );
     }
+    if (asyncWorkerEnabled_) {
+        workerThread_ = std::thread(&FrameDiskWriter::workerLoop_, this);
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: async worker enabled");
+    }
+    else {
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: async worker disabled by FRAME_DISK_WRITER_MODE");
+    }
+}
 
+FrameDiskWriter::~FrameDiskWriter()
+{
+    try {
+        if (asyncWorkerEnabled_) {
+            beginSynchronousWorkerBarrier_(true);
+            {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                forceFinalizeAllOpenClipsLocked_("writer_shutdown");
+            }
+            endSynchronousWorkerBarrier_();
+        }
+        else {
+            std::lock_guard<std::mutex> lk(writerMutex_);
+            forceFinalizeAllOpenClipsLocked_("writer_shutdown");
+        }
+    }
+    catch (...) {
+        Logger::instance().logDebug(cameraId_, "FrameDiskWriter: destructor finalize failed");
+    }
+
+    if (asyncWorkerEnabled_) {
+        {
+            std::lock_guard<std::mutex> lk(workerStateMutex_);
+            workerStopRequested_ = true;
+            workerPauseRequested_ = false;
+            dropAsyncSavesWhilePaused_ = false;
+            pendingFrameReady_ = false;
+            pendingFlushRequested_ = false;
+        }
+        workerCv_.notify_all();
+        workerIdleCv_.notify_all();
+        if (workerThread_.joinable()) {
+            workerThread_.join();
+        }
+    }
 }
 
 void FrameDiskWriter::setEnabled(bool enabled) {
@@ -940,6 +1011,120 @@ void FrameDiskWriter::setCaptureProfiles(const std::vector<VideoCaptureProfile>&
     else {
         minInterval60_ = std::chrono::milliseconds(0);
     }
+}
+
+void FrameDiskWriter::workerLoop_()
+{
+    while (true) {
+        bool shouldSave = false;
+        bool shouldFlush = false;
+        std::chrono::milliseconds flushThreshold{ 0 };
+
+        {
+            std::unique_lock<std::mutex> lk(workerStateMutex_);
+            workerCv_.wait(lk, [this]() {
+                return workerStopRequested_ ||
+                    pendingFrameReady_ ||
+                    pendingFlushRequested_ ||
+                    workerPauseRequested_;
+            });
+
+            if (workerStopRequested_) {
+                break;
+            }
+
+            if (workerPauseRequested_ && !pendingFrameReady_ && !pendingFlushRequested_) {
+                workerIdleCv_.notify_all();
+                workerCv_.wait(lk, [this]() {
+                    return workerStopRequested_ || !workerPauseRequested_;
+                });
+                if (workerStopRequested_) {
+                    break;
+                }
+            }
+
+            if (workerPauseRequested_ && !pendingFrameReady_ && !pendingFlushRequested_) {
+                continue;
+            }
+
+            shouldSave = pendingFrameReady_;
+            if (shouldSave) {
+                std::swap(pendingFrameBuffer_, workerFrameBuffer_);
+                pendingFrameReady_ = false;
+            }
+
+            shouldFlush = pendingFlushRequested_;
+            flushThreshold = pendingFlushIdleThreshold_;
+            pendingFlushRequested_ = false;
+            pendingFlushIdleThreshold_ = std::chrono::milliseconds(0);
+            workerActive_ = shouldSave || shouldFlush;
+        }
+
+        try {
+            if (shouldSave) {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                saveLocked_(workerFrameBuffer_);
+            }
+            if (shouldFlush) {
+                std::lock_guard<std::mutex> lk(writerMutex_);
+                flushVideoClipIfIdleLocked_(flushThreshold);
+            }
+        }
+        catch (const std::exception& ex) {
+            Logger::instance().logDebug(
+                cameraId_,
+                std::string("FrameDiskWriter worker exception: ") + ex.what()
+            );
+        }
+        catch (...) {
+            Logger::instance().logDebug(cameraId_, "FrameDiskWriter worker unknown exception");
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(workerStateMutex_);
+            workerActive_ = false;
+            if (!pendingFrameReady_ && !pendingFlushRequested_) {
+                workerIdleCv_.notify_all();
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        workerActive_ = false;
+    }
+    workerIdleCv_.notify_all();
+}
+
+void FrameDiskWriter::beginSynchronousWorkerBarrier_(bool dropAsyncSaves)
+{
+    if (!asyncWorkerEnabled_) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lk(workerStateMutex_);
+    workerPauseRequested_ = true;
+    if (dropAsyncSaves) {
+        dropAsyncSavesWhilePaused_ = true;
+    }
+    workerCv_.notify_one();
+    workerIdleCv_.wait(lk, [this]() {
+        return !workerActive_ && !pendingFrameReady_ && !pendingFlushRequested_;
+    });
+}
+
+void FrameDiskWriter::endSynchronousWorkerBarrier_()
+{
+    if (!asyncWorkerEnabled_) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        dropAsyncSavesWhilePaused_ = false;
+        workerPauseRequested_ = false;
+    }
+    workerCv_.notify_one();
 }
 
 FrameDiskWriter::RetentionSweepStats FrameDiskWriter::runRetentionCleanupNow(
@@ -1591,6 +1776,12 @@ void FrameDiskWriter::closeWriter_(SegmentWriter& w) {
         w.encoder->sinkWriter->Finalize();
         w.encoder->sinkWriter.Reset();
     }
+    if (w.encoder) {
+        w.encoder->sample.Reset();
+        w.encoder->mediaBuffer.Reset();
+        w.encoder->bgraScratch.release();
+        w.encoder->mediaBufferSize = 0;
+    }
     delete w.encoder;
     w.encoder = nullptr;
 #endif
@@ -1688,7 +1879,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
     }
 
     // Convert BGR -> BGRA (RGB32)
-    cv::Mat bgra;
+    cv::Mat& bgra = w.encoder->bgraScratch;
     try {
         cv::cvtColor(frame, bgra, cv::COLOR_BGR2BGRA);
         cv::flip(bgra, bgra, 0);
@@ -1701,18 +1892,43 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
 
     const DWORD bufferSize = static_cast<DWORD>(bgra.total() * bgra.elemSize());
 
-    ComPtr<IMFMediaBuffer> mediaBuffer;
-    HRESULT hr = MFCreateMemoryBuffer(bufferSize, &mediaBuffer);
-    if (FAILED(hr)) {
-        Logger::instance().logDebug(cameraId_,
-            "writeFrame_: MFCreateMemoryBuffer FAILED hr=0x" +
-            std::to_string(static_cast<unsigned long>(hr)));
-        return;
+    if (!w.encoder->mediaBuffer || !w.encoder->sample || w.encoder->mediaBufferSize != bufferSize) {
+        w.encoder->mediaBuffer.Reset();
+        w.encoder->sample.Reset();
+
+        HRESULT createBufferHr = MFCreateMemoryBuffer(bufferSize, &w.encoder->mediaBuffer);
+        if (FAILED(createBufferHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: MFCreateMemoryBuffer FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(createBufferHr)));
+            return;
+        }
+
+        HRESULT createSampleHr = MFCreateSample(&w.encoder->sample);
+        if (FAILED(createSampleHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: MFCreateSample FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(createSampleHr)));
+            w.encoder->mediaBuffer.Reset();
+            return;
+        }
+
+        HRESULT addBufferHr = w.encoder->sample->AddBuffer(w.encoder->mediaBuffer.Get());
+        if (FAILED(addBufferHr)) {
+            Logger::instance().logDebug(cameraId_,
+                "writeFrame_: AddBuffer FAILED hr=0x" +
+                std::to_string(static_cast<unsigned long>(addBufferHr)));
+            w.encoder->sample.Reset();
+            w.encoder->mediaBuffer.Reset();
+            return;
+        }
+
+        w.encoder->mediaBufferSize = bufferSize;
     }
 
     BYTE* pData = nullptr;
     DWORD maxLen = 0, curLen = 0;
-    hr = mediaBuffer->Lock(&pData, &maxLen, &curLen);
+    HRESULT hr = w.encoder->mediaBuffer->Lock(&pData, &maxLen, &curLen);
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: mediaBuffer->Lock FAILED hr=0x" +
@@ -1722,7 +1938,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
 
     memcpy(pData, bgra.data, bufferSize);
 
-    hr = mediaBuffer->Unlock();
+    hr = w.encoder->mediaBuffer->Unlock();
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: mediaBuffer->Unlock FAILED hr=0x" +
@@ -1730,27 +1946,10 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
         return;
     }
 
-    hr = mediaBuffer->SetCurrentLength(bufferSize);
+    hr = w.encoder->mediaBuffer->SetCurrentLength(bufferSize);
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: SetCurrentLength FAILED hr=0x" +
-            std::to_string(static_cast<unsigned long>(hr)));
-        return;
-    }
-
-    ComPtr<IMFSample> sample;
-    hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
-        Logger::instance().logDebug(cameraId_,
-            "writeFrame_: MFCreateSample FAILED hr=0x" +
-            std::to_string(static_cast<unsigned long>(hr)));
-        return;
-    }
-
-    hr = sample->AddBuffer(mediaBuffer.Get());
-    if (FAILED(hr)) {
-        Logger::instance().logDebug(cameraId_,
-            "writeFrame_: AddBuffer FAILED hr=0x" +
             std::to_string(static_cast<unsigned long>(hr)));
         return;
     }
@@ -1760,7 +1959,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
     LONGLONG duration = static_cast<LONGLONG>(ticksPerSecond / fps);
     LONGLONG sampleTime = static_cast<LONGLONG>(w.frameCount * duration);
 
-    hr = sample->SetSampleTime(sampleTime);
+    hr = w.encoder->sample->SetSampleTime(sampleTime);
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: SetSampleTime FAILED hr=0x" +
@@ -1768,7 +1967,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
         return;
     }
 
-    hr = sample->SetSampleDuration(duration);
+    hr = w.encoder->sample->SetSampleDuration(duration);
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: SetSampleDuration FAILED hr=0x" +
@@ -1776,7 +1975,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
         return;
     }
 
-    hr = w.encoder->sinkWriter->WriteSample(w.encoder->streamIndex, sample.Get());
+    hr = w.encoder->sinkWriter->WriteSample(w.encoder->streamIndex, w.encoder->sample.Get());
     if (FAILED(hr)) {
         Logger::instance().logDebug(cameraId_,
             "writeFrame_: WriteSample FAILED hr=0x" +
@@ -1792,7 +1991,7 @@ void FrameDiskWriter::writeFrame_(SegmentWriter& w, const cv::Mat& frame) {
     const auto writeLatencyUs = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - writeStartedAt).count()
     );
-    recordWriteTelemetry_(0, writeLatencyUs);
+    recordWriteTelemetry_(static_cast<std::uint64_t>(bufferSize), writeLatencyUs);
 #else
     (void)w;
     (void)frame;
@@ -2395,300 +2594,59 @@ bool FrameDiskWriter::finalizeOpenClip_(
     return !clipPaths.empty();
 }
 
-
-
-
-
-
-
-/*
-// Helper: build a merged output path that reuses the timestamp from the first clip.
-// e.g. ".../12_20251205_183455_10s.mp4" + "_60s.mp4" -> ".../12_20251205_183455_60s.mp4"
-static std::string buildMergedPathFromFirstClip(
-    const std::string& firstClipPath,
-    const std::string& cameraId,
-    const std::string& suffix)
-{
-    fs::path p(firstClipPath);
-    fs::path dir = p.parent_path();
-    std::string filename = p.filename().string();
-
-    std::string datePart = "00000000";
-    std::string timePart = "000000";
-
-    // Expected: "<cameraId>_YYYYMMDD_HHMMSS_10s.mp4"
-    std::vector<std::string> tokens;
-    {
-        std::stringstream ss(filename);
-        std::string token;
-        while (std::getline(ss, token, '_')) {
-            tokens.push_back(token);
-        }
-    }
-    if (tokens.size() >= 3) {
-        datePart = tokens[1];
-        timePart = tokens[2];
-        // tokens[3] is like "10s.mp4"
-    }
-
-    std::ostringstream outName;
-    outName << cameraId << "_" << datePart << "_" << timePart << suffix;
-
-    fs::path outPath = dir / outName.str();
-    return outPath.string();
-}
-*/
-
-// --- merge logic: 6 x 10s -> 60s ---
-
-bool FrameDiskWriter::mergeTenSecondClipsInto60_(const cv::Size& size) {
-    if (tenSecondPaths_.size() < MAX_10S_CLIPS) return false;
-
-    const size_t batchStart = 0;
-    std::vector<std::string> batch;
-    batch.reserve(MAX_10S_CLIPS);
-    for (int offset = 0; offset < MAX_10S_CLIPS; ++offset) {
-        batch.push_back(tenSecondPaths_[static_cast<size_t>(offset)]);
-    }
-
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: merging oldest 10s clips into 60s clip, count=" +
-        std::to_string(batch.size())
-    );
-
-    // Merge by finalized clip count and let ffmpeg be the compatibility check.
-
-    // Build 60s output path using timestamp of first 10s clip in this batch
-    std::string outPath = buildMergedPathFromBatch(
-        batch,
-        cameraId_,
-        "_60s.mp4"
-    );
-
-#ifdef _WIN32
-    bool ok = runFfmpegConcat(batch, outPath, cameraId_);
-    if (!ok) {
-        Logger::instance().logDebug(
-            cameraId_,
-            "FrameDiskWriter: ffmpeg concat 10s->60s FAILED; dropping one clip from homogeneous batch to unblock pipeline"
-        );
-
-        if (batchStart < tenSecondPaths_.size()) {
-            const std::string badClip = tenSecondPaths_[batchStart];
-            quarantineFailedMergeClip(cameraId_, badClip, "10s_concat_failed");
-            tenSecondPaths_.erase(tenSecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart));
-            return true;
-        }
-        return false;
-    }
-
-    // Success: store 60s path
-    sixtySecondPaths_.push_back(outPath);
-
-    // Delete ONLY these 6 clips
-    for (const auto& clipPath : batch) {
-        std::error_code ec;
-        fs::remove(clipPath, ec);
-    }
-
-    // Erase the first 6 entries from the deque
-    tenSecondPaths_.erase(
-        tenSecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart),
-        tenSecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart + MAX_10S_CLIPS)
-    );
-
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: finished 10s->60s merge, output=" + outPath
-    );
-
-    // If we reached 5 x 60s clips, merge into 300s
-    if ((int)sixtySecondPaths_.size() >= MAX_60S_CLIPS) {
-        (void)mergeSixtySecondClipsInto300_(size);
-    }
-    return true;
-#else
-    (void)size;
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: mergeTenSecondClipsInto60_ not implemented on this platform"
-    );
-    return false;
-#endif
-}
-
-
-
-// --- merge logic: 5 x 60s -> 300s ---
-// --- merge logic: 5 x 60s -> 300s ---
-
-bool FrameDiskWriter::mergeSixtySecondClipsInto300_(const cv::Size& size) {
-    if (sixtySecondPaths_.size() < MAX_60S_CLIPS) return false;
-
-    const size_t batchStart = 0;
-    std::vector<std::string> batch;
-    batch.reserve(MAX_60S_CLIPS);
-    for (int offset = 0; offset < MAX_60S_CLIPS; ++offset) {
-        batch.push_back(sixtySecondPaths_[static_cast<size_t>(offset)]);
-    }
-
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: merging oldest 60s clips into 300s clip, count=" +
-        std::to_string(batch.size())
-    );
-
-    // Merge by finalized clip count and let ffmpeg be the compatibility check.
-
-    // Build 300s output path using timestamp of first 60s clip
-    std::string outPath = buildMergedPathFromBatch(
-        batch,
-        cameraId_,
-        "_300s.mp4"
-    );
-
-#ifdef _WIN32
-    bool ok = runFfmpegConcat(batch, outPath, cameraId_);
-    if (!ok) {
-        Logger::instance().logDebug(
-            cameraId_,
-            "FrameDiskWriter: ffmpeg concat 60s->300s FAILED; dropping one clip from homogeneous batch to unblock pipeline"
-        );
-
-        if (batchStart < sixtySecondPaths_.size()) {
-            const std::string badClip = sixtySecondPaths_[batchStart];
-            quarantineFailedMergeClip(cameraId_, badClip, "60s_concat_failed");
-            sixtySecondPaths_.erase(sixtySecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart));
-            return true;
-        }
-        return false;
-    }
-
-    // Delete ONLY these 5 clips now that they are merged
-    for (const auto& clipPath : batch) {
-        std::error_code ec;
-        fs::remove(clipPath, ec);
-        if (ec) {
-            Logger::instance().logDebug(
-                cameraId_,
-                "FrameDiskWriter: failed to remove 60s clip " +
-                clipPath + " : " + ec.message()
-            );
-        }
-    }
-
-    // Remove them from deque
-    sixtySecondPaths_.erase(
-        sixtySecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart),
-        sixtySecondPaths_.begin() + static_cast<std::ptrdiff_t>(batchStart + MAX_60S_CLIPS)
-    );
-
-    // NEW: move the merged 300s clip from baseDir_ to baseDir_ + "_300s"
-    try {
-        fs::path srcPath(outPath);
-        fs::path baseRoot(baseDir_);  // e.g. "frames"
-        std::error_code relEc;
-        fs::path rel = fs::relative(srcPath, baseRoot, relEc);
-
-        if (relEc) {
-            Logger::instance().logDebug(
-                cameraId_,
-                "FrameDiskWriter: relative() failed for 300s clip " +
-                srcPath.string() + " : " + relEc.message()
-            );
-        }
-        else {
-            // Long-term 300s root, e.g. "frames_300s"
-            fs::path longRoot(baseDir_ + "_300s");
-            fs::path dstPath = longRoot / rel;  // keep cam/YYYY/MM/DD layout
-
-            std::error_code dirEc;
-            fs::create_directories(dstPath.parent_path(), dirEc);
-            if (dirEc) {
-                Logger::instance().logDebug(
-                    cameraId_,
-                    "FrameDiskWriter: create_directories failed for 300s dst " +
-                    dstPath.parent_path().string() + " : " + dirEc.message()
-                );
-            }
-            else {
-                std::error_code mvEc;
-                fs::rename(srcPath, dstPath, mvEc);
-                if (mvEc) {
-                    Logger::instance().logDebug(
-                        cameraId_,
-                        "FrameDiskWriter: rename failed for 300s clip, trying copy: " +
-                        mvEc.message()
-                    );
-
-                    std::error_code cpEc;
-                    fs::copy_file(
-                        srcPath, dstPath,
-                        fs::copy_options::overwrite_existing,
-                        cpEc
-                    );
-                    if (cpEc) {
-                        Logger::instance().logDebug(
-                            cameraId_,
-                            "FrameDiskWriter: copy_file failed for 300s clip: " +
-                            cpEc.message()
-                        );
-                    }
-                    else {
-                        // Copy succeeded; remove original
-                        std::error_code rmEc;
-                        fs::remove(srcPath, rmEc);
-                        if (rmEc) {
-                            Logger::instance().logDebug(
-                                cameraId_,
-                                "FrameDiskWriter: remove original 300s clip failed: " +
-                                rmEc.message()
-                            );
-                        }
-                        outPath = dstPath.string();
-                    }
-                }
-                else {
-                    // rename succeeded
-                    outPath = dstPath.string();
-                }
-            }
-        }
-    }
-    catch (const std::exception& ex) {
-        Logger::instance().logDebug(
-            cameraId_,
-            std::string("FrameDiskWriter: exception while moving 300s clip: ") +
-            ex.what()
-        );
-    }
-
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: finished 60s->300s merge, output=" + outPath
-    );
-    return true;
-#else
-    (void)size;
-    Logger::instance().logDebug(
-        cameraId_,
-        "FrameDiskWriter: mergeSixtySecondClipsInto300_ not implemented on this platform"
-    );
-    return false;
-#endif
-}
-
-/*
-void FrameDiskWriter::setJobsCopyPredicate(std::function<bool()> pred) {
-    shouldCopyJobs_ = std::move(pred);
-}
-*/
-
 // --- main entry point ---
 
-void FrameDiskWriter::save(const cv::Mat& frame) {
-    std::lock_guard<std::mutex> lk(writerMutex_);
+void FrameDiskWriter::save(const cv::Mat& frame)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        saveLocked_(frame);
+        return;
+    }
+
+    if (frame.empty()) {
+        Logger::instance().logDebug(cameraId_, "save: skipping empty frame before async enqueue");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        if (workerStopRequested_ || dropAsyncSavesWhilePaused_) {
+            return;
+        }
+        frame.copyTo(pendingFrameBuffer_);
+        pendingFrameReady_ = true;
+    }
+    workerCv_.notify_one();
+}
+
+void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        flushVideoClipIfIdleLocked_(idleThreshold);
+        return;
+    }
+
+    if (idleThreshold.count() <= 0) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(workerStateMutex_);
+        if (workerStopRequested_) {
+            return;
+        }
+        pendingFlushRequested_ = true;
+        pendingFlushIdleThreshold_ =
+            pendingFlushIdleThreshold_.count() > 0
+                ? (std::max)(pendingFlushIdleThreshold_, idleThreshold)
+                : idleThreshold;
+    }
+    workerCv_.notify_one();
+}
+
+void FrameDiskWriter::saveLocked_(const cv::Mat& frame) {
     if (!enabled_ || frame.empty()) {
         Logger::instance().logDebug(cameraId_,
             "save: skipping - enabled=" + std::to_string(enabled_) +
@@ -3031,9 +2989,8 @@ void FrameDiskWriter::save(const cv::Mat& frame) {
     emitImageSnapshotIfDue();
 }
 
-void FrameDiskWriter::flushVideoClipIfIdle(std::chrono::milliseconds idleThreshold)
+void FrameDiskWriter::flushVideoClipIfIdleLocked_(std::chrono::milliseconds idleThreshold)
 {
-    std::lock_guard<std::mutex> lk(writerMutex_);
     if (idleThreshold.count() <= 0) {
         return;
     }
@@ -3391,8 +3348,48 @@ FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipT
     const std::chrono::system_clock::time_point& targetUtc,
     int preferredClipSeconds)
 {
-    std::lock_guard<std::mutex> lk(writerMutex_);
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        return materializeOpenClipThroughUtcLocked_(targetUtc, preferredClipSeconds);
+    }
 
+    beginSynchronousWorkerBarrier_(true);
+    try {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        auto result = materializeOpenClipThroughUtcLocked_(targetUtc, preferredClipSeconds);
+        endSynchronousWorkerBarrier_();
+        return result;
+    }
+    catch (...) {
+        endSynchronousWorkerBarrier_();
+        throw;
+    }
+}
+
+void FrameDiskWriter::forceFinalizeAllOpenClips(const std::string& reason)
+{
+    if (!asyncWorkerEnabled_) {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        forceFinalizeAllOpenClipsLocked_(reason);
+        return;
+    }
+
+    beginSynchronousWorkerBarrier_(true);
+    try {
+        std::lock_guard<std::mutex> lk(writerMutex_);
+        forceFinalizeAllOpenClipsLocked_(reason);
+        endSynchronousWorkerBarrier_();
+    }
+    catch (...) {
+        endSynchronousWorkerBarrier_();
+        throw;
+    }
+}
+
+FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipThroughUtcLocked_(
+    const std::chrono::system_clock::time_point& targetUtc,
+    int preferredClipSeconds)
+{
     bool shouldCopyInferenceVideo = true;
     if (inferenceCopyEnabledProvider_) {
         try {
@@ -3456,9 +3453,8 @@ FrameDiskWriter::MaterializeOpenClipResult FrameDiskWriter::materializeOpenClipT
     return result;
 }
 
-void FrameDiskWriter::forceFinalizeAllOpenClips(const std::string& reason)
+void FrameDiskWriter::forceFinalizeAllOpenClipsLocked_(const std::string& reason)
 {
-    std::lock_guard<std::mutex> lk(writerMutex_);
 
     bool shouldCopyInferenceVideo = true;
     if (inferenceCopyEnabledProvider_) {

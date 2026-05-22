@@ -9,11 +9,17 @@
  * 5. Enqueue job_stop commands when a window ends
  */
 import { buildEnabledAlgorithmsForCamera } from "./cameraAlgorithmsPayload";
+import { buildCameraRuntimeResourceEstimate } from "./cameraResourceAdmission";
 import {
   deriveFallbackEventId,
   extractOperationalCorrelationIds,
   persistStructuredAgentEvent,
 } from "./operationalPersistence";
+import {
+  buildJobExecutionPlan,
+  loadJobExecutionDescriptors,
+  type JobExecutionSegmentPlan,
+} from "./sharedJobPlan";
 
 function normalizeOpenAIApiKeyInput(value: unknown): string {
   if (typeof value !== "string") return "";
@@ -59,6 +65,16 @@ function safeJsonStringify(value: unknown): string | null {
   }
 }
 
+function normalizeText(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value === null || value === undefined) {
+    return "";
+  }
+  return String(value).trim();
+}
+
 function redactSchedulerPayloadForStorage(value: unknown): string | null {
   try {
     return JSON.stringify(value, (key, rawValue) => {
@@ -82,6 +98,85 @@ function redactSchedulerPayloadForStorage(value: unknown): string | null {
   }
 }
 
+export type RemoteJobSegmentDispatchInput = {
+  env: Env;
+  userId: string;
+  jobId: number;
+  jobRunId: string;
+  segment: JobExecutionSegmentPlan;
+  triggerType: "manual" | "schedule";
+  trigger: Record<string, unknown>;
+  nowIso: string;
+  federatedCrossCamera: boolean;
+};
+
+export type RemoteJobSegmentDispatchResult =
+  | {
+      ok: true;
+      requestId: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      requestId?: string | null;
+    };
+
+export type RemoteJobSegmentCancelInput = {
+  env: Env;
+  userId: string;
+  jobId: number;
+  jobRunId: string;
+  segment: JobExecutionSegmentPlan;
+  requestId?: string | null;
+  reason: string;
+  nowIso: string;
+};
+
+export type JobSharedExecutionOptions = {
+  dispatchRemoteSegment?: (
+    input: RemoteJobSegmentDispatchInput
+  ) => Promise<RemoteJobSegmentDispatchResult>;
+  cancelRemoteSegment?: (
+    input: RemoteJobSegmentCancelInput
+  ) => Promise<void>;
+  stopRemoteSegments?: (input: {
+    env: Env;
+    userId: string;
+    jobId: number;
+    nowIso: string;
+    reason: string;
+  }) => Promise<void>;
+};
+
+type SharedJobSegmentRuntimeRow = {
+  segment_id: string;
+  job_run_id: string;
+  execution_domain: string;
+  owner_public_id: string | null;
+  request_id: string | null;
+  status: string;
+};
+
+async function listActiveSharedJobSegmentsForOperator(
+  db: D1Database,
+  userId: string,
+  jobId: number
+): Promise<SharedJobSegmentRuntimeRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT segment_id, job_run_id, execution_domain, owner_public_id, request_id, status
+       FROM shared_job_segments
+       WHERE role = 'operator'
+         AND user_id = ?
+         AND job_id = ?
+         AND status NOT IN ('completed', 'failed', 'stopped', 'cancelled')
+       ORDER BY created_at ASC`
+    )
+    .bind(userId, jobId)
+    .all();
+  return Array.isArray(results) ? (results as SharedJobSegmentRuntimeRow[]) : [];
+}
+
 async function upsertJobRunFromScheduler(
   db: D1Database,
   input: {
@@ -91,6 +186,8 @@ async function upsertJobRunFromScheduler(
     jobName: string;
     triggerType: string;
     trigger: unknown;
+    executionDomain?: string | null;
+    remoteOwnerPublicId?: string | null;
     nowIso: string;
   }
 ) {
@@ -103,16 +200,20 @@ async function upsertJobRunFromScheduler(
        status,
        trigger_type,
        trigger_json,
+       execution_domain,
+       remote_owner_public_id,
        started_at_utc,
        last_event_at_utc,
        created_at,
        updated_at
-     ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(job_run_id) DO UPDATE SET
        job_name = COALESCE(excluded.job_name, job_runs.job_name),
        status = 'running',
        trigger_type = COALESCE(excluded.trigger_type, job_runs.trigger_type),
        trigger_json = COALESCE(excluded.trigger_json, job_runs.trigger_json),
+       execution_domain = COALESCE(excluded.execution_domain, job_runs.execution_domain),
+       remote_owner_public_id = COALESCE(excluded.remote_owner_public_id, job_runs.remote_owner_public_id),
        started_at_utc = COALESCE(job_runs.started_at_utc, excluded.started_at_utc),
        last_event_at_utc = excluded.last_event_at_utc,
        updated_at = excluded.updated_at`
@@ -124,6 +225,8 @@ async function upsertJobRunFromScheduler(
       input.jobName,
       input.triggerType,
       safeJsonStringify(input.trigger),
+      normalizeText(input.executionDomain) || "local",
+      normalizeText(input.remoteOwnerPublicId) || null,
       input.nowIso,
       input.nowIso,
       input.nowIso,
@@ -147,6 +250,546 @@ async function updateJobRunSourceCommand(
   )
     .bind(commandId, nowIso, jobRunId)
     .run();
+}
+
+async function upsertSharedJobSegmentForOperator(
+  db: D1Database,
+  input: {
+    userId: string;
+    jobId: number;
+    jobRunId: string;
+    segment: JobExecutionSegmentPlan;
+    status: string;
+    triggerType: string;
+    trigger: unknown;
+    requestId?: string | null;
+    sourceCommandId?: number | null;
+    lastError?: string | null;
+    crossCameraFederationRequired?: boolean;
+    nowIso: string;
+  }
+) {
+  await db.prepare(
+    `INSERT INTO shared_job_segments (
+       segment_id,
+       role,
+       user_id,
+       job_id,
+       job_run_id,
+       execution_domain,
+       owner_public_id,
+       operator_public_id,
+       current_camera_ids_json,
+       remote_camera_ids_json,
+       camera_id_map_json,
+       status,
+       trigger_type,
+       trigger_json,
+       request_id,
+       source_command_id,
+       cross_camera_federation_required,
+       last_error,
+       created_at,
+       updated_at,
+       started_at
+     ) VALUES (?, 'operator', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(segment_id) DO UPDATE SET
+       status = excluded.status,
+       request_id = COALESCE(excluded.request_id, shared_job_segments.request_id),
+       source_command_id = COALESCE(excluded.source_command_id, shared_job_segments.source_command_id),
+       last_error = COALESCE(excluded.last_error, shared_job_segments.last_error),
+       trigger_type = COALESCE(excluded.trigger_type, shared_job_segments.trigger_type),
+       trigger_json = COALESCE(excluded.trigger_json, shared_job_segments.trigger_json),
+       cross_camera_federation_required = COALESCE(
+         excluded.cross_camera_federation_required,
+         shared_job_segments.cross_camera_federation_required
+       ),
+       started_at = COALESCE(shared_job_segments.started_at, excluded.started_at),
+       updated_at = excluded.updated_at`
+  )
+    .bind(
+      input.segment.segment_id,
+      input.userId,
+      input.jobId,
+      input.jobRunId,
+      input.segment.execution_domain,
+      input.segment.owner_public_id,
+      JSON.stringify(input.segment.operator_camera_ids),
+      JSON.stringify(input.segment.owner_camera_ids),
+      JSON.stringify(input.segment.camera_id_map),
+      input.status,
+      input.triggerType,
+      safeJsonStringify(input.trigger),
+      normalizeText(input.requestId) || null,
+      Number.isInteger(Number(input.sourceCommandId)) && Number(input.sourceCommandId) > 0
+        ? Number(input.sourceCommandId)
+        : null,
+      input.crossCameraFederationRequired ? 1 : 0,
+      normalizeText(input.lastError) || null,
+      input.nowIso,
+      input.nowIso,
+      input.status === "running" ? input.nowIso : null
+    )
+    .run();
+}
+
+async function updateSharedJobSegmentForOperator(
+  db: D1Database,
+  input: {
+    segmentId: string;
+    status: string;
+    requestId?: string | null;
+    sourceCommandId?: number | null;
+    lastError?: string | null;
+    nowIso: string;
+  }
+) {
+  await db.prepare(
+    `UPDATE shared_job_segments
+     SET status = ?,
+         request_id = COALESCE(?, request_id),
+         source_command_id = COALESCE(?, source_command_id),
+         last_error = COALESCE(?, last_error),
+         started_at = CASE
+           WHEN ? = 'running' THEN COALESCE(started_at, ?)
+           ELSE started_at
+         END,
+         completed_at = CASE
+           WHEN ? IN ('completed', 'failed', 'stopped', 'cancelled') THEN COALESCE(completed_at, ?)
+           ELSE completed_at
+         END,
+         updated_at = ?
+     WHERE segment_id = ?`
+  )
+    .bind(
+      input.status,
+      normalizeText(input.requestId) || null,
+      Number.isInteger(Number(input.sourceCommandId)) && Number(input.sourceCommandId) > 0
+        ? Number(input.sourceCommandId)
+        : null,
+      normalizeText(input.lastError) || null,
+      input.status,
+      input.nowIso,
+      input.status,
+      input.nowIso,
+      input.nowIso,
+      input.segmentId
+    )
+    .run();
+}
+
+function computeExecutionDomainForPlan(segments: JobExecutionSegmentPlan[]): string {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return "local";
+  }
+  if (segments.length > 1) {
+    return "federated";
+  }
+  return normalizeText(segments[0]?.execution_domain) || "local";
+}
+
+async function buildLocalSegmentStartCameraPayloads(
+  env: Env,
+  userId: string,
+  cameraIds: number[],
+  nowIso: string
+): Promise<Record<string, unknown>> {
+  const startCameraPayloads: Record<string, unknown> = {};
+  for (const cameraId of cameraIds) {
+    const res = await buildStartCameraPayloadForScheduler(env, userId, cameraId);
+    if (res.ok && res.payload) {
+      const cameraSessionId = crypto.randomUUID();
+      const payloadWithSession = {
+        ...res.payload,
+        camera_session_id: cameraSessionId,
+      };
+      await upsertCameraRuntimeSessionStartRequest(env.DB, {
+        cameraSessionId,
+        userId,
+        cameraId,
+        cameraName:
+          typeof payloadWithSession.name === "string"
+            ? payloadWithSession.name
+            : `Camera #${cameraId}`,
+        payload: payloadWithSession,
+        enabledAlgorithms: payloadWithSession.enabled_algorithms,
+        nowIso,
+      });
+      await markSchedulerCameraStartRequested(env.DB, userId, cameraId);
+      startCameraPayloads[String(cameraId)] = {
+        ...payloadWithSession,
+        enabled_algorithms: [],
+      };
+    } else {
+      startCameraPayloads[String(cameraId)] = null;
+    }
+  }
+  return startCameraPayloads;
+}
+
+async function insertLocalJobStartCommand(
+  db: D1Database,
+  input: {
+    userId: string;
+    jobRunId: string;
+    payload: Record<string, unknown>;
+    nowIso: string;
+    executionDomain?: string | null;
+    remoteOwnerPublicId?: string | null;
+    sharedSegmentId?: string | null;
+  }
+): Promise<number> {
+  const commandResult = await db
+    .prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         job_run_id,
+         execution_domain,
+         remote_owner_public_id,
+         shared_segment_id
+       )
+       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      input.userId,
+      JSON.stringify(input.payload),
+      input.nowIso,
+      input.nowIso,
+      input.jobRunId,
+      normalizeText(input.executionDomain) || "local",
+      normalizeText(input.remoteOwnerPublicId) || null,
+      normalizeText(input.sharedSegmentId) || null
+    )
+    .run();
+  return Number((commandResult as any)?.meta?.last_row_id || 0);
+}
+
+async function executeJobStartPlan(
+  env: Env,
+  input: {
+    job: any;
+    jobRunId: string;
+    basePayload: Record<string, unknown>;
+    triggerType: "manual" | "schedule";
+    trigger: Record<string, unknown>;
+    nowIso: string;
+    sharedExecutionOptions?: JobSharedExecutionOptions;
+  }
+): Promise<
+  | {
+      ok: true;
+      executionDomain: string;
+      remoteOwnerPublicId: string | null;
+      sourceCommandId: number | null;
+      usesSharedExecution: boolean;
+    }
+  | {
+      ok: false;
+      error: string;
+    }
+> {
+  const userId = String(input.job?.user_id || "");
+  const allCameraIds = Array.isArray((input.basePayload as any)?.all_camera_ids)
+    ? (input.basePayload as any).all_camera_ids
+        .map((cameraId: unknown) => Number(cameraId))
+        .filter((cameraId: number) => Number.isInteger(cameraId) && cameraId > 0)
+    : [];
+  const executionByCamera = await loadJobExecutionDescriptors(env.DB, userId, allCameraIds);
+  const plan = buildJobExecutionPlan(input.basePayload, executionByCamera);
+  if (plan.issues.length > 0) {
+    return {
+      ok: false,
+      error:
+        plan.issues
+          .map((issue) => normalizeText(issue.message))
+          .filter(Boolean)
+          .join(" ") || "Failed to resolve the job execution plan.",
+    };
+  }
+
+  const remoteSegments = plan.segments.filter((segment) => !segment.is_local);
+  const localSegments = plan.segments.filter((segment) => segment.is_local);
+  const usesSharedExecution =
+    remoteSegments.length > 0 || plan.segments.length > 1 || plan.requires_cross_camera_federation;
+  const executionDomain = usesSharedExecution
+    ? computeExecutionDomainForPlan(plan.segments)
+    : "local";
+  const remoteOwnerPublicId =
+    remoteSegments.length === 1 && localSegments.length === 0
+      ? normalizeText(remoteSegments[0]?.owner_public_id) || null
+      : null;
+
+  await upsertJobRunFromScheduler(env.DB, {
+    jobRunId: input.jobRunId,
+    jobId: Number(input.job?.id),
+    userId,
+    jobName: typeof input.job?.name === "string" ? input.job.name : `Job #${input.job?.id}`,
+    triggerType: input.triggerType,
+    trigger: input.trigger,
+    executionDomain,
+    remoteOwnerPublicId,
+    nowIso: input.nowIso,
+  });
+
+  if (!usesSharedExecution) {
+    const localSegment = localSegments[0] || null;
+    const segmentCameraIds =
+      localSegment?.operator_camera_ids?.length ? localSegment.operator_camera_ids : allCameraIds;
+    const startCameraPayloads = await buildLocalSegmentStartCameraPayloads(
+      env,
+      userId,
+      segmentCameraIds,
+      input.nowIso
+    );
+    const jobStartPayload = {
+      ...input.basePayload,
+      start_camera_payloads: startCameraPayloads,
+    };
+    const commandId = await insertLocalJobStartCommand(env.DB, {
+      userId,
+      jobRunId: input.jobRunId,
+      payload: jobStartPayload,
+      nowIso: input.nowIso,
+      executionDomain: "local",
+      remoteOwnerPublicId: null,
+      sharedSegmentId: localSegment?.segment_id || null,
+    });
+    await updateJobRunSourceCommand(env.DB, input.jobRunId, commandId, input.nowIso);
+    return {
+      ok: true,
+      executionDomain,
+      remoteOwnerPublicId: null,
+      sourceCommandId: commandId > 0 ? commandId : null,
+      usesSharedExecution: false,
+    };
+  }
+
+  const remoteDispatches: Array<{
+    segment: JobExecutionSegmentPlan;
+    requestId: string | null;
+  }> = [];
+
+  try {
+    for (const segment of plan.segments) {
+      await upsertSharedJobSegmentForOperator(env.DB, {
+        userId,
+        jobId: Number(input.job?.id),
+        jobRunId: input.jobRunId,
+        segment,
+        status: segment.is_local ? "queued" : "dispatching",
+        triggerType: input.triggerType,
+        trigger: input.trigger,
+        crossCameraFederationRequired: plan.requires_cross_camera_federation,
+        nowIso: input.nowIso,
+      });
+    }
+
+    for (const segment of remoteSegments) {
+      if (!input.sharedExecutionOptions?.dispatchRemoteSegment) {
+        await updateSharedJobSegmentForOperator(env.DB, {
+          segmentId: segment.segment_id,
+          status: "failed",
+          lastError: "Shared camera execution is not configured on this server.",
+          nowIso: input.nowIso,
+        });
+        return {
+          ok: false,
+          error: "Shared camera execution is not configured on this server.",
+        };
+      }
+
+      const dispatchResult = await input.sharedExecutionOptions.dispatchRemoteSegment({
+        env,
+        userId,
+        jobId: Number(input.job?.id),
+        jobRunId: input.jobRunId,
+        segment,
+        triggerType: input.triggerType,
+        trigger: input.trigger,
+        nowIso: input.nowIso,
+        federatedCrossCamera: Boolean(plan.requires_cross_camera_federation),
+      });
+      if (!dispatchResult.ok) {
+        await updateSharedJobSegmentForOperator(env.DB, {
+          segmentId: segment.segment_id,
+          status: "failed",
+          requestId: dispatchResult.requestId || null,
+          lastError: dispatchResult.error,
+          nowIso: input.nowIso,
+        });
+        return {
+          ok: false,
+          error:
+            normalizeText(dispatchResult.error) ||
+            "The shared owner runtime rejected the job segment.",
+        };
+      }
+
+      remoteDispatches.push({
+        segment,
+        requestId: dispatchResult.requestId || null,
+      });
+      await updateSharedJobSegmentForOperator(env.DB, {
+        segmentId: segment.segment_id,
+        status: "running",
+        requestId: dispatchResult.requestId || null,
+        nowIso: input.nowIso,
+      });
+    }
+
+    let sourceCommandId: number | null = null;
+    for (const segment of localSegments) {
+      const startCameraPayloads = await buildLocalSegmentStartCameraPayloads(
+        env,
+        userId,
+        segment.operator_camera_ids,
+        input.nowIso
+      );
+      const jobStartPayload = {
+        ...segment.payload,
+        start_camera_payloads: startCameraPayloads,
+      };
+      const commandId = await insertLocalJobStartCommand(env.DB, {
+        userId,
+        jobRunId: input.jobRunId,
+        payload: jobStartPayload,
+        nowIso: input.nowIso,
+        executionDomain: segment.execution_domain,
+        remoteOwnerPublicId: null,
+        sharedSegmentId: segment.segment_id,
+      });
+      if (!sourceCommandId && commandId > 0) {
+        sourceCommandId = commandId;
+      }
+      await updateSharedJobSegmentForOperator(env.DB, {
+        segmentId: segment.segment_id,
+        status: "running",
+        sourceCommandId: commandId > 0 ? commandId : null,
+        nowIso: input.nowIso,
+      });
+    }
+
+    if (sourceCommandId && sourceCommandId > 0) {
+      await updateJobRunSourceCommand(env.DB, input.jobRunId, sourceCommandId, input.nowIso);
+    }
+
+    return {
+      ok: true,
+      executionDomain,
+      remoteOwnerPublicId,
+      sourceCommandId,
+      usesSharedExecution: true,
+    };
+  } catch (error) {
+    for (const remoteDispatch of remoteDispatches) {
+      try {
+        await input.sharedExecutionOptions?.cancelRemoteSegment?.({
+          env,
+          userId,
+          jobId: Number(input.job?.id),
+          jobRunId: input.jobRunId,
+          segment: remoteDispatch.segment,
+          requestId: remoteDispatch.requestId,
+          reason: "operator_scheduler_start_rollback",
+          nowIso: input.nowIso,
+        });
+      } catch (cancelError) {
+        console.warn(
+          `[JOB SCHEDULER] Failed to rollback remote shared segment ${remoteDispatch.segment.segment_id}:`,
+          cancelError
+        );
+      }
+    }
+    return {
+      ok: false,
+      error: describeJobSchedulerError(error, "Failed to start the job execution plan."),
+    };
+  }
+}
+
+export async function executeJobStopPlan(
+  env: Env,
+  input: {
+    userId: string;
+    jobId: number;
+    jobName: string;
+    nowIso: string;
+    reason: string;
+    sharedExecutionOptions?: JobSharedExecutionOptions;
+  }
+) {
+  const activeSegments = await listActiveSharedJobSegmentsForOperator(
+    env.DB,
+    input.userId,
+    input.jobId
+  );
+  const hasTrackedSegments = activeSegments.length > 0;
+  const hasLocalSegment =
+    !hasTrackedSegments ||
+    activeSegments.some((segment) => normalizeText(segment.execution_domain) === "local");
+  const hasRemoteSegments = activeSegments.some(
+    (segment) => normalizeText(segment.execution_domain) !== "local"
+  );
+  const activeJobRunId = hasTrackedSegments
+    ? normalizeText(activeSegments[0]?.job_run_id)
+    : "";
+
+  if (hasTrackedSegments) {
+    for (const segment of activeSegments) {
+      await updateSharedJobSegmentForOperator(env.DB, {
+        segmentId: segment.segment_id,
+        status: "stopping",
+        requestId: segment.request_id,
+        nowIso: input.nowIso,
+      });
+    }
+  }
+
+  if (hasLocalSegment) {
+    await env.DB.prepare(
+      `INSERT INTO commands (
+         user_id,
+         camera_id,
+         command_type,
+         payload,
+         status,
+         created_at,
+         updated_at,
+         execution_domain,
+         job_run_id
+       )
+       VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?, ?, ?)`
+    )
+      .bind(
+        input.userId,
+        JSON.stringify({
+          job: { id: input.jobId, name: input.jobName },
+          requested_at_utc: input.nowIso,
+          reason: input.reason,
+        }),
+        input.nowIso,
+        input.nowIso,
+        "local",
+        activeJobRunId || null
+      )
+      .run();
+  }
+
+  if (hasRemoteSegments) {
+    await input.sharedExecutionOptions?.stopRemoteSegments?.({
+      env,
+      userId: input.userId,
+      jobId: input.jobId,
+      nowIso: input.nowIso,
+      reason: input.reason,
+    });
+  }
 }
 
 async function upsertCameraRuntimeSessionStartRequest(
@@ -1859,6 +2502,11 @@ async function buildStartCameraPayloadForScheduler(
     }
 
     const cam = camera as any;
+    const captureAccelerationMode =
+      typeof cam.capture_acceleration_mode === "string" &&
+      ["nvidia", "gpu", "cuda", "nvdec"].includes(cam.capture_acceleration_mode.trim().toLowerCase())
+        ? "nvidia"
+        : "cpu";
 
     // Fetch active subscription
     const activeSubscription = await env.DB.prepare(
@@ -1893,6 +2541,12 @@ async function buildStartCameraPayloadForScheduler(
 
     // Fetch Telegram settings
     const telegram = await getTelegramSettingsForUser(env.DB, userId);
+    const resourceEstimate = await buildCameraRuntimeResourceEstimate(
+      env.DB,
+      userId,
+      cameraId,
+      captureAccelerationMode
+    );
 
     const payload = {
       camera_id: cam.id,
@@ -1911,6 +2565,9 @@ async function buildStartCameraPayloadForScheduler(
       retention_days: cam.retention_days,
       frame_rate: frameRate,
       webcam_index: cam.webcam_index,
+      capture_acceleration_mode: captureAccelerationMode,
+      use_gpu: captureAccelerationMode === "nvidia",
+      resource_estimate: resourceEstimate,
       analysis_speed: subscriptionSecondsPerFrame,
       model_tier: subscriptionModelTier,
       telegram_enabled: telegram.enabled,
@@ -2737,7 +3394,8 @@ async function buildJobStartPayload(
 
 export async function enqueueManualJobStart(
   env: Env,
-  job: any
+  job: any,
+  sharedExecutionOptions?: JobSharedExecutionOptions
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   let commandQueued = false;
   try {
@@ -2783,41 +3441,6 @@ export async function enqueueManualJobStart(
       jobRunId
     );
 
-    const startCameraPayloads: Record<string, any> = {};
-    for (const cameraId of jobStartPayload.all_camera_ids) {
-      const res = await buildStartCameraPayloadForScheduler(env, job.user_id, cameraId);
-      if (res.ok && res.payload) {
-        const cameraSessionId = crypto.randomUUID();
-        const payloadWithSession = {
-          ...res.payload,
-          camera_session_id: cameraSessionId,
-        };
-        await upsertCameraRuntimeSessionStartRequest(env.DB, {
-          cameraSessionId,
-          userId: String(job.user_id || ""),
-          cameraId,
-          cameraName:
-            typeof payloadWithSession.name === "string"
-              ? payloadWithSession.name
-              : `Camera #${cameraId}`,
-          payload: payloadWithSession,
-          enabledAlgorithms: payloadWithSession.enabled_algorithms,
-          nowIso: nowUtc,
-        });
-        await markSchedulerCameraStartRequested(
-          env.DB,
-          String(job.user_id || ""),
-          cameraId
-        );
-        startCameraPayloads[String(cameraId)] = {
-          ...payloadWithSession,
-          enabled_algorithms: [],
-        };
-      } else {
-        startCameraPayloads[String(cameraId)] = null;
-      }
-    }
-
     jobStartPayload = {
       ...jobStartPayload,
       trigger: {
@@ -2827,54 +3450,40 @@ export async function enqueueManualJobStart(
         local_time: localTime.localTimeHHMMSS,
         triggered_at_utc: nowUtc,
       },
-      start_camera_payloads: startCameraPayloads,
     };
-
-    await upsertJobRunFromScheduler(env.DB, {
+    const executionResult = await executeJobStartPlan(env, {
+      job,
       jobRunId,
-      jobId: Number(job.id),
-      userId: String(job.user_id || ""),
-      jobName: typeof job.name === "string" ? job.name : `Job #${job.id}`,
+      basePayload: jobStartPayload,
       triggerType: "manual",
-      trigger: jobStartPayload.trigger,
+      trigger: jobStartPayload.trigger as Record<string, unknown>,
       nowIso: nowUtc,
+      sharedExecutionOptions,
     });
-
-    const commandResult = await env.DB.prepare(
-      `INSERT INTO commands (
-         user_id,
-         camera_id,
-         command_type,
-         payload,
-         status,
-         created_at,
-         updated_at,
-         job_run_id
-       )
-       VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?)`
-    )
-      .bind(
-        job.user_id,
-        JSON.stringify(jobStartPayload),
-        nowUtc,
-        nowUtc,
-        jobRunId
-      )
-      .run();
-    await updateJobRunSourceCommand(
-      env.DB,
-      jobRunId,
-      Number((commandResult as any)?.meta?.last_row_id || 0),
-      nowUtc
-    );
-    commandQueued = true;
+    if (!executionResult.ok) {
+      return { ok: false, error: executionResult.error };
+    }
+    commandQueued = executionResult.sourceCommandId !== null || executionResult.usesSharedExecution;
 
     try {
       await env.DB.prepare(
-        `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, started_at_utc, last_event_at_utc, created_at, updated_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+        `INSERT INTO job_runtime_states (
+           job_id,
+           user_id,
+           job_name,
+           status,
+           execution_domain,
+           remote_owner_public_id,
+           started_at_utc,
+           last_event_at_utc,
+           created_at,
+           updated_at
+         )
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
          ON CONFLICT(job_id) DO UPDATE SET
            status = 'running',
+           execution_domain = COALESCE(excluded.execution_domain, job_runtime_states.execution_domain),
+           remote_owner_public_id = COALESCE(excluded.remote_owner_public_id, job_runtime_states.remote_owner_public_id),
            started_at_utc = ?,
            last_event_at_utc = ?,
            updated_at = ?`
@@ -2883,6 +3492,8 @@ export async function enqueueManualJobStart(
           job.id,
           job.user_id,
           job.name,
+          executionResult.executionDomain,
+          executionResult.remoteOwnerPublicId,
           nowUtc,
           nowUtc,
           nowUtc,
@@ -2954,7 +3565,8 @@ export async function runJobSchedulerTick(
   options: {
     lockDurationMs?: number;
     slotLookbackSeconds?: number;
-  } = {}
+  } = {},
+  sharedExecutionOptions?: JobSharedExecutionOptions
 ): Promise<void> {
   const lockDurationMs =
     typeof options.lockDurationMs === "number" && Number.isFinite(options.lockDurationMs)
@@ -3230,88 +3842,37 @@ export async function runJobSchedulerTick(
                   timezone,
                   jobRunId
                 );
-
-                // Build start_camera_payloads without enqueueing individual camera start commands.
-                const startCameraPayloads: Record<string, any> = {};
-                for (const cameraId of jobStartPayload.all_camera_ids) {
-                  const res = await buildStartCameraPayloadForScheduler(env, j.user_id, cameraId);
-                  if (res.ok && res.payload) {
-                    const cameraSessionId = crypto.randomUUID();
-                    const payloadWithSession = {
-                      ...res.payload,
-                      camera_session_id: cameraSessionId,
-                    };
-                    await upsertCameraRuntimeSessionStartRequest(env.DB, {
-                      cameraSessionId,
-                      userId: String(j.user_id || ""),
-                      cameraId,
-                      cameraName:
-                        typeof payloadWithSession.name === "string"
-                          ? payloadWithSession.name
-                          : `Camera #${cameraId}`,
-                      payload: payloadWithSession,
-                      enabledAlgorithms: payloadWithSession.enabled_algorithms,
-                      nowIso: nowUtc,
-                    });
-                    await markSchedulerCameraStartRequested(
-                      env.DB,
-                      String(j.user_id || ""),
-                      cameraId
-                    );
-                    // Always clear enabled_algorithms in job_start payloads
-                    startCameraPayloads[String(cameraId)] = {
-                      ...payloadWithSession,
-                      enabled_algorithms: [],
-                    };
-                  } else {
-                    startCameraPayloads[String(cameraId)] = null;
-                  }
+                const executionResult = await executeJobStartPlan(env, {
+                  job: j,
+                  jobRunId,
+                  basePayload: jobStartPayload,
+                  triggerType: "schedule",
+                  trigger: jobStartPayload.trigger as Record<string, unknown>,
+                  nowIso: nowUtc,
+                  sharedExecutionOptions,
+                });
+                if (!executionResult.ok) {
+                  throw new Error(executionResult.error);
                 }
 
-                // Enrich job_start payload with start_camera_payloads
-                jobStartPayload = { ...jobStartPayload, start_camera_payloads: startCameraPayloads };
-
-                await upsertJobRunFromScheduler(env.DB, {
-                  jobRunId,
-                  jobId: Number(j.id),
-                  userId: String(j.user_id || ""),
-                  jobName: typeof j.name === "string" ? j.name : `Job #${j.id}`,
-                  triggerType: "schedule",
-                  trigger: jobStartPayload.trigger,
-                  nowIso: nowUtc,
-                });
-
-                const commandResult = await env.DB.prepare(
-                  `INSERT INTO commands (
-                     user_id,
-                     camera_id,
-                     command_type,
-                     payload,
-                     status,
-                     created_at,
-                     updated_at,
-                     job_run_id
-                   )
-                   VALUES (?, NULL, 'job_start', ?, 'pending', ?, ?, ?)`
-                ).bind(
-                  j.user_id,
-                  JSON.stringify(jobStartPayload),
-                  nowUtc,
-                  nowUtc,
-                  jobRunId
-                ).run();
-                await updateJobRunSourceCommand(
-                  env.DB,
-                  jobRunId,
-                  Number((commandResult as any)?.meta?.last_row_id || 0),
-                  nowUtc
-                );
-
                 await env.DB.prepare(
-                  `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, started_at_utc, last_event_at_utc, created_at, updated_at)
-                   VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                  `INSERT INTO job_runtime_states (
+                     job_id,
+                     user_id,
+                     job_name,
+                     status,
+                     execution_domain,
+                     remote_owner_public_id,
+                     started_at_utc,
+                     last_event_at_utc,
+                     created_at,
+                     updated_at
+                   )
+                   VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_id) DO UPDATE SET
                      status = 'running',
+                     execution_domain = COALESCE(excluded.execution_domain, job_runtime_states.execution_domain),
+                     remote_owner_public_id = COALESCE(excluded.remote_owner_public_id, job_runtime_states.remote_owner_public_id),
                      started_at_utc = ?,
                      last_event_at_utc = ?,
                      updated_at = ?`
@@ -3319,6 +3880,8 @@ export async function runJobSchedulerTick(
                   j.id,
                   j.user_id,
                   j.name,
+                  executionResult.executionDomain,
+                  executionResult.remoteOwnerPublicId,
                   nowUtc,
                   nowUtc,
                   nowUtc,
@@ -3432,28 +3995,26 @@ export async function runJobSchedulerTick(
                   continue;
                 }
 
-                // Get all distinct camera IDs from job step targets
-                // Build job_stop payload
-                const jobStopPayload = {
-                  job: { id: j.id, name: j.name },
-                  requested_at_utc: nowUtc,
+                await executeJobStopPlan(env, {
+                  userId: String(j.user_id || ""),
+                  jobId: Number(j.id),
+                  jobName: typeof j.name === "string" ? j.name : `Job #${j.id}`,
+                  nowIso: nowUtc,
                   reason: "schedule_window_end",
-                };
-
-                // Enqueue job_stop command
-                await env.DB.prepare(
-                  `INSERT INTO commands (user_id, camera_id, command_type, payload, status, created_at, updated_at)
-                   VALUES (?, NULL, 'job_stop', ?, 'pending', ?, ?)`
-                ).bind(
-                  j.user_id,
-                  JSON.stringify(jobStopPayload),
-                  nowUtc,
-                  nowUtc
-                ).run();
+                  sharedExecutionOptions,
+                });
 
                 // Upsert job_runtime_states to 'stopping'
                 await env.DB.prepare(
-                  `INSERT INTO job_runtime_states (job_id, user_id, job_name, status, last_event_at_utc, created_at, updated_at)
+                  `INSERT INTO job_runtime_states (
+                     job_id,
+                     user_id,
+                     job_name,
+                     status,
+                     last_event_at_utc,
+                     created_at,
+                     updated_at
+                   )
                    VALUES (?, ?, ?, 'stopping', ?, ?, ?)
                    ON CONFLICT(job_id) DO UPDATE SET
                      status = 'stopping',

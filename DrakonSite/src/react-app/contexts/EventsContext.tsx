@@ -34,8 +34,10 @@ interface Toast {
     | "offline"
     | "online"
     | "camera_started"
+    | "camera_start_blocked"
     | "job_staled"
     | "job_start_blocked"
+    | "job_step_start_blocked"
     | "job_started"
     | "agent_api_error";
 }
@@ -62,6 +64,7 @@ export function EventsProvider({
   const [lastEventId, setLastEventId] = useState(0);
   const [lastJobStaledEventId, setLastJobStaledEventId] = useState(0);
   const [lastJobStartBlockedEventId, setLastJobStartBlockedEventId] = useState(0);
+  const [lastJobStepStartBlockedEventId, setLastJobStepStartBlockedEventId] = useState(0);
   const [lastJobStartedEventId, setLastJobStartedEventId] = useState(0);
   const [lastAgentApiErrorEventId, setLastAgentApiErrorEventId] = useState(0);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -102,6 +105,7 @@ export function EventsProvider({
         primeLatestEventId("camera_connection_failed", setLastEventId),
         primeLatestEventId("job_staled", setLastJobStaledEventId),
         primeLatestEventId("job_start_blocked", setLastJobStartBlockedEventId),
+        primeLatestEventId("job_step_start_blocked", setLastJobStepStartBlockedEventId),
         primeLatestEventId("job_started", setLastJobStartedEventId),
         primeLatestEventId("agent_api_error", setLastAgentApiErrorEventId),
       ]);
@@ -343,6 +347,121 @@ export function EventsProvider({
       pollingManager.unregister("job-start-blocked-events-context");
     };
   }, [lastJobStartBlockedEventId, isInitialized]);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+
+    const url =
+      lastJobStepStartBlockedEventId > 0
+        ? `/api/events?event_type=job_step_start_blocked&after_id=${lastJobStepStartBlockedEventId}`
+        : "/api/events?event_type=job_step_start_blocked";
+
+    pollingManager.register("job-step-start-blocked-events-context", {
+      url,
+      interval: 4000,
+      jitterMaxMs: 500,
+      onData: (events: CameraEvent[]) => {
+        if (events.length === 0) return;
+
+        const maxId = Math.max(...events.map((event) => event.id));
+        setLastJobStepStartBlockedEventId(maxId);
+
+        events.forEach((event) => {
+          if (shownToastIdsRef.current.has(event.id)) return;
+
+          let details: Record<string, unknown> | null = null;
+          if (typeof event.details_json === "string" && event.details_json.trim()) {
+            try {
+              details = JSON.parse(event.details_json);
+            } catch {
+              details = null;
+            }
+          }
+
+          const rawJobName =
+            typeof details?.job_name === "string"
+              ? details.job_name
+              : typeof details?.job === "object" &&
+                details.job &&
+                typeof (details.job as Record<string, unknown>).name === "string"
+              ? (details.job as Record<string, string>).name
+              : "";
+          const rawStepName = typeof details?.step_name === "string" ? details.step_name : "";
+          const blockedCameraNames = Array.isArray(details?.blocked_cameras)
+            ? details.blocked_cameras
+                .map((entry) =>
+                  entry &&
+                  typeof entry === "object" &&
+                  !Array.isArray(entry) &&
+                  typeof (entry as Record<string, unknown>).camera_name === "string"
+                    ? String((entry as Record<string, unknown>).camera_name).trim()
+                    : ""
+                )
+                .filter((entry): entry is string => entry.length > 0)
+            : [];
+          const device =
+            typeof details?.device === "string" && details.device.trim()
+              ? details.device.trim().toUpperCase()
+              : "CPU/GPU";
+
+          const jobName = String(rawJobName || "").trim();
+          const stepName = String(rawStepName || "").trim();
+          const title = jobName
+            ? `Step Start Blocked: ${jobName}`
+            : stepName
+            ? `Step Start Blocked: ${stepName}`
+            : "Step Start Blocked";
+          const fallbackMessage =
+            stepName && blockedCameraNames.length > 0
+              ? `Step "${stepName}" could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+              : stepName
+              ? `Step "${stepName}" could not start because available ${device} memory is too low.`
+              : blockedCameraNames.length > 0
+              ? `The step could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+              : `The step could not start because available ${device} memory is too low.`;
+          const message =
+            typeof event.message === "string" && event.message.trim()
+              ? event.message.trim()
+              : fallbackMessage;
+
+          shownToastIdsRef.current.add(event.id);
+
+          setToasts((prev) => [
+            ...prev,
+            {
+              id: event.id,
+              message,
+              title,
+              type: "job_step_start_blocked",
+            },
+          ]);
+
+          setTimeout(() => {
+            setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
+          }, AUTO_DISMISS_MS);
+        });
+
+        const eventIds = events.map((event) => event.id);
+        fetch("/api/events/mark-read", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: eventIds }),
+        }).catch((error) => {
+          console.error(
+            "[EventsContext] Failed to mark job_step_start_blocked events as read:",
+            error
+          );
+        });
+      },
+      onError: (error) => {
+        console.error("[EventsContext] Job step start blocked polling error:", error);
+      },
+    });
+
+    return () => {
+      pollingManager.unregister("job-step-start-blocked-events-context");
+    };
+  }, [lastJobStepStartBlockedEventId, isInitialized]);
 
   useEffect(() => {
     if (!isInitialized) return;

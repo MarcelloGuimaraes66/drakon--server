@@ -20,6 +20,11 @@ type SharedFindRelayDispatchAckResult = {
   error?: string;
 };
 
+type SharedJobRelayAckResult = {
+  ok: boolean;
+  error?: string;
+};
+
 type SharedFindRelayPendingDispatchAck = {
   key: string;
   ownerPublicId: string;
@@ -31,14 +36,28 @@ type SharedFindRelayPendingDispatchAck = {
   resolve: (result: SharedFindRelayDispatchAckResult) => void;
 };
 
+type SharedJobRelayPendingAck = {
+  key: string;
+  ownerPublicId: string;
+  operatorPublicId: string;
+  operatorJobRunId: string;
+  requestId: string;
+  action: "start" | "stop";
+  expiresAtMs: number;
+  timeoutHandle: ReturnType<typeof setTimeout> | null;
+  resolve: (result: SharedJobRelayAckResult) => void;
+};
+
 type SharedFindRelayState = {
   sessions: Map<string, SharedFindRelaySession>;
   connectionsByPublicId: Map<string, SharedFindRelayConnectionBucket>;
   pendingDispatchAcks: Map<string, SharedFindRelayPendingDispatchAck>;
+  pendingJobAcks: Map<string, SharedJobRelayPendingAck>;
 };
 
 const SHARED_FIND_RELAY_CONNECTION_LEASE_MS = 45_000;
 const SHARED_FIND_RELAY_DISPATCH_ACK_TIMEOUT_MS = 8_000;
+const SHARED_JOB_RELAY_ACK_TIMEOUT_MS = 12_000;
 
 function normalizeText(value: unknown): string {
   if (typeof value !== "string") {
@@ -70,6 +89,7 @@ function getSharedFindRelayState(): SharedFindRelayState {
       sessions: new Map<string, SharedFindRelaySession>(),
       connectionsByPublicId: new Map<string, SharedFindRelayConnectionBucket>(),
       pendingDispatchAcks: new Map<string, SharedFindRelayPendingDispatchAck>(),
+      pendingJobAcks: new Map<string, SharedJobRelayPendingAck>(),
     } satisfies SharedFindRelayState;
   }
   return root[globalKey] as SharedFindRelayState;
@@ -155,6 +175,36 @@ function clearPendingDispatchAck(
   return pending;
 }
 
+function buildSharedJobRelayAckKey(input: {
+  ownerPublicId: string;
+  operatorPublicId: string;
+  operatorJobRunId: string;
+  requestId: string;
+  action: "start" | "stop";
+}) {
+  return [
+    normalizeText(input.ownerPublicId),
+    normalizeText(input.operatorPublicId),
+    normalizeText(input.operatorJobRunId),
+    normalizeText(input.requestId),
+    input.action,
+  ].join("::");
+}
+
+function clearPendingSharedJobAck(
+  state: SharedFindRelayState,
+  key: string
+): SharedJobRelayPendingAck | null {
+  const pending = state.pendingJobAcks.get(key) || null;
+  if (!pending) return null;
+  state.pendingJobAcks.delete(key);
+  if (pending.timeoutHandle) {
+    clearTimeout(pending.timeoutHandle);
+    pending.timeoutHandle = null;
+  }
+  return pending;
+}
+
 function settleSharedFindRelayDispatchAck(
   ownerPublicId: string,
   message: Record<string, unknown>
@@ -192,6 +242,63 @@ function settleSharedFindRelayDispatchAck(
             normalizeText(message.error) ||
             "The owner runtime rejected the shared Drakon Find dispatch.",
         };
+  pending.resolve(result);
+  return result;
+}
+
+function settleSharedJobRelayAck(
+  ownerPublicId: string,
+  message: Record<string, unknown>
+): SharedJobRelayAckResult | null {
+  const type = normalizeText(message.type);
+  if (
+    type !== "shared_job_start_ack" &&
+    type !== "shared_job_stop_ack" &&
+    type !== "shared_job_error"
+  ) {
+    return null;
+  }
+
+  const operatorPublicId = normalizeText(message.operator_public_id);
+  const operatorJobRunId = normalizeText(
+    message.operator_job_run_id ?? message.job_run_id
+  );
+  const requestId = normalizeText(message.request_id);
+  if (!operatorPublicId || !operatorJobRunId || !requestId) {
+    return null;
+  }
+
+  const action =
+    type === "shared_job_stop_ack"
+      ? "stop"
+      : type === "shared_job_start_ack"
+        ? "start"
+        : normalizeText(message.ack_kind).toLowerCase() === "stop"
+          ? "stop"
+          : "start";
+
+  const state = getSharedFindRelayState();
+  const key = buildSharedJobRelayAckKey({
+    ownerPublicId,
+    operatorPublicId,
+    operatorJobRunId,
+    requestId,
+    action,
+  });
+  const pending = clearPendingSharedJobAck(state, key);
+  if (!pending) {
+    return null;
+  }
+
+  const result =
+    type === "shared_job_error"
+      ? {
+          ok: false,
+          error:
+            normalizeText(message.error) ||
+            "The owner runtime rejected the shared job dispatch.",
+        }
+      : { ok: true };
   pending.resolve(result);
   return result;
 }
@@ -398,6 +505,80 @@ export function cancelSharedFindRelayDispatchAckWait(input: {
   clearPendingDispatchAck(getSharedFindRelayState(), key);
 }
 
+export async function waitForSharedJobRelayAck(input: {
+  ownerPublicId: string;
+  operatorPublicId: string;
+  operatorJobRunId: string;
+  requestId: string;
+  action: "start" | "stop";
+  timeoutMs?: number;
+}): Promise<SharedJobRelayAckResult> {
+  const ownerPublicId = normalizeText(input.ownerPublicId);
+  const operatorPublicId = normalizeText(input.operatorPublicId);
+  const operatorJobRunId = normalizeText(input.operatorJobRunId);
+  const requestId = normalizeText(input.requestId);
+  const action = input.action === "stop" ? "stop" : "start";
+  if (!ownerPublicId || !operatorPublicId || !operatorJobRunId || !requestId) {
+    return { ok: false, error: "A valid shared job relay ack context is required." };
+  }
+
+  const state = getSharedFindRelayState();
+  const key = buildSharedJobRelayAckKey({
+    ownerPublicId,
+    operatorPublicId,
+    operatorJobRunId,
+    requestId,
+    action,
+  });
+  clearPendingSharedJobAck(state, key);
+
+  return await new Promise<SharedJobRelayAckResult>((resolve) => {
+    const timeoutMs = Math.max(1_000, clampInteger(input.timeoutMs) || SHARED_JOB_RELAY_ACK_TIMEOUT_MS);
+    const pending: SharedJobRelayPendingAck = {
+      key,
+      ownerPublicId,
+      operatorPublicId,
+      operatorJobRunId,
+      requestId,
+      action,
+      expiresAtMs: Date.now() + timeoutMs,
+      timeoutHandle: null,
+      resolve,
+    };
+
+    pending.timeoutHandle = setTimeout(() => {
+      const settled = clearPendingSharedJobAck(state, key);
+      if (!settled) return;
+      settled.resolve({
+        ok: false,
+        error:
+          action === "stop"
+            ? "The owner runtime did not acknowledge the shared job stop in time."
+            : "The owner runtime did not acknowledge the shared job dispatch in time.",
+      });
+    }, timeoutMs);
+
+    state.pendingJobAcks.set(key, pending);
+  });
+}
+
+export function cancelSharedJobRelayAckWait(input: {
+  ownerPublicId: string;
+  operatorPublicId: string;
+  operatorJobRunId: string;
+  requestId: string;
+  action: "start" | "stop";
+}) {
+  const key = buildSharedJobRelayAckKey({
+    ownerPublicId: input.ownerPublicId,
+    operatorPublicId: input.operatorPublicId,
+    operatorJobRunId: input.operatorJobRunId,
+    requestId: input.requestId,
+    action: input.action,
+  });
+  clearPendingSharedJobAck(getSharedFindRelayState(), key);
+}
+
 export function routeSharedFindRelayClientMessage(
   senderPublicId: string,
   payload: unknown
@@ -427,6 +608,7 @@ export function routeSharedFindRelayClientMessage(
   }
 
   settleSharedFindRelayDispatchAck(normalizedSender, message);
+  settleSharedJobRelayAck(normalizedSender, message);
 
   const operatorPublicId = normalizeText(message.operator_public_id);
   if (!operatorPublicId) {
