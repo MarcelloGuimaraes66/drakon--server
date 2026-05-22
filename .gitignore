@@ -1,0 +1,32 @@
+# Build
+/build/
+/out/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/compile_commands.json
+
+# Runtime data
+/data/frames/
+/data/inference/
+/data/alerts/
+/data/events/
+/data/indexes/
+/data/logs/
+/data/db/
+/runtime/
+
+# Accidental nested clone audited in Prompt 11.
+/drakon-server/
+
+# Secrets/config local
+config/*.local.json
+config/secrets/
+.env
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

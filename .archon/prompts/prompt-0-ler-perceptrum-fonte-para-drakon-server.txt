@@ -1,0 +1,193 @@
+PROMPT 0 — LER PERCEPTRUM_DESKTOP_ASPP COMO FONTE PARA CRIAR DRAKON-SERVER
+
+Atue como arquiteto sênior de C++23, CMake, Linux/Ubuntu, RTSP, webcam, FFmpeg, OpenCV, SQLite, PostgreSQL, JSON estruturado, LLM, jobs, steps, agentes, alertas, API/webhook e sistemas headless.
+
+Objetivo:
+Ler o repositório-fonte perceptrum_desktop_aspp e planejar como criar o novo projeto drakon-server.
+
+Repositório-fonte:
+https://github.com/edguimkit/perceptrum_desktop_aspp.git
+
+Diretório esperado do fonte neste Ubuntu:
+/home/marcello-guimaraes/dev/perceptrum_desktop_aspp
+
+Novo projeto alvo:
+/home/marcello-guimaraes/dev/drakon-server
+
+Conceito:
+O projeto atual perceptrum_desktop_aspp mistura cliente, desktop, dashboard, backend local, captura, jobs, agentes, inferência e alertas.
+
+O novo drakon-server será somente servidor/headless, sem interface gráfica, sem navegador, responsável por:
+- ler banco/configuração;
+- conectar câmeras RTSP/webcam;
+- capturar frames;
+- salvar frames em diretórios com timestamp;
+- executar jobs/steps/agentes;
+- chamar LLM/inferência;
+- salvar resultados em JSON estruturado;
+- gerar alertas;
+- emitir alertas por API/webhook;
+- criar índices JSONL para o dashboard;
+- fornecer dados para o dashboard Drakon exibir.
+
+O dashboard Drakon será cliente visual separado.
+
+Regras absolutas:
+1. Não fazer commit.
+2. Não fazer push.
+3. Não apagar arquivos.
+4. Não executar git reset --hard.
+5. Não alterar o repositório-fonte nesta fase.
+6. Não copiar código cegamente.
+7. Não criar interface gráfica.
+8. Não depender de navegador.
+9. Não hardcodar credenciais.
+10. Não salvar secrets em logs.
+11. Se precisar instalar pacote apt, parar e informar o comando.
+12. Usar somente Codex/gpt-5.5.
+13. Não usar Claude, opus, sonnet ou haiku.
+
+Tarefa 1 — Confirmar fonte:
+1. Verifique se existe /home/marcello-guimaraes/dev/perceptrum_desktop_aspp.
+2. Se não existir, informe que precisa clonar o repositório-fonte.
+3. Se existir, leia a estrutura sem alterar código.
+
+Tarefa 2 — Mapear módulos do fonte:
+Ler e classificar:
+
+Perceptrum/Perceptrum/camera/
+- CameraSession
+- RtspCapture
+- FrameDiskWriter
+- FrameBuffer
+- MotionDetector
+- CameraConfig
+
+Perceptrum/Perceptrum/jobs/
+- JobRuntime
+- JobTypes
+- JobPayloadParser
+
+Perceptrum/Perceptrum/orchestrator/
+- ChatV2Orchestrator
+- PromptBuilder
+- SkillRegistry
+- SkillTypes
+- LocalLlmClient
+- ChatModelConfig
+- OperationTaskState
+- skills/
+
+Perceptrum/Perceptrum/core/
+- AgentCore
+- TemporalEngine
+- TemporalEvidence
+- AnalysisRegionGeometry
+- ContentCoverageTracker
+
+Perceptrum/Perceptrum/comm/
+- BackendConfig
+- PairingClient
+- TelegramNotifier
+- PgClient
+- SecureLocalStore
+
+Perceptrum/Perceptrum/platform/
+- platform_common
+- platform_process
+- platform_secure_store
+- platform_shutdown
+
+Perceptrum/Perceptrum/runtime/
+- HeadlessService
+- BrandingRuntime
+
+DrakonSite/
+- server/
+- src/worker/
+- src/react-app/
+- package.json
+
+AppHost/
+- Platform/LocalBackendHost
+- Platform/PerceptrumRuntimeHost
+- Services/
+- Persistence/
+- Pages/
+
+Tarefa 3 — Identificar o que vira drakon-server:
+Para cada módulo, classifique como:
+- reutilizar diretamente;
+- refatorar e extrair;
+- usar apenas como referência;
+- não usar no servidor;
+- manter no cliente/dashboard.
+
+Tarefa 4 — Identificar contratos:
+Mapear:
+1. formato das câmeras;
+2. formato dos jobs;
+3. formato dos steps;
+4. formato dos agentes;
+5. formato dos prompts;
+6. formato dos resultados de inferência;
+7. formato dos alertas;
+8. formato de eventos;
+9. formato de logs;
+10. formato dos diretórios de frames;
+11. formato dos JSON/JSONL que o dashboard deve ler;
+12. tabelas SQLite/PostgreSQL relevantes;
+13. APIs/webhooks existentes;
+14. integração com LLM.
+
+Tarefa 5 — Planejar arquitetura do drakon-server:
+Propor módulos para o novo projeto:
+
+- cli/
+- config/
+- database/
+- camera/
+- capture/
+- frame_store/
+- inference/
+- jobs/
+- agents/
+- alerts/
+- events/
+- indexes/
+- api/
+- webhook/
+- runtime/
+- logging/
+- security/
+- tests/
+
+Tarefa 6 — Planejar fases:
+Criar plano em fases:
+1. scaffold CLI/CMake;
+2. config e runtime dirs;
+3. SQLite/PostgreSQL;
+4. leitura de câmeras;
+5. captura RTSP/webcam;
+6. escrita de frames 1 FPS/10 FPS;
+7. índice JSONL de frames;
+8. jobs/steps/agentes;
+9. inferência LLM;
+10. JSON de inferência;
+11. alertas JSON/API/webhook;
+12. integração dashboard;
+13. systemd;
+14. pacote .deb.
+
+Saída obrigatória:
+Gerar estes relatórios dentro do projeto drakon-server:
+
+.archon/plans/drakon-server-analise-fonte-perceptrum.md
+.archon/plans/drakon-server-mapa-extracao.md
+.archon/plans/drakon-server-contratos-json-db-api.md
+.archon/plans/drakon-server-plano-fases.md
+.archon/plans/drakon-server-primeira-implementacao.md
+
+Não alterar código nesta fase.
+Não fazer commit.
+Não fazer push.
