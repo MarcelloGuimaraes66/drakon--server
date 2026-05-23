@@ -98,6 +98,23 @@ function isAgentRequestPath(pathname: string) {
   return pathname === "/api/agent" || pathname.startsWith("/api/agent/");
 }
 
+function normalizeProxyHeaderValue(value: string | string[] | undefined): string {
+  const normalized = Array.isArray(value) ? value[0] : value || "";
+  return normalized.split(",")[0]?.trim() || "";
+}
+
+function resolveRequestBaseUrl(req: any): string {
+  const forwardedProto = normalizeProxyHeaderValue(req.headers["x-forwarded-proto"]).toLowerCase();
+  const forwardedHost =
+    normalizeProxyHeaderValue(req.headers["x-forwarded-host"]) ||
+    normalizeProxyHeaderValue(req.headers.host) ||
+    "localhost";
+  const protocol = forwardedProto === "https" || forwardedProto === "http"
+    ? forwardedProto
+    : "http";
+  return `${protocol}://${forwardedHost}`;
+}
+
 async function forwardHttpRequest(req: any, targetUrl: URL) {
   const method = req.method || "GET";
   const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
@@ -163,6 +180,9 @@ async function startServer() {
     R2_BUCKET,
     GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
     GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_ID: process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET:
+      process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET || "",
     GOOGLE_OAUTH_REDIRECT_URI: process.env.GOOGLE_OAUTH_REDIRECT_URI || "",
     DESKTOP_GOOGLE_OAUTH_REDIRECT_URI:
       process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || "",
@@ -207,7 +227,7 @@ async function startServer() {
       return;
     }
 
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, resolveRequestBaseUrl(req));
 
     if (url.pathname.startsWith("/media/")) {
       await serveMedia(res, url.pathname);
@@ -260,7 +280,7 @@ async function startServer() {
   });
 
   relayWss.on("connection", (ws, request) => {
-    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const requestUrl = new URL(request.url || "/", resolveRequestBaseUrl(request));
     const token = requestUrl.searchParams.get("token") || "";
     const registered = registerSharedFindRelayConnection(token, ws as any);
 

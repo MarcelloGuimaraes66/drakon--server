@@ -28,6 +28,8 @@ const execFileAsync = promisify(execFile);
 const desktopRuntimeEnvKeys = [
   "GOOGLE_OAUTH_CLIENT_ID",
   "GOOGLE_OAUTH_CLIENT_SECRET",
+  "DESKTOP_GOOGLE_OAUTH_CLIENT_ID",
+  "DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET",
   "GOOGLE_GEOCODING_API_KEY",
   "GEONAMES_USERNAME",
   "CHAT_V2_ENABLED",
@@ -232,13 +234,6 @@ async function stageDesktopRuntimeEnv() {
     runtimeEnv.CENTRAL_AUTH_PUBLIC_KEY = centralAuthPublicKey;
   }
 
-  if (activeBrand.features?.googleLoginEnabled) {
-    ensureRequiredRuntimeEnv(runtimeEnv, [
-      "GOOGLE_OAUTH_CLIENT_ID",
-      "GOOGLE_OAUTH_CLIENT_SECRET",
-    ]);
-  }
-
   let desktopGoogleRedirectUri = resolveRuntimeEnvValue(
     "DESKTOP_GOOGLE_OAUTH_REDIRECT_URI",
     sourceLocalEnv
@@ -305,17 +300,6 @@ async function resolveDesktopCentralAuthPublicKey(sourceEnv) {
   }
 
   return (await fs.readFile(resolvedPath, "utf8")).trim();
-}
-
-function ensureRequiredRuntimeEnv(envMap, requiredKeys) {
-  const missingKeys = requiredKeys.filter((key) => !String(envMap[key] || "").trim());
-  if (missingKeys.length === 0) {
-    return;
-  }
-
-  throw new Error(
-    `Desktop runtime env is missing required keys for ${activeBrandId}: ${missingKeys.join(", ")}`
-  );
 }
 
 function serializeEnv(envMap) {

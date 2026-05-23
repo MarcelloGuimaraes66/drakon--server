@@ -47,6 +47,18 @@ Template files:
 - `.env.local.example`
 - `.env.server.example`
 
+## Google login split (Perceptrum)
+
+Perceptrum supports separate Google OAuth clients for web and desktop:
+- `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` for the web app callback
+- optional `DESKTOP_GOOGLE_OAUTH_CLIENT_ID` for a packaged desktop loopback callback
+- `DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET` is optional for Desktop App clients that use PKCE without a secret
+
+Recommended shape:
+- web callback: `https://perceptrum.ai/auth/callback`
+- desktop without a dedicated client: reuse the web callback and let the WebView rewrite `/auth/callback` back to the active local origin
+- desktop with a dedicated client: leave `DESKTOP_GOOGLE_OAUTH_REDIRECT_URI` blank and let the runtime use its loopback callback automatically
+
 ## Timezone model
 
 - Global timezone is stored per user in `app_users.timezone_iana`.

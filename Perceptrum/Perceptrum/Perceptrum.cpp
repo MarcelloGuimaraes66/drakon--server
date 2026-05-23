@@ -201,7 +201,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 
     // 4) Start AgentCore in background
-    AgentCore agent(agentBaseUrl, exeToken, clientId);
+    AgentCore agent(agentBaseUrl, uiBaseUrl, exeToken, clientId);
     g_agent = &agent;
 
     agent.initTimeSync();

@@ -10680,6 +10680,71 @@ type GoogleSessionUser = {
 };
 
 type GoogleOAuthIntent = "login" | "signup";
+type GoogleOAuthClientTarget = "web" | "desktop";
+type RequestEffectiveBrandId = "drakon" | "perceptrum";
+type RequestEffectiveBrandConfig = {
+  id: RequestEffectiveBrandId;
+  siteUrl: string;
+  allowedOrigins: string[];
+  features: {
+    googleLoginEnabled: boolean;
+  };
+};
+
+const REQUEST_EFFECTIVE_BRANDS: Record<
+  RequestEffectiveBrandId,
+  RequestEffectiveBrandConfig
+> = {
+  drakon: {
+    id: "drakon",
+    siteUrl: "https://drakon-solution.com/",
+    allowedOrigins: [
+      "https://drakon-solution.com",
+      "https://www.drakon-solution.com",
+    ],
+    features: {
+      googleLoginEnabled: false,
+    },
+  },
+  perceptrum: {
+    id: "perceptrum",
+    siteUrl: "https://perceptrum.ai/",
+    allowedOrigins: [
+      "https://perceptrum.ai",
+      "https://www.perceptrum.ai",
+    ],
+    features: {
+      googleLoginEnabled: true,
+    },
+  },
+};
+
+const ALL_REQUEST_EFFECTIVE_ALLOWED_ORIGINS = Array.from(
+  new Set(
+    Object.values(REQUEST_EFFECTIVE_BRANDS).flatMap((candidate) => candidate.allowedOrigins)
+  )
+);
+
+const REQUEST_EFFECTIVE_BRAND_BY_HOSTNAME = new Map<
+  string,
+  RequestEffectiveBrandId
+>(
+  Object.values(REQUEST_EFFECTIVE_BRANDS).flatMap((candidate) =>
+    candidate.allowedOrigins
+      .map((origin) => {
+        try {
+          return [new URL(origin).hostname.toLowerCase(), candidate.id] as const;
+        } catch {
+          return null;
+        }
+      })
+      .filter(
+        (
+          entry
+        ): entry is readonly [string, RequestEffectiveBrandId] => Boolean(entry)
+      )
+  )
+);
 
 let googleOidcDiscoveryCache: { expiresAt: number; value: GoogleOidcDiscovery } | null = null;
 let googleRemoteJwkSet: ReturnType<typeof createRemoteJWKSet> | null = null;
@@ -10689,23 +10754,143 @@ function normalizeGoogleOAuthIntent(value: unknown): GoogleOAuthIntent {
   return String(value || "").trim().toLowerCase() === "signup" ? "signup" : "login";
 }
 
-function getGoogleOAuthClientId(env: Env): string {
-  const clientId = String(env.GOOGLE_OAUTH_CLIENT_ID || "").trim();
+function normalizeRequestCandidateHostname(value: unknown): string {
+  const rawValue = String(value || "").split(",")[0]?.trim() || "";
+  if (!rawValue) {
+    return "";
+  }
+
+  try {
+    return new URL(rawValue).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+  }
+
+  try {
+    return new URL(`http://${rawValue}`).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function resolveRequestEffectiveBrandId(c: any): RequestEffectiveBrandId {
+  for (const candidate of [
+    c.req.header("origin"),
+    c.req.header("x-forwarded-origin"),
+    c.req.header("x-forwarded-host"),
+    c.req.header("host"),
+    c.req.url,
+  ]) {
+    const hostname = normalizeRequestCandidateHostname(candidate);
+    if (!hostname) {
+      continue;
+    }
+
+    const resolved = REQUEST_EFFECTIVE_BRAND_BY_HOSTNAME.get(hostname);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return brand.id === "perceptrum" ? "perceptrum" : "drakon";
+}
+
+function resolveRequestEffectiveBrand(c: any): RequestEffectiveBrandConfig {
+  return REQUEST_EFFECTIVE_BRANDS[resolveRequestEffectiveBrandId(c)];
+}
+
+function isGoogleLoginEnabledForRequest(c: any): boolean {
+  return resolveRequestEffectiveBrand(c).features.googleLoginEnabled;
+}
+
+function isDesktopGoogleLoginConfigured(env: Env): boolean {
+  return String(env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID || "").trim().length > 0;
+}
+
+function listGoogleOAuthClientIds(
+  env: Env,
+  target: GoogleOAuthClientTarget | "any"
+): string[] {
+  const clientIds: string[] = [];
+  const pushClientId = (value: unknown) => {
+    const normalized = String(value || "").trim();
+    if (normalized && !clientIds.includes(normalized)) {
+      clientIds.push(normalized);
+    }
+  };
+
+  if (target === "desktop" || target === "any") {
+    pushClientId(env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID);
+  }
+
+  if (target === "web" || target === "any") {
+    pushClientId(env.GOOGLE_OAUTH_CLIENT_ID);
+  }
+
+  return clientIds;
+}
+
+function getGoogleOAuthClientId(
+  env: Env,
+  target: GoogleOAuthClientTarget = "web"
+): string {
+  const [clientId] = listGoogleOAuthClientIds(env, target);
   if (!clientId) {
+    if (target === "desktop") {
+      throw new Error(
+        "Desktop Google login is not configured. Set DESKTOP_GOOGLE_OAUTH_CLIENT_ID."
+      );
+    }
     throw new Error("Google login is not configured. Set GOOGLE_OAUTH_CLIENT_ID.");
   }
   return clientId;
 }
 
-function getGoogleOAuthConfig(env: Env) {
-  const clientId = getGoogleOAuthClientId(env);
-  const clientSecret = String(env.GOOGLE_OAUTH_CLIENT_SECRET || "").trim();
-  if (!clientSecret) {
+function getGoogleIdTokenAudiences(
+  env: Env,
+  target: GoogleOAuthClientTarget | "any" = "any"
+): string[] {
+  const clientIds = listGoogleOAuthClientIds(env, target);
+  if (clientIds.length > 0) {
+    return clientIds;
+  }
+
+  if (target === "desktop") {
+    throw new Error(
+      "Desktop Google login is not configured. Set DESKTOP_GOOGLE_OAUTH_CLIENT_ID."
+    );
+  }
+
+  if (target === "web") {
+    throw new Error("Google login is not configured. Set GOOGLE_OAUTH_CLIENT_ID.");
+  }
+
+  throw new Error(
+    "Google token verification is not configured. Set GOOGLE_OAUTH_CLIENT_ID and/or DESKTOP_GOOGLE_OAUTH_CLIENT_ID."
+  );
+}
+
+function getGoogleOAuthConfig(
+  env: Env,
+  target: GoogleOAuthClientTarget = "web"
+): { clientId: string; clientSecret: string | null } {
+  const clientId = getGoogleOAuthClientId(env, target);
+  const clientSecret = String(
+    target === "desktop"
+      ? env.DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET || ""
+      : env.GOOGLE_OAUTH_CLIENT_SECRET || ""
+  ).trim();
+
+  if (target === "web" && !clientSecret) {
     throw new Error(
       "Google login is not configured. Set GOOGLE_OAUTH_CLIENT_SECRET."
     );
   }
-  return { clientId, clientSecret };
+
+  return { clientId, clientSecret: clientSecret || null };
+}
+
+function normalizeForwardedHeaderValue(value: string): string {
+  return value.split(",")[0]?.trim() || "";
 }
 
 function resolveBrowserOrigin(c: any): string {
@@ -10713,11 +10898,22 @@ function resolveBrowserOrigin(c: any): string {
   if (headerOrigin.startsWith("http://") || headerOrigin.startsWith("https://")) {
     return headerOrigin.replace(/\/$/, "");
   }
+
+  const forwardedProto = normalizeForwardedHeaderValue(
+    String(c.req.header("x-forwarded-proto") || "").toLowerCase()
+  );
+  const forwardedHost = normalizeForwardedHeaderValue(
+    String(c.req.header("x-forwarded-host") || c.req.header("host") || "")
+  );
+  if ((forwardedProto === "http" || forwardedProto === "https") && forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`.replace(/\/$/, "");
+  }
+
   return new URL(c.req.url).origin.replace(/\/$/, "");
 }
 
-function resolveAuthoritativeGoogleRedirectUri(): string {
-  const siteUrl = String(brand.siteUrl || "").trim();
+function resolveAuthoritativeGoogleRedirectUri(c: any): string {
+  const siteUrl = String(resolveRequestEffectiveBrand(c).siteUrl || "").trim();
   if (!siteUrl) {
     return "";
   }
@@ -10741,12 +10937,25 @@ function isDesktopHostedGoogleLoginRequest(c: any): boolean {
   return desktopHeader === "1" || desktopHeader === "true" || desktopHeader === "yes";
 }
 
+function resolveGoogleOAuthClientTarget(c: any): GoogleOAuthClientTarget {
+  return isDesktopHostedGoogleLoginRequest(c) && isDesktopGoogleLoginConfigured(c.env)
+    ? "desktop"
+    : "web";
+}
+
 function resolveGoogleRedirectUri(
   c: any,
-  options?: { preferAuthoritative?: boolean; preferLocalOrigin?: boolean }
+  options?: {
+    preferAuthoritative?: boolean;
+    preferLocalOrigin?: boolean;
+    oauthTarget?: GoogleOAuthClientTarget;
+  }
 ): { value: string; source: string } {
-  const desktopConfigured = String(c.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || "").trim();
   const configured = String(c.env.GOOGLE_OAUTH_REDIRECT_URI || "").trim();
+  const desktopConfigured =
+    options?.oauthTarget === "desktop"
+      ? String(c.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || "").trim()
+      : "";
 
   if (options?.preferLocalOrigin) {
     if (desktopConfigured) {
@@ -10760,11 +10969,11 @@ function resolveGoogleRedirectUri(
   }
 
   if (options?.preferAuthoritative) {
-    if (desktopConfigured) {
-      return { value: desktopConfigured, source: "desktop_env" };
+    if (configured) {
+      return { value: configured, source: "web_env" };
     }
 
-    const authoritative = resolveAuthoritativeGoogleRedirectUri();
+    const authoritative = resolveAuthoritativeGoogleRedirectUri(c);
     if (authoritative) {
       return { value: authoritative, source: "brand_site" };
     }
@@ -10776,6 +10985,11 @@ function resolveGoogleRedirectUri(
 
   if (desktopConfigured) {
     return { value: desktopConfigured, source: "desktop_env" };
+  }
+
+  const authoritative = resolveAuthoritativeGoogleRedirectUri(c);
+  if (authoritative) {
+    return { value: authoritative, source: "brand_site" };
   }
 
   return {
@@ -10863,6 +11077,7 @@ async function buildGoogleUserFromIdToken(
   idToken: string,
   options?: {
     expectedNonce?: string;
+    target?: GoogleOAuthClientTarget | "any";
   }
 ): Promise<GoogleOAuthUser> {
   const normalizedIdToken = typeof idToken === "string" ? idToken.trim() : "";
@@ -10870,11 +11085,11 @@ async function buildGoogleUserFromIdToken(
     throw new Error("Google token response did not include id_token.");
   }
 
-  const clientId = getGoogleOAuthClientId(env);
+  const audiences = getGoogleIdTokenAudiences(env, options?.target || "any");
   const discovery = await getGoogleOidcDiscovery();
   const jwks = await getGoogleRemoteJwkSet();
   const verification = await jwtVerify<GoogleIdTokenClaims>(normalizedIdToken, jwks, {
-    audience: clientId,
+    audience: audiences,
     issuer: [discovery.issuer, "https://accounts.google.com", "accounts.google.com"],
     maxTokenAge: "15 minutes",
     clockTolerance: 60,
@@ -11007,13 +11222,17 @@ async function createGoogleOAuthRedirectUrl(
     intent?: GoogleOAuthIntent;
   }
 ): Promise<string> {
-  const { clientId } = getGoogleOAuthConfig(c.env);
+  const oauthTarget = resolveGoogleOAuthClientTarget(c);
+  const { clientId } = getGoogleOAuthConfig(c.env, oauthTarget);
   const discovery = await getGoogleOidcDiscovery();
   const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
   const normalizedIntent = normalizeGoogleOAuthIntent(options?.intent);
+  const requestBrand = resolveRequestEffectiveBrand(c);
   const redirectUriResolution = resolveGoogleRedirectUri(
     c,
-    desktopHosted ? { preferLocalOrigin: true } : undefined
+    oauthTarget === "desktop"
+      ? { preferLocalOrigin: true, oauthTarget }
+      : { preferAuthoritative: true, oauthTarget }
   );
   const redirectUri = redirectUriResolution.value;
   const state = generateRandomBase64Url(24);
@@ -11022,7 +11241,7 @@ async function createGoogleOAuthRedirectUrl(
   const codeChallenge = await sha256Base64Url(codeVerifier);
 
   console.log(
-    `[GOOGLE LOGIN] redirect_uri=${redirectUri} source=${redirectUriResolution.source} desktop_hosted=${desktopHosted} intent=${normalizedIntent} request_origin=${resolveBrowserOrigin(c)}`
+    `[GOOGLE LOGIN] redirect_uri=${redirectUri} source=${redirectUriResolution.source} desktop_hosted=${desktopHosted} oauth_target=${oauthTarget} brand=${requestBrand.id} intent=${normalizedIntent} request_origin=${resolveBrowserOrigin(c)}`
   );
 
   setSessionCookie(c, GOOGLE_OAUTH_STATE_COOKIE_NAME, state, GOOGLE_OAUTH_STATE_MAX_AGE_SECONDS);
@@ -11074,8 +11293,8 @@ async function exchangeGoogleAuthorizationCode(
   code: string,
   state: string
 ): Promise<GoogleOAuthUser> {
-  const { clientId, clientSecret } = getGoogleOAuthConfig(c.env);
-  const desktopHosted = isDesktopHostedGoogleLoginRequest(c);
+  const oauthTarget = resolveGoogleOAuthClientTarget(c);
+  const { clientId, clientSecret } = getGoogleOAuthConfig(c.env, oauthTarget);
   const expectedState = getCookie(c, GOOGLE_OAUTH_STATE_COOKIE_NAME);
   const expectedNonce = getCookie(c, GOOGLE_OAUTH_NONCE_COOKIE_NAME);
   const codeVerifier = getCookie(c, GOOGLE_OAUTH_PKCE_COOKIE_NAME);
@@ -11083,7 +11302,9 @@ async function exchangeGoogleAuthorizationCode(
     getCookie(c, GOOGLE_OAUTH_REDIRECT_URI_COOKIE_NAME) ||
     resolveGoogleRedirectUri(
       c,
-      desktopHosted ? { preferLocalOrigin: true } : undefined
+      oauthTarget === "desktop"
+        ? { preferLocalOrigin: true, oauthTarget }
+        : { preferAuthoritative: true, oauthTarget }
     ).value;
 
   if (!expectedState) {
@@ -11100,17 +11321,20 @@ async function exchangeGoogleAuthorizationCode(
   }
 
   const discovery = await getGoogleOidcDiscovery();
+  const tokenRequestBody = new URLSearchParams({
+    code,
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    grant_type: "authorization_code",
+    code_verifier: codeVerifier,
+  });
+  if (clientSecret) {
+    tokenRequestBody.set("client_secret", clientSecret);
+  }
   const tokenResponse = await fetch(discovery.token_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      code,
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uri: redirectUri,
-      grant_type: "authorization_code",
-      code_verifier: codeVerifier,
-    }),
+    body: tokenRequestBody,
   });
 
   const tokenPayload = (await tokenResponse.json().catch(() => ({}))) as Record<string, unknown>;
@@ -11128,6 +11352,7 @@ async function exchangeGoogleAuthorizationCode(
     typeof tokenPayload.id_token === "string" ? tokenPayload.id_token : "";
   return buildGoogleUserFromIdToken(c.env, idToken, {
     expectedNonce,
+    target: oauthTarget,
   });
 }
 
@@ -15257,7 +15482,7 @@ app.use("*", async (c, next) => {
   // List of allowed origins
   const allowedOrigins = Array.from(
     new Set([
-      ...brand.allowedOrigins,
+      ...ALL_REQUEST_EFFECTIVE_ALLOWED_ORIGINS,
       "https://e4a722mkktilw.mocha.app",
       "https://getmocha.com",
       ...configuredOrigins,
@@ -15565,6 +15790,64 @@ function normalizeResponseErrorMessage(data: any, fallback: string): string {
 function normalizeRemoteHttpErrorMessage(response: Response, data: any, fallback: string): string {
   const statusSuffix = response?.status ? ` (HTTP ${response.status})` : "";
   return normalizeResponseErrorMessage(data, `${fallback}${statusSuffix}`);
+}
+
+const SHARED_RELAY_OPERATOR_UNAVAILABLE_MESSAGE =
+  "This workspace is disconnected from the shared camera relay. Reconnect Drakon/Perceptrum on this machine and try again.";
+const SHARED_RELAY_OWNER_UNAVAILABLE_MESSAGE =
+  "The owner machine is offline or disconnected from the shared camera relay. Reconnect Drakon/Perceptrum on the owner machine and try again.";
+
+function looksLikeSharedRelayOperatorConnectionError(message: string): boolean {
+  const normalized = normalizeText(message).toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("failed to create a shared find relay session") ||
+    normalized.includes("shared find relay socket failed to connect") ||
+    normalized.includes("shared find relay socket closed before opening") ||
+    normalized.includes("connect timeout") ||
+    normalized.includes("fetch failed")
+  );
+}
+
+function looksLikeSharedRelayOwnerAvailabilityError(message: string): boolean {
+  const normalized = normalizeText(message).toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("owner runtime is offline for this shared job segment") ||
+    normalized.includes("owner runtime is offline for this shared job stop request") ||
+    normalized.includes("failed to forward the shared job segment") ||
+    normalized.includes("failed to forward the shared job stop request") ||
+    normalized.includes("did not acknowledge the shared job dispatch") ||
+    normalized.includes("did not acknowledge the shared job stop request")
+  );
+}
+
+function normalizeSharedRelayAvailabilityErrorMessage(
+  error: unknown,
+  fallback: string
+): string {
+  const rawMessage =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+      ? error.message
+      : normalizeText(error);
+  const normalizedMessage = normalizeText(rawMessage) || fallback;
+  if (looksLikeSharedRelayOperatorConnectionError(normalizedMessage)) {
+    return SHARED_RELAY_OPERATOR_UNAVAILABLE_MESSAGE;
+  }
+  if (looksLikeSharedRelayOwnerAvailabilityError(normalizedMessage)) {
+    return SHARED_RELAY_OWNER_UNAVAILABLE_MESSAGE;
+  }
+  return normalizedMessage;
+}
+
+function isSharedRelayAvailabilityErrorMessage(error: unknown): boolean {
+  const normalized = normalizeSharedRelayAvailabilityErrorMessage(error, "");
+  return (
+    normalized === SHARED_RELAY_OPERATOR_UNAVAILABLE_MESSAGE ||
+    normalized === SHARED_RELAY_OWNER_UNAVAILABLE_MESSAGE
+  );
 }
 
 function normalizeDbBoolean(value: unknown, fallback = false): boolean {
@@ -18945,15 +19228,24 @@ async function ensureSharedFindRelayClientForAppUser(
   appUserId: string
 ): Promise<CentralUserRelayContext> {
   const centralContext = await resolveCurrentUserCentralRelayContextById(env, appUserId);
-  await ensureSharedFindRelayClientConnected({
-    env,
-    publicId: centralContext.publicId,
-    appUserId: centralContext.appUserId,
-    grantToken: centralContext.grantToken,
-    onMessage: async (context, message) => {
-      await handleSharedFindRelayInboundMessage(context, message);
-    },
-  });
+  try {
+    await ensureSharedFindRelayClientConnected({
+      env,
+      publicId: centralContext.publicId,
+      appUserId: centralContext.appUserId,
+      grantToken: centralContext.grantToken,
+      onMessage: async (context, message) => {
+        await handleSharedFindRelayInboundMessage(context, message);
+      },
+    });
+  } catch (error) {
+    throw new Error(
+      normalizeSharedRelayAvailabilityErrorMessage(
+        error,
+        "Failed to connect this workspace to the shared camera relay."
+      )
+    );
+  }
   return centralContext;
 }
 
@@ -19044,8 +19336,11 @@ function buildSharedJobExecutionOptions(): JobSharedExecutionOptions {
           return {
             ok: false,
             error:
-              normalizeResponseErrorMessage(
-                response.data,
+              normalizeSharedRelayAvailabilityErrorMessage(
+                normalizeResponseErrorMessage(
+                  response.data,
+                  "Failed to dispatch the shared job segment."
+                ),
                 "Failed to dispatch the shared job segment."
               ) || "Failed to dispatch the shared job segment.",
             requestId: normalizeText(response.data?.request_id) || null,
@@ -19058,10 +19353,10 @@ function buildSharedJobExecutionOptions(): JobSharedExecutionOptions {
       } catch (error) {
         return {
           ok: false,
-          error:
-            error instanceof Error && error.message
-              ? error.message
-              : "Failed to dispatch the shared job segment.",
+          error: normalizeSharedRelayAvailabilityErrorMessage(
+            error,
+            "Failed to dispatch the shared job segment."
+          ),
         };
       }
     },
@@ -32099,6 +32394,10 @@ app.post("/api/account-users/:memberId/password", anyAuthMiddleware, async (c) =
 
 // OAuth endpoints
 app.get("/api/oauth/google/redirect_url", async (c) => {
+  if (!isGoogleLoginEnabledForRequest(c)) {
+    return c.json({ error: "Google login is not available for this app." }, 404);
+  }
+
   try {
     const requestedCountryCode =
       normalizeCountryCode(c.req.query("country_code"), null) ||
@@ -32128,6 +32427,10 @@ app.post("/api/sessions", async (c) => {
   // Ensure schema is initialized
   await ensureSchema(c.env.DB);
   
+  if (!isGoogleLoginEnabledForRequest(c)) {
+    return c.json({ error: "Google login is not available for this app." }, 404);
+  }
+
   const body = await c.req.json();
 
   if (!body.code) {
@@ -37688,14 +37991,24 @@ async function startJobForUser(
       buildSharedJobExecutionOptions()
     );
     if (!startResult.ok) {
-      return { statusCode: 500, body: { error: startResult.error || "Failed to start job" } };
+      const errorMessage = normalizeSharedRelayAvailabilityErrorMessage(
+        startResult.error,
+        "Failed to start job"
+      );
+      return {
+        statusCode: isSharedRelayAvailabilityErrorMessage(errorMessage) ? 409 : 500,
+        body: { error: errorMessage || "Failed to start job" },
+      };
     }
 
     return { statusCode: 200, body: { ok: true } };
   } catch (error) {
-    const message = normalizeText((error as any)?.message || error) || "Failed to start job";
+    const message = normalizeSharedRelayAvailabilityErrorMessage(error, "Failed to start job");
     console.error(`[JOB START] Unexpected error for job ${jobId}:`, error);
-    return { statusCode: 500, body: { error: message } };
+    return {
+      statusCode: isSharedRelayAvailabilityErrorMessage(message) ? 409 : 500,
+      body: { error: message },
+    };
   }
 }
 

@@ -4606,9 +4606,11 @@ static size_t WriteCb(void* ptr, size_t size, size_t nmemb, void* userdata) {
 // ---- constructor --------------------------------------------------
 
 AgentCore::AgentCore(const std::string& baseUrl,
+    const std::string& controlPlaneBaseUrl,
     const std::string& exeToken,
     const std::string& clientId)
     : baseUrl_(baseUrl),
+    controlPlaneBaseUrl_(controlPlaneBaseUrl.empty() ? baseUrl : controlPlaneBaseUrl),
     exeToken_(exeToken),
     clientId_(clientId),
     machineTimezoneForBackend_(detectMachineTimezoneForBackendHeaders()),
@@ -5480,8 +5482,9 @@ void AgentCore::schedulerPingLoop_() {
 void AgentCore::triggerSchedulerTickOnce_() {
     if (exeToken_.empty()) return;
 
-    // Build full URL using the same baseUrl_ you already use for /api/agent/commands
-    const std::string url = baseUrl_ + kSchedulerTickPath;
+    const std::string& controlPlaneBaseUrl =
+        controlPlaneBaseUrl_.empty() ? baseUrl_ : controlPlaneBaseUrl_;
+    const std::string url = controlPlaneBaseUrl + kSchedulerTickPath;
 
     Logger::instance().logDebug("agent", "SchedulerTick: POST " + url);
 
@@ -5580,8 +5583,10 @@ void AgentCore::runConfiguredFrameRetentionSweepIfDue_(bool force)
         return;
     }
 
+    const std::string& controlPlaneBaseUrl =
+        controlPlaneBaseUrl_.empty() ? baseUrl_ : controlPlaneBaseUrl_;
     const std::string url =
-        baseUrl_ + kFrameRetentionPoliciesPath + "?client_id=" + clientId_;
+        controlPlaneBaseUrl + kFrameRetentionPoliciesPath + "?client_id=" + clientId_;
     auto truncateResponse = [](const std::string& text) -> std::string {
         constexpr std::size_t kMaxLen = 1000;
         if (text.size() <= kMaxLen) {

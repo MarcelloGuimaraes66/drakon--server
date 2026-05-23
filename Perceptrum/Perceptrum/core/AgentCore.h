@@ -173,6 +173,7 @@ public:
     };
 
     AgentCore(const std::string& baseUrl,
+        const std::string& controlPlaneBaseUrl,
         const std::string& exeToken,
         const std::string& clientId);
 
@@ -560,6 +561,7 @@ private:
     void stopCamera_(int cameraId);
 
     std::string baseUrl_;
+    std::string controlPlaneBaseUrl_;
     std::string exeToken_;
     std::string clientId_;
     std::string machineTimezoneForBackend_;

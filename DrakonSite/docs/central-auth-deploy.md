@@ -60,6 +60,8 @@ Important values for the dedicated service:
 - `PGPASSWORD=...`
 - `CENTRAL_AUTH_PUBLIC_KEY_PATH=/etc/perceptrum/keys/central-auth-public.pem`
 - `CENTRAL_AUTH_PRIVATE_KEY_PATH=/etc/perceptrum/keys/central-auth-private.pem`
+- `GOOGLE_OAUTH_CLIENT_ID=...` for the web Perceptrum audience
+- optional `DESKTOP_GOOGLE_OAUTH_CLIENT_ID=...` if you want a dedicated desktop Google audience
 
 Recommended permissions:
 
@@ -108,6 +110,12 @@ Or inline:
 CENTRAL_AUTH_BASE_URL=https://auth.perceptrum.ai
 CENTRAL_AUTH_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
 ```
+
+Perceptrum Google login is split by surface:
+
+- web uses `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` with `https://perceptrum.ai/auth/callback`
+- desktop can reuse the web callback, and the desktop WebView rewrites `/auth/callback` back to the active local origin
+- desktop can also use `DESKTOP_GOOGLE_OAUTH_CLIENT_ID`, in which case `DESKTOP_GOOGLE_OAUTH_REDIRECT_URI` may stay empty so the runtime uses its loopback callback automatically
 
 ## 6. Validate
 

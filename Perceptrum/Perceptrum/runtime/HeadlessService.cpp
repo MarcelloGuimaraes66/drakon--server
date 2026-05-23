@@ -99,10 +99,15 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
         Logger::instance().logDebug(
             "agent",
             "HeadlessService: starting AgentCore for client_id=" + currentClientId +
-                " pairingBaseUrl=" + currentPairingBaseUrl +
+                " controlBaseUrl=" + currentPairingBaseUrl +
                 " agentBaseUrl=" + currentAgentBaseUrl);
 
-        agent = std::make_unique<AgentCore>(currentAgentBaseUrl, currentExeToken, currentClientId);
+        agent = std::make_unique<AgentCore>(
+            currentAgentBaseUrl,
+            currentPairingBaseUrl,
+            currentExeToken,
+            currentClientId
+        );
         agent->initTimeSync();
         agent->bootstrapCameras_();
         agent->start();

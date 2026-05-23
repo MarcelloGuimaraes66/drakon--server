@@ -184,6 +184,7 @@ async function upsertJobRunFromScheduler(
     jobId: number;
     userId: string;
     jobName: string;
+    status?: string | null;
     triggerType: string;
     trigger: unknown;
     executionDomain?: string | null;
@@ -191,6 +192,7 @@ async function upsertJobRunFromScheduler(
     nowIso: string;
   }
 ) {
+  const normalizedStatus = normalizeText(input.status) || "queued";
   await db.prepare(
     `INSERT INTO job_runs (
        job_run_id,
@@ -203,18 +205,40 @@ async function upsertJobRunFromScheduler(
        execution_domain,
        remote_owner_public_id,
        started_at_utc,
+       completed_at_utc,
+       stopped_at_utc,
+       failed_at_utc,
        last_event_at_utc,
        created_at,
        updated_at
-      ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(job_run_id) DO UPDATE SET
        job_name = COALESCE(excluded.job_name, job_runs.job_name),
-       status = 'running',
+       status = COALESCE(excluded.status, job_runs.status),
        trigger_type = COALESCE(excluded.trigger_type, job_runs.trigger_type),
        trigger_json = COALESCE(excluded.trigger_json, job_runs.trigger_json),
        execution_domain = COALESCE(excluded.execution_domain, job_runs.execution_domain),
        remote_owner_public_id = COALESCE(excluded.remote_owner_public_id, job_runs.remote_owner_public_id),
-       started_at_utc = COALESCE(job_runs.started_at_utc, excluded.started_at_utc),
+       started_at_utc = CASE
+         WHEN excluded.status = 'running'
+           THEN COALESCE(job_runs.started_at_utc, excluded.started_at_utc)
+         ELSE job_runs.started_at_utc
+       END,
+       completed_at_utc = CASE
+         WHEN excluded.status = 'completed'
+           THEN COALESCE(job_runs.completed_at_utc, excluded.completed_at_utc)
+         ELSE job_runs.completed_at_utc
+       END,
+       stopped_at_utc = CASE
+         WHEN excluded.status = 'stopped'
+           THEN COALESCE(job_runs.stopped_at_utc, excluded.stopped_at_utc)
+         ELSE job_runs.stopped_at_utc
+       END,
+       failed_at_utc = CASE
+         WHEN excluded.status = 'failed'
+           THEN COALESCE(job_runs.failed_at_utc, excluded.failed_at_utc)
+         ELSE job_runs.failed_at_utc
+       END,
        last_event_at_utc = excluded.last_event_at_utc,
        updated_at = excluded.updated_at`
   )
@@ -223,14 +247,80 @@ async function upsertJobRunFromScheduler(
       input.jobId,
       input.userId,
       input.jobName,
+      normalizedStatus,
       input.triggerType,
       safeJsonStringify(input.trigger),
       normalizeText(input.executionDomain) || "local",
       normalizeText(input.remoteOwnerPublicId) || null,
-      input.nowIso,
+      normalizedStatus === "running" ? input.nowIso : null,
+      normalizedStatus === "completed" ? input.nowIso : null,
+      normalizedStatus === "stopped" ? input.nowIso : null,
+      normalizedStatus === "failed" ? input.nowIso : null,
       input.nowIso,
       input.nowIso,
       input.nowIso
+    )
+    .run();
+}
+
+async function updateJobRunStatusFromScheduler(
+  db: D1Database,
+  input: {
+    jobRunId: string;
+    status: string;
+    executionDomain?: string | null;
+    remoteOwnerPublicId?: string | null;
+    sourceCommandId?: number | null;
+    nowIso: string;
+  }
+) {
+  const normalizedStatus = normalizeText(input.status) || "queued";
+  const sourceCommandId =
+    Number.isInteger(Number(input.sourceCommandId)) && Number(input.sourceCommandId) > 0
+      ? Number(input.sourceCommandId)
+      : null;
+  await db.prepare(
+    `UPDATE job_runs
+     SET status = ?,
+         execution_domain = COALESCE(?, execution_domain),
+         remote_owner_public_id = COALESCE(?, remote_owner_public_id),
+         source_command_id = COALESCE(source_command_id, ?),
+         started_at_utc = CASE
+           WHEN ? = 'running' THEN COALESCE(started_at_utc, ?)
+           ELSE started_at_utc
+         END,
+         completed_at_utc = CASE
+           WHEN ? = 'completed' THEN COALESCE(completed_at_utc, ?)
+           ELSE completed_at_utc
+         END,
+         stopped_at_utc = CASE
+           WHEN ? = 'stopped' THEN COALESCE(stopped_at_utc, ?)
+           ELSE stopped_at_utc
+         END,
+         failed_at_utc = CASE
+           WHEN ? = 'failed' THEN COALESCE(failed_at_utc, ?)
+           ELSE failed_at_utc
+         END,
+         last_event_at_utc = ?,
+         updated_at = ?
+     WHERE job_run_id = ?`
+  )
+    .bind(
+      normalizedStatus,
+      normalizeText(input.executionDomain) || null,
+      normalizeText(input.remoteOwnerPublicId) || null,
+      sourceCommandId,
+      normalizedStatus,
+      input.nowIso,
+      normalizedStatus,
+      input.nowIso,
+      normalizedStatus,
+      input.nowIso,
+      normalizedStatus,
+      input.nowIso,
+      input.nowIso,
+      input.nowIso,
+      input.jobRunId
     )
     .run();
 }
@@ -530,6 +620,7 @@ async function executeJobStartPlan(
     jobId: Number(input.job?.id),
     userId,
     jobName: typeof input.job?.name === "string" ? input.job.name : `Job #${input.job?.id}`,
+    status: "queued",
     triggerType: input.triggerType,
     trigger: input.trigger,
     executionDomain,
@@ -537,45 +628,55 @@ async function executeJobStartPlan(
     nowIso: input.nowIso,
   });
 
-  if (!usesSharedExecution) {
-    const localSegment = localSegments[0] || null;
-    const segmentCameraIds =
-      localSegment?.operator_camera_ids?.length ? localSegment.operator_camera_ids : allCameraIds;
-    const startCameraPayloads = await buildLocalSegmentStartCameraPayloads(
-      env,
-      userId,
-      segmentCameraIds,
-      input.nowIso
-    );
-    const jobStartPayload = {
-      ...input.basePayload,
-      start_camera_payloads: startCameraPayloads,
-    };
-    const commandId = await insertLocalJobStartCommand(env.DB, {
-      userId,
-      jobRunId: input.jobRunId,
-      payload: jobStartPayload,
-      nowIso: input.nowIso,
-      executionDomain: "local",
-      remoteOwnerPublicId: null,
-      sharedSegmentId: localSegment?.segment_id || null,
-    });
-    await updateJobRunSourceCommand(env.DB, input.jobRunId, commandId, input.nowIso);
-    return {
-      ok: true,
-      executionDomain,
-      remoteOwnerPublicId: null,
-      sourceCommandId: commandId > 0 ? commandId : null,
-      usesSharedExecution: false,
-    };
-  }
-
   const remoteDispatches: Array<{
     segment: JobExecutionSegmentPlan;
     requestId: string | null;
   }> = [];
 
   try {
+    if (!usesSharedExecution) {
+      const localSegment = localSegments[0] || null;
+      const segmentCameraIds =
+        localSegment?.operator_camera_ids?.length
+          ? localSegment.operator_camera_ids
+          : allCameraIds;
+      const startCameraPayloads = await buildLocalSegmentStartCameraPayloads(
+        env,
+        userId,
+        segmentCameraIds,
+        input.nowIso
+      );
+      const jobStartPayload = {
+        ...input.basePayload,
+        start_camera_payloads: startCameraPayloads,
+      };
+      const commandId = await insertLocalJobStartCommand(env.DB, {
+        userId,
+        jobRunId: input.jobRunId,
+        payload: jobStartPayload,
+        nowIso: input.nowIso,
+        executionDomain: "local",
+        remoteOwnerPublicId: null,
+        sharedSegmentId: localSegment?.segment_id || null,
+      });
+      await updateJobRunSourceCommand(env.DB, input.jobRunId, commandId, input.nowIso);
+      await updateJobRunStatusFromScheduler(env.DB, {
+        jobRunId: input.jobRunId,
+        status: "running",
+        executionDomain,
+        remoteOwnerPublicId: null,
+        sourceCommandId: commandId > 0 ? commandId : null,
+        nowIso: input.nowIso,
+      });
+      return {
+        ok: true,
+        executionDomain,
+        remoteOwnerPublicId: null,
+        sourceCommandId: commandId > 0 ? commandId : null,
+        usesSharedExecution: false,
+      };
+    }
+
     for (const segment of plan.segments) {
       await upsertSharedJobSegmentForOperator(env.DB, {
         userId,
@@ -596,6 +697,13 @@ async function executeJobStartPlan(
           segmentId: segment.segment_id,
           status: "failed",
           lastError: "Shared camera execution is not configured on this server.",
+          nowIso: input.nowIso,
+        });
+        await updateJobRunStatusFromScheduler(env.DB, {
+          jobRunId: input.jobRunId,
+          status: "failed",
+          executionDomain,
+          remoteOwnerPublicId,
           nowIso: input.nowIso,
         });
         return {
@@ -621,6 +729,13 @@ async function executeJobStartPlan(
           status: "failed",
           requestId: dispatchResult.requestId || null,
           lastError: dispatchResult.error,
+          nowIso: input.nowIso,
+        });
+        await updateJobRunStatusFromScheduler(env.DB, {
+          jobRunId: input.jobRunId,
+          status: "failed",
+          executionDomain,
+          remoteOwnerPublicId,
           nowIso: input.nowIso,
         });
         return {
@@ -678,6 +793,14 @@ async function executeJobStartPlan(
     if (sourceCommandId && sourceCommandId > 0) {
       await updateJobRunSourceCommand(env.DB, input.jobRunId, sourceCommandId, input.nowIso);
     }
+    await updateJobRunStatusFromScheduler(env.DB, {
+      jobRunId: input.jobRunId,
+      status: "running",
+      executionDomain,
+      remoteOwnerPublicId,
+      sourceCommandId,
+      nowIso: input.nowIso,
+    });
 
     return {
       ok: true,
@@ -706,6 +829,13 @@ async function executeJobStartPlan(
         );
       }
     }
+    await updateJobRunStatusFromScheduler(env.DB, {
+      jobRunId: input.jobRunId,
+      status: "failed",
+      executionDomain,
+      remoteOwnerPublicId,
+      nowIso: input.nowIso,
+    });
     return {
       ok: false,
       error: describeJobSchedulerError(error, "Failed to start the job execution plan."),

@@ -238,11 +238,19 @@ function createWorkerEnv(DB) {
   const configuredGoogleRedirectUri = String(
     process.env.GOOGLE_OAUTH_REDIRECT_URI || ""
   ).trim();
+  const configuredDesktopGoogleClientId = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID || ""
+  ).trim();
+  const configuredDesktopGoogleClientSecret = String(
+    process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET || ""
+  ).trim();
   const configuredDesktopGoogleRedirectUri = String(
     process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || ""
   ).trim();
   const effectiveDesktopGoogleRedirectUri =
-    configuredDesktopGoogleRedirectUri || buildDesktopGoogleRedirectUri(appBaseUrl);
+    configuredDesktopGoogleClientId
+      ? configuredDesktopGoogleRedirectUri || buildDesktopGoogleRedirectUri(appBaseUrl)
+      : configuredDesktopGoogleRedirectUri;
   const centralAuthPublicKey = resolveOptionalEnvSecretValue(
     process.env.CENTRAL_AUTH_PUBLIC_KEY,
     process.env.CENTRAL_AUTH_PUBLIC_KEY_PATH
@@ -253,6 +261,8 @@ function createWorkerEnv(DB) {
     R2_BUCKET,
     GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
     GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_ID: configuredDesktopGoogleClientId,
+    DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET: configuredDesktopGoogleClientSecret,
     GOOGLE_OAUTH_REDIRECT_URI: configuredGoogleRedirectUri,
     DESKTOP_GOOGLE_OAUTH_REDIRECT_URI: effectiveDesktopGoogleRedirectUri,
     GOOGLE_GEOCODING_API_KEY: process.env.GOOGLE_GEOCODING_API_KEY || "",
