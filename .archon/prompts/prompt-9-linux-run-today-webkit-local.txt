@@ -1,0 +1,62 @@
+# Prompt 9 - Rodar hoje no Ubuntu com WebKitGTK e backend local
+
+Objetivo:
+Fazer o Perceptrum abrir hoje neste Ubuntu como app desktop Linux, usando janela WebKitGTK embutida, o mesmo `DrakonSite/dist` da versao Windows e backend Node local. Esta fase nao deve ativar AgentCore completo, camera RTSP, FrameDiskWriter ou JobRuntime.
+
+Escopo:
+- Validar que `DrakonSite/dist` existe ou gerar com `npm run build`.
+- Validar que `perceptrum-desktop` compila com WebKitGTK.
+- Garantir que o host Linux encontra `DrakonSite/dist` via `APP_STATIC_ROOT`.
+- Garantir que o host Linux encontra `DrakonSite` via `PERCEPTRUM_WEB_SOURCE_DIR`.
+- Garantir que `perceptrum-desktop --check-backend --print-web-root --webkit` inicia backend local e retorna `backendStatus=started` ou `discovered`.
+- Criar um runbook ou script versionavel para executar localmente hoje, preferencialmente `Perceptrum/linux-desktop/run-linux-dev.sh`, sem hardcode absoluto fora do repo.
+- Se houver bug bloqueando o host local, corrigir de forma minima e testavel.
+
+Restricoes:
+- Nao alterar `AppHost/`.
+- Nao alterar `.vcxproj`.
+- Nao alterar `.sln`.
+- Nao fazer commit.
+- Nao fazer push.
+- Nao usar navegador externo como caminho principal.
+- `--browser` pode continuar existindo como fallback, mas o caminho recomendado deve ser `--webkit`.
+- Se faltar pacote apt, parar e informar exatamente o comando; nao instalar automaticamente.
+
+Validacao obrigatoria:
+
+```bash
+cd DrakonSite
+npm run build
+npm run test:local-sqlite-bootstrap
+npm run test:platform-boundaries
+
+cd ../Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+APP_STATIC_ROOT="$PWD/../DrakonSite/dist" \
+PERCEPTRUM_WEB_SOURCE_DIR="$PWD/../DrakonSite" \
+PERCEPTRUM_LINUX_WINDOW_MODE=webkit \
+./out/build/linux-debug/perceptrum-desktop --check-backend --print-web-root --webkit
+```
+
+Validacao manual para o usuario abrir hoje:
+
+```bash
+cd /home/marcello-guimaraes/dev/perceptrum_desktop_aspp/Perceptrum
+APP_STATIC_ROOT="$PWD/../DrakonSite/dist" \
+PERCEPTRUM_WEB_SOURCE_DIR="$PWD/../DrakonSite" \
+PERCEPTRUM_LINUX_WINDOW_MODE=webkit \
+./out/build/linux-debug/perceptrum-desktop --webkit
+```
+
+Relatorio:
+Criar/atualizar `.archon/plans/relatorio-fase9-linux-run-today-webkit-local.md` com:
+- comandos executados;
+- se `node_modules`, `dist`, Node, npm e WebKitGTK existem;
+- resultado de build web;
+- resultado de CMake/build/CTest;
+- resultado do `--check-backend`;
+- comando final para o usuario abrir o app;
+- confirmacao de que AppHost, `.vcxproj` e `.sln` nao foram alterados;
+- confirmacao de que nenhum processo ficou rodando apos testes automatizados.

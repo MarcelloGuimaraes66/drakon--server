@@ -1,0 +1,36 @@
+# Prompt 13 - Integracao Host Linux, sessao local e agente minimo
+
+Objetivo:
+Integrar o host Linux com o agente minimo para que a sessao local do desktop consiga provisionar e observar `perceptrum-agent` por RuntimePaths, mantendo secure store, logging e runtime atras de interfaces.
+
+Escopo:
+- Host Linux deve conseguir preparar roots XDG.
+- Host Linux deve conseguir chamar/provisionar `perceptrum-agent` quando receber local session.
+- Host Linux deve consultar `perceptrum-agent status` ou health snapshot.
+- UI deve enxergar runtime local sem depender de navegador externo.
+- Manter AgentCore completo desativado.
+
+Restricoes:
+- Nao alterar AppHost, `.vcxproj`, `.sln`.
+- Nao fazer commit/push.
+- Nao escrever tokens em data/state/logs.
+
+Validacao obrigatoria:
+
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+```
+
+Validacao manual:
+
+```bash
+APP_ALLOW_PLAINTEXT_SECRET_RECOVERY=1 \
+./out/build/linux-debug/perceptrum-agent provision --base-url http://localhost:4000 --exe-token TEST_TOKEN --client-id test-client --timezone America/Manaus
+./out/build/linux-debug/perceptrum-agent status
+```
+
+Relatorio:
+Criar `.archon/plans/relatorio-fase13-linux-host-agent-session-integration.md`.

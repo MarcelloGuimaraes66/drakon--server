@@ -256,12 +256,12 @@ export default function Events() {
 
         {/* Header */}
         <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr),auto,minmax(0,1fr)] xl:items-start">
-          <div className="min-w-0">
-            <h1 className="text-2xl font-bold text-gray-100">Logs & Events</h1>
-            <p className="mt-1.5 text-sm text-gray-400">Monitor system activity and detections</p>
+          <div className="fluent-page-header min-w-0">
+            <h1 className="fluent-page-title text-2xl font-bold">Logs & Events</h1>
+            <p className="fluent-page-description mt-1.5 text-sm">Monitor system activity and detections</p>
           </div>
           <div className="w-full overflow-x-auto xl:w-auto xl:justify-self-center">
-            <div className="inline-flex min-w-max items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] p-1 shadow-[0_20px_60px_-52px_rgba(0,0,0,0.95)] backdrop-blur-sm">
+            <div className="fluent-tablist inline-flex min-w-max items-center gap-1 rounded-lg border p-1">
               {EVENT_FILTER_OPTIONS.map((option) => {
                 const isActive = filter === option.id;
 
@@ -270,10 +270,8 @@ export default function Events() {
                     key={option.id}
                     type="button"
                     onClick={() => setFilter(option.id)}
-                    className={`whitespace-nowrap rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition-all duration-200 ${
-                      isActive
-                        ? "bg-blue-600 text-white shadow-[0_16px_40px_-20px_rgba(37,99,235,0.95)]"
-                        : "text-gray-300 hover:bg-white/5 hover:text-white"
+                    className={`whitespace-nowrap rounded-md px-3.5 py-1.5 text-[13px] font-semibold transition-colors ${
+                      isActive ? "fluent-tab-active" : "fluent-tab-idle"
                     }`}
                     aria-pressed={isActive}
                   >

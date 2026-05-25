@@ -8,7 +8,6 @@ import QuickChatOverlay from "@/react-app/components/QuickChatOverlay";
 import MinimizedChatTabs from "@/react-app/components/MinimizedChatTabs";
 import LanguageSelector from "@/react-app/components/LanguageSelector";
 import BrandLogo from "@/react-app/components/BrandLogo";
-import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import SystemActivityModal from "@/react-app/components/SystemActivityModal";
 import TutorialOverlay from "@/react-app/components/TutorialOverlay";
 import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
@@ -205,51 +204,25 @@ export default function Layout({ children }: LayoutProps) {
     ? "sidebar-nav-scroll-neutral"
     : "sidebar-nav-scroll-accent";
   const sidebarEdgeLineClass = isDrakonBrand
-    ? "bg-gradient-to-b from-transparent via-white/12 to-transparent"
-    : "bg-gradient-to-b from-transparent via-blue-400/45 to-transparent";
-  const sidebarEdgeGlowClass = isDrakonBrand
-    ? "-right-4 w-8 bg-black/70 blur-[38px]"
-    : "-right-3 w-6 bg-blue-500/15 blur-2xl";
-  const sidebarActiveCardClass = isDrakonBrand
-    ? "border-white/8 bg-[#111112] shadow-[0_24px_40px_-36px_rgba(0,0,0,0.98)]"
-    : "border-blue-400/20 bg-gray-800/90 shadow-[0_20px_40px_-30px_rgba(74,149,255,0.9)]";
-  const sidebarIdleCardClass = isDrakonBrand
-    ? "border-transparent bg-gray-900/15 hover:border-white/8 hover:bg-[#171718]"
-    : "border-transparent bg-gray-900/20 hover:border-white/10 hover:bg-gray-800/70";
-  const sidebarActiveOverlayClass = isDrakonBrand
-    ? "opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(255,255,255,0.05),transparent_56%),linear-gradient(135deg,rgba(255,255,255,0.025),transparent_72%)]"
-    : "opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(100,121,160,0.36),transparent_56%),linear-gradient(135deg,rgba(74,149,255,0.12),transparent_72%)]";
-  const sidebarHoverOverlayClass = isDrakonBrand
-    ? "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(255,255,255,0.04),transparent_60%)]"
-    : "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_left_center,rgba(74,149,255,0.12),transparent_60%)]";
-  const sidebarActiveRailClass = isDrakonBrand
-    ? "w-[3px] bg-gradient-to-b from-white/75 via-white/45 to-white/20 opacity-100 shadow-[0_0_16px_rgba(255,255,255,0.14)]"
-    : "w-[3px] bg-gradient-to-b from-blue-200 via-blue-400 to-purple-300 opacity-100 shadow-[0_0_20px_rgba(74,149,255,0.7)]";
-  const sidebarIdleRailClass = "w-px bg-white/10 opacity-0 group-hover:opacity-100";
-  const sidebarActiveIconClass = isDrakonBrand
-    ? "border-white/8 bg-[#18181a] text-gray-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
-    : "border-white/10 bg-white/10 text-gray-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]";
-  const sidebarIdleIconClass = isDrakonBrand
-    ? "border-white/8 bg-[#141416] text-gray-400 group-hover:border-white/12 group-hover:bg-[#1b1b1d] group-hover:text-gray-200"
-    : "border-white/10 bg-gray-800/60 text-gray-400 group-hover:border-white/15 group-hover:bg-gray-800/80 group-hover:text-gray-200";
-  const sidebarActiveIconOverlayClass = isDrakonBrand
-    ? "opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.06),transparent_62%)]"
-    : "opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.12),transparent_58%)]";
-  const sidebarHoverIconOverlayClass = isDrakonBrand
-    ? "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.04),transparent_62%)]"
-    : "opacity-0 group-hover:opacity-100 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.08),transparent_58%)]";
-  const sidebarActiveDescriptionClass = isDrakonBrand ? "text-gray-500" : "text-blue-100/70";
-  const sidebarActiveDotClass = isDrakonBrand
-    ? "bg-white/45 shadow-[0_0_12px_rgba(255,255,255,0.12)]"
-    : "bg-blue-300/70 shadow-[0_0_14px_rgba(147,197,253,0.65)]";
-  const sidebarBadgeToneClass = isDrakonBrand
-    ? "border-blue-400/25 bg-blue-500/90 shadow-[0_12px_20px_-12px_rgba(59,130,246,0.85)]"
-    : "border-blue-300/30 bg-blue-500 shadow-[0_12px_20px_-12px_rgba(59,130,246,0.95)]";
-  const sidebarTooltipToneClass = isDrakonBrand
-    ? "border-white/10 bg-[#111112]/96 text-gray-200 shadow-[0_18px_34px_-20px_rgba(0,0,0,0.95)]"
-    : "border-blue-400/18 bg-[#16192a]/96 text-blue-50 shadow-[0_18px_34px_-20px_rgba(52,97,255,0.5)]";
-  const sidebarTooltipTitleClass = isDrakonBrand ? "text-gray-500" : "text-blue-200/70";
-  const sidebarTooltipBodyClass = isDrakonBrand ? "text-gray-200" : "text-blue-50/95";
+    ? "bg-white/10"
+    : "bg-blue-400/35";
+  const sidebarEdgeGlowClass = "-right-px w-px bg-transparent";
+  const sidebarActiveCardClass = "fluent-nav-item-active";
+  const sidebarIdleCardClass = "fluent-nav-item-idle";
+  const sidebarActiveOverlayClass = "opacity-0";
+  const sidebarHoverOverlayClass = "opacity-0";
+  const sidebarActiveRailClass = "w-[3px] bg-blue-500 opacity-100";
+  const sidebarIdleRailClass = "w-px bg-transparent opacity-0";
+  const sidebarActiveIconClass = "fluent-nav-icon-active";
+  const sidebarIdleIconClass = "fluent-nav-icon-idle";
+  const sidebarActiveIconOverlayClass = "opacity-0";
+  const sidebarHoverIconOverlayClass = "opacity-0";
+  const sidebarActiveDescriptionClass = "text-gray-400";
+  const sidebarActiveDotClass = "bg-blue-500";
+  const sidebarBadgeToneClass = "border-blue-500/30 bg-blue-600";
+  const sidebarTooltipToneClass = "fluent-flyout";
+  const sidebarTooltipTitleClass = "text-gray-500";
+  const sidebarTooltipBodyClass = "text-gray-200";
   const sidebarSectionLabels = useMemo(
     () => getSidebarSectionLabels((i18n.resolvedLanguage || i18n.language || "en").toLowerCase()),
     [i18n.language, i18n.resolvedLanguage]
@@ -843,11 +816,11 @@ export default function Layout({ children }: LayoutProps) {
   };
 
   return (
-    <div className="h-screen bg-gray-950 flex overflow-hidden">
+    <div className="fluent-shell h-screen flex overflow-hidden">
       {/* Mobile backdrop overlay */}
       {isSidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-40 md:hidden"
+          className="fixed inset-0 bg-black/45 z-40 md:hidden"
           onClick={() => setIsSidebarOpen(false)}
         />
       )}
@@ -858,17 +831,11 @@ export default function Layout({ children }: LayoutProps) {
           isSidebarOpen ? "translate-x-0" : "-translate-x-full"
         } md:translate-x-0 fixed md:relative z-50 md:z-auto ${mobileSidebarWidthClass} ${
           isSidebarCollapsed ? collapsedSidebarWidthClass : expandedSidebarWidthClass
-        } bg-gray-900 border-r border-gray-800 transition-[transform,width] duration-300 h-screen flex-shrink-0 overflow-hidden`}
+        } fluent-sidebar border-r transition-[transform,width] duration-200 h-screen flex-shrink-0 overflow-hidden`}
       >
         <div className="flex h-full min-h-0 flex-col">
           <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
             <div className="pointer-events-none absolute inset-0 overflow-hidden">
-              {!isSidebarCollapsed ? (
-                <ChatPlexusBackground
-                  motion="rise"
-                  className="opacity-[0.7] [mask-image:linear-gradient(180deg,transparent_0%,black_9%,black_92%,transparent_100%)]"
-                />
-              ) : null}
               <div className={`absolute inset-y-12 right-0 w-px ${sidebarEdgeLineClass}`} />
               <div className={`absolute inset-y-16 ${sidebarEdgeGlowClass}`} />
             </div>
@@ -928,7 +895,7 @@ export default function Layout({ children }: LayoutProps) {
                             aria-label={item.name}
                             onMouseEnter={(event) => handleSidebarItemMouseEnter(event.currentTarget, item)}
                             onMouseLeave={hideSidebarHoverHint}
-                            className={`group relative flex items-center overflow-hidden rounded-[18px] border transition-all duration-300 ${
+                          className={`group relative flex items-center overflow-hidden rounded-lg border transition-colors duration-150 ${
                               isSidebarCollapsed ? "justify-center px-2 py-3" : "gap-3 px-3 py-3.5"
                             } ${
                               active ? sidebarActiveCardClass : sidebarIdleCardClass
@@ -965,7 +932,7 @@ export default function Layout({ children }: LayoutProps) {
                                 <div className="relative min-w-0 flex-1">
                                   <div
                                     className={`truncate text-[15px] font-semibold ${
-                                      active ? "text-white" : "text-gray-200 group-hover:text-white"
+                                      active ? "text-gray-100" : "text-gray-300 group-hover:text-gray-100"
                                     }`}
                                   >
                                     {item.name}
@@ -1003,7 +970,7 @@ export default function Layout({ children }: LayoutProps) {
                     </div>
                     {!isSidebarCollapsed && groupIndex < navigationGroups.length - 1 ? (
                       <div className="px-2 pt-1">
-                        <div className="h-px bg-gradient-to-r from-white/0 via-white/10 to-white/0" />
+                        <div className="h-px bg-gray-800/80" />
                       </div>
                     ) : null}
                   </section>
@@ -1014,7 +981,7 @@ export default function Layout({ children }: LayoutProps) {
 
           {/* User section */}
           <div
-            className={`border-t border-gray-800 flex-shrink-0 md:mt-auto ${
+            className={`fluent-sidebar-footer border-t flex-shrink-0 md:mt-auto ${
               isSidebarCollapsed ? "p-2" : "p-4"
             }`}
           >
@@ -1031,12 +998,12 @@ export default function Layout({ children }: LayoutProps) {
                 <p className="mb-2 text-[11px] font-medium uppercase tracking-[0.16em] text-gray-500">
                   {t("settings.appearance")}
                 </p>
-                <div className="grid grid-cols-2 gap-1 rounded-xl border border-gray-700/70 bg-gray-800/70 p-1">
+                <div className="fluent-segmented grid grid-cols-2 gap-1 rounded-lg border p-1">
                   <button
                     onClick={() => setTheme("dark")}
                     className={`flex items-center justify-center gap-2 rounded-lg px-2 py-2 text-sm transition-colors ${
                       theme === "dark"
-                        ? "bg-blue-500/20 text-white"
+                        ? "fluent-segmented-active"
                         : "text-gray-300 hover:bg-gray-700/70"
                     }`}
                   >
@@ -1047,7 +1014,7 @@ export default function Layout({ children }: LayoutProps) {
                     onClick={() => setTheme("light")}
                     className={`flex items-center justify-center gap-2 rounded-lg px-2 py-2 text-sm transition-colors ${
                       theme === "light"
-                        ? "bg-blue-500/20 text-white"
+                        ? "fluent-segmented-active"
                         : "text-gray-300 hover:bg-gray-700/70"
                     }`}
                   >
@@ -1059,7 +1026,7 @@ export default function Layout({ children }: LayoutProps) {
             )}
             <div className={`flex items-center ${isSidebarCollapsed ? "justify-center mb-2" : "mb-3"}`}>
               <div
-                className={`rounded-full bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center text-white font-semibold ${
+                className={`fluent-avatar rounded-full flex items-center justify-center text-white font-semibold ${
                   isSidebarCollapsed ? "w-9 h-9 text-sm" : "w-10 h-10"
                 }`}
                 title={isSidebarCollapsed ? (user?.google_user_data?.name || user?.email) : undefined}
@@ -1091,7 +1058,7 @@ export default function Layout({ children }: LayoutProps) {
 
       {sidebarHoverHint ? (
         <div
-          className={`pointer-events-none fixed z-[70] hidden w-[252px] -translate-y-1/2 rounded-2xl border px-3.5 py-3 backdrop-blur-xl md:block ${sidebarTooltipToneClass}`}
+          className={`pointer-events-none fixed z-[70] hidden w-[252px] -translate-y-1/2 rounded-lg border px-3.5 py-3 md:block ${sidebarTooltipToneClass}`}
           style={{ top: sidebarHoverHint.top, left: sidebarHoverHint.left }}
         >
           <div className={`text-[10px] font-semibold uppercase tracking-[0.22em] ${sidebarTooltipTitleClass}`}>
@@ -1106,7 +1073,7 @@ export default function Layout({ children }: LayoutProps) {
       {/* Main content */}
       <div className="flex-1 min-h-0 flex flex-col min-w-0">
         {/* Top bar */}
-        <header className="h-16 bg-gray-900/50 backdrop-blur-xl border-b border-gray-800/50 flex items-center justify-between px-4 md:px-6 sticky top-0 z-10">
+        <header className="fluent-commandbar h-16 border-b flex items-center justify-between px-4 md:px-6 sticky top-0 z-10">
           <button
             onClick={handleSidebarToggle}
             title={
@@ -1120,7 +1087,7 @@ export default function Layout({ children }: LayoutProps) {
             }
             className={`relative p-2 rounded-lg transition-all ${
               showSidebarCollapseCue
-                ? "bg-gray-800 text-gray-100 shadow-[0_0_0_1px_rgba(96,165,250,0.28),0_0_24px_-10px_rgba(96,165,250,0.9)] ring-2 ring-blue-400/35 scale-[1.03]"
+                ? "bg-gray-800 text-gray-100 ring-2 ring-blue-400/35 scale-[1.02]"
                 : "text-gray-400 hover:text-gray-200 hover:bg-gray-800"
             }`}
           >
@@ -1136,7 +1103,7 @@ export default function Layout({ children }: LayoutProps) {
               <Menu className="w-5 h-5" />
             )}
             {showSidebarCollapseCue && isDesktop && !isSidebarCollapsed ? (
-              <span className="pointer-events-none absolute left-full top-1/2 ml-3 -translate-y-1/2 whitespace-nowrap rounded-full border border-blue-400/20 bg-[#1d2230]/95 px-3 py-1 text-[11px] font-medium tracking-[0.02em] text-blue-100 shadow-[0_18px_40px_-20px_rgba(59,130,246,0.8)]">
+              <span className="fluent-flyout pointer-events-none absolute left-full top-1/2 ml-3 -translate-y-1/2 whitespace-nowrap rounded-lg border px-3 py-1 text-[11px] font-medium tracking-[0.02em]">
                 Collapsing sidebar
               </span>
             ) : null}
@@ -1179,7 +1146,7 @@ export default function Layout({ children }: LayoutProps) {
           <div className="flex items-center gap-3 flex-shrink-0">
             {/* Monthly Token Usage */}
             {tokenUsageMonth && (
-              <div className="hidden sm:flex items-center gap-3 px-3 py-1.5 bg-gray-800/50 rounded-lg border border-gray-700/50">
+              <div className="fluent-chip hidden sm:flex items-center gap-3 px-3 py-1.5 rounded-lg border">
                 <div className="flex items-center gap-1.5">
                   <div className="w-1.5 h-1.5 rounded-full bg-blue-400"></div>
                   <span className="text-xs text-gray-400">In:</span>
@@ -1201,10 +1168,10 @@ export default function Layout({ children }: LayoutProps) {
             <button
               type="button"
               onClick={() => setIsSystemActivityOpen(true)}
-              className="inline-flex items-center gap-2 rounded-lg border border-gray-700/60 bg-gray-800/50 px-3 py-1.5 text-sm font-medium text-gray-200 transition-colors hover:border-gray-500 hover:bg-gray-800 hover:text-white"
+              className="fluent-toolbar-button inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors"
               aria-label="Open system activity"
             >
-              <Activity className="h-4 w-4 text-cyan-300" />
+              <Activity className="h-4 w-4 text-blue-400" />
               <span className="hidden sm:inline">System Activity</span>
             </button>
 
@@ -1212,12 +1179,12 @@ export default function Layout({ children }: LayoutProps) {
               <button
                 type="button"
                 onClick={() => setIsTutorialMenuOpen((open) => !open)}
-                className="inline-flex items-center gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-1.5 text-sm font-medium text-blue-100 transition-colors hover:border-blue-400/45 hover:bg-blue-500/15 hover:text-white"
+                className="fluent-toolbar-button inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors"
                 aria-haspopup="menu"
                 aria-expanded={isTutorialMenuOpen}
                 aria-label={t("tutorial.entry.openAria")}
               >
-                <Sparkles className="h-4 w-4 text-blue-200" />
+                <Sparkles className="h-4 w-4 text-blue-400" />
                 <span className="hidden sm:inline">{tutorialButtonLabel}</span>
                 <ChevronDown
                   className={`h-3.5 w-3.5 text-blue-200 transition-transform ${
@@ -1229,7 +1196,7 @@ export default function Layout({ children }: LayoutProps) {
               {isTutorialMenuOpen ? (
                 <div
                   role="menu"
-                  className="absolute right-0 top-full z-50 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-blue-400/20 bg-slate-950/96 p-1.5 shadow-2xl shadow-blue-950/50 backdrop-blur-xl"
+                  className="fluent-flyout absolute right-0 top-full z-50 mt-2 w-[min(20rem,calc(100vw-2rem))] overflow-hidden rounded-lg border p-1.5"
                 >
                   {tutorialMenuItems.map((item) => (
                     <button
@@ -1237,16 +1204,16 @@ export default function Layout({ children }: LayoutProps) {
                       type="button"
                       role="menuitem"
                       onClick={() => handleTutorialMenuSelect(item.kind)}
-                      className="group flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left transition-colors hover:bg-blue-500/10"
+                      className="group flex w-full items-start gap-3 rounded-md px-3 py-3 text-left transition-colors hover:bg-gray-800/70"
                     >
-                      <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06] text-blue-100 transition-colors group-hover:border-blue-300/35 group-hover:bg-blue-500/15">
+                      <span className="mt-0.5 inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md border border-gray-700 bg-gray-800/70 text-blue-400 transition-colors">
                         <Sparkles className="h-4 w-4" />
                       </span>
                       <span className="min-w-0">
-                        <span className="block text-sm font-semibold text-slate-100">
+                        <span className="block text-sm font-semibold text-gray-100">
                           {item.label}
                         </span>
-                        <span className="mt-1 block text-xs leading-5 text-slate-400">
+                        <span className="mt-1 block text-xs leading-5 text-gray-400">
                           {item.description}
                         </span>
                       </span>
@@ -1279,7 +1246,7 @@ export default function Layout({ children }: LayoutProps) {
         </header>
 
         {/* Page content */}
-        <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-8">{children}</main>
+        <main className="fluent-content fluent-internal-content min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-7">{children}</main>
       </div>
 
       {/* Floating chat button and overlay */}
@@ -1296,10 +1263,10 @@ export default function Layout({ children }: LayoutProps) {
 
       {showOpenAiKeyPrompt && !isSettingsRoute && (
         <div className="fixed bottom-4 right-4 z-40 max-w-md pointer-events-none">
-          <div className="bg-gradient-to-br from-slate-900/95 to-slate-950/95 backdrop-blur-xl border border-blue-600/45 rounded-xl shadow-2xl shadow-blue-500/20 p-4 pointer-events-auto">
+          <div className="fluent-flyout rounded-lg border p-4 pointer-events-auto">
             <div className="flex items-start gap-3">
-              <div className="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center flex-shrink-0">
-                <KeyRound className="w-5 h-5 text-blue-300" />
+              <div className="w-10 h-10 bg-blue-500/15 rounded-lg flex items-center justify-center flex-shrink-0">
+                <KeyRound className="w-5 h-5 text-blue-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-semibold text-gray-100 mb-1">
@@ -1332,10 +1299,10 @@ export default function Layout({ children }: LayoutProps) {
       )}
       {showZAiKeyPrompt && !isSettingsRoute && (
         <div className="fixed bottom-4 right-4 z-40 max-w-md pointer-events-none">
-          <div className="bg-gradient-to-br from-slate-900/95 to-slate-950/95 backdrop-blur-xl border border-cyan-600/45 rounded-xl shadow-2xl shadow-cyan-500/20 p-4 pointer-events-auto">
+          <div className="fluent-flyout rounded-lg border p-4 pointer-events-auto">
             <div className="flex items-start gap-3">
-              <div className="w-10 h-10 bg-cyan-500/20 rounded-lg flex items-center justify-center flex-shrink-0">
-                <KeyRound className="w-5 h-5 text-cyan-300" />
+              <div className="w-10 h-10 bg-blue-500/15 rounded-lg flex items-center justify-center flex-shrink-0">
+                <KeyRound className="w-5 h-5 text-blue-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-semibold text-gray-100 mb-1">
@@ -1369,5 +1336,3 @@ export default function Layout({ children }: LayoutProps) {
     </div>
   );
 }
-
-

@@ -1,0 +1,7 @@
+be49cb0a13752cdae5f4dd211b05255799f17198
+be49cb0 Split desktop Google OAuth and control-plane routing
+b845247 Add shared camera admission and dual local backend roles
+3538abd Add account access controls and desktop settings integration
+bead8fa Add remote workspace access and desktop relay support
+eecf43f Enable desktop daily reports and refresh Drakon branding
+03e2dca Add chat tutorial flow, portal counter jobs, and GPU camera decode

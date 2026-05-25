@@ -14,6 +14,7 @@ import {
 import { loadEnv } from "./env";
 import { PgD1Database } from "./pg-d1";
 import { LocalR2Bucket } from "./local-r2";
+import { runLocalCameraDiscovery } from "./camera-discovery";
 import {
   registerSharedFindRelayConnection,
   routeSharedFindRelayClientMessage,
@@ -37,6 +38,9 @@ const storageRoot = process.env.STORAGE_ROOT
   : path.resolve(process.cwd(), "storage");
 const r2Root = path.join(storageRoot, "r2");
 const appBaseUrl = process.env.APP_BASE_URL || `http://localhost:${port}`;
+const staticRoot = process.env.APP_STATIC_ROOT
+  ? path.resolve(process.env.APP_STATIC_ROOT)
+  : "";
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
 
@@ -132,6 +136,30 @@ async function startServer() {
 
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (url.pathname === "/__perceptrum/health") {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(
+        JSON.stringify({
+          ok: true,
+          brand: activeBrand.id,
+          backend: databaseBackend,
+          staticRoot: staticRoot || null,
+          staticReady: Boolean(staticRoot && fs.existsSync(path.join(staticRoot, "index.html"))),
+        })
+      );
+      return;
+    }
+
+    if (url.pathname === "/api/runtime/local-session" && req.method === "POST") {
+      await handleRuntimeLocalSession(req, res, env);
+      return;
+    }
+
+    if (url.pathname === "/api/runtime/camera-discovery" && req.method === "POST") {
+      await handleRuntimeCameraDiscovery(req, res);
+      return;
+    }
+
     if (url.pathname.startsWith("/media/")) {
       await serveMedia(res, url.pathname);
       return;
@@ -140,6 +168,11 @@ async function startServer() {
     if (url.pathname.startsWith("/ws/")) {
       res.statusCode = 501;
       res.end("WebSocket not supported in local server");
+      return;
+    }
+
+    if (staticRoot && shouldServeStaticRoute(url.pathname, req.method || "GET")) {
+      await serveStaticAsset(res, url.pathname, req.method || "GET");
       return;
     }
 
@@ -155,11 +188,24 @@ async function startServer() {
       init.duplex = "half";
     }
 
-    const response = await worker.fetch(
-      new Request(url.toString(), init),
-      env as any,
-      { waitUntil: () => {} } as any
-    );
+    let response: Response;
+    try {
+      response = await worker.fetch(
+        new Request(url.toString(), init),
+        env as any,
+        { waitUntil: () => {} } as any
+      );
+    } catch (error) {
+      console.error("[local-server] worker request failed", {
+        method,
+        path: url.pathname,
+        error,
+      });
+      res.statusCode = 500;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ error: "Local backend request failed." }));
+      return;
+    }
 
     res.statusCode = response.status;
 
@@ -302,6 +348,235 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   });
 }
 
+async function readJsonBody(req: any) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) {
+    return {};
+  }
+
+  return JSON.parse(text);
+}
+
+function buildForwardHeaders(req: any, extra: Record<string, string> = {}) {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers || {})) {
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey === "host" || normalizedKey === "content-length") {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      headers.set(key, value.join(", "));
+    } else if (typeof value === "string") {
+      headers.set(key, value);
+    }
+  }
+
+  for (const [key, value] of Object.entries(extra)) {
+    headers.set(key, value);
+  }
+  return headers;
+}
+
+async function invokeWorkerFetch(
+  requestUrl: string,
+  method: string,
+  headers: Headers,
+  body: string | undefined,
+  env: unknown
+) {
+  return worker.fetch(
+    new Request(requestUrl, {
+      method,
+      headers,
+      body,
+    }),
+    env as any,
+    { waitUntil: () => {} } as any
+  );
+}
+
+async function writeWorkerFetchResponse(res: any, response: Response) {
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => {
+    res.setHeader(key, value);
+  });
+
+  if (response.body) {
+    Readable.fromWeb(response.body as any).pipe(res);
+  } else {
+    res.end();
+  }
+}
+
+function resolveLocalSessionExeId(value: unknown) {
+  const explicit = typeof value === "string" ? value.trim() : "";
+  if (explicit) {
+    return explicit;
+  }
+  return `exe-${Date.now()}`;
+}
+
+async function handleRuntimeLocalSession(req: any, res: any, env: unknown) {
+  try {
+    const body = await readJsonBody(req);
+    const exeId = resolveLocalSessionExeId(body?.exe_id);
+    const timezoneIana =
+      typeof body?.timezone_iana === "string" ? body.timezone_iana.trim() : "";
+
+    const generateResponse = await invokeWorkerFetch(
+      `${appBaseUrl}/api/pairing/generate`,
+      "POST",
+      buildForwardHeaders(req),
+      undefined,
+      env
+    );
+
+    if (!generateResponse.ok) {
+      await writeWorkerFetchResponse(res, generateResponse);
+      return;
+    }
+
+    const generatePayload = await generateResponse.json();
+    const pairCode = String((generatePayload as any)?.pair_code || "").trim();
+    if (!pairCode) {
+      res.statusCode = 500;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ error: "Unable to generate local pair code." }));
+      return;
+    }
+
+    const pairResponse = await invokeWorkerFetch(
+      `${appBaseUrl}/api/pairing/pair`,
+      "POST",
+      buildForwardHeaders(req, {
+        "content-type": "application/json; charset=utf-8",
+      }),
+      JSON.stringify({
+        pair_code: pairCode,
+        exe_id: exeId,
+        timezone_iana: timezoneIana,
+      }),
+      env
+    );
+
+    await writeWorkerFetchResponse(res, pairResponse);
+  } catch (error) {
+    console.error("[local-server] local-session failed", error);
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(
+      JSON.stringify({
+        error:
+          error instanceof Error ? error.message : "Unable to provision local session.",
+      })
+    );
+  }
+}
+
+async function handleRuntimeCameraDiscovery(req: any, res: any) {
+  try {
+    const body = await readJsonBody(req);
+    const payload = await runLocalCameraDiscovery(body?.timeout_ms);
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(JSON.stringify(payload));
+  } catch (error) {
+    console.error("[local-server] camera discovery failed", error);
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(
+      JSON.stringify({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to scan the local network for cameras.",
+      })
+    );
+  }
+}
+
+function shouldServeStaticRoute(pathname: string, method: string) {
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod !== "GET" && normalizedMethod !== "HEAD") {
+    return false;
+  }
+
+  return !(
+    pathname === "/api" ||
+    pathname.startsWith("/api/") ||
+    pathname === "/media" ||
+    pathname.startsWith("/media/") ||
+    pathname === "/ws" ||
+    pathname.startsWith("/ws/")
+  );
+}
+
+async function serveStaticAsset(res: any, pathname: string, method: string) {
+  const safeRoot = path.resolve(staticRoot);
+  const indexPath = path.join(safeRoot, "index.html");
+  let relativePath = "";
+
+  try {
+    relativePath = decodeURIComponent(pathname);
+  } catch {
+    res.statusCode = 400;
+    res.end("Invalid path");
+    return;
+  }
+
+  if (relativePath === "/" || !relativePath.trim()) {
+    relativePath = "/index.html";
+  }
+
+  const candidatePath = path.resolve(path.join(safeRoot, relativePath.replace(/^\/+/, "")));
+  if (!candidatePath.startsWith(`${safeRoot}${path.sep}`) && candidatePath !== safeRoot) {
+    res.statusCode = 400;
+    res.end("Invalid path");
+    return;
+  }
+
+  let filePath = candidatePath;
+  let spaFallback = false;
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    if (path.extname(candidatePath)) {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+    filePath = indexPath;
+    spaFallback = true;
+  }
+
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    res.statusCode = 404;
+    res.end("Static web build not found");
+    return;
+  }
+
+  const contentType = guessContentType(filePath);
+  if (contentType) {
+    res.setHeader("content-type", contentType);
+  }
+  res.setHeader(
+    "cache-control",
+    spaFallback || path.basename(filePath) === "index.html"
+      ? "no-cache"
+      : "public, max-age=31536000, immutable"
+  );
+
+  if (method.toUpperCase() === "HEAD") {
+    res.end();
+    return;
+  }
+
+  fs.createReadStream(filePath).pipe(res);
+}
+
 async function serveMedia(res: any, pathname: string) {
   const key = decodeURIComponent(pathname.replace(/^\/media\//, ""));
   const safeRoot = path.resolve(r2Root);
@@ -344,6 +619,19 @@ function readMeta(filePath: string): { contentType?: string } | null {
 function guessContentType(filePath: string) {
   const ext = path.extname(filePath).toLowerCase();
   switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    case ".ico":
+      return "image/x-icon";
     case ".jpg":
     case ".jpeg":
       return "image/jpeg";

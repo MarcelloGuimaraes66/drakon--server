@@ -1,0 +1,269 @@
+ .gitignore                                         |     9 +-
+ AppHost/App.xaml.cpp                               |   177 -
+ AppHost/App.xaml.h                                 |    12 -
+ AppHost/AppHost.vcxproj                            |     4 +-
+ AppHost/MainWindow.xaml.cpp                        |    62 +-
+ AppHost/MainWindow.xaml.h                          |     2 -
+ AppHost/Packaging/stage-runtime.mjs                |    40 +-
+ AppHost/Pages/JobsPage.xaml.cpp                    |    92 +-
+ AppHost/Pages/SettingsPage.xaml                    |   214 +-
+ AppHost/Pages/SettingsPage.xaml.cpp                |   427 +-
+ AppHost/Pages/SettingsPage.xaml.h                  |    22 +-
+ AppHost/Pages/ShellPage.xaml.cpp                   |   158 +-
+ AppHost/Pages/ShellPage.xaml.h                     |     6 -
+ AppHost/Pages/SiteHostPage.xaml.cpp                |    99 +-
+ AppHost/Pages/SiteHostPage.xaml.h                  |     3 -
+ AppHost/Platform/AppRuntimeConfig.cpp              |    12 +-
+ AppHost/Platform/AppRuntimeConfig.h                |     3 -
+ AppHost/Platform/LocalBackendHost.cpp              |   323 +-
+ AppHost/Platform/LocalBackendHost.h                |     4 -
+ AppHost/Platform/PerceptrumRuntimeHost.cpp         |     1 -
+ AppHost/Platform/TrayIconHost.cpp                  |     2 -
+ AppHost/Runtime/desktop-local-server.mjs           |   148 +-
+ AppHost/Services/DrakonApiClient.cpp               |   261 -
+ AppHost/Services/DrakonApiClient.h                 |    83 -
+ DrakonSite/.env.local.example                      |    10 -
+ DrakonSite/.env.server.example                     |     3 -
+ DrakonSite/README.md                               |    12 -
+ DrakonSite/deploy_backend.sh                       |    16 +-
+ DrakonSite/docs/central-auth-deploy.md             |    14 -
+ .../perceptrum-central-auth.nginx.conf.example     |    11 -
+ DrakonSite/ops/secrets/central-auth.env.example    |     4 -
+ DrakonSite/package.json                            |     5 +
+ DrakonSite/server/brand.ts                         |     2 +-
+ DrakonSite/server/index.ts                         |   515 +-
+ DrakonSite/server/pg-d1.ts                         |     9 +-
+ DrakonSite/src/react-app/App.tsx                   |   126 +-
+ .../react-app/components/CameraBulkImportModal.tsx |   238 -
+ .../components/CameraCustomAgentEditorModal.tsx    |   822 +-
+ .../src/react-app/components/CameraEventToast.tsx  |    37 +-
+ DrakonSite/src/react-app/components/ChatInput.tsx  |     3 -
+ DrakonSite/src/react-app/components/Layout.tsx     |  1031 +-
+ .../react-app/components/NotificationsDropdown.tsx |    35 +-
+ .../src/react-app/components/ScheduleBuilder.tsx   |   488 +-
+ .../react-app/components/SystemActivityModal.tsx   |    22 +-
+ .../src/react-app/components/TutorialOverlay.tsx   |   119 -
+ .../src/react-app/components/jobs/JobsTabs.tsx     |     8 +-
+ .../components/settings/AccountUsersPanel.tsx      |  1758 --
+ .../react-app/components/settings/SettingsTabs.tsx |    53 +-
+ .../components/settings/WorkspaceAccessPanel.tsx   |  1671 --
+ .../src/react-app/contexts/EventsContext.tsx       |   205 +-
+ .../react-app/contexts/RemoteWorkspaceContext.tsx  |   367 -
+ .../src/react-app/hooks/useAgentCameraDirectory.ts |   192 -
+ DrakonSite/src/react-app/hooks/useCameraEvents.tsx |   153 +-
+ .../react-app/hooks/useDashboardAlertRefresh.ts    |     2 +-
+ DrakonSite/src/react-app/hooks/useEffectiveUser.ts |    14 -
+ DrakonSite/src/react-app/hooks/useOnboarding.tsx   |    69 +-
+ .../src/react-app/hooks/useThumbnailPolling.tsx    |     2 +-
+ DrakonSite/src/react-app/i18n.ts                   |  1203 +-
+ DrakonSite/src/react-app/index.css                 |   448 +-
+ .../src/react-app/lib/DashboardSummaryStore.ts     |     9 -
+ DrakonSite/src/react-app/lib/accountAccess.ts      |   279 -
+ DrakonSite/src/react-app/lib/onboarding.ts         |    40 +-
+ DrakonSite/src/react-app/lib/onboardingChat.ts     |    43 -
+ DrakonSite/src/react-app/pages/AIAgents.tsx        |   476 +-
+ DrakonSite/src/react-app/pages/Billing.tsx         |    14 +-
+ DrakonSite/src/react-app/pages/Cameras.tsx         |   328 +-
+ DrakonSite/src/react-app/pages/Chat.tsx            |   153 +-
+ DrakonSite/src/react-app/pages/Events.tsx          |    14 +-
+ DrakonSite/src/react-app/pages/Hub.tsx             |   157 +-
+ DrakonSite/src/react-app/pages/Jobs.tsx            |  1261 +-
+ DrakonSite/src/react-app/pages/Settings.tsx        |   212 +-
+ .../src/react-app/tutorialChatStepTranslations.ts  |   238 -
+ .../react-app/utils/cameraCaptureAcceleration.ts   |   103 -
+ DrakonSite/src/react-app/utils/cameraService.ts    |   109 +-
+ DrakonSite/src/react-app/utils/scheduleUtils.ts    |   174 +-
+ .../react-app/utils/sharedCameraPresentation.ts    |    88 -
+ DrakonSite/src/shared/brand.ts                     |     1 -
+ DrakonSite/src/shared/cameraImport.ts              |    23 -
+ DrakonSite/src/shared/types.ts                     |    15 -
+ DrakonSite/src/tests/scheduleUtils.test.ts         |    53 -
+ DrakonSite/src/worker/accountAccess.ts             |  1143 --
+ DrakonSite/src/worker/accountDeletion.ts           |     1 -
+ DrakonSite/src/worker/cameraResourceAdmission.ts   |   190 -
+ DrakonSite/src/worker/centralIdentity.ts           |   461 -
+ DrakonSite/src/worker/env.d.ts                     |     9 -
+ DrakonSite/src/worker/index.ts                     | 17868 ++++---------------
+ DrakonSite/src/worker/jobScheduler.ts              |  1257 +-
+ DrakonSite/src/worker/localAgentIngress.ts         |   877 -
+ .../worker/operationalQuery/__tests__/db.test.ts   |   216 -
+ .../operationalQuery/__tests__/executor.test.ts    |    76 -
+ .../operationalQuery/__tests__/planner.test.ts     |    61 -
+ DrakonSite/src/worker/operationalQuery/db.ts       |   198 -
+ DrakonSite/src/worker/operationalQuery/executor.ts |    71 -
+ .../src/worker/operationalQuery/grounding.ts       |    29 -
+ DrakonSite/src/worker/operationalQuery/planner.ts  |    10 -
+ DrakonSite/src/worker/operationalQuery/schema.ts   |     1 -
+ DrakonSite/src/worker/sharedCameraAccess.ts        |   253 -
+ DrakonSite/src/worker/sharedFindRelayState.ts      |   193 +-
+ DrakonSite/src/worker/sharedJobPlan.ts             |   575 -
+ DrakonSite/src/worker/workspaceLocalState.ts       |   168 -
+ DrakonSite/src/worker/workspaceRelayClient.ts      |   262 -
+ DrakonSite/src/worker/workspaceRelayState.ts       |   286 -
+ Perceptrum/Perceptrum/Perceptrum.cpp               |     7 +-
+ Perceptrum/Perceptrum/Perceptrum.ico               |   Bin 173502 -> 209896 bytes
+ Perceptrum/Perceptrum/Perceptrum.vcxproj           |     6 +-
+ Perceptrum/Perceptrum/Perceptrum.vcxproj.filters   |     6 -
+ Perceptrum/Perceptrum/camera/CameraConfig.h        |     6 +-
+ Perceptrum/Perceptrum/camera/CameraSession.cpp     |   466 +-
+ Perceptrum/Perceptrum/camera/CameraSession.h       |     9 +-
+ Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp   |   624 +-
+ Perceptrum/Perceptrum/camera/FrameDiskWriter.h     |    36 +-
+ Perceptrum/Perceptrum/camera/PortalCounter.cpp     |  1752 --
+ Perceptrum/Perceptrum/camera/PortalCounter.h       |    27 -
+ Perceptrum/Perceptrum/camera/RtspCapture.cpp       |   891 +-
+ Perceptrum/Perceptrum/camera/RtspCapture.h         |    33 +-
+ Perceptrum/Perceptrum/comm/BackendConfig.h         |    12 -
+ Perceptrum/Perceptrum/comm/PairingClient.cpp       |   499 +-
+ Perceptrum/Perceptrum/comm/PairingClient.h         |    27 +-
+ Perceptrum/Perceptrum/core/AgentCore.cpp           |  1636 +-
+ Perceptrum/Perceptrum/core/AgentCore.h             |   102 +-
+ Perceptrum/Perceptrum/jobs/JobPayloadParser.cpp    |   123 +-
+ Perceptrum/Perceptrum/jobs/JobRuntime.cpp          |  2930 +--
+ Perceptrum/Perceptrum/jobs/JobRuntime.h            |     4 +-
+ Perceptrum/Perceptrum/jobs/JobTypes.h              |    22 -
+ Perceptrum/Perceptrum/logging/Logging.cpp          |    37 +-
+ .../Perceptrum/platform/platform_secure_store.cpp  |   291 +-
+ Perceptrum/Perceptrum/runtime/BrandingRuntime.h    |     8 +
+ Perceptrum/Perceptrum/runtime/HeadlessService.cpp  |   173 +-
+ Perceptrum/Perceptrum/runtime/HeadlessService.h    |     9 +
+ Perceptrum/Perceptrum/small.ico                    |   Bin 173502 -> 209896 bytes
+ Perceptrum/PerceptrumCore/PerceptrumCore.vcxproj   |     2 -
+ brand.config.json                                  |     8 +-
+ branding/apply-brand.mjs                           |     3 +-
+ 133 files changed, 7697 insertions(+), 41878 deletions(-)
+
+--- files ---
+M	.gitignore
+M	AppHost/App.xaml.cpp
+M	AppHost/App.xaml.h
+M	AppHost/AppHost.vcxproj
+M	AppHost/MainWindow.xaml.cpp
+M	AppHost/MainWindow.xaml.h
+M	AppHost/Packaging/stage-runtime.mjs
+M	AppHost/Pages/JobsPage.xaml.cpp
+M	AppHost/Pages/SettingsPage.xaml
+M	AppHost/Pages/SettingsPage.xaml.cpp
+M	AppHost/Pages/SettingsPage.xaml.h
+M	AppHost/Pages/ShellPage.xaml.cpp
+M	AppHost/Pages/ShellPage.xaml.h
+M	AppHost/Pages/SiteHostPage.xaml.cpp
+M	AppHost/Pages/SiteHostPage.xaml.h
+M	AppHost/Platform/AppRuntimeConfig.cpp
+M	AppHost/Platform/AppRuntimeConfig.h
+M	AppHost/Platform/LocalBackendHost.cpp
+M	AppHost/Platform/LocalBackendHost.h
+M	AppHost/Platform/PerceptrumRuntimeHost.cpp
+M	AppHost/Platform/TrayIconHost.cpp
+M	AppHost/Runtime/desktop-local-server.mjs
+M	AppHost/Services/DrakonApiClient.cpp
+M	AppHost/Services/DrakonApiClient.h
+M	DrakonSite/.env.local.example
+M	DrakonSite/.env.server.example
+M	DrakonSite/README.md
+M	DrakonSite/deploy_backend.sh
+M	DrakonSite/docs/central-auth-deploy.md
+M	DrakonSite/ops/nginx/perceptrum-central-auth.nginx.conf.example
+M	DrakonSite/ops/secrets/central-auth.env.example
+M	DrakonSite/package.json
+M	DrakonSite/server/brand.ts
+M	DrakonSite/server/index.ts
+M	DrakonSite/server/pg-d1.ts
+M	DrakonSite/src/react-app/App.tsx
+M	DrakonSite/src/react-app/components/CameraBulkImportModal.tsx
+M	DrakonSite/src/react-app/components/CameraCustomAgentEditorModal.tsx
+M	DrakonSite/src/react-app/components/CameraEventToast.tsx
+M	DrakonSite/src/react-app/components/ChatInput.tsx
+M	DrakonSite/src/react-app/components/Layout.tsx
+M	DrakonSite/src/react-app/components/NotificationsDropdown.tsx
+M	DrakonSite/src/react-app/components/ScheduleBuilder.tsx
+M	DrakonSite/src/react-app/components/SystemActivityModal.tsx
+M	DrakonSite/src/react-app/components/TutorialOverlay.tsx
+M	DrakonSite/src/react-app/components/jobs/JobsTabs.tsx
+D	DrakonSite/src/react-app/components/settings/AccountUsersPanel.tsx
+M	DrakonSite/src/react-app/components/settings/SettingsTabs.tsx
+D	DrakonSite/src/react-app/components/settings/WorkspaceAccessPanel.tsx
+M	DrakonSite/src/react-app/contexts/EventsContext.tsx
+D	DrakonSite/src/react-app/contexts/RemoteWorkspaceContext.tsx
+D	DrakonSite/src/react-app/hooks/useAgentCameraDirectory.ts
+M	DrakonSite/src/react-app/hooks/useCameraEvents.tsx
+M	DrakonSite/src/react-app/hooks/useDashboardAlertRefresh.ts
+D	DrakonSite/src/react-app/hooks/useEffectiveUser.ts
+M	DrakonSite/src/react-app/hooks/useOnboarding.tsx
+M	DrakonSite/src/react-app/hooks/useThumbnailPolling.tsx
+M	DrakonSite/src/react-app/i18n.ts
+M	DrakonSite/src/react-app/index.css
+M	DrakonSite/src/react-app/lib/DashboardSummaryStore.ts
+D	DrakonSite/src/react-app/lib/accountAccess.ts
+M	DrakonSite/src/react-app/lib/onboarding.ts
+D	DrakonSite/src/react-app/lib/onboardingChat.ts
+M	DrakonSite/src/react-app/pages/AIAgents.tsx
+M	DrakonSite/src/react-app/pages/Billing.tsx
+M	DrakonSite/src/react-app/pages/Cameras.tsx
+M	DrakonSite/src/react-app/pages/Chat.tsx
+M	DrakonSite/src/react-app/pages/Events.tsx
+M	DrakonSite/src/react-app/pages/Hub.tsx
+M	DrakonSite/src/react-app/pages/Jobs.tsx
+M	DrakonSite/src/react-app/pages/Settings.tsx
+D	DrakonSite/src/react-app/tutorialChatStepTranslations.ts
+D	DrakonSite/src/react-app/utils/cameraCaptureAcceleration.ts
+M	DrakonSite/src/react-app/utils/cameraService.ts
+M	DrakonSite/src/react-app/utils/scheduleUtils.ts
+D	DrakonSite/src/react-app/utils/sharedCameraPresentation.ts
+M	DrakonSite/src/shared/brand.ts
+M	DrakonSite/src/shared/cameraImport.ts
+M	DrakonSite/src/shared/types.ts
+D	DrakonSite/src/tests/scheduleUtils.test.ts
+D	DrakonSite/src/worker/accountAccess.ts
+M	DrakonSite/src/worker/accountDeletion.ts
+D	DrakonSite/src/worker/cameraResourceAdmission.ts
+M	DrakonSite/src/worker/centralIdentity.ts
+M	DrakonSite/src/worker/env.d.ts
+M	DrakonSite/src/worker/index.ts
+M	DrakonSite/src/worker/jobScheduler.ts
+D	DrakonSite/src/worker/localAgentIngress.ts
+D	DrakonSite/src/worker/operationalQuery/__tests__/db.test.ts
+M	DrakonSite/src/worker/operationalQuery/__tests__/executor.test.ts
+D	DrakonSite/src/worker/operationalQuery/__tests__/planner.test.ts
+M	DrakonSite/src/worker/operationalQuery/db.ts
+M	DrakonSite/src/worker/operationalQuery/executor.ts
+M	DrakonSite/src/worker/operationalQuery/grounding.ts
+M	DrakonSite/src/worker/operationalQuery/planner.ts
+M	DrakonSite/src/worker/operationalQuery/schema.ts
+D	DrakonSite/src/worker/sharedCameraAccess.ts
+M	DrakonSite/src/worker/sharedFindRelayState.ts
+D	DrakonSite/src/worker/sharedJobPlan.ts
+D	DrakonSite/src/worker/workspaceLocalState.ts
+D	DrakonSite/src/worker/workspaceRelayClient.ts
+D	DrakonSite/src/worker/workspaceRelayState.ts
+M	Perceptrum/Perceptrum/Perceptrum.cpp
+M	Perceptrum/Perceptrum/Perceptrum.ico
+M	Perceptrum/Perceptrum/Perceptrum.vcxproj
+M	Perceptrum/Perceptrum/Perceptrum.vcxproj.filters
+M	Perceptrum/Perceptrum/camera/CameraConfig.h
+M	Perceptrum/Perceptrum/camera/CameraSession.cpp
+M	Perceptrum/Perceptrum/camera/CameraSession.h
+M	Perceptrum/Perceptrum/camera/FrameDiskWriter.cpp
+M	Perceptrum/Perceptrum/camera/FrameDiskWriter.h
+D	Perceptrum/Perceptrum/camera/PortalCounter.cpp
+D	Perceptrum/Perceptrum/camera/PortalCounter.h
+M	Perceptrum/Perceptrum/camera/RtspCapture.cpp
+M	Perceptrum/Perceptrum/camera/RtspCapture.h
+M	Perceptrum/Perceptrum/comm/BackendConfig.h
+M	Perceptrum/Perceptrum/comm/PairingClient.cpp
+M	Perceptrum/Perceptrum/comm/PairingClient.h
+M	Perceptrum/Perceptrum/core/AgentCore.cpp
+M	Perceptrum/Perceptrum/core/AgentCore.h
+M	Perceptrum/Perceptrum/jobs/JobPayloadParser.cpp
+M	Perceptrum/Perceptrum/jobs/JobRuntime.cpp
+M	Perceptrum/Perceptrum/jobs/JobRuntime.h
+M	Perceptrum/Perceptrum/jobs/JobTypes.h
+M	Perceptrum/Perceptrum/logging/Logging.cpp
+M	Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+M	Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+M	Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+M	Perceptrum/Perceptrum/runtime/HeadlessService.h
+M	Perceptrum/Perceptrum/small.ico
+M	Perceptrum/PerceptrumCore/PerceptrumCore.vcxproj
+M	brand.config.json
+M	branding/apply-brand.mjs

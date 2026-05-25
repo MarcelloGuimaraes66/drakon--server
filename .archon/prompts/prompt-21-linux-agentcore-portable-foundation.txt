@@ -1,0 +1,47 @@
+# Prompt 21 - Fundacao portavel do AgentCore completo no Linux
+
+Objetivo:
+Comecar a portar o `AgentCore` completo para Linux de forma incremental, sem ligar camera/jobs ainda, removendo acoplamentos Win32 por interfaces/adaptadores.
+
+Contexto obrigatorio:
+- Leia `.archon/plans/relatorio-fase20-linux-backend-control-plane-agent-ingress.md`.
+- Leia o status minimal atual em `Perceptrum/linux/` e `Perceptrum/CMakeLists.txt`.
+- Inspecione `Perceptrum/Perceptrum/core/AgentCore.cpp`, `AgentCore.h`, orchestrator e runtime interfaces.
+
+Restricoes:
+- Nao fazer push.
+- Nao ligar todas as features de uma vez.
+- Nao quebrar Windows.
+- Nao remover `_WIN32`/`__linux__` sem substituir por interface testavel.
+- Nao incluir `CameraSession`, `FrameDiskWriter` ou `JobRuntime` neste prompt, exceto se for necessario para tipos isolados sem runtime.
+
+Tarefas:
+1. Separar dependencias portaveis do `AgentCore` das dependencias Win32/camera/jobs.
+2. Criar interfaces/adaptadores Linux para:
+   - paths;
+   - logging;
+   - secure store/token store;
+   - HTTP/client;
+   - clock/timezone;
+   - process/lifecycle quando necessario.
+3. Atualizar CMake com gate pequeno, por exemplo `PERCEPTRUM_ENABLE_AGENT_CORE=ON`, que compile somente o nucleo sem camera/jobs.
+4. Fazer o status do agente Linux mostrar `agent_core_partial=false` apenas quando o nucleo portavel estiver realmente inicializado.
+5. Criar testes que garantam:
+   - build default minimal continua funcionando;
+   - gate AgentCore compila;
+   - sem camera/jobs, comandos dependentes retornam erro funcional claro.
+
+Validacao obrigatoria:
+```bash
+cd Perceptrum
+cmake -S . -B out/build/linux-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build out/build/linux-debug -j$(nproc)
+ctest --test-dir out/build/linux-debug --output-on-failure
+cmake -S . -B out/build/linux-agentcore -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPERCEPTRUM_ENABLE_AGENT_CORE=ON
+cmake --build out/build/linux-agentcore -j$(nproc)
+ctest --test-dir out/build/linux-agentcore --output-on-failure
+```
+
+Saida esperada:
+- Criar `.archon/plans/relatorio-fase21-linux-agentcore-portable-foundation.md`.
+- O relatorio deve listar dependencias Win32 removidas/isoladas, gates adicionados, fontes compiladas e fontes ainda bloqueadas.

@@ -8,6 +8,9 @@ brand.txt
 *.log
 backup/
 backup.zip
+_CPack_Packages/
+perceptrum-desktop_*.deb
+perceptrum-desktop_*.tar.gz
 
 # Legacy nested git repositories to be flattened into the root repo
 DrakonSite/.git/
@@ -74,6 +77,8 @@ DrakonSite/.dev.vars
 DrakonSite/dist/
 DrakonSite/node_modules/
 DrakonSite/storage/
+DrakonSite/visual-artifacts/
+DrakonSite/.visual-chrome-profile/
 DrakonSite/index.html
 DrakonSite/src/shared/generated/
 DrakonSite/public/branding/current/

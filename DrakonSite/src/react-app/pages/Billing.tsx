@@ -546,14 +546,14 @@ export default function Billing() {
       />
 
       <div className="max-w-[1280px] space-y-6 md:space-y-8">
-        <header className="max-w-3xl">
+        <header className="fluent-page-header max-w-3xl">
           <div className="inline-flex items-center rounded-full border border-blue-400/20 bg-blue-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-blue-100">
             {t("billing.page.hero.badge")}
           </div>
-          <h1 className="mt-4 text-3xl font-semibold tracking-tight text-white md:text-4xl">
+          <h1 className="fluent-page-title mt-4 text-3xl font-semibold tracking-tight md:text-4xl">
             {t("billing.page.hero.title")}
           </h1>
-          <p className="mt-3 text-sm leading-6 text-gray-400 md:text-[15px]">
+          <p className="fluent-page-description mt-3 text-sm leading-6 md:text-[15px]">
             {IS_PERCEPTRUM_BILLING
               ? t("billing.page.hero.descriptionPerceptrum")
               : t("billing.page.hero.description")}
@@ -569,7 +569,7 @@ export default function Billing() {
           </section>
         ) : null}
 
-        <div className="inline-flex max-w-full flex-wrap items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] p-1 shadow-[0_20px_60px_-52px_rgba(0,0,0,0.95)] backdrop-blur-sm">
+        <div className="fluent-tablist inline-flex max-w-full flex-wrap items-center gap-1 rounded-lg border p-1">
           {tabs.map((tab) => {
             const isActive = activeTab === tab.id;
             return (
@@ -578,10 +578,8 @@ export default function Billing() {
                 type="button"
                 onClick={() => setActiveTab(tab.id)}
                 aria-pressed={isActive}
-                className={`rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition-all duration-200 ${
-                  isActive
-                    ? "bg-blue-600 text-white shadow-[0_16px_40px_-20px_rgba(37,99,235,0.95)]"
-                    : "text-gray-300 hover:bg-white/5 hover:text-white"
+                className={`rounded-md px-3.5 py-1.5 text-[13px] font-semibold transition-colors ${
+                  isActive ? "fluent-tab-active" : "fluent-tab-idle"
                 }`}
               >
                 {tab.label}

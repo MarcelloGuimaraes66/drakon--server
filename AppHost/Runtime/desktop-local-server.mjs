@@ -71,6 +71,7 @@ try {
   sqliteEncryptionConfigError = summarizeError(error);
 }
 const runtimeHealthRoute = "/api/runtime/health";
+const legacyHealthRoute = "/__perceptrum/health";
 const sqliteCriticalTables = [
   "app_users",
   "cameras",
@@ -670,6 +671,17 @@ async function startServer() {
     }
 
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (url.pathname === legacyHealthRoute) {
+      writeJson(res, 200, {
+        ok: true,
+        brand: activeBrand.id,
+        backend: databaseBackend,
+        staticRoot: staticRoot || null,
+        staticReady: Boolean(staticRoot && fs.existsSync(path.join(staticRoot, "index.html"))),
+      });
+      return;
+    }
 
     if (url.pathname === runtimeHealthRoute) {
       writeJson(res, runtimeState.ready ? 200 : runtimeState.fatal ? 503 : 202, {

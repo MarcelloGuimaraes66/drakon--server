@@ -43,7 +43,7 @@ export default function SettingsTabs({
   ];
 
   return (
-    <div className="inline-flex max-w-full flex-wrap items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] p-1 shadow-[0_20px_60px_-52px_rgba(0,0,0,0.95)] backdrop-blur-sm">
+    <div className="fluent-tablist inline-flex max-w-full flex-wrap items-center gap-1 rounded-lg border p-1">
       {tabs.map((tab) => {
         const isActive = activeView === tab.id;
 
@@ -52,10 +52,8 @@ export default function SettingsTabs({
             key={tab.id}
             type="button"
             onClick={tab.onClick}
-            className={`rounded-full px-3.5 py-1.5 text-[13px] font-semibold transition-all duration-200 ${
-              isActive
-                ? "bg-blue-600 text-white shadow-[0_16px_40px_-20px_rgba(37,99,235,0.95)]"
-                : "text-gray-300 hover:bg-white/5 hover:text-white"
+            className={`rounded-md px-3.5 py-1.5 text-[13px] font-semibold transition-colors ${
+              isActive ? "fluent-tab-active" : "fluent-tab-idle"
             }`}
             aria-pressed={isActive}
           >

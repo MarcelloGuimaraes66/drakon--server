@@ -1,0 +1,21 @@
+1d8fa6166faf526423887d55e1184c483547b953
+1d8fa61 Improve chat identity evidence and text entry handling
+2d1a628 Improve chat reveal pacing and job step editing
+535c4a9 Refine agent authoring, temporal analysis, and chat knowledge docs
+b9c893a Persist onboarding state and materialize temporal evidence clips
+e6cbaf4 Add platform abstractions, region overlays, and pairing audit flows
+bb62468 Improve temporal report handling and clip timeline scheduling
+0361559 Add camera recording timeline and expand operational chat flows
+f3af894 Add chat video uploads and Drakon runtime startup fix
+4052bf6 Add desktop SQLite encryption and local keystore support
+80b1ff6 Add secret recovery and expand identity reporting flows
+1a86a14 Add operational query planner and semantic mutation grounding
+182b0a7 Add Telegram algorithm alerts and operational state context
+61dcfb8 Add cyber docs and packaging build updates
+fd4162b Refine dashboard alert flow and temporal confirmed refs
+3d2007a Localize billing flows and improve temporal alert context
+25b8904 Improve dashboard alerts, Hub catalog, and temporal job runtime
+c0581fb Expand billing, camera agent, and job persistence flows
+b9b7f24 Expand chat identity and camera activity workflows
+2308d5f Refactor report document generation pipeline
+5643f72 Add chat report generation workflow

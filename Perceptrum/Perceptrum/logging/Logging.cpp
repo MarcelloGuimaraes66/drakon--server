@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <iomanip>
 #include <ctime>
@@ -23,9 +24,16 @@ using json = nlohmann::json;
 
 static void appendBootstrapAgentLogLine(const std::string& msg) noexcept {
     try {
-        fs::create_directories("logs");
+        fs::path logDir = "logs";
+#ifdef __linux__
+        const char* runtimeLogRoot = std::getenv("APP_RUNTIME_LOG_ROOT");
+        if (runtimeLogRoot != nullptr && *runtimeLogRoot != '\0') {
+            logDir = fs::path(runtimeLogRoot);
+        }
+#endif
+        fs::create_directories(logDir);
 
-        std::ofstream out("logs/agent.log", std::ios::app);
+        std::ofstream out(logDir / "agent.log", std::ios::app);
         if (!out.is_open()) return;
 
         char buf[32]{};
@@ -134,12 +142,27 @@ static std::string urlEncodeValue(const std::string& value) {
 
 static ErrorLogContext sanitizeErrorContext_(const ErrorLogContext& input);
 
+static std::string resolveDefaultLogDir_() {
+#ifdef __linux__
+    const char* runtimeLogRoot = std::getenv("APP_RUNTIME_LOG_ROOT");
+    if (runtimeLogRoot != nullptr) {
+        std::string value = trimAscii(runtimeLogRoot);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+#endif
+    return "logs";
+}
+
 Logger& Logger::instance() {
     static Logger inst;
     return inst;
 }
 
-Logger::Logger() {
+Logger::Logger()
+    : logDir_(resolveDefaultLogDir_())
+{
     try {
         fs::create_directories(logDir_);
     }
@@ -248,6 +271,10 @@ void Logger::enqueueErrorExport_(ErrorExportItem&& item) noexcept {
 bool Logger::flushErrorBatch_(const std::vector<ErrorExportItem>& batch) noexcept {
     if (batch.empty()) return true;
 
+#ifdef __linux__
+    safeCerr("[Logger] Linux error export disabled until an explicit runtime token store is injected");
+    return false;
+#else
     const std::string baseUrl = trimAscii(GetPerceptrumBaseUrl());
     if (baseUrl.empty()) {
         safeCerr("[Logger] flushErrorBatch_: empty base URL");
@@ -354,6 +381,7 @@ bool Logger::flushErrorBatch_(const std::vector<ErrorExportItem>& batch) noexcep
     }
 
     return true;
+#endif
 }
 
 static bool isImportantMsg(const std::string& s) {
@@ -1112,4 +1140,3 @@ void Logger::workerLoop_() noexcept {
     }
     catch (...) {}
 }
-

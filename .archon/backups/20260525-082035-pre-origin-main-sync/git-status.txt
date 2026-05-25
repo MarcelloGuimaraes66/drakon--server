@@ -1,0 +1,33 @@
+## main...origin/main [behind 6]
+ M .gitignore
+ M AppHost/Runtime/desktop-local-server.mjs
+ M DrakonSite/package.json
+ M DrakonSite/server/brand.ts
+ M DrakonSite/server/index.ts
+ M DrakonSite/src/react-app/components/Layout.tsx
+ M DrakonSite/src/react-app/components/jobs/JobsTabs.tsx
+ M DrakonSite/src/react-app/components/settings/SettingsTabs.tsx
+ M DrakonSite/src/react-app/index.css
+ M DrakonSite/src/react-app/pages/Billing.tsx
+ M DrakonSite/src/react-app/pages/Events.tsx
+ M DrakonSite/src/worker/index.ts
+ M Perceptrum/Perceptrum/comm/PairingClient.cpp
+ M Perceptrum/Perceptrum/comm/PairingClient.h
+ M Perceptrum/Perceptrum/logging/Logging.cpp
+ M Perceptrum/Perceptrum/platform/platform_secure_store.cpp
+ M Perceptrum/Perceptrum/runtime/BrandingRuntime.h
+ M Perceptrum/Perceptrum/runtime/HeadlessService.cpp
+ M Perceptrum/Perceptrum/runtime/HeadlessService.h
+?? .archon/
+?? DrakonSite/docs/visual-battery.md
+?? DrakonSite/scripts/assert-platform-boundaries.mjs
+?? DrakonSite/scripts/test-local-sqlite-bootstrap.mjs
+?? DrakonSite/scripts/visual-battery.mjs
+?? DrakonSite/server/camera-discovery.ts
+?? Perceptrum/CMakeLists.txt
+?? Perceptrum/Perceptrum/core/AgentCoreStatus.cpp
+?? Perceptrum/Perceptrum/core/AgentCoreStatus.h
+?? Perceptrum/Perceptrum/runtime/interfaces/
+?? Perceptrum/linux-desktop/
+?? Perceptrum/linux/
+?? RUNBOOK-LINUX.md

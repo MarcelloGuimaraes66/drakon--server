@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -130,8 +128,8 @@
   width: 8px;
   height: 8px;
   border-radius: 9999px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(196, 208, 255, 0.55));
-  box-shadow: 0 6px 16px -10px rgba(255, 255, 255, 0.9);
+  background: rgba(74, 149, 255, 0.78);
+  box-shadow: none;
   animation: chat-thinking-dot 1.15s infinite ease-in-out;
 }
 
@@ -189,12 +187,12 @@
 
 .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
   border: 0;
-  background: linear-gradient(180deg, rgba(88, 96, 124, 0.96), rgba(62, 68, 88, 0.92));
+  background: rgba(118, 118, 124, 0.9);
   box-shadow: var(--app-scrollbar-shadow);
 }
 
 .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(103, 111, 140, 0.98), rgba(71, 79, 102, 0.94));
+  background: rgba(145, 145, 152, 0.96);
 }
 
 .sidebar-nav-scroll-neutral {
@@ -207,12 +205,12 @@
 
 .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
   border: 0;
-  background: linear-gradient(180deg, rgba(116, 118, 128, 0.94), rgba(86, 88, 98, 0.88));
+  background: rgba(118, 118, 124, 0.9);
   box-shadow: var(--app-scrollbar-shadow);
 }
 
 .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(134, 136, 146, 0.98), rgba(96, 98, 108, 0.92));
+  background: rgba(145, 145, 152, 0.96);
 }
 
 @supports selector(::-webkit-scrollbar) {
@@ -231,12 +229,12 @@
 
 .light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb {
   border: 0;
-  background: linear-gradient(180deg, rgba(123, 132, 160, 0.94), rgba(94, 101, 124, 0.88));
+  background: rgba(112, 115, 124, 0.72);
   box-shadow: var(--app-scrollbar-shadow);
 }
 
 .light .sidebar-nav-scroll-accent::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(138, 146, 173, 0.96), rgba(106, 114, 136, 0.9));
+  background: rgba(132, 136, 145, 0.82);
 }
 
 .light .sidebar-nav-scroll-neutral {
@@ -249,20 +247,436 @@
 
 .light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb {
   border: 0;
-  background: linear-gradient(180deg, rgba(125, 130, 144, 0.92), rgba(96, 101, 114, 0.84));
+  background: rgba(112, 115, 124, 0.72);
   box-shadow: var(--app-scrollbar-shadow);
 }
 
 .light .sidebar-nav-scroll-neutral::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(137, 142, 156, 0.96), rgba(108, 113, 126, 0.88));
+  background: rgba(132, 136, 145, 0.82);
 }
 
 :root {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --fluent-app-bg: #111111;
+  --fluent-content-bg: #111111;
+  --fluent-sidebar-bg: #171717;
+  --fluent-header-bg: rgba(24, 24, 24, 0.92);
+  --fluent-control-bg: rgba(255, 255, 255, 0.045);
+  --fluent-control-bg-hover: rgba(255, 255, 255, 0.075);
+  --fluent-control-bg-active: rgba(74, 149, 255, 0.15);
+  --fluent-control-border: rgba(255, 255, 255, 0.095);
+  --fluent-control-border-strong: rgba(74, 149, 255, 0.42);
+  --fluent-text-primary: #ececec;
+  --fluent-text-secondary: #b4b4b4;
+  --fluent-text-muted: #8d8d8d;
+  --fluent-accent: #4a95ff;
+  --fluent-surface-layer: rgba(255, 255, 255, 0.035);
+  --fluent-surface-layer-hover: rgba(255, 255, 255, 0.06);
+  --fluent-surface-layer-strong: rgba(255, 255, 255, 0.075);
+  --fluent-card-bg: rgba(255, 255, 255, 0.04);
+  --fluent-card-bg-hover: rgba(255, 255, 255, 0.065);
+  --fluent-card-border: rgba(255, 255, 255, 0.095);
+  --fluent-divider: rgba(255, 255, 255, 0.075);
+  --fluent-input-bg: rgba(255, 255, 255, 0.045);
+  --fluent-overlay-bg: rgba(0, 0, 0, 0.58);
+  --fluent-media-overlay-bg: rgba(0, 0, 0, 0.58);
+  --fluent-accent-strong: #2563eb;
+  --fluent-accent-subtle: rgba(74, 149, 255, 0.14);
+  --fluent-accent-border: rgba(74, 149, 255, 0.36);
+  --fluent-success-bg: rgba(16, 185, 129, 0.12);
+  --fluent-success-border: rgba(16, 185, 129, 0.28);
+  --fluent-warning-bg: rgba(245, 158, 11, 0.12);
+  --fluent-warning-border: rgba(245, 158, 11, 0.28);
+  --fluent-danger-bg: rgba(239, 68, 68, 0.12);
+  --fluent-danger-border: rgba(239, 68, 68, 0.3);
+  --fluent-shadow-card: none;
+  --fluent-shadow-flyout: 0 18px 38px -26px rgba(0, 0, 0, 0.92);
+  --fluent-radius-card: 8px;
+  --fluent-radius-control: 6px;
 }
 
 body {
   @apply bg-gray-950 text-gray-100;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.light {
+  color-scheme: light;
+  --fluent-app-bg: #f5f7fb;
+  --fluent-content-bg: #f5f7fb;
+  --fluent-sidebar-bg: #fdfdfd;
+  --fluent-header-bg: rgba(253, 253, 253, 0.94);
+  --fluent-control-bg: rgba(0, 0, 0, 0.035);
+  --fluent-control-bg-hover: rgba(0, 0, 0, 0.06);
+  --fluent-control-bg-active: rgba(74, 149, 255, 0.14);
+  --fluent-control-border: rgba(0, 0, 0, 0.095);
+  --fluent-control-border-strong: rgba(74, 149, 255, 0.36);
+  --fluent-text-primary: #111111;
+  --fluent-text-secondary: #3c3c3c;
+  --fluent-text-muted: #6b6b6b;
+  --fluent-surface-layer: rgba(255, 255, 255, 0.72);
+  --fluent-surface-layer-hover: rgba(255, 255, 255, 0.9);
+  --fluent-surface-layer-strong: #ffffff;
+  --fluent-card-bg: rgba(255, 255, 255, 0.78);
+  --fluent-card-bg-hover: #ffffff;
+  --fluent-card-border: rgba(0, 0, 0, 0.1);
+  --fluent-divider: rgba(0, 0, 0, 0.075);
+  --fluent-input-bg: rgba(255, 255, 255, 0.78);
+  --fluent-overlay-bg: rgba(15, 23, 42, 0.42);
+  --fluent-media-overlay-bg: rgba(15, 23, 42, 0.62);
+  --fluent-accent-strong: #2563eb;
+  --fluent-accent-subtle: rgba(37, 99, 235, 0.11);
+  --fluent-accent-border: rgba(37, 99, 235, 0.24);
+  --fluent-success-bg: rgba(5, 150, 105, 0.1);
+  --fluent-success-border: rgba(5, 150, 105, 0.22);
+  --fluent-warning-bg: rgba(217, 119, 6, 0.1);
+  --fluent-warning-border: rgba(217, 119, 6, 0.24);
+  --fluent-danger-bg: rgba(220, 38, 38, 0.1);
+  --fluent-danger-border: rgba(220, 38, 38, 0.24);
+  --fluent-shadow-card: none;
+  --fluent-shadow-flyout: 0 18px 38px -28px rgba(15, 23, 42, 0.35);
+}
+
+.fluent-shell {
+  background: var(--fluent-app-bg);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-sidebar {
+  background: var(--fluent-sidebar-bg);
+  border-color: var(--fluent-control-border);
+}
+
+.fluent-sidebar-footer {
+  background: var(--fluent-sidebar-bg);
+  border-color: var(--fluent-control-border);
+}
+
+.fluent-commandbar {
+  background: var(--fluent-header-bg);
+  border-color: var(--fluent-control-border);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+.fluent-content {
+  background: var(--fluent-content-bg);
+}
+
+.fluent-nav-item-active {
+  background: var(--fluent-control-bg-active);
+  border-color: var(--fluent-control-border-strong);
+}
+
+.fluent-nav-item-idle {
+  background: transparent;
+  border-color: transparent;
+}
+
+.fluent-nav-item-idle:hover {
+  background: var(--fluent-control-bg-hover);
+  border-color: var(--fluent-control-border);
+}
+
+.fluent-nav-icon-active {
+  background: rgba(74, 149, 255, 0.16);
+  border-color: rgba(74, 149, 255, 0.24);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-nav-icon-idle {
+  background: var(--fluent-control-bg);
+  border-color: var(--fluent-control-border);
+  color: var(--fluent-text-muted);
+}
+
+.fluent-nav-icon-idle:hover {
+  background: var(--fluent-control-bg-hover);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-toolbar-button,
+.fluent-chip,
+.fluent-segmented {
+  background: var(--fluent-control-bg);
+  border-color: var(--fluent-control-border);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-toolbar-button:hover {
+  background: var(--fluent-control-bg-hover);
+  border-color: var(--fluent-control-border-strong);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-segmented-active {
+  background: var(--fluent-control-bg-active);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-avatar {
+  background: var(--fluent-accent);
+}
+
+.fluent-flyout {
+  background: var(--fluent-header-bg);
+  border-color: var(--fluent-control-border);
+  color: var(--fluent-text-primary);
+  box-shadow: var(--fluent-shadow-flyout);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+.fluent-surface,
+.fluent-panel,
+.fluent-card {
+  background: var(--fluent-card-bg);
+  border-color: var(--fluent-card-border);
+  color: var(--fluent-text-primary);
+  box-shadow: var(--fluent-shadow-card);
+}
+
+.fluent-surface:hover,
+.fluent-panel:hover,
+.fluent-card:hover {
+  background: var(--fluent-card-bg-hover);
+}
+
+.fluent-page-header {
+  color: var(--fluent-text-primary);
+}
+
+.fluent-page-title {
+  color: var(--fluent-text-primary);
+}
+
+.fluent-page-description {
+  color: var(--fluent-text-muted);
+}
+
+.fluent-tablist {
+  background: var(--fluent-control-bg);
+  border-color: var(--fluent-control-border);
+  box-shadow: var(--fluent-shadow-card);
+}
+
+.fluent-tab-active {
+  background: var(--fluent-accent-strong);
+  color: #ffffff;
+}
+
+.fluent-tab-idle {
+  color: var(--fluent-text-secondary);
+}
+
+.fluent-tab-idle:hover {
+  background: var(--fluent-control-bg-hover);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-modal-backdrop {
+  background: var(--fluent-overlay-bg);
+  backdrop-filter: none;
+}
+
+.fluent-modal-panel {
+  background: var(--fluent-card-bg);
+  border-color: var(--fluent-card-border);
+  color: var(--fluent-text-primary);
+  box-shadow: var(--fluent-shadow-card);
+}
+
+.fluent-input {
+  background: var(--fluent-input-bg);
+  border-color: var(--fluent-control-border);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-input::placeholder {
+  color: var(--fluent-text-muted);
+}
+
+.fluent-divider {
+  border-color: var(--fluent-divider);
+}
+
+.fluent-internal-content {
+  background: var(--fluent-content-bg);
+  color: var(--fluent-text-primary);
+}
+
+.fluent-internal-content :where(
+  [class*="bg-gradient-to-"],
+  [class*="bg-[linear-gradient"],
+  [class*="bg-[radial-gradient"],
+  [class*="from-slate-"],
+  [class*="via-slate-"],
+  [class*="to-slate-"],
+  [class*="from-gray-"],
+  [class*="via-gray-"],
+  [class*="to-gray-"]
+) {
+  background-image: none !important;
+  background-color: var(--fluent-card-bg) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="from-blue-"],
+  [class*="to-blue-"],
+  [class*="from-cyan-"],
+  [class*="to-cyan-"],
+  .bg-blue-500,
+  .bg-blue-600,
+  .bg-cyan-500,
+  .bg-cyan-600
+) {
+  background-color: var(--fluent-accent-strong) !important;
+  color: #ffffff !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-gray-950"],
+  [class*="bg-gray-900"],
+  [class*="bg-gray-800"],
+  [class*="bg-slate-950"],
+  [class*="bg-slate-900"],
+  [class*="bg-slate-800"],
+  [class*="bg-[#"],
+  [class*="bg-white/["],
+  [class*="bg-white/5"],
+  [class*="bg-white/10"]
+) {
+  background-color: var(--fluent-card-bg) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-black/"],
+  [class*="from-black/"],
+  [class*="via-black/"],
+  [class*="to-black/"]
+) {
+  background-image: none !important;
+  background-color: var(--fluent-media-overlay-bg) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="hover:bg-gray-900"],
+  [class*="hover:bg-gray-800"],
+  [class*="hover:bg-slate-900"],
+  [class*="hover:bg-slate-800"],
+  [class*="hover:bg-white/["],
+  [class*="hover:bg-white/5"],
+  [class*="hover:bg-white/10"]
+):hover {
+  background-color: var(--fluent-card-bg-hover) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-gray-700"],
+  [class*="bg-gray-600"]
+) {
+  background-color: var(--fluent-surface-layer-strong) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="border-gray-"],
+  [class*="border-slate-"],
+  [class*="border-white/["],
+  [class*="border-white/"]
+) {
+  border-color: var(--fluent-card-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="divide-gray-"],
+  [class*="divide-white/"]
+) > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--fluent-divider) !important;
+}
+
+.fluent-internal-content :where(
+  .text-white,
+  .text-gray-100,
+  .text-gray-200
+) {
+  color: var(--fluent-text-primary) !important;
+}
+
+.fluent-internal-content :where(
+  .text-gray-300,
+  .text-gray-400
+) {
+  color: var(--fluent-text-secondary) !important;
+}
+
+.fluent-internal-content :where(
+  .text-gray-500,
+  .text-gray-600
+) {
+  color: var(--fluent-text-muted) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="from-blue-"],
+  [class*="to-blue-"],
+  [class*="from-cyan-"],
+  [class*="to-cyan-"],
+  .bg-blue-500,
+  .bg-blue-600,
+  .bg-cyan-500,
+  .bg-cyan-600,
+  .fluent-tab-active
+) {
+  color: #ffffff !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-emerald-"],
+  [class*="bg-green-"]
+) {
+  background-color: var(--fluent-success-bg) !important;
+  border-color: var(--fluent-success-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-amber-"],
+  [class*="bg-yellow-"],
+  [class*="bg-orange-"]
+) {
+  background-color: var(--fluent-warning-bg) !important;
+  border-color: var(--fluent-warning-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="bg-red-"],
+  [class*="bg-rose-"]
+) {
+  background-color: var(--fluent-danger-bg) !important;
+  border-color: var(--fluent-danger-border) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="shadow-"],
+  [class*="shadow-["],
+  [class*="hover:shadow-"]
+) {
+  box-shadow: var(--fluent-shadow-card) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="rounded-2xl"],
+  [class*="rounded-3xl"],
+  [class*="rounded-[24px]"],
+  [class*="rounded-[26px]"],
+  [class*="rounded-[28px]"],
+  [class*="rounded-[30px]"]
+) {
+  border-radius: var(--fluent-radius-card) !important;
+}
+
+.fluent-internal-content :where(
+  [class*="backdrop-blur"]
+) {
+  backdrop-filter: none !important;
 }
 
 .light body {
@@ -448,13 +862,13 @@ body {
   }
   
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    background: linear-gradient(180deg, var(--app-scrollbar-thumb-start), var(--app-scrollbar-thumb-end));
+    background: var(--app-scrollbar-thumb-start);
     border-radius: 9999px;
     box-shadow: var(--app-scrollbar-shadow);
   }
   
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-    background: linear-gradient(180deg, var(--app-scrollbar-thumb-hover-start), var(--app-scrollbar-thumb-hover-end));
+    background: var(--app-scrollbar-thumb-hover-start);
   }
 }
 
@@ -583,7 +997,7 @@ body {
 )::-webkit-scrollbar-thumb {
   border: 0;
   border-radius: 9999px;
-  background: linear-gradient(180deg, var(--app-scrollbar-thumb-start), var(--app-scrollbar-thumb-end));
+  background: var(--app-scrollbar-thumb-start);
   box-shadow: var(--app-scrollbar-shadow);
 }
 
@@ -605,7 +1019,7 @@ body {
   [class*=" overflow-y-scroll"],
   textarea
 )::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, var(--app-scrollbar-thumb-hover-start), var(--app-scrollbar-thumb-hover-end));
+  background: var(--app-scrollbar-thumb-hover-start);
 }
 
 :where(

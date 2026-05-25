@@ -131,6 +131,14 @@ inline const detail::WideValue kAppUserModelIdW{ []() { return detail::config().
 inline const detail::WideValue kTrayIconGuidW{ []() { return detail::config().trayIconGuidW.c_str(); } };
 
 inline std::filesystem::path dataRoot() {
+#if defined(__linux__)
+    const std::string runtimeDataRoot =
+        perceptrum::platform::ReadEnvVar("APP_RUNTIME_DATA_ROOT");
+    if (!runtimeDataRoot.empty()) {
+        return perceptrum::platform::ExpandUserPath(std::filesystem::path(runtimeDataRoot));
+    }
+#endif
+
 #if defined(_WIN32)
     const std::string configuredRoot = detail::config().dataRootWindows;
 #elif defined(__APPLE__)

@@ -54,7 +54,7 @@ export function resolveDefaultSqlitePath(brand: ActiveBrandRuntime, storageRoot:
   }
 
   const baseRoot =
-    brand.id === "perceptrum" && brand.dataRootWindows
+    process.platform === "win32" && brand.id === "perceptrum" && brand.dataRootWindows
       ? brand.dataRootWindows
       : path.join(storageRoot, "sqlite");
 
