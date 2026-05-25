@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "TrayIconHost.h"
+#include "../App.xaml.h"
 #include "AppRuntimeConfig.h"
 #include "../BootstrapTrace.h"
 
@@ -269,6 +270,7 @@ namespace DrakonDesktop::platform
         }
 
         AppendBootstrapTrace("tray: exit requested");
+        ::DrakonDesktop::platform::CloseRemoteWorkspaceWindowsForAppExit();
         m_allowClose = true;
         PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
     }

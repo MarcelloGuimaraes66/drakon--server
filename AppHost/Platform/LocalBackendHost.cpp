@@ -213,6 +213,7 @@ namespace DrakonDesktop::platform
     LocalBackendHost::LocalBackendHost()
     {
         m_logPath = RuntimeConfig().backendLogPath;
+        m_agentLogPath = RuntimeConfig().agentBackendLogPath;
         m_status.logPath = m_logPath;
     }
 
@@ -258,12 +259,28 @@ namespace DrakonDesktop::platform
 
         m_status.ready = true;
         m_status.startedByHost = true;
-        m_status.summary = L"Local backend ready on " + RuntimeConfig().uiBaseUrl;
+        m_status.summary = L"Local backend ready on " + RuntimeConfig().uiBaseUrl +
+            L" with agent ingress on " + RuntimeConfig().agentBaseUrl;
         return m_status;
     }
 
     void LocalBackendHost::Shutdown()
     {
+        if (m_agentJob != nullptr)
+        {
+            TerminateJobObject(m_agentJob, 0);
+            CloseHandle(m_agentJob);
+            m_agentJob = nullptr;
+        }
+
+        if (m_agentProcess != nullptr)
+        {
+            WaitForSingleObject(m_agentProcess, 5000);
+            CloseHandle(m_agentProcess);
+            m_agentProcess = nullptr;
+            m_agentProcessId = 0;
+        }
+
         if (m_job != nullptr)
         {
             TerminateJobObject(m_job, 0);
@@ -287,22 +304,72 @@ namespace DrakonDesktop::platform
 
     bool LocalBackendHost::ProbeReady(std::wstring* summary, bool* fatal) const
     {
-        auto const probe = ProbeHttp(L"127.0.0.1", RuntimeConfig().port);
+        auto const uiProbe = ProbeHttp(L"127.0.0.1", RuntimeConfig().port);
+        auto const agentProbe = ProbeHttp(L"127.0.0.1", RuntimeConfig().agentPort);
         if (summary != nullptr)
         {
-            *summary = probe.summary;
+            if (!uiProbe.summary.empty() && !agentProbe.summary.empty())
+            {
+                *summary = L"UI: " + uiProbe.summary + L" Agent: " + agentProbe.summary;
+            }
+            else if (!uiProbe.summary.empty())
+            {
+                *summary = L"UI: " + uiProbe.summary;
+            }
+            else
+            {
+                *summary = agentProbe.summary.empty()
+                    ? std::wstring{}
+                    : (L"Agent: " + agentProbe.summary);
+            }
         }
         if (fatal != nullptr)
         {
-            *fatal = probe.fatal;
+            *fatal = uiProbe.fatal || agentProbe.fatal;
         }
-        return probe.reachable && probe.ready;
+        return uiProbe.reachable && uiProbe.ready && agentProbe.reachable && agentProbe.ready;
     }
 
     bool LocalBackendHost::WaitForReady(DWORD timeoutMs, std::wstring& error) const
     {
         auto const startTick = GetTickCount64();
         std::wstring lastSummary;
+        auto composeLogHint = [&]()
+        {
+            return m_logPath.wstring() + L" and " + m_agentLogPath.wstring();
+        };
+        auto processExitedWithError = [&](HANDLE processHandle,
+                                          std::filesystem::path const& logPath,
+                                          std::wstring const& roleLabel) -> bool
+        {
+            if (processHandle == nullptr)
+            {
+                return false;
+            }
+
+            auto const waitResult = WaitForSingleObject(processHandle, 0);
+            if (waitResult != WAIT_OBJECT_0)
+            {
+                return false;
+            }
+
+            auto const logTail = ReadLogTail(logPath);
+            error = L"Local " + roleLabel + L" backend exited before becoming ready.";
+            if (!logTail.empty())
+            {
+                error += L" Last log line: " + logTail;
+            }
+            else if (!lastSummary.empty())
+            {
+                error += L" " + lastSummary;
+            }
+            else
+            {
+                error += L" Check " + logPath.wstring();
+            }
+
+            return true;
+        };
         while ((GetTickCount64() - startTick) < timeoutMs)
         {
             bool fatal = false;
@@ -320,41 +387,29 @@ namespace DrakonDesktop::platform
             if (fatal)
             {
                 error = summary.empty()
-                    ? L"Local backend reported an unrecoverable startup failure. Check " + m_logPath.wstring()
-                    : summary + L" Check " + m_logPath.wstring();
+                    ? L"Local backend reported an unrecoverable startup failure. Check " + composeLogHint()
+                    : summary + L" Check " + composeLogHint();
                 return false;
             }
 
-            if (m_process != nullptr)
+            if (processExitedWithError(m_process, m_logPath, L"UI"))
             {
-                auto const waitResult = WaitForSingleObject(m_process, 0);
-                if (waitResult == WAIT_OBJECT_0)
-                {
-                    auto const logTail = ReadLogTail(m_logPath);
-                    error = L"Local backend exited before becoming ready.";
-                    if (!logTail.empty())
-                    {
-                        error += L" Last log line: " + logTail;
-                    }
-                    else if (!lastSummary.empty())
-                    {
-                        error += L" " + lastSummary;
-                    }
-                    else
-                    {
-                        error += L" Check " + m_logPath.wstring();
-                    }
-                    return false;
-                }
+                return false;
+            }
+
+            if (processExitedWithError(m_agentProcess, m_agentLogPath, L"agent"))
+            {
+                return false;
             }
 
             Sleep(kProbeSleepMs);
         }
 
         error = !lastSummary.empty()
-            ? lastSummary + L" Check " + m_logPath.wstring()
+            ? lastSummary + L" Check " + composeLogHint()
             : L"Timed out waiting for the local backend to respond on " + RuntimeConfig().uiBaseUrl +
-                L". Check " + m_logPath.wstring();
+                L" and " + RuntimeConfig().agentBaseUrl +
+                L". Check " + composeLogHint();
         return false;
     }
 
@@ -396,31 +451,6 @@ namespace DrakonDesktop::platform
 
         auto const provisionedExeId = ReadProtectedLocalTextStrict(config.serviceSessionDirectory / "exe_id.txt").value_or(std::string{});
 
-        SECURITY_ATTRIBUTES securityAttributes{};
-        securityAttributes.nLength = sizeof(securityAttributes);
-        securityAttributes.bInheritHandle = TRUE;
-
-        auto logHandle = CreateFileW(
-            m_logPath.wstring().c_str(),
-            FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &securityAttributes,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (logHandle == INVALID_HANDLE_VALUE)
-        {
-            error = L"Unable to open backend log file. Win32=" + std::to_wstring(GetLastError());
-            return false;
-        }
-
-        STARTUPINFOW startupInfo{};
-        startupInfo.cb = sizeof(startupInfo);
-        startupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startupInfo.hStdOutput = logHandle;
-        startupInfo.hStdError = logHandle;
-        startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
         auto const packagedDesktopUsesSqlite = !config.backendUsesTsx;
         auto const desktopBackend = packagedDesktopUsesSqlite
             ? std::wstring(L"sqlite")
@@ -433,84 +463,161 @@ namespace DrakonDesktop::platform
             if (!protectedSqliteKey.has_value())
             {
                 error = L"Unable to read or create the protected desktop SQLite key.";
-                CloseHandle(logHandle);
                 return false;
             }
 
             desktopSqliteKeyHex = AsciiToWide(*protectedSqliteKey);
         }
 
-        PROCESS_INFORMATION processInfo{};
-        std::wstring commandLine;
+        std::wstring commandLineTemplate;
         if (config.backendUsesTsx)
         {
-            commandLine =
+            commandLineTemplate =
                 L"\"" + config.nodeExecutablePath.wstring() + L"\" \"" + config.tsxCliPath.wstring() +
                 L"\" --tsconfig \"" + config.tsconfigPath.wstring() + L"\" \"" +
                 config.desktopServerScriptPath.wstring() + L"\"";
         }
         else
         {
-            commandLine =
+            commandLineTemplate =
                 L"\"" + config.nodeExecutablePath.wstring() + L"\" \"" +
                 config.desktopServerScriptPath.wstring() + L"\"";
         }
 
-        auto environmentBlock = BuildEnvironmentBlock({
-            { L"DRAKON_WORKSPACE_ROOT", config.workspaceRoot.wstring() },
-            { L"APP_RUNTIME_ROOT", config.runtimeRoot.wstring() },
-            { L"PORT", std::to_wstring(config.port) },
-            { L"APP_BIND_HOST", L"127.0.0.1" },
-            { L"APP_BASE_URL", config.uiBaseUrl },
-            { L"APP_ALLOWED_ORIGINS", config.uiBaseUrl + L",http://127.0.0.1:" + std::to_wstring(config.port) },
-            { L"APP_RUNTIME_ENV", L"local" },
-            { L"ENV_PROFILE", L"local" },
-            { L"APP_STATIC_ROOT", config.staticRoot.wstring() },
-            { L"APP_SERVICE_SESSION_DIR", config.serviceSessionDirectory.wstring() },
-            { L"STORAGE_ROOT", config.storageRoot.wstring() },
-            { L"APP_DB_BACKEND", desktopBackend },
-            { L"APP_SQLITE_ENCRYPTION", desktopSqliteEncryptionMode },
-            { L"APP_SQLITE_KEY_HEX", desktopSqliteKeyHex },
-            { L"APP_SQLITE_KEY_VERSION", packagedDesktopUsesSqlite ? std::wstring(L"v1") : std::wstring{} },
-            { L"APP_SQLITE_CIPHER", packagedDesktopUsesSqlite ? std::wstring(L"sqlcipher") : std::wstring{} },
-            { L"APP_SQLITE_LEGACY", packagedDesktopUsesSqlite ? std::wstring(L"4") : std::wstring{} },
-            { L"APP_PROVISIONED_EXE_ID", AsciiToWide(provisionedExeId) },
-        });
+        auto const allowedOrigins =
+            config.uiBaseUrl +
+            L",http://127.0.0.1:" + std::to_wstring(config.port) +
+            L"," + config.agentBaseUrl +
+            L",http://127.0.0.1:" + std::to_wstring(config.agentPort);
+        auto const mediaPublicBaseUrl = config.uiBaseUrl + L"/media";
 
-        if (!CreateProcessW(
-            nullptr,
-            commandLine.data(),
-            nullptr,
-            nullptr,
-            TRUE,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            environmentBlock.data(),
-            config.backendWorkingDirectory.wstring().c_str(),
-            &startupInfo,
-            &processInfo))
+        auto launchBackendProcess =
+            [&](std::filesystem::path const& logPath,
+                std::uint16_t port,
+                std::wstring const& appBaseUrl,
+                std::wstring const& role,
+                HANDLE& outProcess,
+                HANDLE& outJob,
+                DWORD& outProcessId) -> bool
         {
-            error = L"Unable to start the local backend. Win32=" + std::to_wstring(GetLastError());
-            CloseHandle(logHandle);
+            SECURITY_ATTRIBUTES roleSecurityAttributes{};
+            roleSecurityAttributes.nLength = sizeof(roleSecurityAttributes);
+            roleSecurityAttributes.bInheritHandle = TRUE;
+
+            auto roleLogHandle = CreateFileW(
+                logPath.wstring().c_str(),
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &roleSecurityAttributes,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (roleLogHandle == INVALID_HANDLE_VALUE)
+            {
+                error =
+                    L"Unable to open " + role + L" backend log file. Win32=" +
+                    std::to_wstring(GetLastError());
+                return false;
+            }
+
+            STARTUPINFOW roleStartupInfo{};
+            roleStartupInfo.cb = sizeof(roleStartupInfo);
+            roleStartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            roleStartupInfo.hStdOutput = roleLogHandle;
+            roleStartupInfo.hStdError = roleLogHandle;
+            roleStartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+            std::wstring roleCommandLine = commandLineTemplate;
+            auto environmentBlock = BuildEnvironmentBlock({
+                { L"DRAKON_WORKSPACE_ROOT", config.workspaceRoot.wstring() },
+                { L"APP_RUNTIME_ROOT", config.runtimeRoot.wstring() },
+                { L"PORT", std::to_wstring(port) },
+                { L"APP_BIND_HOST", L"127.0.0.1" },
+                { L"APP_BASE_URL", appBaseUrl },
+                { L"APP_AGENT_BASE_URL", config.agentBaseUrl },
+                { L"APP_SERVER_ROLE", role },
+                { L"APP_ALLOWED_ORIGINS", allowedOrigins },
+                { L"APP_RUNTIME_ENV", L"local" },
+                { L"ENV_PROFILE", L"local" },
+                { L"APP_STATIC_ROOT", config.staticRoot.wstring() },
+                { L"APP_SERVICE_SESSION_DIR", config.serviceSessionDirectory.wstring() },
+                { L"STORAGE_ROOT", config.storageRoot.wstring() },
+                { L"APP_DB_BACKEND", desktopBackend },
+                { L"APP_SQLITE_ENCRYPTION", desktopSqliteEncryptionMode },
+                { L"APP_SQLITE_KEY_HEX", desktopSqliteKeyHex },
+                { L"APP_SQLITE_KEY_VERSION", packagedDesktopUsesSqlite ? std::wstring(L"v1") : std::wstring{} },
+                { L"APP_SQLITE_CIPHER", packagedDesktopUsesSqlite ? std::wstring(L"sqlcipher") : std::wstring{} },
+                { L"APP_SQLITE_LEGACY", packagedDesktopUsesSqlite ? std::wstring(L"4") : std::wstring{} },
+                { L"APP_PROVISIONED_EXE_ID", AsciiToWide(provisionedExeId) },
+                { L"R2_PUBLIC_BASE_URL", mediaPublicBaseUrl },
+            });
+
+            PROCESS_INFORMATION processInfo{};
+            if (!CreateProcessW(
+                    nullptr,
+                    roleCommandLine.data(),
+                    nullptr,
+                    nullptr,
+                    TRUE,
+                    CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                    environmentBlock.data(),
+                    config.backendWorkingDirectory.wstring().c_str(),
+                    &roleStartupInfo,
+                    &processInfo))
+            {
+                error =
+                    L"Unable to start the " + role + L" local backend. Win32=" +
+                    std::to_wstring(GetLastError());
+                CloseHandle(roleLogHandle);
+                return false;
+            }
+
+            CloseHandle(roleLogHandle);
+            CloseHandle(processInfo.hThread);
+
+            outJob = CreateJobObjectW(nullptr, nullptr);
+            if (outJob != nullptr)
+            {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limitInfo{};
+                limitInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(outJob, JobObjectExtendedLimitInformation, &limitInfo, sizeof(limitInfo));
+                AssignProcessToJobObject(outJob, processInfo.hProcess);
+            }
+
+            outProcess = processInfo.hProcess;
+            outProcessId = processInfo.dwProcessId;
+
+            auto const roleNarrow = std::string(role.begin(), role.end());
+            AppendBootstrapTrace("backend: started " + roleNarrow + " backend process");
+            AppendBootstrapTrace("backend: " + roleNarrow + " pid=" + std::to_string(outProcessId));
+            return true;
+        };
+
+        if (!launchBackendProcess(
+                m_logPath,
+                config.port,
+                config.uiBaseUrl,
+                L"ui",
+                m_process,
+                m_job,
+                m_processId))
+        {
             return false;
         }
 
-        CloseHandle(logHandle);
-        CloseHandle(processInfo.hThread);
-
-        m_job = CreateJobObjectW(nullptr, nullptr);
-        if (m_job != nullptr)
+        if (!launchBackendProcess(
+                m_agentLogPath,
+                config.agentPort,
+                config.agentBaseUrl,
+                L"agent",
+                m_agentProcess,
+                m_agentJob,
+                m_agentProcessId))
         {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limitInfo{};
-            limitInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(m_job, JobObjectExtendedLimitInformation, &limitInfo, sizeof(limitInfo));
-            AssignProcessToJobObject(m_job, processInfo.hProcess);
+            Shutdown();
+            return false;
         }
 
-        m_process = processInfo.hProcess;
-        m_processId = processInfo.dwProcessId;
-
-        AppendBootstrapTrace("backend: started local backend process");
-        AppendBootstrapTrace("backend: pid=" + std::to_string(m_processId));
         return true;
     }
 

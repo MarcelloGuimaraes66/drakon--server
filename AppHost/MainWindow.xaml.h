@@ -13,6 +13,7 @@ namespace winrt::DrakonDesktop::implementation
     struct MainWindow : MainWindowT<MainWindow>
     {
         MainWindow();
+        MainWindow(winrt::hstring const& initialNavigationUrl);
         ~MainWindow();
 
         void InitializeComponent();
@@ -28,6 +29,7 @@ namespace winrt::DrakonDesktop::implementation
         bool m_initialized{ false };
         bool m_windowChromeConfigured{ false };
         Microsoft::UI::Xaml::ElementTheme m_currentTheme{ Microsoft::UI::Xaml::ElementTheme::Dark };
+        winrt::hstring m_initialNavigationUrl;
     };
 }
 

@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import {
   Archive,
   Camera,
+  Cpu,
   FileUp,
   Pencil,
   Play,
@@ -40,8 +41,22 @@ import {
   formatDiscoveryImportErrorMessage,
   type CameraDiscoveryImportRequest,
 } from "@/react-app/utils/cameraDiscovery";
-import { toggleCameraService } from "@/react-app/utils/cameraService";
+import {
+  applyCameraCaptureAcceleration,
+  type CameraCaptureAccelerationMode,
+} from "@/react-app/utils/cameraCaptureAcceleration";
+import {
+  describeCameraStartBlockedError,
+  toggleCameraService,
+} from "@/react-app/utils/cameraService";
+import {
+  getSharedCameraAttribution,
+  getSharedCameraStatusLabel,
+  getSharedCameraUnavailableReason,
+  isSharedCameraReference,
+} from "@/react-app/utils/sharedCameraPresentation";
 import { brand } from "@/shared/brand";
+import type { CameraImportApplyResult } from "@/shared/cameraImport";
 import { Camera as CameraType } from "@/shared/types";
 
 type CamerasContentProps = {
@@ -57,6 +72,16 @@ const CAMERA_EDITOR_ONBOARDING_STEPS = new Set([
   "camera-webcam-form",
   "camera-webcam-save",
 ]);
+
+function getCameraCaptureAccelerationMode(camera: CameraType): CameraCaptureAccelerationMode {
+  return camera.capture_acceleration_mode === "nvidia" ? "nvidia" : "cpu";
+}
+
+function getCameraDisplayName(camera: CameraType): string {
+  return typeof camera.name === "string" && camera.name.trim()
+    ? camera.name.trim()
+    : `Camera #${camera.id}`;
+}
 
 function findSavedCameraId(
   cameras: CameraType[],
@@ -110,6 +135,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const [deleteCandidate, setDeleteCandidate] = useState<CameraType | null>(null);
   const [isDeletingCamera, setIsDeletingCamera] = useState(false);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
+  const [pendingAccelerationCameraIds, setPendingAccelerationCameraIds] = useState<Set<number>>(
+    () => new Set()
+  );
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast, pushToast } = useEvents();
@@ -143,6 +171,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   const recordingHistoryLabel = i18n.language?.startsWith("pt")
     ? "Arquivo"
     : "Archive";
+  const sharedBadgeLabel = i18n.language?.startsWith("pt")
+    ? "Compartilhada"
+    : "Shared";
 
   useEffect(() => {
     const editId = searchParams.get("edit");
@@ -159,12 +190,18 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     if (!targetCamera) {
       return;
     }
+    if (isSharedCameraReference(targetCamera)) {
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.delete("edit");
+      setSearchParams(nextParams, { replace: true });
+      return;
+    }
 
     if (!isEditorOpen || editorCamera?.id !== targetCamera.id) {
       setEditorCamera(targetCamera);
       setIsEditorOpen(true);
     }
-  }, [cameras, editorCamera?.id, isEditorOpen, searchParams]);
+  }, [cameras, editorCamera?.id, isEditorOpen, searchParams, setSearchParams]);
 
   const clearEditSearchParam = useCallback(() => {
     if (!searchParams.get("edit")) {
@@ -225,6 +262,10 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   };
 
   const openEditModal = (camera: CameraType, syncSearchParam = true) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     onboardingOwnedEditorRef.current = false;
     setIsImportOpen(false);
     setIsDiscoveryOpen(false);
@@ -246,6 +287,10 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
   };
 
   const openRecordingPlayer = (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     setRecordingCamera({
       id: camera.id,
       name: String(camera.name || "").trim() || `Camera ${camera.id}`,
@@ -350,17 +395,34 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     const refreshedCameras = await refreshCameras();
     refreshDashboardSummary();
     if (onboardingStepId === "camera-webcam-save") {
-      completeCameraTutorial(findSavedCameraId(refreshedCameras, saved));
+      completeCameraTutorial(
+        findSavedCameraId(refreshedCameras, saved),
+        saved?.cameraName ?? null
+      );
     }
   };
 
-  const handleImportSaved = async () => {
+  const handleImportSaved = async (applyResult?: CameraImportApplyResult) => {
     await refreshCameras();
     refreshDashboardSummary();
+
+    if (applyResult?.gpu_batch) {
+      pushToast({
+        title:
+          applyResult.gpu_batch.status === "failed"
+            ? "GPU Validation Stopped"
+            : applyResult.gpu_batch.status === "completed"
+            ? "GPU Validation Finished"
+            : "GPU Validation Started",
+        message: applyResult.gpu_batch.message,
+        type:
+          applyResult.gpu_batch.status === "failed" ? "agent_api_error" : "job_started",
+      });
+    }
   };
 
   const requestDeleteCamera = (camera: CameraType) => {
-    if (isDeletingCamera) {
+    if (isDeletingCamera || isSharedCameraReference(camera)) {
       return;
     }
 
@@ -421,7 +483,23 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
     });
   };
 
+  const updatePendingAccelerationState = (cameraId: number, isPending: boolean) => {
+    setPendingAccelerationCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
   const handleToggleService = async (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     if (pendingCameraIds.has(camera.id)) {
       return;
     }
@@ -470,9 +548,104 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
       refreshDashboardSummary();
       void refreshCameras();
     } catch (error) {
+      const blockedToast = describeCameraStartBlockedError(
+        error,
+        typeof camera.name === "string" ? camera.name : `Camera #${camera.id}`
+      );
+      if (blockedToast) {
+        pushToast({
+          cameraId: camera.id,
+          cameraName:
+            typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${camera.id}`,
+          title: blockedToast.title,
+          message: blockedToast.message,
+          type: "camera_start_blocked",
+        });
+      }
       console.error("Failed to toggle service:", error);
     } finally {
       updatePendingCameraState(camera.id, false);
+    }
+  };
+
+  const handleToggleCaptureAcceleration = async (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
+    const cameraId = camera.id;
+    const currentMode = getCameraCaptureAccelerationMode(camera);
+    const requestedMode: CameraCaptureAccelerationMode =
+      currentMode === "nvidia" ? "cpu" : "nvidia";
+
+    if (pendingAccelerationCameraIds.has(cameraId)) {
+      return;
+    }
+
+    updatePendingAccelerationState(cameraId, true);
+
+    try {
+      const result = await applyCameraCaptureAcceleration(cameraId, requestedMode, true);
+      if (result.status !== "applied") {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "GPU Decode Unavailable",
+          message: result.scan?.reason || "GPU decode is not available for this camera.",
+          type: "agent_api_error",
+        });
+        return;
+      }
+
+      patchCamera(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      dashboardSummaryStore.patchCameraLocal(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      refreshDashboardSummary();
+      void refreshCameras();
+
+      const switchedToGpu = result.persisted_mode === "nvidia";
+      const restartMessage =
+        result.running_before_apply && result.restart_enqueued
+          ? "The camera restart was queued on this machine."
+          : result.running_before_apply
+          ? "The preference was saved, but the camera restart could not be queued automatically."
+          : "The new capture mode will be used next time this camera starts.";
+
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: switchedToGpu ? "GPU Decode Enabled" : "CPU Decode Enabled",
+        message: restartMessage,
+        type: "job_started",
+      });
+
+      if (result.restart_error) {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "Camera Restart Pending",
+          message: result.restart_error,
+          type: "agent_api_error",
+        });
+      }
+    } catch (error) {
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: "GPU Decode Error",
+        message:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "Failed to change the camera decode mode.",
+        type: "agent_api_error",
+      });
+    } finally {
+      updatePendingAccelerationState(cameraId, false);
     }
   };
 
@@ -618,21 +791,58 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
               <tbody className="divide-y divide-gray-800">
                 {filteredCameras.map((camera) => {
                   const connectionState = getCameraConnectionState(camera);
+                  const isSharedCamera = isSharedCameraReference(camera);
+                  const sharedAttribution = getSharedCameraAttribution(camera, i18n.language);
+                  const sharedUnavailableReason = getSharedCameraUnavailableReason(
+                    camera,
+                    i18n.language
+                  );
                   const isRunning = isCameraServiceRunning(camera);
+                  const isAccelerationPending = pendingAccelerationCameraIds.has(camera.id);
+                  const captureAccelerationMode = getCameraCaptureAccelerationMode(camera);
+                  const isGpuRequested = captureAccelerationMode === "nvidia";
+                  const canToggleAcceleration =
+                    String(camera.connection_method || "").trim().toUpperCase() !== "WEBCAM";
                   const isAuthLost = connectionState === "auth_lost";
                   const isReconnecting = connectionState === "reconnecting";
                   const isOnline = connectionState === "online";
 
                   return (
-                  <tr key={camera.id} className="hover:bg-gray-800/30 transition-colors">
+                  <tr
+                    key={camera.id}
+                    className={`transition-colors ${
+                      isSharedCamera
+                        ? "[&>td]:border-y [&>td]:border-cyan-400/20 [&>td]:bg-cyan-500/[0.03] [&>td:first-child]:border-l [&>td:last-child]:border-r hover:[&>td]:bg-cyan-500/[0.06]"
+                        : "hover:bg-gray-800/30"
+                    }`}
+                  >
                     <td className="px-4 py-4">
                       <div className="flex min-w-0 items-center gap-3">
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-gray-800">
-                          <Camera className="h-5 w-5 text-gray-500" />
+                        <div
+                          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${
+                            isSharedCamera ? "bg-cyan-500/10" : "bg-gray-800"
+                          }`}
+                        >
+                          <Camera
+                            className={`h-5 w-5 ${isSharedCamera ? "text-cyan-200" : "text-gray-500"}`}
+                          />
                         </div>
-                        <span className="truncate font-medium text-gray-200" title={camera.name || undefined}>
-                          {camera.name}
-                        </span>
+                        <div className="min-w-0">
+                          <span
+                            className="block truncate font-medium text-gray-200"
+                            title={camera.name || undefined}
+                          >
+                            {camera.name}
+                          </span>
+                          {sharedAttribution ? (
+                            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-cyan-100/90">
+                              <span className="inline-flex items-center rounded-full border border-cyan-400/25 bg-cyan-500/10 px-2 py-0.5 font-medium text-cyan-100">
+                                {sharedBadgeLabel}
+                              </span>
+                              <span className="truncate">{sharedAttribution}</span>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
                     </td>
                     <td className="px-4 py-4 text-gray-400 whitespace-nowrap">{camera.ip_address || "-"}</td>
@@ -649,7 +859,9 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                     <td className="px-4 py-4 whitespace-nowrap">
                       <span
                         className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-                          isOnline
+                          isSharedCamera
+                            ? "bg-cyan-500/10 text-cyan-200"
+                            : isOnline
                             ? "bg-green-500/10 text-green-400"
                             : isAuthLost
                             ? "bg-rose-500/10 text-rose-300"
@@ -658,8 +870,10 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                             : "bg-red-500/10 text-red-400"
                         }`}
                         >
-                          <Wifi className="w-3 h-3" />
-                          {isOnline
+                          {isSharedCamera ? <Camera className="w-3 h-3" /> : <Wifi className="w-3 h-3" />}
+                          {isSharedCamera
+                            ? getSharedCameraStatusLabel(i18n.language)
+                            : isOnline
                             ? t("dashboard.online")
                             : isAuthLost
                             ? "Pairing/Auth lost"
@@ -672,12 +886,26 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                       <div className="flex items-center justify-end gap-1.5">
                         <button
                           onClick={() => handleToggleService(camera)}
-                          disabled={pendingCameraIds.has(camera.id)}
+                          disabled={isSharedCamera || pendingCameraIds.has(camera.id)}
                           aria-busy={pendingCameraIds.has(camera.id)}
-                          title={isRunning ? t("dashboard.stop") : t("dashboard.start")}
-                          aria-label={isRunning ? t("dashboard.stop") : t("dashboard.start")}
+                          title={
+                            isSharedCamera
+                              ? sharedUnavailableReason
+                              : isRunning
+                              ? t("dashboard.stop")
+                              : t("dashboard.start")
+                          }
+                          aria-label={
+                            isSharedCamera
+                              ? sharedUnavailableReason
+                              : isRunning
+                              ? t("dashboard.stop")
+                              : t("dashboard.start")
+                          }
                           className={`inline-flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
-                            isRunning
+                            isSharedCamera
+                              ? "text-cyan-200/60 disabled:cursor-not-allowed disabled:opacity-70"
+                              : isRunning
                               ? "text-red-400 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                               : "text-green-400 hover:bg-green-500/10 disabled:cursor-not-allowed disabled:opacity-60"
                           }`}
@@ -692,26 +920,72 @@ function CamerasContent({ cameras, refreshCameras, patchCamera }: CamerasContent
                         </button>
                         <button
                           type="button"
+                          onClick={() => handleToggleCaptureAcceleration(camera)}
+                          disabled={
+                            isSharedCamera ||
+                            !canToggleAcceleration ||
+                            isAccelerationPending ||
+                            pendingCameraIds.has(camera.id)
+                          }
+                          title={
+                            isSharedCamera
+                              ? sharedUnavailableReason
+                              : canToggleAcceleration
+                              ? isGpuRequested
+                                ? "Switch to CPU decode"
+                                : "Try GPU decode"
+                              : "GPU decode is only available for RTSP cameras"
+                          }
+                          aria-label={
+                            isSharedCamera
+                              ? sharedUnavailableReason
+                              : canToggleAcceleration
+                              ? isGpuRequested
+                                ? "Switch to CPU decode"
+                                : "Try GPU decode"
+                              : "GPU decode is only available for RTSP cameras"
+                          }
+                          className={`inline-flex h-9 w-9 items-center justify-center rounded-lg transition-colors ${
+                            isSharedCamera
+                              ? "text-cyan-200/60 disabled:cursor-not-allowed disabled:opacity-70"
+                              : !canToggleAcceleration
+                              ? "text-gray-500"
+                              : isGpuRequested
+                              ? "text-amber-300 hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:opacity-60"
+                              : "text-gray-300 hover:bg-gray-700/60 disabled:cursor-not-allowed disabled:opacity-60"
+                          }`}
+                        >
+                          {isAccelerationPending ? (
+                            <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          ) : (
+                            <Cpu className="h-4 w-4" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => openRecordingPlayer(camera)}
-                          title={recordingHistoryLabel}
-                          aria-label={recordingHistoryLabel}
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-cyan-300 transition-colors hover:bg-cyan-500/10"
+                          disabled={isSharedCamera}
+                          title={isSharedCamera ? sharedUnavailableReason : recordingHistoryLabel}
+                          aria-label={isSharedCamera ? sharedUnavailableReason : recordingHistoryLabel}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-cyan-300 transition-colors hover:bg-cyan-500/10 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Archive className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => openEditModal(camera)}
-                          title={t("dashboard.edit")}
-                          aria-label={t("dashboard.edit")}
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-blue-400 transition-colors hover:bg-blue-500/10"
+                          disabled={isSharedCamera}
+                          title={isSharedCamera ? sharedUnavailableReason : t("dashboard.edit")}
+                          aria-label={isSharedCamera ? sharedUnavailableReason : t("dashboard.edit")}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-blue-400 transition-colors hover:bg-blue-500/10 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Pencil className="h-4 w-4" />
                         </button>
                         <button
                           onClick={() => requestDeleteCamera(camera)}
-                          title={t("cameras.delete")}
-                          aria-label={t("cameras.delete")}
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-red-400 transition-colors hover:bg-red-500/10"
+                          disabled={isSharedCamera}
+                          title={isSharedCamera ? sharedUnavailableReason : t("cameras.delete")}
+                          aria-label={isSharedCamera ? sharedUnavailableReason : t("cameras.delete")}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-red-400 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>

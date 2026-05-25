@@ -55,6 +55,28 @@ export interface CameraImportSharedDefaults {
   subtype?: string;
 }
 
+export type CameraImportGpuBatchStatus =
+  | "queued"
+  | "waiting_for_exe"
+  | "probing"
+  | "completed"
+  | "failed";
+
+export interface CameraImportGpuBatchSummary {
+  job_id?: number;
+  status: CameraImportGpuBatchStatus;
+  requested_mode: "cpu" | "nvidia";
+  total_count: number;
+  processed_count: number;
+  enabled_gpu_count: number;
+  kept_cpu_count: number;
+  failed_count: number;
+  active_camera_id?: number | null;
+  waiting_for_exe: boolean;
+  last_error?: string | null;
+  message: string;
+}
+
 export interface CameraImportPreview {
   file_name: string;
   file_extension: string;
@@ -83,6 +105,7 @@ export interface CameraImportApplyResult {
   skipped_count: number;
   created_camera_ids: number[];
   duplicate_source_indexes: number[];
+  gpu_batch?: CameraImportGpuBatchSummary | null;
   failed_candidates?: Array<{
     source_index: number;
     source_reference: string;

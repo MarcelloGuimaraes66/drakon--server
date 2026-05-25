@@ -1,7 +1,7 @@
 ﻿import { useEffect, useState, useRef } from "react";
 import { pollingManager } from "@/react-app/lib/PollingManager";
 import { dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
-import { normalizeCameraConnectionFailedEvent, type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
+import { type CameraFailurePhase } from "@/react-app/lib/cameraConnectionFailure";
 import { emitOpenAiKeyRequiredPrompt } from "@/react-app/utils/openAiKeyGuard";
 import { formatAiApiErrorDisplay } from "@/shared/aiApiErrorDisplay";
 
@@ -32,8 +32,10 @@ interface Toast {
   type?:
     | "offline"
     | "online"
+    | "camera_start_blocked"
     | "job_staled"
     | "job_start_blocked"
+    | "job_step_start_blocked"
     | "job_started"
     | "agent_api_error";
 }
@@ -45,6 +47,7 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
   const [lastCameraEventId, setLastCameraEventId] = useState(0);
   const [lastJobStaledEventId, setLastJobStaledEventId] = useState(0);
   const [lastJobStartBlockedEventId, setLastJobStartBlockedEventId] = useState(0);
+  const [lastJobStepStartBlockedEventId, setLastJobStepStartBlockedEventId] = useState(0);
   const [lastJobStartedEventId, setLastJobStartedEventId] = useState(0);
   const [lastAgentApiErrorEventId, setLastAgentApiErrorEventId] = useState(0);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -53,7 +56,6 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
   const shownToastIdsRef = useRef<Set<number>>(new Set());
   const offlineCameraIdsRef = useRef<Set<number>>(new Set());
   const previousOnlineStateRef = useRef<Map<number, boolean>>(new Map());
-  const syntheticToastIdRef = useRef(-1);
 
   // Keep refs updated without triggering effects
   useEffect(() => {
@@ -88,6 +90,7 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
         primeLatestEventId("camera_connection_failed", setLastCameraEventId),
         primeLatestEventId("job_staled", setLastJobStaledEventId),
         primeLatestEventId("job_start_blocked", setLastJobStartBlockedEventId),
+        primeLatestEventId("job_step_start_blocked", setLastJobStepStartBlockedEventId),
         primeLatestEventId("job_started", setLastJobStartedEventId),
         primeLatestEventId("agent_api_error", setLastAgentApiErrorEventId),
       ]);
@@ -125,32 +128,9 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
           const camera = camerasRef.current.find((row) => row.id === event.camera_id);
           if (!camera) return;
 
-          const failureToast = normalizeCameraConnectionFailedEvent(event);
           shownToastIdsRef.current.add(event.id);
           offlineCameraIdsRef.current.add(event.camera_id);
           previousOnlineStateRef.current.set(event.camera_id, false);
-
-          setToasts((prev) => [
-            ...prev,
-            {
-              id: event.id,
-              cameraId: event.camera_id,
-              cameraName: camera.name,
-              message: failureToast.message,
-              title: failureToast.title,
-              failureCode: failureToast.failureCode,
-              failureSummary: failureToast.failureSummary,
-              failureAction: failureToast.failureAction,
-              technicalDetail: failureToast.technicalDetail,
-              failurePhase: failureToast.failurePhase,
-              failureConfidence: failureToast.failureConfidence,
-              type: "offline",
-            },
-          ]);
-
-          setTimeout(() => {
-            setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
-          }, AUTO_DISMISS_MS);
         });
 
         dashboardSummaryStore.refresh();
@@ -332,6 +312,108 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
     if (!isInitialized) return;
 
     const url =
+      lastJobStepStartBlockedEventId > 0
+        ? `/api/events?event_type=job_step_start_blocked&after_id=${lastJobStepStartBlockedEventId}`
+        : "/api/events?event_type=job_step_start_blocked";
+
+    pollingManager.register("job-step-start-blocked-events-hook", {
+      url,
+      interval: 4000,
+      jitterMaxMs: 500,
+      onData: (events: CameraEvent[]) => {
+        if (events.length === 0) return;
+
+        const maxId = Math.max(...events.map((event) => event.id));
+        setLastJobStepStartBlockedEventId(maxId);
+
+        events.forEach((event) => {
+          if (shownToastIdsRef.current.has(event.id)) return;
+
+          let details: Record<string, unknown> | null = null;
+          if (typeof event.details_json === "string" && event.details_json.trim()) {
+            try {
+              details = JSON.parse(event.details_json);
+            } catch {
+              details = null;
+            }
+          }
+
+          const rawJobName =
+            typeof details?.job_name === "string"
+              ? details.job_name
+              : typeof details?.job === "object" &&
+                details.job &&
+                typeof (details.job as Record<string, unknown>).name === "string"
+              ? (details.job as Record<string, string>).name
+              : "";
+          const rawStepName = typeof details?.step_name === "string" ? details.step_name : "";
+          const blockedCameraNames = Array.isArray(details?.blocked_cameras)
+            ? details.blocked_cameras
+                .map((entry) =>
+                  entry &&
+                  typeof entry === "object" &&
+                  !Array.isArray(entry) &&
+                  typeof (entry as Record<string, unknown>).camera_name === "string"
+                    ? String((entry as Record<string, unknown>).camera_name).trim()
+                    : ""
+                )
+                .filter((entry): entry is string => entry.length > 0)
+            : [];
+          const device =
+            typeof details?.device === "string" && details.device.trim()
+              ? details.device.trim().toUpperCase()
+              : "CPU/GPU";
+          const jobName = String(rawJobName || "").trim();
+          const stepName = String(rawStepName || "").trim();
+          const title = jobName
+            ? `Step Start Blocked: ${jobName}`
+            : stepName
+            ? `Step Start Blocked: ${stepName}`
+            : "Step Start Blocked";
+          const fallbackMessage =
+            stepName && blockedCameraNames.length > 0
+              ? `Step "${stepName}" could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+              : stepName
+              ? `Step "${stepName}" could not start because available ${device} memory is too low.`
+              : blockedCameraNames.length > 0
+              ? `The step could not start ${blockedCameraNames.join(", ")} because available ${device} memory is too low.`
+              : `The step could not start because available ${device} memory is too low.`;
+          const message =
+            typeof event.message === "string" && event.message.trim()
+              ? event.message.trim()
+              : fallbackMessage;
+
+          shownToastIdsRef.current.add(event.id);
+
+          setToasts((prev) => [
+            ...prev,
+            {
+              id: event.id,
+              message,
+              title,
+              type: "job_step_start_blocked",
+            },
+          ]);
+
+          setTimeout(() => {
+            setToasts((prev) => prev.filter((toast) => toast.id !== event.id));
+          }, AUTO_DISMISS_MS);
+        });
+      },
+      onError: (error) => {
+        console.error("[useCameraEvents] Job step start blocked polling error:", error);
+      },
+    });
+
+    return () => {
+      pollingManager.unregister("job-step-start-blocked-events-hook");
+    };
+  }, [lastJobStepStartBlockedEventId, isInitialized]);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+
+    const url =
       lastJobStartedEventId > 0
         ? `/api/events?event_type=job_started&after_id=${lastJobStartedEventId}`
         : "/api/events?event_type=job_started";
@@ -508,27 +590,6 @@ export function useCameraEvents(cameras: any[], onCameraStateChange?: () => void
             isOnline &&
             offlineCameraIdsRef.current.has(cameraId)
           ) {
-            const cameraName =
-              typeof camera?.name === "string" && camera.name.trim()
-                ? camera.name
-                : `Camera ${cameraId}`;
-            const toastId = syntheticToastIdRef.current--;
-
-            setToasts((prev) => [
-              ...prev,
-              {
-                id: toastId,
-                cameraId,
-                cameraName,
-                message: "Connection restored. Camera is back online.",
-                type: "online",
-              },
-            ]);
-
-            setTimeout(() => {
-              setToasts((prev) => prev.filter((toast) => toast.id !== toastId));
-            }, AUTO_DISMISS_MS);
-
             offlineCameraIdsRef.current.delete(cameraId);
             didRecoverCamera = true;
           }

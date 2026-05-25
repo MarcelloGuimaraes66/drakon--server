@@ -228,9 +228,16 @@ static int readModelFpsField(
 }
 
 static int normalizeRunEverySecondsValue(int raw, int fallback) {
-    const int normalizedFallback = (fallback <= 10) ? 10 : 60;
+    const int normalizedFallback =
+        (fallback <= 10) ? 10 :
+        (fallback == 300) ? 300 :
+        (fallback == 600) ? 600 :
+        60;
     if (raw <= 0) return normalizedFallback;
-    return (raw <= 10) ? 10 : 60;
+    if (raw <= 10) return 10;
+    if (raw == 300) return 300;
+    if (raw == 600) return 600;
+    return 60;
 }
 
 static int readRunEverySecondsField(const json& j, int fallback) {
@@ -646,6 +653,25 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
     JobStartPayload out;
     out.version = p.value("version", 1);
     out.job_run_id = safeString(p, "job_run_id");
+    out.shared_segment_id = safeString(p, "shared_segment_id");
+    out.shared_execution_domain = safeString(p, "shared_execution_domain");
+    out.shared_owner_public_id = safeString(p, "shared_owner_public_id");
+    out.shared_operator_public_id = safeString(p, "shared_operator_public_id");
+    out.shared_operator_job_id =
+        optInt(p, "shared_operator_job_id").value_or(-1);
+    out.shared_allow_event_media = readBoolLikeField(
+        p,
+        { "shared_allow_event_media", "sharedAllowEventMedia" },
+        false
+    );
+    out.shared_cross_camera_federation_required = readBoolLikeField(
+        p,
+        {
+            "shared_cross_camera_federation_required",
+            "sharedCrossCameraFederationRequired"
+        },
+        false
+    );
 
     if (!p.contains("job") || !p["job"].is_object()) {
         throw std::runtime_error("job_start payload missing job object");
@@ -1051,6 +1077,99 @@ JobStartPayload JobPayloadParser::parseJobStartPayloadOrThrow(const json& cmd) {
                 ag.priority_level = safeString(a, "priority_level", "");
                 ag.params_json = safeJsonText(a, "params", "{}");
                 ag.input_schema_json = safeJsonText(a, "input_schema", "{}");
+                try {
+                    json params = json::parse(ag.params_json, nullptr, false);
+                    if (params.is_object()) {
+                        const std::string executionBackend = trimCopy_(
+                            safeString(params, "execution_backend", "llm"));
+                        ag.execution_backend =
+                            (executionBackend == "opencv_portal_counter")
+                                ? "opencv_portal_counter"
+                                : "llm";
+
+                        const json portalCounterNode =
+                            params.contains("portal_counter") && params["portal_counter"].is_object()
+                                ? params["portal_counter"]
+                                : json::object();
+                        if (portalCounterNode.is_object()) {
+                            auto readIntClamped = [&](const char* key,
+                                                      int fallback,
+                                                      int minValue,
+                                                      int maxValue) -> int {
+                                if (!portalCounterNode.contains(key) ||
+                                    portalCounterNode[key].is_null()) {
+                                    return fallback;
+                                }
+                                int value = fallback;
+                                try {
+                                    if (portalCounterNode[key].is_number_integer()) {
+                                        value = portalCounterNode[key].get<int>();
+                                    }
+                                    else if (portalCounterNode[key].is_number_float()) {
+                                        value = static_cast<int>(
+                                            std::lround(portalCounterNode[key].get<double>()));
+                                    }
+                                    else if (portalCounterNode[key].is_string()) {
+                                        value = std::stoi(portalCounterNode[key].get<std::string>());
+                                    }
+                                }
+                                catch (...) {
+                                    value = fallback;
+                                }
+                                return (std::clamp)(value, minValue, maxValue);
+                            };
+
+                            ag.portal_counter_config.region_id =
+                                trimCopy_(safeString(portalCounterNode, "region_id", ""));
+                            ag.portal_counter_config.min_count_to_alert = readIntClamped(
+                                "min_count_to_alert",
+                                1,
+                                0,
+                                9999);
+                            ag.portal_counter_config.min_area = readIntClamped(
+                                "min_area",
+                                1800,
+                                1,
+                                500000);
+                            ag.portal_counter_config.max_area = readIntClamped(
+                                "max_area",
+                                70000,
+                                1,
+                                1000000);
+                            ag.portal_counter_config.warmup_frames = readIntClamped(
+                                "warmup_frames",
+                                60,
+                                0,
+                                10000);
+                            ag.portal_counter_config.min_track_frames_for_count = readIntClamped(
+                                "min_track_frames_for_count",
+                                3,
+                                1,
+                                300);
+                            ag.portal_counter_config.max_missed_frames = readIntClamped(
+                                "max_missed_frames",
+                                12,
+                                1,
+                                300);
+                            ag.portal_counter_config.min_path_length_px = readIntClamped(
+                                "min_path_length_px",
+                                85,
+                                1,
+                                5000);
+                            ag.portal_counter_config.max_proof_frames = readIntClamped(
+                                "max_proof_frames",
+                                6,
+                                1,
+                                24);
+                            ag.portal_counter_config.save_annotated_video =
+                                !portalCounterNode.contains("save_annotated_video") ||
+                                !portalCounterNode["save_annotated_video"].is_boolean()
+                                    ? true
+                                    : portalCounterNode["save_annotated_video"].get<bool>();
+                        }
+                    }
+                }
+                catch (...) {}
                 ag.input_type = normalizeInputTypeValue(
                     safeString(a, "input_type", safeString(a, "inputType", "video"))
                 );

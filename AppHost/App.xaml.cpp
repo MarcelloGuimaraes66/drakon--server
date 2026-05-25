@@ -17,7 +17,9 @@
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 
+#include <algorithm>
 #include <exception>
+#include <string>
 #include <vector>
 
 using namespace winrt;
@@ -26,6 +28,7 @@ using namespace Microsoft::UI::Xaml;
 namespace
 {
     ::DrakonDesktop::platform::PerceptrumRuntimeHost* g_runtimeHost = nullptr;
+    winrt::DrakonDesktop::implementation::App* g_appInstance = nullptr;
 
     std::wstring EscapePowerShellSingleQuotedLiteral(std::wstring const& value)
     {
@@ -71,6 +74,7 @@ namespace
         auto const powerShellPath = ResolvePowerShellPath();
         std::vector<std::filesystem::path> cleanupTargets{
             serviceSessionDirectory / "backend-host.log",
+            serviceSessionDirectory / "agent-backend.log",
             serviceSessionDirectory / "service-cpp.log",
             serviceSessionDirectory / "logs",
             serviceSessionDirectory / "webview2",
@@ -209,6 +213,72 @@ namespace
 
         ShowWindow(hwnd, SW_MAXIMIZE);
     }
+
+    std::wstring UrlEncodeComponent(std::wstring const& value)
+    {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        auto const utf8 = winrt::to_string(winrt::hstring(value));
+        std::string encoded;
+        encoded.reserve(utf8.size() * 3);
+
+        for (unsigned char ch : utf8)
+        {
+            if (
+                (ch >= 'a' && ch <= 'z') ||
+                (ch >= 'A' && ch <= 'Z') ||
+                (ch >= '0' && ch <= '9') ||
+                ch == '-' ||
+                ch == '_' ||
+                ch == '.' ||
+                ch == '~')
+            {
+                encoded.push_back(static_cast<char>(ch));
+            }
+            else
+            {
+                encoded.push_back('%');
+                encoded.push_back(kHex[(ch >> 4) & 0x0F]);
+                encoded.push_back(kHex[ch & 0x0F]);
+            }
+        }
+
+        return winrt::to_hstring(encoded).c_str();
+    }
+
+    std::wstring BuildRemoteWorkspaceUrl(
+        winrt::hstring const& sessionId,
+        winrt::hstring const& ownerDisplayLabel,
+        winrt::hstring const& operatorDisplayLabel)
+    {
+        auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+        std::wstring base = runtimeConfig.uiBaseUrl;
+        if (base.empty())
+        {
+            base = L"http://127.0.0.1:4000";
+        }
+
+        if (!base.ends_with(L"/"))
+        {
+            base += L'/';
+        }
+
+        std::wstring url = base + L"dashboard";
+        url += L"?remote_workspace_session=" + UrlEncodeComponent(sessionId.c_str());
+
+        auto const ownerLabel = std::wstring(ownerDisplayLabel.c_str());
+        if (!ownerLabel.empty())
+        {
+            url += L"&remote_workspace_owner=" + UrlEncodeComponent(ownerLabel);
+        }
+
+        auto const operatorLabel = std::wstring(operatorDisplayLabel.c_str());
+        if (!operatorLabel.empty())
+        {
+            url += L"&remote_workspace_operator=" + UrlEncodeComponent(operatorLabel);
+        }
+
+        return url;
+    }
 }
 
 namespace DrakonDesktop::platform
@@ -279,12 +349,37 @@ namespace DrakonDesktop::platform
 
         return { true, L"Local AppData cleanup scheduled." };
     }
+
+    DesktopShellRequestResult OpenRemoteWorkspaceWindowFromWeb(
+        winrt::hstring const& sessionId,
+        winrt::hstring const& ownerDisplayLabel,
+        winrt::hstring const& operatorDisplayLabel)
+    {
+        if (g_appInstance == nullptr)
+        {
+            return { false, L"Application instance is not available." };
+        }
+
+        return g_appInstance->OpenRemoteWorkspaceWindow(
+            sessionId,
+            ownerDisplayLabel,
+            operatorDisplayLabel);
+    }
+
+    void CloseRemoteWorkspaceWindowsForAppExit()
+    {
+        if (g_appInstance != nullptr)
+        {
+            g_appInstance->CloseRemoteWorkspaceWindows();
+        }
+    }
 }
 
 namespace winrt::DrakonDesktop::implementation
 {
     App::App()
     {
+        g_appInstance = this;
 #if defined _DEBUG && !defined DISABLE_XAML_GENERATED_BREAK_ON_UNHANDLED_EXCEPTION
         UnhandledException([](IInspectable const&, UnhandledExceptionEventArgs const& e)
         {
@@ -300,6 +395,10 @@ namespace winrt::DrakonDesktop::implementation
 
     App::~App()
     {
+        if (g_appInstance == this)
+        {
+            g_appInstance = nullptr;
+        }
         if (g_runtimeHost == m_runtimeHost.get())
         {
             g_runtimeHost = nullptr;
@@ -343,6 +442,7 @@ namespace winrt::DrakonDesktop::implementation
             SetCurrentProcessExplicitAppUserModelID(runtimeConfig.appUserModelId.c_str());
         }
         SetEnvironmentVariableW(L"APP_BASE_URL", runtimeConfig.uiBaseUrl.c_str());
+        SetEnvironmentVariableW(L"APP_AGENT_BASE_URL", runtimeConfig.agentBaseUrl.c_str());
         SetEnvironmentVariableW(L"DRAKON_UI_URL", (runtimeConfig.uiBaseUrl + L"/dashboard").c_str());
         SetEnvironmentVariableW(
             L"WEBVIEW2_USER_DATA_FOLDER",
@@ -387,6 +487,83 @@ namespace winrt::DrakonDesktop::implementation
         catch (...)
         {
             AppendBootstrapTrace("app: tray/icon hookup failed");
+        }
+    }
+
+    ::DrakonDesktop::platform::DesktopShellRequestResult App::OpenRemoteWorkspaceWindow(
+        winrt::hstring const& sessionId,
+        winrt::hstring const& ownerDisplayLabel,
+        winrt::hstring const& operatorDisplayLabel)
+    {
+        auto const navigationUrl = BuildRemoteWorkspaceUrl(
+            sessionId,
+            ownerDisplayLabel,
+            operatorDisplayLabel);
+        auto window = make<MainWindow>(winrt::hstring(navigationUrl));
+
+        auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
+        std::wstring windowTitle = runtimeConfig.windowTitle;
+        auto const ownerLabel = std::wstring(ownerDisplayLabel.c_str());
+        if (!ownerLabel.empty())
+        {
+            windowTitle += L" - ";
+            windowTitle += ownerLabel;
+        }
+
+        window.Title(winrt::hstring(windowTitle));
+        window.Activate();
+        m_auxWindows.push_back(window);
+        window.Closed([this, window](auto const&, auto const&)
+        {
+            m_auxWindows.erase(
+                std::remove(m_auxWindows.begin(), m_auxWindows.end(), window),
+                m_auxWindows.end());
+        });
+
+        ::DrakonDesktop::platform::ConfigureMainWindowChrome();
+
+        try
+        {
+            HWND hwnd{};
+            auto windowNative = window.as<IWindowNative>();
+            check_hresult(windowNative->get_WindowHandle(&hwnd));
+            if (hwnd != nullptr)
+            {
+                ApplyMainWindowIcon(hwnd);
+            }
+        }
+        catch (...)
+        {
+            AppendBootstrapTrace("app: remote workspace icon hookup failed");
+        }
+
+        return { true, L"Remote workspace window opened." };
+    }
+
+    void App::CloseRemoteWorkspaceWindows()
+    {
+        if (m_auxWindows.empty())
+        {
+            return;
+        }
+
+        AppendBootstrapTrace("app: closing remote workspace windows before exit");
+        auto const windowsToClose = m_auxWindows;
+        for (auto const& window : windowsToClose)
+        {
+            if (!window)
+            {
+                continue;
+            }
+
+            try
+            {
+                window.Close();
+            }
+            catch (...)
+            {
+                AppendBootstrapTrace("app: failed to close remote workspace window before exit");
+            }
         }
     }
 

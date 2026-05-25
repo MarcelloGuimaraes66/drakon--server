@@ -6,6 +6,8 @@ declare global {
     R2_BUCKET: R2Bucket;
     GOOGLE_OAUTH_CLIENT_ID: string;
     GOOGLE_OAUTH_CLIENT_SECRET: string;
+    DESKTOP_GOOGLE_OAUTH_CLIENT_ID: string;
+    DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET: string;
     GOOGLE_OAUTH_REDIRECT_URI?: string;
     DESKTOP_GOOGLE_OAUTH_REDIRECT_URI?: string;
     GOOGLE_GEOCODING_API_KEY?: string;
@@ -19,9 +21,16 @@ declare global {
     STORAGE_ROOT?: string;
     CAMERA_RECORDINGS_BASE_DIR?: string;
     APP_ALLOWED_ORIGINS?: string;
+    APP_AGENT_BASE_URL?: string;
+    APP_SERVER_ROLE?: string;
     USD_TO_BRL?: string;
     SCHEDULER_TICK_SECRET?: string;
     CHAT_V2_ENABLED?: string;
+    LOCAL_AGENT_INGEST_MODE?: string;
+    LOCAL_AGENT_INGEST_POLL_MS?: string;
+    LOCAL_AGENT_EVENT_BATCH_SIZE?: string;
+    LOCAL_AGENT_LATEST_BATCH_SIZE?: string;
+    LOCAL_AGENT_EVENT_MAX_ATTEMPTS?: string;
     APP_SCHEMA_SCOPE?: string;
     CENTRAL_AUTH_BASE_URL?: string;
     CENTRAL_AUTH_PUBLIC_KEY?: string;

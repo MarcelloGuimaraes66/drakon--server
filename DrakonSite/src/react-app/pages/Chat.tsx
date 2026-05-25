@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import Layout from "@/react-app/components/Layout";
@@ -29,11 +29,18 @@ import Toast from "@/react-app/components/Toast";
 import ModelHostingBadge from "@/react-app/components/ModelHostingBadge";
 import PendingAssistantMessage from "@/react-app/components/PendingAssistantMessage";
 import CameraEventToast from "@/react-app/components/CameraEventToast";
+import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import {
   PERCEPTRUM_CHAT_TRIAL_EXPIRED_ERROR,
   usePerceptrumChatSession,
 } from "@/react-app/hooks/usePerceptrumChatSession";
 import { useCameraEvents } from "@/react-app/hooks/useCameraEvents";
+import {
+  buildOnboardingChatCameraStatusPrompt,
+  ONBOARDING_CHAT_PREFILL_EVENT,
+} from "@/react-app/lib/onboardingChat";
+import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import { ChatMessage, ChatSession, type UploadedVideoAttachment as UploadedVideoAttachmentData } from "@/shared/types";
 import { brand, getBrandStorageKey } from "@/shared/brand";
 import { AlertCircle, Bot, User, Plus, Edit2, Check, X, Trash2 } from "lucide-react";
@@ -95,10 +102,26 @@ function getAssistantRevealId(message: ChatMessage): string {
   ].join(":");
 }
 
+function normalizeOnboardingPromptText(value: string | null | undefined): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().replace(/\s+/g, " ");
+}
+
 export default function Chat() {
   const { t, i18n } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
+  const { cameras: dashboardCameras } = useDashboardSummary();
+  const {
+    isOpen: isOnboardingOpen,
+    currentStepId: onboardingStepId,
+    tutorialCameraId,
+    tutorialCameraName,
+    next: advanceOnboarding,
+  } = useOnboarding();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -135,8 +158,35 @@ export default function Chat() {
   const animatedRevealIdsRef = useRef<Set<string>>(new Set());
   const revealScrollFrameRef = useRef<number | null>(null);
   const [activeRevealId, setActiveRevealId] = useState<string | null>(null);
+  const lastTutorialCameraPrefillPromptRef = useRef("");
+  const pendingTutorialCameraPromptRef = useRef<{
+    sessionId: number;
+    normalizedPrompt: string;
+  } | null>(null);
   const { toasts: cameraEventToasts, dismissToast: dismissCameraEventToast } = useCameraEvents(
     emptyCamerasRef.current,
+  );
+
+  const resolvedTutorialCameraName = useMemo(() => {
+    if (typeof tutorialCameraId === "number" && tutorialCameraId > 0) {
+      const matchingCamera = dashboardCameras.find((camera) => camera.id === tutorialCameraId);
+      const matchingCameraName =
+        typeof matchingCamera?.name === "string" ? matchingCamera.name.trim() : "";
+      if (matchingCameraName) {
+        return matchingCameraName;
+      }
+    }
+
+    if (typeof tutorialCameraName === "string" && tutorialCameraName.trim()) {
+      return tutorialCameraName.trim();
+    }
+
+    return null;
+  }, [dashboardCameras, tutorialCameraId, tutorialCameraName]);
+
+  const tutorialCameraStatusPrompt = useMemo(
+    () => buildOnboardingChatCameraStatusPrompt(t, resolvedTutorialCameraName),
+    [resolvedTutorialCameraName, t, i18n.language, i18n.resolvedLanguage]
   );
 
   const canChangeModelTier = true;
@@ -147,6 +197,40 @@ export default function Chat() {
     setModelTier(normalizedTier);
     localStorage.setItem(getBrandStorageKey("globalModelTier"), normalizedTier);
   }, []);
+
+  useEffect(() => {
+    const handleOnboardingChatPrefill = (event: Event) => {
+      const prompt =
+        (event as CustomEvent<{ prompt?: string }>).detail?.prompt || tutorialCameraStatusPrompt;
+      if (typeof prompt !== "string" || !prompt.trim()) {
+        return;
+      }
+
+      lastTutorialCameraPrefillPromptRef.current = normalizeOnboardingPromptText(prompt);
+      setInput(prompt);
+      window.requestAnimationFrame(() => {
+        const textarea = document.getElementById(CHAT_PAGE_TEXTAREA_ID);
+        if (!(textarea instanceof HTMLTextAreaElement)) {
+          return;
+        }
+
+        textarea.focus();
+        textarea.setSelectionRange(prompt.length, prompt.length);
+      });
+    };
+
+    window.addEventListener(
+      ONBOARDING_CHAT_PREFILL_EVENT,
+      handleOnboardingChatPrefill as EventListener
+    );
+
+    return () => {
+      window.removeEventListener(
+        ONBOARDING_CHAT_PREFILL_EVENT,
+        handleOnboardingChatPrefill as EventListener
+      );
+    };
+  }, [tutorialCameraStatusPrompt]);
 
   const {
     isLoading,
@@ -387,6 +471,48 @@ export default function Chat() {
       return currentRevealId;
     });
   }, [messages]);
+
+  useEffect(() => {
+    if (!isOnboardingOpen || onboardingStepId !== "chat-compose") {
+      pendingTutorialCameraPromptRef.current = null;
+      return;
+    }
+
+    const pendingPrompt = pendingTutorialCameraPromptRef.current;
+    if (!pendingPrompt || activeSessionId !== pendingPrompt.sessionId) {
+      return;
+    }
+
+    const latestMatchingUserMessage = [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" &&
+          normalizeOnboardingPromptText(message.content) === pendingPrompt.normalizedPrompt
+      );
+
+    if (!latestMatchingUserMessage) {
+      return;
+    }
+
+    const hasCompletedAssistantReply = messages.some((message) => {
+      const isPending = Number((message as any).is_pending || 0) === 1;
+      return (
+        message.role === "assistant" &&
+        message.id > latestMatchingUserMessage.id &&
+        !isPending &&
+        typeof message.content === "string" &&
+        message.content.trim().length > 0
+      );
+    });
+
+    if (!hasCompletedAssistantReply) {
+      return;
+    }
+
+    pendingTutorialCameraPromptRef.current = null;
+    void advanceOnboarding();
+  }, [activeSessionId, advanceOnboarding, isOnboardingOpen, messages, onboardingStepId]);
 
   const fetchSessions = async ({
     preferredSessionId = null,
@@ -645,6 +771,25 @@ export default function Chat() {
     const imageBase64 = uploadedImage;
     const draftVideo = uploadedVideo;
     const videoId = uploadedVideo?.id ?? null;
+    const normalizedUserMessage = normalizeOnboardingPromptText(userMessage);
+    const normalizedTutorialCameraPrompt = normalizeOnboardingPromptText(tutorialCameraStatusPrompt);
+    const shouldTrackTutorialCameraPrompt =
+      isOnboardingOpen &&
+      onboardingStepId === "chat-compose" &&
+      normalizedUserMessage.length > 0 &&
+      (
+        normalizedUserMessage === normalizedTutorialCameraPrompt ||
+        normalizedUserMessage === lastTutorialCameraPrefillPromptRef.current
+      );
+
+    if (shouldTrackTutorialCameraPrompt) {
+      pendingTutorialCameraPromptRef.current = {
+        sessionId: targetSessionId,
+        normalizedPrompt: normalizedUserMessage,
+      };
+    } else {
+      pendingTutorialCameraPromptRef.current = null;
+    }
 
     setInput("");
     setUploadedImage(null);
@@ -662,6 +807,7 @@ export default function Chat() {
     });
 
     if (!sendSucceeded) {
+      pendingTutorialCameraPromptRef.current = null;
       setInput(userMessage);
       setUploadedImage(imageBase64);
       if (draftVideo) {
@@ -1266,6 +1412,11 @@ export default function Chat() {
                   disabled={isCreatingSession}
                   placeholder={t("chat.placeholder")}
                   textareaId={CHAT_PAGE_TEXTAREA_ID}
+                  containerTargetId={
+                    isOnboardingOpen && onboardingStepId === "chat-compose"
+                      ? ONBOARDING_TARGETS.chatComposer
+                      : undefined
+                  }
                   variant="chat-page"
                   uploadedImage={uploadedImage}
                   onImageUpload={setUploadedImage}

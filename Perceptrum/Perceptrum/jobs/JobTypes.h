@@ -56,6 +56,19 @@ struct JobAnalysisRegion {
     JobFrameWindowNorm frame_window_norm;
 };
 
+struct PortalCounterConfig {
+    std::string region_id;
+    int min_count_to_alert = 1;
+    int min_area = 1800;
+    int max_area = 70000;
+    int warmup_frames = 60;
+    int min_track_frames_for_count = 3;
+    int max_missed_frames = 12;
+    int min_path_length_px = 85;
+    int max_proof_frames = 6;
+    bool save_annotated_video = true;
+};
+
 struct JobAgentDef {
     int id = -1;
     std::string agent_run_id;
@@ -65,6 +78,8 @@ struct JobAgentDef {
     std::string input_schema_json;
     std::optional<int> camera_id; // null means default
 
+    std::string execution_backend = "llm";
+    PortalCounterConfig portal_counter_config;
     std::string priority_level;
     std::string inference_model = "legacy"; // "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core"
     std::string api_key;
@@ -245,6 +260,13 @@ struct JobTriggerSnapshot {
 struct JobStartPayload {
     int version = 1;
     std::string job_run_id;
+    std::string shared_segment_id;
+    std::string shared_execution_domain;
+    std::string shared_owner_public_id;
+    std::string shared_operator_public_id;
+    int shared_operator_job_id = -1;
+    bool shared_allow_event_media = false;
+    bool shared_cross_camera_federation_required = false;
     // Optional global semantic end for the overall execution (ISO UTC).
     std::string execution_target_end_utc;
     JobDefSnapshot job;

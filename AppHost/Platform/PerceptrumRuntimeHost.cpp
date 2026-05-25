@@ -284,6 +284,7 @@ namespace DrakonDesktop::platform
 
         auto environmentBlock = BuildEnvironmentBlock({
             { L"APP_BASE_URL", config.uiBaseUrl },
+            { L"APP_AGENT_BASE_URL", config.agentBaseUrl },
             { L"DRAKON_WORKSPACE_ROOT", config.workspaceRoot.wstring() },
             { L"PORT", std::to_wstring(config.port) },
             { L"SYSTEM_ACTIVITY_LOG_PATH", config.systemActivityLogPath.wstring() },

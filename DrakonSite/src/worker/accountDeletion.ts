@@ -745,6 +745,7 @@ export async function purgeLocalAccountData(
   await safeRun(db, `DELETE FROM detections WHERE user_id = ?`, [appUserId]);
   await safeRun(db, `DELETE FROM notifications WHERE user_id = ?`, [appUserId]);
   await safeRun(db, `DELETE FROM events WHERE user_id = ?`, [appUserId]);
+  await safeRun(db, `DELETE FROM media_objects WHERE user_id = ?`, [appUserId]);
   await safeRun(db, `DELETE FROM video_uploads WHERE user_id = ?`, [appUserId]);
   await safeRun(db, `DELETE FROM telegram_settings WHERE user_id = ?`, [appUserId]);
   await safeRun(db, `DELETE FROM openai_settings WHERE user_id = ?`, [appUserId]);

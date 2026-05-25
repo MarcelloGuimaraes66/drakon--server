@@ -275,7 +275,7 @@ bool Logger::flushErrorBatch_(const std::vector<ErrorExportItem>& batch) noexcep
     safeCerr("[Logger] Linux error export disabled until an explicit runtime token store is injected");
     return false;
 #else
-    const std::string baseUrl = trimAscii(GetPerceptrumBaseUrl());
+    const std::string baseUrl = trimAscii(GetPerceptrumAgentBaseUrl());
     if (baseUrl.empty()) {
         safeCerr("[Logger] flushErrorBatch_: empty base URL");
         return false;

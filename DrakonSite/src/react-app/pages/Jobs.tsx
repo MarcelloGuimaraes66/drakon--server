@@ -148,6 +148,39 @@ type PromptEnhanceSuggestion = PromptEditorFields & {
   snapshot_ts_utc_iso?: string;
 };
 
+type StepAgentExecutionBackend = "llm" | "opencv_portal_counter";
+
+type PortalCounterConfig = {
+  region_id: string;
+  min_count_to_alert: number;
+  min_area: number;
+  max_area: number;
+  warmup_frames: number;
+  min_track_frames_for_count: number;
+  max_missed_frames: number;
+  min_path_length_px: number;
+  max_proof_frames: number;
+  save_annotated_video: boolean;
+};
+
+const PORTAL_COUNTER_EXECUTION_BACKEND: StepAgentExecutionBackend = "opencv_portal_counter";
+const PORTAL_COUNTER_AGENT_KEY = "portal_counter";
+const DEFAULT_PORTAL_COUNTER_SUMMARY =
+  "Counts portal passages with native OpenCV analysis after the step finishes.";
+const DEFAULT_PORTAL_COUNTER_CONFIG: PortalCounterConfig = {
+  region_id: "",
+  min_count_to_alert: 1,
+  min_area: 1800,
+  max_area: 70000,
+  warmup_frames: 60,
+  min_track_frames_for_count: 3,
+  max_missed_frames: 12,
+  min_path_length_px: 85,
+  max_proof_frames: 6,
+  save_annotated_video: true,
+};
+const IS_DRAKON_BRAND = String(brand.id || "").trim().toLowerCase() === "drakon";
+
 const OPTIONAL_SUFFIX_PATTERN = /([(\uFF08][^)\uFF09]*[)\uFF09])\s*$/u;
 const PROMPT_DOCUMENT_BLOCK_CLASS = "overflow-hidden rounded-xl border border-gray-700 bg-gray-800/70";
 const PROMPT_DOCUMENT_SECTION_CLASS = "space-y-2 px-4 py-4";
@@ -793,6 +826,100 @@ const normalizeAgentSummaryLocked = (value: unknown): boolean => {
   return false;
 };
 
+const normalizeStepAgentExecutionBackend = (
+  value: unknown
+): StepAgentExecutionBackend =>
+  String(value || "").trim().toLowerCase() === PORTAL_COUNTER_EXECUTION_BACKEND
+    ? PORTAL_COUNTER_EXECUTION_BACKEND
+    : "llm";
+
+const clampInteger = (value: unknown, fallback: number, min: number, max: number): number => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+};
+
+const normalizePortalCounterConfig = (value: unknown): PortalCounterConfig => {
+  const raw =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const regionId =
+    typeof raw.region_id === "string"
+      ? raw.region_id.trim()
+      : typeof raw.regionId === "string"
+      ? raw.regionId.trim()
+      : "";
+  return {
+    region_id: regionId,
+    min_count_to_alert: clampInteger(raw.min_count_to_alert ?? raw.minCountToAlert, 1, 0, 9999),
+    min_area: clampInteger(raw.min_area ?? raw.minArea, 1800, 1, 500000),
+    max_area: clampInteger(raw.max_area ?? raw.maxArea, 70000, 1, 1000000),
+    warmup_frames: clampInteger(raw.warmup_frames ?? raw.warmupFrames, 60, 0, 10000),
+    min_track_frames_for_count: clampInteger(
+      raw.min_track_frames_for_count ?? raw.minTrackFramesForCount,
+      3,
+      1,
+      300
+    ),
+    max_missed_frames: clampInteger(raw.max_missed_frames ?? raw.maxMissedFrames, 12, 1, 300),
+    min_path_length_px: clampInteger(raw.min_path_length_px ?? raw.minPathLengthPx, 85, 1, 5000),
+    max_proof_frames: clampInteger(raw.max_proof_frames ?? raw.maxProofFrames, 6, 1, 24),
+    save_annotated_video:
+      raw.save_annotated_video === false || raw.saveAnnotatedVideo === false ? false : true,
+  };
+};
+
+const buildStepAgentParamsPayload = (
+  sourceParamsRaw: unknown,
+  options: {
+    displayName?: string | null;
+    summary?: string | null;
+    summaryLocked?: boolean | null;
+    portalCounterEnabled: boolean;
+    portalCounterConfig?: unknown;
+  }
+): Record<string, unknown> => {
+  const paramsPayload = {
+    ...parseAgentParamsObject(sourceParamsRaw),
+  };
+  const trimmedDisplayName = String(options.displayName || "").trim();
+  const trimmedSummary = String(options.summary || "").trim();
+
+  if (trimmedDisplayName) {
+    paramsPayload.display_name = trimmedDisplayName;
+  } else {
+    delete paramsPayload.display_name;
+  }
+
+  if (trimmedSummary) {
+    paramsPayload.summary = trimmedSummary;
+  } else {
+    delete paramsPayload.summary;
+  }
+
+  if (options.summaryLocked === true) {
+    paramsPayload.summary_locked = true;
+  } else if (options.summaryLocked === false) {
+    delete paramsPayload.summary_locked;
+  }
+
+  paramsPayload.execution_backend = options.portalCounterEnabled
+    ? PORTAL_COUNTER_EXECUTION_BACKEND
+    : "llm";
+
+  if (options.portalCounterEnabled) {
+    paramsPayload.portal_counter = {
+      ...normalizePortalCounterConfig(options.portalCounterConfig),
+      save_annotated_video: true,
+    };
+  } else {
+    delete paramsPayload.portal_counter;
+  }
+
+  return paramsPayload;
+};
+
 const JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED = brand.id === "drakon";
 const DEFAULT_AGENT_USE_TEMPORAL_CONTEXT = true;
 
@@ -834,9 +961,9 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
     const requestedModelFps = normalizeAgentModelFps(
       typeof row?.model_fps === "number" ? row.model_fps : row?.modelFps
     );
-    const requestedRunEvery = normalizeAgentRunEverySeconds(
+    const requestedRunEvery = normalizeGroupRunEverySeconds(
       row?.run_every ?? row?.runEvery,
-      FIXED_AGENT_RUN_EVERY_SECONDS
+      FIXED_GROUP_RUN_EVERY_SECONDS
     );
     const requestedRunningResolution =
       normalizeAgentInferenceModel(
@@ -847,7 +974,7 @@ const parseInferenceGroups = (raw: unknown): InferenceGroup[] => {
             DEFAULT_CORE_RUNNING_RESOLUTION
           )
         : null;
-    const execution = applyAgentExecutionConstraints(
+    const execution = applyGroupExecutionConstraints(
       inputType,
       inferenceModel,
       requestedRunEvery,
@@ -1031,9 +1158,11 @@ interface Target {
 type TargetInputType = "video" | "image";
 type AgentInferenceModel = "legacy" | "pro" | "ultra" | "ultra_plus" | "light" | "core";
 type AgentRunEverySeconds = 10 | 60;
+type GroupRunEverySeconds = 10 | 60 | 300 | 600;
 type AgentRunningResolution = 640 | 1024;
 type AgentVideoPackagingMode = "mosaic_2x2" | "mosaic_3x3" | "frame_sequence";
 const FIXED_AGENT_RUN_EVERY_SECONDS: AgentRunEverySeconds = 60;
+const FIXED_GROUP_RUN_EVERY_SECONDS: GroupRunEverySeconds = 60;
 const DEFAULT_CORE_RUNNING_RESOLUTION: AgentRunningResolution = 640;
 const DEFAULT_ULTRA_VIDEO_MODEL_FPS = 1;
 const MAX_ULTRA_VIDEO_MODEL_FPS = 10;
@@ -1119,7 +1248,7 @@ interface InferenceGroup {
   priority_level?: AgentPriority | null;
   inference_model?: AgentInferenceModel;
   model_fps?: number;
-  run_every: AgentRunEverySeconds;
+  run_every: GroupRunEverySeconds;
   running_resolution?: AgentRunningResolution | null;
   only_capture_on_motion?: boolean;
   source_target_id?: number | null;
@@ -1155,6 +1284,7 @@ interface GroupAgentSourceOption {
 }
 
 const AGENT_RUN_EVERY_OPTIONS: ReadonlyArray<AgentRunEverySeconds> = [60, 10];
+const GROUP_RUN_EVERY_OPTIONS: ReadonlyArray<GroupRunEverySeconds> = [10, 60, 300, 600];
 
 const normalizeAgentRunEverySeconds = (
   value: unknown,
@@ -1176,6 +1306,31 @@ const normalizeAgentRunEverySeconds = (
     return parsed <= 10 ? 10 : 60;
   };
   return normalizeSeconds(value) ?? normalizeSeconds(fallback) ?? FIXED_AGENT_RUN_EVERY_SECONDS;
+};
+
+const normalizeGroupRunEverySeconds = (
+  value: unknown,
+  fallback: GroupRunEverySeconds = FIXED_GROUP_RUN_EVERY_SECONDS
+): GroupRunEverySeconds => {
+  const parseSeconds = (candidate: unknown): number | null => {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return Math.round(candidate);
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const parsed = Number.parseInt(candidate.trim(), 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const normalizeSeconds = (candidate: unknown): GroupRunEverySeconds | null => {
+    const parsed = parseSeconds(candidate);
+    if (parsed === null || parsed <= 0) return null;
+    if (parsed <= 10) return 10;
+    if (parsed === 300) return 300;
+    if (parsed === 600) return 600;
+    return 60;
+  };
+  return normalizeSeconds(value) ?? normalizeSeconds(fallback) ?? FIXED_GROUP_RUN_EVERY_SECONDS;
 };
 
 const normalizeAgentModelFps = (
@@ -1294,6 +1449,45 @@ const applyAgentExecutionConstraints = (
     };
 };
 
+const applyGroupExecutionConstraints = (
+  inputType: TargetInputType,
+  inferenceModel: AgentInferenceModel,
+  runEvery: GroupRunEverySeconds,
+  runningResolution: AgentRunningResolution | null | undefined,
+  modelFps: number | null | undefined
+): {
+  inputType: TargetInputType;
+  inferenceModel: AgentInferenceModel;
+  runEvery: GroupRunEverySeconds;
+  runningResolution: AgentRunningResolution | null;
+  modelFps: number;
+} => {
+  if (inferenceModel === "core") {
+    return {
+      inputType: "video",
+      inferenceModel,
+      runEvery: 60,
+      runningResolution: normalizeAgentRunningResolution(
+        runningResolution,
+        DEFAULT_CORE_RUNNING_RESOLUTION
+      ),
+      modelFps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+    };
+  }
+
+  const normalizedInputType = inputType === "image" ? "image" : "video";
+  return {
+    inputType: normalizedInputType,
+    inferenceModel,
+    runEvery: normalizeGroupRunEverySeconds(runEvery, FIXED_GROUP_RUN_EVERY_SECONDS),
+    runningResolution: null,
+    modelFps:
+      supportsAdjustableAgentVideoFps(inferenceModel) && normalizedInputType === "video"
+        ? normalizeAgentModelFps(modelFps)
+        : DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+  };
+};
+
 const normalizeAgentPriority = (value: unknown): AgentPriority => {
   if (typeof value !== "string") return "MEDIUM";
   const normalized = value.trim().toUpperCase();
@@ -1304,19 +1498,20 @@ const normalizeAgentPriority = (value: unknown): AgentPriority => {
   return "MEDIUM";
 };
 
-const parseHHMMToMinutes = (value: string): number | null => {
-  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec((value || "").trim());
+const parseTimeToSeconds = (value: string): number | null => {
+  const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))?$/.exec((value || "").trim());
   if (!match) return null;
   const hours = parseInt(match[1], 10);
   const minutes = parseInt(match[2], 10);
-  return hours * 60 + minutes;
+  const seconds = parseInt(match[3] || "0", 10);
+  return hours * 3600 + minutes * 60 + seconds;
 };
 
 const getScheduleWindowDurationSeconds = (start: string, end: string): number | null => {
-  const startMinutes = parseHHMMToMinutes(start);
-  const endMinutes = parseHHMMToMinutes(end);
-  if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) return null;
-  return (endMinutes - startMinutes) * 60;
+  const startSeconds = parseTimeToSeconds(start);
+  const endSeconds = parseTimeToSeconds(end);
+  if (startSeconds === null || endSeconds === null || endSeconds <= startSeconds) return null;
+  return endSeconds - startSeconds;
 };
 
 const getJobMaxStepTimeoutSeconds = (job: Job | null): number | null => {
@@ -1729,6 +1924,14 @@ const buildBaseFrameWindowForViewport = (
   };
 };
 
+const getFrameWindowZoom = (
+  value: FrameWindowNorm | null | undefined
+): number => {
+  const normalized = normalizeFrameWindowFromUnknown(value);
+  const dominantSpan = Math.max(normalized.width, normalized.height, 0.000001);
+  return Math.min(FRAME_WINDOW_MAX_ZOOM, Math.max(1, 1 / dominantSpan));
+};
+
 const areFrameWindowsClose = (
   a: FrameWindowNorm | null | undefined,
   b: FrameWindowNorm | null | undefined,
@@ -1747,17 +1950,18 @@ const constrainFrameWindow = (
   candidate: FrameWindowNorm,
   metrics: PreviewViewportMetrics | null | undefined
 ): FrameWindowNorm => {
+  const normalizedCandidate = normalizeFrameWindowFromUnknown(candidate);
+  if (!metrics) {
+    return normalizedCandidate;
+  }
   const base = buildBaseFrameWindowForViewport(metrics);
-  const rawWidth = clamp01(candidate.width) || base.width;
-  const rawHeight = clamp01(candidate.height) || base.height;
-  const zoom = Math.min(
-    FRAME_WINDOW_MAX_ZOOM,
-    Math.max(1, Math.max(base.width / Math.max(rawWidth, 0.000001), base.height / Math.max(rawHeight, 0.000001)))
-  );
+  const rawWidth = clamp01(normalizedCandidate.width) || base.width;
+  const rawHeight = clamp01(normalizedCandidate.height) || base.height;
+  const zoom = getFrameWindowZoom(normalizedCandidate);
   const width = base.width / zoom;
   const height = base.height / zoom;
-  const centerX = clamp01((Number(candidate.x) || 0) + rawWidth / 2);
-  const centerY = clamp01((Number(candidate.y) || 0) + rawHeight / 2);
+  const centerX = clamp01(normalizedCandidate.x + rawWidth / 2);
+  const centerY = clamp01(normalizedCandidate.y + rawHeight / 2);
   const maxX = Math.max(0, 1 - width);
   const maxY = Math.max(0, 1 - height);
   return {
@@ -2963,14 +3167,14 @@ export default function JobsPage() {
         (window) =>
           typeof window?.start_time === "string" &&
           typeof window?.end_time === "string" &&
-          parseHHMMToMinutes(window.start_time) !== null &&
-          parseHHMMToMinutes(window.end_time) !== null
+          parseTimeToSeconds(window.start_time) !== null &&
+          parseTimeToSeconds(window.end_time) !== null
       )
       .sort((a, b) => {
         const startDiff =
-          (parseHHMMToMinutes(a.start_time) ?? 0) - (parseHHMMToMinutes(b.start_time) ?? 0);
+          (parseTimeToSeconds(a.start_time) ?? 0) - (parseTimeToSeconds(b.start_time) ?? 0);
         if (startDiff !== 0) return startDiff;
-        return (parseHHMMToMinutes(a.end_time) ?? 0) - (parseHHMMToMinutes(b.end_time) ?? 0);
+        return (parseTimeToSeconds(a.end_time) ?? 0) - (parseTimeToSeconds(b.end_time) ?? 0);
       });
   };
 
@@ -4429,6 +4633,9 @@ function StepCard({
   const [groupName, setGroupName] = useState("");
   const [groupAgentKey, setGroupAgentKey] = useState("");
   const [groupAgentSourceTargetId, setGroupAgentSourceTargetId] = useState<number | null>(null);
+  const [groupRunEvery, setGroupRunEvery] = useState<GroupRunEverySeconds>(
+    FIXED_GROUP_RUN_EVERY_SECONDS
+  );
   const [inferenceGroups, setInferenceGroups] = useState<InferenceGroup[]>([]);
   const [savingInferenceGroups, setSavingInferenceGroups] = useState(false);
   const groupedTargetIds = new Set(inferenceGroups.flatMap((group) => group.targetIds));
@@ -4456,6 +4663,9 @@ function StepCard({
   const [targetCameraDraft, setTargetCameraDraft] = useState("");
   const [assigningTargetIds, setAssigningTargetIds] = useState<Set<number>>(new Set());
   const [showAllTargets, setShowAllTargets] = useState(false);
+  const [expandedInferenceGroupIds, setExpandedInferenceGroupIds] = useState<Set<string>>(
+    new Set()
+  );
   const [confirmCloneAgent, setConfirmCloneAgent] = useState<{
     isOpen: boolean;
     targetId: number | null;
@@ -4530,6 +4740,7 @@ function StepCard({
     setShowTargetSelect(false);
     setTargetPickerQuery("");
   };
+  const collapsedTargetPreviewLimit = 3;
 
   const toggleTargetPicker = () => {
     setShowTargetSelect((current) => {
@@ -4581,6 +4792,18 @@ function StepCard({
     });
   };
 
+  const toggleInferenceGroupTargets = (groupId: string) => {
+    setExpandedInferenceGroupIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
+  };
+
   const persistInferenceGroups = async (nextGroups: InferenceGroup[]): Promise<boolean> => {
     if (savingInferenceGroups) return false;
     setSavingInferenceGroups(true);
@@ -4614,6 +4837,7 @@ function StepCard({
     setGroupName("");
     setGroupAgentKey("");
     setGroupAgentSourceTargetId(null);
+    setGroupRunEvery(FIXED_GROUP_RUN_EVERY_SECONDS);
   };
 
   const openGroupModal = () => {
@@ -4640,9 +4864,20 @@ function StepCard({
           return effectiveAgent?.agent_key === preselectedAgentKey;
         })?.id ?? null
       : null;
+    const preselectedSourceOption = preselectedSourceTargetId
+      ? groupAgentSourceOptions.find((option) => option.targetId === preselectedSourceTargetId) || null
+      : preselectedAgentKey
+      ? groupAgentSourceOptions.find((option) => option.agentKey === preselectedAgentKey) || null
+      : null;
     setGroupName("");
     setGroupAgentKey(preselectedAgentKey);
     setGroupAgentSourceTargetId(preselectedSourceTargetId);
+    setGroupRunEvery(
+      normalizeGroupRunEverySeconds(
+        preselectedSourceOption?.runEvery,
+        FIXED_GROUP_RUN_EVERY_SECONDS
+      )
+    );
     setEditingGroupId(null);
     setShowGroupModal(true);
   };
@@ -4650,10 +4885,10 @@ function StepCard({
   const handleSaveGroup = async () => {
     if (!selectedGroupSourceOption) return;
     const selectedSource = selectedGroupSourceOption;
-    const sourceExecution = applyAgentExecutionConstraints(
+    const sourceExecution = applyGroupExecutionConstraints(
       selectedSource.inferenceModel === "core" ? "video" : "image",
       selectedSource.inferenceModel,
-      selectedSource.runEvery,
+      groupRunEvery,
       selectedSource.runningResolution,
       selectedSource.modelFps
     );
@@ -4743,6 +4978,12 @@ function StepCard({
     alert_condition: "",
     negative_condition: "",
   });
+  const [promptEditorPortalCounterExpanded, setPromptEditorPortalCounterExpanded] =
+    useState(false);
+  const [promptEditorPortalCounterEnabled, setPromptEditorPortalCounterEnabled] =
+    useState(false);
+  const [promptEditorPortalCounterConfig, setPromptEditorPortalCounterConfig] =
+    useState<PortalCounterConfig>(DEFAULT_PORTAL_COUNTER_CONFIG);
   const [promptEditorRegions, setPromptEditorRegions] = useState<AnalysisRegion[]>([
     buildDefaultAnalysisRegion(
       { prompt_template: "", alert_condition: "", negative_condition: "" },
@@ -4869,15 +5110,15 @@ function StepCard({
 
   const isTimeWithinScheduleWindows = (timeHHMM: string): boolean => {
     if (!scheduleDays || scheduleDays.length === 0) return true;
-    const targetMinutes = parseHHMMToMinutes(timeHHMM);
-    if (targetMinutes === null) return true;
+    const targetSeconds = parseTimeToSeconds(timeHHMM);
+    if (targetSeconds === null) return true;
     const windows = scheduleDays.flatMap((d) => d.windows || []);
     if (windows.length === 0) return true;
     return windows.some((w) => {
-      const start = parseHHMMToMinutes(w.start_time);
-      const end = parseHHMMToMinutes(w.end_time);
+      const start = parseTimeToSeconds(w.start_time);
+      const end = parseTimeToSeconds(w.end_time);
       if (start === null || end === null) return false;
-      return targetMinutes >= start && targetMinutes <= end;
+      return targetSeconds >= start && targetSeconds <= end;
     });
   };
 
@@ -4922,6 +5163,7 @@ function StepCard({
   useEffect(() => {
     setExpandedTargetId(null);
     setShowAllTargets(false);
+    setExpandedInferenceGroupIds(new Set());
     setStepDataLoaded(false);
     handledAgentDeepLinkKeyRef.current = null;
   }, [step.id]);
@@ -4937,6 +5179,20 @@ function StepCard({
   useEffect(() => {
     setInferenceGroups(parseInferenceGroups(step.inference_groups));
   }, [step.id, step.inference_groups]);
+
+  useEffect(() => {
+    setExpandedInferenceGroupIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validGroupIds = new Set(inferenceGroups.map((group) => group.id));
+      const next = new Set<string>();
+      prev.forEach((groupId) => {
+        if (validGroupIds.has(groupId)) {
+          next.add(groupId);
+        }
+      });
+      return next.size === prev.size ? prev : next;
+    });
+  }, [inferenceGroups]);
 
   useEffect(() => {
     const pipelines = parsePipelinesFromStep(step);
@@ -4976,7 +5232,7 @@ function StepCard({
       return;
     }
 
-    // Parse "start:positive:<key>", "start:negative:<key>", "start:time:<HH:MM>", or "start:elapsed:<seconds>"
+    // Parse "start:positive:<key>", "start:negative:<key>", "start:time:<HH:MM[:SS]>", or "start:elapsed:<seconds>"
     const parts = conditionStr.split(":");
     if (parts.length < 3) {
       setStartConditionForm({
@@ -6248,6 +6504,10 @@ function StepCard({
     const inferenceModel = normalizeAgentInferenceModel(source.inference_model);
     const sourceParams = parseAgentParamsObject(source.params ?? "{}");
     const summaryLocked = normalizeAgentSummaryLocked(sourceParams.summary_locked);
+    const portalCounterEnabled =
+      normalizeStepAgentExecutionBackend(sourceParams.execution_backend) ===
+      PORTAL_COUNTER_EXECUTION_BACKEND;
+    const portalCounterConfig = normalizePortalCounterConfig(sourceParams.portal_counter);
     const sourceAgentKey = String(source.agent_key || "").trim();
     const paramsDisplayName =
       typeof sourceParams.display_name === "string" ? sourceParams.display_name.trim() : "";
@@ -6256,62 +6516,78 @@ function StepCard({
       (typeof source.stored_agent_key === "string" ? sourceAgentKey : paramsDisplayName) ||
       paramsDisplayName ||
       sourceAgentKey;
+    const effectivePromptPayload = portalCounterEnabled
+      ? {
+          prompt_template: "",
+          alert_condition: "",
+          negative_condition: "",
+        }
+      : promptPayload;
+    const defaultSummary = portalCounterEnabled
+      ? DEFAULT_PORTAL_COUNTER_SUMMARY
+      : String(promptPayload.alert_condition || "").trim();
     const summary =
       summaryLocked
         ? (typeof sourceParams.summary === "string" ? sourceParams.summary.trim() : "") ||
           (typeof source.summary === "string" ? source.summary.trim() : "") ||
-          String(promptPayload.alert_condition || "").trim()
-        : String(promptPayload.alert_condition || "").trim();
-    const paramsPayload: Record<string, unknown> = {
-      ...sourceParams,
-      display_name: displayName,
-    };
-    if (summary) {
-      paramsPayload.summary = summary;
-    } else {
-      delete paramsPayload.summary;
-    }
-    if (summaryLocked) {
-      paramsPayload.summary_locked = true;
-    } else {
-      delete paramsPayload.summary_locked;
-    }
+          defaultSummary
+        : defaultSummary;
+    const paramsPayload = buildStepAgentParamsPayload(sourceParams, {
+      displayName,
+      summary,
+      summaryLocked,
+      portalCounterEnabled,
+      portalCounterConfig,
+    });
     const body: Record<string, unknown> = {
-      agent_key: source.stored_agent_key || source.agent_key,
-      prompt_template: promptPayload.prompt_template,
-      alert_condition: promptPayload.alert_condition,
-      negative_condition: promptPayload.negative_condition,
+      agent_key: portalCounterEnabled
+        ? PORTAL_COUNTER_AGENT_KEY
+        : source.stored_agent_key || source.agent_key,
+      prompt_template: effectivePromptPayload.prompt_template,
+      alert_condition: effectivePromptPayload.alert_condition,
+      negative_condition: effectivePromptPayload.negative_condition,
       camera_id: cameraId,
       params: JSON.stringify(paramsPayload),
       input_schema: source.input_schema ?? "{}",
       priority_level: source.priority_level || "MEDIUM",
-      inference_model: inferenceModel,
-      model_fps: normalizeAgentModelFps(source.model_fps),
-      run_every: normalizeAgentRunEverySeconds(
-        source.run_every,
-        FIXED_AGENT_RUN_EVERY_SECONDS
-      ),
-      video_packaging_mode: normalizeAgentVideoPackagingMode(source.video_packaging_mode),
+      inference_model: portalCounterEnabled ? "ultra" : inferenceModel,
+      model_fps: portalCounterEnabled
+        ? DEFAULT_ULTRA_VIDEO_MODEL_FPS
+        : normalizeAgentModelFps(source.model_fps),
+      run_every: portalCounterEnabled
+        ? 60
+        : normalizeAgentRunEverySeconds(source.run_every, FIXED_AGENT_RUN_EVERY_SECONDS),
+      video_packaging_mode: portalCounterEnabled
+        ? DEFAULT_AGENT_VIDEO_PACKAGING_MODE
+        : normalizeAgentVideoPackagingMode(source.video_packaging_mode),
       running_resolution:
-        inferenceModel === "core"
+        portalCounterEnabled
+          ? null
+          : inferenceModel === "core"
           ? normalizeAgentRunningResolution(
               source.running_resolution,
               DEFAULT_CORE_RUNNING_RESOLUTION
             )
           : null,
-      only_capture_on_motion: normalizeAgentOnlyCaptureOnMotion(
-        source.only_capture_on_motion
-      ),
+      only_capture_on_motion: portalCounterEnabled
+        ? false
+        : normalizeAgentOnlyCaptureOnMotion(source.only_capture_on_motion),
       face_target_ids: collectFaceTargetIdsFromRegions(analysisRegions),
       analysis_regions: analysisRegions,
     };
     const normalizedInputType =
-      inputType == null ? null : normalizeTargetInputType(inputType);
+      portalCounterEnabled
+        ? "video"
+        : inputType == null
+        ? null
+        : normalizeTargetInputType(inputType);
     if (normalizedInputType) {
       body.input_type = normalizedInputType;
     }
 
-    if (JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED) {
+    if (portalCounterEnabled) {
+      body.use_temporal_context = false;
+    } else if (JOBS_TEMPORAL_CONTEXT_TOGGLE_ENABLED) {
       body.use_temporal_context = normalizeAgentUseTemporalContext(
         source.use_temporal_context
       );
@@ -6366,10 +6642,15 @@ function StepCard({
   };
 
   const upsertAgentFromForm = async (form: AgentFormState): Promise<boolean> => {
+    const formParams = parseAgentParamsObject(form.params ?? "{}");
+    const portalCounterEnabled =
+      normalizeStepAgentExecutionBackend(formParams.execution_backend) ===
+      PORTAL_COUNTER_EXECUTION_BACKEND;
+    const portalCounterConfig = normalizePortalCounterConfig(formParams.portal_counter);
     const fallbackPromptFields = normalizePromptEditorFields({
-      prompt_template: form.prompt_template,
-      alert_condition: form.alert_condition,
-      negative_condition: form.negative_condition,
+      prompt_template: portalCounterEnabled ? "" : form.prompt_template,
+      alert_condition: portalCounterEnabled ? "" : form.alert_condition,
+      negative_condition: portalCounterEnabled ? "" : form.negative_condition,
     });
     const fallbackFaceTargetIds = Array.isArray(form.face_target_ids)
       ? form.face_target_ids
@@ -6408,7 +6689,12 @@ function StepCard({
       normalizedAgentKey === "faceid" ||
       normalizedAgentKey === "face_id" ||
       normalizedAgentKey === "face-id";
-    if (!form.agent_key || (!primaryRegion.prompt_core?.trim() && !hasFaceTargets)) {
+    const formDisplayName =
+      typeof formParams.display_name === "string" ? formParams.display_name.trim() : "";
+    if (
+      (!String(form.agent_key || "").trim() && !formDisplayName) ||
+      (!portalCounterEnabled && !primaryRegion.prompt_core?.trim() && !hasFaceTargets)
+    ) {
       alert(t("jobs.promptEditor.alertAgentKeyAndPromptRequired"));
       return false;
     }
@@ -6420,6 +6706,15 @@ function StepCard({
     if (agentFormCameraId === null) {
       alert(t("jobs.promptEditor.alertTargetCameraRequired"));
       return false;
+    }
+    if (portalCounterEnabled) {
+      const selectedPortalRegion = syncedRegions.find(
+        (region) => region.region_id === portalCounterConfig.region_id
+      );
+      if (!hasPolygonPoints(selectedPortalRegion)) {
+        onShowToast("Select a polygon region for the portal counter before saving", "warning");
+        return false;
+      }
     }
 
     try {
@@ -6895,10 +7190,10 @@ function StepCard({
           onShowToast("Start time is required", "error");
           return;
         }
-        // Validate HH:MM format
-        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+        // Validate HH:MM or HH:MM:SS format
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?$/;
         if (!timeRegex.test(startConditionForm.time)) {
-          onShowToast("Invalid time format. Use HH:MM", "error");
+          onShowToast("Invalid time format. Use HH:MM or HH:MM:SS", "error");
           return;
         }
         if (!isTimeWithinScheduleWindows(startConditionForm.time)) {
@@ -7054,6 +7349,9 @@ function StepCard({
     setShowPromptEditor(false);
     setPromptDocumentExpanded(false);
     setPromptEditorInputTypeDraft("video");
+    setPromptEditorPortalCounterExpanded(false);
+    setPromptEditorPortalCounterEnabled(false);
+    setPromptEditorPortalCounterConfig(DEFAULT_PORTAL_COUNTER_CONFIG);
     setPromptEnhanceSuggestion(null);
     setPolygonDrawEnabled(false);
     setAnalysisRegionsPanelOpen(false);
@@ -7150,6 +7448,11 @@ function StepCard({
     const sourceNegativeImageIds = extractNegativeImageIdsFromImages(
       sourceNegativeReferenceImages
     );
+    const sourceParams = parseAgentParamsObject(targetAgent?.params ?? sourceForm.params);
+    const executionBackend = normalizeStepAgentExecutionBackend(sourceParams.execution_backend);
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(
+      sourceParams.portal_counter
+    );
     const fallbackPromptFields = normalizePromptEditorFields({
       prompt_template: sourceForm.prompt_template || "",
       alert_condition: sourceForm.alert_condition || "",
@@ -7170,6 +7473,15 @@ function StepCard({
       negative_image_ids: sourceNegativeImageIds,
       context_padding_pct: 0,
     }));
+    const defaultPortalCounterRegionId =
+      (normalizedPortalCounterConfig.region_id &&
+      initialRegions.some(
+        (region) =>
+          region.region_id === normalizedPortalCounterConfig.region_id &&
+          hasPolygonPoints(region)
+      )
+        ? normalizedPortalCounterConfig.region_id
+        : "") || initialRegions.find((region) => hasPolygonPoints(region))?.region_id || "";
     const initialActiveRegion = initialRegions[0];
     const initialFrameWindow = constrainFrameWindow(
       extractFrameWindowFromAnalysisRegions(
@@ -7206,7 +7518,25 @@ function StepCard({
       alert_condition: fallbackPromptFields.alert_condition,
       negative_condition: fallbackPromptFields.negative_condition,
     });
-    setPromptEditorInputTypeDraft(initialPromptEditorInputType);
+    setPromptEditorPortalCounterEnabled(
+      IS_DRAKON_BRAND &&
+        selectedCameraId !== null &&
+        executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND
+    );
+    setPromptEditorPortalCounterExpanded(
+      IS_DRAKON_BRAND &&
+        selectedCameraId !== null &&
+        executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND
+    );
+    setPromptEditorPortalCounterConfig({
+      ...DEFAULT_PORTAL_COUNTER_CONFIG,
+      ...normalizedPortalCounterConfig,
+      region_id: defaultPortalCounterRegionId,
+      save_annotated_video: true,
+    });
+    setPromptEditorInputTypeDraft(
+      executionBackend === PORTAL_COUNTER_EXECUTION_BACKEND ? "video" : initialPromptEditorInputType
+    );
     setPolygonDrawEnabled(false);
     cancelEditingFaceTarget();
     setDeletingFaceTargetId(null);
@@ -7308,6 +7638,14 @@ function StepCard({
       template.summary.trim() ||
       normalizedPromptFields.alert_condition ||
       fallbackForm.alert_condition.trim();
+    const paramsPayload = buildStepAgentParamsPayload(fallbackForm.params, {
+      displayName,
+      summary,
+      summaryLocked: normalizeAgentSummaryLocked(
+        parseAgentParamsObject(fallbackForm.params).summary_locked
+      ),
+      portalCounterEnabled: false,
+    });
 
     return {
       inputType: execution.inputType,
@@ -7321,11 +7659,7 @@ function StepCard({
         prompt_template: normalizedPromptFields.prompt_template,
         alert_condition: normalizedPromptFields.alert_condition,
         negative_condition: normalizedPromptFields.negative_condition,
-        params: JSON.stringify({
-          ...parseAgentParamsObject(fallbackForm.params),
-          display_name: displayName,
-          summary,
-        }),
+        params: JSON.stringify(paramsPayload),
         priority_level: normalizeAgentPriority(
           template.priority_level ?? fallbackForm.priority_level
         ),
@@ -7570,11 +7904,7 @@ function StepCard({
     if (localX < 0 || localY < 0 || localX > bounds.width || localY > bounds.height) return;
     event.preventDefault();
     const anchor = { x: localX / bounds.width, y: localY / bounds.height };
-    const baseFrameWindow = buildBaseFrameWindowForViewport(bounds);
-    const currentZoom = Math.min(
-      FRAME_WINDOW_MAX_ZOOM,
-      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
-    );
+    const currentZoom = getFrameWindowZoom(promptEditorFrameWindow);
     const nextZoom = currentZoom * Math.exp(-event.deltaY * 0.0025);
     applyPromptEditorFrameZoom(nextZoom, anchor);
   };
@@ -7844,11 +8174,29 @@ function StepCard({
 
   const applyPromptEditor = async () => {
     const normalizedDraft = normalizePromptEditorFields(promptEditorDraft);
+    const portalCounterEnabled = IS_DRAKON_BRAND && promptEditorPortalCounterEnabled;
+    const normalizedPortalCounterConfig = normalizePortalCounterConfig(
+      promptEditorPortalCounterConfig
+    );
+    const selectedPortalRegion = promptEditorRegions.find(
+      (region) => region.region_id === normalizedPortalCounterConfig.region_id
+    );
+    if (portalCounterEnabled && !hasPolygonPoints(selectedPortalRegion)) {
+      onShowToast("Select a polygon region for the portal counter before saving", "warning");
+      return;
+    }
+    const normalizedDraftForSave = portalCounterEnabled
+      ? {
+          prompt_template: "",
+          alert_condition: "",
+          negative_condition: "",
+        }
+      : normalizedDraft;
     let updatedRegions = promptEditorRegions.map((region) => ({
       ...region,
-      prompt_core: normalizedDraft.prompt_template,
-      alert_condition: normalizedDraft.alert_condition,
-      negative_condition: normalizedDraft.negative_condition,
+      prompt_core: normalizedDraftForSave.prompt_template,
+      alert_condition: normalizedDraftForSave.alert_condition,
+      negative_condition: normalizedDraftForSave.negative_condition,
       context_padding_pct: 0,
     }));
 
@@ -7889,7 +8237,7 @@ function StepCard({
 
     const normalizedRegions = normalizeAnalysisRegionsForPayload(
       updatedRegions,
-      normalizedDraft,
+      normalizedDraftForSave,
       agentForm.face_target_ids,
       extractNegativeImageIdsFromImages(agentForm.negative_reference_images),
       promptEditorFrameWindow
@@ -7900,18 +8248,44 @@ function StepCard({
     );
     const syncedRegions = normalizedRegions.map((region) => ({
       ...region,
-      prompt_core: normalizedDraft.prompt_template,
-      alert_condition: normalizedDraft.alert_condition,
-      negative_condition: normalizedDraft.negative_condition,
+      prompt_core: normalizedDraftForSave.prompt_template,
+      alert_condition: normalizedDraftForSave.alert_condition,
+      negative_condition: normalizedDraftForSave.negative_condition,
       face_target_ids: normalizedFaceTargetIds,
       negative_image_ids: normalizedNegativeImageIds,
       context_padding_pct: 0,
     }));
+    const currentParams = parseAgentParamsObject(agentForm.params);
+    const summaryLocked = normalizeAgentSummaryLocked(currentParams.summary_locked);
+    const paramsPayload = buildStepAgentParamsPayload(currentParams, {
+      displayName: agentForm.agent_key,
+      summary: portalCounterEnabled
+        ? DEFAULT_PORTAL_COUNTER_SUMMARY
+        : normalizedDraftForSave.alert_condition,
+      summaryLocked,
+      portalCounterEnabled,
+      portalCounterConfig: portalCounterEnabled
+        ? {
+            ...normalizedPortalCounterConfig,
+            save_annotated_video: true,
+          }
+        : undefined,
+    });
     const nextForm: AgentFormState = {
       ...agentForm,
-      prompt_template: normalizedDraft.prompt_template,
-      alert_condition: normalizedDraft.alert_condition,
-      negative_condition: normalizedDraft.negative_condition,
+      prompt_template: normalizedDraftForSave.prompt_template,
+      alert_condition: normalizedDraftForSave.alert_condition,
+      negative_condition: normalizedDraftForSave.negative_condition,
+      params: JSON.stringify(paramsPayload),
+      inference_model: portalCounterEnabled ? "ultra" : agentForm.inference_model,
+      model_fps: portalCounterEnabled ? DEFAULT_ULTRA_VIDEO_MODEL_FPS : agentForm.model_fps,
+      run_every: portalCounterEnabled ? 60 : agentForm.run_every,
+      running_resolution: portalCounterEnabled ? null : agentForm.running_resolution,
+      video_packaging_mode: portalCounterEnabled
+        ? DEFAULT_AGENT_VIDEO_PACKAGING_MODE
+        : agentForm.video_packaging_mode,
+      only_capture_on_motion: portalCounterEnabled ? false : agentForm.only_capture_on_motion,
+      use_temporal_context: portalCounterEnabled ? false : agentForm.use_temporal_context,
       face_target_ids: normalizedFaceTargetIds,
       analysis_regions: syncedRegions,
     };
@@ -7930,6 +8304,13 @@ function StepCard({
   };
 
   const handleEnhancePromptWithAI = async () => {
+    if (IS_DRAKON_BRAND && promptEditorPortalCounterEnabled) {
+      onShowToast(
+        "Prompt enhancement is disabled while the native portal counter mode is active",
+        "warning"
+      );
+      return;
+    }
     const normalized = normalizePromptEditorFields(promptEditorDraft);
 
     if (!normalized.prompt_template) {
@@ -8345,12 +8726,8 @@ function StepCard({
     promptEditorSnapshotRefreshInFlightRef.current ||
     promptEditorSnapshotRefreshCooldownActive;
   const promptEditorCurrentZoom = useMemo(() => {
-    const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
-    return Math.min(
-      FRAME_WINDOW_MAX_ZOOM,
-      Math.max(1, baseFrameWindow.width / Math.max(promptEditorFrameWindow.width, 0.000001))
-    );
-  }, [promptEditorFrameWindow.width, promptEditorViewportMetrics]);
+    return getFrameWindowZoom(promptEditorFrameWindow);
+  }, [promptEditorFrameWindow]);
   const promptEditorHasViewportAdjustments = useMemo(() => {
     const baseFrameWindow = buildBaseFrameWindowForViewport(promptEditorViewportMetrics);
     return !areFrameWindowsClose(promptEditorFrameWindow, baseFrameWindow);
@@ -8465,18 +8842,6 @@ function StepCard({
   );
   const negativeReferenceMaxReached =
     negativeReferenceImageCount >= NEGATIVE_REFERENCE_MAX_IMAGES;
-  const promptEditorSummary = promptCoreFilled
-    ? `${promptAlertFilled ? t("jobs.promptEditor.summaryAlertConfigured") : t("jobs.promptEditor.summaryAlertMissing")} | ${
-        promptNegativeFilled
-          ? t("jobs.promptEditor.summaryNegativeConfigured")
-          : t("jobs.promptEditor.summaryNegativeOptional")
-      } | ${t("jobs.promptEditor.summaryFaceTargets", { count: promptFaceTargetCount })}`
-    : t("jobs.promptEditor.summaryConfigurePrompt");
-  const canEnhancePromptWithAI =
-    agentFormCameraId !== null &&
-    promptEditorDraft.prompt_template.trim().length > 0 &&
-    promptEditorDraft.alert_condition.trim().length > 0 &&
-    !enhancingPrompt;
   const promptEditorTarget = useMemo<Target | null>(() => {
     if (!Number.isInteger(agentFormCameraId) || (agentFormCameraId as number) <= 0) {
       return null;
@@ -8490,6 +8855,52 @@ function StepCard({
         targetInputTypes[promptEditorTarget.id] ?? promptEditorTarget.input_type
       )
     : "video";
+  const promptEditorPortalCounterRegionOptions = useMemo(
+    () => (Array.isArray(promptEditorRegions) ? promptEditorRegions.filter((region) => hasPolygonPoints(region)) : []),
+    [promptEditorRegions]
+  );
+  const promptEditorPortalCounterAvailable = IS_DRAKON_BRAND && promptEditorTarget !== null;
+  const promptEditorHasPortalCounterRegions =
+    promptEditorPortalCounterRegionOptions.length > 0;
+  const isPromptEditorPortalCounterActive =
+    promptEditorPortalCounterAvailable && promptEditorPortalCounterEnabled;
+  const promptEditorSummary = isPromptEditorPortalCounterActive
+    ? "Native portal counter configured for end-of-step OpenCV analysis."
+    : promptCoreFilled
+    ? `${promptAlertFilled ? t("jobs.promptEditor.summaryAlertConfigured") : t("jobs.promptEditor.summaryAlertMissing")} | ${
+        promptNegativeFilled
+          ? t("jobs.promptEditor.summaryNegativeConfigured")
+          : t("jobs.promptEditor.summaryNegativeOptional")
+      } | ${t("jobs.promptEditor.summaryFaceTargets", { count: promptFaceTargetCount })}`
+    : t("jobs.promptEditor.summaryConfigurePrompt");
+  const canEnhancePromptWithAI =
+    agentFormCameraId !== null &&
+    promptEditorDraft.prompt_template.trim().length > 0 &&
+    promptEditorDraft.alert_condition.trim().length > 0 &&
+    !enhancingPrompt &&
+    !isPromptEditorPortalCounterActive;
+  useEffect(() => {
+    if (promptEditorPortalCounterAvailable) return;
+    if (!promptEditorPortalCounterEnabled) return;
+    setPromptEditorPortalCounterEnabled(false);
+  }, [promptEditorPortalCounterAvailable, promptEditorPortalCounterEnabled]);
+  useEffect(() => {
+    if (!promptEditorPortalCounterEnabled) return;
+    if (promptEditorPortalCounterRegionOptions.length === 0) return;
+    const hasSelectedRegion = promptEditorPortalCounterRegionOptions.some(
+      (region) => region.region_id === promptEditorPortalCounterConfig.region_id
+    );
+    if (hasSelectedRegion) return;
+    setPromptEditorPortalCounterConfig((prev) => ({
+      ...prev,
+      region_id: promptEditorPortalCounterRegionOptions[0]?.region_id || "",
+      save_annotated_video: true,
+    }));
+  }, [
+    promptEditorPortalCounterConfig.region_id,
+    promptEditorPortalCounterEnabled,
+    promptEditorPortalCounterRegionOptions,
+  ]);
   const selectedSavedAgentLibraryEntry = useMemo(() => {
     const selectedKey = selectedSavedAgentLibraryKey.trim();
     if (!selectedKey) return null;
@@ -8506,6 +8917,19 @@ function StepCard({
       FIXED_AGENT_RUN_EVERY_SECONDS
     );
     return getRunEveryOptionLabel(normalized);
+  };
+  const getGroupRunEveryOptionLabel = (seconds: GroupRunEverySeconds): string => {
+    if (seconds === 10) return t("jobs.runEveryOption.seconds10");
+    if (seconds === 300) return t("jobs.runEveryOption.seconds300");
+    if (seconds === 600) return t("jobs.runEveryOption.seconds600");
+    return t("jobs.runEveryOption.seconds60");
+  };
+  const formatGroupRunEveryLabel = (seconds: number | null | undefined): string => {
+    const normalized = normalizeGroupRunEverySeconds(
+      seconds ?? undefined,
+      FIXED_GROUP_RUN_EVERY_SECONDS
+    );
+    return getGroupRunEveryOptionLabel(normalized);
   };
 
   const updatePromptEditorPromptCore = (value: string) => {
@@ -8545,6 +8969,43 @@ function StepCard({
         negative_condition: value,
       }))
     );
+  };
+
+  const handlePromptEditorPortalCounterToggle = (nextEnabled: boolean) => {
+    if (!promptEditorPortalCounterAvailable) {
+      return;
+    }
+    if (nextEnabled) {
+      if (!promptEditorHasPortalCounterRegions) {
+        onShowToast("Draw at least one polygon region before enabling the portal counter", "warning");
+        return;
+      }
+      const fallbackRegionId =
+        promptEditorPortalCounterConfig.region_id &&
+        promptEditorPortalCounterRegionOptions.some(
+          (region) => region.region_id === promptEditorPortalCounterConfig.region_id
+        )
+          ? promptEditorPortalCounterConfig.region_id
+          : promptEditorPortalCounterRegionOptions[0]?.region_id || "";
+      setPromptEditorPortalCounterConfig((prev) => ({
+        ...prev,
+        region_id: fallbackRegionId,
+        save_annotated_video: true,
+      }));
+      setPromptEditorInputTypeDraft("video");
+      setAgentForm((prev) => ({
+        ...prev,
+        inference_model: "ultra",
+        model_fps: DEFAULT_ULTRA_VIDEO_MODEL_FPS,
+        run_every: 60,
+        running_resolution: null,
+        video_packaging_mode: DEFAULT_AGENT_VIDEO_PACKAGING_MODE,
+        only_capture_on_motion: false,
+        use_temporal_context: false,
+      }));
+      setPromptEditorPortalCounterExpanded(true);
+    }
+    setPromptEditorPortalCounterEnabled(nextEnabled);
   };
 
   const renderPromptEditorDocument = (options?: { expanded?: boolean }) => {
@@ -8982,7 +9443,9 @@ function StepCard({
 
   const forceAllTargetsVisible = showTargetSelect || isTargetMultiSelect;
   const visibleTargets =
-    forceAllTargetsVisible || showAllTargets ? targets : targets.slice(0, 3);
+    forceAllTargetsVisible || showAllTargets
+      ? targets
+      : targets.slice(0, collapsedTargetPreviewLimit);
   const hiddenTargetsCount = Math.max(0, targets.length - visibleTargets.length);
   const isCompactFlow = density === "compact";
   const stepActionBaseClass =
@@ -9554,7 +10017,7 @@ function StepCard({
                   <span className="text-[11px] text-gray-500">
                     {visibleTargets.length} / {targets.length} {targets.length === 1 ? "camera" : "cameras"}
                   </span>
-                  {targets.length > 3 && !forceAllTargetsVisible ? (
+                  {targets.length > collapsedTargetPreviewLimit && !forceAllTargetsVisible ? (
                     <button
                       type="button"
                       onClick={() => setShowAllTargets((current) => !current)}
@@ -9717,90 +10180,136 @@ function StepCard({
                       </span>
                     </div>
                     <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      {inferenceGroups.map((group) => (
-                        <div
-                          key={group.id}
-                          className="rounded-xl border border-blue-500/30 bg-blue-600/15 p-4"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="text-sm font-medium text-blue-100">
-                              {group.name}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <button
-                                type="button"
-                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
-                                title={t("jobs.editGroup")}
-                                onClick={() => {
-                                  const inferredSourceTargetId =
-                                    group.source_target_id ??
-                                    group.targetIds.find((targetId) => {
-                                      const target = targets.find((t) => t.id === targetId);
-                                      if (!target) return false;
-                                      const targetAgent = agents.find(
-                                        (agent) =>
-                                          agent.is_active === 1 &&
-                                          agent.camera_id === target.camera_id
-                                      );
-                                      const effectiveAgent = targetAgent || defaultAgent;
-                                      return effectiveAgent?.agent_key === group.agentKey;
-                                    }) ??
-                                    null;
-                                  setEditingGroupId(group.id);
-                                  setGroupName(group.name);
-                                  setGroupAgentKey(group.agentKey);
-                                  setGroupAgentSourceTargetId(inferredSourceTargetId);
-                                  setShowGroupModal(true);
-                                }}
-                              >
-                                <Edit2 className="w-4 h-4" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveGroup(group.id)}
-                                className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
-                                title={t("jobs.deleteGroup")}
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
-                            </div>
-                          </div>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            {group.targetIds.map((targetId) => {
-                              const target = targets.find((t) => t.id === targetId);
-                              if (!target) return null;
-                              const targetLabel =
-                                target.camera_name || `Camera ${target.camera_id}`;
-                              return (
-                                <span
-                                  key={targetId}
-                                  title={targetLabel}
-                                  className="inline-flex min-w-0 max-w-full items-center rounded-full border border-blue-400/20 bg-blue-900/40 px-3 py-1.5 text-xs font-medium text-blue-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
-                                >
-                                  <span className="min-w-0 truncate whitespace-nowrap">
-                                    {targetLabel}
-                                  </span>
-                                </span>
-                              );
-                            })}
-                          </div>
-                          <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
-                            {t("jobs.unifiedAgent")}
-                          </div>
+                      {inferenceGroups.map((group) => {
+                        const showAllGroupTargets = expandedInferenceGroupIds.has(group.id);
+                        const visibleGroupTargetIds = showAllGroupTargets
+                          ? group.targetIds
+                          : group.targetIds.slice(0, collapsedTargetPreviewLimit);
+                        const hiddenGroupTargetCount = Math.max(
+                          0,
+                          group.targetIds.length - visibleGroupTargetIds.length
+                        );
+
+                        return (
                           <div
-                            title={group.agentKey}
-                            className="min-w-0 text-sm leading-6 text-blue-100 break-words [overflow-wrap:anywhere]"
+                            key={group.id}
+                            className="rounded-xl border border-blue-500/30 bg-blue-600/15 p-4"
                           >
-                            {group.agentKey}
+                            <div className="flex items-center justify-between">
+                              <div className="text-sm font-medium text-blue-100">
+                                {group.name}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
+                                  title={t("jobs.editGroup")}
+                                  onClick={() => {
+                                    const inferredSourceTargetId =
+                                      group.source_target_id ??
+                                      group.targetIds.find((targetId) => {
+                                        const target = targets.find((t) => t.id === targetId);
+                                        if (!target) return false;
+                                        const targetAgent = agents.find(
+                                          (agent) =>
+                                            agent.is_active === 1 &&
+                                            agent.camera_id === target.camera_id
+                                        );
+                                        const effectiveAgent = targetAgent || defaultAgent;
+                                        return effectiveAgent?.agent_key === group.agentKey;
+                                      }) ??
+                                      null;
+                                    setEditingGroupId(group.id);
+                                    setGroupName(group.name);
+                                    setGroupAgentKey(group.agentKey);
+                                    setGroupAgentSourceTargetId(inferredSourceTargetId);
+                                    setGroupRunEvery(
+                                      normalizeGroupRunEverySeconds(
+                                        group.run_every,
+                                        FIXED_GROUP_RUN_EVERY_SECONDS
+                                      )
+                                    );
+                                    setShowGroupModal(true);
+                                  }}
+                                >
+                                  <Edit2 className="w-4 h-4" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveGroup(group.id)}
+                                  className="rounded-md p-1 text-blue-200 transition-colors hover:bg-blue-500/30 hover:text-white"
+                                  title={t("jobs.deleteGroup")}
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="mt-3 space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-[11px] text-blue-100/70">
+                                  {visibleGroupTargetIds.length} / {group.targetIds.length}{" "}
+                                  {group.targetIds.length === 1 ? "camera" : "cameras"}
+                                </span>
+                                {group.targetIds.length > collapsedTargetPreviewLimit ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleInferenceGroupTargets(group.id)}
+                                    className="rounded-full border border-blue-400/20 bg-blue-900/30 px-2.5 py-1 text-[11px] text-blue-100 transition-colors hover:border-blue-300/30 hover:bg-blue-900/45"
+                                  >
+                                    {showAllGroupTargets
+                                      ? t("jobs.showFewerCameras", {
+                                          defaultValue: "Show fewer",
+                                        })
+                                      : t("jobs.showMoreCameras", {
+                                          defaultValue: `Show ${hiddenGroupTargetCount} more`,
+                                        })}
+                                  </button>
+                                ) : null}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {visibleGroupTargetIds.map((targetId) => {
+                                  const target = targets.find((t) => t.id === targetId);
+                                  if (!target) return null;
+                                  const targetLabel =
+                                    target.camera_name || `Camera ${target.camera_id}`;
+                                  return (
+                                    <span
+                                      key={targetId}
+                                      title={targetLabel}
+                                      className="inline-flex min-w-0 max-w-full items-center rounded-full border border-blue-400/20 bg-blue-900/40 px-3 py-1.5 text-xs font-medium text-blue-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+                                    >
+                                      <span className="min-w-0 truncate whitespace-nowrap">
+                                        {targetLabel}
+                                      </span>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            <div className="mt-3 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.unifiedAgent")}
+                            </div>
+                            <div
+                              title={group.agentKey}
+                              className="min-w-0 text-sm leading-6 text-blue-100 break-words [overflow-wrap:anywhere]"
+                            >
+                              {group.agentKey}
+                            </div>
+                            <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.inputType")}
+                            </div>
+                            <div className="text-sm text-blue-100">
+                              {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
+                            </div>
+                            <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
+                              {t("jobs.groupRunEvery")}
+                            </div>
+                            <div className="text-sm text-blue-100">
+                              {formatGroupRunEveryLabel(group.run_every)}
+                            </div>
                           </div>
-                          <div className="mt-2 text-[11px] uppercase tracking-widest text-blue-200">
-                            {t("jobs.inputType")}
-                          </div>
-                          <div className="text-sm text-blue-100">
-                            {group.inputType === "image" ? t("jobs.image") : t("jobs.video")}
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 )}
@@ -10092,7 +10601,7 @@ function StepCard({
                                 setPromptEditorInputTypeDraft("video");
                               }
                             }}
-                            disabled={enhancingPrompt}
+                            disabled={enhancingPrompt || isPromptEditorPortalCounterActive}
                             className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                             title={t("jobs.inferenceModel")}
                             >
@@ -10115,7 +10624,8 @@ function StepCard({
                             disabled={
                               !promptEditorTarget ||
                               enhancingPrompt ||
-                              normalizeAgentInferenceModel(agentForm.inference_model) === "core"
+                              normalizeAgentInferenceModel(agentForm.inference_model) === "core" ||
+                              isPromptEditorPortalCounterActive
                             }
                             className="text-xs px-3 py-2 rounded border border-gray-700 bg-gray-900 text-gray-100 focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                             title={t("jobs.inputType")}
@@ -10162,7 +10672,10 @@ function StepCard({
                                     ),
                                   }))
                                 }
-                                disabled={normalizeAgentInferenceModel(agentForm.inference_model) === "core"}
+                                disabled={
+                                  normalizeAgentInferenceModel(agentForm.inference_model) === "core" ||
+                                  isPromptEditorPortalCounterActive
+                                }
                                 className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                                 title={t("jobs.runInterval")}
                               >
@@ -10190,7 +10703,8 @@ function StepCard({
                                       ),
                                     }))
                                   }
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                                  disabled={isPromptEditorPortalCounterActive}
+                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                                 >
                                   {!isSelectableAgentVideoPackagingMode(
                                     normalizeAgentVideoPackagingMode(agentForm.video_packaging_mode)
@@ -10240,7 +10754,8 @@ function StepCard({
                                       ),
                                     }))
                                   }
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                                  disabled={isPromptEditorPortalCounterActive}
+                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                                 >
                                   {Array.from({ length: MAX_ULTRA_VIDEO_MODEL_FPS }, (_, index) => {
                                     const fps = index + 1;
@@ -10269,7 +10784,8 @@ function StepCard({
                                       ),
                                     }))
                                   }
-                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500"
+                                  disabled={isPromptEditorPortalCounterActive}
+                                  className="w-full px-3 py-2 rounded border border-gray-700 bg-gray-800 text-gray-100 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60 disabled:cursor-not-allowed"
                                 >
                                   <option value={640}>
                                     {t("jobs.runningResolutionOption.640")}
@@ -10310,7 +10826,20 @@ function StepCard({
                                 </label>
                               </div>
                             ) : null} */}
-                            {renderPromptEditorDocument()}
+                            {!isPromptEditorPortalCounterActive ? (
+                              renderPromptEditorDocument()
+                            ) : (
+                              <div className="space-y-3 rounded-xl border border-blue-500/20 bg-blue-500/5 p-4">
+                                <div className="text-sm font-semibold text-gray-100">
+                                  Native portal counter mode
+                                </div>
+                                <p className="text-sm leading-6 text-gray-300">
+                                  Prompt Core, Alert Condition, and Negative Condition are disabled
+                                  while this step records the full video and runs OpenCV after the
+                                  timeout. The annotated video will be saved automatically.
+                                </p>
+                              </div>
+                            )}
                             <div className="space-y-2">
                               <label className="block font-mono text-[13px] font-semibold text-gray-100">
                                 {formatPromptDocumentHeading("Negative Reference Images", {
@@ -10404,6 +10933,290 @@ function StepCard({
                                 )}
                               </div>
                             </div>
+                            {IS_DRAKON_BRAND ? (
+                              <div className="space-y-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPromptEditorPortalCounterExpanded((prev) => !prev)
+                                  }
+                                  className="flex w-full items-center justify-between rounded-lg border border-gray-700 bg-gray-800/70 px-3 py-2.5 text-left transition-colors hover:border-gray-600"
+                                >
+                                  <span className="flex items-center gap-2 text-sm font-semibold text-gray-100">
+                                    {promptEditorPortalCounterExpanded ? (
+                                      <ChevronDown className="h-4 w-4 text-gray-400" />
+                                    ) : (
+                                      <ChevronRight className="h-4 w-4 text-gray-400" />
+                                    )}
+                                    Native Portal Counter
+                                  </span>
+                                  <span className="text-[11px] text-gray-500">
+                                    Drakon jobs/steps only
+                                  </span>
+                                </button>
+                                {promptEditorPortalCounterExpanded ? (
+                                  <div className="rounded-lg border border-gray-700 bg-gray-800/60 p-3 space-y-3">
+                                    <label
+                                      className={`flex items-start gap-3 rounded-lg border px-3 py-3 text-sm ${
+                                        !promptEditorPortalCounterAvailable ||
+                                        !promptEditorHasPortalCounterRegions
+                                          ? "border-gray-700 bg-gray-900/40 text-gray-500"
+                                          : "border-blue-500/20 bg-blue-500/5 text-gray-200"
+                                      }`}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={promptEditorPortalCounterEnabled}
+                                        onChange={(e) =>
+                                          handlePromptEditorPortalCounterToggle(
+                                            e.target.checked
+                                          )
+                                        }
+                                        disabled={
+                                          enhancingPrompt ||
+                                          !promptEditorPortalCounterAvailable ||
+                                          !promptEditorHasPortalCounterRegions
+                                        }
+                                        className="mt-0.5 h-4 w-4 rounded border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500 disabled:cursor-not-allowed"
+                                      />
+                                      <span className="space-y-1">
+                                        <span className="block font-medium text-gray-100">
+                                          Use OpenCV portal counter
+                                        </span>
+                                        <span className="block text-xs text-gray-400">
+                                          Capture the full step video, analyze only after the step
+                                          finishes, and always save the annotated video.
+                                        </span>
+                                      </span>
+                                    </label>
+                                    {!promptEditorPortalCounterAvailable ? (
+                                      <p className="text-xs text-gray-400">
+                                        This option appears only in the Drakon jobs/steps camera
+                                        agent editor.
+                                      </p>
+                                    ) : !promptEditorHasPortalCounterRegions ? (
+                                      <p className="text-xs text-amber-400">
+                                        Draw at least one polygon region to enable this mode.
+                                      </p>
+                                    ) : null}
+                                    {promptEditorPortalCounterEnabled ? (
+                                      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Polygon region
+                                          </span>
+                                          <select
+                                            value={promptEditorPortalCounterConfig.region_id}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                region_id: e.target.value,
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          >
+                                            {promptEditorPortalCounterRegionOptions.map((region) => (
+                                              <option
+                                                key={region.region_id}
+                                                value={region.region_id}
+                                              >
+                                                {region.label || region.region_id}
+                                              </option>
+                                            ))}
+                                          </select>
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Minimum count to alert
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            max={9999}
+                                            value={promptEditorPortalCounterConfig.min_count_to_alert}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                min_count_to_alert: clampInteger(
+                                                  e.target.value,
+                                                  1,
+                                                  0,
+                                                  9999
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Min area
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={500000}
+                                            value={promptEditorPortalCounterConfig.min_area}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                min_area: clampInteger(
+                                                  e.target.value,
+                                                  1800,
+                                                  1,
+                                                  500000
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Max area
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={1000000}
+                                            value={promptEditorPortalCounterConfig.max_area}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                max_area: clampInteger(
+                                                  e.target.value,
+                                                  70000,
+                                                  1,
+                                                  1000000
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Warmup frames
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={0}
+                                            max={10000}
+                                            value={promptEditorPortalCounterConfig.warmup_frames}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                warmup_frames: clampInteger(
+                                                  e.target.value,
+                                                  60,
+                                                  0,
+                                                  10000
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Min track frames
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={300}
+                                            value={
+                                              promptEditorPortalCounterConfig.min_track_frames_for_count
+                                            }
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                min_track_frames_for_count: clampInteger(
+                                                  e.target.value,
+                                                  3,
+                                                  1,
+                                                  300
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Max missed frames
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={300}
+                                            value={promptEditorPortalCounterConfig.max_missed_frames}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                max_missed_frames: clampInteger(
+                                                  e.target.value,
+                                                  12,
+                                                  1,
+                                                  300
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Min path length (px)
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={5000}
+                                            value={promptEditorPortalCounterConfig.min_path_length_px}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                min_path_length_px: clampInteger(
+                                                  e.target.value,
+                                                  85,
+                                                  1,
+                                                  5000
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                        <label className="space-y-1">
+                                          <span className="block text-xs font-medium uppercase tracking-[0.12em] text-gray-400">
+                                            Max proof frames
+                                          </span>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={24}
+                                            value={promptEditorPortalCounterConfig.max_proof_frames}
+                                            onChange={(e) =>
+                                              setPromptEditorPortalCounterConfig((prev) => ({
+                                                ...prev,
+                                                max_proof_frames: clampInteger(
+                                                  e.target.value,
+                                                  6,
+                                                  1,
+                                                  24
+                                                ),
+                                              }))
+                                            }
+                                            className="w-full rounded border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                                          />
+                                        </label>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
                             </div>
                             {enhancingPrompt ? (
                               <div className="absolute -inset-px z-20 rounded-xl bg-gray-950/55 backdrop-blur-[2px] flex items-center justify-center">
@@ -11271,6 +12084,11 @@ function StepCard({
                           type="button"
                           onClick={handleEnhancePromptWithAI}
                           disabled={!canEnhancePromptWithAI}
+                          title={
+                            isPromptEditorPortalCounterActive
+                              ? "Disabled while native portal counter mode is active"
+                              : undefined
+                          }
                           className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 border border-white/85 hover:border-white disabled:bg-gray-600 disabled:border-white/35 disabled:cursor-not-allowed text-white text-sm inline-flex items-center gap-1.5 shadow-[0_0_0_1px_rgba(255,255,255,0.12)]"
                         >
                           <Sparkles className="w-3.5 h-3.5" />
@@ -11533,8 +12351,46 @@ function StepCard({
                       {t("jobs.inputType")}
                     </label>
                     <div className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-gray-200 text-sm">
-                      {t("jobs.image")}
+                      {selectedGroupSourceOption?.inferenceModel === "core"
+                        ? t("jobs.video")
+                        : t("jobs.image")}
                     </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs uppercase tracking-widest text-gray-400 mb-2">
+                      {t("jobs.groupRunEvery")}
+                    </label>
+                    <select
+                      value={
+                        selectedGroupSourceOption?.inferenceModel === "core" ? 60 : groupRunEvery
+                      }
+                      onChange={(e) =>
+                        setGroupRunEvery(
+                          normalizeGroupRunEverySeconds(
+                            Number(e.target.value),
+                            FIXED_GROUP_RUN_EVERY_SECONDS
+                          )
+                        )
+                      }
+                      disabled={
+                        !selectedGroupSourceOption ||
+                        selectedGroupSourceOption.inferenceModel === "core"
+                      }
+                      className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded text-gray-200 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-60"
+                    >
+                      {GROUP_RUN_EVERY_OPTIONS.map((seconds) => (
+                        <option key={seconds} value={seconds}>
+                          {getGroupRunEveryOptionLabel(seconds)}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedGroupSourceOption?.inferenceModel === "core" ? (
+                      <p className="mt-2 text-xs text-amber-300">
+                        {t("jobs.coreGroupRunEveryFixed", {
+                          defaultValue: "Core groups currently use a fixed 60-second cadence.",
+                        })}
+                      </p>
+                    ) : null}
                   </div>
                   <div>
                     <label className="block text-xs uppercase tracking-widest text-gray-400 mb-2">
@@ -11748,10 +12604,11 @@ function StepCard({
                 {startConditionForm.mode === "time" && (
                   <div>
                     <label className="block text-xs text-gray-400 mb-1">
-                      {t("jobs.startTimeHHMM")}
+                      {t("jobs.startTimeHHMMSS", { defaultValue: "Start Time (HH:MM:SS)" })}
                     </label>
                     <input
                       type="time"
+                      step={1}
                       value={startConditionForm.time}
                       onChange={(e) =>
                         setStartConditionForm({

@@ -5,7 +5,7 @@ interface DashboardAlertEvent {
   id: number;
 }
 
-const ALERT_POLL_INTERVAL_MS = 3000;
+const ALERT_POLL_INTERVAL_MS = 4000;
 const DASHBOARD_REFRESH_THROTTLE_MS = 1500;
 
 export function useDashboardAlertRefresh(refresh: () => void) {

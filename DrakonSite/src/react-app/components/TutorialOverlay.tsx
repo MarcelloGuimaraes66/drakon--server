@@ -15,6 +15,12 @@ import { useTranslation } from "react-i18next";
 import ChatPlexusBackground from "@/react-app/components/ChatPlexusBackground";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
 import {
+  buildOnboardingChatActiveFollowUpPrompt,
+  buildOnboardingChatCameraStatusPrompt,
+  buildOnboardingChatRecoveryPrompt,
+  ONBOARDING_CHAT_PREFILL_EVENT,
+} from "@/react-app/lib/onboardingChat";
+import {
   getOnboardingTargetId,
   getOnboardingTargetSelector,
   ONBOARDING_TARGETS,
@@ -120,11 +126,18 @@ function getStepView(
   stepId: OnboardingStepId | null,
   tutorialKind: OnboardingTutorialKind,
   provider: OnboardingProviderKind | null,
+  tutorialCameraName: string | null,
   tutorialProceedWithoutWebcam: boolean,
   inlineMessage: string,
   t: TFunction
 ): StepView | null {
   const providerMeta = getProviderMeta(provider, t);
+  const tutorialCameraPrompt = buildOnboardingChatCameraStatusPrompt(t, tutorialCameraName);
+  const tutorialChatActiveFollowUpPrompt = buildOnboardingChatActiveFollowUpPrompt(
+    t,
+    tutorialCameraName
+  );
+  const tutorialChatRecoveryPrompt = buildOnboardingChatRecoveryPrompt(t, tutorialCameraName);
 
   switch (stepId) {
     case "welcome":
@@ -478,6 +491,74 @@ function getStepView(
         panelMaxWidth: 560,
         accentClassName: "from-amber-500/18 to-orange-500/10 border-amber-400/35 text-amber-100",
       };
+    case "chat-offer":
+      return {
+        title: t("tutorial.chatOffer.title"),
+        description: t("tutorial.chatOffer.description"),
+        bullets: [
+          t("tutorial.chatOffer.bullet1"),
+          t("tutorial.chatOffer.bullet2"),
+        ],
+        primaryLabel: t("tutorial.chatOffer.primary"),
+        showBack: true,
+        centered: true,
+        panelMaxWidth: 580,
+        accentClassName: "from-cyan-500/18 to-blue-500/10 border-cyan-400/35 text-cyan-100",
+      };
+    case "chat-intro":
+      return {
+        title: t("tutorial.chatIntro.title"),
+        description: t("tutorial.chatIntro.description"),
+        bullets: [
+          t("tutorial.chatIntro.bullet1"),
+          t("tutorial.chatIntro.bullet2"),
+          t("tutorial.chatIntro.bullet3"),
+        ],
+        stageLabel: t("tutorial.entry.menu.chat.label"),
+        stageProgress: t("tutorial.common.progressOfTotal", { current: 1, total: 3 }),
+        primaryLabel: t("tutorial.chatIntro.primary"),
+        centered: true,
+        panelMaxWidth: 600,
+        accentClassName: "from-sky-500/18 to-indigo-500/10 border-sky-400/35 text-sky-100",
+      };
+    case "chat-compose":
+      return {
+        title: t("tutorial.chatCompose.title"),
+        description: tutorialCameraName
+          ? t("tutorial.chatCompose.descriptionWithCamera", { cameraName: tutorialCameraName })
+          : t("tutorial.chatCompose.descriptionWithoutCamera"),
+        bullets: [
+          t("tutorial.chatCompose.bullet1"),
+          t("tutorial.chatCompose.bullet2"),
+        ],
+        stageLabel: t("tutorial.entry.menu.chat.label"),
+        stageProgress: t("tutorial.common.progressOfTotal", { current: 2, total: 3 }),
+        primaryLabel: t("tutorial.chatCompose.primary"),
+        showBack: true,
+        hint: tutorialCameraPrompt,
+        accentClassName: "from-blue-500/18 to-cyan-500/10 border-blue-400/35 text-blue-100",
+      };
+    case "chat-examples":
+      return {
+        title: t("tutorial.chatExamples.title"),
+        description: t("tutorial.chatExamples.description"),
+        bullets: [
+          t("tutorial.chatExamples.activeBullet", {
+            prompt: tutorialChatActiveFollowUpPrompt,
+          }),
+          t("tutorial.chatExamples.recoveryBullet", {
+            prompt: tutorialChatRecoveryPrompt,
+          }),
+          t("tutorial.chatExamples.generalBullet"),
+        ],
+        stageLabel: t("tutorial.entry.menu.chat.label"),
+        stageProgress: t("tutorial.common.progressOfTotal", { current: 3, total: 3 }),
+        primaryLabel: t("tutorial.chatExamples.primary"),
+        showBack: true,
+        centered: true,
+        panelMaxWidth: 620,
+        accentClassName: "from-violet-500/18 to-cyan-500/10 border-violet-400/35 text-violet-100",
+      };
     case "complete":
       if (tutorialKind === "api-key") {
         return {
@@ -526,6 +607,21 @@ function getStepView(
         };
       }
 
+      if (tutorialKind === "chat") {
+        return {
+          title: t("tutorial.complete.chat.title"),
+          description: t("tutorial.complete.chat.description"),
+          bullets: [
+            t("tutorial.complete.chat.bullet1"),
+            t("tutorial.complete.chat.bullet2"),
+          ],
+          primaryLabel: t("tutorial.complete.primary"),
+          centered: true,
+          panelMaxWidth: 560,
+          accentClassName: "from-cyan-500/20 to-blue-500/10 border-cyan-400/35 text-cyan-100",
+        };
+      }
+
       return {
         title: t("tutorial.complete.title"),
         description: tutorialProceedWithoutWebcam
@@ -558,6 +654,8 @@ export default function TutorialOverlay() {
     tutorialKind,
     currentStepId,
     selectedProvider,
+    tutorialCameraId,
+    tutorialCameraName,
     providerStatus,
     inlineMessage,
     tutorialProceedWithoutWebcam,
@@ -585,6 +683,7 @@ export default function TutorialOverlay() {
         currentStepId,
         tutorialKind,
         selectedProvider,
+        tutorialCameraName,
         tutorialProceedWithoutWebcam,
         inlineMessage,
         t
@@ -596,6 +695,7 @@ export default function TutorialOverlay() {
       inlineMessage,
       selectedProvider,
       t,
+      tutorialCameraName,
       tutorialKind,
       tutorialProceedWithoutWebcam,
     ]
@@ -852,6 +952,14 @@ export default function TutorialOverlay() {
       return;
     }
 
+    if (currentStepId === "chat-offer") {
+      startTutorial("chat", {
+        cameraId: tutorialCameraId,
+        cameraName: tutorialCameraName,
+      });
+      return;
+    }
+
     if (currentStepId === "complete") {
       finishTutorial();
       return;
@@ -889,6 +997,17 @@ export default function TutorialOverlay() {
         );
         saveButton?.click();
       }
+      return;
+    }
+
+    if (currentStepId === "chat-compose") {
+      window.dispatchEvent(
+        new CustomEvent(ONBOARDING_CHAT_PREFILL_EVENT, {
+          detail: {
+            prompt: buildOnboardingChatCameraStatusPrompt(t, tutorialCameraName),
+          },
+        })
+      );
       return;
     }
 

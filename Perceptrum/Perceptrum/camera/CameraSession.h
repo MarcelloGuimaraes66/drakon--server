@@ -71,6 +71,7 @@ public:
     ~CameraSession();
 
     const std::string& id() const { return config_.id; }
+    const CameraConfig& getConfig() const { return config_; }
 
     void start();
     void stop();
@@ -142,13 +143,13 @@ private:
     void sendThumbnail_(const cv::Mat& frame);
 
     void thumbnailLoop_();
-    void enqueueThumbnail_(std::string b64);
+    void enqueueThumbnail_(std::vector<unsigned char> jpegBytes);
 
     std::thread thumbnailThread_;
     std::atomic<bool> thumbnailStop_{ false };
     std::mutex thumbnailMutex_;
     std::condition_variable thumbnailCv_;
-    std::string pendingThumbnailB64_;
+    std::vector<unsigned char> pendingThumbnailBytes_;
     bool thumbnailPending_{ false };
 
 
@@ -204,10 +205,14 @@ private:
     std::unordered_map<std::string, std::deque<TemporalEvidenceItem>> temporalEvidenceByAlgo_;
 
     void maybeUpdateJobStill_(const cv::Mat& frame, std::chrono::steady_clock::time_point now);
+    void maybeWriteDailyReport_(const cv::Mat& frame, std::chrono::steady_clock::time_point now);
     mutable std::mutex jobStillMutex_;
     std::string lastJobStillB64_;
     std::chrono::steady_clock::time_point lastJobStillAt_{};
     std::string lastJobStillTsUtcIso_;
+    std::string lastDailyReportDateToken_;
+    std::string dailyReportRetryDateToken_;
+    std::chrono::steady_clock::time_point nextDailyReportRetryAt_{};
 
     std::atomic<std::uint64_t> telemetryLastFrameTickMs_{ 0 };
     std::atomic<double> telemetryActualFps_{ 0.0 };

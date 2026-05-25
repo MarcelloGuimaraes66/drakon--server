@@ -443,6 +443,69 @@ namespace
         return settings;
     }
 
+    winrt::DrakonDesktop::services::AuthState::AccountPermissions ParseAccountPermissions(
+        json const& object)
+    {
+        winrt::DrakonDesktop::services::AuthState::AccountPermissions permissions;
+        permissions.viewCameras = JsonBool(object, "view_cameras");
+        permissions.executeCameras = JsonBool(object, "execute_cameras");
+        permissions.viewTasks = JsonBool(object, "view_tasks");
+        permissions.executeTasks = JsonBool(object, "execute_tasks");
+        permissions.viewAgents = JsonBool(object, "view_agents");
+        permissions.executeAgents = JsonBool(object, "execute_agents");
+        permissions.chat = JsonBool(object, "chat");
+        return permissions;
+    }
+
+    winrt::DrakonDesktop::services::AccountUserRecord ParseAccountUserRecord(json const& object)
+    {
+        winrt::DrakonDesktop::services::AccountUserRecord record;
+        record.memberUserId = JsonString(object, "member_user_id");
+        record.accountUserId = JsonString(object, "account_user_id");
+        record.email = JsonString(object, "email");
+        record.role = JsonString(object, "role");
+        record.status = JsonString(object, "status");
+        record.isOwner = JsonBool(object, "is_owner");
+        record.isAdmin = JsonBool(object, "is_admin");
+        record.canManageSettings = JsonBool(object, "can_manage_settings");
+        record.fullAccess = JsonBool(object, "full_access");
+        record.updatedAt = JsonString(object, "updated_at");
+
+        if (object.contains("permissions") && object["permissions"].is_object())
+        {
+            auto const& permissions = object["permissions"];
+            record.viewCameras = JsonBool(permissions, "view_cameras");
+            record.executeCameras = JsonBool(permissions, "execute_cameras");
+            record.viewTasks = JsonBool(permissions, "view_tasks");
+            record.executeTasks = JsonBool(permissions, "execute_tasks");
+            record.viewAgents = JsonBool(permissions, "view_agents");
+            record.executeAgents = JsonBool(permissions, "execute_agents");
+            record.chat = JsonBool(permissions, "chat");
+        }
+
+        return record;
+    }
+
+    json BuildAccountUserPermissionsPayload(
+        bool viewCameras,
+        bool executeCameras,
+        bool viewTasks,
+        bool executeTasks,
+        bool viewAgents,
+        bool executeAgents,
+        bool chat)
+    {
+        return json{
+            { "view_cameras", viewCameras },
+            { "execute_cameras", executeCameras },
+            { "view_tasks", viewTasks },
+            { "execute_tasks", executeTasks },
+            { "view_agents", viewAgents },
+            { "execute_agents", executeAgents },
+            { "chat", chat },
+        };
+    }
+
     winrt::DrakonDesktop::services::PairingConnection ParsePairingConnection(json const& object)
     {
         winrt::DrakonDesktop::services::PairingConnection connection;
@@ -1401,6 +1464,23 @@ namespace winrt::DrakonDesktop::services
                 {
                     result.value.displayName = JsonString(user["google_user_data"], "name");
                 }
+                if (user.contains("account_access") && user["account_access"].is_object())
+                {
+                    auto const& access = user["account_access"];
+                    result.value.accountUserId = JsonString(access, "account_user_id");
+                    result.value.actorUserId = JsonString(access, "actor_user_id");
+                    result.value.accountRole = JsonString(access, "role");
+                    result.value.accountStatus = JsonString(access, "status");
+                    result.value.isAccountOwner = JsonBool(access, "is_owner");
+                    result.value.isAccountAdmin = JsonBool(access, "is_admin");
+                    result.value.canManageSettings = JsonBool(access, "can_manage_settings");
+                    result.value.hasFullAccess = JsonBool(access, "full_access");
+                    result.value.managedPassword = JsonBool(access, "managed_password");
+                    if (access.contains("permissions") && access["permissions"].is_object())
+                    {
+                        result.value.permissions = ParseAccountPermissions(access["permissions"]);
+                    }
+                }
             }
             result.success = true;
             return result;
@@ -1657,6 +1737,187 @@ namespace winrt::DrakonDesktop::services
             result.error = "Invalid Telegram settings save response";
             return result;
         }
+    }
+
+    ServiceValueResponse<AccountUsersSnapshot> DrakonApiClient::GetAccountUsers()
+    {
+        ServiceValueResponse<AccountUsersSnapshot> result;
+        auto response = SendRequest("GET", "/api/account-users", std::nullopt, true);
+        result.statusCode = response.statusCode;
+
+        if (!response.transportOk)
+        {
+            result.error = response.error;
+            return result;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300)
+        {
+            result.error = JsonErrorMessage(response.body, response.statusCode, "Failed to load account users");
+            return result;
+        }
+
+        try
+        {
+            auto parsed = json::parse(response.body);
+            result.value.canAssignAdmin = JsonBool(parsed, "can_assign_admin");
+            if (parsed.contains("users") && parsed["users"].is_array())
+            {
+                for (auto const& item : parsed["users"])
+                {
+                    result.value.users.push_back(ParseAccountUserRecord(item));
+                }
+            }
+            result.success = true;
+            return result;
+        }
+        catch (...)
+        {
+            result.error = "Invalid account users response";
+            return result;
+        }
+    }
+
+    ServiceValueResponse<AccountUserRecord> DrakonApiClient::CreateAccountUser(
+        AccountUserCreateRequest const& request)
+    {
+        ServiceValueResponse<AccountUserRecord> result;
+        json payload = {
+            { "email", request.email },
+            { "password", request.password },
+            { "role", request.role },
+            { "full_access", request.fullAccess },
+            {
+                "permissions",
+                BuildAccountUserPermissionsPayload(
+                    request.viewCameras,
+                    request.executeCameras,
+                    request.viewTasks,
+                    request.executeTasks,
+                    request.viewAgents,
+                    request.executeAgents,
+                    request.chat)
+            },
+        };
+
+        auto response = SendRequest("POST", "/api/account-users", payload.dump(), true);
+        result.statusCode = response.statusCode;
+
+        if (!response.transportOk)
+        {
+            result.error = response.error;
+            return result;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300)
+        {
+            result.error = JsonErrorMessage(response.body, response.statusCode, "Failed to create account user");
+            return result;
+        }
+
+        try
+        {
+            auto parsed = json::parse(response.body);
+            if (!parsed.contains("user") || !parsed["user"].is_object())
+            {
+                result.error = "Account user payload missing from response";
+                return result;
+            }
+            result.value = ParseAccountUserRecord(parsed["user"]);
+            result.success = true;
+            return result;
+        }
+        catch (...)
+        {
+            result.error = "Invalid account user create response";
+            return result;
+        }
+    }
+
+    ServiceValueResponse<AccountUserRecord> DrakonApiClient::UpdateAccountUser(
+        std::string const& memberUserId,
+        AccountUserUpdateRequest const& request)
+    {
+        ServiceValueResponse<AccountUserRecord> result;
+        json payload = {
+            { "role", request.role },
+            { "status", request.status },
+            { "full_access", request.fullAccess },
+            {
+                "permissions",
+                BuildAccountUserPermissionsPayload(
+                    request.viewCameras,
+                    request.executeCameras,
+                    request.viewTasks,
+                    request.executeTasks,
+                    request.viewAgents,
+                    request.executeAgents,
+                    request.chat)
+            },
+        };
+
+        auto path = "/api/account-users/" + memberUserId;
+        auto response = SendRequest("PATCH", path, payload.dump(), true);
+        result.statusCode = response.statusCode;
+
+        if (!response.transportOk)
+        {
+            result.error = response.error;
+            return result;
+        }
+
+        if (response.statusCode < 200 || response.statusCode >= 300)
+        {
+            result.error = JsonErrorMessage(response.body, response.statusCode, "Failed to update account user");
+            return result;
+        }
+
+        try
+        {
+            auto parsed = json::parse(response.body);
+            if (!parsed.contains("user") || !parsed["user"].is_object())
+            {
+                result.error = "Account user payload missing from response";
+                return result;
+            }
+            result.value = ParseAccountUserRecord(parsed["user"]);
+            result.success = true;
+            return result;
+        }
+        catch (...)
+        {
+            result.error = "Invalid account user update response";
+            return result;
+        }
+    }
+
+    ServiceResponse DrakonApiClient::ResetAccountUserPassword(
+        std::string const& memberUserId,
+        std::string const& password)
+    {
+        ServiceResponse result;
+        json payload = {
+            { "password", password },
+        };
+        auto path = "/api/account-users/" + memberUserId + "/password";
+        auto response = SendRequest("POST", path, payload.dump(), true);
+        result.statusCode = response.statusCode;
+
+        if (!response.transportOk)
+        {
+            result.error = response.error;
+            return result;
+        }
+
+        result.success = response.statusCode >= 200 && response.statusCode < 300;
+        if (!result.success)
+        {
+            result.error = JsonErrorMessage(
+                response.body,
+                response.statusCode,
+                "Failed to update account user password");
+        }
+        return result;
     }
 
     ServiceValueResponse<PairCodeSnapshot> DrakonApiClient::GeneratePairCode()

@@ -7,6 +7,7 @@ namespace winrt::DrakonDesktop::implementation
     struct SiteHostPage : winrt::Microsoft::UI::Xaml::Controls::PageT<SiteHostPage>
     {
         SiteHostPage();
+        SiteHostPage(winrt::hstring const& initialNavigationUrl, bool enableResidentRuntimeBridge);
 
         void InitializeComponent();
 
@@ -55,5 +56,7 @@ namespace winrt::DrakonDesktop::implementation
         bool m_pairingCompleted{ false };
         bool m_pairingRequested{ false };
         std::uint64_t m_navigationToken{ 0 };
+        winrt::hstring m_initialNavigationUrl;
+        bool m_enableResidentRuntimeBridge{ true };
     };
 }

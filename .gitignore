@@ -3,6 +3,8 @@
 .codex-logs/
 .repo-backups/
 _tmp*/
+.tmp_logs_1/
+tmp_ensureSchema_excerpt.txt
 brand.txt
 *.obj
 *.log
@@ -11,6 +13,8 @@ backup.zip
 _CPack_Packages/
 perceptrum-desktop_*.deb
 perceptrum-desktop_*.tar.gz
+scratch/
+/-
 
 # Legacy nested git repositories to be flattened into the root repo
 DrakonSite/.git/

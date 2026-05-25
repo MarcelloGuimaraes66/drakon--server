@@ -1,4 +1,5 @@
-import { useState, useRef, useMemo, useEffect } from "react";
+import { type ReactElement, useState, useRef, useMemo, useEffect } from "react";
+import { useAuth } from "@getmocha/users-service/react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router";
 import { useTranslation } from "react-i18next";
 import CameraBulkImportModal from "@/react-app/components/CameraBulkImportModal";
@@ -21,26 +22,52 @@ import {
   type CameraDirectoryState,
   type CameraDirectoryTab,
 } from "@/react-app/hooks/useCameraDirectory";
-import { EventsProvider, useEvents } from "@/react-app/contexts/EventsContext";
-import { useDashboardSummary } from "@/react-app/hooks/useDashboardSummary";
+import {
+  EventsProvider,
+  PassiveEventsProvider,
+  useEvents,
+} from "@/react-app/contexts/EventsContext";
+import { useAgentCameraDirectory } from "@/react-app/hooks/useAgentCameraDirectory";
 import { useThumbnailPolling } from "@/react-app/hooks/useThumbnailPolling";
 import { useThumbnailRecovery } from "@/react-app/hooks/useThumbnailRecovery";
 import { useBillingCheck } from "@/react-app/hooks/useBillingCheck";
+import { useEffectiveUser } from "@/react-app/hooks/useEffectiveUser";
 import { useOnboarding } from "@/react-app/hooks/useOnboarding";
+import {
+  canCreateCameras,
+  canExecuteAgents,
+  canExecuteCameras,
+  canViewCameras,
+  canViewEvents,
+} from "@/react-app/lib/accountAccess";
 import {
   getCameraConnectionState,
   isCameraOnline,
   isCameraServiceRunning,
 } from "@/react-app/lib/cameraStatus";
-import { Camera as CameraType, dashboardSummaryStore } from "@/react-app/lib/DashboardSummaryStore";
+import { type Camera as CameraType } from "@/react-app/lib/DashboardSummaryStore";
 import { ONBOARDING_TARGETS } from "@/react-app/lib/onboarding";
 import {
   createCamerasFromDiscoveryImport,
   formatDiscoveryImportErrorMessage,
   type CameraDiscoveryImportRequest,
 } from "@/react-app/utils/cameraDiscovery";
-import { toggleCameraService } from "@/react-app/utils/cameraService";
+import {
+  applyCameraCaptureAcceleration,
+  type CameraCaptureAccelerationMode,
+} from "@/react-app/utils/cameraCaptureAcceleration";
+import {
+  describeCameraStartBlockedError,
+  toggleCameraService,
+} from "@/react-app/utils/cameraService";
+import {
+  getSharedCameraAttribution,
+  getSharedCameraStatusLabel,
+  getSharedCameraUnavailableReason,
+  isSharedCameraReference,
+} from "@/react-app/utils/sharedCameraPresentation";
 import { brand } from "@/shared/brand";
+import type { CameraImportApplyResult } from "@/shared/cameraImport";
 import {
   Archive,
   Camera,
@@ -136,7 +163,37 @@ function applyAIAgentsDirectoryState(
   return nextParams;
 }
 
-function AIAgentsContent() {
+function getCameraCaptureAccelerationMode(camera: CameraType): CameraCaptureAccelerationMode {
+  return camera.capture_acceleration_mode === "nvidia" ? "nvidia" : "cpu";
+}
+
+function getCameraDisplayName(camera: CameraType): string {
+  return typeof camera.name === "string" && camera.name.trim()
+    ? camera.name.trim()
+    : `Camera #${camera.id}`;
+}
+
+type AIAgentsContentProps = {
+  cameras: CameraType[];
+  lastUpdatedAt: string | null;
+  refreshAgentCameras: () => Promise<void>;
+  patchAgentCameraLocal: (cameraId: number, patch: Partial<CameraType>) => void;
+  canViewCameraDetails: boolean;
+  canCreateCameraEntries: boolean;
+  canManageCameraControls: boolean;
+  canManageAgents: boolean;
+};
+
+function AIAgentsContent({
+  cameras,
+  lastUpdatedAt,
+  refreshAgentCameras,
+  patchAgentCameraLocal,
+  canViewCameraDetails,
+  canCreateCameraEntries,
+  canManageCameraControls,
+  canManageAgents,
+}: AIAgentsContentProps) {
   const { t, i18n } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
@@ -154,9 +211,6 @@ function AIAgentsContent() {
   const [subscriptionToastCameraId, setSubscriptionToastCameraId] = useState<number | null>(null);
   const { checkBillingForCameraCreation, showBillingModal, closeBillingModal } = useBillingCheck();
   const { toasts, dismissToast, pushToast } = useEvents();
-
-  // Use unified dashboard summary hook - gets cameras from centralized polling
-  const { cameras, lastUpdatedAt } = useDashboardSummary();
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -166,6 +220,9 @@ function AIAgentsContent() {
   const [editorDraft, setEditorDraft] = useState<CameraEditorDraft | null>(null);
   const [loadingEditCameraId, setLoadingEditCameraId] = useState<number | null>(null);
   const [pendingCameraIds, setPendingCameraIds] = useState<Set<number>>(() => new Set());
+  const [pendingAccelerationCameraIds, setPendingAccelerationCameraIds] = useState<Set<number>>(
+    () => new Set()
+  );
   const editRequestCameraId = useRef<number | null>(null);
   const hasAlignedTutorialCameraStartTabRef = useRef(false);
   const {
@@ -207,9 +264,9 @@ function AIAgentsContent() {
     setSearchParams(nextParams, { replace: true });
   }, [directoryState, searchParams, setSearchParams]);
 
-  useThumbnailPolling(cameras, (updates) => {
+  useThumbnailPolling(canViewCameraDetails ? cameras : [], (updates) => {
     for (const update of updates) {
-      dashboardSummaryStore.patchCameraLocal(update.camera_id, {
+      patchAgentCameraLocal(update.camera_id, {
         is_service_running: update.is_service_running ?? undefined,
         is_online: update.is_online ?? undefined,
         thumbnail_url: update.thumbnail_url ?? null,
@@ -217,7 +274,7 @@ function AIAgentsContent() {
       });
     }
   });
-  useThumbnailRecovery(cameras);
+  useThumbnailRecovery(canManageCameraControls ? cameras : []);
   const existingCameraNames = useMemo(
     () => cameras.map((camera) => String(camera.name || "").trim()).filter(Boolean),
     [cameras]
@@ -225,6 +282,9 @@ function AIAgentsContent() {
   const recordingHistoryLabel = i18n.language?.startsWith("pt")
     ? "Arquivo"
     : "Archive";
+  const sharedBadgeLabel = i18n.language?.startsWith("pt")
+    ? "Compartilhada"
+    : "Shared";
 
   useEffect(() => {
     if (!isOnboardingOpen || onboardingStepId !== "ai-agents-camera-start") {
@@ -261,7 +321,23 @@ function AIAgentsContent() {
     });
   };
 
+  const updatePendingAccelerationState = (cameraId: number, isPending: boolean) => {
+    setPendingAccelerationCameraIds((current) => {
+      const next = new Set(current);
+      if (isPending) {
+        next.add(cameraId);
+      } else {
+        next.delete(cameraId);
+      }
+      return next;
+    });
+  };
+
   const toggleService = async (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     const cameraId = camera.id;
     const isRunning = camera.is_service_running === 1;
 
@@ -296,18 +372,109 @@ function AIAgentsContent() {
         });
       }
 
-      dashboardSummaryStore.patchCameraLocal(cameraId, {
+      patchAgentCameraLocal(cameraId, {
         is_service_running: result.nextRunning,
         ...(result.nextRunning === 0
           ? { thumbnail_url: null, last_thumbnail_update: null }
           : {}),
       });
 
-      dashboardSummaryStore.refresh();
+      void refreshAgentCameras();
     } catch (error) {
+      const blockedToast = describeCameraStartBlockedError(
+        error,
+        typeof camera.name === "string" ? camera.name : `Camera #${cameraId}`
+      );
+      if (blockedToast) {
+        pushToast({
+          cameraId,
+          cameraName:
+            typeof camera.name === "string" && camera.name.trim()
+              ? camera.name.trim()
+              : `Camera #${cameraId}`,
+          title: blockedToast.title,
+          message: blockedToast.message,
+          type: "camera_start_blocked",
+        });
+      }
       console.error("Failed to toggle service:", error);
     } finally {
       updatePendingCameraState(cameraId, false);
+    }
+  };
+
+  const applyCaptureAcceleration = async (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
+    const cameraId = camera.id;
+    const currentMode = getCameraCaptureAccelerationMode(camera);
+    const requestedMode: CameraCaptureAccelerationMode =
+      currentMode === "nvidia" ? "cpu" : "nvidia";
+
+    if (pendingAccelerationCameraIds.has(cameraId)) {
+      return;
+    }
+
+    updatePendingAccelerationState(cameraId, true);
+
+    try {
+      const result = await applyCameraCaptureAcceleration(cameraId, requestedMode, true);
+      if (result.status !== "applied") {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "GPU Decode Unavailable",
+          message: result.scan?.reason || "GPU decode is not available for this camera.",
+          type: "agent_api_error",
+        });
+        return;
+      }
+
+      patchAgentCameraLocal(cameraId, {
+        capture_acceleration_mode: result.persisted_mode,
+      });
+      void refreshAgentCameras();
+
+      const switchedToGpu = result.persisted_mode === "nvidia";
+      const restartMessage =
+        result.running_before_apply && result.restart_enqueued
+          ? "The camera restart was queued on this machine."
+          : result.running_before_apply
+          ? "The preference was saved, but the camera restart could not be queued automatically."
+          : "The new capture mode will be used next time this camera starts.";
+
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: switchedToGpu ? "GPU Decode Enabled" : "CPU Decode Enabled",
+        message: restartMessage,
+        type: "job_started",
+      });
+
+      if (result.restart_error) {
+        pushToast({
+          cameraId,
+          cameraName: getCameraDisplayName(camera),
+          title: "Camera Restart Pending",
+          message: result.restart_error,
+          type: "agent_api_error",
+        });
+      }
+    } catch (error) {
+      pushToast({
+        cameraId,
+        cameraName: getCameraDisplayName(camera),
+        title: "GPU Decode Error",
+        message:
+          error instanceof Error && error.message.trim()
+            ? error.message
+            : "Failed to change the camera decode mode.",
+        type: "agent_api_error",
+      });
+    } finally {
+      updatePendingAccelerationState(cameraId, false);
     }
   };
 
@@ -335,6 +502,10 @@ function AIAgentsContent() {
   };
 
   const openEditCamera = async (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     editRequestCameraId.current = camera.id;
     setLoadingEditCameraId(camera.id);
     setIsImportOpen(false);
@@ -380,10 +551,13 @@ function AIAgentsContent() {
   };
 
   const handleCameraSaved = async () => {
-    dashboardSummaryStore.refresh();
+    await refreshAgentCameras();
   };
 
   const openAddModal = async () => {
+    if (!canCreateCameraEntries) {
+      return;
+    }
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
@@ -399,6 +573,9 @@ function AIAgentsContent() {
   };
 
   const openImportModal = async () => {
+    if (!canCreateCameraEntries) {
+      return;
+    }
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
@@ -410,19 +587,25 @@ function AIAgentsContent() {
   };
 
   const openDiscoveryModal = () => {
+    if (!canCreateCameraEntries) {
+      return;
+    }
     setIsImportOpen(false);
     closeEditCamera();
     setIsDiscoveryOpen(true);
   };
 
   const handleDiscoveryImport = async (request: CameraDiscoveryImportRequest) => {
+    if (!canCreateCameraEntries) {
+      return;
+    }
     const canAdd = await checkBillingForCameraCreation();
     if (!canAdd) {
       return;
     }
 
     const result = await createCamerasFromDiscoveryImport(request);
-    dashboardSummaryStore.refresh();
+    await refreshAgentCameras();
     if (result.failures.length > 0) {
       throw new Error(formatDiscoveryImportErrorMessage(result));
     }
@@ -434,11 +617,29 @@ function AIAgentsContent() {
     setIsEditorOpen(false);
   };
 
-  const handleImportSaved = async () => {
-    dashboardSummaryStore.refresh();
+  const handleImportSaved = async (applyResult?: CameraImportApplyResult) => {
+    await refreshAgentCameras();
+
+    if (applyResult?.gpu_batch) {
+      pushToast({
+        title:
+          applyResult.gpu_batch.status === "failed"
+            ? "GPU Validation Stopped"
+            : applyResult.gpu_batch.status === "completed"
+            ? "GPU Validation Finished"
+            : "GPU Validation Started",
+        message: applyResult.gpu_batch.message,
+        type:
+          applyResult.gpu_batch.status === "failed" ? "agent_api_error" : "job_started",
+      });
+    }
   };
 
   const openRecordingPlayer = (camera: CameraType) => {
+    if (isSharedCameraReference(camera)) {
+      return;
+    }
+
     setRecordingCamera({
       id: camera.id,
       name: String(camera.name || "").trim() || `Camera ${camera.id}`,
@@ -470,8 +671,16 @@ function AIAgentsContent() {
     mode: "default" | "overlay" = "default"
   ) => {
     const isOverlay = mode === "overlay";
+    const isSharedCamera = isSharedCameraReference(camera);
+    const sharedStatusLabel = getSharedCameraStatusLabel(i18n.language);
+    const sharedUnavailableReason = getSharedCameraUnavailableReason(camera, i18n.language);
     const isRunning = isCameraServiceRunning(camera);
     const isTogglePending = pendingCameraIds.has(camera.id);
+    const isAccelerationPending = pendingAccelerationCameraIds.has(camera.id);
+    const captureAccelerationMode = getCameraCaptureAccelerationMode(camera);
+    const isGpuRequested = captureAccelerationMode === "nvidia";
+    const canToggleAcceleration =
+      String(camera.connection_method || "").trim().toUpperCase() !== "WEBCAM";
     const isTutorialCameraStartTarget =
       !isOverlay &&
       isOnboardingOpen &&
@@ -479,18 +688,15 @@ function AIAgentsContent() {
       typeof tutorialCameraId === "number" &&
       tutorialCameraId > 0 &&
       tutorialCameraId === camera.id;
+    const actionButtons: ReactElement[] = [];
 
-    return (
-      <div
-        className={
-          isOverlay
-            ? "grid grid-cols-2 gap-2"
-            : "flex flex-col gap-2 md:grid md:grid-cols-2"
-        }
-      >
+    if (canManageCameraControls) {
+      actionButtons.push(
         <button
+          key="edit"
           onClick={() => openEditCamera(camera)}
-          disabled={loadingEditCameraId === camera.id}
+          disabled={isSharedCamera || loadingEditCameraId === camera.id}
+          title={isSharedCamera ? sharedUnavailableReason : t("dashboard.edit")}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
             isOverlay
               ? "min-h-[40px] rounded-xl border border-white/10 bg-gray-950/85 px-3 py-2 text-gray-100 backdrop-blur-sm hover:bg-gray-800/95 disabled:bg-gray-950/60 disabled:text-gray-500"
@@ -500,17 +706,31 @@ function AIAgentsContent() {
           <Pencil className="w-4 h-4" />
           {loadingEditCameraId === camera.id ? "Loading..." : t("dashboard.edit")}
         </button>
+      );
 
+      actionButtons.push(
         <button
+          key="toggle-service"
           onClick={() => toggleService(camera)}
-          disabled={isTogglePending}
+          disabled={isSharedCamera || isTogglePending}
           aria-busy={isTogglePending}
           data-camera-running={isRunning ? "true" : "false"}
+          title={
+            isSharedCamera
+              ? sharedUnavailableReason
+              : isRunning
+              ? t("dashboard.stop")
+              : t("dashboard.start")
+          }
           data-onboarding-target={
             isTutorialCameraStartTarget ? ONBOARDING_TARGETS.aiAgentsCameraStart : undefined
           }
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
-            isRunning
+            isSharedCamera
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-cyan-400/20 bg-cyan-500/12 px-3 py-2 text-cyan-100 backdrop-blur-sm disabled:cursor-not-allowed disabled:opacity-70"
+                : "min-h-[44px] rounded-lg bg-cyan-500/10 px-3 py-2.5 text-cyan-200 disabled:cursor-not-allowed disabled:opacity-70 md:min-h-0 md:py-2"
+              : isRunning
               ? isOverlay
                 ? "min-h-[40px] rounded-xl border border-red-400/20 bg-red-500/20 px-3 py-2 text-red-100 backdrop-blur-sm hover:bg-red-500/30 disabled:cursor-not-allowed disabled:opacity-60"
                 : "min-h-[44px] rounded-lg bg-red-500/10 px-3 py-2.5 text-red-400 hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
@@ -519,7 +739,12 @@ function AIAgentsContent() {
               : "min-h-[44px] rounded-lg bg-green-500/10 px-3 py-2.5 text-green-400 hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
           }`}
         >
-          {isTogglePending ? (
+          {isSharedCamera ? (
+            <>
+              <Camera className="w-4 h-4" />
+              {sharedStatusLabel}
+            </>
+          ) : isTogglePending ? (
             t("common.loading")
           ) : isRunning ? (
             <>
@@ -533,35 +758,95 @@ function AIAgentsContent() {
             </>
           )}
         </button>
+      );
 
+      actionButtons.push(
         <button
+          key="capture-acceleration"
+          type="button"
+          onClick={() => applyCaptureAcceleration(camera)}
+          disabled={isSharedCamera || !canToggleAcceleration || isAccelerationPending || isTogglePending}
+          title={
+            isSharedCamera
+              ? sharedUnavailableReason
+              : canToggleAcceleration
+              ? isGpuRequested
+                ? "Switch to CPU decode"
+                : "Try GPU decode"
+              : "GPU decode is only available for RTSP cameras"
+          }
+          className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
+            isSharedCamera
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-cyan-400/20 bg-cyan-500/10 px-3 py-2 text-cyan-100/60 backdrop-blur-sm disabled:cursor-not-allowed disabled:opacity-70"
+                : "min-h-[44px] rounded-lg bg-cyan-500/10 px-3 py-2.5 text-cyan-100/60 disabled:cursor-not-allowed disabled:opacity-70 md:min-h-0 md:py-2"
+              : !canToggleAcceleration
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-white/10 bg-gray-950/60 px-3 py-2 text-gray-500 backdrop-blur-sm"
+                : "min-h-[44px] rounded-lg bg-gray-800/70 px-3 py-2.5 text-gray-500 md:min-h-0 md:py-2"
+              : isGpuRequested
+              ? isOverlay
+                ? "min-h-[40px] rounded-xl border border-amber-400/20 bg-amber-500/20 px-3 py-2 text-amber-100 backdrop-blur-sm hover:bg-amber-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                : "min-h-[44px] rounded-lg bg-amber-500/10 px-3 py-2.5 text-amber-300 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
+              : isOverlay
+              ? "min-h-[40px] rounded-xl border border-gray-300/15 bg-gray-950/85 px-3 py-2 text-gray-100 backdrop-blur-sm hover:bg-gray-800/95 disabled:cursor-not-allowed disabled:opacity-60"
+              : "min-h-[44px] rounded-lg bg-gray-800 px-3 py-2.5 text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-60 md:min-h-0 md:py-2"
+          }`}
+        >
+          <Cpu className="w-4 h-4" />
+          {isAccelerationPending ? t("common.loading") : isGpuRequested ? "GPU" : "CPU"}
+        </button>
+      );
+    }
+
+    if (canViewCameraDetails) {
+      actionButtons.push(
+        <button
+          key="recordings"
           type="button"
           onClick={() => openRecordingPlayer(camera)}
+          disabled={isSharedCamera}
+          title={isSharedCamera ? sharedUnavailableReason : recordingHistoryLabel}
           className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
             isOverlay
-              ? "min-h-[40px] rounded-xl border border-cyan-400/20 bg-cyan-500/16 px-3 py-2 text-cyan-100 backdrop-blur-sm hover:bg-cyan-500/24"
-              : "min-h-[44px] rounded-lg bg-cyan-500/10 px-3 py-2.5 text-cyan-300 hover:bg-cyan-500/18 md:min-h-0 md:py-2"
+              ? "min-h-[40px] rounded-xl border border-cyan-400/20 bg-cyan-500/16 px-3 py-2 text-cyan-100 backdrop-blur-sm hover:bg-cyan-500/24 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-cyan-500/16"
+              : "min-h-[44px] rounded-lg bg-cyan-500/10 px-3 py-2.5 text-cyan-300 hover:bg-cyan-500/18 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-cyan-500/10 md:min-h-0 md:py-2"
           }`}
         >
           <Archive className="w-4 h-4" />
           {recordingHistoryLabel}
         </button>
+      );
+    }
 
-        <Link
-          to={{
-            pathname: `/algorithms/${camera.id}`,
-            search: `?${new URLSearchParams({ returnTo: aiAgentsReturnTo }).toString()}`,
-          }}
-          state={{ returnSource: AI_AGENTS_RETURN_SOURCE }}
-          className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
-            isOverlay
-              ? "min-h-[40px] rounded-xl border border-blue-400/20 bg-blue-500/20 px-3 py-2 text-blue-100 backdrop-blur-sm hover:bg-blue-500/30"
-              : "min-h-[44px] rounded-lg bg-blue-500/10 px-3 py-2.5 text-blue-400 hover:bg-blue-500/20 md:min-h-0 md:py-2"
-          }`}
-        >
-          <Cpu className="w-4 h-4" />
-          {t("dashboard.configureAlgorithms")}
-        </Link>
+    actionButtons.push(
+      <Link
+        key="algorithms"
+        to={{
+          pathname: `/algorithms/${camera.id}`,
+          search: `?${new URLSearchParams({ returnTo: aiAgentsReturnTo }).toString()}`,
+        }}
+        state={{ returnSource: AI_AGENTS_RETURN_SOURCE }}
+        className={`flex items-center justify-center gap-2 text-sm font-medium transition-colors ${
+          isOverlay
+            ? "min-h-[40px] rounded-xl border border-blue-400/20 bg-blue-500/20 px-3 py-2 text-blue-100 backdrop-blur-sm hover:bg-blue-500/30"
+            : "min-h-[44px] rounded-lg bg-blue-500/10 px-3 py-2.5 text-blue-400 hover:bg-blue-500/20 md:min-h-0 md:py-2"
+        }`}
+      >
+        <Cpu className="w-4 h-4" />
+        {canManageAgents ? t("dashboard.configureAlgorithms") : "View Algorithms"}
+      </Link>
+    );
+
+    return (
+      <div
+        className={
+          isOverlay
+            ? "grid grid-cols-2 gap-2"
+            : "flex flex-col gap-2 md:grid md:grid-cols-2"
+        }
+      >
+        {actionButtons}
       </div>
     );
   };
@@ -622,6 +907,7 @@ function AIAgentsContent() {
           onSearchChange={setActiveSearchTerm}
           onIndexChange={setActiveIndexKey}
           actions={
+            canCreateCameraEntries ? (
             <>
               <button
                 onClick={openDiscoveryModal}
@@ -638,27 +924,32 @@ function AIAgentsContent() {
                 Import Cameras
               </button>
             </>
+            ) : undefined
           }
         />
 
         {/* Camera grid */}
         <div className="grid grid-cols-1 items-start gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-3">
           {/* Add camera card */}
-          <button
-            onClick={openAddModal}
-            className="group relative flex h-[200px] self-start flex-col items-center justify-center rounded-2xl border-2 border-dashed border-gray-700 bg-gradient-to-br from-gray-800/50 to-gray-900/50 p-6 backdrop-blur-sm transition-all duration-300 hover:border-blue-500/50 hover:shadow-lg hover:shadow-blue-500/20 dark:from-gray-800/50 dark:to-gray-900/50 md:h-[280px] md:p-8"
-          >
-            <div className="w-12 md:w-16 h-12 md:h-16 bg-gray-800 group-hover:bg-blue-500/10 rounded-2xl flex items-center justify-center mb-3 md:mb-4 transition-colors">
-              <Plus className="w-6 md:w-8 h-6 md:h-8 text-gray-500 group-hover:text-blue-400 transition-colors" />
-            </div>
-            <p className="text-sm md:text-base text-gray-400 group-hover:text-gray-200 font-medium transition-colors">
-              {t("common.registerCamera")}
-            </p>
-          </button>
+          {canCreateCameraEntries ? (
+            <button
+              onClick={openAddModal}
+              className="group relative flex h-[200px] self-start flex-col items-center justify-center rounded-2xl border-2 border-dashed border-gray-700 bg-gradient-to-br from-gray-800/50 to-gray-900/50 p-6 backdrop-blur-sm transition-all duration-300 hover:border-blue-500/50 hover:shadow-lg hover:shadow-blue-500/20 dark:from-gray-800/50 dark:to-gray-900/50 md:h-[280px] md:p-8"
+            >
+              <div className="w-12 md:w-16 h-12 md:h-16 bg-gray-800 group-hover:bg-blue-500/10 rounded-2xl flex items-center justify-center mb-3 md:mb-4 transition-colors">
+                <Plus className="w-6 md:w-8 h-6 md:h-8 text-gray-500 group-hover:text-blue-400 transition-colors" />
+              </div>
+              <p className="text-sm md:text-base text-gray-400 group-hover:text-gray-200 font-medium transition-colors">
+                {t("common.registerCamera")}
+              </p>
+            </button>
+          ) : null}
 
           {/* Camera cards */}
           {filteredCameras.map((camera) => {
             const connectionState = getCameraConnectionState(camera);
+            const isSharedCamera = isSharedCameraReference(camera);
+            const sharedAttribution = getSharedCameraAttribution(camera, i18n.language);
             const isRunning = isCameraServiceRunning(camera);
             const isOnline = isCameraOnline(camera);
             const isAuthLost = connectionState === "auth_lost";
@@ -673,7 +964,11 @@ function AIAgentsContent() {
             return (
             <div
               key={camera.id}
-              className="group relative bg-gradient-to-br from-gray-800/50 to-gray-900/50 backdrop-blur-sm border border-gray-700/50 rounded-2xl overflow-hidden shadow-xl hover:shadow-2xl transition-all duration-300 md:hover:scale-[1.02]"
+              className={`group relative overflow-hidden rounded-2xl bg-gradient-to-br from-gray-800/50 to-gray-900/50 backdrop-blur-sm shadow-xl transition-all duration-300 md:hover:scale-[1.02] ${
+                isSharedCamera
+                  ? "border border-cyan-400/30 ring-1 ring-inset ring-cyan-400/20 hover:shadow-cyan-500/10"
+                  : "border border-gray-700/50 hover:shadow-2xl"
+              }`}
             >
               {/* Thumbnail */}
               <div className="relative aspect-video bg-gradient-to-br from-gray-900 via-gray-950 to-gray-900 overflow-hidden">
@@ -709,7 +1004,14 @@ function AIAgentsContent() {
                 )}
 
                 {/* Status badge */}
-                {isAuthLost ? (
+                {isSharedCamera ? (
+                  <div className="absolute top-3 right-3 z-20 flex items-center gap-2 rounded-full bg-cyan-950/85 px-3 py-1.5 backdrop-blur-sm">
+                    <Camera className="h-4 w-4 text-cyan-200" />
+                    <span className="text-xs font-medium text-cyan-100">
+                      {getSharedCameraStatusLabel(i18n.language)}
+                    </span>
+                  </div>
+                ) : isAuthLost ? (
                   <div className="absolute top-3 right-3 z-20 flex items-center gap-2 rounded-full bg-gray-900/90 px-3 py-1.5 backdrop-blur-sm">
                     <AlertCircle className="h-4 w-4 text-rose-300" />
                     <span className="text-xs font-medium text-rose-300">
@@ -753,10 +1055,23 @@ function AIAgentsContent() {
                 <h3 className="text-base md:text-lg font-semibold text-gray-100 mb-1">
                   {camera.name}
                 </h3>
-                <p className="text-xs md:text-sm text-gray-500 mb-3 md:mb-4">{camera.ip_address}</p>
+                {sharedAttribution ? (
+                  <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-cyan-100/90">
+                    <span className="inline-flex items-center rounded-full border border-cyan-400/25 bg-cyan-500/10 px-2 py-0.5 font-medium text-cyan-100">
+                      {sharedBadgeLabel}
+                    </span>
+                    <span>{sharedAttribution}</span>
+                  </div>
+                ) : canViewCameraDetails && camera.ip_address ? (
+                  <p className="text-xs md:text-sm text-gray-500 mb-3 md:mb-4">
+                    {camera.ip_address}
+                  </p>
+                ) : null}
                 <p
                   className={`text-xs font-medium mb-3 ${
-                    isOnline
+                    isSharedCamera
+                      ? "text-cyan-200"
+                      : isOnline
                       ? "text-green-400"
                       : isAuthLost
                       ? "text-rose-300"
@@ -765,7 +1080,9 @@ function AIAgentsContent() {
                       : "text-red-400"
                   }`}
                 >
-                  {isOnline
+                  {isSharedCamera
+                    ? getSharedCameraStatusLabel(i18n.language)
+                    : isOnline
                     ? t("dashboard.online")
                     : isAuthLost
                     ? "Pairing/Auth lost"
@@ -789,7 +1106,7 @@ function AIAgentsContent() {
               <p className="mx-auto max-w-2xl text-sm text-gray-500">
                 {emptyStateDescription}
               </p>
-              {totalCameraCount === 0 ? (
+              {totalCameraCount === 0 && canCreateCameraEntries ? (
                 <button
                   onClick={openAddModal}
                   className="mt-6 inline-flex min-h-[44px] items-center gap-2 rounded-lg bg-blue-500 px-6 py-3 font-medium text-white transition-colors hover:bg-blue-600"
@@ -912,14 +1229,35 @@ function AIAgentsContent() {
 }
 
 export default function AIAgentsPage() {
-  // Use dashboard summary for EventsProvider cameras
-  const { cameras } = useDashboardSummary();
+  const { user } = useAuth();
+  const { effectiveUser } = useEffectiveUser();
+  const { cameras, lastUpdatedAt, refresh, patchCameraLocal } = useAgentCameraDirectory();
+  const permissionUser = effectiveUser || user;
+  const canViewCameraDetails = canViewCameras(permissionUser);
+  const canCreateCameraEntries = canCreateCameras(permissionUser);
+  const canManageCameraControls = canExecuteCameras(permissionUser);
+  const canManageAgents = canExecuteAgents(permissionUser);
+  const shouldUseLiveEvents = canViewEvents(permissionUser);
+  const content = (
+    <AIAgentsContent
+      cameras={cameras}
+      lastUpdatedAt={lastUpdatedAt}
+      refreshAgentCameras={refresh}
+      patchAgentCameraLocal={patchCameraLocal}
+      canViewCameraDetails={canViewCameraDetails}
+      canCreateCameraEntries={canCreateCameraEntries}
+      canManageCameraControls={canManageCameraControls}
+      canManageAgents={canManageAgents}
+    />
+  );
 
   return (
     <Layout>
-      <EventsProvider cameras={cameras}>
-        <AIAgentsContent />
-      </EventsProvider>
+      {shouldUseLiveEvents ? (
+        <EventsProvider cameras={cameras}>{content}</EventsProvider>
+      ) : (
+        <PassiveEventsProvider>{content}</PassiveEventsProvider>
+      )}
     </Layout>
   );
 }

@@ -45,7 +45,8 @@
       "features": {
         "billingEnabled": false,
         "drakonFindEnabled": true,
-        "googleLoginEnabled": false
+        "googleLoginEnabled": false,
+        "workspaceAccessEnabled": true
       },
       "frontend": {
         "logoMode": "image",
@@ -108,7 +109,8 @@
       "features": {
         "billingEnabled": true,
         "drakonFindEnabled": false,
-        "googleLoginEnabled": true
+        "googleLoginEnabled": true,
+        "workspaceAccessEnabled": true
       },
       "frontend": {
         "logoMode": "image",

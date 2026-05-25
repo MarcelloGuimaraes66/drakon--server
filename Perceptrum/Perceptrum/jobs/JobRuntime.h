@@ -24,6 +24,7 @@ public:
     // Called by AgentCore::processCommand_
     void onJobStartCommand(const json& cmd);
     void onJobStopCommand(const json& cmd);
+    void onCrossCameraUpdateCommand(const json& cmd);
 
 private:
     struct JobInstance {
@@ -224,7 +225,8 @@ private:
         const JobStepDef& step,
         int cameraId,
         const JobAgentDef& agent,
-        const std::string& inferenceOutput
+        const std::string& inferenceOutput,
+        bool suppressDelivery = false
     );
 
     // utils

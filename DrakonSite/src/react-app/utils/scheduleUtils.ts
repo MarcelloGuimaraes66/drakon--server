@@ -8,8 +8,8 @@
 export type ScheduleMode = 'weekly' | 'monthly' | 'yearly' | 'one_shot';
 
 export interface TimeWindow {
-  start_time: string; // HH:MM format
-  end_time: string; // HH:MM format
+  start_time: string; // HH:MM or HH:MM:SS format
+  end_time: string; // HH:MM or HH:MM:SS format
 }
 
 /**
@@ -40,8 +40,8 @@ export interface ScheduleConfig {
 // =============================================================================
 
 export interface LegacyTimeWindow {
-  start: string; // HH:MM format
-  end: string; // HH:MM format
+  start: string; // HH:MM or HH:MM:SS format
+  end: string; // HH:MM or HH:MM:SS format
 }
 
 export interface DaySchedule {
@@ -115,7 +115,7 @@ export function createYearlyDay(month: number, day: number, windows: TimeWindow[
  * Get default windows for a new day (9 AM - 5 PM)
  */
 export function getDefaultWindows(): TimeWindow[] {
-  return [{ start_time: '09:00', end_time: '17:00' }];
+  return [{ start_time: '09:00:00', end_time: '17:00:00' }];
 }
 
 // =============================================================================
@@ -217,10 +217,131 @@ export function getDefaultScheduleDays(mode: ScheduleMode): ScheduleDay[] {
 // =============================================================================
 
 /**
- * Validate time format (HH:MM)
+ * Validate time format (HH:MM or HH:MM:SS)
  */
 export function isValidTimeFormat(time: string): boolean {
-  return /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/.test(time);
+  return /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?$/.test(time);
+}
+
+export function parseTimeToSeconds(time: string): number | null {
+  if (!isValidTimeFormat(time)) {
+    return null;
+  }
+
+  const [hoursRaw, minutesRaw, secondsRaw] = String(time).trim().split(':');
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  const seconds = Number(secondsRaw ?? '0');
+
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return null;
+  }
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+export function normalizeTimeToHHMMSS(time: string): string | null {
+  const totalSeconds = parseTimeToSeconds(time);
+  if (totalSeconds === null) {
+    return null;
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+export type RepeatedTimeUnit = 'minutes' | 'hours';
+
+export interface RepeatedTimeWindowInput {
+  start_time: string;
+  duration_value: number;
+  duration_unit: RepeatedTimeUnit;
+  repeat_value: number;
+  repeat_unit: RepeatedTimeUnit;
+  occurrence_count: number;
+}
+
+function normalizePositiveInteger(value: number): number | null {
+  if (!Number.isInteger(value) || value <= 0) {
+    return null;
+  }
+  return value;
+}
+
+function repeatedUnitToSeconds(value: number, unit: RepeatedTimeUnit): number | null {
+  const normalizedValue = normalizePositiveInteger(value);
+  if (normalizedValue === null) {
+    return null;
+  }
+  if (unit === 'hours') {
+    return normalizedValue * 3600;
+  }
+  if (unit === 'minutes') {
+    return normalizedValue * 60;
+  }
+  return null;
+}
+
+function formatSecondsToTimeString(totalSeconds: number): string | null {
+  if (!Number.isInteger(totalSeconds) || totalSeconds < 0 || totalSeconds >= 24 * 3600) {
+    return null;
+  }
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+export function buildRepeatedTimeWindows(
+  input: RepeatedTimeWindowInput
+): { windows: TimeWindow[]; first_start_time: string; last_end_time: string } | { error: string } {
+  const startSeconds = parseTimeToSeconds(input.start_time);
+  if (startSeconds === null) {
+    return { error: 'Invalid start time format' };
+  }
+
+  const durationSeconds = repeatedUnitToSeconds(input.duration_value, input.duration_unit);
+  if (durationSeconds === null) {
+    return { error: 'Duration must be a whole number greater than zero' };
+  }
+
+  const repeatSeconds = repeatedUnitToSeconds(input.repeat_value, input.repeat_unit);
+  if (repeatSeconds === null) {
+    return { error: 'Repeat interval must be a whole number greater than zero' };
+  }
+
+  const occurrenceCount = normalizePositiveInteger(input.occurrence_count);
+  if (occurrenceCount === null) {
+    return { error: 'Occurrences must be a whole number greater than zero' };
+  }
+
+  if (occurrenceCount > 1 && durationSeconds > repeatSeconds) {
+    return { error: 'Duration cannot be longer than the repeat interval' };
+  }
+
+  const windows: TimeWindow[] = [];
+  for (let index = 0; index < occurrenceCount; index += 1) {
+    const windowStartSeconds = startSeconds + repeatSeconds * index;
+    const windowEndSeconds = windowStartSeconds + durationSeconds;
+    const startTime = formatSecondsToTimeString(windowStartSeconds);
+    const endTime = formatSecondsToTimeString(windowEndSeconds);
+    if (!startTime || !endTime) {
+      return { error: 'The generated sequence must stay within the same day' };
+    }
+    windows.push({
+      start_time: startTime,
+      end_time: endTime,
+    });
+  }
+
+  return {
+    windows,
+    first_start_time: windows[0]?.start_time || '',
+    last_end_time: windows[windows.length - 1]?.end_time || '',
+  };
 }
 
 /**
@@ -228,20 +349,21 @@ export function isValidTimeFormat(time: string): boolean {
  */
 export function validateTimeWindow(window: TimeWindow): string | null {
   if (!isValidTimeFormat(window.start_time)) {
-    return "Invalid start time format (use HH:MM)";
+    return "Invalid start time format (use HH:MM or HH:MM:SS)";
   }
   
   if (!isValidTimeFormat(window.end_time)) {
-    return "Invalid end time format (use HH:MM)";
+    return "Invalid end time format (use HH:MM or HH:MM:SS)";
   }
 
-  const [startHour, startMin] = window.start_time.split(':').map(Number);
-  const [endHour, endMin] = window.end_time.split(':').map(Number);
+  const startSeconds = parseTimeToSeconds(window.start_time);
+  const endSeconds = parseTimeToSeconds(window.end_time);
   
-  const startMinutes = startHour * 60 + startMin;
-  const endMinutes = endHour * 60 + endMin;
-  
-  if (startMinutes >= endMinutes) {
+  if (startSeconds === null || endSeconds === null) {
+    return "Invalid time format";
+  }
+
+  if (startSeconds >= endSeconds) {
     return "Start time must be before end time";
   }
 
@@ -252,15 +374,14 @@ export function validateTimeWindow(window: TimeWindow): string | null {
  * Check if two time windows overlap
  */
 export function timeWindowsOverlap(w1: TimeWindow, w2: TimeWindow): boolean {
-  const toMinutes = (time: string) => {
-    const [h, m] = time.split(':').map(Number);
-    return h * 60 + m;
-  };
+  const s1 = parseTimeToSeconds(w1.start_time);
+  const e1 = parseTimeToSeconds(w1.end_time);
+  const s2 = parseTimeToSeconds(w2.start_time);
+  const e2 = parseTimeToSeconds(w2.end_time);
 
-  const s1 = toMinutes(w1.start_time);
-  const e1 = toMinutes(w1.end_time);
-  const s2 = toMinutes(w2.start_time);
-  const e2 = toMinutes(w2.end_time);
+  if (s1 === null || e1 === null || s2 === null || e2 === null) {
+    return false;
+  }
 
   return s1 < e2 && s2 < e1;
 }
@@ -604,10 +725,13 @@ export function calculateNextOccurrence(schedule: WeeklySchedule): {
 }
 
 function parseTimeForCalc(timeStr: string, daysAhead: number): Date {
-  const [hours, minutes] = timeStr.split(':').map(Number);
+  const totalSeconds = parseTimeToSeconds(timeStr) ?? 0;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
   const date = new Date();
   date.setDate(date.getDate() + daysAhead);
-  date.setHours(hours, minutes, 0, 0);
+  date.setHours(hours, minutes, seconds, 0);
   return date;
 }
 

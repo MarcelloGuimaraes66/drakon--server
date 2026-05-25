@@ -14,15 +14,17 @@ namespace winrt::DrakonDesktop::implementation
         enum class SettingsSectionTab
         {
             User = 0,
-            ApiKeys = 1,
-            Alerts = 2,
-            Connectivity = 3,
+            Users = 1,
+            ApiKeys = 2,
+            Alerts = 3,
+            Connectivity = 4,
         };
 
         void WireUpActions();
         void ApplyActiveTab();
         void UpdatePairCodeCountdown();
         void RenderState();
+        void RenderAccountUsersSection();
         void ShowStatus(
             winrt::hstring const& message,
             winrt::Microsoft::UI::Xaml::Controls::InfoBarSeverity severity);
@@ -69,6 +71,18 @@ namespace winrt::DrakonDesktop::implementation
         winrt::fire_and_forget OnSaveTelegramClick(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget OnCreateAccountUserClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnManagedUserSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        winrt::fire_and_forget OnSaveManagedUserClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        winrt::fire_and_forget OnResetManagedUserPasswordClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnRefreshClick(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
@@ -86,9 +100,11 @@ namespace winrt::DrakonDesktop::implementation
         services::ApiKeySettings m_openAiSettings{};
         services::ApiKeySettings m_zAiSettings{};
         services::TelegramSettings m_telegramSettings{};
+        services::AccountUsersSnapshot m_accountUsers{};
         services::PairingStatusSnapshot m_pairingStatus{};
         std::string m_pairCode;
         std::string m_pairExpiresAt;
+        std::string m_selectedManagedUserId;
         winrt::Microsoft::UI::Xaml::DispatcherTimer m_pollTimer{ nullptr };
     };
 }

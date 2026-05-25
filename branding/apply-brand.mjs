@@ -159,7 +159,8 @@ function buildFrontendGenerated(config, activeBrandKey, activeBrand, frontendAss
     features: {
       billingEnabled: ${activeBrand.features?.billingEnabled ? "true" : "false"},
       drakonFindEnabled: ${activeBrand.features?.drakonFindEnabled ? "true" : "false"},
-      googleLoginEnabled: ${activeBrand.features?.googleLoginEnabled ? "true" : "false"}
+      googleLoginEnabled: ${activeBrand.features?.googleLoginEnabled ? "true" : "false"},
+      workspaceAccessEnabled: ${activeBrand.features?.workspaceAccessEnabled ? "true" : "false"}
     },
     storageKeys: {
       sidebarCollapsed: ${escapeTs(`${activeBrand.storageNamespace}:sidebar-collapsed`)},

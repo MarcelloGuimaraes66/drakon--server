@@ -19,22 +19,53 @@ import SettingsPage from "@/react-app/pages/Settings";
 import DrakonFindPage from "@/react-app/pages/DrakonFind";
 import HubPage from "@/react-app/pages/Hub";
 import SecretRecoverySetupOverlay from "@/react-app/components/SecretRecoverySetupOverlay";
+import { RemoteWorkspaceProvider } from "@/react-app/contexts/RemoteWorkspaceContext";
+import { useRemoteWorkspace } from "@/react-app/contexts/RemoteWorkspaceContext";
+import { useEffectiveUser } from "@/react-app/hooks/useEffectiveUser";
+import {
+  canAccessRoute,
+  getDefaultAuthorizedRoute,
+} from "@/react-app/lib/accountAccess";
 import { brand } from "@/shared/brand";
 import { Loader2 } from "lucide-react";
 
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, isPending } = useAuth();
+function AuthLoadingScreen() {
+  return (
+    <div className="flex items-center justify-center min-h-screen bg-gray-950">
+      <Loader2 className="w-10 h-10 text-blue-500 animate-spin" />
+    </div>
+  );
+}
 
-  if (isPending) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-950">
-        <Loader2 className="w-10 h-10 text-blue-500 animate-spin" />
-      </div>
-    );
+function ProtectedRoute({
+  children,
+  routePath,
+}: {
+  children: React.ReactNode;
+  routePath: string;
+}) {
+  const { user, isPending } = useAuth();
+  const { error: remoteWorkspaceError } = useRemoteWorkspace();
+  const { effectiveUser, isResolvingRemoteUser } = useEffectiveUser();
+  const accessOptions = {
+    billingEnabled: brand.features.billingEnabled,
+    drakonFindEnabled: brand.features.drakonFindEnabled,
+  };
+
+  if (isPending || isResolvingRemoteUser) {
+    return <AuthLoadingScreen />;
   }
 
   if (!user) {
     return <Navigate to="/login" replace />;
+  }
+
+  if (!effectiveUser) {
+    return remoteWorkspaceError ? <Navigate to="/login" replace /> : <AuthLoadingScreen />;
+  }
+
+  if (!canAccessRoute(effectiveUser, routePath, accessOptions)) {
+    return <Navigate to={getDefaultAuthorizedRoute(effectiveUser, accessOptions)} replace />;
   }
 
   return (
@@ -42,6 +73,34 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
       {children}
       <SecretRecoverySetupOverlay />
     </>
+  );
+}
+
+function AuthorizedHomeRedirect() {
+  const { user, isPending } = useAuth();
+  const { error: remoteWorkspaceError } = useRemoteWorkspace();
+  const { effectiveUser, isResolvingRemoteUser } = useEffectiveUser();
+
+  if (isPending || isResolvingRemoteUser) {
+    return <AuthLoadingScreen />;
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  if (!effectiveUser) {
+    return remoteWorkspaceError ? <Navigate to="/login" replace /> : <AuthLoadingScreen />;
+  }
+
+  return (
+    <Navigate
+      to={getDefaultAuthorizedRoute(effectiveUser, {
+        billingEnabled: brand.features.billingEnabled,
+        drakonFindEnabled: brand.features.drakonFindEnabled,
+      })}
+      replace
+    />
   );
 }
 
@@ -53,18 +112,11 @@ function AppRoutes() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/auth/callback" element={<AuthCallbackPage />} />
-      <Route
-        path="/"
-        element={
-          <ProtectedRoute>
-            <Navigate to="/ai-agents" replace />
-          </ProtectedRoute>
-        }
-      />
+      <Route path="/" element={<AuthorizedHomeRedirect />} />
       <Route
         path="/ai-agents"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/ai-agents">
             <AIAgentsPage />
           </ProtectedRoute>
         }
@@ -72,7 +124,7 @@ function AppRoutes() {
       <Route
         path="/dashboard"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/dashboard">
             <DashboardPage />
           </ProtectedRoute>
         }
@@ -80,7 +132,7 @@ function AppRoutes() {
       <Route
         path="/cameras"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/cameras">
             <CamerasPage />
           </ProtectedRoute>
         }
@@ -88,7 +140,7 @@ function AppRoutes() {
       <Route
         path="/algorithms/:cameraId"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/algorithms/">
             <AlgorithmsPage />
           </ProtectedRoute>
         }
@@ -96,7 +148,7 @@ function AppRoutes() {
       <Route
         path="/jobs"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/jobs">
             <JobsPage />
           </ProtectedRoute>
         }
@@ -104,7 +156,7 @@ function AppRoutes() {
       <Route
         path="/hub"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/hub">
             <HubPage />
           </ProtectedRoute>
         }
@@ -112,7 +164,7 @@ function AppRoutes() {
       <Route
         path="/chat"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/chat">
             <ChatPage />
           </ProtectedRoute>
         }
@@ -120,7 +172,7 @@ function AppRoutes() {
       <Route
         path="/events"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/events">
             <EventsPage />
           </ProtectedRoute>
         }
@@ -128,7 +180,7 @@ function AppRoutes() {
       <Route
         path="/drakon-find"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/drakon-find">
             {drakonFindEnabled ? <DrakonFindPage /> : <Navigate to="/ai-agents" replace />}
           </ProtectedRoute>
         }
@@ -136,7 +188,7 @@ function AppRoutes() {
       <Route
         path="/billing"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/billing">
             {billingEnabled ? <BillingPage /> : <Navigate to="/ai-agents" replace />}
           </ProtectedRoute>
         }
@@ -144,7 +196,7 @@ function AppRoutes() {
       <Route
         path="/settings"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/settings">
             <SettingsPage />
           </ProtectedRoute>
         }
@@ -152,7 +204,7 @@ function AppRoutes() {
       <Route
         path="/settings/alerts"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute routePath="/settings">
             <SettingsPage />
           </ProtectedRoute>
         }
@@ -165,15 +217,17 @@ export default function App() {
   return (
     <I18nextProvider i18n={i18n}>
       <AuthProvider>
-        <ThemeProvider>
-          <QuickChatProvider>
-            <Router>
-              <OnboardingProvider>
-                <AppRoutes />
-              </OnboardingProvider>
-            </Router>
-          </QuickChatProvider>
-        </ThemeProvider>
+        <RemoteWorkspaceProvider>
+          <ThemeProvider>
+            <QuickChatProvider>
+              <Router>
+                <OnboardingProvider>
+                  <AppRoutes />
+                </OnboardingProvider>
+              </Router>
+            </QuickChatProvider>
+          </ThemeProvider>
+        </RemoteWorkspaceProvider>
       </AuthProvider>
     </I18nextProvider>
   );

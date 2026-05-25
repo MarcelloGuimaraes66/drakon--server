@@ -90,6 +90,7 @@
     <ClInclude Include="..\Perceptrum\camera\FrameBuffer.h" />
     <ClInclude Include="..\Perceptrum\camera\FrameDiskWriter.h" />
     <ClInclude Include="..\Perceptrum\camera\MotionDetector.h" />
+    <ClInclude Include="..\Perceptrum\camera\PortalCounter.h" />
     <ClInclude Include="..\Perceptrum\camera\PerfMetrics.h" />
     <ClInclude Include="..\Perceptrum\camera\RtspCapture.h" />
     <ClInclude Include="..\Perceptrum\comm\BackendConfig.h" />
@@ -148,6 +149,7 @@
     <ClCompile Include="..\Perceptrum\camera\FrameBuffer.cpp" />
     <ClCompile Include="..\Perceptrum\camera\FrameDiskWriter.cpp" />
     <ClCompile Include="..\Perceptrum\camera\MotionDetector.cpp" />
+    <ClCompile Include="..\Perceptrum\camera\PortalCounter.cpp" />
     <ClCompile Include="..\Perceptrum\camera\RtspCapture.cpp" />
     <ClCompile Include="..\Perceptrum\comm\PairingClient.cpp" />
     <ClCompile Include="..\Perceptrum\comm\SecureLocalStore.cpp" />

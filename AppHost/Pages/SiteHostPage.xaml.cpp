@@ -345,7 +345,16 @@ namespace winrt::DrakonDesktop::implementation
     }
 
     SiteHostPage::SiteHostPage()
+        : SiteHostPage(winrt::hstring{}, true)
     {
+    }
+
+    SiteHostPage::SiteHostPage(
+        winrt::hstring const& initialNavigationUrl,
+        bool enableResidentRuntimeBridge)
+    {
+        m_initialNavigationUrl = initialNavigationUrl;
+        m_enableResidentRuntimeBridge = enableResidentRuntimeBridge;
         auto const& runtimeConfig = ::DrakonDesktop::platform::RuntimeConfig();
         InitializeComponent();
 
@@ -494,7 +503,10 @@ namespace winrt::DrakonDesktop::implementation
                 }
             }
 
-            InstallNativePairingBridge(webView);
+            if (m_enableResidentRuntimeBridge)
+            {
+                InstallNativePairingBridge(webView);
+            }
 
             if (forceReload && webView.Source())
             {
@@ -503,7 +515,9 @@ namespace winrt::DrakonDesktop::implementation
             }
 
             m_navigationStarted = true;
-            webView.Source(Windows::Foundation::Uri{ ResolveUiUrl() });
+            auto const navigationTarget =
+                m_initialNavigationUrl.empty() ? ResolveUiUrl() : std::wstring(m_initialNavigationUrl);
+            webView.Source(Windows::Foundation::Uri{ navigationTarget });
             UpdateNavigationButtons(webView);
         }
         catch (winrt::hresult_error const& ex)
@@ -592,37 +606,40 @@ namespace winrt::DrakonDesktop::implementation
         if (args.IsSuccess())
         {
             AppendBootstrapTrace("site-host: navigation completed");
-            InstallNativePairingBridge(sender);
-            if (auto core = sender.CoreWebView2())
+            if (m_enableResidentRuntimeBridge)
             {
-                bool isLoginSurface = false;
-                try
+                InstallNativePairingBridge(sender);
+                if (auto core = sender.CoreWebView2())
                 {
-                    if (auto const source = sender.Source())
+                    bool isLoginSurface = false;
+                    try
                     {
-                        auto const absoluteUri = ToLowerCopy(std::wstring(source.AbsoluteUri()));
-                        isLoginSurface = absoluteUri.find(L"/login") != std::wstring::npos;
+                        if (auto const source = sender.Source())
+                        {
+                            auto const absoluteUri = ToLowerCopy(std::wstring(source.AbsoluteUri()));
+                            isLoginSurface = absoluteUri.find(L"/login") != std::wstring::npos;
+                        }
                     }
-                }
-                catch (...)
-                {
-                }
+                    catch (...)
+                    {
+                    }
 
-                // Existing local files are not enough to prove the resident runtime is
-                // still paired to the currently authenticated account. If the user is on
-                // the login surface, allow a fresh local-session provision after sign-in.
-                if (isLoginSurface)
-                {
-                    m_pairingCompleted = false;
+                    // Existing local files are not enough to prove the resident runtime is
+                    // still paired to the currently authenticated account. If the user is on
+                    // the login surface, allow a fresh local-session provision after sign-in.
+                    if (isLoginSurface)
+                    {
+                        m_pairingCompleted = false;
+                    }
+
+                    core.ExecuteScriptAsync(
+                        m_pairingCompleted
+                            ? L"window.__drakonDesktopPairRuntimeCompleted = true;"
+                            : L"window.__drakonDesktopPairRuntimeCompleted = false;");
+
+                    core.ExecuteScriptAsync(L"window.__drakonDesktopReportTheme && window.__drakonDesktopReportTheme();");
+                    core.ExecuteScriptAsync(winrt::to_hstring("window.__drakonDesktopTryResidentRuntime && window.__drakonDesktopTryResidentRuntime();"));
                 }
-
-                core.ExecuteScriptAsync(
-                    m_pairingCompleted
-                        ? L"window.__drakonDesktopPairRuntimeCompleted = true;"
-                        : L"window.__drakonDesktopPairRuntimeCompleted = false;");
-
-                core.ExecuteScriptAsync(L"window.__drakonDesktopReportTheme && window.__drakonDesktopReportTheme();");
-                core.ExecuteScriptAsync(winrt::to_hstring("window.__drakonDesktopTryResidentRuntime && window.__drakonDesktopTryResidentRuntime();"));
             }
 
             SetStatus(L"", L"", false, false);
@@ -690,6 +707,11 @@ namespace winrt::DrakonDesktop::implementation
     fire_and_forget SiteHostPage::InstallNativePairingBridge(WebView2 const& webView)
     {
         auto lifetime = get_strong();
+
+        if (!m_enableResidentRuntimeBridge)
+        {
+            co_return;
+        }
 
         try
         {
@@ -769,6 +791,31 @@ namespace winrt::DrakonDesktop::implementation
             {
                 AppendBootstrapTrace("site-host: account deletion cleanup scheduling failed");
                 AppendBootstrapTrace(winrt::to_string(result.message));
+            }
+            return;
+        }
+
+        if (messageType == "open-remote-workspace")
+        {
+            auto const sessionId = CleanBridgeSessionValue(payload.value("session_id", std::string{}));
+            auto const ownerDisplayLabel = CleanBridgeSessionValue(payload.value("owner_display_label", std::string{}));
+            auto const operatorDisplayLabel = CleanBridgeSessionValue(payload.value("operator_display_label", std::string{}));
+            if (sessionId.empty())
+            {
+                return;
+            }
+
+            auto const result = ::DrakonDesktop::platform::OpenRemoteWorkspaceWindowFromWeb(
+                winrt::to_hstring(sessionId),
+                winrt::to_hstring(ownerDisplayLabel),
+                winrt::to_hstring(operatorDisplayLabel));
+            if (!result.succeeded)
+            {
+                AppendBootstrapTrace("site-host: failed to open remote workspace window");
+                if (!result.message.empty())
+                {
+                    AppendBootstrapTrace(winrt::to_string(result.message));
+                }
             }
             return;
         }

@@ -23,6 +23,7 @@ export const CreateCameraSchema = z.object({
   webcam_index: z.number().optional(),
   allowpublicaccess: z.boolean().optional(),
   direct_capture_on_motion_only: z.boolean().optional(),
+  capture_acceleration_mode: z.enum(["cpu", "nvidia"]).optional(),
 });
 
 export const UpdateCameraSchema = z.object({
@@ -48,6 +49,7 @@ export const UpdateCameraSchema = z.object({
   webcam_index: z.number().int().nonnegative().nullable().optional(),
   allowpublicaccess: z.boolean().optional(),
   direct_capture_on_motion_only: z.boolean().optional(),
+  capture_acceleration_mode: z.enum(["cpu", "nvidia"]).optional(),
   is_service_running: z.number().min(0).max(1).optional(),
 });
 
@@ -224,6 +226,16 @@ export interface Camera {
   allowpublicaccess?: number;
   analysis_speed?: number;
   model_tier?: string;
+  capture_acceleration_mode?: "cpu" | "nvidia";
+  origin_type?: string;
+  shared_share_id?: number | null;
+  shared_owner_public_id?: string | null;
+  shared_owner_local_camera_id?: number | null;
+  shared_owner_handle?: string | null;
+  shared_owner_email?: string | null;
+  shared_owner_display_label?: string | null;
+  shared_origin_brand_id?: string | null;
+  shared_status?: string | null;
 }
 
 export interface DrakonFindTarget {
@@ -373,6 +385,7 @@ export interface CameraFindShare {
   id: number;
   owner_public_id: string;
   invitee_public_id: string;
+  origin_brand_id?: string | null;
   owner_local_camera_id: number;
   camera_name: string;
   city?: string | null;
@@ -383,6 +396,8 @@ export interface CameraFindShare {
   accepted_at?: string | null;
   revoked_at?: string | null;
   updated_at: string;
+  owner_handle?: string | null;
+  owner_email?: string | null;
 }
 
 export interface Algorithm {

@@ -451,6 +451,35 @@ function buildRunContext(plan: ResolvedOperationalPlan): QueryRunContext {
   };
 }
 
+function deriveScopedStepIds(plan: ResolvedOperationalPlan): number[] {
+  return asPositiveNumberList([
+    ...plan.intent.scope.steps,
+    ...plan.resolved.steps.map((entry) => entry.id),
+    ...plan.resolved.step_runs
+      .map((entry) => entry.step_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+    ...plan.resolved.agent_runs
+      .map((entry) => entry.step_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+  ]);
+}
+
+function deriveScopedJobIds(plan: ResolvedOperationalPlan): number[] {
+  return asPositiveNumberList([
+    ...plan.intent.scope.jobs,
+    ...plan.resolved.jobs.map((entry) => entry.id),
+    ...plan.resolved.job_runs
+      .map((entry) => entry.job_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+    ...plan.resolved.step_runs
+      .map((entry) => entry.job_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+    ...plan.resolved.agent_runs
+      .map((entry) => entry.job_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+  ]);
+}
+
 function buildQueryWindow(plan: ResolvedOperationalPlan, context: OperationalPlannerContext): QueryWindow {
   return {
     startAt:
@@ -1168,6 +1197,171 @@ async function queryIdentityCardsDb(params: {
     .slice(0, requestedLimit);
 }
 
+async function queryCamerasDb(params: {
+  db: D1Database;
+  userId: string;
+  plan: ResolvedOperationalPlan;
+  context: OperationalPlannerContext;
+}): Promise<Array<Record<string, unknown>>> {
+  const runContext = buildRunContext(params.plan);
+  const requestedLimit = Math.max(1, Math.min(params.plan.intent.filters.limit, 120));
+  const stepIds = deriveScopedStepIds(params.plan);
+  const jobIds = deriveScopedJobIds(params.plan);
+  const directStepIds = asPositiveNumberList([
+    ...params.plan.intent.scope.steps,
+    ...params.plan.resolved.steps.map((entry) => entry.id),
+  ]);
+  const directJobIds = asPositiveNumberList([
+    ...params.plan.intent.scope.jobs,
+    ...params.plan.resolved.jobs.map((entry) => entry.id),
+  ]);
+  const runDerivedCameraIds = asPositiveNumberList([
+    ...params.plan.resolved.step_runs
+      .map((entry) => entry.camera_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+    ...params.plan.resolved.agent_runs
+      .map((entry) => entry.camera_id)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value)),
+  ]);
+  const cameraIdsForScopedTargets =
+    directStepIds.length > 0 || directJobIds.length > 0
+      ? runContext.cameraIds
+      : asPositiveNumberList([...runContext.cameraIds, ...runDerivedCameraIds]);
+
+  if (stepIds.length > 0 || jobIds.length > 0) {
+    const stepFilter = buildNumberInClause("js.id", stepIds);
+    const jobFilter = buildNumberInClause("js.job_id", jobIds);
+    const cameraFilter = buildNumberInClause("jst.camera_id", cameraIdsForScopedTargets);
+    const totalCountRows = await runQuery(
+      params.db,
+      `SELECT COUNT(*) AS total_count
+       FROM job_step_targets jst
+       JOIN job_steps js ON js.id = jst.step_id
+       JOIN jobs j ON j.id = js.job_id
+       WHERE j.user_id = ?${stepFilter.clause}${jobFilter.clause}${cameraFilter.clause}`,
+      [params.userId, ...stepFilter.params, ...jobFilter.params, ...cameraFilter.params]
+    );
+    const totalCount = Number(totalCountRows[0]?.total_count || 0) || 0;
+
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = await runQuery(
+        params.db,
+        `SELECT
+           jst.id AS target_id,
+           jst.camera_id,
+           jst.slot_key,
+           jst.slot_label,
+           COALESCE(c.name, jst.slot_label, '') AS camera_name,
+           js.id AS step_id,
+           COALESCE(js.title, '') AS step_name,
+           j.id AS job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(jsa.input_type, 'video') AS input_type
+         FROM job_step_targets jst
+         JOIN job_steps js ON js.id = jst.step_id
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN cameras c ON c.id = jst.camera_id
+         LEFT JOIN job_step_agents jsa
+           ON jsa.step_id = jst.step_id
+          AND jsa.camera_id = jst.camera_id
+          AND jsa.is_active = 1
+         WHERE j.user_id = ?${stepFilter.clause}${jobFilter.clause}${cameraFilter.clause}
+         ORDER BY COALESCE(j.name, ''), COALESCE(js.step_order, 0), jst.id ASC
+         LIMIT ${requestedLimit}`,
+        [params.userId, ...stepFilter.params, ...jobFilter.params, ...cameraFilter.params]
+      );
+    } catch {
+      rows = await runQuery(
+        params.db,
+        `SELECT
+           jst.id AS target_id,
+           jst.camera_id,
+           NULL AS slot_key,
+           NULL AS slot_label,
+           COALESCE(c.name, '') AS camera_name,
+           js.id AS step_id,
+           COALESCE(js.name, '') AS step_name,
+           j.id AS job_id,
+           COALESCE(j.name, '') AS job_name,
+           COALESCE(jsa.input_type, 'video') AS input_type
+         FROM job_step_targets jst
+         JOIN job_steps js ON js.id = jst.step_id
+         JOIN jobs j ON j.id = js.job_id
+         LEFT JOIN cameras c ON c.id = jst.camera_id
+         LEFT JOIN job_step_agents jsa
+           ON jsa.step_id = jst.step_id
+          AND jsa.camera_id = jst.camera_id
+          AND jsa.is_active = 1
+         WHERE j.user_id = ?${stepFilter.clause}${jobFilter.clause}${cameraFilter.clause}
+         ORDER BY COALESCE(j.name, ''), COALESCE(js.step_order, 0), jst.id ASC
+         LIMIT ${requestedLimit}`,
+        [params.userId, ...stepFilter.params, ...jobFilter.params, ...cameraFilter.params]
+      );
+    }
+
+    const seen = new Set<string>();
+    const deduped: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const stepId = Number(row.step_id || 0) || 0;
+      const cameraId = Number(row.camera_id || 0) || 0;
+      const slotKey = normalizePlannerText(row.slot_key, 160);
+      const dedupeKey = `${stepId}:${cameraId}:${slotKey}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      deduped.push({
+        target_id: Number(row.target_id || 0) || null,
+        camera_id: cameraId || null,
+        camera_name: normalizePlannerText(row.camera_name, 160) || null,
+        slot_key: slotKey || null,
+        slot_label: normalizePlannerText(row.slot_label, 160) || null,
+        step_id: stepId || null,
+        step_name: normalizePlannerText(row.step_name, 160) || null,
+        job_id: Number(row.job_id || 0) || null,
+        job_name: normalizePlannerText(row.job_name, 160) || null,
+        input_type: normalizePlannerText(row.input_type, 80) || null,
+        total_count: totalCount,
+      });
+      if (deduped.length >= requestedLimit) break;
+    }
+    return deduped;
+  }
+
+  const inventoryFilter = buildNumberInClause(
+    "c.id",
+    asPositiveNumberList([...runContext.cameraIds, ...runDerivedCameraIds])
+  );
+  const rows = await runQuery(
+    params.db,
+    `SELECT
+       c.id AS camera_id,
+       COALESCE(c.name, '') AS camera_name,
+       NULL AS slot_key,
+       NULL AS slot_label,
+       NULL AS step_id,
+       NULL AS step_name,
+       NULL AS job_id,
+       NULL AS job_name,
+       NULL AS input_type
+     FROM cameras c
+     WHERE c.user_id = ?${inventoryFilter.clause}
+     ORDER BY COALESCE(c.name, '') ASC
+     LIMIT ${requestedLimit}`,
+    [params.userId, ...inventoryFilter.params]
+  );
+  return rows.map((row) => ({
+    camera_id: Number(row.camera_id || 0) || null,
+    camera_name: normalizePlannerText(row.camera_name, 160) || null,
+    slot_key: null,
+    slot_label: null,
+    step_id: null,
+    step_name: null,
+    job_id: null,
+    job_name: null,
+    input_type: null,
+  }));
+}
+
 async function queryJobRunsDb(params: {
   db: D1Database;
   userId: string;
@@ -1456,6 +1650,10 @@ async function queryPrimaryRowsDb(params: {
     case "identity_cards": {
       const rows = await queryIdentityCardsDb(params);
       return { source, rows, datasets: { identity_cards: rows } };
+    }
+    case "cameras": {
+      const rows = await queryCamerasDb(params);
+      return { source, rows, datasets: { cameras: rows } };
     }
     case "job_runs": {
       const rows = await queryJobRunsDb(params);

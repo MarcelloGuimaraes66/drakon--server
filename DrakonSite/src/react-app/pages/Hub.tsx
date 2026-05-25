@@ -1,9 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
+import { useAuth } from "@getmocha/users-service/react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Bot, Briefcase, Camera, Download, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import ConfirmDialog from "@/react-app/components/ConfirmDialog";
 import Layout from "@/react-app/components/Layout";
+import { useEffectiveUser } from "@/react-app/hooks/useEffectiveUser";
+import {
+  canCreateAgents,
+  canCreateTasks,
+  canExecuteAgents,
+  canExecuteCameras,
+  canExecuteTasks,
+  canViewAgents,
+  canViewTasks,
+} from "@/react-app/lib/accountAccess";
 
 type HubTab = "agent" | "task";
 type HubCatalogSource = "hub" | "cache";
@@ -30,9 +41,11 @@ type CameraRow = {
 
 export default function HubPage() {
   const { t } = useTranslation();
+  const { user } = useAuth();
+  const { effectiveUser } = useEffectiveUser();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = (searchParams.get("type") === "task" ? "task" : "agent") as HubTab;
+  const requestedTab = (searchParams.get("type") === "task" ? "task" : "agent") as HubTab;
   const installTarget = searchParams.get("installTarget");
   const contextCameraId = Number(searchParams.get("cameraId") || 0);
   const contextStepId = Number(searchParams.get("stepId") || 0);
@@ -62,6 +75,22 @@ export default function HubPage() {
   const searchJobsLabel = t("jobs.searchJobs", { defaultValue: "Search jobs..." });
   const jobNameLabel = t("jobs.jobName", { defaultValue: "Job Name" });
   const jobsLabelLower = jobsLabel.toLocaleLowerCase();
+  const permissionUser = effectiveUser || user;
+  const canBrowseAgentHub = canViewAgents(permissionUser);
+  const canBrowseTaskHub = canViewTasks(permissionUser);
+  const canManageAgentHub = canExecuteAgents(permissionUser);
+  const canManageTaskHub = canExecuteTasks(permissionUser);
+  const canCreateAgentEntries = canCreateAgents(permissionUser);
+  const canCreateTaskEntries = canCreateTasks(permissionUser);
+  const canManageCameras = canExecuteCameras(permissionUser);
+  const canInstallAgentToCamera = canCreateAgentEntries && canManageCameras;
+  const canInstallAgentToStep = canCreateAgentEntries && canManageTaskHub;
+  const tab =
+    requestedTab === "agent" && !canBrowseAgentHub && canBrowseTaskHub
+      ? "task"
+      : requestedTab === "task" && !canBrowseTaskHub && canBrowseAgentHub
+        ? "agent"
+        : requestedTab;
 
   const availableSlots = useMemo(() => {
     const slots = Array.isArray(taskInstallItem?.snapshot_json?.camera_slots)
@@ -71,6 +100,10 @@ export default function HubPage() {
   }, [taskInstallItem]);
 
   const fetchCameras = async () => {
+    if (!canManageCameras) {
+      setCameras([]);
+      return;
+    }
     try {
       const response = await fetch("/api/cameras");
       if (!response.ok) return;
@@ -122,7 +155,24 @@ export default function HubPage() {
 
   useEffect(() => {
     void fetchCameras();
-  }, []);
+  }, [canManageCameras]);
+
+  useEffect(() => {
+    if (
+      (requestedTab === "agent" && !canBrowseAgentHub && canBrowseTaskHub) ||
+      (requestedTab === "task" && !canBrowseTaskHub && canBrowseAgentHub)
+    ) {
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.set("type", canBrowseAgentHub ? "agent" : "task");
+      setSearchParams(nextParams, { replace: true });
+    }
+  }, [
+    canBrowseAgentHub,
+    canBrowseTaskHub,
+    requestedTab,
+    searchParams,
+    setSearchParams,
+  ]);
 
   useEffect(() => {
     void fetchItems({ syncFirst: true });
@@ -281,24 +331,28 @@ export default function HubPage() {
           </div>
 
           <div className="inline-flex rounded-full border border-gray-800 bg-gray-900/80 p-1">
-            <button
-              type="button"
-              onClick={() => updateTab("agent")}
-              className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
-                tab === "agent" ? "bg-orange-500 text-white" : "text-gray-400 hover:text-gray-200"
-              }`}
-            >
-              Agents
-            </button>
-            <button
-              type="button"
-              onClick={() => updateTab("task")}
-              className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
-                tab === "task" ? "bg-orange-500 text-white" : "text-gray-400 hover:text-gray-200"
-              }`}
-            >
-              {jobsLabel}
-            </button>
+            {canBrowseAgentHub ? (
+              <button
+                type="button"
+                onClick={() => updateTab("agent")}
+                className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                  tab === "agent" ? "bg-orange-500 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                Agents
+              </button>
+            ) : null}
+            {canBrowseTaskHub ? (
+              <button
+                type="button"
+                onClick={() => updateTab("task")}
+                className={`rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+                  tab === "task" ? "bg-orange-500 text-white" : "text-gray-400 hover:text-gray-200"
+                }`}
+              >
+                {jobsLabel}
+              </button>
+            ) : null}
           </div>
 
           <div className="flex flex-col gap-3 sm:flex-row xl:justify-self-end">
@@ -416,10 +470,15 @@ export default function HubPage() {
                     {item.can_delete ? (
                       <button
                         type="button"
-                        disabled={deletingItemId === item.id || installingItemId === item.id}
+                        disabled={
+                          deletingItemId === item.id ||
+                          installingItemId === item.id ||
+                          (item.item_type === "agent" ? !canManageAgentHub : !canManageTaskHub)
+                        }
                         onClick={() => setDeleteCandidate(item)}
                         className={`inline-flex items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold transition-colors ${
-                          deletingItemId === item.id
+                          deletingItemId === item.id ||
+                          (item.item_type === "agent" ? !canManageAgentHub : !canManageTaskHub)
                             ? "cursor-not-allowed border-gray-800 bg-gray-900 text-gray-500"
                             : "border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/15"
                         }`}
@@ -432,54 +491,70 @@ export default function HubPage() {
                       installTarget === "step" && contextStepCameraReady && contextStepReady ? (
                         <button
                           type="button"
-                          disabled={installingItemId === item.id}
+                          disabled={installingItemId === item.id || !canInstallAgentToStep}
                           onClick={() => void installAgentIntoStep(item)}
                           className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
                             item.can_delete ? "flex-1" : "w-full"
                           } ${
-                            installingItemId === item.id
+                            installingItemId === item.id || !canInstallAgentToStep
                               ? "cursor-not-allowed bg-gray-800 text-gray-500"
                               : "bg-orange-500 text-white hover:bg-orange-400"
                           }`}
                         >
                           <Download className="h-4 w-4" />
-                          {installingItemId === item.id ? "Installing..." : "Use in This Step"}
+                          {installingItemId === item.id
+                            ? "Installing..."
+                            : canInstallAgentToStep
+                              ? "Use in This Step"
+                              : "View Only"}
                         </button>
                       ) : installTarget === "camera" && contextCameraReady ? (
                         <button
                           type="button"
-                          disabled={installingItemId === item.id}
+                          disabled={installingItemId === item.id || !canInstallAgentToCamera}
                           onClick={() => void installAgent(item, contextCameraId)}
                           className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
                             item.can_delete ? "flex-1" : "w-full"
                           } ${
-                            installingItemId === item.id
+                            installingItemId === item.id || !canInstallAgentToCamera
                               ? "cursor-not-allowed bg-gray-800 text-gray-500"
                               : "bg-orange-500 text-white hover:bg-orange-400"
                           }`}
                         >
                           <Camera className="h-4 w-4" />
-                          {installingItemId === item.id ? "Installing..." : "Add to This Camera"}
+                          {installingItemId === item.id
+                            ? "Installing..."
+                            : canInstallAgentToCamera
+                              ? "Add to This Camera"
+                              : "View Only"}
                         </button>
                       ) : (
                         <button
                           type="button"
+                          disabled={!canInstallAgentToCamera}
                           onClick={() => {
+                            if (!canInstallAgentToCamera) return;
                             setAgentPickerItem(item);
                             setAgentCameraId(cameras[0]?.id ? String(cameras[0].id) : "");
                           }}
-                          className={`inline-flex items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400 ${
+                          className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
                             item.can_delete ? "flex-1" : "w-full"
+                          } ${
+                            canInstallAgentToCamera
+                              ? "bg-orange-500 text-white hover:bg-orange-400"
+                              : "cursor-not-allowed bg-gray-800 text-gray-500"
                           }`}
                         >
                           <Camera className="h-4 w-4" />
-                          Install to Camera
+                          {canInstallAgentToCamera ? "Install to Camera" : "View Only"}
                         </button>
                       )
                     ) : (
                       <button
                         type="button"
+                        disabled={!canCreateTaskEntries}
                         onClick={() => {
+                          if (!canCreateTaskEntries) return;
                           setTaskInstallItem(item);
                           setTaskNameOverride(item.title);
                           const initialMapping: Record<string, string> = {};
@@ -492,12 +567,16 @@ export default function HubPage() {
                           }
                           setTaskCameraMapping(initialMapping);
                         }}
-                        className={`inline-flex items-center justify-center gap-2 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-orange-400 ${
+                        className={`inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold transition-colors ${
                           item.can_delete ? "flex-1" : "w-full"
+                        } ${
+                          canCreateTaskEntries
+                            ? "bg-orange-500 text-white hover:bg-orange-400"
+                            : "cursor-not-allowed bg-gray-800 text-gray-500"
                         }`}
                       >
                         <Briefcase className="h-4 w-4" />
-                        {createJobLabel}
+                        {canCreateTaskEntries ? createJobLabel : "View Only"}
                       </button>
                     )}
                   </div>
@@ -550,10 +629,10 @@ export default function HubPage() {
               </button>
               <button
                 type="button"
-                disabled={!agentCameraId || installingItemId === agentPickerItem.id}
+                disabled={!agentCameraId || installingItemId === agentPickerItem.id || !canInstallAgentToCamera}
                 onClick={() => void installAgent(agentPickerItem, Number(agentCameraId))}
                 className={`rounded-2xl px-4 py-2.5 text-sm font-semibold transition-colors ${
-                  !agentCameraId || installingItemId === agentPickerItem.id
+                  !agentCameraId || installingItemId === agentPickerItem.id || !canInstallAgentToCamera
                     ? "cursor-not-allowed bg-gray-800 text-gray-500"
                     : "bg-orange-500 text-white hover:bg-orange-400"
                 }`}
@@ -627,15 +706,19 @@ export default function HubPage() {
               </button>
               <button
                 type="button"
-                disabled={installingItemId === taskInstallItem.id}
+                disabled={installingItemId === taskInstallItem.id || !canCreateTaskEntries}
                 onClick={() => void submitTaskInstall()}
                 className={`rounded-2xl px-4 py-2.5 text-sm font-semibold transition-colors ${
-                  installingItemId === taskInstallItem.id
+                  installingItemId === taskInstallItem.id || !canCreateTaskEntries
                     ? "cursor-not-allowed bg-gray-800 text-gray-500"
                     : "bg-orange-500 text-white hover:bg-orange-400"
                 }`}
               >
-                {installingItemId === taskInstallItem.id ? "Creating..." : createJobLabel}
+                {installingItemId === taskInstallItem.id
+                  ? "Creating..."
+                  : canCreateTaskEntries
+                    ? createJobLabel
+                    : "View Only"}
               </button>
             </div>
           </div>

@@ -28,9 +28,12 @@ const execFileAsync = promisify(execFile);
 const desktopRuntimeEnvKeys = [
   "GOOGLE_OAUTH_CLIENT_ID",
   "GOOGLE_OAUTH_CLIENT_SECRET",
+  "DESKTOP_GOOGLE_OAUTH_CLIENT_ID",
+  "DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET",
   "GOOGLE_GEOCODING_API_KEY",
   "GEONAMES_USERNAME",
   "CHAT_V2_ENABLED",
+  "DAILY_REPORTS",
   "STRIPE_SECRET_KEY",
   "STRIPE_WEBHOOK_SECRET",
   "STRIPE_CHAT_PAYG_PRICE_ID",
@@ -199,6 +202,14 @@ async function stageDesktopRuntimeEnv() {
     }
   }
 
+  const dailyReportsValue = resolveRuntimeEnvValueFromAliases(
+    ["DAILY_REPORTS", "daily_reports"],
+    sourceLocalEnv
+  );
+  if (dailyReportsValue) {
+    runtimeEnv.DAILY_REPORTS = dailyReportsValue;
+  }
+
   const centralAuthPublicKey = await resolveDesktopCentralAuthPublicKey(sourceLocalEnv);
   const centralAuthBaseUrl = String(runtimeEnv.CENTRAL_AUTH_BASE_URL || "").trim();
   const centralAuthConfigured = Boolean(
@@ -221,13 +232,6 @@ async function stageDesktopRuntimeEnv() {
 
     runtimeEnv.CENTRAL_AUTH_BASE_URL = centralAuthBaseUrl;
     runtimeEnv.CENTRAL_AUTH_PUBLIC_KEY = centralAuthPublicKey;
-  }
-
-  if (activeBrand.features?.googleLoginEnabled) {
-    ensureRequiredRuntimeEnv(runtimeEnv, [
-      "GOOGLE_OAUTH_CLIENT_ID",
-      "GOOGLE_OAUTH_CLIENT_SECRET",
-    ]);
   }
 
   let desktopGoogleRedirectUri = resolveRuntimeEnvValue(
@@ -263,6 +267,17 @@ function resolveRuntimeEnvValue(key, sourceEnv) {
   return String(sourceEnv[key] || "").trim();
 }
 
+function resolveRuntimeEnvValueFromAliases(keys, sourceEnv) {
+  for (const key of keys) {
+    const value = resolveRuntimeEnvValue(key, sourceEnv);
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
 async function resolveDesktopCentralAuthPublicKey(sourceEnv) {
   const inlineValue = resolveRuntimeEnvValue("CENTRAL_AUTH_PUBLIC_KEY", sourceEnv);
   if (inlineValue) {
@@ -285,17 +300,6 @@ async function resolveDesktopCentralAuthPublicKey(sourceEnv) {
   }
 
   return (await fs.readFile(resolvedPath, "utf8")).trim();
-}
-
-function ensureRequiredRuntimeEnv(envMap, requiredKeys) {
-  const missingKeys = requiredKeys.filter((key) => !String(envMap[key] || "").trim());
-  if (missingKeys.length === 0) {
-    return;
-  }
-
-  throw new Error(
-    `Desktop runtime env is missing required keys for ${activeBrandId}: ${missingKeys.join(", ")}`
-  );
 }
 
 function serializeEnv(envMap) {

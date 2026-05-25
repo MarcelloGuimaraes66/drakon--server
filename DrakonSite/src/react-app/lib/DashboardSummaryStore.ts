@@ -20,6 +20,15 @@ export interface Camera {
   is_online?: number;
   connection_issue_kind?: string | null;
   connection_issue_reason?: string | null;
+  origin_type?: string | null;
+  shared_share_id?: number | null;
+  shared_owner_public_id?: string | null;
+  shared_owner_local_camera_id?: number | null;
+  shared_owner_handle?: string | null;
+  shared_owner_email?: string | null;
+  shared_owner_display_label?: string | null;
+  shared_origin_brand_id?: string | null;
+  shared_status?: string | null;
   [key: string]: any; // Allow other camera properties
 }
 

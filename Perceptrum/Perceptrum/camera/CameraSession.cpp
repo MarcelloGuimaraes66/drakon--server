@@ -1,4 +1,4 @@
-// CameraSession.cpp
+﻿// CameraSession.cpp
 #include "CameraSession.h"
 
 #include <iostream>
@@ -34,6 +34,7 @@
 #include "../comm/BackendConfig.h"
 #include "../comm/PairingClient.h"
 #include "../generated/Branding.h"
+#include "../orchestrator/ConfigUtils.h"
 
 #include <filesystem>
 #include <fstream>
@@ -882,6 +883,202 @@ static std::string localDateTokenYYYYMMDD_()
     return std::string(buffer);
 }
 
+struct DailyReportDateParts_ {
+    std::string compactToken;
+    std::string dashedToken;
+    std::string year;
+    std::string month;
+    std::string day;
+};
+
+static DailyReportDateParts_ localDatePartsForDailyReport_()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    char compact[16];
+    char dashed[16];
+    char year[8];
+    char month[4];
+    char day[4];
+
+    std::snprintf(
+        compact,
+        sizeof(compact),
+        "%04u%02u%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(
+        dashed,
+        sizeof(dashed),
+        "%04u-%02u-%02u",
+        static_cast<unsigned>(st.wYear),
+        static_cast<unsigned>(st.wMonth),
+        static_cast<unsigned>(st.wDay)
+    );
+    std::snprintf(year, sizeof(year), "%04u", static_cast<unsigned>(st.wYear));
+    std::snprintf(month, sizeof(month), "%02u", static_cast<unsigned>(st.wMonth));
+    std::snprintf(day, sizeof(day), "%02u", static_cast<unsigned>(st.wDay));
+
+    return DailyReportDateParts_{
+        std::string(compact),
+        std::string(dashed),
+        std::string(year),
+        std::string(month),
+        std::string(day)
+    };
+}
+
+static bool dailyReportsEnabled_()
+{
+    static const bool enabled = [] {
+        return chatv2::parseBoolValue(
+            chatv2::loadConfigValue("DAILY_REPORTS", { "daily_reports_enabled.txt" }),
+            false
+        );
+    }();
+    return enabled;
+}
+
+static std::string dailyReportCameraNameToken_(const CameraConfig& config)
+{
+    const std::string fallback =
+        config.id.empty() ? std::string("camera") : std::string("camera_") + config.id;
+    const std::string rawValue = !config.name.empty() ? config.name : fallback;
+    const std::string token = sanitizeCameraAgentEventToken_(rawValue);
+    return token.empty() ? sanitizeCameraAgentEventToken_(fallback) : token;
+}
+
+static std::string dailyReportCameraDirToken_(const CameraConfig& config)
+{
+    const std::string idToken = sanitizeCameraAgentEventToken_(
+        config.id.empty() ? std::string("unknown") : config.id
+    );
+    return idToken.empty() ? std::string("camera_unknown") : std::string("camera_") + idToken;
+}
+
+static fs::path buildDailyReportCameraDir_(
+    const CameraConfig& config,
+    const DailyReportDateParts_& dateParts)
+{
+    fs::path dir = fs::path("C:\\daily_reports");
+    dir /= dateParts.year;
+    dir /= dateParts.month;
+    dir /= dateParts.day;
+    dir /= dailyReportCameraDirToken_(config);
+    return dir;
+}
+
+static std::string buildDailyReportFileName_(
+    const CameraConfig& config,
+    const DailyReportDateParts_& dateParts)
+{
+    return dateParts.dashedToken + "__" + dailyReportCameraNameToken_(config) + ".jpg";
+}
+
+static bool hasDailyReportImageInDir_(const fs::path& dir)
+{
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        return false;
+    }
+
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) continue;
+
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        if (extension == ".jpg" || extension == ".jpeg") {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool writeDailyReportImageAtomic_(
+    const std::string& cameraId,
+    const fs::path& dir,
+    const std::string& fileName,
+    const std::vector<uchar>& imageBytes)
+{
+    try {
+        if (imageBytes.empty()) return false;
+
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            Logger::instance().logDebug(
+                cameraId,
+                "daily_reports: create_directories failed: " + ec.message() + " dir=" + dir.string()
+            );
+            return false;
+        }
+
+        const fs::path finalPath = dir / fileName;
+        fs::path tmpPath = finalPath;
+        tmpPath += ".tmp";
+
+        {
+            std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    "daily_reports: failed opening temp image path: " + tmpPath.string()
+                );
+                return false;
+            }
+
+            ofs.write(
+                reinterpret_cast<const char*>(imageBytes.data()),
+                static_cast<std::streamsize>(imageBytes.size())
+            );
+            if (!ofs) {
+                Logger::instance().logDebug(
+                    cameraId,
+                    "daily_reports: failed writing temp image path: " + tmpPath.string()
+                );
+                ofs.close();
+                fs::remove(tmpPath, ec);
+                return false;
+            }
+        }
+
+        fs::rename(tmpPath, finalPath, ec);
+        if (ec) {
+            fs::remove(tmpPath, ec);
+            Logger::instance().logDebug(
+                cameraId,
+                "daily_reports: rename temp image failed: " + ec.message() +
+                " tmp=" + tmpPath.string() + " final=" + finalPath.string()
+            );
+            return false;
+        }
+
+        return true;
+    }
+    catch (const std::exception& ex) {
+        Logger::instance().logDebug(
+            cameraId,
+            std::string("daily_reports: exception writing image snapshot: ") + ex.what()
+        );
+    }
+    catch (...) {
+        Logger::instance().logDebug(
+            cameraId,
+            "daily_reports: unknown exception writing image snapshot"
+        );
+    }
+
+    return false;
+}
+
 
 
 void CameraSession::setOwner(AgentCore* owner)
@@ -1028,7 +1225,7 @@ CameraSession::OpenMonitorSnapshot CameraSession::getOpenMonitorSnapshot() const
     snapshot.reconnectCount = telemetryReconnectCount_.load(std::memory_order_relaxed);
     snapshot.width = telemetryFrameWidth_.load(std::memory_order_relaxed);
     snapshot.height = telemetryFrameHeight_.load(std::memory_order_relaxed);
-    snapshot.useGpu = config_.useGpu;
+    snapshot.useGpu = config_.captureAccelerationMode == "nvidia";
     snapshot.captureThreadCpuPercent = telemetryCaptureThreadCpuPercent_.load(std::memory_order_relaxed);
     snapshot.captureMemEstimatedBytes = telemetryCaptureMemEstimatedBytes_.load(std::memory_order_relaxed);
     snapshot.processWorkingSetBytes = telemetryProcessWorkingSetBytes_.load(std::memory_order_relaxed);
@@ -1725,7 +1922,7 @@ static const std::unordered_map<std::string, std::string> kAlgorithmPrompts = {
 
 
 
-// Delay para considerar a câmera "idle" e começar a pular frames
+// Delay para considerar a cÃ¢mera "idle" e comeÃ§ar a pular frames
 static constexpr auto kIdlePurgeDelay = std::chrono::seconds(3);
 
 CameraSession::CameraSession(const CameraConfig& cfg,
@@ -1793,7 +1990,7 @@ void CameraSession::start() {
         "START camera session. RTSP=" + config_.rtspUrl
     );
 
-    // Agora usamos o nome que você pediu: base_camera_thread().
+    // Agora usamos o nome que vocÃª pediu: base_camera_thread().
     if (owner_ &&
         !config_.isDrakonFindTemporarySession &&
         !config_.isVideoSearchTemporarySession) {
@@ -1836,10 +2033,10 @@ void CameraSession::base_camera_thread() {
     // Thread de captura
     captureThread_ = std::thread(&CameraSession::captureLoop_, this);
 
-    // Thread de inferência
+    // Thread de inferÃªncia
     inferenceThread_ = std::thread(&CameraSession::inferenceLoop_, this);
 
-    // Thread para envio de thumbnails (não bloqueia a captura)
+    // Thread para envio de thumbnails (nÃ£o bloqueia a captura)
     thumbnailStop_.store(false);
     thumbnailThread_ = std::thread(&CameraSession::thumbnailLoop_, this);
 }
@@ -2052,7 +2249,7 @@ std::string httpPostJsonGemini(const std::string& api_key, const std::string& mo
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 90L);           // Timeout total: 60s
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexão: 30s
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexÃ£o: 30s
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
@@ -2317,7 +2514,7 @@ std::string describe_environment_gemini_from_bytes(
         img_bytes.size()
     );
 
-    // SYSTEM RULES focados em descrição de ambiente
+    // SYSTEM RULES focados em descriÃ§Ã£o de ambiente
     std::string system_rules =
         "You are " + std::string(AppBrand::kAssistantName) + ", a CCTV camera ENVIRONMENT classifier.\n"
         "Your job is to identify what kind of PLACE the camera is looking at and "
@@ -2397,7 +2594,7 @@ static bool loadMochaAuth(std::string& baseUrl,
     std::string& clientId)
 {
     // Shared config for backend base URL
-    baseUrl = GetPerceptrumBaseUrl();
+    baseUrl = GetPerceptrumAgentBaseUrl();
 
     PairingClient pairing(baseUrl);
     bool ok = pairing.loadSavedToken(exeToken, clientId);
@@ -2449,7 +2646,7 @@ static std::string httpPostJsonAuthorized(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);           // Timeout total: 60s
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexão: 30s
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexÃ£o: 30s
 
     CURLcode res = curl_easy_perform(curl);
 
@@ -2538,7 +2735,7 @@ static std::string httpGetJsonAuthorized(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);           // Timeout total: 60s
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexão: 30s
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);    // Timeout conexÃ£o: 30s
 
     CURLcode res = curl_easy_perform(curl);
 
@@ -2676,16 +2873,16 @@ void CameraSession::checkCameraDescriptionOnce_() {
         return; // already started
     }
 
-    // Se já existe uma thread rodando, não criar outra
+    // Se jÃ¡ existe uma thread rodando, nÃ£o criar outra
     if (descriptionThread_.joinable()) {
         return;
     }
 
     try {
-        // Capturar cópias dos dados necessários ANTES de lançar a thread
+        // Capturar cÃ³pias dos dados necessÃ¡rios ANTES de lanÃ§ar a thread
         std::string cameraId = config_.id;
 
-        // Usar thread gerenciada ao invés de detached
+        // Usar thread gerenciada ao invÃ©s de detached
         descriptionThread_ = std::thread([this, cameraId]() {
             try {
                 // Verificar se ainda estamos rodando
@@ -2754,7 +2951,7 @@ void CameraSession::checkCameraDescriptionOnce_() {
                         frameCopy = firstFrameForDescription_.clone();
                     }
 
-                    // === converter para JPEG em memória ===
+                    // === converter para JPEG em memÃ³ria ===
                     std::vector<uchar> jpgBuf;
                     if (!cv::imencode(".jpg", frameCopy, jpgBuf)) {
                         Logger::instance().logDebug(cameraId, "checkCameraDescriptionOnce_: imencode failed...");
@@ -2810,7 +3007,7 @@ void CameraSession::checkCameraDescriptionOnce_() {
                 );
             }
             });
-        // NÃO chama .detach() - a thread é gerenciada pelo membro descriptionThread_
+        // NÃƒO chama .detach() - a thread Ã© gerenciada pelo membro descriptionThread_
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug(
@@ -2879,6 +3076,86 @@ void CameraSession::maybeUpdateJobStill_(const cv::Mat& frame, std::chrono::stea
         lastJobStillTsUtcIso_ = std::move(tsUtcIso);
         lastJobStillAt_ = now;
     }
+}
+
+void CameraSession::maybeWriteDailyReport_(
+    const cv::Mat& frame,
+    std::chrono::steady_clock::time_point now)
+{
+    static const auto kRetryBackoff = std::chrono::seconds(60);
+
+    if (!dailyReportsEnabled_() || frame.empty()) {
+        return;
+    }
+
+    int camId = 0;
+    try {
+        camId = std::stoi(config_.id);
+    }
+    catch (...) {
+        camId = 0;
+    }
+
+    if (!owner_ || camId <= 0) {
+        return;
+    }
+
+    const auto activeJobIds = owner_->getActiveJobIdsForCamera(camId);
+    if (activeJobIds.empty()) {
+        return;
+    }
+
+    const DailyReportDateParts_ dateParts = localDatePartsForDailyReport_();
+    const std::string& dateToken = dateParts.compactToken;
+    if (!lastDailyReportDateToken_.empty() && lastDailyReportDateToken_ == dateToken) {
+        return;
+    }
+
+    if (!dailyReportRetryDateToken_.empty() &&
+        dailyReportRetryDateToken_ == dateToken &&
+        nextDailyReportRetryAt_.time_since_epoch().count() != 0 &&
+        now < nextDailyReportRetryAt_)
+    {
+        return;
+    }
+
+    const fs::path cameraDir = buildDailyReportCameraDir_(config_, dateParts);
+    if (hasDailyReportImageInDir_(cameraDir)) {
+        lastDailyReportDateToken_ = dateToken;
+        dailyReportRetryDateToken_.clear();
+        nextDailyReportRetryAt_ = std::chrono::steady_clock::time_point{};
+        return;
+    }
+
+    std::vector<uchar> jpgBuf;
+    const std::vector<int> encodeParams{
+        cv::IMWRITE_JPEG_QUALITY,
+        90
+    };
+    if (!cv::imencode(".jpg", frame, jpgBuf, encodeParams) || jpgBuf.empty()) {
+        dailyReportRetryDateToken_ = dateToken;
+        nextDailyReportRetryAt_ = now + kRetryBackoff;
+        Logger::instance().logDebug(
+            config_.id,
+            "daily_reports: failed to encode daily snapshot JPEG"
+        );
+        return;
+    }
+
+    const std::string fileName = buildDailyReportFileName_(config_, dateParts);
+    if (!writeDailyReportImageAtomic_(config_.id, cameraDir, fileName, jpgBuf)) {
+        dailyReportRetryDateToken_ = dateToken;
+        nextDailyReportRetryAt_ = now + kRetryBackoff;
+        return;
+    }
+
+    lastDailyReportDateToken_ = dateToken;
+    dailyReportRetryDateToken_.clear();
+    nextDailyReportRetryAt_ = std::chrono::steady_clock::time_point{};
+    Logger::instance().logDebug(
+        config_.id,
+        "daily_reports: saved daily snapshot " + (cameraDir / fileName).string()
+    );
 }
 
 
@@ -2996,7 +3273,7 @@ void CameraSession::captureLoop_() {
 
 
         // ============================================================
-        // 1) BRANCH WEBCAM LOCAL (0..5) – sobrescreve RTSP quando setado
+        // 1) BRANCH WEBCAM LOCAL (0..5) â€“ sobrescreve RTSP quando setado
         // ============================================================
         if (config_.webcam_index >= 0 && config_.webcam_index <= 5) {
             Logger::instance().logDebug(
@@ -3025,7 +3302,7 @@ void CameraSession::captureLoop_() {
             const int   kFailsBeforeGiveUp = 50;
             const auto  kReadFailSleep = std::chrono::milliseconds(100);
 
-            // Intervalo de envio para a thread de inferência,
+            // Intervalo de envio para a thread de inferÃªncia,
             // vindo de cfg.frameCaptureIntervalSeconds (1, 8, 12, etc.)
             const int intervalSeconds = (config_.frameCaptureIntervalSeconds > 0)
                 ? config_.frameCaptureIntervalSeconds
@@ -3115,12 +3392,13 @@ void CameraSession::captureLoop_() {
                 telemetryFrameHeight_.store(frameMat.rows, std::memory_order_relaxed);
 
                 maybeUpdateJobStill_(frameMat, now);
+                maybeWriteDailyReport_(frameMat, now);
 
-                // salva o primeiro frame na memoria para descrição de ambiente <<< 
+                // salva o primeiro frame na memoria para descriÃ§Ã£o de ambiente <<< 
                 if (!firstFrameSaved_.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lock(firstFrameMutex_);
                     if (!firstFrameSaved_.load(std::memory_order_relaxed)) {
-                        firstFrameForDescription_ = frameMat.clone();   // cópia independente
+                        firstFrameForDescription_ = frameMat.clone();   // cÃ³pia independente
                         firstFrameSaved_.store(true, std::memory_order_release);
 
                         Logger::instance().logDebug(
@@ -3135,7 +3413,7 @@ void CameraSession::captureLoop_() {
 
                 // --- Thumbnail update every 3 seconds ---
                 if (lastThumbnailSent_.time_since_epoch().count() == 0) {
-                    // segurança, caso não tenha sido inicializado
+                    // seguranÃ§a, caso nÃ£o tenha sido inicializado
                     lastThumbnailSent_ = now - kDashboardThumbnailIntervalCamera_;
                 }
 
@@ -3197,7 +3475,7 @@ void CameraSession::captureLoop_() {
                 bool idleLong = (now - lastMotionSeen_) >= kIdlePurgeDelay;
                 skipFrames_.store(idleLong, std::memory_order_relaxed);
 
-                // Só enfileira para inferência quando não estiver pulando
+                // SÃ³ enfileira para inferÃªncia quando nÃ£o estiver pulando
                 // e respeitando o intervalo de frame_rate
                 if (!skipFrames_.load(std::memory_order_relaxed)) {
                     if ((now - lastSentToBuffer) >= enqueueInterval) {
@@ -3318,7 +3596,7 @@ void CameraSession::captureLoop_() {
             streamOnline_.store(false, std::memory_order_relaxed);
             buffer_.requestStop();
             Logger::instance().logDebug(config_.id, "captureLoop_ (webcam) exiting.");
-            return; // não cai na lógica RTSP
+            return; // nÃ£o cai na lÃ³gica RTSP
         }
 
 
@@ -3374,9 +3652,11 @@ void CameraSession::captureLoop_() {
         p.enable_reconnect = true;
         p.reconnect_max_delay_s = 5; // optional: was 10
 
-        // Troque true/false pra comparar rápido
-        const bool kUsePumpMode = true;
-        p.low_cpu_skip_nonref = kUsePumpMode;
+        // Troque true/false pra comparar rÃ¡pido
+        bool usePumpMode = true;
+        p.low_cpu_skip_nonref = false;
+        p.prefer_nvidia_decode = config_.captureAccelerationMode == "nvidia";
+        p.require_hardware_decode = false;
 
 
         RtspCapture cap;
@@ -3390,7 +3670,7 @@ void CameraSession::captureLoop_() {
         mdPump.thresholdValue = 22;   // era 20
         mdPump.minChangedPixels = 100;  // era 80 (mata speckle/noise)
         mdPump.sensitivity = 0.022; // era 0.02 (slow path usa *0.5 => 0.02)
-        mdPump.bgAlpha = 0.03; // era 0.2 aprende luz mais rápido (menos falso positivo por sombra)
+        mdPump.bgAlpha = 0.03; // era 0.2 aprende luz mais rÃ¡pido (menos falso positivo por sombra)
         mdPump.globalChangeFrac = 0.5;  // opcional (era 0.5)
 
 
@@ -3666,7 +3946,7 @@ void CameraSession::captureLoop_() {
         const auto  kReadFailSleep = std::chrono::milliseconds(100);
 
 
-        // Intervalo de envio para a thread de inferência,
+        // Intervalo de envio para a thread de inferÃªncia,
         // vindo de cfg.frameCaptureIntervalSeconds (1, 8, 12, etc.)
         const int intervalSeconds = (config_.frameCaptureIntervalSeconds > 0)
             ? config_.frameCaptureIntervalSeconds
@@ -3685,6 +3965,22 @@ void CameraSession::captureLoop_() {
 
         bool offline = false;
         auto nextTick = std::chrono::steady_clock::now();
+        std::size_t consecutiveNearBlackFrames = 0;
+        bool captureModeFallbackAttempted = false;
+        bool directReadStillBlackWarned = false;
+        auto estimateFrameMeanLuma = [](const cv::Mat& frame) -> double {
+            if (frame.empty()) return 0.0;
+            const cv::Scalar meanScalar = cv::mean(frame);
+            if (frame.channels() <= 1) {
+                return meanScalar[0];
+            }
+            return (meanScalar[0] + meanScalar[1] + meanScalar[2]) / 3.0;
+        };
+        auto formatLumaForLog = [](double luma) -> std::string {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(2) << luma;
+            return oss.str();
+        };
 
         auto onOffline = [&](const std::string& reason) {
             if (!offline) {
@@ -3696,7 +3992,7 @@ void CameraSession::captureLoop_() {
                 if (owner_) {
                     maybeNotifyReconnectStatus("runtime", true, 0, 1, reason);
                 }
-                // Important: do NOT requestStop here (that’s for shutdown).
+                // Important: do NOT requestStop here (thatâ€™s for shutdown).
                 buffer_.clearBuffer(); // flush stale frames while offline
             }
             };
@@ -3732,7 +4028,7 @@ void CameraSession::captureLoop_() {
 
             cv::Mat frameMat;
 
-            if (!kUsePumpMode) {
+            if (!usePumpMode) {
                 const auto captureReadStartedAt = std::chrono::steady_clock::now();
                 const bool readOk = cap.read(frameMat) && !frameMat.empty();
                 const auto captureReadLatencyUs = static_cast<std::uint64_t>(
@@ -3798,7 +4094,7 @@ void CameraSession::captureLoop_() {
                     (std::max)(1, static_cast<int>(std::llround(1000.0 / static_cast<double>(normalizedRecordingFps))))
                 );
 
-                // mantém RTSP fluindo sem converter pra BGR
+                // mantÃ©m RTSP fluindo sem converter pra BGR
                 const auto captureReadStartedAt = std::chrono::steady_clock::now();
                 const bool pumpOk = cap.pump(false, nullptr);
                 const auto captureReadLatencyUs = static_cast<std::uint64_t>(
@@ -3852,7 +4148,7 @@ void CameraSession::captureLoop_() {
 
                 auto nowTick = std::chrono::steady_clock::now();
                 if (nowTick < nextTick) {
-                    continue; // ainda não é hora do próximo frame (5 FPS)
+                    continue; // ainda nÃ£o Ã© hora do prÃ³ximo frame (5 FPS)
                 }
 
                 // hora do sample: tenta obter 1 Mat (BGR) numa janela curta
@@ -3876,7 +4172,7 @@ void CameraSession::captureLoop_() {
                 nextTick = std::chrono::steady_clock::now() + tick;
 
                 if (frameMat.empty()) {
-                    // não conseguiu produzir Mat nesse tick; tenta no próximo ciclo
+                    // nÃ£o conseguiu produzir Mat nesse tick; tenta no prÃ³ximo ciclo
                     continue;
                 }
             
@@ -3908,18 +4204,76 @@ void CameraSession::captureLoop_() {
             }
 
 
+            const double frameMeanLuma = estimateFrameMeanLuma(frameMat);
+            const bool nearBlackFrame = frameMeanLuma <= 1.0;
+            if (nearBlackFrame) {
+                ++consecutiveNearBlackFrames;
+            }
+            else {
+                consecutiveNearBlackFrames = 0;
+                if (!usePumpMode) {
+                    directReadStillBlackWarned = false;
+                }
+            }
+
+            if (usePumpMode &&
+                !captureModeFallbackAttempted &&
+                consecutiveNearBlackFrames >= 3)
+            {
+                captureModeFallbackAttempted = true;
+                usePumpMode = false;
+                p.low_cpu_skip_nonref = false;
+                Logger::instance().logWarning(
+                    config_.id,
+                    "captureLoop_: detected repeated near-black frames in pump mode; "
+                    "switching to direct-read RTSP fallback mean_luma=" +
+                    formatLumaForLog(frameMeanLuma)
+                );
+
+                cap.close();
+                activeUrl.clear();
+                if (openAnyCandidate()) {
+                    nextTick = std::chrono::steady_clock::now();
+                    consecutiveReadFails = 0;
+                    consecutiveNearBlackFrames = 0;
+                    continue;
+                }
+
+                Logger::instance().logWarning(
+                    config_.id,
+                    "captureLoop_: direct-read fallback could not reopen the RTSP stream: " +
+                    (lastErr.empty() ? std::string("unknown error") : lastErr)
+                );
+                continue;
+            }
+
+            if (!usePumpMode &&
+                captureModeFallbackAttempted &&
+                nearBlackFrame &&
+                !directReadStillBlackWarned)
+            {
+                directReadStillBlackWarned = true;
+                Logger::instance().logWarning(
+                    config_.id,
+                    "captureLoop_: direct-read fallback is also receiving near-black frames; "
+                    "the source stream itself may be black or unavailable mean_luma=" +
+                    formatLumaForLog(frameMeanLuma)
+                );
+            }
+
             auto now = std::chrono::steady_clock::now();
             telemetryLastFrameTickMs_.store(steadyToMs_(now), std::memory_order_relaxed);
             telemetryFrameWidth_.store(frameMat.cols, std::memory_order_relaxed);
             telemetryFrameHeight_.store(frameMat.rows, std::memory_order_relaxed);
 
             maybeUpdateJobStill_(frameMat, now);
+            maybeWriteDailyReport_(frameMat, now);
 
-            // salva o primeiro frame na memoria para descrição de ambiente <<< 
+            // salva o primeiro frame na memoria para descriÃ§Ã£o de ambiente <<< 
             if (!firstFrameSaved_.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> lock(firstFrameMutex_);
                 if (!firstFrameSaved_.load(std::memory_order_relaxed)) {
-                    firstFrameForDescription_ = frameMat.clone();   // cópia independente
+                    firstFrameForDescription_ = frameMat.clone();   // cÃ³pia independente
                     firstFrameSaved_.store(true, std::memory_order_release);
 
                     Logger::instance().logDebug(
@@ -3938,15 +4292,15 @@ void CameraSession::captureLoop_() {
 
             // Update MotionDetector
             try {
-                if (kUsePumpMode) motionDetector_.update(frameMat, mdPump);
-                else              motionDetector_.update(frameMat, mdNormal);
+                if (usePumpMode) motionDetector_.update(frameMat, mdPump);
+                else             motionDetector_.update(frameMat, mdNormal);
 
                 //motionDetector_.update(frameMat);
             }
             catch (const std::exception& e) {
                 Logger::instance().logDebug(config_.id,
                     std::string("motionDetector_.update() EXCEPTION: ") + e.what());
-                continue; // não mate a thread, apenas pule este frame
+                continue; // nÃ£o mate a thread, apenas pule este frame
             }
             catch (...) {
                 Logger::instance().logDebug(config_.id,
@@ -6204,7 +6558,7 @@ void tokenUsageWorker() {
     Logger::instance().logDebug("TokenWorker", "worker thread exiting");
 }
 
-// Chamar no início do programa (ex: em AgentCore::start ou main)
+// Chamar no inÃ­cio do programa (ex: em AgentCore::start ou main)
 void startTokenUsageWorker() {
     if (g_tokenWorkerRunning.load()) return;
     g_tokenWorkerRunning.store(true);
@@ -6244,7 +6598,7 @@ void sendTokenUsageAsync(
     const std::string& backendBaseUrl
 )
 {
-    // Criar a tarefa com cópias dos parâmetros
+    // Criar a tarefa com cÃ³pias dos parÃ¢metros
     auto task = [cameraId, promptTokens, outputTokens, totalTokens,
         source, algoType, cameraSessionId, cameraAlgorithmId, agentRunId,
         clientId, exeToken, backendBaseUrl]() {
@@ -6312,7 +6666,7 @@ void sendTokenUsageAsync(
         }
         };
 
-    // Enfileirar ao invés de criar thread
+    // Enfileirar ao invÃ©s de criar thread
     {
         std::lock_guard<std::mutex> lock(g_tokenQueueMutex);
 
@@ -6979,6 +7333,8 @@ bool CameraSession::matchesStartConfig(const CameraConfig& cfg) const
         config_.rtspUrl == cfg.rtspUrl &&
         config_.storage.storeFrames == cfg.storage.storeFrames &&
         config_.storage.retentionDays == cfg.storage.retentionDays &&
+        config_.captureAccelerationMode == cfg.captureAccelerationMode &&
+        config_.useGpu == cfg.useGpu &&
         config_.frameCaptureIntervalSeconds == cfg.frameCaptureIntervalSeconds &&
         config_.analysisSpeed == cfg.analysisSpeed &&
         config_.modelTier == cfg.modelTier &&
@@ -10222,13 +10578,13 @@ void CameraSession::inferenceLoop_() {
 
 
 
-void CameraSession::enqueueThumbnail_(std::string b64) {
+void CameraSession::enqueueThumbnail_(std::vector<unsigned char> jpegBytes) {
     if (thumbnailStop_.load()) return;
 
     // Keep only the most recent thumbnail (overwrite previous)
     {
         std::lock_guard<std::mutex> lock(thumbnailMutex_);
-        pendingThumbnailB64_ = std::move(b64);
+        pendingThumbnailBytes_ = std::move(jpegBytes);
         thumbnailPending_ = true;
     }
     thumbnailCv_.notify_one();
@@ -10238,7 +10594,7 @@ void CameraSession::thumbnailLoop_() {
     Logger::instance().logDebug(config_.id, "thumbnailLoop_: started");
 
     while (!thumbnailStop_.load()) {
-        std::string b64;
+        std::vector<unsigned char> jpegBytes;
 
         {
             std::unique_lock<std::mutex> lock(thumbnailMutex_);
@@ -10249,16 +10605,16 @@ void CameraSession::thumbnailLoop_() {
             if (thumbnailStop_.load()) break;
 
             // Take latest thumbnail and clear pending flag
-            b64 = std::move(pendingThumbnailB64_);
-            pendingThumbnailB64_.clear();
+            jpegBytes = std::move(pendingThumbnailBytes_);
+            pendingThumbnailBytes_.clear();
             thumbnailPending_ = false;
         }
 
         // Call owner outside the lock (never block enqueue/capture)
         try {
             AgentCore* owner = owner_;
-            if (owner && !b64.empty()) {
-                owner->sendThumbnail(config_.id, b64);
+            if (owner && !jpegBytes.empty()) {
+                owner->sendThumbnail(config_.id, jpegBytes);
             }
         }
         catch (...) {
@@ -10301,7 +10657,7 @@ void CameraSession::sendThumbnail_(const cv::Mat& frame) {
             src = &resized;
         }
 
-        // 2) JPEG em memória
+        // 2) JPEG em memÃ³ria
         std::vector<uchar> jpgBuf;
         if (!cv::imencode(".jpg", *src, jpgBuf)) {
             Logger::instance().logDebug(
@@ -10311,15 +10667,8 @@ void CameraSession::sendThumbnail_(const cv::Mat& frame) {
             return;
         }
 
-        // 3) Base64
-        std::string imgB64 = base64_encode(
-            reinterpret_cast<const unsigned char*>(jpgBuf.data()),
-            jpgBuf.size()
-        );
-
-        // 4) Delega para o AgentCore mandar para o Mocha
-        //owner_->sendThumbnail(config_.id, imgB64);
-        enqueueThumbnail_(std::move(imgB64));
+        // 3) Delega os bytes JPEG já comprimidos para o AgentCore.
+        enqueueThumbnail_(std::move(jpgBuf));
     }
     catch (const std::exception& e) {
         Logger::instance().logDebug(
@@ -10334,3 +10683,4 @@ void CameraSession::sendThumbnail_(const cv::Mat& frame) {
         );
     }
 }
+

@@ -154,7 +154,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world4110d.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>opencv_world4110d.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -175,7 +175,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>$(PostgreSqlRoot)lib;C:\libs\opencv-4.11.0\build\x64\vc16\lib;$(VcpkgLibraryRoot);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world4110.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>opencv_world4110.lib;$(CurlImportLibrary);avcodec.lib;avformat.lib;avutil.lib;swresample.lib;swscale.lib;libpq.lib;shell32.lib;winhttp.lib;comctl32.lib;dbghelp.lib;bcrypt.lib;crypt32.lib;d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -187,6 +187,7 @@
     <ClInclude Include="camera\FrameBuffer.h" />
     <ClInclude Include="camera\FrameDiskWriter.h" />
     <ClInclude Include="camera\MotionDetector.h" />
+    <ClInclude Include="camera\PortalCounter.h" />
     <ClInclude Include="camera\PerfMetrics.h" />
     <ClInclude Include="camera\RtspCapture.h" />
     <ClInclude Include="comm\BackendConfig.h" />
@@ -250,6 +251,7 @@
     <ClCompile Include="camera\FrameBuffer.cpp" />
     <ClCompile Include="camera\FrameDiskWriter.cpp" />
     <ClCompile Include="camera\MotionDetector.cpp" />
+    <ClCompile Include="camera\PortalCounter.cpp" />
     <ClCompile Include="camera\RtspCapture.cpp" />
     <ClCompile Include="comm\PairingClient.cpp" />
     <ClCompile Include="comm\SecureLocalStore.cpp" />

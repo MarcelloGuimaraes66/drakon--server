@@ -192,7 +192,8 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
     perceptrum::platform::ShutdownSignal shutdownSignal(options.shutdownEventName);
 
     std::unique_ptr<AgentCore> agent;
-    std::string currentBaseUrl;
+    std::string currentPairingBaseUrl;
+    std::string currentAgentBaseUrl;
     std::string currentExeToken;
     std::string currentClientId;
     bool waitingForPairingLogged = false;
@@ -202,8 +203,9 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
             break;
         }
 
-        const std::string baseUrl = GetPerceptrumBaseUrl();
-        PairingClient pairing(baseUrl);
+        const std::string pairingBaseUrl = GetPerceptrumBaseUrl();
+        const std::string agentBaseUrl = GetPerceptrumAgentBaseUrl();
+        PairingClient pairing(pairingBaseUrl);
 
         std::string exeToken;
         std::string clientId;
@@ -218,7 +220,8 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
         waitingForPairingLogged = false;
         const bool needsRestart =
             agent == nullptr ||
-            baseUrl != currentBaseUrl ||
+            pairingBaseUrl != currentPairingBaseUrl ||
+            agentBaseUrl != currentAgentBaseUrl ||
             exeToken != currentExeToken ||
             clientId != currentClientId;
 
@@ -232,16 +235,23 @@ int RunHeadlessService(const HeadlessServiceOptions& options) {
             agent.reset();
         }
 
-        currentBaseUrl = baseUrl;
+        currentPairingBaseUrl = pairingBaseUrl;
+        currentAgentBaseUrl = agentBaseUrl;
         currentExeToken = exeToken;
         currentClientId = clientId;
 
         Logger::instance().logDebug(
             "agent",
             "HeadlessService: starting AgentCore for client_id=" + currentClientId +
-                " baseUrl=" + currentBaseUrl);
+                " controlBaseUrl=" + currentPairingBaseUrl +
+                " agentBaseUrl=" + currentAgentBaseUrl);
 
-        agent = std::make_unique<AgentCore>(currentBaseUrl, currentExeToken, currentClientId);
+        agent = std::make_unique<AgentCore>(
+            currentAgentBaseUrl,
+            currentPairingBaseUrl,
+            currentExeToken,
+            currentClientId
+        );
         agent->initTimeSync();
         agent->bootstrapCameras_();
         agent->start();

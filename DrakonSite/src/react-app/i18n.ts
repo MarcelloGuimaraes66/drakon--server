@@ -7,6 +7,7 @@ import { securityRecoveryTranslations } from "@/react-app/securityRecoveryTransl
 import { tutorialFeatureTranslations } from "@/react-app/tutorialTranslations";
 import { tutorialCameraStepTranslations } from "@/react-app/tutorialCameraStepTranslations";
 import { tutorialAgentStepTranslations } from "@/react-app/tutorialAgentStepTranslations";
+import { tutorialChatStepTranslations } from "@/react-app/tutorialChatStepTranslations";
 
 const resources = {
   en: {
@@ -234,7 +235,7 @@ const resources = {
       "settings.userProfile": "User Profile",
       "settings.name": "Name",
       "settings.email": "Email",
-      "settings.handle": "Username",
+      "settings.handle": "Username (handle)",
       "settings.handlePlaceholder": "yourusername",
       "settings.handleHelp": "Saved without @. The prefix is shown automatically.",
       "settings.handleSave": "Save username",
@@ -635,7 +636,7 @@ const resources = {
       "settings.userProfile": "Perfil de Usuario",
       "settings.name": "Nombre",
       "settings.email": "Correo Electrónico",
-      "settings.handle": "Nombre de usuario",
+      "settings.handle": "Nombre de usuario (handle)",
       "settings.handlePlaceholder": "tunombredeusuario",
       "settings.handleHelp": "Se guarda sin @. El prefijo aparece automáticamente.",
       "settings.handleSave": "Guardar nombre de usuario",
@@ -926,15 +927,15 @@ const resources = {
       "settings.userProfile": "Perfil do Usuário",
       "settings.name": "Nome",
       "settings.email": "E-mail",
-      "settings.handle": "Arroba",
-      "settings.handlePlaceholder": "seuarroba",
+      "settings.handle": "Nome do usuário (handle)",
+      "settings.handlePlaceholder": "seunomedeusuario",
       "settings.handleHelp": "Salvo sem @. O prefixo aparece automaticamente.",
-      "settings.handleSave": "Salvar arroba",
+      "settings.handleSave": "Salvar nome do usuário",
       "settings.handleSaving": "Salvando...",
-      "settings.handleSaved": "Arroba salvo.",
-      "settings.handleRequired": "O arroba não pode ficar vazio.",
-      "settings.handleInvalid": "O arroba não pode conter espaços.",
-      "settings.handleSaveFailed": "Não foi possível salvar o arroba.",
+      "settings.handleSaved": "Nome do usuário salvo.",
+      "settings.handleRequired": "O nome do usuário não pode ficar vazio.",
+      "settings.handleInvalid": "O nome do usuário não pode conter espaços.",
+      "settings.handleSaveFailed": "Não foi possível salvar o nome do usuário.",
       "settings.accountCreated": "Conta Criada",
       "settings.deleteAccount.title": "Excluir conta",
       "settings.deleteAccount.description": "Remove permanentemente seus dados locais, desconecta este dispositivo e limpa suas credenciais no servidor do {{brand}}.",
@@ -1246,7 +1247,7 @@ const resources = {
       "settings.userProfile": "Profil utilisateur",
       "settings.name": "Nom",
       "settings.email": "E-mail",
-      "settings.handle": "Nom d'utilisateur",
+      "settings.handle": "Nom d'utilisateur (handle)",
       "settings.handlePlaceholder": "votrenomutilisateur",
       "settings.handleHelp": "Enregistré sans @. Le préfixe s'affiche automatiquement.",
       "settings.handleSave": "Enregistrer le nom d'utilisateur",
@@ -1519,7 +1520,7 @@ const resources = {
       "settings.userProfile": "ç”¨æˆ·èµ„æ–™",
       "settings.name": "å§“å",
       "settings.email": "ç”µå­é‚®ä»¶",
-      "settings.handle": "\u7528\u6237\u540d",
+      "settings.handle": "\u7528\u6237\u540d\uff08handle\uff09",
       "settings.handlePlaceholder": "\u60a8\u7684\u7528\u6237\u540d",
       "settings.handleHelp": "\u4fdd\u5b58\u65f6\u4e0d\u5305\u542b @\uff0c\u524d\u7f00\u4f1a\u81ea\u52a8\u663e\u793a\u3002",
       "settings.handleSave": "\u4fdd\u5b58\u7528\u6237\u540d",
@@ -1792,7 +1793,7 @@ const resources = {
       "settings.userProfile": "Ù…Ù„Ù Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù…",
       "settings.name": "Ø§Ù„Ø§Ø³Ù…",
       "settings.email": "Ø§Ù„Ø¨Ø±ÙŠØ¯ Ø§Ù„Ø¥Ù„ÙƒØªØ±ÙˆÙ†ÙŠ",
-      "settings.handle": "\u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645",
+      "settings.handle": "\u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 (handle)",
       "settings.handlePlaceholder": "\u0627\u0633\u0645\u0643",
       "settings.handleHelp": "\u064a\u064f\u062d\u0641\u0638 \u0628\u062f\u0648\u0646 @\u060c \u0648\u064a\u064f\u0639\u0631\u0636 \u0627\u0644\u0628\u0627\u062f\u0626\u0629 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627.",
       "settings.handleSave": "\u062d\u0641\u0638 \u0627\u0633\u0645 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645",
@@ -2032,6 +2033,7 @@ const enPageExtensions: Record<string, string> = {
   "jobs.closeClonePicker": "Close clone picker",
   "jobs.priority": "Priority",
   "jobs.runEvery": "Run Every",
+  "jobs.groupRunEvery": "Group Run Every",
   "jobs.runInterval": "Run interval",
   "jobs.runEveryOption.video60": "60 frames every 60 seconds (alert every 60 seconds)",
   "jobs.runEveryOption.video10": "10 frames every 10 seconds (alert every 10 seconds)",
@@ -2039,6 +2041,8 @@ const enPageExtensions: Record<string, string> = {
   "jobs.runEveryOption.image10": "1 frame every 10 seconds (alert every 10 seconds)",
   "jobs.runEveryOption.seconds60": "Every 60 seconds",
   "jobs.runEveryOption.seconds10": "Every 10 seconds",
+  "jobs.runEveryOption.seconds300": "Every 5 minutes",
+  "jobs.runEveryOption.seconds600": "Every 10 minutes",
   "jobs.runningResolution": "Running Resolution",
   "jobs.runningResolutionOption.640": "640 (1 frame per second) - fast detections",
   "jobs.runningResolutionOption.1024": "1024 (1 frame every 3 seconds) - higher detail",
@@ -2400,6 +2404,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Cerrar selector de clones",
     "jobs.priority": "Prioridad",
     "jobs.runEvery": "Ejecutar cada",
+    "jobs.groupRunEvery": "Ejecutar grupo cada",
     "jobs.runInterval": "Intervalo de ejecución",
     "jobs.runEveryOption.video60": "60 fotogramas cada 60 segundos (alerta cada 60 segundos)",
     "jobs.runEveryOption.video10": "10 fotogramas cada 10 segundos (alerta cada 10 segundos)",
@@ -2407,6 +2412,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 fotograma cada 10 segundos (alerta cada 10 segundos)",
     "jobs.runEveryOption.seconds60": "Cada 60 segundos",
     "jobs.runEveryOption.seconds10": "Cada 10 segundos",
+    "jobs.runEveryOption.seconds300": "Cada 5 minutos",
+    "jobs.runEveryOption.seconds600": "Cada 10 minutos",
     "jobs.runningResolution": "Resolución de ejecución",
     "jobs.runningResolutionOption.640": "640 (1 fotograma por segundo) - detecciones rápidas",
     "jobs.runningResolutionOption.1024": "1024 (1 fotograma cada 3 segundos) - mayor detalle",
@@ -2755,6 +2762,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Fechar seletor de clones",
     "jobs.priority": "Prioridade",
     "jobs.runEvery": "Executar a cada",
+    "jobs.groupRunEvery": "Executar grupo a cada",
     "jobs.runInterval": "Intervalo de execução",
     "jobs.runEveryOption.video60": "60 frames a cada 60 segundos (alerta a cada 60 segundos)",
     "jobs.runEveryOption.video10": "10 frames a cada 10 segundos (alerta a cada 10 segundos)",
@@ -2762,6 +2770,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 frame a cada 10 segundos (alerta a cada 10 segundos)",
     "jobs.runEveryOption.seconds60": "A cada 60 segundos",
     "jobs.runEveryOption.seconds10": "A cada 10 segundos",
+    "jobs.runEveryOption.seconds300": "A cada 5 minutos",
+    "jobs.runEveryOption.seconds600": "A cada 10 minutos",
     "jobs.runningResolution": "Resolução de execução",
     "jobs.runningResolutionOption.640": "640 (1 frame por segundo) - detecções rápidas",
     "jobs.runningResolutionOption.1024": "1024 (1 frame a cada 3 segundos) - maior detalhe",
@@ -3107,6 +3117,7 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.closeClonePicker": "Fermer le sélecteur de clones",
     "jobs.priority": "Priorité",
     "jobs.runEvery": "Exécuter tous les",
+    "jobs.groupRunEvery": "Exécuter le groupe toutes les",
     "jobs.runInterval": "Intervalle d'exécution",
     "jobs.runEveryOption.video60": "60 images toutes les 60 secondes (alerte toutes les 60 secondes)",
     "jobs.runEveryOption.video10": "10 images toutes les 10 secondes (alerte toutes les 10 secondes)",
@@ -3114,6 +3125,8 @@ const localeOverrides: Record<string, Record<string, string>> = {
     "jobs.runEveryOption.image10": "1 image toutes les 10 secondes (alerte toutes les 10 secondes)",
     "jobs.runEveryOption.seconds60": "Toutes les 60 secondes",
     "jobs.runEveryOption.seconds10": "Toutes les 10 secondes",
+    "jobs.runEveryOption.seconds300": "Toutes les 5 minutes",
+    "jobs.runEveryOption.seconds600": "Toutes les 10 minutes",
     "jobs.runningResolution": "Résolution d'exécution",
     "jobs.runningResolutionOption.640": "640 (1 image par seconde) - détections rapides",
     "jobs.runningResolutionOption.1024": "1024 (1 image toutes les 3 secondes) - plus de détail",
@@ -4132,6 +4145,1168 @@ const languageSafetyOverrides: Record<string, Record<string, string>> = {
   },
 };
 
+const workspaceAccessTranslations: Record<string, Record<string, string>> = {
+  en: {
+    "settings.tabs.user": "User",
+    "settings.tabs.apiKeys": "API Keys",
+    "settings.tabs.alerts": "Alerts",
+    "settings.tabs.connectivity": "EXE Connectivity",
+    "settings.tabs.workspaceAccess": "Workspace Access",
+    "settings.workspaceAccess.title": "Share your {{brand}} workspace by @handle",
+    "settings.workspaceAccess.description":
+      "Another user can only open your workspace while your app is open and online. The new connection opens a separate window with the remote app.",
+    "settings.workspaceAccess.loading": "Loading Workspace Access...",
+    "settings.workspaceAccess.browserNotice":
+      "Remote sharing was designed for the desktop app. In a regular browser, opening the remote window uses a new tab.",
+    "settings.workspaceAccess.myApp.title": "My app",
+    "settings.workspaceAccess.myApp.description":
+      "Your workspace is available only while this app is open.",
+    "settings.workspaceAccess.policy.confirm.title": "Ask for confirmation on every connection",
+    "settings.workspaceAccess.policy.confirm.description":
+      "The other user can only enter after you approve the session.",
+    "settings.workspaceAccess.policy.allow.title": "Allow while my app is open",
+    "settings.workspaceAccess.policy.allow.description":
+      "An accepted invite stays directly connectable while this app instance is online.",
+    "settings.workspaceAccess.share.title": "Give access to my workspace",
+    "settings.workspaceAccess.share.description":
+      "Invite another user by @handle or email to open your app in a new window.",
+    "settings.workspaceAccess.share.placeholder": "@handle or email",
+    "settings.workspaceAccess.sections.incoming": "Incoming invites",
+    "settings.workspaceAccess.sections.outgoing": "Sent invites",
+    "settings.workspaceAccess.sections.available": "Available workspaces",
+    "settings.workspaceAccess.empty.incoming": "No incoming invites.",
+    "settings.workspaceAccess.empty.outgoing": "No sent invites.",
+    "settings.workspaceAccess.empty.available": "No workspace has been shared with you.",
+    "settings.workspaceAccess.permission.fullAccess": "Admin",
+    "settings.workspaceAccess.permission.scopedAccess": "Limited access",
+    "settings.workspaceAccess.permission.remoteAccess": "Remote access",
+    "settings.workspaceAccess.status.accepted": "Accepted",
+    "settings.workspaceAccess.status.pending": "Pending",
+    "settings.workspaceAccess.status.denied": "Denied",
+    "settings.workspaceAccess.status.revoked": "Revoked",
+    "settings.workspaceAccess.status.approved": "Approved",
+    "settings.workspaceAccess.status.active": "Active",
+    "settings.workspaceAccess.status.ended": "Ended",
+    "settings.workspaceAccess.availability.online": "Online",
+    "settings.workspaceAccess.availability.offline": "Offline",
+    "settings.workspaceAccess.actions.refresh": "Refresh",
+    "settings.workspaceAccess.actions.sendInvite": "Send invite",
+    "settings.workspaceAccess.actions.cancel": "Cancel",
+    "settings.workspaceAccess.actions.accept": "Accept",
+    "settings.workspaceAccess.actions.deny": "Decline",
+    "settings.workspaceAccess.actions.revoke": "Revoke",
+    "settings.workspaceAccess.actions.open": "Open workspace",
+    "settings.workspaceAccess.actions.waiting": "Waiting...",
+    "settings.workspaceAccess.inviteDialog.title": "Choose invite privileges",
+    "settings.workspaceAccess.inviteDialog.description":
+      "Set the remote privileges before sending the workspace invite.",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel": "Invitee:",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "Admin invites get full remote access to this workspace.",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "Pick only the cameras, jobs, and agents this invite can view or execute.",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "Admin invites can view and manage the full workspace, including settings.",
+    "settings.workspaceAccess.messages.sessionReady":
+      "{{owner}}'s remote workspace is ready to open.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "The remote session did not become available.",
+    "settings.workspaceAccess.messages.policySaved": "Connection policy saved.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Enter an @handle or email to send the invite.",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "Choose at least one camera, job, or agent permission for limited access.",
+    "settings.workspaceAccess.messages.inviteSent": "Invite sent successfully.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Invite accepted.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invite declined.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Invite revoked.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "This workspace is offline right now.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Opening {{owner}}'s remote workspace.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Requesting approval from {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "Failed to load workspace access settings.",
+    "settings.workspaceAccess.errors.loadIncoming": "Failed to load incoming invites.",
+    "settings.workspaceAccess.errors.loadOutgoing": "Failed to load sent invites.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "Failed to load available workspaces.",
+    "settings.workspaceAccess.errors.loadData": "Failed to load workspace access data.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "Failed to refresh the remote workspace session.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "Failed to save the connection policy.",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "Failed to resolve the invited user.",
+    "settings.workspaceAccess.errors.createInvite": "Failed to create the invite.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "Failed to accept the workspace access invite.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "Failed to decline the workspace access invite.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "Failed to revoke the workspace access invite.",
+    "settings.workspaceAccess.errors.createSession":
+      "Failed to create the remote workspace session.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "The remote workspace session response was invalid.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "Failed to open the remote workspace.",
+  },
+  es: {
+    "settings.tabs.user": "Usuario",
+    "settings.tabs.apiKeys": "Claves de API",
+    "settings.tabs.alerts": "Alertas",
+    "settings.tabs.connectivity": "Conectividad EXE",
+    "settings.tabs.workspaceAccess": "Acceso al workspace",
+    "settings.workspaceAccess.title": "Comparte el workspace de {{brand}} por @handle",
+    "settings.workspaceAccess.description":
+      "Otro usuario solo puede abrir tu workspace mientras tu app est\u00e9 abierta y en l\u00ednea. La nueva conexi\u00f3n abre una ventana separada con la app remota.",
+    "settings.workspaceAccess.loading": "Cargando acceso al workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "El uso compartido remoto fue pensado para la app de escritorio. En un navegador com\u00fan, la ventana remota se abre en una nueva pesta\u00f1a.",
+    "settings.workspaceAccess.myApp.title": "Mi app",
+    "settings.workspaceAccess.myApp.description":
+      "Tu workspace est\u00e1 disponible solo mientras esta app est\u00e1 abierta.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Pedir confirmaci\u00f3n en cada conexi\u00f3n",
+    "settings.workspaceAccess.policy.confirm.description":
+      "La otra persona solo entra cuando apruebas la sesi\u00f3n.",
+    "settings.workspaceAccess.policy.allow.title": "Permitir mientras mi app est\u00e9 abierta",
+    "settings.workspaceAccess.policy.allow.description":
+      "Una invitaci\u00f3n aceptada queda disponible para conexi\u00f3n directa mientras esta instancia de la app est\u00e9 en l\u00ednea.",
+    "settings.workspaceAccess.share.title": "Dar acceso a mi workspace",
+    "settings.workspaceAccess.share.description":
+      "Invita a otro usuario por @handle o correo para abrir tu app en una nueva ventana.",
+    "settings.workspaceAccess.share.placeholder": "@handle o correo",
+    "settings.workspaceAccess.sections.incoming": "Invitaciones recibidas",
+    "settings.workspaceAccess.sections.outgoing": "Invitaciones enviadas",
+    "settings.workspaceAccess.sections.available": "Workspaces disponibles",
+    "settings.workspaceAccess.empty.incoming": "No hay invitaciones recibidas.",
+    "settings.workspaceAccess.empty.outgoing": "No hay invitaciones enviadas.",
+    "settings.workspaceAccess.empty.available":
+      "No hay ning\u00fan workspace compartido contigo.",
+    "settings.workspaceAccess.permission.fullAccess": "Admin",
+    "settings.workspaceAccess.permission.scopedAccess": "Acceso limitado",
+    "settings.workspaceAccess.permission.remoteAccess": "Acceso remoto",
+    "settings.workspaceAccess.status.accepted": "Aceptada",
+    "settings.workspaceAccess.status.pending": "Pendiente",
+    "settings.workspaceAccess.status.denied": "Rechazada",
+    "settings.workspaceAccess.status.revoked": "Revocada",
+    "settings.workspaceAccess.status.approved": "Aprobada",
+    "settings.workspaceAccess.status.active": "Activa",
+    "settings.workspaceAccess.status.ended": "Finalizada",
+    "settings.workspaceAccess.availability.online": "En l\u00ednea",
+    "settings.workspaceAccess.availability.offline": "Fuera de l\u00ednea",
+    "settings.workspaceAccess.actions.refresh": "Actualizar",
+    "settings.workspaceAccess.actions.sendInvite": "Enviar invitaci\u00f3n",
+    "settings.workspaceAccess.actions.cancel": "Cancelar",
+    "settings.workspaceAccess.actions.accept": "Aceptar",
+    "settings.workspaceAccess.actions.deny": "Rechazar",
+    "settings.workspaceAccess.actions.revoke": "Revocar",
+    "settings.workspaceAccess.actions.open": "Abrir workspace",
+    "settings.workspaceAccess.actions.waiting": "Esperando...",
+    "settings.workspaceAccess.inviteDialog.title": "Elegir privilegios de la invitacion",
+    "settings.workspaceAccess.inviteDialog.description":
+      "Define los privilegios remotos antes de enviar la invitacion al workspace.",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel": "Invitado:",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "Las invitaciones Admin reciben acceso remoto completo a este workspace.",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "Elige solo las camaras, jobs y agentes que esta invitacion puede ver o ejecutar.",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "Las invitaciones Admin pueden ver y administrar todo el workspace, incluyendo settings.",
+    "settings.workspaceAccess.messages.sessionReady":
+      "El workspace remoto de {{owner}} est\u00e1 listo para abrirse.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "La sesi\u00f3n remota no qued\u00f3 disponible.",
+    "settings.workspaceAccess.messages.policySaved":
+      "Pol\u00edtica de conexi\u00f3n guardada.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Ingresa un @handle o correo para enviar la invitaci\u00f3n.",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "Elige al menos un permiso de camaras, jobs o agentes para el acceso limitado.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Invitaci\u00f3n enviada con \u00e9xito.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Invitaci\u00f3n aceptada.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invitaci\u00f3n rechazada.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Invitaci\u00f3n revocada.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Ese workspace est\u00e1 offline en este momento.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Abriendo el workspace remoto de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Solicitando aprobaci\u00f3n de {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "No se pudo cargar la configuraci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "No se pudieron cargar las invitaciones recibidas.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "No se pudieron cargar las invitaciones enviadas.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "No se pudieron cargar los workspaces disponibles.",
+    "settings.workspaceAccess.errors.loadData":
+      "No se pudieron cargar los datos de acceso al workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "No se pudo actualizar la sesi\u00f3n remota del workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "No se pudo guardar la pol\u00edtica de conexi\u00f3n.",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "No se pudo resolver el usuario invitado.",
+    "settings.workspaceAccess.errors.createInvite":
+      "No se pudo crear la invitaci\u00f3n.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "No se pudo aceptar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "No se pudo rechazar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "No se pudo revocar la invitaci\u00f3n de acceso al workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "No se pudo crear la sesi\u00f3n remota del workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "La respuesta de la sesi\u00f3n remota del workspace no fue v\u00e1lida.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "No se pudo abrir el workspace remoto.",
+  },
+  pt: {
+    "settings.tabs.user": "Usu\u00e1rio",
+    "settings.tabs.apiKeys": "Chaves de API",
+    "settings.tabs.alerts": "Alertas",
+    "settings.tabs.connectivity": "Conectividade EXE",
+    "settings.tabs.workspaceAccess": "Acesso ao workspace",
+    "settings.workspaceAccess.title":
+      "Compartilhe o workspace do {{brand}} por @handle",
+    "settings.workspaceAccess.description":
+      "Outro usu\u00e1rio s\u00f3 pode abrir seu workspace enquanto seu app estiver aberto e online. A nova conex\u00e3o abre uma janela separada com o app remoto.",
+    "settings.workspaceAccess.loading": "Carregando acesso ao workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "O compartilhamento remoto foi pensado para o app desktop. Em um navegador comum, a janela remota abre em uma nova aba.",
+    "settings.workspaceAccess.myApp.title": "Meu app",
+    "settings.workspaceAccess.myApp.description":
+      "Seu workspace fica dispon\u00edvel somente enquanto este app estiver aberto.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Pedir confirma\u00e7\u00e3o a cada conex\u00e3o",
+    "settings.workspaceAccess.policy.confirm.description":
+      "O outro usu\u00e1rio s\u00f3 entra quando voc\u00ea aprovar a sess\u00e3o.",
+    "settings.workspaceAccess.policy.allow.title":
+      "Permitir enquanto meu app estiver aberto",
+    "settings.workspaceAccess.policy.allow.description":
+      "Um convite aceito fica conect\u00e1vel diretamente enquanto esta inst\u00e2ncia do app estiver online.",
+    "settings.workspaceAccess.share.title": "Dar acesso ao meu workspace",
+    "settings.workspaceAccess.share.description":
+      "Convide outro usu\u00e1rio por @handle ou e-mail para abrir seu app em uma nova janela.",
+    "settings.workspaceAccess.share.placeholder": "@handle ou e-mail",
+    "settings.workspaceAccess.sections.incoming": "Convites recebidos",
+    "settings.workspaceAccess.sections.outgoing": "Convites enviados",
+    "settings.workspaceAccess.sections.available": "Workspaces dispon\u00edveis",
+    "settings.workspaceAccess.empty.incoming": "Nenhum convite recebido.",
+    "settings.workspaceAccess.empty.outgoing": "Nenhum convite enviado.",
+    "settings.workspaceAccess.empty.available":
+      "Nenhum workspace compartilhado com voc\u00ea.",
+    "settings.workspaceAccess.permission.fullAccess": "Admin",
+    "settings.workspaceAccess.permission.scopedAccess": "Acesso limitado",
+    "settings.workspaceAccess.permission.remoteAccess": "Acesso remoto",
+    "settings.workspaceAccess.status.accepted": "Aceito",
+    "settings.workspaceAccess.status.pending": "Pendente",
+    "settings.workspaceAccess.status.denied": "Recusado",
+    "settings.workspaceAccess.status.revoked": "Revogado",
+    "settings.workspaceAccess.status.approved": "Aprovado",
+    "settings.workspaceAccess.status.active": "Ativo",
+    "settings.workspaceAccess.status.ended": "Encerrado",
+    "settings.workspaceAccess.availability.online": "Online",
+    "settings.workspaceAccess.availability.offline": "Offline",
+    "settings.workspaceAccess.actions.refresh": "Atualizar",
+    "settings.workspaceAccess.actions.sendInvite": "Enviar convite",
+    "settings.workspaceAccess.actions.cancel": "Cancelar",
+    "settings.workspaceAccess.actions.accept": "Aceitar",
+    "settings.workspaceAccess.actions.deny": "Recusar",
+    "settings.workspaceAccess.actions.revoke": "Revogar",
+    "settings.workspaceAccess.actions.open": "Abrir workspace",
+    "settings.workspaceAccess.actions.waiting": "Aguardando...",
+    "settings.workspaceAccess.inviteDialog.title": "Escolha os privilegios do convite",
+    "settings.workspaceAccess.inviteDialog.description":
+      "Defina os privilegios remotos antes de enviar o convite do workspace.",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel": "Convidado:",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "Convites Admin recebem acesso remoto total a este workspace.",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "Escolha apenas quais cameras, jobs e agentes este convite pode visualizar ou executar.",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "Convites Admin podem ver e gerenciar o workspace inteiro, incluindo settings.",
+    "settings.workspaceAccess.messages.sessionReady":
+      "O workspace remoto de {{owner}} est\u00e1 pronto para abrir.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "A sess\u00e3o remota n\u00e3o ficou dispon\u00edvel.",
+    "settings.workspaceAccess.messages.policySaved":
+      "Pol\u00edtica de conex\u00e3o salva.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Informe um @handle ou e-mail para enviar o convite.",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "Escolha pelo menos uma permissao de cameras, jobs ou agentes para o acesso limitado.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Convite enviado com sucesso.",
+    "settings.workspaceAccess.messages.inviteAccepted": "Convite aceito.",
+    "settings.workspaceAccess.messages.inviteDenied": "Convite recusado.",
+    "settings.workspaceAccess.messages.inviteRevoked": "Convite revogado.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Esse workspace est\u00e1 offline no momento.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Abrindo o workspace remoto de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Solicitando aprova\u00e7\u00e3o de {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "N\u00e3o foi poss\u00edvel carregar as configura\u00e7\u00f5es de acesso ao workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "N\u00e3o foi poss\u00edvel carregar os convites recebidos.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "N\u00e3o foi poss\u00edvel carregar os convites enviados.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "N\u00e3o foi poss\u00edvel carregar os workspaces dispon\u00edveis.",
+    "settings.workspaceAccess.errors.loadData":
+      "N\u00e3o foi poss\u00edvel carregar os dados de acesso ao workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "N\u00e3o foi poss\u00edvel atualizar a sess\u00e3o remota do workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "N\u00e3o foi poss\u00edvel salvar a pol\u00edtica de conex\u00e3o.",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "Falha ao resolver o usuario convidado.",
+    "settings.workspaceAccess.errors.createInvite":
+      "N\u00e3o foi poss\u00edvel criar o convite.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "N\u00e3o foi poss\u00edvel aceitar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "N\u00e3o foi poss\u00edvel recusar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "N\u00e3o foi poss\u00edvel revogar o convite de acesso ao workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "N\u00e3o foi poss\u00edvel criar a sess\u00e3o remota do workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "A resposta da sess\u00e3o remota do workspace foi inv\u00e1lida.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "N\u00e3o foi poss\u00edvel abrir o workspace remoto.",
+  },
+  fr: {
+    "settings.tabs.user": "Utilisateur",
+    "settings.tabs.apiKeys": "Cl\u00e9s API",
+    "settings.tabs.alerts": "Alertes",
+    "settings.tabs.connectivity": "Connectivit\u00e9 EXE",
+    "settings.tabs.workspaceAccess": "Acc\u00e8s workspace",
+    "settings.workspaceAccess.title":
+      "Partagez le workspace {{brand}} via @handle",
+    "settings.workspaceAccess.description":
+      "Un autre utilisateur ne peut ouvrir votre workspace que lorsque votre app est ouverte et en ligne. La nouvelle connexion ouvre une fen\u00eatre s\u00e9par\u00e9e avec l'app distante.",
+    "settings.workspaceAccess.loading": "Chargement de l'acc\u00e8s workspace...",
+    "settings.workspaceAccess.browserNotice":
+      "Le partage \u00e0 distance a \u00e9t\u00e9 pens\u00e9 pour l'app desktop. Dans un navigateur classique, la fen\u00eatre distante s'ouvre dans un nouvel onglet.",
+    "settings.workspaceAccess.myApp.title": "Mon app",
+    "settings.workspaceAccess.myApp.description":
+      "Votre workspace est disponible uniquement tant que cette app reste ouverte.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "Demander une confirmation \u00e0 chaque connexion",
+    "settings.workspaceAccess.policy.confirm.description":
+      "L'autre utilisateur n'entre que lorsque vous approuvez la session.",
+    "settings.workspaceAccess.policy.allow.title":
+      "Autoriser tant que mon app est ouverte",
+    "settings.workspaceAccess.policy.allow.description":
+      "Une invitation accept\u00e9e reste accessible directement tant que cette instance de l'app est en ligne.",
+    "settings.workspaceAccess.share.title": "Donner acc\u00e8s \u00e0 mon workspace",
+    "settings.workspaceAccess.share.description":
+      "Invitez un autre utilisateur via @handle ou e-mail pour ouvrir votre app dans une nouvelle fen\u00eatre.",
+    "settings.workspaceAccess.share.placeholder": "@handle ou e-mail",
+    "settings.workspaceAccess.sections.incoming": "Invitations re\u00e7ues",
+    "settings.workspaceAccess.sections.outgoing": "Invitations envoy\u00e9es",
+    "settings.workspaceAccess.sections.available": "Workspaces disponibles",
+    "settings.workspaceAccess.empty.incoming": "Aucune invitation re\u00e7ue.",
+    "settings.workspaceAccess.empty.outgoing": "Aucune invitation envoy\u00e9e.",
+    "settings.workspaceAccess.empty.available":
+      "Aucun workspace partag\u00e9 avec vous.",
+    "settings.workspaceAccess.permission.fullAccess": "Admin",
+    "settings.workspaceAccess.permission.scopedAccess": "Acc\u00e8s limit\u00e9",
+    "settings.workspaceAccess.permission.remoteAccess": "Acc\u00e8s distant",
+    "settings.workspaceAccess.status.accepted": "Accept\u00e9e",
+    "settings.workspaceAccess.status.pending": "En attente",
+    "settings.workspaceAccess.status.denied": "Refus\u00e9e",
+    "settings.workspaceAccess.status.revoked": "R\u00e9voqu\u00e9e",
+    "settings.workspaceAccess.status.approved": "Approuv\u00e9e",
+    "settings.workspaceAccess.status.active": "Active",
+    "settings.workspaceAccess.status.ended": "Termin\u00e9e",
+    "settings.workspaceAccess.availability.online": "En ligne",
+    "settings.workspaceAccess.availability.offline": "Hors ligne",
+    "settings.workspaceAccess.actions.refresh": "Actualiser",
+    "settings.workspaceAccess.actions.sendInvite": "Envoyer l'invitation",
+    "settings.workspaceAccess.actions.cancel": "Annuler",
+    "settings.workspaceAccess.actions.accept": "Accepter",
+    "settings.workspaceAccess.actions.deny": "Refuser",
+    "settings.workspaceAccess.actions.revoke": "R\u00e9voquer",
+    "settings.workspaceAccess.actions.open": "Ouvrir le workspace",
+    "settings.workspaceAccess.actions.waiting": "En attente...",
+    "settings.workspaceAccess.inviteDialog.title": "Choisir les privil\u00e8ges de l'invitation",
+    "settings.workspaceAccess.inviteDialog.description":
+      "D\u00e9finissez les privil\u00e8ges distants avant d'envoyer l'invitation au workspace.",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel": "Invit\u00e9 :",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "Les invitations Admin obtiennent un acc\u00e8s distant complet \u00e0 ce workspace.",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "Choisissez seulement les cam\u00e9ras, jobs et agents que cette invitation peut voir ou ex\u00e9cuter.",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "Les invitations Admin peuvent voir et g\u00e9rer tout le workspace, y compris les settings.",
+    "settings.workspaceAccess.messages.sessionReady":
+      "Le workspace distant de {{owner}} est pr\u00eat \u00e0 s'ouvrir.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "La session distante n'est pas devenue disponible.",
+    "settings.workspaceAccess.messages.policySaved":
+      "La politique de connexion a \u00e9t\u00e9 enregistr\u00e9e.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "Saisissez un @handle ou un e-mail pour envoyer l'invitation.",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "Choisissez au moins une permission de cam\u00e9ras, jobs ou agents pour l'acc\u00e8s limit\u00e9.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "Invitation envoy\u00e9e avec succ\u00e8s.",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "Invitation accept\u00e9e.",
+    "settings.workspaceAccess.messages.inviteDenied": "Invitation refus\u00e9e.",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "Invitation r\u00e9voqu\u00e9e.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "Ce workspace est hors ligne pour le moment.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "Ouverture du workspace distant de {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "Demande d'approbation \u00e0 {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "Impossible de charger les param\u00e8tres d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "Impossible de charger les invitations re\u00e7ues.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "Impossible de charger les invitations envoy\u00e9es.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "Impossible de charger les workspaces disponibles.",
+    "settings.workspaceAccess.errors.loadData":
+      "Impossible de charger les donn\u00e9es d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "Impossible d'actualiser la session distante du workspace.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "Impossible d'enregistrer la politique de connexion.",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "Impossible de r\u00e9soudre l'utilisateur invit\u00e9.",
+    "settings.workspaceAccess.errors.createInvite":
+      "Impossible de cr\u00e9er l'invitation.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "Impossible d'accepter l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "Impossible de refuser l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "Impossible de r\u00e9voquer l'invitation d'acc\u00e8s workspace.",
+    "settings.workspaceAccess.errors.createSession":
+      "Impossible de cr\u00e9er la session distante du workspace.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "La r\u00e9ponse de la session distante du workspace est invalide.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "Impossible d'ouvrir le workspace distant.",
+  },
+  zh: {
+    "settings.tabs.user": "\u7528\u6237",
+    "settings.tabs.apiKeys": "API \u5bc6\u94a5",
+    "settings.tabs.alerts": "\u63d0\u9192",
+    "settings.tabs.connectivity": "EXE \u8fde\u63a5",
+    "settings.tabs.workspaceAccess": "\u5de5\u4f5c\u533a\u8bbf\u95ee",
+    "settings.workspaceAccess.title":
+      "\u901a\u8fc7 @handle \u5206\u4eab\u4f60\u7684 {{brand}} \u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.description":
+      "\u53ea\u6709\u5f53\u4f60\u7684 app \u4fdd\u6301\u6253\u5f00\u5e76\u5728\u7ebf\u65f6\uff0c\u5176\u4ed6\u7528\u6237\u624d\u80fd\u6253\u5f00\u4f60\u7684\u5de5\u4f5c\u533a\u3002\u65b0\u8fde\u63a5\u4f1a\u5728\u5355\u72ec\u7a97\u53e3\u4e2d\u6253\u5f00\u8fdc\u7a0b app\u3002",
+    "settings.workspaceAccess.loading":
+      "\u6b63\u5728\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee...",
+    "settings.workspaceAccess.browserNotice":
+      "\u8fdc\u7a0b\u5171\u4eab\u662f\u4e3a\u684c\u9762 app \u8bbe\u8ba1\u7684\u3002\u5728\u666e\u901a\u6d4f\u89c8\u5668\u4e2d\uff0c\u8fdc\u7a0b\u7a97\u53e3\u4f1a\u5728\u65b0\u6807\u7b7e\u9875\u4e2d\u6253\u5f00\u3002",
+    "settings.workspaceAccess.myApp.title": "\u6211\u7684 app",
+    "settings.workspaceAccess.myApp.description":
+      "\u53ea\u6709\u5f53\u6b64 app \u4fdd\u6301\u6253\u5f00\u65f6\uff0c\u4f60\u7684\u5de5\u4f5c\u533a\u624d\u53ef\u7528\u3002",
+    "settings.workspaceAccess.policy.confirm.title":
+      "\u6bcf\u6b21\u8fde\u63a5\u90fd\u8bf7\u6c42\u786e\u8ba4",
+    "settings.workspaceAccess.policy.confirm.description":
+      "\u53ea\u6709\u5728\u4f60\u6279\u51c6\u4f1a\u8bdd\u540e\uff0c\u53e6\u4e00\u4f4d\u7528\u6237\u624d\u80fd\u8fdb\u5165\u3002",
+    "settings.workspaceAccess.policy.allow.title":
+      "\u5f53\u6211\u7684 app \u6253\u5f00\u65f6\u5141\u8bb8\u8bbf\u95ee",
+    "settings.workspaceAccess.policy.allow.description":
+      "\u5df2\u63a5\u53d7\u7684\u9080\u8bf7\u4f1a\u5728\u6b64 app \u5b9e\u4f8b\u5728\u7ebf\u671f\u95f4\u4fdd\u6301\u53ef\u76f4\u63a5\u8fde\u63a5\u3002",
+    "settings.workspaceAccess.share.title":
+      "\u5411\u6211\u7684\u5de5\u4f5c\u533a\u6388\u4e88\u8bbf\u95ee\u6743\u9650",
+    "settings.workspaceAccess.share.description":
+      "\u901a\u8fc7 @handle \u6216\u90ae\u7bb1\u9080\u8bf7\u5176\u4ed6\u7528\u6237\uff0c\u5728\u65b0\u7a97\u53e3\u4e2d\u6253\u5f00\u4f60\u7684 app\u3002",
+    "settings.workspaceAccess.share.placeholder": "@handle \u6216\u90ae\u7bb1",
+    "settings.workspaceAccess.sections.incoming": "\u6536\u5230\u7684\u9080\u8bf7",
+    "settings.workspaceAccess.sections.outgoing": "\u5df2\u53d1\u9001\u7684\u9080\u8bf7",
+    "settings.workspaceAccess.sections.available": "\u53ef\u7528\u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.empty.incoming":
+      "\u6682\u65e0\u6536\u5230\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.empty.outgoing":
+      "\u6682\u65e0\u5df2\u53d1\u9001\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.empty.available":
+      "\u6682\u65e0\u5171\u4eab\u7ed9\u4f60\u7684\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.permission.fullAccess": "\u7ba1\u7406\u5458",
+    "settings.workspaceAccess.permission.scopedAccess": "\u53d7\u9650\u8bbf\u95ee",
+    "settings.workspaceAccess.permission.remoteAccess": "\u8fdc\u7a0b\u8bbf\u95ee",
+    "settings.workspaceAccess.status.accepted": "\u5df2\u63a5\u53d7",
+    "settings.workspaceAccess.status.pending": "\u5f85\u5904\u7406",
+    "settings.workspaceAccess.status.denied": "\u5df2\u62d2\u7edd",
+    "settings.workspaceAccess.status.revoked": "\u5df2\u64a4\u9500",
+    "settings.workspaceAccess.status.approved": "\u5df2\u6279\u51c6",
+    "settings.workspaceAccess.status.active": "\u8fdb\u884c\u4e2d",
+    "settings.workspaceAccess.status.ended": "\u5df2\u7ed3\u675f",
+    "settings.workspaceAccess.availability.online": "\u5728\u7ebf",
+    "settings.workspaceAccess.availability.offline":
+      "\u79bb\u7ebf",
+    "settings.workspaceAccess.actions.refresh": "\u5237\u65b0",
+    "settings.workspaceAccess.actions.sendInvite": "\u53d1\u9001\u9080\u8bf7",
+    "settings.workspaceAccess.actions.cancel": "\u53d6\u6d88",
+    "settings.workspaceAccess.actions.accept": "\u63a5\u53d7",
+    "settings.workspaceAccess.actions.deny": "\u62d2\u7edd",
+    "settings.workspaceAccess.actions.revoke": "\u64a4\u9500",
+    "settings.workspaceAccess.actions.open": "\u6253\u5f00\u5de5\u4f5c\u533a",
+    "settings.workspaceAccess.actions.waiting": "\u7b49\u5f85\u4e2d...",
+    "settings.workspaceAccess.inviteDialog.title": "\u9009\u62e9\u9080\u8bf7\u6743\u9650",
+    "settings.workspaceAccess.inviteDialog.description":
+      "\u5728\u53d1\u9001 workspace \u9080\u8bf7\u4e4b\u524d\u5148\u8bbe\u7f6e\u8fdc\u7a0b\u6743\u9650\u3002",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel": "\u88ab\u9080\u8bf7\u4eba\uff1a",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "\u7ba1\u7406\u5458\u9080\u8bf7\u53ef\u83b7\u5f97\u6b64 workspace \u7684\u5b8c\u6574\u8fdc\u7a0b\u8bbf\u95ee\u6743\u9650\u3002",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "\u53ea\u9009\u62e9\u6b64\u9080\u8bf7\u53ef\u4ee5\u67e5\u770b\u6216\u6267\u884c\u7684\u6444\u50cf\u5934\u3001jobs \u548c agents\u3002",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "\u7ba1\u7406\u5458\u9080\u8bf7\u53ef\u4ee5\u67e5\u770b\u5e76\u7ba1\u7406\u6574\u4e2a workspace\uff0c\u5305\u62ec settings\u3002",
+    "settings.workspaceAccess.messages.sessionReady":
+      "{{owner}} \u7684\u8fdc\u7a0b\u5de5\u4f5c\u533a\u5df2\u53ef\u6253\u5f00\u3002",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "\u8fdc\u7a0b\u4f1a\u8bdd\u672a\u80fd\u53d8\u4e3a\u53ef\u7528\u72b6\u6001\u3002",
+    "settings.workspaceAccess.messages.policySaved":
+      "\u8fde\u63a5\u7b56\u7565\u5df2\u4fdd\u5b58\u3002",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "\u8bf7\u8f93\u5165 @handle \u6216\u90ae\u7bb1\u4ee5\u53d1\u9001\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "\u53d7\u9650\u8bbf\u95ee\u81f3\u5c11\u8981\u9009\u62e9\u4e00\u9879\u6444\u50cf\u5934\u3001jobs \u6216 agents \u6743\u9650\u3002",
+    "settings.workspaceAccess.messages.inviteSent":
+      "\u9080\u8bf7\u5df2\u6210\u529f\u53d1\u9001\u3002",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "\u9080\u8bf7\u5df2\u63a5\u53d7\u3002",
+    "settings.workspaceAccess.messages.inviteDenied":
+      "\u9080\u8bf7\u5df2\u62d2\u7edd\u3002",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "\u9080\u8bf7\u5df2\u64a4\u9500\u3002",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "\u8be5\u5de5\u4f5c\u533a\u5f53\u524d\u79bb\u7ebf\u3002",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "\u6b63\u5728\u6253\u5f00 {{owner}} \u7684\u8fdc\u7a0b\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "\u6b63\u5728\u5411 {{owner}} \u8bf7\u6c42\u6279\u51c6\u3002",
+    "settings.workspaceAccess.errors.loadSettings":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee\u8bbe\u7f6e\u3002",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "\u65e0\u6cd5\u52a0\u8f7d\u6536\u5230\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5df2\u53d1\u9001\u7684\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "\u65e0\u6cd5\u52a0\u8f7d\u53ef\u7528\u5de5\u4f5c\u533a\u3002",
+    "settings.workspaceAccess.errors.loadData":
+      "\u65e0\u6cd5\u52a0\u8f7d\u5de5\u4f5c\u533a\u8bbf\u95ee\u6570\u636e\u3002",
+    "settings.workspaceAccess.errors.refreshSession":
+      "\u65e0\u6cd5\u5237\u65b0\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u3002",
+    "settings.workspaceAccess.errors.savePolicy":
+      "\u65e0\u6cd5\u4fdd\u5b58\u8fde\u63a5\u7b56\u7565\u3002",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "\u65e0\u6cd5\u89e3\u6790\u88ab\u9080\u8bf7\u7684\u7528\u6237\u3002",
+    "settings.workspaceAccess.errors.createInvite":
+      "\u65e0\u6cd5\u521b\u5efa\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "\u65e0\u6cd5\u63a5\u53d7\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.denyInvite":
+      "\u65e0\u6cd5\u62d2\u7edd\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "\u65e0\u6cd5\u64a4\u9500\u5de5\u4f5c\u533a\u8bbf\u95ee\u9080\u8bf7\u3002",
+    "settings.workspaceAccess.errors.createSession":
+      "\u65e0\u6cd5\u521b\u5efa\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u3002",
+    "settings.workspaceAccess.errors.invalidSession":
+      "\u8fdc\u7a0b\u5de5\u4f5c\u533a\u4f1a\u8bdd\u54cd\u5e94\u65e0\u6548\u3002",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "\u65e0\u6cd5\u6253\u5f00\u8fdc\u7a0b\u5de5\u4f5c\u533a\u3002",
+  },
+  ar: {
+    "settings.tabs.user": "\u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645",
+    "settings.tabs.apiKeys": "\u0645\u0641\u0627\u062a\u064a\u062d API",
+    "settings.tabs.alerts": "\u0627\u0644\u062a\u0646\u0628\u064a\u0647\u0627\u062a",
+    "settings.tabs.connectivity": "\u0627\u062a\u0635\u0627\u0644 EXE",
+    "settings.tabs.workspaceAccess": "\u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644",
+    "settings.workspaceAccess.title":
+      "\u0634\u0627\u0631\u0643 \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 {{brand}} \u0639\u0628\u0631 @handle",
+    "settings.workspaceAccess.description":
+      "\u0644\u0627 \u064a\u0645\u0643\u0646 \u0644\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0622\u062e\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644\u0643 \u0625\u0644\u0627 \u0639\u0646\u062f\u0645\u0627 \u064a\u0643\u0648\u0646 \u062a\u0637\u0628\u064a\u0642\u0643 \u0645\u0641\u062a\u0648\u062d\u0627 \u0648\u0645\u062a\u0635\u0644\u0627. \u064a\u0641\u062a\u062d \u0627\u0644\u0627\u062a\u0635\u0627\u0644 \u0627\u0644\u062c\u062f\u064a\u062f \u0646\u0627\u0641\u0630\u0629 \u0645\u0646\u0641\u0635\u0644\u0629 \u0628\u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0627\u0644\u0628\u0639\u064a\u062f.",
+    "settings.workspaceAccess.loading":
+      "\u062c\u0627\u0631 \u062a\u062d\u0645\u064a\u0644 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644...",
+    "settings.workspaceAccess.browserNotice":
+      "\u062a\u0645 \u062a\u0635\u0645\u064a\u0645 \u0627\u0644\u0645\u0634\u0627\u0631\u0643\u0629 \u0639\u0646 \u0628\u0639\u062f \u0644\u062a\u0637\u0628\u064a\u0642 \u0633\u0637\u062d \u0627\u0644\u0645\u0643\u062a\u0628. \u0641\u064a \u0627\u0644\u0645\u062a\u0635\u0641\u062d \u0627\u0644\u0639\u0627\u062f\u064a\u060c \u062a\u0641\u062a\u062d \u0627\u0644\u0646\u0627\u0641\u0630\u0629 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0641\u064a \u0639\u0644\u0627\u0645\u0629 \u062a\u0628\u0648\u064a\u0628 \u062c\u062f\u064a\u062f\u0629.",
+    "settings.workspaceAccess.myApp.title": "\u062a\u0637\u0628\u064a\u0642\u064a",
+    "settings.workspaceAccess.myApp.description":
+      "\u062a\u0643\u0648\u0646 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0645\u062a\u0627\u062d\u0629 \u0641\u0642\u0637 \u0639\u0646\u062f\u0645\u0627 \u064a\u0643\u0648\u0646 \u0647\u0630\u0627 \u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0645\u0641\u062a\u0648\u062d\u0627.",
+    "settings.workspaceAccess.policy.confirm.title":
+      "\u0627\u0637\u0644\u0628 \u0627\u0644\u062a\u0623\u0643\u064a\u062f \u0639\u0646\u062f \u0643\u0644 \u0627\u062a\u0635\u0627\u0644",
+    "settings.workspaceAccess.policy.confirm.description":
+      "\u0644\u0627 \u064a\u062f\u062e\u0644 \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0622\u062e\u0631 \u0625\u0644\u0627 \u0628\u0639\u062f \u0645\u0648\u0627\u0641\u0642\u062a\u0643 \u0639\u0644\u0649 \u0627\u0644\u062c\u0644\u0633\u0629.",
+    "settings.workspaceAccess.policy.allow.title":
+      "\u0627\u0633\u0645\u062d \u0645\u0627 \u062f\u0627\u0645 \u062a\u0637\u0628\u064a\u0642\u064a \u0645\u0641\u062a\u0648\u062d\u0627",
+    "settings.workspaceAccess.policy.allow.description":
+      "\u062a\u0628\u0642\u0649 \u0627\u0644\u062f\u0639\u0648\u0629 \u0627\u0644\u0645\u0642\u0628\u0648\u0644\u0629 \u0642\u0627\u0628\u0644\u0629 \u0644\u0644\u0627\u062a\u0635\u0627\u0644 \u0627\u0644\u0645\u0628\u0627\u0634\u0631 \u0645\u0627 \u062f\u0627\u0645\u062a \u0647\u0630\u0647 \u0627\u0644\u0646\u0633\u062e\u0629 \u0645\u0646 \u0627\u0644\u062a\u0637\u0628\u064a\u0642 \u0645\u062a\u0635\u0644\u0629.",
+    "settings.workspaceAccess.share.title":
+      "\u0645\u0646\u062d \u0648\u0635\u0648\u0644 \u0625\u0644\u0649 \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644\u064a",
+    "settings.workspaceAccess.share.description":
+      "\u0627\u062f\u0639 \u0645\u0633\u062a\u062e\u062f\u0645\u0627 \u0622\u062e\u0631 \u0639\u0628\u0631 @handle \u0623\u0648 \u0627\u0644\u0628\u0631\u064a\u062f \u0627\u0644\u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a \u0644\u0641\u062a\u062d \u062a\u0637\u0628\u064a\u0642\u0643 \u0641\u064a \u0646\u0627\u0641\u0630\u0629 \u062c\u062f\u064a\u062f\u0629.",
+    "settings.workspaceAccess.share.placeholder":
+      "@handle \u0623\u0648 \u0627\u0644\u0628\u0631\u064a\u062f \u0627\u0644\u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a",
+    "settings.workspaceAccess.sections.incoming":
+      "\u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0648\u0627\u0631\u062f\u0629",
+    "settings.workspaceAccess.sections.outgoing":
+      "\u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0631\u0633\u0644\u0629",
+    "settings.workspaceAccess.sections.available":
+      "\u0645\u0633\u0627\u062d\u0627\u062a \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629",
+    "settings.workspaceAccess.empty.incoming":
+      "\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0639\u0648\u0627\u062a \u0648\u0627\u0631\u062f\u0629.",
+    "settings.workspaceAccess.empty.outgoing":
+      "\u0644\u0627 \u062a\u0648\u062c\u062f \u062f\u0639\u0648\u0627\u062a \u0645\u0631\u0633\u0644\u0629.",
+    "settings.workspaceAccess.empty.available":
+      "\u0644\u0645 \u062a\u062a\u0645 \u0645\u0634\u0627\u0631\u0643\u0629 \u0623\u064a \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 \u0645\u0639\u0643.",
+    "settings.workspaceAccess.permission.fullAccess":
+      "\u0645\u0633\u0624\u0648\u0644",
+    "settings.workspaceAccess.permission.scopedAccess":
+      "\u0648\u0635\u0648\u0644 \u0645\u062d\u062f\u0648\u062f",
+    "settings.workspaceAccess.permission.remoteAccess":
+      "\u0648\u0635\u0648\u0644 \u0639\u0646 \u0628\u0639\u062f",
+    "settings.workspaceAccess.status.accepted": "\u0645\u0642\u0628\u0648\u0644\u0629",
+    "settings.workspaceAccess.status.pending":
+      "\u0642\u064a\u062f \u0627\u0644\u0627\u0646\u062a\u0638\u0627\u0631",
+    "settings.workspaceAccess.status.denied": "\u0645\u0631\u0641\u0648\u0636\u0629",
+    "settings.workspaceAccess.status.revoked": "\u0645\u0644\u063a\u0627\u0629",
+    "settings.workspaceAccess.status.approved":
+      "\u0645\u0648\u0627\u0641\u0642 \u0639\u0644\u064a\u0647\u0627",
+    "settings.workspaceAccess.status.active": "\u0646\u0634\u0637\u0629",
+    "settings.workspaceAccess.status.ended": "\u0645\u0646\u062a\u0647\u064a\u0629",
+    "settings.workspaceAccess.availability.online": "\u0645\u062a\u0635\u0644",
+    "settings.workspaceAccess.availability.offline":
+      "\u063a\u064a\u0631 \u0645\u062a\u0635\u0644",
+    "settings.workspaceAccess.actions.refresh": "\u062a\u062d\u062f\u064a\u062b",
+    "settings.workspaceAccess.actions.sendInvite":
+      "\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629",
+    "settings.workspaceAccess.actions.cancel":
+      "\u0625\u0644\u063a\u0627\u0621",
+    "settings.workspaceAccess.actions.accept": "\u0642\u0628\u0648\u0644",
+    "settings.workspaceAccess.actions.deny": "\u0631\u0641\u0636",
+    "settings.workspaceAccess.actions.revoke": "\u0625\u0644\u063a\u0627\u0621",
+    "settings.workspaceAccess.actions.open":
+      "\u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644",
+    "settings.workspaceAccess.actions.waiting":
+      "\u0628\u0627\u0646\u062a\u0638\u0627\u0631...",
+    "settings.workspaceAccess.inviteDialog.title":
+      "\u0627\u062e\u062a\u0631 \u0635\u0644\u0627\u062d\u064a\u0627\u062a \u0627\u0644\u062f\u0639\u0648\u0629",
+    "settings.workspaceAccess.inviteDialog.description":
+      "\u062d\u062f\u062f \u0627\u0644\u0635\u0644\u0627\u062d\u064a\u0627\u062a \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0642\u0628\u0644 \u0625\u0631\u0633\u0627\u0644 \u062f\u0639\u0648\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.inviteDialog.inviteeLabel":
+      "\u0627\u0644\u0645\u062f\u0639\u0648:",
+    "settings.workspaceAccess.inviteDialog.fullAccessDescription":
+      "\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0633\u0624\u0648\u0644 \u062a\u062d\u0635\u0644 \u0639\u0644\u0649 \u0648\u0635\u0648\u0644 \u0628\u0639\u064a\u062f \u0643\u0627\u0645\u0644 \u0625\u0644\u0649 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0647\u0630\u0647.",
+    "settings.workspaceAccess.inviteDialog.scopedAccessDescription":
+      "\u0627\u062e\u062a\u0631 \u0641\u0642\u0637 \u0627\u0644\u0643\u0627\u0645\u064a\u0631\u0627\u062a \u0648\u0627\u0644\u0645\u0647\u0627\u0645 \u0648\u0627\u0644\u0648\u0643\u0644\u0627\u0621 \u0627\u0644\u0630\u064a\u0646 \u064a\u0645\u0643\u0646 \u0644\u0647\u0630\u0647 \u0627\u0644\u062f\u0639\u0648\u0629 \u0639\u0631\u0636\u0647\u0645 \u0623\u0648 \u062a\u0646\u0641\u064a\u0630\u0647\u0645.",
+    "settings.workspaceAccess.inviteDialog.fullAccessNotice":
+      "\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0633\u0624\u0648\u0644 \u064a\u0645\u0643\u0646\u0647\u0627 \u0639\u0631\u0636 \u0648\u0625\u062f\u0627\u0631\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0643\u0627\u0645\u0644\u0629\u060c \u0628\u0645\u0627 \u0641\u064a \u0630\u0644\u0643 \u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a.",
+    "settings.workspaceAccess.messages.sessionReady":
+      "\u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0640 {{owner}} \u062c\u0627\u0647\u0632\u0629 \u0644\u0644\u0641\u062a\u062d.",
+    "settings.workspaceAccess.messages.sessionUnavailable":
+      "\u0644\u0645 \u062a\u0635\u0628\u062d \u0627\u0644\u062c\u0644\u0633\u0629 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0645\u062a\u0627\u062d\u0629.",
+    "settings.workspaceAccess.messages.policySaved":
+      "\u062a\u0645 \u062d\u0641\u0638 \u0633\u064a\u0627\u0633\u0629 \u0627\u0644\u0627\u062a\u0635\u0627\u0644.",
+    "settings.workspaceAccess.messages.inviteQueryRequired":
+      "\u0623\u062f\u062e\u0644 @handle \u0623\u0648 \u0628\u0631\u064a\u062f\u0627 \u0625\u0644\u0643\u062a\u0631\u0648\u0646\u064a\u0627 \u0644\u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.permissionRequired":
+      "\u0627\u062e\u062a\u0631 \u0635\u0644\u0627\u062d\u064a\u0629 \u0648\u0627\u062d\u062f\u0629 \u0639\u0644\u0649 \u0627\u0644\u0623\u0642\u0644 \u0644\u0644\u0643\u0627\u0645\u064a\u0631\u0627\u062a \u0623\u0648 \u0627\u0644\u0645\u0647\u0627\u0645 \u0623\u0648 \u0627\u0644\u0648\u0643\u0644\u0627\u0621 \u0644\u0644\u0648\u0635\u0648\u0644 \u0627\u0644\u0645\u062d\u062f\u0648\u062f.",
+    "settings.workspaceAccess.messages.inviteSent":
+      "\u062a\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062f\u0639\u0648\u0629 \u0628\u0646\u062c\u0627\u062d.",
+    "settings.workspaceAccess.messages.inviteAccepted":
+      "\u062a\u0645 \u0642\u0628\u0648\u0644 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.inviteDenied":
+      "\u062a\u0645 \u0631\u0641\u0636 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.inviteRevoked":
+      "\u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.messages.workspaceOffline":
+      "\u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0647\u0630\u0647 \u063a\u064a\u0631 \u0645\u062a\u0635\u0644\u0629 \u062d\u0627\u0644\u064a\u0627.",
+    "settings.workspaceAccess.messages.openingWorkspace":
+      "\u062c\u0627\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u0627\u0644\u062e\u0627\u0635\u0629 \u0628\u0640 {{owner}}.",
+    "settings.workspaceAccess.messages.requestingApproval":
+      "\u062c\u0627\u0631 \u0637\u0644\u0628 \u0627\u0644\u0645\u0648\u0627\u0641\u0642\u0629 \u0645\u0646 {{owner}}.",
+    "settings.workspaceAccess.errors.loadSettings":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0625\u0639\u062f\u0627\u062f\u0627\u062a \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.loadIncoming":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0648\u0627\u0631\u062f\u0629.",
+    "settings.workspaceAccess.errors.loadOutgoing":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0627\u0644\u062f\u0639\u0648\u0627\u062a \u0627\u0644\u0645\u0631\u0633\u0644\u0629.",
+    "settings.workspaceAccess.errors.loadAvailable":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0645\u0633\u0627\u062d\u0627\u062a \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0645\u062a\u0627\u062d\u0629.",
+    "settings.workspaceAccess.errors.loadData":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u0645\u064a\u0644 \u0628\u064a\u0627\u0646\u0627\u062a \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.refreshSession":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u062f\u064a\u062b \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+    "settings.workspaceAccess.errors.savePolicy":
+      "\u062a\u0639\u0630\u0631 \u062d\u0641\u0638 \u0633\u064a\u0627\u0633\u0629 \u0627\u0644\u0627\u062a\u0635\u0627\u0644.",
+    "settings.workspaceAccess.errors.resolveInvitee":
+      "\u062a\u0639\u0630\u0631 \u062a\u062d\u062f\u064a\u062f \u0627\u0644\u0645\u0633\u062a\u062e\u062f\u0645 \u0627\u0644\u0645\u062f\u0639\u0648.",
+    "settings.workspaceAccess.errors.createInvite":
+      "\u062a\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u0627\u0644\u062f\u0639\u0648\u0629.",
+    "settings.workspaceAccess.errors.acceptInvite":
+      "\u062a\u0639\u0630\u0631 \u0642\u0628\u0648\u0644 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.denyInvite":
+      "\u062a\u0639\u0630\u0631 \u0631\u0641\u0636 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.revokeInvite":
+      "\u062a\u0639\u0630\u0631 \u0625\u0644\u063a\u0627\u0621 \u062f\u0639\u0648\u0629 \u0648\u0635\u0648\u0644 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644.",
+    "settings.workspaceAccess.errors.createSession":
+      "\u062a\u0639\u0630\u0631 \u0625\u0646\u0634\u0627\u0621 \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+    "settings.workspaceAccess.errors.invalidSession":
+      "\u0627\u0633\u062a\u062c\u0627\u0628\u0629 \u062c\u0644\u0633\u0629 \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629 \u063a\u064a\u0631 \u0635\u0627\u0644\u062d\u0629.",
+    "settings.workspaceAccess.errors.openWorkspace":
+      "\u062a\u0639\u0630\u0631 \u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0627\u0644\u0639\u0645\u0644 \u0627\u0644\u0628\u0639\u064a\u062f\u0629.",
+  },
+};
+
+const accountUsersTranslations: Record<string, Record<string, string>> = {
+  en: {
+    "settings.tabs.usersRights": "Users & Rights",
+    "settings.usersRights.title": "Users & Rights",
+    "settings.usersRights.description":
+      "Create subaccounts with their own email and password, then decide exactly which areas they can view or execute.",
+    "settings.usersRights.create.title": "Create subaccount",
+    "settings.usersRights.create.description":
+      "New subaccounts are created with admin-managed passwords.",
+    "settings.usersRights.fields.email": "Email",
+    "settings.usersRights.fields.initialPassword": "Initial password",
+    "settings.usersRights.fields.role": "Role",
+    "settings.usersRights.fields.status": "Status",
+    "settings.usersRights.role.owner": "Owner",
+    "settings.usersRights.role.admin": "Admin",
+    "settings.usersRights.role.member": "Member",
+    "settings.usersRights.role.adminHint":
+      "Admins automatically receive full access and Settings management.",
+    "settings.usersRights.status.active": "Active",
+    "settings.usersRights.status.disabled": "Disabled",
+    "settings.usersRights.fullAccess": "Full access",
+    "settings.usersRights.permissions.cameras": "Cameras",
+  "settings.usersRights.permissions.tasks": "Jobs",
+    "settings.usersRights.permissions.agents": "Agents",
+    "settings.usersRights.permissions.chat": "Chat",
+    "settings.usersRights.permissions.view": "View",
+    "settings.usersRights.permissions.execute": "Execute",
+    "settings.usersRights.permissions.useChat": "Use chat",
+    "settings.usersRights.scope.viewTitle": "View scope",
+    "settings.usersRights.scope.executeTitle": "Execute scope",
+    "settings.usersRights.scope.all": "All",
+    "settings.usersRights.scope.selected": "Selected",
+    "settings.usersRights.scope.selectedCount": "{{count}} selected",
+    "settings.usersRights.scope.noneAvailable": "No items available.",
+    "settings.usersRights.scope.inactive": "Inactive",
+    "settings.usersRights.actions.create": "Create subaccount",
+    "settings.usersRights.actions.refresh": "Refresh",
+    "settings.usersRights.actions.saveChanges": "Save changes",
+    "settings.usersRights.actions.showDetails": "Show details",
+    "settings.usersRights.actions.hideDetails": "Hide details",
+    "settings.usersRights.actions.updatePassword": "Update password",
+    "settings.usersRights.existing.title": "Existing users",
+    "settings.usersRights.existing.description":
+      "Review roles, disable access, and rotate passwords from here.",
+    "settings.usersRights.loading": "Loading users...",
+    "settings.usersRights.empty": "No users found for this account yet.",
+    "settings.usersRights.ownerDescription":
+      "This is the main account owner. Role and password changes stay outside this panel.",
+    "settings.usersRights.adminLockedDescription":
+      "Only the main owner can edit admin subaccounts.",
+    "settings.usersRights.managedPasswordDescription":
+      "Passwords for subaccounts are managed here by the account owner or an admin.",
+    "settings.usersRights.updatedAt": "Updated {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "Change password",
+    "settings.usersRights.password.description":
+      "The subaccount will need the new password on the next login.",
+    "settings.usersRights.password.placeholder": "New password",
+    "settings.usersRights.validation.emailRequired": "Email is required.",
+    "settings.usersRights.validation.passwordMin":
+      "Password must be at least {{min}} characters.",
+    "settings.usersRights.messages.loadFailed": "Failed to load users.",
+    "settings.usersRights.messages.createFailed":
+      "Failed to create the subaccount.",
+    "settings.usersRights.messages.createSuccess": "Subaccount created.",
+    "settings.usersRights.messages.saveFailed": "Failed to save the subaccount.",
+    "settings.usersRights.messages.saveSuccess": "Saved.",
+    "settings.usersRights.messages.passwordFailed":
+      "Failed to change the password.",
+    "settings.usersRights.messages.passwordSuccess": "Password updated.",
+  },
+  es: {
+    "settings.tabs.usersRights": "Usuarios y permisos",
+    "settings.usersRights.title": "Usuarios y permisos",
+    "settings.usersRights.description":
+      "Crea subcuentas con su propio correo y contrasena, y luego decide exactamente que areas pueden ver o ejecutar.",
+    "settings.usersRights.create.title": "Crear subcuenta",
+    "settings.usersRights.create.description":
+      "Las subcuentas nuevas se crean con contrasenas administradas por el admin.",
+    "settings.usersRights.fields.email": "Correo",
+    "settings.usersRights.fields.initialPassword": "Contrasena inicial",
+    "settings.usersRights.fields.role": "Rol",
+    "settings.usersRights.fields.status": "Estado",
+    "settings.usersRights.role.owner": "Propietario",
+    "settings.usersRights.role.admin": "Admin",
+    "settings.usersRights.role.member": "Miembro",
+    "settings.usersRights.role.adminHint":
+      "Los admins reciben acceso total y gestion de Settings automaticamente.",
+    "settings.usersRights.status.active": "Activo",
+    "settings.usersRights.status.disabled": "Deshabilitado",
+    "settings.usersRights.fullAccess": "Acceso total",
+    "settings.usersRights.permissions.cameras": "Camaras",
+    "settings.usersRights.permissions.tasks": "Tareas",
+    "settings.usersRights.permissions.agents": "Agentes",
+    "settings.usersRights.permissions.chat": "Chat",
+    "settings.usersRights.permissions.view": "Ver",
+    "settings.usersRights.permissions.execute": "Ejecutar",
+    "settings.usersRights.permissions.useChat": "Usar chat",
+    "settings.usersRights.scope.viewTitle": "Alcance de visualizacion",
+    "settings.usersRights.scope.executeTitle": "Alcance de ejecucion",
+    "settings.usersRights.scope.all": "Todos",
+    "settings.usersRights.scope.selected": "Seleccionados",
+    "settings.usersRights.scope.selectedCount": "{{count}} seleccionados",
+    "settings.usersRights.scope.noneAvailable": "No hay elementos disponibles.",
+    "settings.usersRights.scope.inactive": "Inactivo",
+    "settings.usersRights.actions.create": "Crear subcuenta",
+    "settings.usersRights.actions.refresh": "Actualizar",
+    "settings.usersRights.actions.saveChanges": "Guardar cambios",
+    "settings.usersRights.actions.showDetails": "Mostrar detalles",
+    "settings.usersRights.actions.hideDetails": "Ocultar detalles",
+    "settings.usersRights.actions.updatePassword": "Actualizar contrasena",
+    "settings.usersRights.existing.title": "Usuarios existentes",
+    "settings.usersRights.existing.description":
+      "Revisa roles, desactiva accesos y rota contrasenas desde aqui.",
+    "settings.usersRights.loading": "Cargando usuarios...",
+    "settings.usersRights.empty": "Todavia no hay usuarios para esta cuenta.",
+    "settings.usersRights.ownerDescription":
+      "Esta es la cuenta propietaria principal. Los cambios de rol y contrasena quedan fuera de este panel.",
+    "settings.usersRights.adminLockedDescription":
+      "Solo el propietario principal puede editar subcuentas admin.",
+    "settings.usersRights.managedPasswordDescription":
+      "Las contrasenas de las subcuentas se gestionan aqui por el propietario o un admin.",
+    "settings.usersRights.updatedAt": "Actualizado {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "Cambiar contrasena",
+    "settings.usersRights.password.description":
+      "La subcuenta necesitara la nueva contrasena en el proximo inicio de sesion.",
+    "settings.usersRights.password.placeholder": "Nueva contrasena",
+    "settings.usersRights.validation.emailRequired": "El correo es obligatorio.",
+    "settings.usersRights.validation.passwordMin":
+      "La contrasena debe tener al menos {{min}} caracteres.",
+    "settings.usersRights.messages.loadFailed": "No se pudieron cargar los usuarios.",
+    "settings.usersRights.messages.createFailed":
+      "No se pudo crear la subcuenta.",
+    "settings.usersRights.messages.createSuccess": "Subcuenta creada.",
+    "settings.usersRights.messages.saveFailed":
+      "No se pudo guardar la subcuenta.",
+    "settings.usersRights.messages.saveSuccess": "Guardado.",
+    "settings.usersRights.messages.passwordFailed":
+      "No se pudo cambiar la contrasena.",
+    "settings.usersRights.messages.passwordSuccess":
+      "Contrasena actualizada.",
+  },
+  pt: {
+    "settings.tabs.usersRights": "Usuarios e Direitos",
+    "settings.usersRights.title": "Usuarios e Direitos",
+    "settings.usersRights.description":
+      "Crie subcontas com email e senha proprios e depois defina exatamente quais areas elas podem visualizar ou executar.",
+    "settings.usersRights.create.title": "Criar subconta",
+    "settings.usersRights.create.description":
+      "Novas subcontas sao criadas com senhas gerenciadas pelo admin.",
+    "settings.usersRights.fields.email": "Email",
+    "settings.usersRights.fields.initialPassword": "Senha inicial",
+    "settings.usersRights.fields.role": "Funcao",
+    "settings.usersRights.fields.status": "Status",
+    "settings.usersRights.role.owner": "Dono",
+    "settings.usersRights.role.admin": "Admin",
+    "settings.usersRights.role.member": "Membro",
+    "settings.usersRights.role.adminHint":
+      "Admins recebem acesso total e gerenciamento de Settings automaticamente.",
+    "settings.usersRights.status.active": "Ativo",
+    "settings.usersRights.status.disabled": "Desativado",
+    "settings.usersRights.fullAccess": "Acesso total",
+    "settings.usersRights.permissions.cameras": "Cameras",
+    "settings.usersRights.permissions.tasks": "Tarefas",
+    "settings.usersRights.permissions.agents": "Agentes",
+    "settings.usersRights.permissions.chat": "Chat",
+    "settings.usersRights.permissions.view": "Visualizar",
+    "settings.usersRights.permissions.execute": "Executar",
+    "settings.usersRights.permissions.useChat": "Usar chat",
+    "settings.usersRights.scope.viewTitle": "Escopo de visualizacao",
+    "settings.usersRights.scope.executeTitle": "Escopo de execucao",
+    "settings.usersRights.scope.all": "Todos",
+    "settings.usersRights.scope.selected": "Selecionados",
+    "settings.usersRights.scope.selectedCount": "{{count}} selecionados",
+    "settings.usersRights.scope.noneAvailable": "Nenhum item disponivel.",
+    "settings.usersRights.scope.inactive": "Inativo",
+    "settings.usersRights.actions.create": "Criar subconta",
+    "settings.usersRights.actions.refresh": "Atualizar",
+    "settings.usersRights.actions.saveChanges": "Salvar alteracoes",
+    "settings.usersRights.actions.showDetails": "Mostrar detalhes",
+    "settings.usersRights.actions.hideDetails": "Ocultar detalhes",
+    "settings.usersRights.actions.updatePassword": "Atualizar senha",
+    "settings.usersRights.existing.title": "Usuarios existentes",
+    "settings.usersRights.existing.description":
+      "Revise funcoes, desative acessos e troque senhas por aqui.",
+    "settings.usersRights.loading": "Carregando usuarios...",
+    "settings.usersRights.empty": "Ainda nao ha usuarios para esta conta.",
+    "settings.usersRights.ownerDescription":
+      "Este e o dono principal da conta. Alteracoes de funcao e senha ficam fora deste painel.",
+    "settings.usersRights.adminLockedDescription":
+      "Apenas o dono principal pode editar subcontas admin.",
+    "settings.usersRights.managedPasswordDescription":
+      "As senhas das subcontas sao gerenciadas aqui pelo dono da conta ou por um admin.",
+    "settings.usersRights.updatedAt": "Atualizado {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "Alterar senha",
+    "settings.usersRights.password.description":
+      "A subconta precisara da nova senha no proximo login.",
+    "settings.usersRights.password.placeholder": "Nova senha",
+    "settings.usersRights.validation.emailRequired": "Email e obrigatorio.",
+    "settings.usersRights.validation.passwordMin":
+      "A senha deve ter pelo menos {{min}} caracteres.",
+    "settings.usersRights.messages.loadFailed": "Falha ao carregar usuarios.",
+    "settings.usersRights.messages.createFailed":
+      "Falha ao criar a subconta.",
+    "settings.usersRights.messages.createSuccess": "Subconta criada.",
+    "settings.usersRights.messages.saveFailed":
+      "Falha ao salvar a subconta.",
+    "settings.usersRights.messages.saveSuccess": "Salvo.",
+    "settings.usersRights.messages.passwordFailed":
+      "Falha ao alterar a senha.",
+    "settings.usersRights.messages.passwordSuccess": "Senha atualizada.",
+  },
+  fr: {
+    "settings.tabs.usersRights": "Utilisateurs et droits",
+    "settings.usersRights.title": "Utilisateurs et droits",
+    "settings.usersRights.description":
+      "Creez des sous-comptes avec leur propre e-mail et mot de passe, puis decidez exactement quelles zones ils peuvent voir ou executer.",
+    "settings.usersRights.create.title": "Creer un sous-compte",
+    "settings.usersRights.create.description":
+      "Les nouveaux sous-comptes sont crees avec des mots de passe geres par l'admin.",
+    "settings.usersRights.fields.email": "E-mail",
+    "settings.usersRights.fields.initialPassword": "Mot de passe initial",
+    "settings.usersRights.fields.role": "Role",
+    "settings.usersRights.fields.status": "Statut",
+    "settings.usersRights.role.owner": "Proprietaire",
+    "settings.usersRights.role.admin": "Admin",
+    "settings.usersRights.role.member": "Membre",
+    "settings.usersRights.role.adminHint":
+      "Les admins recoivent automatiquement l'acces complet et la gestion des Parametres.",
+    "settings.usersRights.status.active": "Actif",
+    "settings.usersRights.status.disabled": "Desactive",
+    "settings.usersRights.fullAccess": "Acces complet",
+    "settings.usersRights.permissions.cameras": "Cameras",
+    "settings.usersRights.permissions.tasks": "Taches",
+    "settings.usersRights.permissions.agents": "Agents",
+    "settings.usersRights.permissions.chat": "Chat",
+    "settings.usersRights.permissions.view": "Voir",
+    "settings.usersRights.permissions.execute": "Executer",
+    "settings.usersRights.permissions.useChat": "Utiliser le chat",
+    "settings.usersRights.scope.viewTitle": "Portee de visualisation",
+    "settings.usersRights.scope.executeTitle": "Portee d'execution",
+    "settings.usersRights.scope.all": "Tous",
+    "settings.usersRights.scope.selected": "Selectionnes",
+    "settings.usersRights.scope.selectedCount": "{{count}} selectionnes",
+    "settings.usersRights.scope.noneAvailable": "Aucun element disponible.",
+    "settings.usersRights.scope.inactive": "Inactif",
+    "settings.usersRights.actions.create": "Creer un sous-compte",
+    "settings.usersRights.actions.refresh": "Actualiser",
+    "settings.usersRights.actions.saveChanges": "Enregistrer les changements",
+    "settings.usersRights.actions.showDetails": "Afficher les details",
+    "settings.usersRights.actions.hideDetails": "Masquer les details",
+    "settings.usersRights.actions.updatePassword": "Mettre a jour le mot de passe",
+    "settings.usersRights.existing.title": "Utilisateurs existants",
+    "settings.usersRights.existing.description":
+      "Revoyez les roles, desactivez l'acces et faites tourner les mots de passe depuis ici.",
+    "settings.usersRights.loading": "Chargement des utilisateurs...",
+    "settings.usersRights.empty":
+      "Aucun utilisateur trouve pour ce compte pour le moment.",
+    "settings.usersRights.ownerDescription":
+      "Ceci est le proprietaire principal du compte. Les changements de role et de mot de passe restent hors de ce panneau.",
+    "settings.usersRights.adminLockedDescription":
+      "Seul le proprietaire principal peut modifier les sous-comptes admin.",
+    "settings.usersRights.managedPasswordDescription":
+      "Les mots de passe des sous-comptes sont geres ici par le proprietaire du compte ou un admin.",
+    "settings.usersRights.updatedAt": "Mis a jour {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "Changer le mot de passe",
+    "settings.usersRights.password.description":
+      "Le sous-compte devra utiliser le nouveau mot de passe a la prochaine connexion.",
+    "settings.usersRights.password.placeholder": "Nouveau mot de passe",
+    "settings.usersRights.validation.emailRequired": "L'e-mail est obligatoire.",
+    "settings.usersRights.validation.passwordMin":
+      "Le mot de passe doit contenir au moins {{min}} caracteres.",
+    "settings.usersRights.messages.loadFailed":
+      "Impossible de charger les utilisateurs.",
+    "settings.usersRights.messages.createFailed":
+      "Impossible de creer le sous-compte.",
+    "settings.usersRights.messages.createSuccess": "Sous-compte cree.",
+    "settings.usersRights.messages.saveFailed":
+      "Impossible d'enregistrer le sous-compte.",
+    "settings.usersRights.messages.saveSuccess": "Enregistre.",
+    "settings.usersRights.messages.passwordFailed":
+      "Impossible de changer le mot de passe.",
+    "settings.usersRights.messages.passwordSuccess":
+      "Mot de passe mis a jour.",
+  },
+  zh: {
+    "settings.tabs.usersRights": "用户与权限",
+    "settings.usersRights.title": "用户与权限",
+    "settings.usersRights.description":
+      "创建具有独立邮箱和密码的子账户，并精确决定他们可以查看或执行哪些区域。",
+    "settings.usersRights.create.title": "创建子账户",
+    "settings.usersRights.create.description":
+      "新的子账户会以管理员托管密码的方式创建。",
+    "settings.usersRights.fields.email": "邮箱",
+    "settings.usersRights.fields.initialPassword": "初始密码",
+    "settings.usersRights.fields.role": "角色",
+    "settings.usersRights.fields.status": "状态",
+    "settings.usersRights.role.owner": "所有者",
+    "settings.usersRights.role.admin": "管理员",
+    "settings.usersRights.role.member": "成员",
+    "settings.usersRights.role.adminHint":
+      "管理员会自动获得完全访问权限和设置管理权限。",
+    "settings.usersRights.status.active": "启用",
+    "settings.usersRights.status.disabled": "已禁用",
+    "settings.usersRights.fullAccess": "完全访问",
+    "settings.usersRights.permissions.cameras": "摄像头",
+    "settings.usersRights.permissions.tasks": "任务",
+    "settings.usersRights.permissions.agents": "代理",
+    "settings.usersRights.permissions.chat": "聊天",
+    "settings.usersRights.permissions.view": "查看",
+    "settings.usersRights.permissions.execute": "执行",
+    "settings.usersRights.permissions.useChat": "使用聊天",
+    "settings.usersRights.scope.viewTitle": "查看范围",
+    "settings.usersRights.scope.executeTitle": "执行范围",
+    "settings.usersRights.scope.all": "全部",
+    "settings.usersRights.scope.selected": "已选择",
+    "settings.usersRights.scope.selectedCount": "已选择 {{count}} 项",
+    "settings.usersRights.scope.noneAvailable": "没有可用项目。",
+    "settings.usersRights.scope.inactive": "已停用",
+    "settings.usersRights.actions.create": "创建子账户",
+    "settings.usersRights.actions.refresh": "刷新",
+    "settings.usersRights.actions.saveChanges": "保存更改",
+    "settings.usersRights.actions.showDetails": "显示详情",
+    "settings.usersRights.actions.hideDetails": "隐藏详情",
+    "settings.usersRights.actions.updatePassword": "更新密码",
+    "settings.usersRights.existing.title": "现有用户",
+    "settings.usersRights.existing.description":
+      "在这里查看角色、禁用访问并轮换密码。",
+    "settings.usersRights.loading": "正在加载用户...",
+    "settings.usersRights.empty": "该账户还没有用户。",
+    "settings.usersRights.ownerDescription":
+      "这是主账户所有者。角色和密码变更不在此面板中处理。",
+    "settings.usersRights.adminLockedDescription":
+      "只有主所有者可以编辑管理员子账户。",
+    "settings.usersRights.managedPasswordDescription":
+      "子账户密码由账户所有者或管理员在这里管理。",
+    "settings.usersRights.updatedAt": "更新于 {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "更改密码",
+    "settings.usersRights.password.description":
+      "子账户下次登录时需要使用新密码。",
+    "settings.usersRights.password.placeholder": "新密码",
+    "settings.usersRights.validation.emailRequired": "请输入邮箱。",
+    "settings.usersRights.validation.passwordMin":
+      "密码至少需要 {{min}} 个字符。",
+    "settings.usersRights.messages.loadFailed": "加载用户失败。",
+    "settings.usersRights.messages.createFailed": "创建子账户失败。",
+    "settings.usersRights.messages.createSuccess": "子账户已创建。",
+    "settings.usersRights.messages.saveFailed": "保存子账户失败。",
+    "settings.usersRights.messages.saveSuccess": "已保存。",
+    "settings.usersRights.messages.passwordFailed": "修改密码失败。",
+    "settings.usersRights.messages.passwordSuccess": "密码已更新。",
+  },
+  ar: {
+    "settings.tabs.usersRights": "المستخدمون والصلاحيات",
+    "settings.usersRights.title": "المستخدمون والصلاحيات",
+    "settings.usersRights.description":
+      "أنشئ حسابات فرعية ببريد إلكتروني وكلمة مرور خاصين بها، ثم حدد بدقة ما يمكنها عرضه أو تنفيذه.",
+    "settings.usersRights.create.title": "إنشاء حساب فرعي",
+    "settings.usersRights.create.description":
+      "تُنشأ الحسابات الفرعية الجديدة بكلمات مرور يديرها المشرف.",
+    "settings.usersRights.fields.email": "البريد الإلكتروني",
+    "settings.usersRights.fields.initialPassword": "كلمة المرور الأولية",
+    "settings.usersRights.fields.role": "الدور",
+    "settings.usersRights.fields.status": "الحالة",
+    "settings.usersRights.role.owner": "المالك",
+    "settings.usersRights.role.admin": "مشرف",
+    "settings.usersRights.role.member": "عضو",
+    "settings.usersRights.role.adminHint":
+      "يحصل المشرفون تلقائيا على وصول كامل وإدارة الإعدادات.",
+    "settings.usersRights.status.active": "نشط",
+    "settings.usersRights.status.disabled": "معطل",
+    "settings.usersRights.fullAccess": "وصول كامل",
+    "settings.usersRights.permissions.cameras": "الكاميرات",
+    "settings.usersRights.permissions.tasks": "المهام",
+    "settings.usersRights.permissions.agents": "الوكلاء",
+    "settings.usersRights.permissions.chat": "الدردشة",
+    "settings.usersRights.permissions.view": "عرض",
+    "settings.usersRights.permissions.execute": "تنفيذ",
+    "settings.usersRights.permissions.useChat": "استخدام الدردشة",
+    "settings.usersRights.scope.viewTitle": "نطاق العرض",
+    "settings.usersRights.scope.executeTitle": "نطاق التنفيذ",
+    "settings.usersRights.scope.all": "الكل",
+    "settings.usersRights.scope.selected": "محدد",
+    "settings.usersRights.scope.selectedCount": "{{count}} محدد",
+    "settings.usersRights.scope.noneAvailable": "لا توجد عناصر متاحة.",
+    "settings.usersRights.scope.inactive": "غير نشط",
+    "settings.usersRights.actions.create": "إنشاء حساب فرعي",
+    "settings.usersRights.actions.refresh": "تحديث",
+    "settings.usersRights.actions.saveChanges": "حفظ التغييرات",
+    "settings.usersRights.actions.showDetails": "إظهار التفاصيل",
+    "settings.usersRights.actions.hideDetails": "إخفاء التفاصيل",
+    "settings.usersRights.actions.updatePassword": "تحديث كلمة المرور",
+    "settings.usersRights.existing.title": "المستخدمون الحاليون",
+    "settings.usersRights.existing.description":
+      "راجع الأدوار وعطل الوصول وبدل كلمات المرور من هنا.",
+    "settings.usersRights.loading": "جار تحميل المستخدمين...",
+    "settings.usersRights.empty": "لا يوجد مستخدمون لهذا الحساب بعد.",
+    "settings.usersRights.ownerDescription":
+      "هذا هو مالك الحساب الرئيسي. تبقى تغييرات الدور وكلمة المرور خارج هذه اللوحة.",
+    "settings.usersRights.adminLockedDescription":
+      "لا يمكن تعديل الحسابات الفرعية للمشرفين إلا بواسطة المالك الرئيسي.",
+    "settings.usersRights.managedPasswordDescription":
+      "تتم إدارة كلمات مرور الحسابات الفرعية هنا بواسطة مالك الحساب أو مشرف.",
+    "settings.usersRights.updatedAt": "آخر تحديث {{value}}",
+    "settings.usersRights.notAvailable": "-",
+    "settings.usersRights.password.title": "تغيير كلمة المرور",
+    "settings.usersRights.password.description":
+      "سيحتاج الحساب الفرعي إلى كلمة المرور الجديدة عند تسجيل الدخول التالي.",
+    "settings.usersRights.password.placeholder": "كلمة مرور جديدة",
+    "settings.usersRights.validation.emailRequired": "البريد الإلكتروني مطلوب.",
+    "settings.usersRights.validation.passwordMin":
+      "يجب أن تتكون كلمة المرور من {{min}} أحرف على الأقل.",
+    "settings.usersRights.messages.loadFailed": "تعذر تحميل المستخدمين.",
+    "settings.usersRights.messages.createFailed": "تعذر إنشاء الحساب الفرعي.",
+    "settings.usersRights.messages.createSuccess": "تم إنشاء الحساب الفرعي.",
+    "settings.usersRights.messages.saveFailed": "تعذر حفظ الحساب الفرعي.",
+    "settings.usersRights.messages.saveSuccess": "تم الحفظ.",
+    "settings.usersRights.messages.passwordFailed":
+      "تعذر تغيير كلمة المرور.",
+    "settings.usersRights.messages.passwordSuccess":
+      "تم تحديث كلمة المرور.",
+  },
+};
+
+for (const [lang, entries] of Object.entries(workspaceAccessTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(accountUsersTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
 for (const [lang, entries] of Object.entries(drakonFindOverrides)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
@@ -4149,6 +5324,10 @@ for (const [lang, entries] of Object.entries(tutorialCameraStepTranslations)) {
 }
 
 for (const [lang, entries] of Object.entries(tutorialAgentStepTranslations)) {
+  Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
+}
+
+for (const [lang, entries] of Object.entries(tutorialChatStepTranslations)) {
   Object.assign(languageSafetyOverrides[lang] || (languageSafetyOverrides[lang] = {}), entries);
 }
 

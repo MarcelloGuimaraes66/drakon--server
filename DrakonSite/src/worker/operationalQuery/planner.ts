@@ -43,6 +43,16 @@ function buildExecutionSteps(intent: OperationalIntent): OperationalExecutionSte
           limit: baseLimit,
         },
       ];
+    case "camera":
+      return [
+        {
+          source: "cameras",
+          strategy: "filter_join_sort_limit",
+          joins: ["job_runs", "step_runs", "agent_runs"],
+          order_by: "camera_name_asc",
+          limit: baseLimit,
+        },
+      ];
     case "step_run":
       return [
         {

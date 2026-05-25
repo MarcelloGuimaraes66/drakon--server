@@ -5,7 +5,6 @@ import path from "path";
 import { webcrypto } from "node:crypto";
 import { Pool } from "pg";
 import { WebSocketServer } from "ws";
-import worker from "../src/worker/index";
 import {
   resolveActiveBrandRuntime,
   resolveDatabaseBackend,
@@ -20,6 +19,12 @@ import {
   routeSharedFindRelayClientMessage,
   unregisterSharedFindRelayConnection,
 } from "../src/worker/sharedFindRelayState";
+import {
+  registerWorkspaceRelayConnection,
+  routeWorkspaceRelayClientMessage,
+  unregisterWorkspaceRelayConnection,
+} from "../src/worker/workspaceRelayState";
+import { startLocalAgentIngressPump } from "../src/worker/localAgentIngress";
 
 if (!(globalThis as any).crypto) {
   Object.defineProperty(globalThis, "crypto", {
@@ -41,6 +46,9 @@ const appBaseUrl = process.env.APP_BASE_URL || `http://localhost:${port}`;
 const staticRoot = process.env.APP_STATIC_ROOT
   ? path.resolve(process.env.APP_STATIC_ROOT)
   : "";
+const agentBaseUrl = String(process.env.APP_AGENT_BASE_URL || "").trim().replace(/\/+$/, "");
+const serverRole = String(process.env.APP_SERVER_ROLE || "ui").trim().toLowerCase();
+const isAgentServer = serverRole === "agent";
 const activeBrand = resolveActiveBrandRuntime();
 const databaseBackend = resolveDatabaseBackend(activeBrand);
 
@@ -90,7 +98,78 @@ async function createDatabase() {
   return new PgD1Database(pool);
 }
 
+function isAgentRequestPath(pathname: string) {
+  return pathname === "/api/agent" || pathname.startsWith("/api/agent/");
+}
+
+function normalizeProxyHeaderValue(value: string | string[] | undefined): string {
+  const normalized = Array.isArray(value) ? value[0] : value || "";
+  return normalized.split(",")[0]?.trim() || "";
+}
+
+function resolveRequestBaseUrl(req: any): string {
+  const forwardedProto = normalizeProxyHeaderValue(req.headers["x-forwarded-proto"]).toLowerCase();
+  const forwardedHost =
+    normalizeProxyHeaderValue(req.headers["x-forwarded-host"]) ||
+    normalizeProxyHeaderValue(req.headers.host) ||
+    "localhost";
+  const protocol = forwardedProto === "https" || forwardedProto === "http"
+    ? forwardedProto
+    : "http";
+  return `${protocol}://${forwardedHost}`;
+}
+
+async function forwardHttpRequest(req: any, targetUrl: URL) {
+  const method = req.method || "GET";
+  const body = method === "GET" || method === "HEAD" ? undefined : Readable.toWeb(req);
+  const init: RequestInit & { duplex?: "half" } = {
+    method,
+    headers: req.headers as any,
+    body,
+  };
+
+  if (body) {
+    init.duplex = "half";
+  }
+
+  return fetch(new Request(targetUrl.toString(), init));
+}
+
+async function writeForwardedResponse(res: any, response: Response) {
+  res.statusCode = response.status;
+
+  const getSetCookie =
+    typeof (response.headers as any).getSetCookie === "function"
+      ? (response.headers as any).getSetCookie()
+      : null;
+  const setCookieValues: string[] = Array.isArray(getSetCookie)
+    ? getSetCookie
+    : (() => {
+        const single = response.headers.get("set-cookie");
+        return single ? [single] : [];
+      })();
+
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase() === "set-cookie") return;
+    res.setHeader(key, value);
+  });
+
+  if (setCookieValues.length > 0) {
+    res.setHeader(
+      "set-cookie",
+      setCookieValues.map((value) => rewriteSetCookie(value))
+    );
+  }
+
+  if (response.body) {
+    Readable.fromWeb(response.body as any).pipe(res);
+  } else {
+    res.end();
+  }
+}
+
 async function startServer() {
+  const { default: worker } = await import("../src/worker/index");
   const DB = await createDatabase();
   const centralAuthPublicKey = resolveSecretValue(
     process.env.CENTRAL_AUTH_PUBLIC_KEY,
@@ -105,6 +184,9 @@ async function startServer() {
     R2_BUCKET,
     GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID || "",
     GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_ID: process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_ID || "",
+    DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET:
+      process.env.DESKTOP_GOOGLE_OAUTH_CLIENT_SECRET || "",
     GOOGLE_OAUTH_REDIRECT_URI: process.env.GOOGLE_OAUTH_REDIRECT_URI || "",
     DESKTOP_GOOGLE_OAUTH_REDIRECT_URI:
       process.env.DESKTOP_GOOGLE_OAUTH_REDIRECT_URI || "",
@@ -116,8 +198,15 @@ async function startServer() {
     R2_PUBLIC_BASE_URL:
       process.env.R2_PUBLIC_BASE_URL || `${appBaseUrl}/media`,
     APP_ALLOWED_ORIGINS: process.env.APP_ALLOWED_ORIGINS || "",
+    APP_AGENT_BASE_URL: process.env.APP_AGENT_BASE_URL || "",
+    APP_SERVER_ROLE: process.env.APP_SERVER_ROLE || "",
     USD_TO_BRL: process.env.USD_TO_BRL || "",
     SCHEDULER_TICK_SECRET: process.env.SCHEDULER_TICK_SECRET || "",
+    LOCAL_AGENT_INGEST_MODE: process.env.LOCAL_AGENT_INGEST_MODE || "",
+    LOCAL_AGENT_INGEST_POLL_MS: process.env.LOCAL_AGENT_INGEST_POLL_MS || "",
+    LOCAL_AGENT_EVENT_BATCH_SIZE: process.env.LOCAL_AGENT_EVENT_BATCH_SIZE || "",
+    LOCAL_AGENT_LATEST_BATCH_SIZE: process.env.LOCAL_AGENT_LATEST_BATCH_SIZE || "",
+    LOCAL_AGENT_EVENT_MAX_ATTEMPTS: process.env.LOCAL_AGENT_EVENT_MAX_ATTEMPTS || "",
     APP_SCHEMA_SCOPE: process.env.APP_SCHEMA_SCOPE || "",
     CENTRAL_AUTH_BASE_URL: process.env.CENTRAL_AUTH_BASE_URL || "",
     CENTRAL_AUTH_PUBLIC_KEY: centralAuthPublicKey,
@@ -125,7 +214,15 @@ async function startServer() {
     CENTRAL_AUTH_GRANT_TTL_HOURS: process.env.CENTRAL_AUTH_GRANT_TTL_HOURS || "",
     CENTRAL_AUTH_KEY_ID: process.env.CENTRAL_AUTH_KEY_ID || "",
   };
+  if (isAgentServer) {
+    startLocalAgentIngressPump({
+      env: env as any,
+      dispatch: (request) =>
+        worker.fetch(request, env as any, { waitUntil: () => {} } as any),
+    });
+  }
   const relayWss = new WebSocketServer({ noServer: true });
+  const workspaceRelayWss = new WebSocketServer({ noServer: true });
 
   const server = createServer(async (req, res) => {
     if (!req.url) {
@@ -134,7 +231,7 @@ async function startServer() {
       return;
     }
 
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, resolveRequestBaseUrl(req));
 
     if (url.pathname === "/__perceptrum/health") {
       res.setHeader("content-type", "application/json; charset=utf-8");
@@ -162,6 +259,24 @@ async function startServer() {
 
     if (url.pathname.startsWith("/media/")) {
       await serveMedia(res, url.pathname);
+      return;
+    }
+
+    if (isAgentServer && !isAgentRequestPath(url.pathname)) {
+      res.statusCode = 404;
+      res.end("Not Found");
+      return;
+    }
+
+    if (!isAgentServer && agentBaseUrl && isAgentRequestPath(url.pathname)) {
+      const forwarded = await forwardHttpRequest(
+        req,
+        new URL(
+          `${url.pathname}${url.search}`,
+          agentBaseUrl.endsWith("/") ? agentBaseUrl : `${agentBaseUrl}/`
+        )
+      );
+      await writeForwardedResponse(res, forwarded);
       return;
     }
 
@@ -207,40 +322,11 @@ async function startServer() {
       return;
     }
 
-    res.statusCode = response.status;
-
-    const getSetCookie =
-      typeof (response.headers as any).getSetCookie === "function"
-        ? (response.headers as any).getSetCookie()
-        : null;
-    const setCookieValues: string[] = Array.isArray(getSetCookie)
-      ? getSetCookie
-      : (() => {
-          const single = response.headers.get("set-cookie");
-          return single ? [single] : [];
-        })();
-
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() === "set-cookie") return;
-      res.setHeader(key, value);
-    });
-
-    if (setCookieValues.length > 0) {
-      res.setHeader(
-        "set-cookie",
-        setCookieValues.map((value) => rewriteSetCookie(value))
-      );
-    }
-
-    if (response.body) {
-      Readable.fromWeb(response.body as any).pipe(res);
-    } else {
-      res.end();
-    }
+    await writeForwardedResponse(res, response);
   });
 
   relayWss.on("connection", (ws, request) => {
-    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const requestUrl = new URL(request.url || "/", resolveRequestBaseUrl(request));
     const token = requestUrl.searchParams.get("token") || "";
     const registered = registerSharedFindRelayConnection(token, ws as any);
 
@@ -296,6 +382,63 @@ async function startServer() {
     });
   });
 
+  workspaceRelayWss.on("connection", (ws, request) => {
+    const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const token = requestUrl.searchParams.get("token") || "";
+    const registered = registerWorkspaceRelayConnection(token, ws as any);
+
+    if (!registered) {
+      try {
+        ws.send(JSON.stringify({ type: "relay_error", error: "invalid_or_expired_session" }));
+      } catch {
+        // ignore send errors during close
+      }
+      ws.close(1008, "invalid_or_expired_session");
+      return;
+    }
+
+    const { publicId, expiresAt } = registered;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "relay_ready",
+          public_id: publicId,
+          expires_at: expiresAt,
+        })
+      );
+    } catch {
+      ws.close(1011, "relay_ready_failed");
+      return;
+    }
+
+    ws.on("message", (rawData) => {
+      let payload: unknown = null;
+      try {
+        payload = JSON.parse(String(rawData || "{}"));
+      } catch {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: "invalid_json" }));
+        } catch {
+          // ignore send errors
+        }
+        return;
+      }
+
+      const routed = routeWorkspaceRelayClientMessage(publicId, payload);
+      if (!routed.ok && routed.error) {
+        try {
+          ws.send(JSON.stringify({ type: "relay_error", error: routed.error }));
+        } catch {
+          // ignore send errors
+        }
+      }
+    });
+
+    ws.on("close", () => {
+      unregisterWorkspaceRelayConnection(publicId, ws as any);
+    });
+  });
+
   server.on("upgrade", (req, socket, head) => {
     if (!req.url) {
       socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -304,20 +447,32 @@ async function startServer() {
     }
 
     const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (requestUrl.pathname === "/ws/find-relay") {
+      relayWss.handleUpgrade(req, socket, head, (ws) => {
+        relayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    if (requestUrl.pathname === "/ws/workspace-relay") {
+      workspaceRelayWss.handleUpgrade(req, socket, head, (ws) => {
+        workspaceRelayWss.emit("connection", ws, req);
+      });
+      return;
+    }
+
     if (requestUrl.pathname !== "/ws/find-relay") {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       socket.destroy();
       return;
     }
-
-    relayWss.handleUpgrade(req, socket, head, (ws) => {
-      relayWss.emit("connection", ws, req);
-    });
   });
 
   server.listen(port, () => {
     console.log(
-      `[local-server] brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://localhost:${port}`
+      `[local-server] role=${serverRole} brand=${activeBrand.id} profile=${runtimeProfile} backend=${databaseBackend} listening on http://localhost:${port}${
+        !isAgentServer && agentBaseUrl ? ` agentProxy=${agentBaseUrl}` : ""
+      }`
     );
   });
 }

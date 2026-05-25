@@ -10,6 +10,7 @@ namespace DrakonDesktop::platform
     {
         std::string brandId{ "perceptrum" };
         std::uint16_t port{ 4000 };
+        std::uint16_t agentPort{ 4001 };
         bool internalServiceMode{ false };
         std::wstring shutdownEventName;
 
@@ -30,6 +31,7 @@ namespace DrakonDesktop::platform
         std::filesystem::path webViewUserDataDirectory;
         std::filesystem::path brandIconPath;
         std::filesystem::path backendLogPath;
+        std::filesystem::path agentBackendLogPath;
         std::filesystem::path serviceLogPath;
         std::filesystem::path systemActivityLogPath;
         bool backendUsesTsx{ true };
@@ -41,6 +43,7 @@ namespace DrakonDesktop::platform
         std::wstring backgroundNotificationTitle;
         std::wstring backgroundNotificationMessage{ L"Perceptrum is now running in the background." };
         std::wstring uiBaseUrl{ L"http://127.0.0.1:4000" };
+        std::wstring agentBaseUrl{ L"http://127.0.0.1:4001" };
         GUID trayIconGuid{};
         bool trayIconGuidValid{ false };
     };

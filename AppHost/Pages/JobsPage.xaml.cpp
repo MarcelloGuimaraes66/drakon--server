@@ -176,30 +176,94 @@ namespace
         auto dash = trimmed.find('-');
         if (dash == std::string::npos)
         {
-            error = "Each schedule window must use HH:MM-HH:MM format.";
+            error = "Each schedule window must use HH:MM[:SS]-HH:MM[:SS] format.";
             return false;
         }
 
         auto start = TrimAsciiJobs(trimmed.substr(0, dash));
         auto end = TrimAsciiJobs(trimmed.substr(dash + 1));
-        auto isTime = [](std::string const& value)
+        auto parseTime = [](std::string const& value, std::string& canonical, int32_t& totalSeconds)
         {
-            return value.size() == 5 &&
-                std::isdigit(static_cast<unsigned char>(value[0])) &&
-                std::isdigit(static_cast<unsigned char>(value[1])) &&
-                value[2] == ':' &&
-                std::isdigit(static_cast<unsigned char>(value[3])) &&
-                std::isdigit(static_cast<unsigned char>(value[4]));
+            auto parseTwoDigits = [](std::string const& part, int32_t minValue, int32_t maxValue, int32_t& parsed)
+            {
+                if (part.size() != 2 ||
+                    !std::isdigit(static_cast<unsigned char>(part[0])) ||
+                    !std::isdigit(static_cast<unsigned char>(part[1])))
+                {
+                    return false;
+                }
+
+                parsed = ((part[0] - '0') * 10) + (part[1] - '0');
+                return parsed >= minValue && parsed <= maxValue;
+            };
+            auto padTwo = [](int32_t value)
+            {
+                auto text = std::to_string(value);
+                if (text.size() < 2)
+                {
+                    text.insert(text.begin(), '0');
+                }
+                return text;
+            };
+
+            auto firstColon = value.find(':');
+            if (firstColon == std::string::npos)
+            {
+                return false;
+            }
+
+            auto secondColon = value.find(':', firstColon + 1);
+            if (secondColon != std::string::npos &&
+                value.find(':', secondColon + 1) != std::string::npos)
+            {
+                return false;
+            }
+
+            auto hourPart = value.substr(0, firstColon);
+            auto minutePart = secondColon == std::string::npos
+                ? value.substr(firstColon + 1)
+                : value.substr(firstColon + 1, secondColon - firstColon - 1);
+            auto secondPart = secondColon == std::string::npos
+                ? std::string()
+                : value.substr(secondColon + 1);
+
+            int32_t hour = 0;
+            int32_t minute = 0;
+            int32_t second = 0;
+            if (!parseTwoDigits(hourPart, 0, 23, hour) ||
+                !parseTwoDigits(minutePart, 0, 59, minute))
+            {
+                return false;
+            }
+
+            if (!secondPart.empty() && !parseTwoDigits(secondPart, 0, 59, second))
+            {
+                return false;
+            }
+
+            totalSeconds = (hour * 3600) + (minute * 60) + second;
+            canonical = padTwo(hour) + ":" + padTwo(minute);
+            if (!secondPart.empty())
+            {
+                canonical += ":" + padTwo(second);
+            }
+            return true;
         };
 
-        if (!isTime(start) || !isTime(end) || start >= end)
+        std::string normalizedStart;
+        std::string normalizedEnd;
+        int32_t startSeconds = 0;
+        int32_t endSeconds = 0;
+        if (!parseTime(start, normalizedStart, startSeconds) ||
+            !parseTime(end, normalizedEnd, endSeconds) ||
+            startSeconds >= endSeconds)
         {
-            error = "Invalid schedule window. Use HH:MM-HH:MM with start before end.";
+            error = "Invalid schedule window. Use HH:MM[:SS]-HH:MM[:SS] with start before end.";
             return false;
         }
 
-        window.startTime = start;
-        window.endTime = end;
+        window.startTime = normalizedStart;
+        window.endTime = normalizedEnd;
         return true;
     }
 
@@ -313,7 +377,7 @@ namespace
             auto windowTokens = SplitList(windowsPart, ',');
             if (windowTokens.empty())
             {
-                error = "Each schedule line must include at least one HH:MM-HH:MM window.";
+                error = "Each schedule line must include at least one HH:MM[:SS]-HH:MM[:SS] window.";
                 return false;
             }
 

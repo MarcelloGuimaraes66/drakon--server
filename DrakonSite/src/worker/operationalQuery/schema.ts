@@ -113,6 +113,7 @@ export type OperationalIntent = {
 
 export type OperationalExecutionSource =
   | "identity_cards"
+  | "cameras"
   | "job_runs"
   | "step_runs"
   | "agent_runs"
